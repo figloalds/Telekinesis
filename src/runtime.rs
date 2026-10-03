@@ -300,11 +300,22 @@ impl Engine {
                 s["notification_error"] = json!(self.notification_error);
                 s["pending_notifications"] = json!(self.notifications.len());
                 s["last_sync"] = json!(self.last_sync);
-                s["caught_up"] = self
-                    .last_sync
-                    .as_ref()
-                    .map(|v| v["caught_up"].clone())
-                    .unwrap_or(json!(false));
+                s["caught_up"] = json!(
+                    self.last_sync
+                        .as_ref()
+                        .is_some_and(|v| v["caught_up"] == true)
+                        && s["outgoing_unacknowledged"] == 0
+                        && s["incoming_pending"] == 0
+                        && s["pending_causal_events"] == json!([])
+                        && s["unflushed_files"] == 0
+                        && self.health.is_none()
+                        && if let Some(peer) = &self.peer {
+                            self.store.shared_event_inventory()?
+                                == self.store.known_by_peer(&peer.peer)?
+                        } else {
+                            false
+                        }
+                );
                 s["upload_state"] = json!(if !self.store.branch(&self.store.active)?.shared {
                     "local-only"
                 } else if self.peer.is_none() {
@@ -507,7 +518,6 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
                                 .clone()
                                 .context("PEER_NOT_CONFIGURED")?;
                             let value = sync_once(&engine, &config)?;
-                            engine.lock().unwrap().last_sync = Some(value.clone());
                             return Ok(value);
                         }
                         #[cfg(windows)]
@@ -589,6 +599,13 @@ fn check_peer(e: &Engine, c: &PeerConfig, message: &PeerMessage) -> Result<()> {
         message.format == 2 && message.sender == c.peer && message.receiver == e.store.device,
         "UNAUTHORIZED_DEVICE"
     );
+    ensure!(
+        message
+            .ack
+            .iter()
+            .all(|event| message.known.contains(event)),
+        "INVALID_PEER_ACK"
+    );
     Ok(())
 }
 pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
@@ -613,19 +630,16 @@ pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
                     vec![]
                 };
                 e.store.acknowledge(&message.ack)?;
+                e.store.remember_peer_inventory(&sc.peer, &message.known)?;
+                e.store
+                    .remember_peer_objects(&sc.peer, &message.known_objects)?;
                 Ok(PeerMessage {
                     format: 2,
                     sender: e.store.device.clone(),
                     receiver: sc.peer.clone(),
                     request: id(),
                     reply_to: Some(message.request),
-                    known: e
-                        .store
-                        .events()?
-                        .into_iter()
-                        .filter(|e| e.branch.shared)
-                        .map(|e| e.id)
-                        .collect(),
+                    known: e.store.shared_event_inventory()?,
                     known_objects: e.store.shared_object_inventory()?,
                     pending_events: e.store.db.query_row(
                         "SELECT count(*) FROM incoming_events",
@@ -655,20 +669,22 @@ pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
     });
     std::thread::spawn(move || {
         loop {
-            let result = sync_once(&engine, &config);
-            let mut e = engine.lock().unwrap();
-            e.last_sync = Some(match result {
-                Ok(value) => value,
-                Err(error) => json!({"caught_up":false,"error":format!("{error:#}")}),
-            });
-            drop(e);
-            deliver_notifications(&engine);
+            let _ = sync_once(&engine, &config);
             std::thread::sleep(Duration::from_secs(1));
         }
     });
     Ok(())
 }
 pub fn sync_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
+    let result = exchange_once(engine, c);
+    engine.lock().unwrap().last_sync = Some(match &result {
+        Ok(value) => value.clone(),
+        Err(error) => json!({"caught_up":false,"error":format!("{error:#}")}),
+    });
+    deliver_notifications(engine);
+    result
+}
+fn exchange_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
     let request = id();
     let message = {
         let e = engine.lock().unwrap();
@@ -678,13 +694,7 @@ pub fn sync_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
             receiver: c.peer.clone(),
             request: request.clone(),
             reply_to: None,
-            known: e
-                .store
-                .events()?
-                .into_iter()
-                .filter(|e| e.branch.shared)
-                .map(|e| e.id)
-                .collect(),
+            known: e.store.shared_event_inventory()?,
             known_objects: e.store.shared_object_inventory()?,
             pending_events: e.store.db.query_row(
                 "SELECT count(*) FROM incoming_events",
@@ -718,20 +728,12 @@ pub fn sync_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
     e.store.remember_peer_inventory(&c.peer, &response.known)?;
     e.store
         .remember_peer_objects(&c.peer, &response.known_objects)?;
-    let local: BTreeSet<_> = e
-        .store
-        .events()?
-        .into_iter()
-        .filter(|e| e.branch.shared)
-        .map(|e| e.id)
-        .collect();
+    let local = e.store.shared_event_inventory()?;
     let pending: usize = e
         .store
         .db
         .query_row("SELECT count(*) FROM incoming_events", [], |r| r.get(0))?;
-    let result = json!({"caught_up_at":time(),"caught_up":local==response.known&&pending==0&&response.pending_events==0&&e.store.projection(&e.store.active)?.pending.is_empty(),"peer":c.peer,"durability":"peer SQLite+verified objects"});
-    drop(e);
-    deliver_notifications(engine);
+    let result = json!({"caught_up_at":time(),"caught_up":local==response.known&&pending==0&&response.pending_events==0&&e.store.outgoing_unacknowledged()?==0&&e.store.projection(&e.store.active)?.pending.is_empty()&&e.health.is_none()&&!e.sessions.values().any(|s|s.dirty),"peer":c.peer,"durability":"peer SQLite+verified objects"});
     Ok(result)
 }
 

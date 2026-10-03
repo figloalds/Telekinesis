@@ -113,9 +113,12 @@ class Device:
 
 
 def main():
+    global EXE
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", type=Path, default=ROOT / "VALIDATION.json")
+    parser.add_argument("--exe", type=Path, default=EXE)
     args = parser.parse_args()
+    EXE = args.exe.resolve()
     run = ROOT / "test-runs" / str(uuid.uuid4())
     run.mkdir(parents=True)
     repo = str(uuid.uuid4())
@@ -132,6 +135,15 @@ def main():
         save(a.mount / "note.txt", b"base\n")
         wait_for(lambda: (b.mount / "note.txt").read_bytes() == b"base\n", "live shared save")
         passed("real WinFsp mounted save is visible on the second LOCAL process without checkpoint")
+
+        for _ in range(3):
+            a.control("sync")
+            b.control("sync")
+        def queues_caught_up():
+            statuses = [a.control("status"), b.control("status")]
+            return all(s["outgoing_unacknowledged"] == 0 and s["incoming_pending"] == 0 and s["caught_up"] for s in statuses)
+        wait_for(queues_caught_up, "both durable peer inventories drain received echoes and retries")
+        passed("authenticated inventories drain both outgoing queues after repeated two-way sync")
 
         # Real .NET directory watcher on the peer mount; no simulated callbacks.
         ready, events, stop = run / "watch.ready", run / "watch.events", run / "watch.stop"
@@ -359,7 +371,7 @@ def main():
         assert "REQUEST_ID_REUSED" in a.control("--request-id", request, "checkpoint", "-m", "different", expected_ok=False)
         passed("RPC retry identity survives restart and rejects changed payload")
 
-        report = {"passed": True, "kind": "two-local-processes-real-WinFsp-mounts", "real_two_computers": False,
+        report = {"passed": True, "kind": "two-local-processes-real-WinFsp-mounts", "real_two_computers": False, "build_executable": str(EXE),
                   "run_directory": str(run), "devices": [a.identity, b.identity], "checks": checks,
                   "limitations": ["No actual second computer", "No power-loss/storage-controller qualification", "No general editor/build-tool compatibility claim"]}
         args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

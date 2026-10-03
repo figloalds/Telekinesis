@@ -170,6 +170,13 @@ caches and idempotent replay survive reconnect/crash/ack loss. Status distinguis
 unflushed staging, local durability, queued/acknowledged publication and last
 roundtrip catchup, plus pending/quarantined incoming counts. Catchup requires no
 incomplete incoming events and is knowledge at that exchange, not a global barrier.
+Authenticated accepted-event inventories are durable receipts on both request and
+response paths. Inventory replacement and reconciliation of the two-device outbox
+are one SQLite transaction; withdrawn peer events are queued again. Object-only,
+incomplete, quarantined and private data are excluded from event acknowledgement.
+Current status also requires identical shared inventories, empty outgoing/incoming
+queues, no unflushed staging/pending causal events and healthy local storage.
+Every failed explicit/background exchange invalidates the last roundtrip result.
 Malformed semantic events are quarantined without blocking unrelated valid events.
 
 Outbound events must belong to shared branches. Objects are selected only by
@@ -190,6 +197,40 @@ Concurrent shared publications with the same label are both retained and synced;
 ambiguous label lookup asks for a branch ID. An existing local label in the same
 scope prevents local duplicate creation. Full-history publication and merge into
 existing branches remain open decisions.
+
+## Orchestrator and distributable product direction
+
+The next management layer is specified in
+[ORCHESTRATOR-PLAN.md](ORCHESTRATOR-PLAN.md), recorded 2026-10-03. Add a new
+orchestrator mode in the existing executable, supervising one daemon worker per
+state. This preserves current store ownership and isolates the process-global
+WinFsp mount bridge while allowing multiple independent states/mounts.
+
+The proposed orchestrator takes one versioned `--defaults-file`, with a default
+native data directory containing `states/<local-state-UUID>/`. Its own SQLite
+registry stores managed-state identities, locally chosen mount paths, desired
+lifecycle, durable management jobs, machine pairings and sharing contracts.
+Per-state SQLite/CAS remains authoritative for filesystem history and branch
+selection. CLI and later UI use one local authenticated management API.
+
+Pairing orchestrators once establishes machine trust and persistent protected
+credential references. Owners separately authorize remote catalog visibility and
+repository/branch sharing contracts. A peer can list authorized offers and request
+a local replica with its own state/device UUID and mount path; pairing does not
+grant blanket state access or remote administration. Existing event-origin IDs,
+private branches and explicit current-state-only publication remain intact.
+
+This requires contract-scoped event/object inventories and receive validation,
+bilateral agreement, persistent key management and eventually per-recipient
+acknowledgements. Today's single-peer worker and outbox acknowledgement flag do
+not support arbitrary multi-peer sharing. Start with two replicas per repository
+and many repositories over one machine pairing before expanding membership/relay.
+
+Delivery order: local supervisor/config/registry; safe state/mount lifecycle;
+persistent pairing and authorized discovery; scoped two-machine sharing; service
+packaging/UI; then expanded multi-replica policies. All are **planned**, not
+implemented or validated. The detailed design records recovery, identity/adoption,
+revocation, OS-user authorization and acceptance gates for each stage.
 
 ## Validation and remaining gates
 
@@ -224,7 +265,8 @@ paths with normal PowerShell/Python OS I/O, not substituted native directories.
 | Peer notifications/read-only handle refresh | Passed actual mounted FileSystemWatcher/read checks |
 | Namespace recovery and checkpoint history/restore | Passed core tests and actual mounts |
 | Optional object backend | Local native test-bucket export/privacy passed; no remote provider validation |
-| Two real computers | **Not run**; needs second device/authorized network |
+| Two real computers | Ten live mounted checks passed on FIGLOALDS/FELYPE at `303fec8`; stale acknowledgement counters found; correction validated locally only |
+| Physical offline/reconnect and corrected version | **Not run** on two computers; await user-directed next steps |
 | Chosen editor/build ecosystem | **Not qualified** |
 | All remount faults, disk-full, power loss | Remaining qualification |
 | Checkpoint replication/diff and branch merge | Subsequent source-control work |

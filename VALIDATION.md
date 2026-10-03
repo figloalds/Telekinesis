@@ -1,5 +1,95 @@
 # Implementation validation — 2026-10-03
 
+The original 42-test/17-mount evidence below predates the acknowledgement correction
+from the later physical run. The separate correction validation and physical scope
+are recorded under "Physical findings and acknowledgement correction" below;
+the original JSON reports and benchmark observations are preserved.
+
+## Local orchestrator O1 and WinFsp loader — 2026-10-03
+
+Implemented the accepted foreground, single-user, peer-network-disabled O1 slice.
+The registry journals caller-scoped UUID requests with expected catalog/state
+generations and payload hashes. Creation preallocates identities, stages a
+versioned marker and initializes explicitly; existing workers open strictly.
+Management uses owner-only local Windows named pipes, verified caller/server
+SIDs, bounded frames/I/O and a separate transient worker instance secret passed
+through stdin. Supervisor crashes reattach authenticated instances; an occupied
+unverified store is unavailable and never killed/replaced. Cooperative shutdown
+refuses handles/mappings and verifies process exit. Desired state survives
+graceful supervisor shutdown; a completed shutdown receipt never exits a new
+supervisor. Worker launch failures/backoff/limits are per-state.
+
+The reported Windows startup error was reproduced as `0xC0000135`
+(`STATUS_DLL_NOT_FOUND`) with the installed `winfsp-x64.dll` absent from PATH.
+The new build delay-loads WinFsp; mount startup loads the DLL by absolute path
+from an explicit `WINFSP_DIR`, otherwise the installer's registry or conventional
+installation path. `dumpbin /dependents` confirmed WinFsp moved to delay imports;
+clean-environment CLI, test binaries and managed real mounts succeeded. Bad
+explicit overrides produce `WINFSP_RUNTIME_UNAVAILABLE` with the attempted path.
+No system PATH, driver, firewall or existing executable/daemon was changed.
+Older binaries still use their original startup loader behavior.
+
+Build/test target: `target/o1`, keeping the default executable and original
+daemons untouched. Executed:
+
+```powershell
+cargo build --offline --target-dir target/o1
+cargo test --offline --target-dir target/o1
+cargo test --offline --target-dir target/o1 --test orchestrator
+cargo clippy --offline --all-targets --target-dir target/o1 -- -D warnings
+cargo fmt --check
+python scripts/orchestrator_e2e.py
+python scripts/e2e.py --exe target/o1/debug/tkfs.exe --report ORCHESTRATOR-COMPATIBILITY.json
+```
+
+The final full suite passed all 54 tests, including the existing acknowledgement,
+recovery, replication and 10,000-save regression tests. The focused O1 suite
+contains four integration tests and three targeted lifecycle regressions, covering
+strict missing/identity refusal, explicit initialization, defaults validation,
+duplicate registry ownership, exact terminal receipt replay, interrupted
+bootstrap, future schema refusal and wrong owner refusal, startup shutdown fencing,
+recoverable staging installation and terminal-versus-retryable I/O classification.
+Final Clippy with warnings denied and formatting passed.
+
+[ORCHESTRATOR-VALIDATION.json](ORCHESTRATOR-VALIDATION.json) records 22 local
+acceptance checks: two independent real mounts, durable isolated content,
+duplicate supervisor/store ownership refusal, exact replay/mismatch/stale
+generation behavior, API version/anonymous caller rejection, worker token and
+instance rejection, mounted bearer separation, crash reattachment, unverified
+owner isolation, open handle/mapping refusal, occupied target/data overlap
+refusal, graceful exit/restart and completed-shutdown replay, strict missing
+metadata recovery, five creation crash boundaries, partial startup failure and
+running-limit recovery, durable shutdown fencing across pending create/start and
+crash/restart, and staging sharing-violation recovery without reallocation/data
+loss. The harness removes WinFsp PATH and `WINFSP_DIR` from
+its environment and retains its own fixture directories under `test-runs/`.
+All successful-run fixture workers/mounts were cooperatively stopped.
+
+[ORCHESTRATOR-COMPATIBILITY.json](ORCHESTRATOR-COMPATIBILITY.json) records all
+18 existing real mounted-filesystem/peer checks passing against the new binary,
+including notifications, retained mappings, private/current-state publication,
+offline conflict convergence and acknowledgement-loss replay. This remains
+two local processes on one computer, not renewed physical-machine qualification.
+
+Deferred: adoption; O2 mount reassignment/trash/restore/purge; O3/O4 persistent
+machine trust/catalog/contracts; privileged services, logoff/reboot/session
+visibility, installer/UI; power-loss and physical cross-machine qualification.
+There is no claim of installation-level multi-user authorization or a reviewed
+network identity protocol. Existing per-store mounted discovery RPC remains
+loopback/bearer for compatibility; it grants no supervisor lifecycle capability.
+
+Independent-review follow-up: both reported P2 issues were reproduced with failing
+targeted tests before fixes. `recover()` now checks the durable shutdown fence
+before its first startup pass; pending create/start exact retries also honor it.
+Recoverable I/O classification retains the typed Windows sharing/lock/busy errors
+(32/33/170) through the error chain instead of relying on localized message text.
+Missing paths, access-denied errors outside existing worker availability handling,
+invalid markers/identities and unsupported versions are not broadly converted to
+endless retries. The real-mount harness also reproduced busy shutdown with both
+pending create/start, crash/restart, and a non-delete-sharing staging handle across
+retry/restart/release. Both recovered with the same allocated IDs and preserved
+data. No deferred scope or machine configuration was changed.
+
 All commands ran from `C:\Users\felyp\Desktop\Projetos\Telekinesis` with the
 existing toolchain. WinFsp was discovered pre-existing; no driver was installed or
 changed. Its DLL at `C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll` reports
@@ -195,13 +285,79 @@ separate durable stores bound only to loopback. This is **two local processes wi
 real WinFsp mounts, not real two-computer validation**. No simulated filesystem,
 central ref service or cloud bucket substitutes for the mount.
 
+## Physical findings and acknowledgement correction
+
+The preserved [physical report](test-runs/two-machine-448ed3f6-948d-4d90-b8b7-9b1cdbd82744/TWO-MACHINE-VALIDATION.json)
+records ten live checks on FIGLOALDS/FELYPE at commit
+`303fec87c02444d3c9790ac11268f9c396fb6527`: bidirectional mounted saves,
+stable-ID renames/delete, private branch/canary event/object isolation and
+bidirectional authentication after the user's firewall exception. Physical
+offline conflict/reconnect qualification was not completed. Both nodes reported
+caught-up while one/three received events remained queued despite durable copies.
+
+Two new baseline regressions reproduced the stale queue and stale caught-up flag
+before changes ([failure log](test-runs/ack-fix-before.log)). The correction makes
+authenticated accepted-event inventories authoritative receipts on both request
+and response paths. Peer inventory and outbox reconciliation are atomic; events
+withdrawn from the peer inventory are queued again. SQL acknowledgements apply
+only to validated shared journal entries. Objects, private events, incomplete
+manifests and quarantined data do not become event receipts. Explicit ack IDs must
+be in the authenticated sender's accepted inventory. Protocol version remains 2.
+
+`status.caught_up` now requires current matching shared inventories, empty queues,
+no pending causal events/unflushed staging and healthy storage, in addition to a
+successful exchange. Failed explicit and background syncs invalidate `last_sync`.
+This is knowledge of the last peer exchange, not a guarantee about unseen remote
+edits or a distributed barrier. Conflict rules and object publication scope are
+unchanged.
+
+Five focused tests cover received-event echoes, lost acknowledgements and restart,
+repeated inventory replay, peer restore/withdrawal, staging/current status,
+object-only receipts, private/quarantined data, real encrypted TCP reply loss and
+retry without explicit acks, wrong device, unbound responses and inconsistent ack
+claims. All passed, alongside the relevant existing suite:
+
+```powershell
+$env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
+cargo test --offline --target-dir target/ack-fix -- --nocapture --skip ten_thousand_durable_content_saves_and_later_delete_undelete --skip two_replicas_each_make_one_hundred_offline_saves_and_retain_all_pairs
+cargo fmt -- --check
+cargo clippy --offline --target-dir target/ack-fix --all-targets -- -D warnings
+cargo build --offline --target-dir target/ack-fix
+python scripts/e2e.py --exe target/ack-fix/debug/tkfs.exe --report ACK-FIX-VALIDATION.json
+```
+
+Results: **45 Rust tests passed**, zero failures; two heavy save benchmarks were
+intentionally filtered because content projection/storage did not change. Their
+original measurements remain in `SCALABILITY.json`. Formatting, strict Clippy,
+offline build, diff whitespace and harness syntax checks passed. **18 real WinFsp
+checks passed**, adding both outgoing queues reaching zero after repeated two-way
+sync to the original mounted acceptance suite.
+
+Machine-readable correction result: [ACK-FIX-VALIDATION.json](ACK-FIX-VALIDATION.json).
+Logs: [focused tests](test-runs/ack-fix-focused.log),
+[relevant suite](test-runs/ack-fix-tests.log),
+[actual mounts](test-runs/ack-fix-mounted.log).
+Correction fixture: `test-runs/b6102308-b998-461b-bf77-f1ca5db437fd/`; each device's native SQLite/CAS and
+stdout/stderr logs are retained there. These are **two local processes**, not a
+retest on physical computers. Both disposable mounts/processes were removed.
+Original daemon PIDs `44164`/`66280`, the default executable, original physical/local
+reports and plan archive remain untouched. Those daemons still run the prior
+binary; no restart, second-machine operation, settings change or push occurred.
+The corrected executable is `target/ack-fix/debug/tkfs.exe`. Physical testing of the
+correction and offline/reconnect qualification await user-directed next steps.
+
 ## Remaining setup and acceptance gaps
+
+The original build at `303fec87c02444d3c9790ac11268f9c396fb6527` subsequently passed
+ten live checks on two physical computers. The acknowledgement correction is
+validated locally only; physical offline/reconnect qualification remains pending.
 
 Real second-machine prerequisites/runbook are in
 [README.md](README.md#two-explicitly-configured-devices): another x64 Windows
 computer with WinFsp, distinct device database/UUID, common repository UUID,
 authorized reachable endpoints and an ephemeral out-of-band pairing key. No
-driver, firewall or network-security setup was performed. Both daemon peer
+driver, firewall or network-security setup was performed by agents; the physical
+report records the user's firewall exception. Both daemon peer
 endpoints/peer identity must be configured together; the secret is environment
 only. Pairing assumes trusted devices; no PKI, independent signing, forward
 secrecy, revocation or multi-user permissions are implemented.

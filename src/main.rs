@@ -25,7 +25,7 @@ struct Args {
     /// Retry the same semantic request using the same UUID.
     #[arg(long, global = true)]
     request_id: Option<String>,
-    /// Reject a request from an obsolete checkout generation.
+    /// Reject an obsolete checkout or management generation.
     #[arg(long, global = true)]
     generation: Option<u64>,
     #[command(subcommand)]
@@ -33,6 +33,20 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Foreground O1 management supervisor; networking is disabled.
+    Orchestrator {
+        #[arg(long)]
+        defaults_file: PathBuf,
+    },
+    /// Client of the same-user management API. Mutations require --generation.
+    Manage {
+        #[arg(long)]
+        defaults_file: PathBuf,
+        #[command(subcommand)]
+        action: ManagementCommand,
+    },
+    #[command(hide = true)]
+    ManagedWorker,
     Init {
         #[arg(long)]
         state: PathBuf,
@@ -119,6 +133,28 @@ enum Command {
         path: String,
     },
 }
+#[derive(Subcommand)]
+enum ManagementCommand {
+    Create {
+        label: String,
+        #[arg(long)]
+        mount: Option<PathBuf>,
+    },
+    List,
+    Inspect {
+        state: String,
+    },
+    Start {
+        state: String,
+    },
+    Stop {
+        state: String,
+    },
+    Shutdown,
+    Operation {
+        operation: String,
+    },
+}
 fn discover(args: &Args) -> Result<Discovery> {
     if let Some(path) = &args.runtime {
         return Ok(serde_json::from_slice(&std::fs::read(path)?)?);
@@ -141,6 +177,81 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse();
     match &args.command {
+        Command::Orchestrator { defaults_file } => {
+            #[cfg(windows)]
+            return tkfs::orchestrator::Supervisor::open(tkfs::orchestrator::Config::load(
+                defaults_file,
+            )?)?
+            .run();
+            #[cfg(not(windows))]
+            bail!("O1_WINDOWS_ONLY: {}", defaults_file.display());
+        }
+        Command::ManagedWorker => {
+            #[cfg(windows)]
+            return tkfs::orchestrator::worker();
+            #[cfg(not(windows))]
+            bail!("O1_WINDOWS_ONLY");
+        }
+        Command::Manage {
+            defaults_file,
+            action,
+        } => {
+            #[cfg(windows)]
+            {
+                use tkfs::orchestrator::{self, Action, Request};
+                let config = orchestrator::Config::load(defaults_file)?;
+                let action = match action {
+                    ManagementCommand::Create { label, mount } => Action::Create {
+                        label: label.clone(),
+                        mount: mount.clone(),
+                    },
+                    ManagementCommand::List => Action::List,
+                    ManagementCommand::Inspect { state } => Action::Inspect {
+                        state: state.clone(),
+                    },
+                    ManagementCommand::Start { state } => Action::Start {
+                        state: state.clone(),
+                    },
+                    ManagementCommand::Stop { state } => Action::Stop {
+                        state: state.clone(),
+                    },
+                    ManagementCommand::Shutdown => Action::Shutdown,
+                    ManagementCommand::Operation { operation } => Action::Operation {
+                        operation: operation.clone(),
+                    },
+                };
+                if action.mutates() {
+                    ensure!(
+                        args.generation.is_some(),
+                        "MANAGEMENT_GENERATION_REQUIRED: inspect catalog/state generation; retry with the same --request-id and --generation"
+                    );
+                }
+                let request = Request {
+                    version: 1,
+                    operation_id: if action.mutates() {
+                        Some(args.request_id.clone().unwrap_or_else(id))
+                    } else {
+                        None
+                    },
+                    expected_generation: args.generation,
+                    action,
+                };
+                if request.action.mutates() && args.request_id.is_none() {
+                    eprintln!(
+                        "{}",
+                        json!({"operation_id":request.operation_id,"expected_generation":request.expected_generation,"retry":"repeat the same action with these --request-id and --generation values"})
+                    );
+                }
+                let response = orchestrator::client(&config, &request)?;
+                if response["ok"] != true {
+                    bail!("{}", response);
+                }
+                println!("{}", serde_json::to_string_pretty(&response["result"])?);
+                return Ok(());
+            }
+            #[cfg(not(windows))]
+            bail!("O1_WINDOWS_ONLY: {}", defaults_file.display());
+        }
         Command::Init { state, repo } => {
             std::fs::create_dir_all(state)?;
             let _lock = lock_state(state)?;
@@ -160,7 +271,7 @@ fn run() -> Result<()> {
             // Native exclusive sharing prevents two owners of the same SQLite,
             // even after crash: the OS releases the lock, no stale lockfile policy.
             let _lock = lock_state(&state)?;
-            let store = Store::open(&state, None)?;
+            let store = Store::open_existing(&state)?;
             let engine = Arc::new(Mutex::new(Engine::new(store)));
             let mount = mount.as_ref().map(std::path::absolute).transpose()?;
             if let Some(m) = &mount {

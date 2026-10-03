@@ -154,6 +154,55 @@ pub struct Store {
     pub generation: u64,
 }
 impl Store {
+    /// Initialize an operation-owned new store with identities chosen by its caller.
+    /// Repeated initialization verifies the same identities; it never replaces them.
+    pub fn initialize(root: &Path, repo: &str, device: &str) -> Result<Self> {
+        ensure!(
+            !repo.is_empty() && !device.is_empty(),
+            "INVALID_STORE_IDENTITY"
+        );
+        fs::create_dir_all(root)?;
+        let mut db = Connection::open(root.join("metadata.sqlite"))?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
+        let tx = db.transaction()?;
+        for (key, expected) in [("repo", repo), ("device", device)] {
+            let actual: Option<String> = tx
+                .query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
+                .optional()?;
+            if let Some(actual) = actual {
+                ensure!(actual == expected, "STORE_IDENTITY_MISMATCH");
+            } else {
+                tx.execute("INSERT INTO config VALUES(?,?)", [key, expected])?;
+            }
+        }
+        tx.commit()?;
+        drop(db);
+        Self::open(root, Some(repo))
+    }
+
+    /// Validate before invoking the legacy schema/recovery path. Missing metadata
+    /// or identities must never become a newly initialized healthy replica.
+    pub fn open_existing(root: &Path) -> Result<Self> {
+        ensure!(
+            root.join("objects").is_dir() && root.join("metadata.sqlite").is_file(),
+            "STATE_NOT_INITIALIZED"
+        );
+        let db = Connection::open_with_flags(
+            root.join("metadata.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        for key in ["repo", "device", "active", "generation"] {
+            let value: String = db
+                .query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
+                .context("INVALID_STORE_METADATA")?;
+            ensure!(!value.is_empty(), "INVALID_STORE_METADATA");
+        }
+        let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM branches WHERE id=(SELECT value FROM config WHERE key='active'))", [], |r| r.get(0))?;
+        ensure!(valid, "INVALID_SELECTED_BRANCH");
+        drop(db);
+        Self::open(root, None)
+    }
+
     pub fn open(root: &Path, repo: Option<&str>) -> Result<Self> {
         fs::create_dir_all(root.join("objects"))?;
         let db = Connection::open(root.join("metadata.sqlite"))?;
@@ -1130,12 +1179,25 @@ impl Store {
         }
         Ok(branch)
     }
+    pub fn shared_event_inventory(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .db
+            .prepare("SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1")?
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+    /// The configured authenticated peer advertises accepted, durable events,
+    /// not staged manifests or object possession. Record this current receipt
+    /// snapshot and reconcile the two-device outbox in the same transaction.
+    /// A withdrawn event is queued again (for example after a peer restore).
     pub fn remember_peer_inventory(&mut self, peer: &str, known: &BTreeSet<String>) -> Result<()> {
         let tx = self.db.savepoint()?;
         tx.execute("DELETE FROM peer_known WHERE peer=?", [peer])?;
         for event in known {
             tx.execute("INSERT INTO peer_known VALUES(?,?)", params![peer, event])?;
         }
+        tx.execute("UPDATE outbox SET acknowledged=EXISTS(SELECT 1 FROM peer_known p WHERE p.peer=? AND p.event=outbox.event)
+            WHERE event IN (SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1)", [peer])?;
         tx.commit()?;
         Ok(())
     }
@@ -1424,18 +1486,24 @@ impl Store {
     }
     pub fn acknowledge(&self, events: &[String]) -> Result<()> {
         for rev in events {
-            self.db
-                .execute("UPDATE outbox SET acknowledged=1 WHERE event=?", [rev])?;
+            self.db.execute(
+                "UPDATE outbox SET acknowledged=1 WHERE event=? AND event IN
+                    (SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1)",
+                [rev],
+            )?;
         }
         Ok(())
     }
-    pub fn status(&self) -> Result<Value> {
-        let p = self.projection(&self.active)?;
-        let outgoing: i64 = self.db.query_row(
+    pub fn outgoing_unacknowledged(&self) -> Result<i64> {
+        Ok(self.db.query_row(
             "SELECT count(*) FROM outbox WHERE acknowledged=0",
             [],
             |r| r.get(0),
-        )?;
+        )?)
+    }
+    pub fn status(&self) -> Result<Value> {
+        let p = self.projection(&self.active)?;
+        let outgoing = self.outgoing_unacknowledged()?;
         Ok(
             json!({"repo":self.repo,"device":self.device,"branch":self.branch(&self.active)?,"generation":self.generation,
             "local_durability":"sqlite-full+verified-objects","outgoing_unacknowledged":outgoing,"incoming_pending":self.db.query_row("SELECT count(*) FROM incoming_events",[],|r|r.get::<_,i64>(0))?,"incoming_quarantined":self.db.query_row("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",[],|r|r.get::<_,i64>(0))?,"peer_protocol":2,

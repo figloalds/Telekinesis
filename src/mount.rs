@@ -21,6 +21,7 @@ pub struct Info {
     attributes: u32,
 }
 unsafe extern "C" {
+    fn tk_winfsp_load(attempted: *mut u16, count: u32) -> u32;
     fn tk_mount_start(path: *const u16, out: *mut usize) -> u32;
     fn tk_mount_stop(native: usize);
     fn tk_mount_notify(native: usize, path: *const u16, action: u32) -> u32;
@@ -39,9 +40,32 @@ pub fn notify(path: &str, action: u32) -> Result<()> {
 }
 fn wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
+    // canonicalize produces extended DOS paths. WinFsp's mount-point parser
+    // expects a DOS folder path; retain canonical paths for reservation checks.
+    let text = path.as_os_str().to_string_lossy();
+    let normalized = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+    };
+    std::ffi::OsStr::new(&normalized)
+        .encode_wide()
+        .chain(Some(0))
+        .collect()
 }
 pub fn start(engine: Shared, path: &Path) -> Result<()> {
+    let mut attempted = vec![0u16; 32768];
+    let loaded = unsafe { tk_winfsp_load(attempted.as_mut_ptr(), attempted.len() as u32) };
+    let length = attempted
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(attempted.len());
+    ensure!(
+        loaded == 0,
+        "WINFSP_RUNTIME_UNAVAILABLE: {} at {}; install WinFsp or set WINFSP_DIR to its installation root",
+        std::io::Error::from_raw_os_error(loaded as i32),
+        String::from_utf16_lossy(&attempted[..length])
+    );
     ensure!(ENGINE.set(engine.clone()).is_ok(), "ONE_MOUNT_PER_RUNTIME");
     ensure!(
         !path.exists(),
@@ -56,6 +80,24 @@ pub fn start(engine: Shared, path: &Path) -> Result<()> {
         path: path.to_owned(),
     });
     engine.lock().unwrap().mounted = true;
+    Ok(())
+}
+/// Cooperative O1 stop. Never hold the engine mutex while stopping callbacks.
+pub fn stop(engine: &Shared) -> Result<()> {
+    let mut guard = MOUNT.lock().unwrap();
+    {
+        let mut e = engine.lock().unwrap();
+        e.quiet()?;
+        e.switching = true;
+    }
+    if let Some(mount) = guard.take()
+        && mount.native != 0
+    {
+        unsafe { tk_mount_stop(mount.native) };
+    }
+    let mut e = engine.lock().unwrap();
+    e.mounted = false;
+    // Remain fenced until process exit; no new opens in the shutdown gap.
     Ok(())
 }
 pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value> {

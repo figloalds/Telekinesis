@@ -11,6 +11,17 @@ tested scope and remaining acceptance gaps are in [TKFS-PLAN.md](TKFS-PLAN.md).
 The prior 101,897-byte design is preserved unchanged in
 [TKFS-PLAN-2026-10-02-LEGACY.md](TKFS-PLAN-2026-10-02-LEGACY.md).
 
+## Local orchestrator and later distribution
+
+[ORCHESTRATOR-PLAN.md](ORCHESTRATOR-PLAN.md) records the implemented local O1
+slice and later product direction. `orchestrator` supervises independent worker
+processes from one TOML defaults file and an owner-protected SQLite registry.
+`manage` uses a separate same-user Windows named pipe for create/list/inspect,
+start/stop, operation lookup and orderly supervisor shutdown. Managed O1 workers
+have no peer replication; existing mounted store commands remain compatible.
+Adoption, mount reassignment/trash/restore, persistent machine pairing, shared
+catalog/contracts, service installation and desktop UI are deferred.
+
 ## Build and test
 
 Prerequisites: x64 Windows, Rust/MSVC and Windows SDK, and an installed WinFsp
@@ -23,14 +34,101 @@ is x64; other Windows architectures are not supported by this build script.
 Run in PowerShell from this repository:
 
 ```powershell
-# Process-local DLL lookup; does not modify the system PATH.
-$env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
 cargo build --offline
 cargo test --offline
 cargo fmt --check
 cargo clippy --offline --all-targets -- -D warnings
 python scripts\e2e.py
 ```
+
+No WinFsp `PATH` setup is needed for the new executable or test binaries. WinFsp
+is delay-loaded only for mounts, using an absolute path from `WINFSP_DIR` when
+explicitly set, otherwise the installer registry and conventional installation
+directory. A bad override fails with `WINFSP_RUNTIME_UNAVAILABLE` and the attempted
+path. It never changes machine PATH or installs a driver. Older already-built
+executables retain their original DLL lookup; use a newly built executable.
+
+For an isolated build while another daemon holds the default executable:
+
+```powershell
+cargo build --offline --target-dir target/o1
+python scripts\orchestrator_e2e.py --exe .\target\o1\debug\tkfs.exe
+```
+
+## Foreground local management
+
+Create `orchestrator.toml` in the repository (choose a fresh data directory):
+
+```toml
+format_version = 1
+data_directory = 'test-runs\managed-data'
+[control]
+transport = 'named-pipe'
+name = 'telekinesis-local'
+[network]
+enabled = false
+[workers]
+restart_policy = 'on-failure'
+maximum_running = 8
+```
+
+Relative data paths resolve against the config file. Unknown fields/versions and
+enabled networking are refused before workers launch. One supervisor owns each
+registry; the data root must be fresh or an existing O1 registry. The foreground
+supervisor owns its data root and restricts its ACL to the current Windows user.
+Keep it running in one shell:
+
+```powershell
+.\target\o1\debug\tkfs.exe orchestrator --defaults-file .\orchestrator.toml
+```
+
+Use a second shell for management. Mount parents must exist and targets must be
+absolute, unoccupied and outside the data root. A create without `--mount` starts
+a headless worker. Mutations require the observed catalog generation for create
+or shutdown, and the state's `management_generation` for start/stop.
+
+```powershell
+$tkfs = '.\target\o1\debug\tkfs.exe'
+& $tkfs manage --defaults-file .\orchestrator.toml list
+$request = [guid]::NewGuid().ToString()
+$mount = Join-Path (Get-Location).Path 'test-runs\ManagedProject'
+& $tkfs --request-id $request --generation 0 manage --defaults-file .\orchestrator.toml create Project --mount $mount
+& $tkfs manage --defaults-file .\orchestrator.toml list
+# Copy state_id and management_generation from list/inspect:
+& $tkfs manage --defaults-file .\orchestrator.toml inspect '<state_id>'
+& $tkfs --request-id ([guid]::NewGuid().ToString()) --generation 0 manage --defaults-file .\orchestrator.toml stop '<state_id>'
+& $tkfs --request-id ([guid]::NewGuid().ToString()) --generation 1 manage --defaults-file .\orchestrator.toml start '<state_id>'
+& $tkfs manage --defaults-file .\orchestrator.toml operation $request
+# For this one-created-state example, catalog generation is now 1:
+& $tkfs --request-id ([guid]::NewGuid().ToString()) --generation 1 manage --defaults-file .\orchestrator.toml shutdown
+```
+
+After a timeout, retry the exact action, operation UUID and expected generation.
+Completed receipts replay before checking current generation; changing parameters
+under the same UUID is refused. Automatically generated UUIDs are printed to
+stderr before the request. Busy/unavailable errors retain queryable pending
+intent; terminal validation errors are recorded. Automatic worker retries use
+bounded backoff and the configured running limit. A pending shutdown requires
+an exact retry and inhibits startup recovery, automatic restarts and pending
+create/start retries while shutdown is incomplete. Windows sharing/lock/busy
+I/O violations remain pending and resumable; invalid markers/identities remain
+terminal. A temporarily blocked staging installation retains its allocated
+identities and mount reservation across retries and restarts.
+
+An unexpected supervisor exit leaves workers mounted. Restart authenticates the
+instance/state/repo/device/mount before reattaching. An unverified occupied store
+is reported unavailable and never killed or replaced. Graceful shutdown refuses
+open handles/mappings, unmounts, verifies worker exit and preserves desired states
+for the next supervisor launch. Closing a management CLI has no lifecycle effect.
+The worker's lifecycle secret is transient local process authentication in an
+owner-protected `worker.json`, not a machine pairing credential. There is no
+service/logoff/reboot or power-loss qualification in O1.
+
+The isolated acceptance harness checks real mounts without `WINFSP_DIR`/WinFsp
+PATH, lifecycle/ownership, five creation crash boundaries, retries, missing
+metadata, authorization, mappings, worker limits and partial startup failures.
+Evidence: [ORCHESTRATOR-VALIDATION.json](ORCHESTRATOR-VALIDATION.json) and
+[ORCHESTRATOR-COMPATIBILITY.json](ORCHESTRATOR-COMPATIBILITY.json).
 
 The offline commands use the dependencies already cached on the implementation
 machine. On a fresh development machine, fetch Cargo dependencies normally before
@@ -98,9 +196,12 @@ checkpoint intact. Checkpoint labels/history are not replicated between devices.
 
 ## Two explicitly configured devices
 
-These steps are a runbook for future **real second-machine validation**. They
-have not been run on two computers. No persistent service, credentials, firewall
-exception, driver installation or remote infrastructure is created by this repo.
+These steps configure the two devices. Ten live checks passed on
+FIGLOALDS/FELYPE at commit `303fec8`; the saved
+[physical report](test-runs/two-machine-448ed3f6-948d-4d90-b8b7-9b1cdbd82744/TWO-MACHINE-VALIDATION.json)
+records the results and acknowledgement finding. The correction below is validated
+locally, and has not been tested on two physical computers. The user configured the
+firewall exception; agents did not change network settings, drivers or credentials.
 
 1. Build/copy the executable onto each x64 Windows machine; verify the existing
    WinFsp runtime/SDK and process-local DLL PATH. Installing a driver is a
@@ -151,15 +252,28 @@ an inbound shared reference requires previously shared bytes or verified inbound
 bytes. Invalid events are quarantined without blocking unrelated valid events.
 Inventories, durable outboxes, peer
 acknowledgements and idempotent event replay provide reconnect catchup. Inventory
-caches reduce retransmission and are scoped to the configured peer UUID. A
+caches reduce retransmission and are scoped to the configured peer UUID. Accepted
+event inventories are durable receipts: both request and response paths atomically
+reconcile the two-device outbox with the peer's current inventory. Withdrawn events
+are queued again. Object inventories, incomplete manifests, quarantine and private
+events cannot acknowledge shared metadata. Explicit acknowledgements must appear
+in the sender's accepted inventory. A
 one-second retry loop and `sync` perform exchanges. Objects arrive and verify
 before metadata can become visible. `status` separates unflushed local staging,
 local durable state, queued/acknowledged publication and last observed catchup.
-Catchup also requires no incomplete incoming events; status exposes pending and
-quarantined counts. Catchup is knowledge at a roundtrip, not a global distributed
+Catchup also requires matching current shared inventories, zero outgoing/incoming
+backlog, no pending causal events, no unflushed staging and healthy local storage.
+Failed explicit or background exchanges invalidate the cached roundtrip result.
+Status exposes pending and quarantined counts. Catchup is knowledge at a roundtrip, not a global distributed
 barrier. Branch identity is its UUID: private and shared names may overlap, and
 concurrent shared publications with one name remain distinct branches. An
 ambiguous name fails clearly; use the ID returned by `branches`.
+
+When an existing daemon locks the default executable, validate a separate build
+without stopping it: `cargo build --offline --target-dir target/ack-fix`, then
+`python scripts/e2e.py --exe target/ack-fix/debug/tkfs.exe --report ACK-FIX-VALIDATION.json`.
+The [local correction report](ACK-FIX-VALIDATION.json) preserves the prior physical
+and original local reports; exact commands/results are in [VALIDATION.md](VALIDATION.md).
 
 To reproduce the acceptance checks on two machines: save/rename on mounted
 `main` at A and reopen at B; stop both daemons, restart without peer arguments,
