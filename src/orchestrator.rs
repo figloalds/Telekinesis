@@ -511,9 +511,14 @@ impl Supervisor {
             if state.desired {
                 self.verify(state).context("STATE_UNAVAILABLE")?;
                 ensure!(
-                    info["health"].is_null() && info["mounted"] == json!(state.mount.is_some()),
-                    "WORKER_UNAVAILABLE: unhealthy view"
+                    info["mounted"] == json!(state.mount.is_some()),
+                    "WORKER_UNAVAILABLE: view not mounted"
                 );
+                if !info["health"].is_null() {
+                    let mut degraded = info;
+                    degraded["status"] = json!("degraded");
+                    return Ok(degraded);
+                }
                 return Ok(info);
             }
             let pid = info["pid"].as_u64().context("INVALID_WORKER_PID")? as u32;
@@ -640,7 +645,10 @@ impl Supervisor {
         };
         let value = match &result {
             Ok(value) => value.clone(),
-            Err(e) => json!({"status":"unavailable","error":format!("{e:#}")}),
+            Err(e) => {
+                let message = format!("{e:#}");
+                json!({"status":if message.contains("BUSY_VIEW") {"stop-pending"} else {"unavailable"},"error":message})
+            }
         };
         let seconds = if failures == 0 {
             1
@@ -1035,6 +1043,7 @@ pub fn worker() -> Result<()> {
     }
     // Private lifecycle readiness is published AFTER mount installation.
     let mut listener = local_ipc::Listener::bind(&record.pipe)?;
+    let observation = engine.lock().unwrap().observation.clone();
     loop {
         let request = match listener.receive::<WorkerRequest>() {
             Ok(Some(r)) => r,
@@ -1056,9 +1065,14 @@ pub fn worker() -> Result<()> {
                 "stop" => crate::mount::stop(&engine)?,
                 _ => bail!("UNKNOWN_WORKER_OPERATION"),
             }
-            let e = engine.lock().unwrap();
+            let (sample, busy) = if let Ok(e) = engine.try_lock() {
+                e.publish_observation();
+                (observation.lock().unwrap().clone(), false)
+            } else {
+                (observation.lock().unwrap().clone(), true)
+            };
             Ok(
-                json!({"status":"running","instance":record.instance,"state_id":record.marker.state,"repo_id":e.store.repo,"device_id":e.store.device,"mount":record.mount,"pid":std::process::id(),"open_handles":e.handles.len(),"mounted":e.mounted,"health":e.health}),
+                json!({"status":"running","instance":record.instance,"state_id":record.marker.state,"repo_id":record.marker.repo,"device_id":record.marker.device,"mount":record.mount,"pid":std::process::id(),"open_handles":sample["open_handles"],"unflushed_files":sample["unflushed_files"],"mounted":sample["mounted"],"health":sample["health"],"busy":busy,"stale":busy,"sampled_at_ms":sample["sampled_at_ms"]}),
             )
         })();
         let stopping = request.op == "stop" && result.is_ok();
