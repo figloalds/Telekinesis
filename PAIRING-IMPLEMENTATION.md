@@ -65,3 +65,13 @@ revocation and data operations serialize through SQLite transactions. See
 `PAIRING.md` and `PAIRING-VALIDATION.json` for instructions, qualification and the
 two-replica/rotation boundaries. No installed user credential or system unit was
 created during this work.
+
+Security review follow-up adds absolute TLS/frame deadlines, cancellation-aware
+network IO, separate enrollment capacity and a bounded shutdown drain. Windows
+storage now checks actual handle ownership and existing file ACLs, rejects
+unsafe ancestors/reparse points/hardlinks, and pins the namespace and primary
+database while in use. No existing ownership/ACL is repaired. Disposable
+regressions cover slow trickles, paired progress and shutdown, foreign-owner
+security descriptors, writable registry/sidecar/ancestor fixtures, junctions,
+hardlinks and blocked replacement. See the validation record for exact runs and
+the development machine's unsafe AppData ancestor constraint.

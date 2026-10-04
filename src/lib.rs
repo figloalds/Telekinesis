@@ -16,5 +16,6 @@ pub mod orchestrator;
 pub mod paired_sync;
 pub mod pairing;
 pub mod pairing_service;
+pub mod private_storage;
 pub mod runtime;
 pub mod staging;

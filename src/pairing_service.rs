@@ -21,6 +21,105 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[derive(Clone, Copy)]
+struct Limits {
+    handshake: Duration,
+    enrollment: Duration,
+    sync: Duration,
+    shutdown: Duration,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            handshake: Duration::from_secs(5),
+            enrollment: Duration::from_secs(10),
+            sync: Duration::from_secs(45),
+            shutdown: Duration::from_secs(35),
+        }
+    }
+}
+/// Every socket read/write uses the remaining absolute budget. Progress never
+/// extends it. Cancellation is polled even when the peer only trickles bytes.
+struct BudgetSocket {
+    socket: TcpStream,
+    deadline: Instant,
+    stop: Arc<AtomicBool>,
+}
+impl BudgetSocket {
+    fn new(socket: TcpStream, budget: Duration, stop: Arc<AtomicBool>) -> std::io::Result<Self> {
+        socket.set_nonblocking(false)?;
+        Ok(Self {
+            socket,
+            deadline: Instant::now() + budget,
+            stop,
+        })
+    }
+    fn remaining(&self) -> std::io::Result<Duration> {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "PAIRING_CANCELLED",
+            ));
+        }
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "PAIRING_ABSOLUTE_DEADLINE",
+            ));
+        }
+        Ok(remaining.min(Duration::from_millis(100)))
+    }
+    fn stage(&mut self, budget: Duration, total: Instant) {
+        self.deadline = (Instant::now() + budget).min(total);
+    }
+}
+impl Read for BudgetSocket {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            self.socket.set_read_timeout(Some(self.remaining()?))?;
+            match self.socket.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+}
+impl Write for BudgetSocket {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        loop {
+            self.socket.set_write_timeout(Some(self.remaining()?))?;
+            match self.socket.write(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
+                result => return result,
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.remaining()?;
+        self.socket.flush()
+    }
+}
+type Client = rustls::StreamOwned<rustls::ClientConnection, BudgetSocket>;
+fn cancelled(stop: &AtomicBool) -> Result<()> {
+    ensure!(!stop.load(Ordering::Relaxed), "PAIRING_CANCELLED");
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -77,29 +176,7 @@ impl Config {
     }
 }
 pub fn prepare_directory(path: &Path) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        if !path.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(path)?;
-        }
-        let metadata = std::fs::symlink_metadata(path)?;
-        ensure!(
-            metadata.is_dir()
-                && !metadata.file_type().is_symlink()
-                && metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o077 == 0,
-            "PAIRING_DIRECTORY_NOT_PRIVATE"
-        );
-    }
-    #[cfg(windows)]
-    {
-        std::fs::create_dir_all(path)?;
-        crate::local_ipc::protect_directory(path)?;
-    }
+    crate::private_storage::Directory::open(path)?.validate_existing_files()?;
     Ok(())
 }
 pub fn local_runtime(grant: &SyncConfiguration) -> Result<Discovery> {
@@ -148,11 +225,22 @@ fn read<T: DeserializeOwned>(stream: &mut impl Read, maximum: usize) -> Result<T
     stream.read_exact(&mut bytes)?;
     serde_json::from_slice(&bytes).context("INVALID_PAIRING_REQUEST")
 }
-fn client(
+fn client(identity: &Identity, peer: &Peer, enrollment: bool) -> Result<Client> {
+    client_budget(
+        identity,
+        peer,
+        enrollment,
+        Arc::new(AtomicBool::new(false)),
+        Limits::default(),
+    )
+}
+fn client_budget(
     identity: &Identity,
     peer: &Peer,
     enrollment: bool,
-) -> Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
+    stop: Arc<AtomicBool>,
+    limits: Limits,
+) -> Result<Client> {
     ensure!(!peer.revoked, "PAIR_REVOKED");
     let mut config = (*identity.tls_client(peer)?).clone();
     config.alpn_protocols = vec![if enrollment {
@@ -163,7 +251,14 @@ fn client(
     let name =
         rustls::pki_types::ServerName::try_from(format!("{}.tkfs.invalid", peer.installation))?;
     let mut conn = rustls::ClientConnection::new(Arc::new(config), name)?;
-    let mut socket = runtime::stream(&peer.endpoint)?;
+    cancelled(&stop)?;
+    let frame_budget = if enrollment {
+        limits.enrollment
+    } else {
+        limits.sync
+    };
+    let total = Instant::now() + limits.handshake + frame_budget;
+    let mut socket = BudgetSocket::new(runtime::stream(&peer.endpoint)?, limits.handshake, stop)?;
     while conn.is_handshaking() {
         conn.complete_io(&mut socket)?;
     }
@@ -182,6 +277,7 @@ fn client(
             .is_some_and(|certificate| certificate.as_ref() == peer.certificate),
         "PAIR_KEY_MISMATCH"
     );
+    socket.stage(frame_budget, total);
     Ok(rustls::StreamOwned::new(conn, socket))
 }
 #[derive(Serialize, Deserialize)]
@@ -267,6 +363,22 @@ fn synchronize_with_identity(
     identity: &Identity,
     grant: &SyncConfiguration,
 ) -> Result<Value> {
+    synchronize_budget(
+        config,
+        identity,
+        grant,
+        Arc::new(AtomicBool::new(false)),
+        Limits::default(),
+    )
+}
+fn synchronize_budget(
+    config: &Config,
+    identity: &Identity,
+    grant: &SyncConfiguration,
+    stop: Arc<AtomicBool>,
+    limits: Limits,
+) -> Result<Value> {
+    cancelled(&stop)?;
     let registry = config.registry()?;
     let current = registry.grant(&grant.peer, &grant.repo)?;
     ensure!(
@@ -290,7 +402,8 @@ fn synchronize_with_identity(
         .iter()
         .map(|event| event.id.clone())
         .collect();
-    let mut stream = client(identity, &peer, false)?;
+    cancelled(&stop)?;
+    let mut stream = client_budget(identity, &peer, false, stop.clone(), limits)?;
     {
         let _access = registry.begin_access()?;
         registry.authenticate(&peer.certificate, &peer.installation)?;
@@ -310,6 +423,7 @@ fn synchronize_with_identity(
     }
     let response: Value = read(&mut stream, runtime::MAX_FRAME)?;
     ensure!(response["ok"] == true, "SYNC_DENIED: {}", response["error"]);
+    cancelled(&stop)?;
     let _access = registry.begin_access()?;
     registry.authenticate(&peer.certificate, &peer.installation)?;
     ensure!(
@@ -333,7 +447,13 @@ fn authenticated(registry: &Registry, certificate: &[u8]) -> Result<Peer> {
         .context("PAIR_NOT_FOUND")?;
     registry.authenticate(certificate, &peer.installation)
 }
-fn dispatch(registry: &Registry, peer: &Peer, request: NetworkRequest) -> Result<Value> {
+fn dispatch(
+    registry: &Registry,
+    peer: &Peer,
+    request: NetworkRequest,
+    stop: &AtomicBool,
+) -> Result<Value> {
+    cancelled(stop)?;
     match request {
         NetworkRequest::ListPublished {} => {
             let mut states = vec![];
@@ -342,6 +462,7 @@ fn dispatch(registry: &Registry, peer: &Peer, request: NetworkRequest) -> Result
                 .into_iter()
                 .filter(|grant| grant.peer == peer.installation && grant.enabled)
             {
+                cancelled(stop)?;
                 let value = worker(&grant, "published-summary", None, None, None)?;
                 let state: PublishedState = serde_json::from_value(value)?;
                 if !state.branches.is_empty() {
@@ -363,12 +484,18 @@ fn dispatch(registry: &Registry, peer: &Peer, request: NetworkRequest) -> Result
 fn accepted(
     config: &Config,
     identity: &Identity,
-    mut socket: TcpStream,
+    socket: TcpStream,
     enrollment: bool,
+    stop: Arc<AtomicBool>,
+    limits: Limits,
 ) -> Result<()> {
-    socket.set_nonblocking(false)?;
-    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
-    socket.set_write_timeout(Some(Duration::from_secs(15)))?;
+    let frame_budget = if enrollment {
+        limits.enrollment
+    } else {
+        limits.sync
+    };
+    let total = Instant::now() + limits.handshake + frame_budget;
+    let mut socket = BudgetSocket::new(socket, limits.handshake, stop.clone())?;
     let registry = config.registry()?;
     let peers = registry.peers()?;
     let mut conn = rustls::ServerConnection::new(identity.tls_server(&peers, enrollment)?)?;
@@ -388,6 +515,7 @@ fn accepted(
         .peer_certificates()
         .and_then(|certificates| certificates.first())
         .map(|certificate| certificate.as_ref().to_vec());
+    socket.stage(frame_budget, total);
     let mut stream = rustls::StreamOwned::new(conn, socket);
     if enrollment {
         let request: Enrollment = read(&mut stream, 64 * 1024)?;
@@ -411,7 +539,7 @@ fn accepted(
                     .as_deref()
                     .context("CLIENT_CERTIFICATE_REQUIRED")?,
             )?;
-            dispatch(&registry, &peer, request)
+            dispatch(&registry, &peer, request, &stop)
         })();
         let response = match result {
             Ok(value) => json!({"ok":true,"result":value}),
@@ -430,6 +558,8 @@ pub struct Service {
     sync: TcpListener,
     enrollment: TcpListener,
     _lock: std::fs::File,
+    _storage: crate::private_storage::Directory,
+    limits: Limits,
 }
 impl Service {
     pub fn open(config: Config) -> Result<Self> {
@@ -442,9 +572,16 @@ impl Service {
             "CREDENTIAL_IDENTITY_MISMATCH"
         );
         config.registry()?;
+        let storage = crate::private_storage::Directory::open(&config.data_directory)?;
+        storage.validate_existing_files()?;
         let path = config.data_directory.join("service.lock");
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -471,6 +608,8 @@ impl Service {
             sync,
             enrollment,
             _lock: lock,
+            _storage: storage,
+            limits: Limits::default(),
         })
     }
     pub fn addresses(&self) -> Result<(String, String)> {
@@ -484,21 +623,31 @@ impl Service {
         let mut inflight = std::collections::BTreeSet::new();
         let (finished, results) = std::sync::mpsc::channel();
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let enroll_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while !stop.load(Ordering::Relaxed) {
             for (listener, enrollment) in [(&self.sync, false), (&self.enrollment, true)] {
                 if let Ok((socket, _)) = listener.accept() {
-                    if active.load(Ordering::Relaxed) >= 8 {
+                    let counter = if enrollment { &enroll_active } else { &active };
+                    let maximum = if enrollment { 2 } else { 8 };
+                    if counter.load(Ordering::Relaxed) >= maximum {
                         drop(socket);
                         continue;
                     }
-                    active.fetch_add(1, Ordering::Relaxed);
-                    let active = active.clone();
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let counter = counter.clone();
                     let config = self.config.clone();
                     let identity = self.identity.clone();
+                    let stop = stop.clone();
+                    let limits = self.limits;
                     std::thread::spawn(move || {
-                        let result = accepted(&config, &identity, socket, enrollment);
-                        let _ = result;
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        struct Slot(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for Slot {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
+                        let _slot = Slot(counter);
+                        let _ = accepted(&config, &identity, socket, enrollment, stop, limits);
                     });
                 }
             }
@@ -546,15 +695,23 @@ impl Service {
                 let finished = finished.clone();
                 let config = self.config.clone();
                 let identity = self.identity.clone();
+                let stop = stop.clone();
+                let limits = self.limits;
                 std::thread::spawn(move || {
-                    let result = synchronize_with_identity(&config, &identity, &grant);
+                    let result = synchronize_budget(&config, &identity, &grant, stop, limits);
                     let _ = finished.send((grant, result));
                 });
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Each accepted connection is bounded; drain own operations before lock release.
-        while active.load(Ordering::Relaxed) > 0 || !inflight.is_empty() {
+        // Stop interrupts socket IO within a poll interval; local worker RPCs
+        // retain their own fixed timeout. Never wait indefinitely for a peer.
+        let drain = Instant::now() + self.limits.shutdown;
+        while active.load(Ordering::Relaxed) > 0
+            || enroll_active.load(Ordering::Relaxed) > 0
+            || !inflight.is_empty()
+        {
+            ensure!(Instant::now() < drain, "PAIRING_SHUTDOWN_DEADLINE");
             while let Ok((grant, _)) = results.try_recv() {
                 inflight.remove(&(grant.peer, grant.repo));
             }
@@ -667,8 +824,16 @@ mod tests {
             enrollment_advertise: "127.0.0.1:0".into(),
         }
     }
-    fn start(mut config: Config, identity: Arc<Identity>) -> (Config, Running) {
+    fn start(config: Config, identity: Arc<Identity>) -> (Config, Running) {
+        start_limits(config, identity, Limits::default())
+    }
+    fn start_limits(
+        mut config: Config,
+        identity: Arc<Identity>,
+        limits: Limits,
+    ) -> (Config, Running) {
         let mut service = Service::open_identity(config.clone(), identity).unwrap();
+        service.limits = limits;
         let (sync, enrollment) = service.addresses().unwrap();
         config.listen = sync.clone();
         config.advertise = sync;
@@ -698,6 +863,108 @@ mod tests {
             endpoint: config.advertise.clone(),
             revoked: false,
         }
+    }
+    #[test]
+    fn slow_frame_progress_cannot_extend_absolute_budget_and_cancel_interrupts_read_exact() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let began = Instant::now();
+            let mut socket = BudgetSocket::new(socket, Duration::from_millis(220), flag).unwrap();
+            let result = read::<Value>(&mut socket, 65536);
+            (began.elapsed(), result)
+        });
+        let mut sender = TcpStream::connect(address).unwrap();
+        sender.write_all(&65536u32.to_be_bytes()).unwrap();
+        for _ in 0..10 {
+            if sender.write_all(b" ").is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        let (elapsed, result) = server.join().unwrap();
+        assert!(result.is_err());
+        assert!(elapsed < Duration::from_millis(500));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let flag = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut receiver = BudgetSocket::new(receiver, Duration::from_secs(60), flag).unwrap();
+            let mut byte = [0];
+            receiver.read_exact(&mut byte)
+        });
+        stop.store(true, Ordering::Relaxed);
+        let now = Instant::now();
+        assert!(thread.join().unwrap().is_err());
+        assert!(now.elapsed() < Duration::from_millis(500));
+        drop(sender);
+    }
+    #[test]
+    fn enrollment_trickles_cannot_take_sync_capacity_and_shutdown_cancels_stalled_tls() {
+        let temp = tempfile::tempdir().unwrap();
+        let ia = Arc::new(Identity::generate(&id()).unwrap());
+        let ib = Identity::generate(&id()).unwrap();
+        let config = fixture_config(&temp.path().join("service"), &ia);
+        config
+            .registry()
+            .unwrap()
+            .trust(&Peer {
+                installation: ib.installation.clone(),
+                certificate: ib.certificate.clone(),
+                endpoint: "127.0.0.1:1".into(),
+                revoked: false,
+            })
+            .unwrap();
+        let limits = Limits {
+            handshake: Duration::from_millis(500),
+            enrollment: Duration::from_millis(900),
+            sync: Duration::from_secs(2),
+            shutdown: Duration::from_secs(2),
+        };
+        let (config, running) = start_limits(config, ia.clone(), limits);
+        let peer = Peer {
+            endpoint: config.enrollment_advertise.clone(),
+            ..endpoint(&config, &ia)
+        };
+        let mut trickles = vec![];
+        for _ in 0..2 {
+            let mut socket = client(&ib, &peer, true).unwrap();
+            socket.write_all(&65536u32.to_be_bytes()).unwrap();
+            socket.flush().unwrap();
+            trickles.push(std::thread::spawn(move || {
+                let began = Instant::now();
+                for _ in 0..40 {
+                    if socket.write_all(b" ").and_then(|_| socket.flush()).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+                began.elapsed()
+            }));
+        }
+        let flood: Vec<_> = (0..8)
+            .map(|_| TcpStream::connect(&config.enrollment_listen).unwrap())
+            .collect();
+        std::thread::sleep(Duration::from_millis(600));
+        let began = Instant::now();
+        let response =
+            request(&ib, &endpoint(&config, &ia), json!({"op":"list-published"})).unwrap();
+        assert_eq!(response["ok"], true);
+        assert!(began.elapsed() < Duration::from_millis(800));
+        for thread in trickles {
+            assert!(thread.join().unwrap() < Duration::from_millis(1500));
+        }
+        // Stalled unauthenticated handshakes are cancelled rather than drained forever.
+        let stalled = TcpStream::connect(&config.enrollment_listen).unwrap();
+        let began = Instant::now();
+        drop(running);
+        assert!(began.elapsed() < Duration::from_secs(1));
+        drop(stalled);
+        drop(flood);
     }
     #[test]
     fn actual_tls_enrollment_grants_sync_resume_and_revoke_existing_connection() {

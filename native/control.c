@@ -28,6 +28,97 @@ DWORD tk_private_directory(LPWSTR path) {
     e=SetNamedSecurityInfoW(path,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|PROTECTED_DACL_SECURITY_INFORMATION,0,0,acl,0);
     LocalFree(sd);return e;
 }
+/* Pairing storage never repairs an existing descriptor or takes ownership. */
+static DWORD storage_descriptor(PSECURITY_DESCRIPTOR *out) {
+    TOKEN_USER *user=0;LPWSTR sid=0;WCHAR text[512];DWORD e=current_user(&user);
+    if(e)return e;
+    if(!ConvertSidToStringSidW(user->User.Sid,&sid)){e=GetLastError();LocalFree(user);return e;}
+    swprintf_s(text,512,L"O:%sD:P(A;OICI;GA;;;%s)",sid,sid);
+    if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(text,SDDL_REVISION_1,out,0))e=GetLastError();
+    LocalFree(sid);LocalFree(user);return e;
+}
+DWORD tk_storage_validate_descriptor(PSECURITY_DESCRIPTOR sd) {
+    TOKEN_USER *user=0;PSID owner=0;PACL acl=0;BOOL defaulted=FALSE,present=FALSE;DWORD e=current_user(&user);
+    if(e)return e;
+    if(!GetSecurityDescriptorOwner(sd,&owner,&defaulted)||!owner||!EqualSid(owner,user->User.Sid)){e=ERROR_ACCESS_DENIED;goto done;}
+    if(!GetSecurityDescriptorDacl(sd,&present,&acl,&defaulted)||!present||!acl){e=ERROR_ACCESS_DENIED;goto done;}
+    for(DWORD i=0;i<acl->AceCount;i++){
+        ACE_HEADER *ace=0;
+        if(!GetAce(acl,i,(void**)&ace)){e=GetLastError();goto done;}
+        if(ace->AceType==ACCESS_DENIED_ACE_TYPE)continue;
+        if(ace->AceType!=ACCESS_ALLOWED_ACE_TYPE||!EqualSid(&((ACCESS_ALLOWED_ACE*)ace)->SidStart,user->User.Sid)){e=ERROR_ACCESS_DENIED;goto done;}
+    }
+done:
+    LocalFree(user);return e;
+}
+static BOOL trusted_ancestor_sid(PSID sid,PSID user) {
+    BYTE value[SECURITY_MAX_SID_SIZE];DWORD size=sizeof value;
+    if(EqualSid(sid,user))return TRUE;
+    if(CreateWellKnownSid(WinLocalSystemSid,0,value,&size)&&EqualSid(sid,value))return TRUE;
+    size=sizeof value;
+    if(CreateWellKnownSid(WinBuiltinAdministratorsSid,0,value,&size)&&EqualSid(sid,value))return TRUE;
+    /* Windows' TrustedInstaller owns volume roots on supported installations. */
+    PSID installer=0;BOOL same=FALSE;
+    if(ConvertStringSidToSidW(L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",&installer)){same=EqualSid(sid,installer);LocalFree(installer);}
+    return same;
+}
+DWORD tk_storage_validate_ancestor(PSECURITY_DESCRIPTOR sd) {
+    TOKEN_USER *user=0;PSID owner=0;PACL acl=0;BOOL defaulted=FALSE,present=FALSE;DWORD e=current_user(&user);
+    if(e)return e;
+    if(!GetSecurityDescriptorOwner(sd,&owner,&defaulted)||!owner||!trusted_ancestor_sid(owner,user->User.Sid)){e=ERROR_ACCESS_DENIED;goto done;}
+    if(!GetSecurityDescriptorDacl(sd,&present,&acl,&defaulted)||!present||!acl){e=ERROR_ACCESS_DENIED;goto done;}
+    for(DWORD i=0;i<acl->AceCount;i++){
+        ACE_HEADER *ace=0;if(!GetAce(acl,i,(void**)&ace)){e=GetLastError();goto done;}
+        if(ace->AceFlags&INHERIT_ONLY_ACE)continue;
+        if(ace->AceType==ACCESS_DENIED_ACE_TYPE)continue;
+        if(ace->AceType!=ACCESS_ALLOWED_ACE_TYPE){e=ERROR_ACCESS_DENIED;goto done;}
+        ACCESS_ALLOWED_ACE *allow=(ACCESS_ALLOWED_ACE*)ace;
+        if(trusted_ancestor_sid(&allow->SidStart,user->User.Sid))continue;
+        DWORD unsafe=GENERIC_ALL|GENERIC_WRITE|WRITE_DAC|WRITE_OWNER|DELETE|FILE_DELETE_CHILD|FILE_WRITE_DATA|FILE_WRITE_ATTRIBUTES;
+        if(allow->Mask&unsafe){e=ERROR_ACCESS_DENIED;goto done;}
+    }
+done:
+    LocalFree(user);return e;
+}
+/* flags: directory=1, create-private=2, check-owner/DACL=4, share-delete=8,
+ * attributes-only=16 (inspection only), trusted-ancestor=32.
+ * Open the reparse point itself, reject it, and retain handles to prevent path
+ * replacement. Files must be single-link disk files, never an alias or device. */
+DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
+    PSECURITY_DESCRIPTOR created=0,actual=0;DWORD e=0;*out=INVALID_HANDLE_VALUE;
+    if(flags&2){
+        e=storage_descriptor(&created);if(e)return e;
+        if((flags&1)&&GetFileAttributesW(path)==INVALID_FILE_ATTRIBUTES){
+            SECURITY_ATTRIBUTES sa={sizeof sa,created,FALSE};
+            if(!CreateDirectoryW(path,&sa)&&GetLastError()!=ERROR_ALREADY_EXISTS){e=GetLastError();goto done;}
+        }
+    }
+    SECURITY_ATTRIBUTES sa={sizeof sa,created,FALSE};
+    /* Attribute-only opens do not participate in Windows sharing checks. Read
+     * data/list-directory access makes the no-share-delete pin effective. */
+    DWORD access=FILE_READ_ATTRIBUTES|((flags&16)?0:FILE_READ_DATA)|((flags&(4|32))?READ_CONTROL:0);
+    /* Directory write handles can mutate reparse metadata without a rename.
+     * Deny those too while the namespace is pinned. Child file IO is separate. */
+    DWORD share=FILE_SHARE_READ|((flags&1)?0:FILE_SHARE_WRITE)|((flags&8)?FILE_SHARE_DELETE:0);
+    *out=CreateFileW(path,access,share,created?&sa:0,
+        (flags&2)&&!(flags&1)?OPEN_ALWAYS:OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,0);
+    if(*out==INVALID_HANDLE_VALUE){e=GetLastError();goto done;}
+    BY_HANDLE_FILE_INFORMATION info;
+    if(!GetFileInformationByHandle(*out,&info)){e=GetLastError();goto done;}
+    if((info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||!!(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=!!(flags&1)||(!(flags&1)&&(GetFileType(*out)!=FILE_TYPE_DISK||info.nNumberOfLinks!=1))){e=ERROR_ACCESS_DENIED;goto done;}
+    if(flags&(4|32)){
+        e=GetSecurityInfo(*out,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,0,0,0,0,&actual);
+        if(e)goto done;
+        e=(flags&4)?tk_storage_validate_descriptor(actual):tk_storage_validate_ancestor(actual);if(e)goto done;
+        if((flags&1)&&(flags&4)){SECURITY_DESCRIPTOR_CONTROL control;DWORD revision;
+            if(!GetSecurityDescriptorControl(actual,&control,&revision)||!(control&SE_DACL_PROTECTED))e=ERROR_ACCESS_DENIED;
+        }
+    }
+done:
+    LocalFree(created);LocalFree(actual);
+    if(e&&*out!=INVALID_HANDLE_VALUE){CloseHandle(*out);*out=INVALID_HANDLE_VALUE;}
+    return e;
+}
 DWORD tk_owner_sid(LPWSTR out,DWORD count) {
     TOKEN_USER *user=0;LPWSTR sid=0;DWORD e=current_user(&user);if(e)return e;
     if(!ConvertSidToStringSidW(user->User.Sid,&sid))e=GetLastError();

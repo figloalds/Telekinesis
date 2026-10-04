@@ -162,6 +162,33 @@ invitation and approve the intended exact key rather than replaying it.
 
 ## Revocation, rotation and limits
 
+Network operations use absolute budgets: five seconds for TLS, then ten seconds
+for an enrollment frame/response or 45 seconds for a sync frame/response. Byte
+progress does not reset these deadlines. Enrollment has two connection slots,
+separate from eight paired-service slots. Network shutdown cancellation is checked
+at most every 100 milliseconds; draining service jobs has a 35-second ceiling and
+reports `PAIRING_SHUTDOWN_DEADLINE` if exceeded. Local worker calls retain their
+own bounded RPC timeout. These bounds do not guarantee storage/OS scheduling
+latency or availability under a sustained network flood.
+
+Pairing storage fails closed on unsafe existing paths; startup never repairs an
+existing owner or ACL. Windows checks actual handle owners and DACLs before
+opening the registry/credentials, including existing SQLite WAL/SHM/journal,
+lock and other files. Private files/directories must belong only to the current
+SID. Reparse points and multiply linked files are rejected. Retained ancestor,
+directory and primary-file handles prevent namespace replacement; ancestors
+must be owned by the current SID, SYSTEM, Administrators or TrustedInstaller,
+with no foreign write/delete/security-control grants. Administrator/OS compromise
+is outside this single-owner boundary. Linux requires current-UID private
+directories/files (0700/0600), rejects symlinks/hardlinks and unsafe ancestors,
+and permits root-owned sticky temporary directories.
+
+An existing ancestor with a foreign write grant also fails validation even if
+the final directory is private. For example, this development machine's
+`AppData` contains a sandbox capability SID with full control. Use a separately
+reviewed safe storage path; do not bypass the check or automatically change ACLs.
+Windows regression fixtures used a disposable sibling path with safe ancestors.
+
 `tkfs pairing revoke PEER_ID` persists revocation and stops that peer's data access
 on fresh and already-established sessions. Each request reloads registry state
 after TLS; registry transactions serialize data operations with local revocation

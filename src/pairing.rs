@@ -116,6 +116,12 @@ impl CredentialSource {
             Self::WindowsDpapi { file } => {
                 #[cfg(windows)]
                 {
+                    let directory = crate::private_storage::Directory::open(
+                        file.parent().context("CREDENTIAL_DIRECTORY_REQUIRED")?,
+                    )?;
+                    let _guard = directory
+                        .file(file, false, false)
+                        .context("CREDENTIAL_MISSING_OR_UNSAFE")?;
                     dpapi(&std::fs::read(file).context("CREDENTIAL_MISSING")?, false)?
                 }
                 #[cfg(not(windows))]
@@ -188,8 +194,7 @@ impl CredentialSource {
             };
             ensure!(!file.exists(), "CREDENTIAL_ALREADY_EXISTS");
             let parent = file.parent().context("CREDENTIAL_DIRECTORY_REQUIRED")?;
-            std::fs::create_dir_all(parent)?;
-            crate::local_ipc::protect_directory(parent)?;
+            let _directory = crate::private_storage::Directory::open(parent)?;
             let serialized = Zeroizing::new(serde_json::to_vec(identity)?);
             let encrypted = dpapi(&serialized, true)?;
             use std::io::Write;
@@ -331,12 +336,20 @@ pub struct SyncConfiguration {
 
 pub struct Registry {
     db: Connection,
+    _file: std::fs::File,
+    _directory: crate::private_storage::Directory,
     pub installation: String,
 }
 impl Registry {
     pub fn open(path: &Path, installation: &str) -> Result<Self> {
         uuid::Uuid::parse_str(installation).context("INVALID_INSTALLATION_ID")?;
+        let directory = crate::private_storage::Directory::open(
+            path.parent().context("PAIRING_DIRECTORY_REQUIRED")?,
+        )?;
+        directory.validate_existing_files()?;
+        let file = directory.file(path, true, false)?;
         let db = Connection::open(path)?;
+        directory.validate_existing_files()?;
         db.busy_timeout(std::time::Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS identity(id TEXT PRIMARY KEY);
@@ -356,6 +369,8 @@ impl Registry {
         }
         Ok(Self {
             db,
+            _file: file,
+            _directory: directory,
             installation: installation.into(),
         })
     }
@@ -649,6 +664,17 @@ pub struct PublishedState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn private_temp() -> tempfile::TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        crate::local_ipc::protect_directory(temp.path()).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        temp
+    }
     fn peer(identity: &Identity) -> Peer {
         Peer {
             installation: identity.installation.clone(),
@@ -659,7 +685,7 @@ mod tests {
     }
     #[test]
     fn invitation_is_single_use_requires_approval_and_persists_revocation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_temp();
         let path = temp.path().join("pairs.db");
         let a = Identity::generate(&id()).unwrap();
         let b = Identity::generate(&id()).unwrap();
@@ -722,7 +748,7 @@ mod tests {
     }
     #[test]
     fn expired_wrong_secret_and_wrong_identity_invitations_fail() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_temp();
         let a = Identity::generate(&id()).unwrap();
         let b = Identity::generate(&id()).unwrap();
         let mut registry = Registry::open(&temp.path().join("pairs.db"), &a.installation).unwrap();
@@ -747,7 +773,7 @@ mod tests {
     }
     #[test]
     fn concurrent_invitation_consumption_accepts_exactly_one() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_temp();
         let path = temp.path().join("pairs.db");
         let a = Identity::generate(&id()).unwrap();
         let b = Identity::generate(&id()).unwrap();
@@ -809,7 +835,7 @@ mod tests {
     }
     #[test]
     fn revocation_serializes_with_inflight_data_and_cannot_be_overwritten_by_late_status() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_temp();
         let path = temp.path().join("pairs.db");
         let a = Identity::generate(&id()).unwrap();
         let b = Identity::generate(&id()).unwrap();
@@ -860,7 +886,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn dpapi_fixture_roundtrip_has_no_plaintext_or_fallback() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = private_temp();
         let identity = Identity::generate(&id()).unwrap();
         let source = CredentialSource::WindowsDpapi {
             file: temp.path().join("credential.dpapi"),

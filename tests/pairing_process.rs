@@ -31,7 +31,12 @@ fn command(config: &Path, credentials: &Path) -> Command {
 }
 fn cli(config: &Path, credentials: &Path, args: &[&str]) -> Value {
     let output = command(config, credentials).args(args).output().unwrap();
-    assert!(output.status.success(), "public pairing CLI command failed");
+    assert!(
+        output.status.success(),
+        "public pairing CLI command failed: {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
     serde_json::from_slice(&output.stdout).unwrap()
 }
 fn service(config: &Path, credentials: &Path, log: &Path) -> Owned {
@@ -81,7 +86,7 @@ fn fixture(path: &Path, ports: (&str, &str)) -> (Config, PathBuf, PathBuf, Ident
     std::fs::create_dir_all(path).unwrap();
     let identity = Identity::generate(&id()).unwrap();
     let credentials = path.join("credentials");
-    std::fs::create_dir(&credentials).unwrap();
+    tkfs::private_storage::Directory::open(&credentials).unwrap();
     #[cfg(windows)]
     let credential = {
         let source = CredentialSource::WindowsDpapi {
