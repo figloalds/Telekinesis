@@ -161,7 +161,15 @@ Set-Content .\test-runs\Project\hello.txt 'Private branch edit'
 ```
 
 `-C` or cwd discovers the project through the synthetic, read-only
-`.tkfs-runtime.json` file at the mount root. For checkout, keep the calling shell
+`.tkfs-runtime.json` file at the mount root. The control file is omitted from every
+directory listing, so a fresh mount is empty to Git and other listing-based
+checks. It remains readable by exact path, including `stat`/`GetFileAttributes`,
+under the existing mount ACL; this is enumeration omission, not a security
+boundary or removal of the reserved namespace. The name remains reserved at all
+directory levels. Standard `.`/`..` directory entries let Windows open a search
+on an otherwise empty mount; normal listings omit them.
+
+For checkout, keep the calling shell
 outside the mount and use `--runtime`. Open file/directory contexts, watchers,
 cwd references and memory mappings can cause `BUSY_VIEW`. Dirty edits already
 flushed into a branch stay there when switching; no checkpoint is needed merely
@@ -376,6 +384,31 @@ Limits: 16 MiB per object/file, 8 MiB per locally generated event, 64 MiB per pe
 frame, 4,096 competing topology witness cuts per dependency cone, whole-file buffering and
 unbounded retained history; no GC. Names use version-1 NFC plus Unicode lowercase,
 not full Windows ordinal casing equivalence. Links, reparse points, ADS, persistent
-ACL edits, arbitrary attribute/timestamp setters, distributed locks and live
+ACL edits, attributes beyond basic Readonly/Hidden/System/Archive/Normal,
+root-directory metadata setters, distributed locks and live
 databases are unsupported. Only the tested mapping refusal is qualified; general
 mapped-write coherence and power-loss/storage-device guarantees remain unproven.
+
+Basic creation/access/write/change timestamps are independent Windows FILETIME
+values, persisted with attributes in one causal `basic` register per entry.
+Directory is derived from entry type; Normal means no other flags. Attributes
+supplied at creation are honored. A metadata setter does not flush dirty content;
+unchanged setters and reads generate no events. Reads do not automatically advance
+access time. Content flush advances write/change time and sets Archive, unless an
+explicit time was supplied after the buffered write or that handle disabled the
+automatic update. Zero timestamps and `INVALID_FILE_ATTRIBUTES` leave values
+unchanged; access/write/change `-1` disables automatic updates on that handle and
+`-2` reenables them. A later write resumes normal updates unless disabled.
+Readonly prevents new writable opens and deletion of regular files; an existing
+writable handle retains its granted access. Synthetic discovery remains readonly.
+
+Metadata follows rename, branch selection, restart, checkpoint/restore and shared
+replication, with deterministic concurrent winners and reviewable alternatives.
+Private metadata/history stays private; explicit publication copies only the
+current visible metadata. Requested timestamps do not alter causal event clocks.
+
+Run the focused local Git acceptance with
+`python scripts/git_compatibility_e2e.py --exe <fresh-tkfs.exe>`.
+It covers default local/`--no-local` clones into the mount root and subfolder,
+Git locks/atomic replacement, four timestamps, readonly behavior, restart and
+nested discovery using disposable fixtures without an external repository.
