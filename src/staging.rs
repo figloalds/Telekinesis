@@ -112,10 +112,16 @@ impl Staged {
         match self {
             Self::Memory(buffer) => bytes[..count].copy_from_slice(&buffer[offset..offset + count]),
             Self::Disk { file, .. } => {
+                #[cfg(unix)]
+                use std::os::unix::fs::FileExt;
+                #[cfg(windows)]
                 use std::os::windows::fs::FileExt;
                 let mut read = 0;
                 while read < count {
+                    #[cfg(windows)]
                     let n = file.seek_read(&mut bytes[read..count], (offset + read) as u64)?;
+                    #[cfg(unix)]
+                    let n = file.read_at(&mut bytes[read..count], (offset + read) as u64)?;
                     ensure!(n > 0, "STAGING_TRUNCATED");
                     read += n;
                 }

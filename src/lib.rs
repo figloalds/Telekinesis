@@ -8,6 +8,9 @@ pub mod desktop_branch;
 pub mod local_ipc;
 #[cfg(windows)]
 pub mod mount;
+#[cfg(target_os = "linux")]
+#[path = "fuse_linux.rs"]
+pub mod mount;
 #[cfg(windows)]
 pub mod orchestrator;
 pub mod runtime;

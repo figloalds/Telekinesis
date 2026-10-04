@@ -690,16 +690,16 @@ impl Engine {
 }
 pub type Shared = Arc<Mutex<Engine>>;
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
-/// Format 3 requires the durable basic metadata register. Never negotiate down:
-/// a format-2 peer must not acknowledge or cache events it cannot project.
+/// Format 5 includes durable basic metadata and portable POSIX permissions.
+/// Never negotiate down or acknowledge events a peer cannot project.
 pub use crate::core::PEER_FORMAT;
-pub fn send_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
+pub fn send_frame(stream: &mut impl Write, bytes: &[u8]) -> Result<()> {
     ensure!(bytes.len() <= MAX_FRAME, "FRAME_TOO_LARGE");
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
     stream.write_all(bytes)?;
     Ok(())
 }
-pub fn read_frame(stream: &mut TcpStream) -> Result<Vec<u8>> {
+pub fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>> {
     let mut len = [0; 4];
     stream.read_exact(&mut len)?;
     let count = u32::from_be_bytes(len) as usize;
@@ -729,6 +729,9 @@ pub struct Discovery {
     pub device: String,
 }
 pub fn rpc(info: &Discovery, request: &str, payload: Value) -> Result<Value> {
+    #[cfg(target_os = "linux")]
+    let mut s = unix_control_stream(&info.address)?;
+    #[cfg(not(target_os = "linux"))]
     let mut s = stream(&info.address)?;
     send_frame(
         &mut s,
@@ -741,7 +744,10 @@ pub fn rpc(info: &Discovery, request: &str, payload: Value) -> Result<Value> {
     Ok(response["result"].clone())
 }
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
+    #[cfg(not(target_os = "linux"))]
     let listener = TcpListener::bind("127.0.0.1:0")?;
+    #[cfg(target_os = "linux")]
+    let listener = bind_unix_control(state)?;
     let recovery = engine.clone();
     std::thread::spawn(move || {
         loop {
@@ -757,7 +763,10 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
         let e = engine.lock().unwrap();
         Discovery {
             format: 1,
+            #[cfg(not(target_os = "linux"))]
             address: listener.local_addr()?.to_string(),
+            #[cfg(target_os = "linux")]
+            address: format!("unix:{}", state.join("control.sock").display()),
             token: id(),
             state: state.to_string_lossy().into_owned(),
             mount,
@@ -777,6 +786,8 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
             match incoming {
                 Ok(mut s) => {
                     let result = (|| -> Result<Value> {
+                        #[cfg(target_os = "linux")]
+                        authorize_unix(&s)?;
                         s.set_read_timeout(Some(Duration::from_secs(10)))?;
                         s.set_write_timeout(Some(Duration::from_secs(15)))?;
                         let r: Value = serde_json::from_slice(&read_frame(&mut s)?)?;
@@ -802,9 +813,18 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
                             let value = sync_once(&engine, &config)?;
                             return Ok(value);
                         }
-                        #[cfg(windows)]
+                        #[cfg(any(windows, target_os = "linux"))]
                         if payload["op"] == "checkout" && engine.lock().unwrap().mounted {
                             return crate::mount::checkout(&engine, request, payload);
+                        }
+                        #[cfg(target_os = "linux")]
+                        if payload["op"] == "stop" {
+                            if engine.lock().unwrap().mounted {
+                                crate::mount::stop(&engine)?;
+                            } else {
+                                engine.lock().unwrap().quiet()?;
+                            }
+                            return Ok(json!({"stopped":true}));
                         }
                         if payload["op"] == "bucket-export" {
                             return export_bucket(&engine, payload);
@@ -817,6 +837,10 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
                         Err(e) => json!({"ok":false,"error":format!("{e:#}")}),
                     };
                     let _ = send_frame(&mut s, &serde_json::to_vec(&reply).unwrap());
+                    #[cfg(target_os = "linux")]
+                    if reply["result"]["stopped"] == true {
+                        std::process::exit(0);
+                    }
                 }
                 Err(e) => eprintln!("rpc accept: {e}"),
             }
@@ -1240,4 +1264,55 @@ fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
     Ok(
         json!({"backend":"local-directory-test-bucket","manifest":hash,"objects":objects.len(),"remote_validated":false}),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn authorize_unix(stream: &std::os::unix::net::UnixStream) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    ensure!(
+        unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut size,
+            )
+        } == 0,
+        "LOCAL_IPC_CREDENTIALS"
+    );
+    ensure!(
+        credentials.uid == unsafe { libc::geteuid() },
+        "LOCAL_IPC_OWNER_MISMATCH"
+    );
+    Ok(())
+}
+#[cfg(target_os = "linux")]
+fn unix_control_stream(address: &str) -> Result<std::os::unix::net::UnixStream> {
+    let stream = std::os::unix::net::UnixStream::connect(
+        address
+            .strip_prefix("unix:")
+            .context("LINUX_CONTROL_REQUIRES_UNIX_SOCKET")?,
+    )?;
+    authorize_unix(&stream)?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    Ok(stream)
+}
+#[cfg(target_os = "linux")]
+fn bind_unix_control(state: &Path) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+    let path = state.join("control.sock");
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        ensure!(
+            metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
+            "UNSAFE_STALE_CONTROL_SOCKET"
+        );
+        std::fs::remove_file(&path)?;
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
 }
