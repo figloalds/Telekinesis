@@ -1,10 +1,11 @@
 fn main() {
-    slint_build::compile("ui/app.slint").expect("compile desktop UI");
     println!("cargo:rerun-if-changed=native/mount.c");
     println!("cargo:rerun-if-changed=native/control.c");
     println!("cargo:rerun-if-changed=native/winfsp_loader.c");
     println!("cargo:rerun-if-env-changed=WINFSP_DIR");
+    #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        slint_build::compile("ui/app.slint").expect("compile desktop UI");
         let root =
             std::env::var("WINFSP_DIR").unwrap_or_else(|_| "C:/Program Files (x86)/WinFsp".into());
         cc::Build::new()

@@ -5059,6 +5059,7 @@ dependencies = [
  "cc",
  "clap",
  "hex",
+ "libc",
  "rand 0.8.6",
  "rusqlite",
  "serde",
