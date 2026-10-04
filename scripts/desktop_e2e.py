@@ -1,7 +1,7 @@
 """Real Slint Windows window + isolated mounted desktop acceptance.
 
 Uses the application's explicit gui-test callbacks, not physical mouse/keyboard
-automation. Keeps fixtures/screenshots, and shuts down only its own installation.
+automation. Shuts down only its own installation; --keep-artifacts retains output.
 """
 from __future__ import annotations
 import argparse
@@ -15,6 +15,7 @@ import subprocess
 import time
 import uuid
 import tomllib
+from test_artifacts import add_artifact_options, prepare_artifacts, finish_artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -24,7 +25,9 @@ def main():
     parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "DESKTOP-VALIDATION.json")
     parser.add_argument("--theme", choices=("system", "light", "dark"), default="system")
     parser.add_argument("--branches", action="store_true", help="Exercise branch controls in the same disposable mounted installation")
+    add_artifact_options(parser)
     options = parser.parse_args()
+    prepare_artifacts(options)
     run = ROOT / "test-runs" / f"desktop-{uuid.uuid4()}"
     app = run / "portable"
     app.mkdir(parents=True)
@@ -95,14 +98,18 @@ def main():
         report["error"] = repr(error)
         raise
     finally:
+        shutdown_confirmed = report.get("passed", False)
         if config.exists():
             try:
                 catalog = manage("list")
                 cli("--generation",catalog["catalog_generation"],"--request-id",uuid.uuid4(),"manage","--defaults-file",config,"shutdown")
+                shutdown_confirmed = True
             except Exception:
                 pass  # The successful reopen phase has already stopped it.
         report["completed_at"] = datetime.now(timezone.utc).isoformat()
         report["fixture_mounts_removed"] = not (app / "Projects/Design studio").exists() and not (app / "Projects/Research lab").exists()
+        finish_artifacts(run, report, options,
+                         stopped=shutdown_confirmed and report["fixture_mounts_removed"])
         options.report.write_text(json.dumps(report,indent=2)+"\n")
         print(json.dumps(report,indent=2),flush=True)
 

@@ -40,7 +40,7 @@ tests/           Rust integration and regression tests
 scripts/         Acceptance harnesses, packaging and development helpers
 deploy/          Example Linux systemd units
 docs/            Platform guides, operating instructions, plans and validation notes
-test-evidence/   Saved JSON reports, provenance and isolated research harnesses
+test-evidence/   Ignored local JSON reports, provenance and research archives
 test-runs/       Ignored disposable states, mounts, screenshots and logs
 ```
 
@@ -51,6 +51,10 @@ Start with the [documentation index](docs/README.md) and
 License texts and [third-party notices](THIRD-PARTY-NOTICES.md) remain at the root.
 Saved reports record their original binaries, commits and fixture locations;
 they are historical evidence, not a claim that every check ran against this checkout.
+Both `test-evidence/` and `test-runs/` are local artifacts and are absent from a
+fresh clone. Links to saved evidence are available only when those archives are
+present. Keep test code in `tests/` and acceptance harnesses in `scripts/`; record
+lasting findings in `docs/` instead of committing generated reports or fixtures.
 
 ## Local orchestrator and later distribution
 
@@ -189,6 +193,14 @@ These `--offline` commands require cached dependencies. On a fresh machine use
 `cargo build --locked` first; Cargo.lock pins the dependency set. Harnesses write
 summary reports to `test-evidence/` by default and retain disposable mount/state
 fixtures in ignored `test-runs/`. Use `--report <path>` to preserve a separate run.
+After stopping their own processes and mounts, acceptance harnesses delete
+successful-run fixtures, copied binaries and screenshots. Failed-run fixtures
+are retained for at most seven days with a shared 1 GiB budget; retention is
+enforced when a harness starts or finishes. Summary JSON reports remain available.
+Use `--keep-artifacts` to explicitly preserve a run for inspection. To preview
+expired completed runs, use `python scripts/test_artifacts.py`; add `--apply` to
+remove them now. Unmarked legacy directories, active mounts and inaccessible
+fixtures require separate cleanup and are never automatically deleted.
 Packaging accepts `--exe <path>` and `--output <folder>` for an isolated build.
 
 No WinFsp `PATH` setup is needed for the new executable or test binaries. WinFsp

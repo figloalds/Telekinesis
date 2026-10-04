@@ -30,8 +30,9 @@ def main():
     for name in ("README.md", "THIRD-PARTY-NOTICES.md", "LICENSE-GPL-3.0.txt", "LICENSE-SLINT-ROYALTY-FREE-2.0.md"):
         shutil.copy2(ROOT / name, output / name)
     shutil.copytree(ROOT / "docs", output / "docs", dirs_exist_ok=True)
-    shutil.copytree(ROOT / "test-evidence", output / "test-evidence",
-                    dirs_exist_ok=True, ignore=evidence_ignore)
+    if (ROOT / "test-evidence").is_dir():
+        shutil.copytree(ROOT / "test-evidence", output / "test-evidence",
+                        dirs_exist_ok=True, ignore=evidence_ignore)
     result = subprocess.run(["cargo","metadata","--offline","--locked","--filter-platform","x86_64-pc-windows-msvc","--format-version","1"],cwd=ROOT,capture_output=True,text=True,check=True)
     metadata = json.loads(result.stdout)
     selected = {node["id"] for node in metadata["resolve"]["nodes"]}

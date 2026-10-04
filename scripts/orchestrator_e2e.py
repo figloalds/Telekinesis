@@ -1,7 +1,7 @@
 """Isolated LOCAL O1 acceptance. No existing daemon, driver or system PATH changes.
 
 Runs the new binary without WinFsp environment setup, suppresses native loader
-dialogs in test children, and retains fixture/evidence directories for inspection.
+dialogs in test children. --keep-artifacts retains fixtures for inspection.
 """
 from __future__ import annotations
 import argparse
@@ -18,6 +18,7 @@ import struct
 import subprocess
 import time
 import uuid
+from test_artifacts import add_artifact_options, prepare_artifacts, finish_artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV = os.environ.copy()
@@ -130,12 +131,17 @@ class Fixture:
                 self.kill_supervisor()
         if self.data.exists():
             for record_path in self.data.glob("states/*/worker.json"):
+                record = json.loads(record_path.read_text())
                 try:
-                    record = json.loads(record_path.read_text())
                     reply = pipe_call(record["pipe"], {"version": 1, "instance": record["instance"], "token": record["token"], "op": "stop"})
                     assert reply["ok"], reply
                 except (OSError, AssertionError):
-                    pass
+                    pass  # A stopped worker has no pipe; verify that below.
+                def stopped():
+                    available = ctypes.windll.kernel32.WaitNamedPipeW(rf"\\.\pipe\{record['pipe']}", 1)
+                    absent = not available and ctypes.windll.kernel32.GetLastError() == 2
+                    return absent and (not record.get("mount") or not Path(record["mount"]).exists())
+                wait(stopped, "owned worker exit and mount removal")
 
 def anonymous_rejected(name):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -170,7 +176,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/o1/debug/tkfs.exe")
     parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "ORCHESTRATOR-VALIDATION.json")
+    add_artifact_options(parser)
     options = parser.parse_args()
+    prepare_artifacts(options)
     run = ROOT / "test-runs" / f"orchestrator-{uuid.uuid4()}"
     run.mkdir()
     fixture = Fixture(options.exe.resolve(), run, "main")
@@ -464,6 +472,7 @@ def main():
             except Exception as cleanup_error:
                 report.setdefault("cleanup_errors", []).append(repr(cleanup_error))
         report["completed_at"] = datetime.now(timezone.utc).isoformat()
+        finish_artifacts(run, report, options, stopped=not report.get("cleanup_errors"))
         options.report.write_text(json.dumps(report, indent=2) + "\n")
         print("REPORT", options.report, flush=True)
 

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Bounded real Linux mount qualification. Creates only its own state/mounts.
-Retains JSON/logs/state under test-runs/linux-evidence; no network or live project access.
+Keeps summary JSON; --keep-artifacts retains fixtures. No network or live project access.
 """
 import argparse, errno, json, os, pathlib, signal, stat, subprocess, tempfile, time, traceback
+from test_artifacts import TEST_RUNS, add_artifact_options, finish_artifacts, prune_runs
 
 def main():
     args=argparse.ArgumentParser()
     args.add_argument('--binary',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'target/debug/tkfs')
     args.add_argument('--evidence',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'test-runs/linux-evidence')
+    add_artifact_options(args)
     args=args.parse_args(); binary=args.binary.resolve(); args.evidence.mkdir(parents=True,exist_ok=True)
+    args.report=args.evidence/'mounted-latest.json'
+    retention_base=TEST_RUNS if args.evidence.resolve()==(TEST_RUNS/'linux-evidence').resolve() else args.evidence
+    for result in prune_runs(retention_base): print('ARTIFACT RETENTION '+json.dumps(result),flush=True)
     root=pathlib.Path(tempfile.mkdtemp(prefix='mounted-',dir=args.evidence.resolve()))
     state=root/'state'; mount=root/'mount'; daemon=None; report={'root':str(root),'checks':[]}; log=(root/'daemon.log').open('w')
     def run(argv,cwd=None,ok=True):
@@ -118,7 +123,9 @@ def main():
                 try:daemon.wait(timeout=3)
                 except subprocess.TimeoutExpired:daemon.kill();daemon.wait(timeout=3)
         log.close();report['cleanup_mount_absent']=not os.path.ismount(mount)
-        (root/'report.json').write_text(json.dumps(report,indent=2));(args.evidence/'mounted-latest.json').write_text(json.dumps(report,indent=2))
+        (root/'report.json').write_text(json.dumps(report,indent=2))
+        finish_artifacts(root,report,args,stopped=report['cleanup_mount_absent'] and (daemon is None or daemon.poll() is not None),base=retention_base)
+        args.report.write_text(json.dumps(report,indent=2))
         print('EVIDENCE '+str(root),flush=True)
     return 0 if report.get('passed') else 1
 

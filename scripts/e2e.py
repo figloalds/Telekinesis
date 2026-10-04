@@ -14,6 +14,7 @@ import socket
 import subprocess
 import time
 import uuid
+from test_artifacts import add_artifact_options, prepare_artifacts, finish_artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ROOT / "target" / "debug" / "tkfs.exe"
@@ -117,13 +118,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "VALIDATION.json")
     parser.add_argument("--exe", type=Path, default=EXE)
+    add_artifact_options(parser)
     args = parser.parse_args()
+    prepare_artifacts(args)
     EXE = args.exe.resolve()
     run = ROOT / "test-runs" / str(uuid.uuid4())
     run.mkdir(parents=True)
     repo = str(uuid.uuid4())
     a, b = Device(run, "a", repo), Device(run, "b", repo)
     checks = []
+    report = {"passed": False, "checks": checks, "run_directory": str(run)}
 
     def passed(message):
         checks.append(message)
@@ -377,11 +381,16 @@ def main():
         args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         print("Evidence:", args.report, flush=True)
     except Exception as error:
-        args.report.write_text(json.dumps({"passed":False,"checks":checks,"error":repr(error),"run_directory":str(run)},indent=2)+"\n",encoding="utf-8")
+        report.update(passed=False, error=repr(error))
         raise
     finally:
-        a.stop()
-        b.stop()
+        for device in (a, b):
+            try:
+                device.stop()
+            except Exception as error:
+                report.setdefault("cleanup_errors", []).append(repr(error))
+        finish_artifacts(run, report, args, stopped=not report.get("cleanup_errors"))
+        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

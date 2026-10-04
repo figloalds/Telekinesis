@@ -1,6 +1,13 @@
 /target/
+# Local test output and archived evidence; keep tests and harnesses in source control.
 /test-runs/
 /test-evidence/
+# Legacy report locations (current harnesses use the directories above).
+/VALIDATION.json
+/*-VALIDATION.json
+/ORCHESTRATOR-COMPATIBILITY.json
+/DESKTOP-CHECKS.json
+/SCALABILITY.json
 *.sqlite*
 *.log
 __pycache__/

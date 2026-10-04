@@ -10,13 +10,16 @@ import sqlite3
 import subprocess
 import uuid
 from orchestrator_e2e import ENV, ROOT, Fixture
+from test_artifacts import add_artifact_options, prepare_artifacts, finish_artifacts
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
     parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "DESKTOP-CATALOG-VALIDATION.json")
+    add_artifact_options(parser)
     options = parser.parse_args()
+    prepare_artifacts(options)
     exe = options.exe.resolve()
     run = ROOT / "test-runs" / f"catalog-startup-{uuid.uuid4()}"
     run.mkdir()
@@ -99,8 +102,12 @@ def main():
         raise
     finally:
         for fixture in fixtures:
-            fixture.cleanup()
+            try:
+                fixture.cleanup()
+            except Exception as error:
+                report.setdefault("cleanup_errors", []).append(repr(error))
         report["completed_at"] = datetime.now(timezone.utc).isoformat()
+        finish_artifacts(run, report, options, stopped=not report.get("cleanup_errors"))
         options.report.write_text(json.dumps(report, indent=2)+"\n")
         print(json.dumps(report, indent=2), flush=True)
 

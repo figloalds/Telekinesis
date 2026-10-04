@@ -14,6 +14,7 @@ from pathlib import Path
 import subprocess
 import time
 import uuid
+from test_artifacts import add_artifact_options, prepare_artifacts, finish_artifacts
 
 ROOT = Path(__file__).resolve().parents[1]
 K = C.WinDLL("kernel32", use_last_error=True)
@@ -54,7 +55,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", type=Path, required=True)
     ap.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "GIT-COMPATIBILITY-VALIDATION.json")
+    add_artifact_options(ap)
     args = ap.parse_args()
+    prepare_artifacts(args)
     exe = args.exe.resolve()
     run = ROOT / "test-runs" / ("git-" + uuid.uuid4().hex[:8])
     run.mkdir()
@@ -70,6 +73,7 @@ def main():
     (run / "template").mkdir()
     (run / "xdg").mkdir()
     checks, commands, cleanup = [], [], []
+    live_children = set()
     report = {"passed": False, "host": os.environ.get("COMPUTERNAME"),
         "exe": str(exe), "exe_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
         "run_directory": str(run), "checks": checks, "commands": commands, "cleanup": cleanup}
@@ -100,6 +104,7 @@ def main():
         err = open(run / (label + ".stderr.log"), "wb")
         p = subprocess.Popen([str(exe), "daemon", "--state", str(state), "--mount", str(mount)],
             cwd=run, env=env, stdout=out, stderr=err, creationflags=subprocess.CREATE_NO_WINDOW)
+        live_children.add(p.pid)
         try:
             deadline = time.monotonic() + 25
             while not mount.exists() or not (state / "runtime.json").exists():
@@ -122,6 +127,7 @@ def main():
             "mount_removed": not mount.exists(), "credentials_removed": not (state / "runtime.json").exists()})
         save()
         assert not mount.exists()
+        live_children.discard(p.pid)
     try:
         command(["git", "--version"])
         fixture = run / "fixture"
@@ -215,6 +221,7 @@ def main():
         report["error"] = repr(exc)
         raise
     finally:
+        finish_artifacts(run, report, args, stopped=not live_children)
         save()
         print("Evidence: " + str(args.report), flush=True)
 
