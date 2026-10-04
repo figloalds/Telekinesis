@@ -1,0 +1,19 @@
+# Headless worker template only. Initialize the state explicitly beforehand.
+# Add a FUSE mount only after qualifying its separate mount/recovery lifecycle.
+[Unit]
+Description=TKFS headless state worker %i
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tkfs
+Group=tkfs
+UMask=0077
+ExecStart=/usr/local/bin/tkfs daemon --state /var/lib/tkfs-states/%i
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

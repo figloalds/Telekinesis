@@ -36,6 +36,13 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Owner-local pairing management and separate TLS published-data service.
+    Pairing {
+        #[arg(short = 'f', long, default_value = "pairing.toml")]
+        defaults_file: PathBuf,
+        #[command(subcommand)]
+        action: PairingCommand,
+    },
     /// Open the portable desktop application (also the default with no arguments).
     Gui,
     #[command(hide = true)]
@@ -170,6 +177,207 @@ enum ManagementCommand {
         operation: String,
     },
 }
+#[derive(Subcommand)]
+enum PairingCommand {
+    /// Print a fresh public installation ID for a new config.
+    NewId,
+    /// Generate this device's key, protected with Windows CurrentUser DPAPI.
+    CredentialInit,
+    /// Linux: pipe a new key directly to systemd-creds encrypt; no plaintext file.
+    CredentialProvision {
+        #[arg(long)]
+        encrypted_output: PathBuf,
+    },
+    Run,
+    Status,
+    /// Print a secret invitation token; transfer it privately, never log it.
+    Invite {
+        #[arg(long, default_value_t = 300)]
+        lifetime_seconds: u64,
+    },
+    /// Paste a secret invitation on masked stdin; not argv or shell history.
+    Join,
+    /// Approve the exact public installation and certificate fingerprint.
+    Approve {
+        invitation: String,
+        #[arg(long)]
+        installation: String,
+        #[arg(long)]
+        fingerprint: String,
+    },
+    Revoke {
+        peer: String,
+    },
+    /// Explicitly grant published-data sync for an already running local replica.
+    Grant {
+        peer: String,
+        #[arg(long)]
+        repo: String,
+        #[arg(long)]
+        runtime: PathBuf,
+        #[arg(long)]
+        remote_replica: String,
+        #[arg(long)]
+        disable: bool,
+    },
+    RemoteList {
+        peer: String,
+    },
+    Sync {
+        peer: String,
+        #[arg(long)]
+        repo: String,
+    },
+}
+fn pairing_command(path: &Path, action: &PairingCommand) -> Result<()> {
+    use tkfs::{
+        pairing::{CredentialSource, Identity, SyncConfiguration},
+        pairing_service::{self, Config},
+    };
+    if matches!(action, PairingCommand::NewId) {
+        println!("{}", id());
+        return Ok(());
+    }
+    let config = Config::load(path)?;
+    let output = match action {
+        PairingCommand::NewId => unreachable!(),
+        PairingCommand::CredentialInit => {
+            let identity = Identity::generate(&config.installation)?;
+            config.credential.save_windows(&identity)?;
+            json!({"installation":identity.installation,"fingerprint":identity.fingerprint(),"status":"credential-created"})
+        }
+        PairingCommand::CredentialProvision { encrypted_output } => {
+            #[cfg(target_os = "linux")]
+            {
+                use std::io::Write;
+                use std::process::{Command, Stdio};
+                let CredentialSource::Systemd { name } = &config.credential else {
+                    bail!("SYSTEMD_CREDENTIAL_REQUIRED");
+                };
+                ensure!(!encrypted_output.exists(), "CREDENTIAL_ALREADY_EXISTS");
+                let identity = Identity::generate(&config.installation)?;
+                let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&identity)?);
+                let mut child = Command::new("systemd-creds")
+                    .args(["encrypt", "--name", name, "-"])
+                    .arg(encrypted_output)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .context("SYSTEMD_CREDS_UNAVAILABLE")?;
+                child
+                    .stdin
+                    .take()
+                    .context("CREDENTIAL_PIPE_UNAVAILABLE")?
+                    .write_all(&bytes)?;
+                ensure!(child.wait()?.success(), "CREDENTIAL_ENCRYPTION_FAILED");
+                json!({"installation":identity.installation,"fingerprint":identity.fingerprint(),"status":"encrypted-credential-created","requires":"LoadCredentialEncrypted with same credential name"})
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = encrypted_output;
+                let _: Option<CredentialSource> = None;
+                bail!("SYSTEMD_CREDS_LINUX_ONLY");
+            }
+        }
+        PairingCommand::Run => {
+            let service = pairing_service::Service::open(config)?;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            #[cfg(target_os = "linux")]
+            {
+                unsafe {
+                    libc::signal(libc::SIGINT, request_linux_stop as libc::sighandler_t);
+                    libc::signal(libc::SIGTERM, request_linux_stop as libc::sighandler_t);
+                }
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        if LINUX_STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                });
+            }
+            return service.run(stop);
+        }
+        PairingCommand::Status => {
+            let registry = config.registry()?;
+            let credential = match config.identity() {
+                Ok(identity) => json!({"status":"available","fingerprint":identity.fingerprint()}),
+                Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
+            };
+            json!({"installation":config.installation,"credential":credential,"peers":registry.peers()?.into_iter().map(|peer|json!({"installation":peer.installation,"fingerprint":peer.fingerprint(),"revoked":peer.revoked})).collect::<Vec<_>>(),"invitations":registry.pending()?,"syncs":registry.statuses()?})
+        }
+        PairingCommand::Invite { lifetime_seconds } => {
+            let lifetime = lifetime_seconds
+                .checked_mul(1000)
+                .context("INVALID_INVITATION_LIFETIME")?;
+            let invitation = config.registry()?.create_invitation(
+                &config.identity()?,
+                &config.enrollment_advertise,
+                &config.advertise,
+                lifetime,
+            )?;
+            let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&invitation)?);
+            println!("{}", hex::encode(&bytes));
+            return Ok(());
+        }
+        PairingCommand::Join => {
+            pairing_service::join(&config, pairing_service::read_invitation()?)?
+        }
+        PairingCommand::Approve {
+            invitation,
+            installation,
+            fingerprint,
+        } => {
+            let mut registry = config.registry()?;
+            let candidates = registry.pending()?;
+            ensure!(
+                candidates
+                    .as_array()
+                    .context("INVALID_PAIR_CANDIDATES")?
+                    .iter()
+                    .any(|candidate| candidate["invitation"] == *invitation
+                        && candidate["installation"] == *installation
+                        && candidate["fingerprint"] == *fingerprint),
+                "PAIR_APPROVAL_IDENTITY_MISMATCH"
+            );
+            let peer = registry.approve(invitation)?;
+            json!({"installation":peer.installation,"fingerprint":peer.fingerprint(),"status":"approved-no-repository-grants"})
+        }
+        PairingCommand::Revoke { peer } => {
+            config.registry()?.revoke(peer)?;
+            json!({"installation":peer,"status":"revoked"})
+        }
+        PairingCommand::Grant {
+            peer,
+            repo,
+            runtime,
+            remote_replica,
+            disable,
+        } => {
+            let runtime = std::fs::canonicalize(runtime)?;
+            let discovery: Discovery = serde_json::from_slice(&std::fs::read(&runtime)?)?;
+            let grant = SyncConfiguration {
+                peer: peer.clone(),
+                repo: repo.clone(),
+                local_runtime: runtime,
+                local_replica: discovery.device,
+                remote_replica: remote_replica.clone(),
+                enabled: !*disable,
+            };
+            pairing_service::worker(&grant, "published-summary", None, None, None)?;
+            config.registry()?.configure_sync(&grant)?;
+            json!({"status":"configured","grant":grant})
+        }
+        PairingCommand::RemoteList { peer } => pairing_service::remote_list(&config, peer)?,
+        PairingCommand::Sync { peer, repo } => {
+            pairing_service::synchronize(&config, &config.registry()?.grant(peer, repo)?)?
+        }
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
 fn discover(args: &Args) -> Result<Discovery> {
     if let Some(path) = &args.runtime {
         return Ok(serde_json::from_slice(&std::fs::read(path)?)?);
@@ -236,6 +444,10 @@ fn run() -> Result<()> {
     }
     let args = Args::parse();
     match &args.command {
+        Command::Pairing {
+            defaults_file,
+            action,
+        } => return pairing_command(defaults_file, action),
         Command::Gui => {
             #[cfg(windows)]
             return gui::run(None);

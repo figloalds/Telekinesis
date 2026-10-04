@@ -10,7 +10,8 @@ Use a native Linux filesystem for the checkout and state. Tested on Ubuntu
 24.04.4 x86_64, WSL2 kernel 6.18.33.2, Rust/Cargo 1.88, GCC 13.3, FUSE 3.14.
 The adapter speaks kernel FUSE protocol 7.31 and uses the installed owner-only
 `fusermount3` helper. It does not link libfuse or require its development headers.
-`libc` is the only added Rust dependency; bundled SQLite needs a C compiler.
+The FUSE adapter adds `libc`; the separate paired-data service adds standard
+Rustls/ring, rcgen and zeroize dependencies. Bundled SQLite needs a C compiler.
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -29,6 +30,11 @@ From another shell outside the mount:
 ./target/debug/tkfs --runtime /native/path/new-state/runtime.json checkout private-work
 ./target/debug/tkfs --runtime /native/path/new-state/runtime.json stop
 ```
+
+See [PAIRING.md](PAIRING.md) for the separate portable TLS data service,
+owner-scoped repository grants and systemd credential/unit templates. The
+legacy standalone `--listen` PSK test transport is not the paired service and
+must not be treated as approved device authentication.
 
 `-C /native/path/new-mount` discovers the same daemon through its read-only
 `.tkfs-runtime.json`. Local control uses a mode-0600 Unix socket and checks both

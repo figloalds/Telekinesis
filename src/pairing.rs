@@ -175,6 +175,9 @@ impl CredentialSource {
             !identity.private_key.is_empty() && !identity.certificate.is_empty(),
             "CREDENTIAL_INVALID"
         );
+        identity
+            .tls_server(&[], true)
+            .context("CREDENTIAL_INVALID: certificate/key mismatch")?;
         Ok(identity)
     }
     pub fn save_windows(&self, identity: &Identity) -> Result<()> {
@@ -447,6 +450,7 @@ impl Registry {
         Ok(peer)
     }
     pub fn trust(&mut self, peer: &Peer) -> Result<()> {
+        let transaction = self.begin_access()?;
         ensure!(
             peer.installation != self.installation && !peer.revoked,
             "INVALID_PAIR_CANDIDATE"
@@ -456,6 +460,18 @@ impl Registry {
             !peer.certificate.is_empty() && peer.certificate.len() <= 8192,
             "INVALID_PAIR_CERTIFICATE"
         );
+        ensure!(
+            peer.endpoint
+                .parse::<std::net::SocketAddr>()
+                .context("PAIR_ENDPOINT_REQUIRES_NUMERIC_ADDRESS")?
+                .port()
+                != 0,
+            "INVALID_PAIR_ENDPOINT"
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(peer.certificate.clone().into())
+            .context("INVALID_PAIR_CERTIFICATE")?;
         let prior: Option<(Vec<u8>, bool)> = self
             .db
             .query_row(
@@ -472,6 +488,7 @@ impl Registry {
             );
         }
         self.db.execute("INSERT INTO pairs VALUES(?,?,?,0) ON CONFLICT(id) DO UPDATE SET endpoint=excluded.endpoint",params![peer.installation,peer.certificate,peer.endpoint])?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn peers(&self) -> Result<Vec<Peer>> {
@@ -499,6 +516,7 @@ impl Registry {
         Ok(peer)
     }
     pub fn revoke(&mut self, peer: &str) -> Result<()> {
+        let transaction = self.begin_access()?;
         ensure!(
             self.db
                 .execute("UPDATE pairs SET revoked=1 WHERE id=?", [peer])?
@@ -507,9 +525,11 @@ impl Registry {
         );
         self.db
             .execute("UPDATE syncs SET status='revoked' WHERE peer=?", [peer])?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn configure_sync(&mut self, configuration: &SyncConfiguration) -> Result<()> {
+        let transaction = self.begin_access()?;
         let peer = self
             .peers()?
             .into_iter()
@@ -527,12 +547,18 @@ impl Registry {
             configuration.local_replica != configuration.remote_replica,
             "DUPLICATE_REPLICA_IDENTITY"
         );
-        let prior = self
-            .configurations()?
-            .into_iter()
-            .find(|prior| prior.repo == configuration.repo && prior.peer != configuration.peer);
+        let peers = self.peers()?;
+        let prior = self.configurations()?.into_iter().find(|prior| {
+            prior.repo == configuration.repo
+                && prior.peer != configuration.peer
+                && prior.enabled
+                && peers
+                    .iter()
+                    .any(|peer| peer.installation == prior.peer && !peer.revoked)
+        });
         ensure!(prior.is_none(), "FIRST_SLICE_ONE_PEER_PER_REPOSITORY");
         self.db.execute("INSERT INTO syncs VALUES(?,?,?,'configured') ON CONFLICT(peer,repo) DO UPDATE SET payload=excluded.payload,status='configured'",params![configuration.peer,configuration.repo,serde_json::to_string(configuration)?])?;
+        transaction.commit()?;
         Ok(())
     }
     pub fn configurations(&self) -> Result<Vec<SyncConfiguration>> {
@@ -547,8 +573,8 @@ impl Registry {
     }
     pub fn sync_status(&mut self, configuration: &SyncConfiguration, status: &str) -> Result<()> {
         self.db.execute(
-            "UPDATE syncs SET status=? WHERE peer=? AND repo=?",
-            params![status, configuration.peer, configuration.repo],
+            "UPDATE syncs SET status=? WHERE peer=? AND repo=? AND payload=? AND EXISTS(SELECT 1 FROM pairs WHERE id=syncs.peer AND revoked=0)",
+            params![status, configuration.peer, configuration.repo,serde_json::to_string(configuration)?],
         )?;
         Ok(())
     }
@@ -576,6 +602,23 @@ impl Registry {
             .context("REPOSITORY_NOT_GRANTED")?;
         Ok(grant)
     }
+    pub fn pending(&self) -> Result<serde_json::Value> {
+        let rows = self
+            .db
+            .prepare(
+                "SELECT id,candidate FROM invitations WHERE consumed=1 AND candidate IS NOT NULL",
+            )?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let peers = self.peers()?;
+        let pending=rows.into_iter().map(|(invitation,candidate)|->Result<_>{
+            let peer:Peer=serde_json::from_str(&candidate)?;
+            Ok(serde_json::json!({"invitation":invitation,"installation":peer.installation,"fingerprint":peer.fingerprint(),"endpoint":peer.endpoint,"approved":peers.iter().any(|known|known.installation==peer.installation&&!known.revoked)}))
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::json!(pending))
+    }
     // Serialize data operations with owner-driven revoke/configuration updates.
     // The caller must hold this guard until the response has been sent.
     pub fn begin_access(&self) -> Result<rusqlite::Transaction<'_>> {
@@ -592,10 +635,7 @@ pub enum NetworkRequest {
     ListPublished {},
     Exchange {
         repo: String,
-        replica: String,
-        bundle: crate::core::Bundle,
-        known: std::collections::BTreeSet<String>,
-        known_objects: std::collections::BTreeSet<String>,
+        page: Box<crate::paired_sync::SyncPage>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -674,6 +714,11 @@ mod tests {
         );
         assert!(registry.trust(&peer(&b)).is_err());
         assert!(registry.configure_sync(&grant).is_err());
+        let replacement = Identity::generate(&id()).unwrap();
+        registry.trust(&peer(&replacement)).unwrap();
+        let mut rotated = grant.clone();
+        rotated.peer = replacement.installation.clone();
+        registry.configure_sync(&rotated).unwrap();
     }
     #[test]
     fn expired_wrong_secret_and_wrong_identity_invitations_fail() {
@@ -761,6 +806,56 @@ mod tests {
             )
             .is_err()
         );
+    }
+    #[test]
+    fn revocation_serializes_with_inflight_data_and_cannot_be_overwritten_by_late_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pairs.db");
+        let a = Identity::generate(&id()).unwrap();
+        let b = Identity::generate(&id()).unwrap();
+        let mut registry = Registry::open(&path, &a.installation).unwrap();
+        registry.trust(&peer(&b)).unwrap();
+        let grant = SyncConfiguration {
+            peer: b.installation.clone(),
+            repo: id(),
+            local_runtime: temp.path().join("runtime.json"),
+            local_replica: id(),
+            remote_replica: id(),
+            enabled: true,
+        };
+        registry.configure_sync(&grant).unwrap();
+        let access = registry.begin_access().unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (completed, result) = std::sync::mpsc::channel();
+        let installation = a.installation.clone();
+        let peer = b.installation.clone();
+        let thread = std::thread::spawn(move || {
+            let mut registry = Registry::open(&path, &installation).unwrap();
+            started.send(()).unwrap();
+            let result = registry.revoke(&peer);
+            completed.send(result.is_ok()).unwrap();
+        });
+        ready.recv().unwrap();
+        assert!(
+            result
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        access.commit().unwrap();
+        assert!(
+            result
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .unwrap()
+        );
+        thread.join().unwrap();
+        assert!(
+            registry
+                .authenticate(&b.certificate, &b.installation)
+                .is_err()
+        );
+        registry.sync_status(&grant, "caught-up").unwrap();
+        assert_eq!(registry.statuses().unwrap()[0]["status"], "revoked");
+        assert!(registry.configure_sync(&grant).is_err());
     }
     #[cfg(windows)]
     #[test]

@@ -71,8 +71,8 @@ impl Listener {
         }
         let result = (|| {
             check(code)?;
-            let value = read(&mut self.0, 3000)?;
             check(unsafe { tk_pipe_authorize(self.0.as_raw_handle()) })?;
+            let value = read(&mut self.0, 3000)?;
             Ok(Some(value))
         })();
         if result.is_err() {
@@ -94,7 +94,8 @@ impl Listener {
         result.and(disconnected)
     }
 }
-const MAX_MANAGEMENT_FRAME: usize = 1024 * 1024;
+// Worker control also carries bounded published-object pages over this owner pipe.
+const MAX_MANAGEMENT_FRAME: usize = 64 * 1024 * 1024;
 fn transfer(file: &File, bytes: &mut [u8], write: bool, timeout: u32) -> Result<()> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout as u64);
     let mut offset = 0;

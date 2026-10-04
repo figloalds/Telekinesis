@@ -1,0 +1,27 @@
+# Template only: review paths/account/credential policy. Not installed/enabled.
+[Unit]
+Description=TKFS paired published-data service
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tkfs
+Group=tkfs
+WorkingDirectory=/var/lib/tkfs-pairing
+UMask=0077
+LoadCredentialEncrypted=tkfs.identity:/etc/credstore.encrypted/tkfs.identity
+ExecStart=/usr/local/bin/tkfs pairing -f /etc/tkfs/pairing.toml run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/tkfs-pairing
+
+[Install]
+WantedBy=multi-user.target

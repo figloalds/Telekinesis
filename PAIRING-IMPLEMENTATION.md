@@ -53,3 +53,15 @@ expired/replayed invitations, revoked keys and wrong installation/repository
 bindings. Fixture credentials stay temporary and are never printed. Public
 listeners, live daemon upgrades, real persistent credential provisioning,
 firewall/Tailscale changes and service enablement are excluded.
+
+Implemented slice: portable `pairing` CLI/service, DPAPI/systemd credential
+sources, distinct TLS keys, owner-approved durable enrollment, explicit grants
+with installation/replica binding, published-only worker DTOs, bounded background
+retry and persistent restart resume. Windows worker control is now the same
+owner-authenticated named-pipe transport used by management; Linux keeps UID
+checked Unix sockets. TLS tickets, resumption and early data are disabled; fresh
+registry authorization occurs after handshakes and before data use. Local grants,
+revocation and data operations serialize through SQLite transactions. See
+`PAIRING.md` and `PAIRING-VALIDATION.json` for instructions, qualification and the
+two-replica/rotation boundaries. No installed user credential or system unit was
+created during this work.

@@ -729,23 +729,41 @@ pub struct Discovery {
     pub device: String,
 }
 pub fn rpc(info: &Discovery, request: &str, payload: Value) -> Result<Value> {
-    #[cfg(target_os = "linux")]
-    let mut s = unix_control_stream(&info.address)?;
-    #[cfg(not(target_os = "linux"))]
-    let mut s = stream(&info.address)?;
-    send_frame(
-        &mut s,
-        &serde_json::to_vec(&json!({"token":info.token,"request":request,"payload":payload}))?,
+    #[cfg(windows)]
+    let response: Value = crate::local_ipc::call_timeout(
+        info.address
+            .strip_prefix("pipe:")
+            .context("WINDOWS_CONTROL_REQUIRES_OWNER_PIPE")?,
+        &json!({"token":info.token,"request":request,"payload":payload}),
+        20000,
     )?;
-    let response: Value = serde_json::from_slice(&read_frame(&mut s)?)?;
+    #[cfg(not(windows))]
+    let response = {
+        #[cfg(target_os = "linux")]
+        let mut s = unix_control_stream(&info.address)?;
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let mut s = stream(&info.address)?;
+        send_frame(
+            &mut s,
+            &serde_json::to_vec(&json!({"token":info.token,"request":request,"payload":payload}))?,
+        )?;
+        let response: Value = serde_json::from_slice(&read_frame(&mut s)?)?;
+        response
+    };
     if response["ok"] != true {
         bail!("{}", response["error"].as_str().unwrap_or("RPC_ERROR"));
     }
     Ok(response["result"].clone())
 }
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    crate::local_ipc::protect_directory(state)?;
+    #[cfg(not(any(windows, target_os = "linux")))]
     let listener = TcpListener::bind("127.0.0.1:0")?;
+    #[cfg(windows)]
+    let pipe_name = format!("tkfs-worker-{}", id());
+    #[cfg(windows)]
+    let mut listener = crate::local_ipc::Listener::bind(&pipe_name)?;
     #[cfg(target_os = "linux")]
     let listener = bind_unix_control(state)?;
     let recovery = engine.clone();
@@ -763,8 +781,10 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
         let e = engine.lock().unwrap();
         Discovery {
             format: 1,
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             address: listener.local_addr()?.to_string(),
+            #[cfg(windows)]
+            address: format!("pipe:{pipe_name}"),
             #[cfg(target_os = "linux")]
             address: format!("unix:{}", state.join("control.sock").display()),
             token: id(),
@@ -782,6 +802,23 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
     let token = info.token.clone();
     let observation = engine.lock().unwrap().observation.clone();
     std::thread::spawn(move || {
+        #[cfg(windows)]
+        loop {
+            match listener.receive::<Value>() {
+                Ok(Some(request)) => {
+                    let result = dispatch_rpc(&engine, &observation, &token, &request);
+                    deliver_notifications(&engine);
+                    let reply = match result {
+                        Ok(value) => json!({"ok":true,"result":value}),
+                        Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
+                    };
+                    let _ = listener.reply(&reply);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("owner pipe receive: {error:#}"),
+            }
+        }
+        #[cfg(not(windows))]
         for incoming in listener.incoming() {
             match incoming {
                 Ok(mut s) => {
@@ -791,45 +828,7 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
                         s.set_read_timeout(Some(Duration::from_secs(10)))?;
                         s.set_write_timeout(Some(Duration::from_secs(15)))?;
                         let r: Value = serde_json::from_slice(&read_frame(&mut s)?)?;
-                        ensure!(r["token"] == token, "PERMISSION_DENIED");
-                        let request = r["request"].as_str().context("INVALID_REQUEST_ID")?;
-                        let payload = &r["payload"];
-                        if payload["op"] == "status" {
-                            if let Ok(mut e) = engine.try_lock() {
-                                return e.control(request, payload);
-                            }
-                            let mut status = observation.lock().unwrap().clone();
-                            status["busy"] = json!(true);
-                            status["stale"] = json!(true);
-                            return Ok(status);
-                        }
-                        if payload["op"] == "sync" {
-                            let config = engine
-                                .lock()
-                                .unwrap()
-                                .peer
-                                .clone()
-                                .context("PEER_NOT_CONFIGURED")?;
-                            let value = sync_once(&engine, &config)?;
-                            return Ok(value);
-                        }
-                        #[cfg(any(windows, target_os = "linux"))]
-                        if payload["op"] == "checkout" && engine.lock().unwrap().mounted {
-                            return crate::mount::checkout(&engine, request, payload);
-                        }
-                        #[cfg(target_os = "linux")]
-                        if payload["op"] == "stop" {
-                            if engine.lock().unwrap().mounted {
-                                crate::mount::stop(&engine)?;
-                            } else {
-                                engine.lock().unwrap().quiet()?;
-                            }
-                            return Ok(json!({"stopped":true}));
-                        }
-                        if payload["op"] == "bucket-export" {
-                            return export_bucket(&engine, payload);
-                        }
-                        engine.lock().unwrap().control(request, payload)
+                        dispatch_rpc(&engine, &observation, &token, &r)
                     })();
                     deliver_notifications(&engine);
                     let reply = match result {
@@ -849,6 +848,58 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
     Ok(info)
 }
 
+fn dispatch_rpc(
+    engine: &Shared,
+    observation: &Arc<Mutex<Value>>,
+    token: &str,
+    r: &Value,
+) -> Result<Value> {
+    ensure!(r["token"] == token, "PERMISSION_DENIED");
+    let request = r["request"].as_str().context("INVALID_REQUEST_ID")?;
+    let payload = &r["payload"];
+    if payload["op"]
+        .as_str()
+        .is_some_and(|op| op.starts_with("published-"))
+    {
+        return crate::paired_sync::worker_control(&mut engine.lock().unwrap(), payload);
+    }
+    if payload["op"] == "status" {
+        if let Ok(mut e) = engine.try_lock() {
+            return e.control(request, payload);
+        }
+        let mut status = observation.lock().unwrap().clone();
+        status["busy"] = json!(true);
+        status["stale"] = json!(true);
+        return Ok(status);
+    }
+    if payload["op"] == "sync" {
+        let config = engine
+            .lock()
+            .unwrap()
+            .peer
+            .clone()
+            .context("PEER_NOT_CONFIGURED")?;
+        let value = sync_once(engine, &config)?;
+        return Ok(value);
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    if payload["op"] == "checkout" && engine.lock().unwrap().mounted {
+        return crate::mount::checkout(engine, request, payload);
+    }
+    #[cfg(target_os = "linux")]
+    if payload["op"] == "stop" {
+        if engine.lock().unwrap().mounted {
+            crate::mount::stop(engine)?;
+        } else {
+            engine.lock().unwrap().quiet()?;
+        }
+        return Ok(json!({"stopped":true}));
+    }
+    if payload["op"] == "bucket-export" {
+        return export_bucket(engine, payload);
+    }
+    engine.lock().unwrap().control(request, payload)
+}
 #[derive(Clone)]
 pub struct PeerConfig {
     pub listen: String,

@@ -444,11 +444,10 @@ impl Session {
                 && json!(discovery.mount) == registered["mount"],
             "RUNTIME_IDENTITY_MISMATCH"
         );
-        let address: std::net::SocketAddr = discovery
-            .address
-            .parse()
-            .context("INVALID_RUNTIME_ADDRESS")?;
-        ensure!(address.ip().is_loopback(), "RUNTIME_MUST_BE_LOCAL");
+        ensure!(
+            discovery.address.starts_with("pipe:tkfs-worker-"),
+            "RUNTIME_REQUIRES_OWNER_PIPE"
+        );
         ensure!(
             fs::canonicalize(&discovery.state)?
                 == fs::canonicalize(self.config.data_directory.join("states").join(state))?,

@@ -13,6 +13,8 @@ pub mod mount;
 pub mod mount;
 #[cfg(windows)]
 pub mod orchestrator;
+pub mod paired_sync;
 pub mod pairing;
+pub mod pairing_service;
 pub mod runtime;
 pub mod staging;
