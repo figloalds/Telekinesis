@@ -45,12 +45,14 @@ enum Command {
     },
     /// Foreground O1 management supervisor; networking is disabled.
     Orchestrator {
-        #[arg(long)]
+        /// Configuration in the current directory; -f selects another file.
+        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
         defaults_file: PathBuf,
     },
     /// Client of the same-user management API. Mutations require --generation.
     Manage {
-        #[arg(long)]
+        /// Configuration in the current directory; -f selects another file.
+        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
         defaults_file: PathBuf,
         #[command(subcommand)]
         action: ManagementCommand,
@@ -492,6 +494,93 @@ fn lock_state(state: &Path) -> Result<std::fs::File> {
         use std::os::windows::fs::OpenOptionsExt;
         opts.share_mode(0);
     }
-    opts.open(state.join("owner.lock"))
-        .context("STATE_ALREADY_OWNED")
+    let file = opts
+        .open(state.join("owner.lock"))
+        .context("STATE_ALREADY_OWNED")?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::metadata(state)?;
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() },
+            "STATE_OWNER_MISMATCH"
+        );
+        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700))?;
+        ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "STATE_ALREADY_OWNED: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(file)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn orchestrator_configuration_defaults_to_current_directory_only() {
+        let args = Args::try_parse_from(["tkfs", "orchestrator"]).unwrap();
+        let Command::Orchestrator { defaults_file } = args.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(defaults_file, PathBuf::from("orchestrator.toml"));
+        let args = Args::try_parse_from(["tkfs", "manage", "list"]).unwrap();
+        let Command::Manage { defaults_file, .. } = args.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(defaults_file, PathBuf::from("orchestrator.toml"));
+    }
+
+    #[test]
+    fn explicit_configuration_and_short_alias_preserve_paths_with_spaces() {
+        for option in ["--defaults-file", "-f"] {
+            let args = Args::try_parse_from([
+                "tkfs",
+                "manage",
+                option,
+                "some directory/custom.toml",
+                "list",
+            ])
+            .unwrap();
+            let Command::Manage { defaults_file, .. } = args.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(defaults_file, PathBuf::from("some directory/custom.toml"));
+            let args = Args::try_parse_from([
+                "tkfs",
+                "orchestrator",
+                option,
+                "some directory/custom.toml",
+            ])
+            .unwrap();
+            let Command::Orchestrator { defaults_file } = args.command else {
+                panic!("wrong command")
+            };
+            assert_eq!(defaults_file, PathBuf::from("some directory/custom.toml"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn selected_configuration_rejects_missing_invalid_and_resolves_relative_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("orchestrator.toml");
+        let error = tkfs::orchestrator::Config::load(&missing).unwrap_err();
+        assert!(format!("{error:#}").contains("ORCHESTRATOR_CONFIG_NOT_FOUND"));
+        std::fs::write(&missing, "not valid toml [").unwrap();
+        let error = tkfs::orchestrator::Config::load(&missing).unwrap_err();
+        assert!(format!("{error:#}").contains("INVALID_ORCHESTRATOR_CONFIG"));
+        let explicit = directory.path().join("config with spaces.toml");
+        std::fs::write(&explicit, "format_version=1\ndata_directory='data'\n[control]\ntransport='named-pipe'\nname='cli-fixture-only'\n").unwrap();
+        let config = tkfs::orchestrator::Config::load(&explicit).unwrap();
+        assert_eq!(
+            config.data_directory,
+            std::fs::canonicalize(directory.path())
+                .unwrap()
+                .join("data")
+        );
+    }
 }

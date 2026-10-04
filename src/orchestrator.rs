@@ -60,8 +60,11 @@ impl Default for Workers {
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let path = fs::canonicalize(path)?;
-        let mut config: Self = toml::from_str(&fs::read_to_string(&path)?)?;
+        let path = fs::canonicalize(path).with_context(|| {
+            format!("ORCHESTRATOR_CONFIG_NOT_FOUND: {}; run in the directory containing orchestrator.toml or select --defaults-file / -f", path.display())
+        })?;
+        let mut config: Self = toml::from_str(&fs::read_to_string(&path)?)
+            .with_context(|| format!("INVALID_ORCHESTRATOR_CONFIG: {}", path.display()))?;
         ensure!(config.format_version == 1, "UNSUPPORTED_CONFIG_VERSION");
         if let Some(identity) = &config.installation_id {
             uuid::Uuid::parse_str(identity).context("INVALID_INSTALLATION_ID")?;
