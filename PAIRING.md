@@ -1,6 +1,8 @@
 # Paired published-data service (first bounded slice)
 
 `tkfs pairing -f pairing.toml ...` manages a separate portable data service.
+For one-port WSS and outbound-only home clients, see
+[PAIRING-WSS.md](PAIRING-WSS.md). Raw TLS remains the default compatibility mode.
 The default is `./pairing.toml` in the current directory; there is no parent or
 global config search. Relative paths in the file resolve beside that file.
 Windows O1/GUI catalog management remains separate and Windows-only. This service

@@ -57,6 +57,14 @@ pub fn offer(
     grant: &SyncConfiguration,
     inventory: Option<&SyncPage>,
 ) -> Result<SyncPage> {
+    offer_bounded(engine, grant, inventory, MAX_FRAME)
+}
+pub(crate) fn offer_bounded(
+    engine: &Engine,
+    grant: &SyncConfiguration,
+    inventory: Option<&SyncPage>,
+    maximum: usize,
+) -> Result<SyncPage> {
     binding(engine, grant)?;
     let known = inventory
         .map(|page| Ok(page.known.clone()))
@@ -67,13 +75,25 @@ pub fn offer(
     let offsets = inventory
         .map(|page| Ok(page.partial_objects.clone()))
         .unwrap_or_else(|| engine.store.peer_partial_objects(&grant.remote_replica))?;
-    let bundle = engine
-        .store
-        .shared_page(&known, &objects, MAX_FRAME - 12 * 1024 * 1024)?;
-    let parts =
-        engine
-            .store
-            .shared_parts(&bundle, &objects, &offsets, MAX_FRAME - 8 * 1024 * 1024)?;
+    let bundle = engine.store.shared_page(
+        &known,
+        &objects,
+        if maximum == MAX_FRAME {
+            MAX_FRAME - 12 * 1024 * 1024
+        } else {
+            maximum / 4
+        },
+    )?;
+    let parts = engine.store.shared_parts(
+        &bundle,
+        &objects,
+        &offsets,
+        if maximum == MAX_FRAME {
+            MAX_FRAME - 8 * 1024 * 1024
+        } else {
+            maximum / 2
+        },
+    )?;
     Ok(SyncPage {
         format: PEER_FORMAT,
         repo: engine.store.repo.clone(),
@@ -163,13 +183,18 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
     }
     let grant: SyncConfiguration = serde_json::from_value(payload["grant"].clone())?;
     binding(engine, &grant)?;
+    let maximum = payload["max_frame"].as_u64().unwrap_or(MAX_FRAME as u64) as usize;
+    ensure!(
+        (1024 * 1024..=MAX_FRAME).contains(&maximum),
+        "INVALID_PAGE_BUDGET"
+    );
     match op {
-        "published-offer" => Ok(json!(offer(engine, &grant, None)?)),
+        "published-offer" => Ok(json!(offer_bounded(engine, &grant, None, maximum)?)),
         "published-exchange" => {
             let page: SyncPage = serde_json::from_value(payload["page"].clone())?;
             ensure!(page.reply_to.is_none(), "INVALID_SYNC_REQUEST");
             let ack = receive(engine, &grant, &page)?;
-            let mut response = offer(engine, &grant, Some(&page))?;
+            let mut response = offer_bounded(engine, &grant, Some(&page), maximum)?;
             response.ack = ack;
             Ok(json!(response))
         }

@@ -108,6 +108,9 @@ fn fixture(path: &Path, ports: (&str, &str)) -> (Config, PathBuf, PathBuf, Ident
     };
     let config = Config {
         format_version: 1,
+        transport: tkfs::pairing_service::Transport::Tls,
+        inbound: true,
+        dial: true,
         installation: identity.installation.clone(),
         data_directory: path.join("data"),
         credential,
@@ -122,6 +125,13 @@ fn fixture(path: &Path, ports: (&str, &str)) -> (Config, PathBuf, PathBuf, Ident
 }
 #[test]
 fn cli_pairing_and_configured_sync_resume_after_both_worker_and_service_process_restarts() {
+    process_flow(false);
+}
+#[test]
+fn wss_outbound_only_home_single_vps_ingress_two_way_sync_and_process_restart() {
+    process_flow(true);
+}
+fn process_flow(wss: bool) {
     let temp = tempfile::tempdir().unwrap();
     let reserved: Vec<_> = (0..4)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -130,8 +140,23 @@ fn cli_pairing_and_configured_sync_resume_after_both_worker_and_service_process_
         .iter()
         .map(|listener| listener.local_addr().unwrap().to_string())
         .collect();
-    let (ca, pa, ka, ia) = fixture(&temp.path().join("a"), (&ports[0], &ports[1]));
-    let (cb, pb, kb, ib) = fixture(&temp.path().join("b"), (&ports[2], &ports[3]));
+    let (mut ca, pa, ka, ia) = fixture(&temp.path().join("a"), (&ports[0], &ports[1]));
+    let (mut cb, pb, kb, ib) = fixture(&temp.path().join("b"), (&ports[2], &ports[3]));
+    if wss {
+        ca.transport = tkfs::pairing_service::Transport::Wss;
+        ca.dial = false;
+        ca.enrollment_listen.clear();
+        ca.advertise = format!("wss://{}/tkfs/sync", ca.listen);
+        ca.enrollment_advertise = format!("wss://{}/tkfs/enroll", ca.listen);
+        cb.transport = tkfs::pairing_service::Transport::Wss;
+        cb.inbound = false;
+        cb.listen.clear();
+        cb.enrollment_listen.clear();
+        cb.enrollment_advertise.clear();
+        cb.advertise = "outbound-only".into();
+        std::fs::write(&pa, toml::to_string(&ca).unwrap()).unwrap();
+        std::fs::write(&pb, toml::to_string(&cb).unwrap()).unwrap();
+    }
     drop(reserved);
     let repo = id();
     let da = id();
@@ -146,8 +171,13 @@ fn cli_pairing_and_configured_sync_resume_after_both_worker_and_service_process_
     let mut service_a = service(&pa, &ka, &temp.path().join("service-a.log"));
     let mut service_b = service(&pb, &kb, &temp.path().join("service-b.log"));
     wait(|| {
-        std::net::TcpStream::connect(&ca.enrollment_listen).is_ok()
-            && std::net::TcpStream::connect(&cb.enrollment_listen).is_ok()
+        if wss {
+            std::net::TcpStream::connect(&ca.listen).is_ok()
+                && service_b.0.try_wait().unwrap().is_none()
+        } else {
+            std::net::TcpStream::connect(&ca.enrollment_listen).is_ok()
+                && std::net::TcpStream::connect(&cb.enrollment_listen).is_ok()
+        }
     });
     let invitation = ca
         .registry()
@@ -225,6 +255,25 @@ fn cli_pairing_and_configured_sync_resume_after_both_worker_and_service_process_
             .is_ok_and(|value| serde_json::to_string(&value).unwrap().contains("first.txt"))
     });
     drop(service_a);
+    if wss {
+        rpc(
+            &sb,
+            json!({"op":"import","path":"home-upload.txt","hex":hex::encode(b"outbound upload")}),
+        )
+        .unwrap();
+        // Restart the VPS; an existing home pool must recover stale sessions.
+        service_a = service(&pa, &ka, &temp.path().join("service-a.log"));
+        wait(|| {
+            rpc(&sa, json!({"op":"state"})).is_ok_and(|value| {
+                serde_json::to_string(&value)
+                    .unwrap()
+                    .contains("home-upload.txt")
+            })
+        });
+        assert!(std::net::TcpListener::bind(&ports[2]).is_ok());
+        assert!(std::net::TcpListener::bind(&ports[3]).is_ok());
+        drop(service_a);
+    }
     drop(service_b);
     drop(wa);
     drop(wb);

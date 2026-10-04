@@ -19,3 +19,4 @@ pub mod pairing_service;
 pub mod private_storage;
 pub mod runtime;
 pub mod staging;
+mod wss_transport;

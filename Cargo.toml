@@ -22,6 +22,8 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "crypto"] }
 zeroize = "1.8"
 subtle = "2.6"
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+data-encoding = "2"
 
 [target.'cfg(windows)'.dependencies]
 slint = { version = "=1.17.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2"] }

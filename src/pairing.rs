@@ -66,6 +66,59 @@ impl Identity {
         config.resumption = rustls::client::Resumption::disabled();
         Ok(Arc::new(config))
     }
+    pub(crate) fn tls_wss_client(
+        &self,
+        peer: &Peer,
+        enrollment: bool,
+    ) -> Result<Arc<rustls::ClientConfig>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(peer.certificate.clone().into())?;
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots);
+        let mut config = if enrollment {
+            builder.with_no_client_auth()
+        } else {
+            builder.with_client_auth_cert(self.certificate_chain(), self.key())?
+        };
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.enable_early_data = false;
+        config.resumption = rustls::client::Resumption::disabled();
+        Ok(Arc::new(config))
+    }
+    pub(crate) fn tls_wss_server(&self, peers: &[Peer]) -> Result<Arc<rustls::ServerConfig>> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])?;
+        let mut roots = rustls::RootCertStore::empty();
+        for peer in peers.iter().filter(|peer| !peer.revoked) {
+            roots.add(peer.certificate.clone().into())?;
+        }
+        // Anonymous TLS is solely for enrollment. Every sync upgrade requires
+        // an actual verified certificate AND fresh registry authorization.
+        let mut config = if roots.is_empty() {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(self.certificate_chain(), self.key())?
+        } else {
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider,
+            )
+            .allow_unauthenticated()
+            .build()?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(self.certificate_chain(), self.key())?
+        };
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.max_early_data_size = 0;
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.send_tls13_tickets = 0;
+        Ok(Arc::new(config))
+    }
     pub fn tls_server(
         &self,
         peers: &[Peer],
@@ -476,11 +529,15 @@ impl Registry {
             "INVALID_PAIR_CERTIFICATE"
         );
         ensure!(
-            peer.endpoint
-                .parse::<std::net::SocketAddr>()
-                .context("PAIR_ENDPOINT_REQUIRES_NUMERIC_ADDRESS")?
-                .port()
-                != 0,
+            peer.endpoint == "outbound-only"
+                || (peer.endpoint.starts_with("wss://")
+                    && crate::wss_transport::endpoint(&peer.endpoint, false).is_ok())
+                || peer
+                    .endpoint
+                    .parse::<std::net::SocketAddr>()
+                    .context("PAIR_ENDPOINT_REQUIRES_NUMERIC_ADDRESS")?
+                    .port()
+                    != 0,
             "INVALID_PAIR_ENDPOINT"
         );
         let mut roots = rustls::RootCertStore::empty();

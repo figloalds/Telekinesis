@@ -40,18 +40,26 @@ impl Default for Limits {
 }
 /// Every socket read/write uses the remaining absolute budget. Progress never
 /// extends it. Cancellation is polled even when the peer only trickles bytes.
-struct BudgetSocket {
+pub(crate) struct BudgetSocket {
     socket: TcpStream,
     deadline: Instant,
     stop: Arc<AtomicBool>,
+    read_left: usize,
+    write_left: usize,
 }
 impl BudgetSocket {
-    fn new(socket: TcpStream, budget: Duration, stop: Arc<AtomicBool>) -> std::io::Result<Self> {
+    pub(crate) fn new(
+        socket: TcpStream,
+        budget: Duration,
+        stop: Arc<AtomicBool>,
+    ) -> std::io::Result<Self> {
         socket.set_nonblocking(false)?;
         Ok(Self {
             socket,
             deadline: Instant::now() + budget,
             stop,
+            read_left: 128 * 1024,
+            write_left: 128 * 1024,
         })
     }
     fn remaining(&self) -> std::io::Result<Duration> {
@@ -70,15 +78,27 @@ impl BudgetSocket {
         }
         Ok(remaining.min(Duration::from_millis(100)))
     }
-    fn stage(&mut self, budget: Duration, total: Instant) {
+    pub(crate) fn stage(&mut self, budget: Duration, total: Instant) {
         self.deadline = (Instant::now() + budget).min(total);
+        self.limit(runtime::MAX_FRAME + 1024 * 1024);
+    }
+    pub(crate) fn limit(&mut self, maximum: usize) {
+        self.read_left = maximum;
+        self.write_left = maximum;
     }
 }
 impl Read for BudgetSocket {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         loop {
+            if self.read_left == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "PAIRING_IO_BUDGET",
+                ));
+            }
             self.socket.set_read_timeout(Some(self.remaining()?))?;
-            match self.socket.read(bytes) {
+            let count = bytes.len().min(self.read_left);
+            match self.socket.read(&mut bytes[..count]) {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -87,7 +107,11 @@ impl Read for BudgetSocket {
                 {
                     continue;
                 }
-                result => return result,
+                Ok(count) => {
+                    self.read_left -= count;
+                    return Ok(count);
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -95,8 +119,17 @@ impl Read for BudgetSocket {
 impl Write for BudgetSocket {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         loop {
+            if self.write_left == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "PAIRING_IO_BUDGET",
+                ));
+            }
             self.socket.set_write_timeout(Some(self.remaining()?))?;
-            match self.socket.write(bytes) {
+            match self
+                .socket
+                .write(&bytes[..bytes.len().min(self.write_left)])
+            {
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -105,7 +138,11 @@ impl Write for BudgetSocket {
                 {
                     continue;
                 }
-                result => return result,
+                Ok(count) => {
+                    self.write_left -= count;
+                    return Ok(count);
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -127,10 +164,30 @@ pub struct Config {
     pub installation: String,
     pub data_directory: PathBuf,
     pub credential: CredentialSource,
+    #[serde(default)]
+    pub transport: Transport,
+    #[serde(default = "yes")]
+    pub inbound: bool,
+    #[serde(default = "yes")]
+    pub dial: bool,
+    #[serde(default)]
     pub listen: String,
+    #[serde(default)]
     pub enrollment_listen: String,
+    #[serde(default)]
     pub advertise: String,
+    #[serde(default)]
     pub enrollment_advertise: String,
+}
+fn yes() -> bool {
+    true
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    #[default]
+    Tls,
+    Wss,
 }
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
@@ -143,15 +200,19 @@ impl Config {
             "UNSUPPORTED_PAIRING_CONFIG_VERSION"
         );
         uuid::Uuid::parse_str(&config.installation)?;
-        for listen in [
-            &config.listen,
-            &config.enrollment_listen,
-            &config.advertise,
-            &config.enrollment_advertise,
-        ] {
-            listen
-                .parse::<std::net::SocketAddr>()
-                .context("INVALID_LISTEN_ADDRESS")?;
+        if config.transport == Transport::Wss {
+            crate::wss_transport::validate_config(&config)?;
+        } else {
+            for listen in [
+                &config.listen,
+                &config.enrollment_listen,
+                &config.advertise,
+                &config.enrollment_advertise,
+            ] {
+                listen
+                    .parse::<std::net::SocketAddr>()
+                    .context("INVALID_LISTEN_ADDRESS")?;
+            }
         }
         let parent = path.parent().unwrap();
         if config.data_directory.is_relative() {
@@ -206,10 +267,20 @@ pub fn worker(
     request: Option<&str>,
     sent: Option<Value>,
 ) -> Result<Value> {
+    worker_bounded(grant, op, page, request, sent, runtime::MAX_FRAME)
+}
+fn worker_bounded(
+    grant: &SyncConfiguration,
+    op: &str,
+    page: Option<Value>,
+    request: Option<&str>,
+    sent: Option<Value>,
+    maximum: usize,
+) -> Result<Value> {
     runtime::rpc(
         &local_runtime(grant)?,
         &id(),
-        json!({"op":op,"grant":grant,"page":page,"request":request,"sent":sent}),
+        json!({"op":op,"grant":grant,"page":page,"request":request,"sent":sent,"max_frame":maximum}),
     )
 }
 fn frame<T: Serialize>(stream: &mut impl Write, value: &T) -> Result<()> {
@@ -282,9 +353,9 @@ fn client_budget(
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Enrollment {
-    invitation: Invitation,
-    candidate: Peer,
+pub(crate) struct Enrollment {
+    pub(crate) invitation: Invitation,
+    pub(crate) candidate: Peer,
 }
 pub fn join(config: &Config, invitation: Invitation) -> Result<Value> {
     join_with_identity(config, &config.identity()?, invitation)
@@ -305,7 +376,6 @@ fn join_with_identity(
     let mut issuer = invitation.issuer.clone();
     let id = invitation.id.clone();
     issuer.endpoint = invitation.enrollment_endpoint.clone();
-    let mut stream = client(identity, &issuer, true)?;
     let candidate = Peer {
         installation: identity.installation.clone(),
         certificate: identity.certificate.clone(),
@@ -313,14 +383,17 @@ fn join_with_identity(
         revoked: false,
     };
     let trusted = invitation.issuer.clone();
-    frame(
-        &mut stream,
-        &Enrollment {
-            invitation,
-            candidate,
-        },
-    )?;
-    let response: Value = read(&mut stream, 64 * 1024)?;
+    let enrollment = Enrollment {
+        invitation,
+        candidate,
+    };
+    let response: Value = if issuer.endpoint.starts_with("wss://") {
+        crate::wss_transport::enroll(identity, &issuer, &enrollment)?
+    } else {
+        let mut stream = client(identity, &issuer, true)?;
+        frame(&mut stream, &enrollment)?;
+        read(&mut stream, 64 * 1024)?
+    };
     ensure!(
         response["ok"] == true,
         "ENROLLMENT_REJECTED: {}",
@@ -338,6 +411,23 @@ pub fn remote_list(config: &Config, peer_id: &str) -> Result<Value> {
         .into_iter()
         .find(|peer| peer.installation == peer_id && !peer.revoked)
         .context("PAIR_NOT_FOUND_OR_REVOKED")?;
+    if peer.endpoint.starts_with("wss://") {
+        let response = crate::wss_transport::request(
+            &config.identity()?,
+            &peer,
+            &NetworkRequest::ListPublished {},
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        let _access = registry.begin_access()?;
+        registry.authenticate(&peer.certificate, &peer.installation)?;
+        ensure!(
+            response["ok"] == true,
+            "PUBLISHED_LIST_DENIED: {}",
+            response["error"]
+        );
+        return Ok(response["result"].clone());
+    }
     let mut stream = client(&config.identity()?, &peer, false)?;
     {
         let _access = registry.begin_access()?;
@@ -369,7 +459,17 @@ fn synchronize_with_identity(
         grant,
         Arc::new(AtomicBool::new(false)),
         Limits::default(),
+        None,
     )
+}
+pub(crate) fn synchronize_wss(
+    config: &Config,
+    identity: &Identity,
+    grant: &SyncConfiguration,
+    stop: Arc<AtomicBool>,
+    pool: &crate::wss_transport::Pool,
+) -> Result<Value> {
+    synchronize_budget(config, identity, grant, stop, Limits::default(), Some(pool))
 }
 fn synchronize_budget(
     config: &Config,
@@ -377,6 +477,7 @@ fn synchronize_budget(
     grant: &SyncConfiguration,
     stop: Arc<AtomicBool>,
     limits: Limits,
+    pool: Option<&crate::wss_transport::Pool>,
 ) -> Result<Value> {
     cancelled(&stop)?;
     let registry = config.registry()?;
@@ -393,7 +494,18 @@ fn synchronize_budget(
     let page: SyncPage = {
         let _access = registry.begin_access()?;
         registry.authenticate(&peer.certificate, &peer.installation)?;
-        serde_json::from_value(worker(grant, "published-offer", None, None, None)?)?
+        serde_json::from_value(worker_bounded(
+            grant,
+            "published-offer",
+            None,
+            None,
+            None,
+            if peer.endpoint.starts_with("wss://") {
+                crate::wss_transport::MAX_PAGE
+            } else {
+                runtime::MAX_FRAME
+            },
+        )?)?
     };
     let request = page.request.clone();
     let sent: Vec<_> = page
@@ -403,25 +515,39 @@ fn synchronize_budget(
         .map(|event| event.id.clone())
         .collect();
     cancelled(&stop)?;
-    let mut stream = client_budget(identity, &peer, false, stop.clone(), limits)?;
-    {
-        let _access = registry.begin_access()?;
-        registry.authenticate(&peer.certificate, &peer.installation)?;
-        ensure!(
-            serde_json::to_value(registry.grant(&grant.peer, &grant.repo)?)?
-                == serde_json::to_value(grant)?,
-            "STALE_REPOSITORY_GRANT"
-        );
-        frame(
-            &mut stream,
-            &NetworkRequest::Exchange {
-                repo: grant.repo.clone(),
-                page: Box::new(page),
-            },
-        )?;
-        stream.flush()?;
-    }
-    let response: Value = read(&mut stream, runtime::MAX_FRAME)?;
+    let network_request = NetworkRequest::Exchange {
+        repo: grant.repo.clone(),
+        page: Box::new(page),
+    };
+    let response: Value = if peer.endpoint.starts_with("wss://") {
+        {
+            let _access = registry.begin_access()?;
+            registry.authenticate(&peer.certificate, &peer.installation)?;
+        }
+        crate::wss_transport::authorized_request(
+            config,
+            identity,
+            &peer,
+            &network_request,
+            pool,
+            stop.clone(),
+            grant,
+        )?
+    } else {
+        let mut stream = client_budget(identity, &peer, false, stop.clone(), limits)?;
+        {
+            let _access = registry.begin_access()?;
+            registry.authenticate(&peer.certificate, &peer.installation)?;
+            ensure!(
+                serde_json::to_value(registry.grant(&grant.peer, &grant.repo)?)?
+                    == serde_json::to_value(grant)?,
+                "STALE_REPOSITORY_GRANT"
+            );
+            frame(&mut stream, &network_request)?;
+            stream.flush()?;
+        }
+        read(&mut stream, runtime::MAX_FRAME)?
+    };
     ensure!(response["ok"] == true, "SYNC_DENIED: {}", response["error"]);
     cancelled(&stop)?;
     let _access = registry.begin_access()?;
@@ -439,7 +565,7 @@ fn synchronize_budget(
         Some(json!(sent)),
     )
 }
-fn authenticated(registry: &Registry, certificate: &[u8]) -> Result<Peer> {
+pub(crate) fn authenticated(registry: &Registry, certificate: &[u8]) -> Result<Peer> {
     let peer = registry
         .peers()?
         .into_iter()
@@ -447,11 +573,12 @@ fn authenticated(registry: &Registry, certificate: &[u8]) -> Result<Peer> {
         .context("PAIR_NOT_FOUND")?;
     registry.authenticate(certificate, &peer.installation)
 }
-fn dispatch(
+pub(crate) fn dispatch(
     registry: &Registry,
     peer: &Peer,
     request: NetworkRequest,
     stop: &AtomicBool,
+    maximum: usize,
 ) -> Result<Value> {
     cancelled(stop)?;
     match request {
@@ -477,7 +604,14 @@ fn dispatch(
                 page.sender == grant.remote_replica && page.receiver == grant.local_replica,
                 "REMOTE_REPLICA_BINDING_MISMATCH"
             );
-            worker(&grant, "published-exchange", Some(json!(page)), None, None)
+            worker_bounded(
+                &grant,
+                "published-exchange",
+                Some(json!(page)),
+                None,
+                None,
+                maximum,
+            )
         }
     }
 }
@@ -539,7 +673,7 @@ fn accepted(
                     .as_deref()
                     .context("CLIENT_CERTIFICATE_REQUIRED")?,
             )?;
-            dispatch(&registry, &peer, request, &stop)
+            dispatch(&registry, &peer, request, &stop, runtime::MAX_FRAME)
         })();
         let response = match result {
             Ok(value) => json!({"ok":true,"result":value}),
@@ -555,8 +689,8 @@ fn accepted(
 pub struct Service {
     config: Config,
     identity: Arc<Identity>,
-    sync: TcpListener,
-    enrollment: TcpListener,
+    sync: Option<TcpListener>,
+    enrollment: Option<TcpListener>,
     _lock: std::fs::File,
     _storage: crate::private_storage::Directory,
     limits: Limits,
@@ -566,7 +700,7 @@ impl Service {
         let identity = Arc::new(config.identity()?);
         Self::open_identity(config, identity)
     }
-    fn open_identity(config: Config, identity: Arc<Identity>) -> Result<Self> {
+    pub(crate) fn open_identity(config: Config, identity: Arc<Identity>) -> Result<Self> {
         ensure!(
             identity.installation == config.installation,
             "CREDENTIAL_IDENTITY_MISMATCH"
@@ -598,10 +732,19 @@ impl Service {
                 "PAIRING_SERVICE_ALREADY_RUNNING"
             );
         }
-        let sync = TcpListener::bind(&config.listen)?;
-        let enrollment = TcpListener::bind(&config.enrollment_listen)?;
-        sync.set_nonblocking(true)?;
-        enrollment.set_nonblocking(true)?;
+        let sync = if config.inbound {
+            Some(TcpListener::bind(&config.listen)?)
+        } else {
+            None
+        };
+        let enrollment = if config.inbound && config.transport == Transport::Tls {
+            Some(TcpListener::bind(&config.enrollment_listen)?)
+        } else {
+            None
+        };
+        for listener in [&sync, &enrollment].into_iter().flatten() {
+            listener.set_nonblocking(true)?;
+        }
         Ok(Self {
             config,
             identity,
@@ -613,19 +756,54 @@ impl Service {
         })
     }
     pub fn addresses(&self) -> Result<(String, String)> {
-        Ok((
-            self.sync.local_addr()?.to_string(),
-            self.enrollment.local_addr()?.to_string(),
-        ))
+        let sync = self
+            .sync
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()?;
+        let enrollment = self
+            .enrollment
+            .as_ref()
+            .map(TcpListener::local_addr)
+            .transpose()?;
+        if self.config.transport == Transport::Wss {
+            Ok((
+                sync.map(|address| format!("wss://{address}/tkfs/sync"))
+                    .unwrap_or_else(|| "outbound-only".into()),
+                sync.map(|address| format!("wss://{address}/tkfs/enroll"))
+                    .unwrap_or_else(|| "outbound-only".into()),
+            ))
+        } else {
+            Ok((
+                sync.map(|address| address.to_string())
+                    .unwrap_or_else(|| "outbound-only".into()),
+                enrollment
+                    .map(|address| address.to_string())
+                    .unwrap_or_else(|| "outbound-only".into()),
+            ))
+        }
     }
     pub fn run(self, stop: Arc<AtomicBool>) -> Result<()> {
+        if self.config.transport == Transport::Wss {
+            return crate::wss_transport::run(
+                &self.config,
+                &self.identity,
+                self.sync.as_ref(),
+                stop,
+            );
+        }
         let mut jobs = std::collections::BTreeMap::new();
         let mut inflight = std::collections::BTreeSet::new();
         let (finished, results) = std::sync::mpsc::channel();
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let enroll_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         while !stop.load(Ordering::Relaxed) {
-            for (listener, enrollment) in [(&self.sync, false), (&self.enrollment, true)] {
+            for (listener, enrollment) in [(&self.sync, false), (&self.enrollment, true)]
+                .into_iter()
+                .filter_map(|(listener, enrollment)| {
+                    listener.as_ref().map(|listener| (listener, enrollment))
+                })
+            {
                 if let Ok((socket, _)) = listener.accept() {
                     let counter = if enrollment { &enroll_active } else { &active };
                     let maximum = if enrollment { 2 } else { 8 };
@@ -681,7 +859,7 @@ impl Service {
             }
             for grant in grants
                 .into_iter()
-                .filter(|grant| grant.enabled && approved.contains(&grant.peer))
+                .filter(|grant| self.config.dial && grant.enabled && approved.contains(&grant.peer))
             {
                 let key = (grant.peer.clone(), grant.repo.clone());
                 let job = jobs
@@ -698,7 +876,7 @@ impl Service {
                 let stop = stop.clone();
                 let limits = self.limits;
                 std::thread::spawn(move || {
-                    let result = synchronize_budget(&config, &identity, &grant, stop, limits);
+                    let result = synchronize_budget(&config, &identity, &grant, stop, limits, None);
                     let _ = finished.send((grant, result));
                 });
             }
@@ -813,6 +991,9 @@ mod tests {
     fn fixture_config(path: &Path, identity: &Identity) -> Config {
         Config {
             format_version: 1,
+            transport: Transport::Tls,
+            inbound: true,
+            dial: true,
             installation: identity.installation.clone(),
             data_directory: path.into(),
             credential: CredentialSource::WindowsDpapi {

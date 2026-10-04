@@ -25,3 +25,10 @@ public installer or a qualified release package.
 
 WinFsp remains a separately installed system prerequisite with its own license.
 The desktop app does not install WinFsp, alter PATH, or configure a service.
+
+The one-port published-data adapter uses Tungstenite 0.28.0, licensed MIT OR
+Apache-2.0, https://github.com/snapview/tungstenite-rs. Its `handshake` feature
+runs over the existing Rustls stream; it adds no separate TLS provider or async
+runtime. Data-encoding 2.11.1 (MIT) validates the WebSocket upgrade nonce.
+Cargo.lock records the official archive checksums. These debug validation
+binaries retain the existing local-prototype/public-release limits above.

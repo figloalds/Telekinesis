@@ -309,6 +309,7 @@ fn pairing_command(path: &Path, action: &PairingCommand) -> Result<()> {
             json!({"installation":config.installation,"credential":credential,"peers":registry.peers()?.into_iter().map(|peer|json!({"installation":peer.installation,"fingerprint":peer.fingerprint(),"revoked":peer.revoked})).collect::<Vec<_>>(),"invitations":registry.pending()?,"syncs":registry.statuses()?})
         }
         PairingCommand::Invite { lifetime_seconds } => {
+            ensure!(config.inbound, "OUTBOUND_ONLY_CANNOT_ISSUE_INVITATIONS");
             let lifetime = lifetime_seconds
                 .checked_mul(1000)
                 .context("INVALID_INVITATION_LIFETIME")?;

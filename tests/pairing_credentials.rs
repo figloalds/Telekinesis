@@ -26,6 +26,9 @@ fn systemd_source_reports_locked_missing_invalid_and_refuses_unprotected_or_syml
     let identity = Identity::generate(&id()).unwrap();
     let config = Config {
         format_version: 1,
+        transport: tkfs::pairing_service::Transport::Tls,
+        inbound: true,
+        dial: true,
         installation: identity.installation.clone(),
         data_directory: temp.path().join("private-state"),
         credential: CredentialSource::Systemd {

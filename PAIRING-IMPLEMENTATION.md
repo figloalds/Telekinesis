@@ -75,3 +75,11 @@ regressions cover slow trickles, paired progress and shutdown, foreign-owner
 security descriptors, writable registry/sidecar/ancestor fixtures, junctions,
 hardlinks and blocked replacement. See the validation record for exact runs and
 the development machine's unsafe AppData ancestor constraint.
+
+The one-port WSS follow-up keeps this portable service separate from O1 and
+adds an explicit outbound-only home mode with dialing independent of grants.
+Direct TLS termination, approved certificates, local enrollment approval,
+fresh per-operation authorization, device-wide connection/rate quotas, reserved
+control/bulk lanes, bounded pages and persistent pools are implemented. Raw TLS
+mode remains compatible. See `PAIRING-WSS.md` and `WSS-VALIDATION.json` for the
+tested command flow, limits and remaining lifecycle/topology boundaries.
