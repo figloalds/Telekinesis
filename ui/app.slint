@@ -1,17 +1,27 @@
-import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint, Palette } from "std-widgets.slint";
 
 export struct Project { label: string, id: string, status: string, mount: string, desired: bool }
 
-component Caption inherits Text { color: #657581; font-size: 13px; }
-component Heading inherits Text { color: #142e3c; font-size: 26px; font-weight: 700; }
+// Standard controls and custom surfaces share Slint's resolved system palette.
+// Translucent Fluent controls must never sit on a fixed opposite-theme panel.
+export global AppTheme {
+    out property <brush> background: Palette.background;
+    out property <brush> surface: Palette.alternate-background;
+    out property <brush> foreground: Palette.foreground;
+    out property <brush> muted: Palette.foreground.with-alpha(0.78);
+    out property <brush> border: Palette.border;
+}
+
+component Caption inherits Text { color: AppTheme.muted; font-size: 13px; }
+component Heading inherits Text { color: AppTheme.foreground; font-size: 26px; font-weight: 700; }
 component Card inherits Rectangle {
-    background: white; border-color: #dde5e6; border-width: 1px; border-radius: 12px;
+    background: AppTheme.surface; border-color: AppTheme.border; border-width: 1px; border-radius: 12px;
 }
 
 export component App inherits Window {
     title: "Telekinesis";
     preferred-width: 1180px; preferred-height: 820px; min-width: 980px; min-height: 720px;
-    background: #f4f7f7; default-font-family: "Segoe UI"; default-font-size: 14px;
+    background: AppTheme.background; default-font-family: "Segoe UI"; default-font-size: 14px;
     in-out property <bool> first-run;
     in-out property <bool> connected;
     in-out property <bool> working;
@@ -20,6 +30,10 @@ export component App inherits Window {
     in-out property <bool> shutdown-visible;
     in-out property <bool> can-retry;
     private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible;
+    out property <bool> can-start-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (!root.projects[root.selected].desired || root.projects[root.selected].status == "Unavailable");
+    out property <bool> can-stop-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (root.projects[root.selected].desired || root.projects[root.selected].status != "Stopped");
+    out property <bool> can-start-supervisor: !root.working && !root.modal && !root.first-run;
+    out property <bool> can-stop-supervisor: root.connected && !root.working && !root.modal;
     in-out property <string> connection: "Connecting…";
     in-out property <string> config-path;
     in-out property <string> data-folder;
@@ -48,6 +62,9 @@ export component App inherits Window {
     callback browse(int);
     callback open-project;
     callback focus-project-name;
+    // App-local override used by acceptance; no Windows settings are changed.
+    callback set-theme(int);
+    set-theme(mode) => { Palette.color-scheme = mode == 1 ? ColorScheme.light : mode == 2 ? ColorScheme.dark : ColorScheme.unknown; }
     focus-project-name => { project-name-edit.focus(); }
 
     HorizontalLayout {
@@ -65,7 +82,7 @@ export component App inherits Window {
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 Text { text: "LOCAL MODE"; color: #8de0c4; font-size: 11px; font-weight: 700; }
                 Text { text: "Background workers keep your projects available when you close this window."; color: #afc4cf; font-size: 13px; wrap: word-wrap; }
-                Button { text: "About Telekinesis"; enabled: !root.modal; clicked => { root.about-visible = true; } }
+                Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; HorizontalLayout { padding: 4px; Button { text: "About Telekinesis"; enabled: !root.modal; clicked => { root.about-visible = true; } } } }
                 Text { text: "Made with Slint"; color: #afc4cf; font-size: 12px; }
             }
         }
@@ -78,7 +95,7 @@ export component App inherits Window {
                     Caption { text: root.first-run ? "One portable installation, independent local workspaces." : "Manage the workspaces running on this computer."; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                Button { text: root.connected ? "Refresh" : "Reconnect"; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
+                Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
                 Button { text: "+ New project"; primary: true; enabled: root.connected && !root.working && !root.modal; visible: !root.first-run; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
             }
             Card {
@@ -86,7 +103,7 @@ export component App inherits Window {
                 HorizontalLayout {
                     padding: 16px; spacing: 12px;
                     Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.connected ? #239675 : #c18c3f; }
-                    Text { text: root.connection; color: #142e3c; vertical-alignment: center; overflow: elide; }
+                    Text { text: root.connection; color: AppTheme.foreground; vertical-alignment: center; overflow: elide; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
                     Caption { text: root.working ? "Working…" : "Local only"; vertical-alignment: center; }
                 }
@@ -94,16 +111,16 @@ export component App inherits Window {
             if root.first-run: Card {
                 VerticalLayout {
                     padding: 26px; spacing: 16px;
-                    Text { text: "Choose two separate folders"; color: #142e3c; font-size: 19px; font-weight: 600; }
+                    Text { text: "Choose two separate folders"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
                     Caption { text: "Native data holds the catalog and durable history. Project folders contain the mounted views you use in Explorer."; wrap: word-wrap; }
-                    Text { text: "Native data folder (new or empty)"; color: #142e3c; }
+                    Text { text: "Native data folder (new or empty)"; color: AppTheme.foreground; }
                     HorizontalLayout { LineEdit { accessible-label: "Native data folder"; text <=> root.data-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(0); } } }
-                    Text { text: "Parent folder for project mounts"; color: #142e3c; }
+                    Text { text: "Parent folder for project mounts"; color: AppTheme.foreground; }
                     HorizontalLayout { LineEdit { accessible-label: "Project mount parent folder"; text <=> root.mount-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(1); } } }
-                    HorizontalLayout { Text { text: "Maximum running projects"; color: #142e3c; vertical-alignment: center; } SpinBox { value <=> root.worker-limit; minimum: 1; maximum: 64; enabled: !root.working && !root.modal; } Rectangle { horizontal-stretch: 1; } }
-                    Rectangle { height: 1px; background: #dde5e6; }
+                    HorizontalLayout { Text { text: "Maximum running projects"; color: AppTheme.foreground; vertical-alignment: center; } SpinBox { value <=> root.worker-limit; minimum: 1; maximum: 64; enabled: !root.working && !root.modal; } Rectangle { horizontal-stretch: 1; } }
+                    Rectangle { height: 1px; background: AppTheme.border; }
                     Caption { text: "Configuration is saved beside this application:"; }
-                    Text { text: root.config-path; color: #142e3c; wrap: word-wrap; font-size: 12px; }
+                    Text { text: root.config-path; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                     Caption { text: "Mounting requires the installed WinFsp runtime. No network connection or service is configured."; wrap: word-wrap; }
                     HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Save and connect"; primary: true; enabled: !root.working && !root.modal; clicked => { root.setup(); } } }
                     Rectangle { vertical-stretch: 1; }
@@ -115,10 +132,10 @@ export component App inherits Window {
                     width: 300px;
                     VerticalLayout {
                         padding: 16px; spacing: 12px;
-                        Text { text: "WORKSPACES"; color: #657581; font-size: 11px; font-weight: 700; }
+                        Text { text: "WORKSPACES"; color: AppTheme.muted; font-size: 11px; font-weight: 700; }
                         if root.projects.length == 0: VerticalLayout {
                             spacing: 12px;
-                            Text { text: root.connected ? "Your first project starts here" : "Projects are unavailable"; color: #142e3c; font-size: 19px; font-weight: 600; wrap: word-wrap; }
+                            Text { text: root.connected ? "Your first project starts here" : "Projects are unavailable"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; wrap: word-wrap; }
                             Caption { text: root.connected ? "Create a project and choose its mount folder. Its history stays in your native data folder." : "Reconnect to load the catalog. Existing project data is preserved."; wrap: word-wrap; }
                             Rectangle { vertical-stretch: 1; }
                         }
@@ -134,16 +151,16 @@ export component App inherits Window {
                 Card {
                     VerticalLayout {
                         padding: 22px; spacing: 14px;
-                        Text { text: root.selected >= 0 && root.selected < root.projects.length ? root.projects[root.selected].label : "Project details"; color: #142e3c; font-size: 22px; font-weight: 600; }
+                        Text { text: root.selected >= 0 && root.selected < root.projects.length ? root.projects[root.selected].label : "Project details"; color: AppTheme.foreground; font-size: 22px; font-weight: 600; }
                         if root.selected >= 0 && root.selected < root.projects.length: HorizontalLayout {
                             Button { text: "Open folder"; enabled: root.connected && !root.working && !root.modal && (root.projects[root.selected].status == "Running" || root.projects[root.selected].status == "Needs attention" || root.projects[root.selected].status == "Stopping · files in use") && root.projects[root.selected].mount != ""; clicked => { root.open-project(); } }
-                            Button { text: "Start"; enabled: root.connected && !root.working && !root.modal; clicked => { root.start-project(); } }
-                            Button { text: "Stop"; enabled: root.connected && !root.working && !root.modal; clicked => { root.stop-project(); } }
+                            Button { text: "Start project"; enabled: root.can-start-project; clicked => { root.start-project(); } }
+                            Button { text: "Stop project"; enabled: root.can-stop-project; clicked => { root.stop-project(); } }
                         }
                         ScrollView { VerticalLayout {
                             spacing: 16px;
-                            Text { text: root.status-detail; color: #334c59; wrap: word-wrap; font-size: 13px; }
-                            Text { text: root.branches-detail; color: #334c59; wrap: word-wrap; font-size: 13px; }
+                            Text { text: root.status-detail; color: AppTheme.foreground; wrap: word-wrap; font-size: 13px; }
+                            Text { text: root.branches-detail; color: AppTheme.foreground; wrap: word-wrap; font-size: 13px; }
                             Rectangle { vertical-stretch: 1; }
                         } }
                     }
@@ -160,14 +177,15 @@ export component App inherits Window {
             if root.operation-detail != "": Card {
                 max-height: 120px; min-height: 65px;
                 HorizontalLayout { padding: 12px; spacing: 10px;
-                    ScrollView { Text { text: root.operation-detail; color: #657581; font-size: 12px; wrap: word-wrap; } }
+                    ScrollView { Text { text: root.operation-detail; color: AppTheme.muted; font-size: 12px; wrap: word-wrap; } }
                     Button { text: "Inspect operation"; enabled: !root.working && !root.modal && root.connected; clicked => { root.inspect-operation(); } }
                 }
             }
             if !root.first-run: HorizontalLayout {
                 Caption { text: "Closing this window keeps your projects running."; }
                 Rectangle { horizontal-stretch: 1; }
-                Button { text: "Shut down supervisor…"; enabled: root.connected && !root.working && !root.modal; clicked => { root.shutdown-visible = true; } }
+                Button { text: "Reconnect supervisor"; visible: root.connected; enabled: root.can-start-supervisor; clicked => { root.connect(); } }
+                Button { text: "Shut down supervisor…"; enabled: root.can-stop-supervisor; clicked => { root.shutdown-visible = true; } }
             }
         }
     }
@@ -178,9 +196,9 @@ export component App inherits Window {
             VerticalLayout { padding: 26px; spacing: 15px;
                 Heading { text: "New project"; }
                 Caption { text: "Creates a new independent local store and starts its worker."; wrap: word-wrap; }
-                Text { text: "Project name"; color: #142e3c; }
+                Text { text: "Project name"; color: AppTheme.foreground; }
                 project-name-edit := LineEdit { accessible-label: "Project name"; text <=> root.project-name; placeholder-text: "My project"; enabled: !root.working; }
-                Text { text: "Mount path (a new folder, with an existing parent)"; color: #142e3c; }
+                Text { text: "Mount path (a new folder, with an existing parent)"; color: AppTheme.foreground; }
                 HorizontalLayout { LineEdit { accessible-label: "Project mount path"; text <=> root.project-mount; placeholder-text: "Leave blank to use the default parent + project name"; enabled: !root.working; } Button { text: "Parent…"; enabled: !root.working; clicked => { root.browse(2); } } }
                 Caption { text: "The final mount folder must not already exist. Native data remains separate."; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }

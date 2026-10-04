@@ -644,6 +644,12 @@ fn snapshot(ui: &App, path: &Path) -> Result<()> {
 }
 fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
     use slint::Model;
+    let theme = std::env::var("TKFS_UI_TEST_THEME").unwrap_or_else(|_| "system".into());
+    match theme.as_str() {
+        "light" => ui.invoke_set_theme(1),
+        "dark" => ui.invoke_set_theme(2),
+        _ => {}
+    }
     let directory = report
         .parent()
         .context("REPORT_PARENT_REQUIRED")?
@@ -672,7 +678,9 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
                 match step {
                     0=>{ensure!(ui.get_connected(),"REOPEN_NOT_CONNECTED: {}",ui.get_message());ensure!(ui.get_projects().row_count()==2,"REOPEN_PROJECT_COUNT");snapshot(&ui,&directory.join("reopened.bmp"))?;checks.push("existing config reconnects to both running projects".into());ui.set_about_visible(true);step=1;},
                     1=>{snapshot(&ui,&directory.join("about.bmp"))?;ui.set_about_visible(false);ui.invoke_shutdown();step=2;},
-                    _=>{ensure!(!ui.get_connected()&&!ui.get_error(),"SHUTDOWN_FAILED: {}",ui.get_message());checks.push("explicit GUI shutdown cooperatively stops test workers".into());snapshot(&ui,&directory.join("shutdown.bmp"))?;return Ok(true);}
+                    2=>{ensure!(!ui.get_connected()&&!ui.get_error(),"SHUTDOWN_FAILED: {}",ui.get_message());ensure!(ui.get_can_start_supervisor()&&!ui.get_can_stop_supervisor(),"SUPERVISOR_CONTROL_STATE");checks.push("explicit GUI shutdown cooperatively stops test workers; start/reconnect remains available".into());snapshot(&ui,&directory.join("shutdown.bmp"))?;ui.invoke_connect();step=3;},
+                    3=>{ensure!(ui.get_connected(),"SUPERVISOR_RESTART_FAILED: {}",ui.get_message());if ui.get_projects().iter().any(|row|row.status!="Running"){ui.invoke_refresh();return Ok(false);}snapshot(&ui,&directory.join("supervisor-restarted.bmp"))?;checks.push("GUI reconnect starts stopped supervisor and restores desired project mounts".into());ui.invoke_shutdown();step=4;},
+                    _=>{ensure!(!ui.get_connected()&&!ui.get_error(),"FINAL_SHUTDOWN_FAILED: {}",ui.get_message());return Ok(true);}
                 }
             } else {
                 match step {
@@ -681,7 +689,7 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
                     2=>{ui.invoke_focus_project_name();ensure!(ui.get_project_name_focused(),"PROJECT_NAME_FOCUS_FAILED");ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyPressed{text:slint::platform::Key::Tab.into()})?;ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyReleased{text:slint::platform::Key::Tab.into()})?;ensure!(!ui.get_project_name_focused(),"TAB_NAVIGATION_FAILED");ui.invoke_focus_project_name();for letter in "Design studio".chars(){ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyPressed{text:letter.to_string().into()})?;ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyReleased{text:letter.to_string().into()})?;}ensure!(ui.get_project_name()=="Design studio","KEYBOARD_TEXT_ENTRY_FAILED");checks.push("toolkit keyboard focus, Tab navigation, and text entry work in create dialog".into());snapshot(&ui,&directory.join("create.bmp"))?;ui.set_create_visible(false);ui.invoke_create_project();step=3;},
                     3=>{ensure!(ui.get_projects().row_count()==1&&!ui.get_error(),"FIRST_CREATE_FAILED: {}",ui.get_message());snapshot(&ui,&directory.join("project.bmp"))?;let row=ui.get_projects().row_data(ui.get_selected() as usize).context("NO_SELECTED_PROJECT")?;let file=PathBuf::from(row.mount.as_str()).join("hello.txt");std::fs::write(&file,b"UI acceptance durable data")?;busy=Some(std::fs::File::open(file)?);ui.invoke_stop_project();step=4;},
                     4=>{ensure!(ui.get_error()&&ui.get_can_retry(),"BUSY_STOP_NOT_RETRYABLE: {}",ui.get_message());snapshot(&ui,&directory.join("busy.bmp"))?;checks.push("busy real file handle produces pending stop and exact retry UI".into());busy=None;ui.invoke_retry();step=5;},
-                    5=>{ensure!(!ui.get_error(),"EXACT_RETRY_FAILED: {}",ui.get_message());ui.invoke_start_project();step=6;},
+                    5=>{ensure!(!ui.get_error(),"EXACT_RETRY_FAILED: {}",ui.get_message());ensure!(ui.get_can_start_project()&&!ui.get_can_stop_project(),"STOPPED_PROJECT_CONTROLS");snapshot(&ui,&directory.join("stopped.bmp"))?;ui.invoke_start_project();step=6;},
                     6=>{ensure!(!ui.get_error(),"RESTART_FAILED: {}",ui.get_message());let row=ui.get_projects().row_data(ui.get_selected() as usize).context("NO_SELECTED_PROJECT")?;ensure!(std::fs::read(PathBuf::from(row.mount.as_str()).join("hello.txt"))?==b"UI acceptance durable data","DATA_CHANGED");checks.push("exact retry stops worker; start restores durable mounted data".into());ui.set_project_name("Research lab".into());ui.set_project_mount("".into());ui.invoke_create_project();step=7;},
                     7=>{ensure!(ui.get_projects().row_count()==2&&!ui.get_error(),"SECOND_CREATE_FAILED: {}",ui.get_message());snapshot(&ui,&directory.join("two-projects.bmp"))?;ui.window().set_size(slint::LogicalSize::new(980.0,720.0));step=8;}, _=>{snapshot(&ui,&directory.join("minimum-size.bmp"))?;checks.push("two independent stores mounted; minimum-size layout captured; GUI closes without shutdown".into());return Ok(true);}
                 }
@@ -689,7 +697,7 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
             Ok(false)
         })();
         match result {Ok(false)=>{},result=>{
-            let error=result.as_ref().err().map(|e|format!("{e:#}"));let passed=error.is_none();let _=std::fs::write(&report,serde_json::to_vec_pretty(&json!({"passed":passed,"phase":phase,"checks":checks,"error":error,"elapsed_seconds":started.elapsed().as_secs_f64()})).unwrap());let _=ui.hide();let _=slint::quit_event_loop();
+            let error=result.as_ref().err().map(|e|format!("{e:#}"));let passed=error.is_none();let _=std::fs::write(&report,serde_json::to_vec_pretty(&json!({"passed":passed,"phase":phase,"theme":theme,"checks":checks,"error":error,"elapsed_seconds":started.elapsed().as_secs_f64()})).unwrap());let _=ui.hide();let _=slint::quit_event_loop();
         }}
     });
     Ok(timer)

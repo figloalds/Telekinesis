@@ -22,6 +22,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
     parser.add_argument("--report", type=Path, default=ROOT / "DESKTOP-VALIDATION.json")
+    parser.add_argument("--theme", choices=("system", "light", "dark"), default="system")
     options = parser.parse_args()
     run = ROOT / "test-runs" / f"desktop-{uuid.uuid4()}"
     app = run / "portable"
@@ -30,10 +31,11 @@ def main():
     shutil.copy2(options.exe, exe)
     config = app / "orchestrator.toml"
     env = os.environ.copy()
+    env["TKFS_UI_TEST_THEME"] = options.theme
     for key in ("TKFS_FAULT", "TKFS_PEER_KEY", "WINFSP_DIR"):
         env.pop(key, None)
     checks = []
-    report = {"scope":"one Windows computer, real Slint window, callback automation, real WinFsp mounts; no network", "run":str(run), "exe":str(options.exe.resolve()), "exe_sha256":hashlib.sha256(exe.read_bytes()).hexdigest(), "started_at":datetime.now(timezone.utc).isoformat(), "checks":checks, "screenshots":[]}
+    report = {"scope":"one Windows computer, real Slint window, callback automation, real WinFsp mounts; no network", "theme":options.theme, "run":str(run), "exe":str(options.exe.resolve()), "exe_sha256":hashlib.sha256(exe.read_bytes()).hexdigest(), "started_at":datetime.now(timezone.utc).isoformat(), "checks":checks, "screenshots":[]}
     def cli(*args, good=True):
         result = subprocess.run([str(exe),*map(str,args)], env=env,capture_output=True,text=True,timeout=35)
         if good:
