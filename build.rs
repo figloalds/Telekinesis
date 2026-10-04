@@ -1,4 +1,5 @@
 fn main() {
+    slint_build::compile("ui/app.slint").expect("compile desktop UI");
     println!("cargo:rerun-if-changed=native/mount.c");
     println!("cargo:rerun-if-changed=native/control.c");
     println!("cargo:rerun-if-changed=native/winfsp_loader.c");

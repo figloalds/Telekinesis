@@ -18,9 +18,14 @@ sha2 = "0.10"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 unicode-normalization = "0.1"
 toml = "0.9"
+slint = { version = "=1.17.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 cc = "1.2"
+slint-build = "=1.17.0"
 
 [dev-dependencies]
 tempfile = "3.27"

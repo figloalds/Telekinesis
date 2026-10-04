@@ -8,6 +8,27 @@ remain proposed. Filesystem contracts remain in [TKFS-PLAN.md](TKFS-PLAN.md).
 See [README.md](README.md) for available commands and
 [ORCHESTRATOR-VALIDATION.json](ORCHESTRATOR-VALIDATION.json) for local evidence.
 
+The first portable desktop slice is now implemented with Slint 1.17.0. A single
+application executable dispatches GUI, CLI, supervisor and worker modes, retaining
+process isolation and the same-user management boundary. Executable-local first
+run, atomic locked config creation, installation/effective-root/version/capability
+handshake, project create/list/status/branches/start/stop, durable client operation
+retry, explicit shutdown and About are implemented. Closing the GUI leaves mounts
+alive. `hello` adds management identity and readiness context; optional
+`target_installation` binds a request to its intended registry. Config accepts
+optional `installation_id` and `default_mount_directory` while preserving legacy
+O1 files. DESKTOP-VALIDATION.json and DESKTOP-ORCHESTRATOR-VALIDATION.json record
+the separate desktop evidence. Service/package upgrades, broader lifecycle,
+networking and distribution qualification below remain proposed.
+
+Catalog startup now validates established databases read-only before any writable
+open. Missing, empty, truncated or unrecognized established catalogs are refused.
+Fresh creation writes an installation/owner/root-bound bootstrap marker before
+SQLite initialization; interrupted first startup recovers that same identity,
+and the marker is removed before state directories or workers can exist.
+DESKTOP-CATALOG-VALIDATION.json records bootstrap crash recovery and CLI/GUI
+refusal with byte-for-byte retained fixture data.
+
 ## Accepted local O1 implementation contract (2026-10-03)
 
 Implement the foreground, single-user, network-disabled supervisor first.
@@ -117,13 +138,13 @@ or authorization decision is based on a friendly name, mount path or remote path
 ## One bootstrap config and a durable registry
 
 Use one explicit versioned config file, similar in purpose to `--defaults-file`.
-Proposed initial syntax is TOML; parser/format support is new work. Resolve
+Implemented O1 syntax is TOML; the README records the accepted subset. Resolve
 relative paths against the config file's directory, never the launcher's cwd.
 Keep config limited to installation defaults and service policy. State records,
 mount choices, pairings and contracts belong in the database, so a UI does not
 rewrite a growing config file or introduce a second authoritative catalog.
 
-Illustrative config, not accepted by today's executable:
+Illustrative local configuration (choose a writable owner-specific data root):
 
 ```toml
 format_version = 1

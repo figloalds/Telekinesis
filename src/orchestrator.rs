@@ -22,6 +22,8 @@ use std::{
 #[serde(deny_unknown_fields)]
 pub struct Config {
     format_version: u32,
+    pub installation_id: Option<String>,
+    pub default_mount_directory: Option<PathBuf>,
     pub data_directory: PathBuf,
     pub control: Control,
     #[serde(default)]
@@ -61,6 +63,15 @@ impl Config {
         let path = fs::canonicalize(path)?;
         let mut config: Self = toml::from_str(&fs::read_to_string(&path)?)?;
         ensure!(config.format_version == 1, "UNSUPPORTED_CONFIG_VERSION");
+        if let Some(identity) = &config.installation_id {
+            uuid::Uuid::parse_str(identity).context("INVALID_INSTALLATION_ID")?;
+        }
+        if let Some(directory) = &mut config.default_mount_directory {
+            if directory.is_relative() {
+                *directory = path.parent().unwrap().join(&*directory);
+            }
+            *directory = std::path::absolute(&*directory)?;
+        }
         ensure!(
             config.control.transport == "named-pipe",
             "UNSUPPORTED_CONTROL_TRANSPORT"
@@ -102,6 +113,7 @@ impl Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
+    Hello,
     List,
     Inspect {
         state: String,
@@ -133,6 +145,8 @@ impl Action {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_installation: Option<String>,
     pub operation_id: Option<String>,
     pub expected_generation: Option<u64>,
     pub action: Action,
@@ -165,6 +179,14 @@ struct WorkerRequest {
     token: String,
     op: String,
 }
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapMarker {
+    version: u32,
+    installation_id: String,
+    owner: String,
+    root: PathBuf,
+}
 #[derive(Clone)]
 struct State {
     marker: Marker,
@@ -187,6 +209,7 @@ pub struct Supervisor {
     observations: BTreeMap<String, Observation>,
     children: BTreeMap<String, Child>,
     exit_requested: bool,
+    instance: String,
 }
 fn lock(path: &Path) -> Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -254,32 +277,125 @@ fn retryable(error: &anyhow::Error) -> bool {
     .any(|code| message.contains(code))
 }
 
+/// Some(marker) permits only initial creation/recovery; None is a strictly
+/// recognized existing catalog. An arbitrary version-zero file is never fresh.
+fn catalog_preflight(
+    root: &Path,
+    config: &Config,
+    caller: &str,
+) -> Result<Option<BootstrapMarker>> {
+    let database = root.join("orchestrator.sqlite");
+    let marker_path = root.join(".orchestrator-bootstrap.json");
+    let marker: Option<BootstrapMarker> = if marker_path.try_exists()? {
+        let marker: BootstrapMarker =
+            load_json(&marker_path).context("INVALID_BOOTSTRAP_MARKER")?;
+        ensure!(
+            marker.version == 1 && marker.owner == caller && marker.root == fs::canonicalize(root)?,
+            "BOOTSTRAP_IDENTITY_MISMATCH"
+        );
+        uuid::Uuid::parse_str(&marker.installation_id).context("INVALID_BOOTSTRAP_IDENTITY")?;
+        if let Some(expected) = &config.installation_id {
+            ensure!(
+                expected == &marker.installation_id,
+                "INSTALLATION_ID_MISMATCH"
+            );
+        }
+        Some(marker)
+    } else {
+        None
+    };
+    let entries = fs::read_dir(root)?
+        .map(|entry| Ok(entry?.file_name()))
+        .collect::<Result<Vec<_>>>()?;
+    let bootstrap_layout = || {
+        entries.iter().all(|entry| {
+            [
+                "orchestrator.lock",
+                ".orchestrator-bootstrap.json",
+                "orchestrator.sqlite",
+                "orchestrator.sqlite-wal",
+                "orchestrator.sqlite-shm",
+                "orchestrator.sqlite-journal",
+            ]
+            .iter()
+            .any(|name| entry == name)
+        })
+    };
+    if database.try_exists()? {
+        no_reparse(&database)?;
+        let db = Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("INVALID_REGISTRY")?;
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .context("INVALID_REGISTRY")?;
+        ensure!((0..=1).contains(&version), "UNSUPPORTED_REGISTRY_VERSION");
+        if version == 0 {
+            ensure!(
+                marker.is_some() && bootstrap_layout(),
+                "REGISTRY_UNINITIALIZED: existing empty/unrecognized catalog has no valid fresh-bootstrap proof; restore the original catalog"
+            );
+            let tables: i64 = db
+                .query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))
+                .context("INVALID_REGISTRY")?;
+            ensure!(
+                tables == 0,
+                "INVALID_BOOTSTRAP_SCHEMA: version-zero catalog contains existing schema"
+            );
+            return Ok(marker);
+        }
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM installation", [], |r| r.get(0))
+            .context("INVALID_REGISTRY_SCHEMA")?;
+        ensure!(count == 1, "INVALID_REGISTRY_IDENTITY");
+        let (identity, owner, generation): (String, String, i64) = db
+            .query_row("SELECT id,owner,generation FROM installation", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .context("INVALID_REGISTRY_SCHEMA")?;
+        uuid::Uuid::parse_str(&identity).context("INVALID_REGISTRY_IDENTITY")?;
+        ensure!(generation >= 0, "INVALID_REGISTRY_GENERATION");
+        ensure!(owner == caller, "REGISTRY_OWNER_MISMATCH");
+        if let Some(expected) = &config.installation_id {
+            ensure!(expected == &identity, "INSTALLATION_ID_MISMATCH");
+        }
+        if let Some(marker) = &marker {
+            ensure!(
+                marker.installation_id == identity,
+                "BOOTSTRAP_IDENTITY_MISMATCH"
+            );
+        }
+        db.prepare("SELECT id,repo,device,operation,label,mount,desired,ready,generation FROM states LIMIT 0").context("INVALID_REGISTRY_SCHEMA")?;
+        db.prepare("SELECT caller,id,payload_hash,request,status,response FROM operations LIMIT 0")
+            .context("INVALID_REGISTRY_SCHEMA")?;
+        return Ok(None);
+    }
+    if let Some(marker) = marker {
+        ensure!(
+            bootstrap_layout(),
+            "INVALID_BOOTSTRAP_LAYOUT: state directories exist without their catalog"
+        );
+        return Ok(Some(marker));
+    }
+    ensure!(
+        entries.iter().all(|entry| entry == "orchestrator.lock"),
+        "DATA_DIRECTORY_NOT_EMPTY: missing catalog; existing data will not be recreated"
+    );
+    Ok(Some(BootstrapMarker {
+        version: 1,
+        installation_id: config.installation_id.clone().unwrap_or_else(id),
+        owner: caller.into(),
+        root: fs::canonicalize(root)?,
+    }))
+}
+
 impl Supervisor {
     pub fn open(mut config: Config) -> Result<Self> {
         let caller = local_ipc::owner_sid()?;
         let root = &config.data_directory;
         if root.exists() {
             no_reparse(root)?;
-            let bootstrap_only = fs::read_dir(root)?
-                .all(|entry| entry.is_ok_and(|entry| entry.file_name() == "orchestrator.lock"));
-            ensure!(
-                root.join("orchestrator.sqlite").is_file() || bootstrap_only,
-                "DATA_DIRECTORY_NOT_EMPTY"
-            );
-            if root.join("orchestrator.sqlite").is_file() {
-                no_reparse(&root.join("orchestrator.sqlite"))?;
-                let existing = Connection::open_with_flags(
-                    root.join("orchestrator.sqlite"),
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )?;
-                let version: i64 = existing.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-                ensure!(version <= 1, "UNSUPPORTED_REGISTRY_VERSION");
-                if version == 1 {
-                    let owner: String =
-                        existing.query_row("SELECT owner FROM installation", [], |r| r.get(0))?;
-                    ensure!(caller == owner, "REGISTRY_OWNER_MISMATCH");
-                }
-            }
+            // Validate read-only before changing ACLs or opening a writable catalog.
+            catalog_preflight(root, &config, &caller)?;
         } else {
             fs::create_dir_all(root)?;
         }
@@ -287,7 +403,26 @@ impl Supervisor {
         config.data_directory = fs::canonicalize(root)?;
         let root = &config.data_directory;
         let guard = lock(&root.join("orchestrator.lock"))?;
-        let mut db = Connection::open(root.join("orchestrator.sqlite"))?;
+        // Repeat after locking; a concurrent first launcher may have initialized it.
+        let bootstrap = catalog_preflight(root, &config, &caller)?;
+        let marker_path = root.join(".orchestrator-bootstrap.json");
+        if let Some(marker) = &bootstrap {
+            if !marker_path.try_exists()? {
+                atomic_json(&marker_path, marker)?;
+            }
+            crate::core::fault("orchestrator_bootstrap_marked");
+        }
+        let mut db = if bootstrap.is_some() {
+            Connection::open(root.join("orchestrator.sqlite"))?
+        } else {
+            Connection::open_with_flags(
+                root.join("orchestrator.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?
+        };
+        if bootstrap.is_some() {
+            crate::core::fault("orchestrator_catalog_opened");
+        }
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
@@ -295,18 +430,27 @@ impl Supervisor {
         let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         ensure!(version <= 1, "UNSUPPORTED_REGISTRY_VERSION");
         if version == 0 {
+            let marker = bootstrap
+                .as_ref()
+                .context("REGISTRY_UNINITIALIZED: no proven fresh bootstrap")?;
             let tx = db.transaction()?;
             tx.execute_batch("CREATE TABLE installation(id TEXT PRIMARY KEY,owner TEXT NOT NULL,generation INTEGER NOT NULL);
                 CREATE TABLE states(id TEXT PRIMARY KEY,repo TEXT NOT NULL,device TEXT NOT NULL,operation TEXT NOT NULL,label TEXT NOT NULL,mount TEXT,desired INTEGER NOT NULL,ready INTEGER NOT NULL,generation INTEGER NOT NULL);
                 CREATE TABLE operations(caller TEXT NOT NULL,id TEXT NOT NULL,payload_hash TEXT NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,response TEXT,PRIMARY KEY(caller,id)); PRAGMA user_version=1;")?;
             tx.execute(
                 "INSERT INTO installation VALUES(?,?,0)",
-                params![id(), caller],
+                params![marker.installation_id, caller],
             )?;
             tx.commit()?;
+            crate::core::fault("orchestrator_catalog_committed");
         }
         let owner: String = db.query_row("SELECT owner FROM installation", [], |r| r.get(0))?;
         ensure!(caller == owner, "REGISTRY_OWNER_MISMATCH");
+        // A valid catalog replaces the transient bootstrap proof BEFORE state
+        // directories or workers can exist. A stale marker never permits reset.
+        if marker_path.try_exists()? {
+            fs::remove_file(&marker_path)?;
+        }
         // Commit bootstrap metadata before other directories so an interrupted
         // first startup remains distinguishable from unrelated user contents.
         for name in ["states", "staging", "logs"] {
@@ -322,6 +466,7 @@ impl Supervisor {
             observations: BTreeMap::new(),
             children: BTreeMap::new(),
             exit_requested: false,
+            instance: id(),
         })
     }
     fn state(&self, state: &str) -> Result<State> {
@@ -762,8 +907,19 @@ impl Supervisor {
     }
     pub fn handle(&mut self, request: Request) -> Result<Value> {
         ensure!(request.version == 1, "UNSUPPORTED_API_VERSION");
+        let identity: String = self
+            .db
+            .query_row("SELECT id FROM installation", [], |r| r.get(0))?;
+        if let Some(expected) = &request.target_installation {
+            ensure!(expected == &identity, "INSTALLATION_ID_MISMATCH");
+        }
         if !request.action.mutates() {
             return match request.action {
+                Action::Hello => Ok(ok(json!({"api_version":1,"installation_id":identity,
+                    "instance_id":self.instance,"data_directory":self.config.data_directory,
+                    "build_version":env!("CARGO_PKG_VERSION"),"registry_version":1,
+                    "capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1"],
+                    "network_enabled":false,"shutdown_pending":self.shutdown_pending()?}))),
                 Action::List => Ok(ok(
                     json!({"api_version":1,"catalog_generation":self.generation(&Action::List)?,"states":self.states()?.iter().map(|s|self.observed(s)).collect::<Vec<_>>()}),
                 )),
@@ -1107,6 +1263,7 @@ mod regressions {
     fn pending_create(supervisor: &mut Supervisor) -> (Request, State) {
         let request = Request {
             version: 1,
+            target_installation: None,
             operation_id: Some(id()),
             expected_generation: Some(0),
             action: Action::Create {
@@ -1162,6 +1319,7 @@ mod regressions {
         let (request, state) = pending_create(&mut supervisor);
         let shutdown = Request {
             version: 1,
+            target_installation: None,
             operation_id: Some(id()),
             expected_generation: Some(1),
             action: Action::Shutdown,

@@ -1,3 +1,4 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::json;
@@ -9,6 +10,8 @@ use tkfs::{
     core::{Store, id},
     runtime::{self, Discovery, Engine, PeerConfig},
 };
+#[cfg(windows)]
+mod gui;
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +36,13 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Open the portable desktop application (also the default with no arguments).
+    Gui,
+    #[command(hide = true)]
+    GuiTest {
+        #[arg(long)]
+        report: PathBuf,
+    },
     /// Foreground O1 management supervisor; networking is disabled.
     Orchestrator {
         #[arg(long)]
@@ -135,6 +145,7 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum ManagementCommand {
+    Hello,
     Create {
         label: String,
         #[arg(long)]
@@ -171,12 +182,61 @@ fn discover(args: &Args) -> Result<Discovery> {
 fn main() {
     if let Err(e) = run() {
         eprintln!("{}", json!({"ok":false,"error":format!("{e:#}")}));
+        #[cfg(windows)]
+        if std::env::args_os().nth(1).is_none_or(|arg| arg == "gui") {
+            use windows::{
+                Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
+                core::PCWSTR,
+            };
+            let message: Vec<u16> = format!("Telekinesis could not open.\n\n{e:#}")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            let title: Vec<u16> = "Telekinesis".encode_utf16().chain(Some(0)).collect();
+            unsafe {
+                MessageBoxW(
+                    None,
+                    PCWSTR(message.as_ptr()),
+                    PCWSTR(title.as_ptr()),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
         std::process::exit(1);
     }
 }
 fn run() -> Result<()> {
+    #[cfg(windows)]
+    if std::env::args_os().len() == 1 {
+        return gui::run(None);
+    }
+    #[cfg(windows)]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg != "gui" && arg != "gui-test")
+    {
+        unsafe extern "system" {
+            fn AttachConsole(pid: u32) -> i32;
+        }
+        // Redirected handles are preserved; interactive CLI attaches its parent's console.
+        unsafe {
+            AttachConsole(u32::MAX);
+        }
+    }
     let args = Args::parse();
     match &args.command {
+        Command::Gui => {
+            #[cfg(windows)]
+            return gui::run(None);
+            #[cfg(not(windows))]
+            bail!("DESKTOP_WINDOWS_ONLY");
+        }
+        Command::GuiTest { report } => {
+            #[cfg(windows)]
+            return gui::run(Some(report));
+            #[cfg(not(windows))]
+            bail!("DESKTOP_WINDOWS_ONLY: {}", report.display());
+        }
         Command::Orchestrator { defaults_file } => {
             #[cfg(windows)]
             return tkfs::orchestrator::Supervisor::open(tkfs::orchestrator::Config::load(
@@ -201,6 +261,7 @@ fn run() -> Result<()> {
                 use tkfs::orchestrator::{self, Action, Request};
                 let config = orchestrator::Config::load(defaults_file)?;
                 let action = match action {
+                    ManagementCommand::Hello => Action::Hello,
                     ManagementCommand::Create { label, mount } => Action::Create {
                         label: label.clone(),
                         mount: mount.clone(),
@@ -228,6 +289,7 @@ fn run() -> Result<()> {
                 }
                 let request = Request {
                     version: 1,
+                    target_installation: config.installation_id.clone(),
                     operation_id: if action.mutates() {
                         Some(args.request_id.clone().unwrap_or_else(id))
                     } else {

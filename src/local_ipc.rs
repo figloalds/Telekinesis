@@ -1,5 +1,5 @@
 //! O1 Windows IPC: owner-only DACL, local clients only, both endpoint SIDs checked.
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     fs::File,
@@ -25,11 +25,9 @@ unsafe extern "C" {
     ) -> u32;
 }
 fn check(code: u32) -> Result<()> {
-    ensure!(
-        code == 0,
-        "LOCAL_IPC: {}",
-        std::io::Error::from_raw_os_error(code as i32)
-    );
+    if code != 0 {
+        return Err(std::io::Error::from_raw_os_error(code as i32)).context("LOCAL_IPC");
+    }
     Ok(())
 }
 fn wide(text: &str) -> Vec<u16> {

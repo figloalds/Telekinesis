@@ -20,7 +20,81 @@ processes from one TOML defaults file and an owner-protected SQLite registry.
 start/stop, operation lookup and orderly supervisor shutdown. Managed O1 workers
 have no peer replication; existing mounted store commands remain compatible.
 Adoption, mount reassignment/trash/restore, persistent machine pairing, shared
-catalog/contracts, service installation and desktop UI are deferred.
+catalog/contracts and service installation are deferred. The first portable Slint
+desktop slice is implemented; it uses the same executable and management API.
+
+## Portable desktop application
+
+Build and launch the first Windows desktop slice:
+
+```powershell
+cargo build --offline --target-dir target/slint-ui
+python scripts/package_desktop.py
+.\target\desktop-portable\tkfs.exe
+```
+
+No arguments opens the UI; `tkfs gui` does the same. Existing CLI commands,
+`orchestrator`, and the private `managed-worker` mode dispatch before any UI
+initialization. One shipped executable runs separate GUI, supervisor, and worker
+processes. WinFsp remains an installed prerequisite for mounts.
+
+The app locates `orchestrator.toml` beside its actual executable, independent of
+cwd. First run asks for a new/empty native data directory and a separate parent
+for mounted project folders, with a running-project limit. It creates a versioned
+config with a unique installation UUID and pipe name under an exclusive lock and
+publishes it atomically. Concurrent first-run clients reread the winning config.
+The application folder must be writable; for Program Files or a read-only folder,
+move the portable application to a writable folder. There is no silent fallback
+to another configuration or data root.
+
+Existing configurations are validated, and the client checks API version,
+installation identity, effective data root, build version, and capabilities before
+attaching. After the first connection an adjacent `.tkfs-ui-identity.json` pins the
+catalog identity; a missing pinned catalog is refused. Established missing,
+empty, truncated or unrecognized catalogs are never initialized again. Only a
+fresh empty directory or a valid initial-bootstrap marker allows creation;
+interrupted first startup retains its installation identity. Legacy O1 configs
+remain accepted. A legacy config without
+`default_mount_directory` requires an explicit new-project mount path.
+
+The UI supports listing projects, create-and-mount, selected local status and
+branches, start/stop, opening a mounted folder in Explorer, operation inspection
+and exact retry, explicit supervisor shutdown, and About/attribution. All startup
+and RPC work runs off the Slint event loop. Standard controls have keyboard focus
+and accessible labels; layouts resize and use Windows DPI scaling. Closing the
+UI leaves the supervisor and workers alive. Shutdown preserves desired-running
+states for the next launch; stop changes one project's desired state.
+
+Mutation UUIDs, exact payloads, and expected generations are persisted before
+send in `.tkfs-ui-operation.json`. A timeout is uncertain delivery, not cancellation.
+Pending operations are inspected/retried using the same request. Terminal stale
+generation failures require refreshing and issuing a new action. There are no
+percentage progress or cancellation APIs. Managed workers have no peer configured;
+the UI does not expose networking, adoption, trash, mount reassignment, or services.
+
+Slint is pinned to 1.17.0 with the winit Windows backend, software renderer, and
+accessibility support. Slint uses the Royalty-free Desktop, Mobile, and Web
+Applications License 2.0 with the official AboutSlint widget in the accessible
+About screen. This does not impose GPL on the application's own code; the repo's
+pre-existing GPL-3.0-or-later declaration remains unchanged. The
+portable package contains attribution, license texts, registry notices/inventory,
+and the corresponding application source archive. See THIRD-PARTY-NOTICES.md.
+This is an experimental local package, not an installer or release qualification.
+
+```powershell
+python scripts/desktop_e2e.py
+python scripts/catalog_startup_e2e.py
+python scripts/orchestrator_e2e.py --exe target/slint-ui/debug/tkfs.exe --report DESKTOP-ORCHESTRATOR-VALIDATION.json
+```
+
+`gui-test --report <path>` is an explicitly selected acceptance mode for an
+isolated copied executable. It opens the real Windows Slint window, exercises
+component callbacks and toolkit keyboard events, and captures rendered BMP
+screenshots. It is not physical OS mouse/keyboard automation. The harness checks
+first run, two real independent mounts, busy stop/exact retry, durable data after
+start, GUI close/reopen, and cooperative shutdown; fixtures and screenshots remain
+under `test-runs/desktop-<UUID>`. Evidence is in DESKTOP-VALIDATION.json. Native
+folder picker interaction and general screen-reader behavior require manual QA.
 
 ## Build and test
 

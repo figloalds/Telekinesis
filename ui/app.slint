@@ -1,0 +1,215 @@
+import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint } from "std-widgets.slint";
+
+export struct Project { label: string, id: string, status: string, mount: string, desired: bool }
+
+component Caption inherits Text { color: #657581; font-size: 13px; }
+component Heading inherits Text { color: #142e3c; font-size: 26px; font-weight: 700; }
+component Card inherits Rectangle {
+    background: white; border-color: #dde5e6; border-width: 1px; border-radius: 12px;
+}
+
+export component App inherits Window {
+    title: "Telekinesis";
+    preferred-width: 1180px; preferred-height: 820px; min-width: 980px; min-height: 720px;
+    background: #f4f7f7; default-font-family: "Segoe UI"; default-font-size: 14px;
+    in-out property <bool> first-run;
+    in-out property <bool> connected;
+    in-out property <bool> working;
+    in-out property <bool> create-visible;
+    in-out property <bool> about-visible;
+    in-out property <bool> shutdown-visible;
+    in-out property <bool> can-retry;
+    private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible;
+    in-out property <string> connection: "Connecting…";
+    in-out property <string> config-path;
+    in-out property <string> data-folder;
+    in-out property <string> mount-folder;
+    in-out property <int> worker-limit: 8;
+    in-out property <[Project]> projects;
+    in-out property <int> selected: -1;
+    in-out property <string> project-name;
+    in-out property <string> project-mount;
+    in-out property <string> status-detail: "Choose a project to see its local state.";
+    in-out property <string> branches-detail;
+    in-out property <string> message;
+    in-out property <string> operation-detail;
+    in-out property <bool> error;
+    out property <bool> project-name-focused: project-name-edit.has-focus;
+    callback setup;
+    callback connect;
+    callback refresh;
+    callback select-project(int);
+    callback create-project;
+    callback start-project;
+    callback stop-project;
+    callback shutdown;
+    callback retry;
+    callback inspect-operation;
+    callback browse(int);
+    callback open-project;
+    callback focus-project-name;
+    focus-project-name => { project-name-edit.focus(); }
+
+    HorizontalLayout {
+        spacing: 0px;
+        Rectangle {
+            width: 214px; background: #142e3c;
+            VerticalLayout {
+                padding: 24px; spacing: 18px;
+                Text { text: "TK"; color: #8de0c4; font-size: 36px; font-weight: 800; }
+                Text { text: "Telekinesis"; color: white; font-size: 22px; font-weight: 650; }
+                Text { text: "Your projects.\nYour computer."; color: #afc4cf; font-size: 14px; }
+                Rectangle { height: 1px; background: #35515f; }
+                Text { text: root.first-run ? "01  Set up" : "01  Projects"; color: #8de0c4; font-size: 16px; font-weight: 600; }
+                Text { text: "Local workspace manager"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                Text { text: "LOCAL MODE"; color: #8de0c4; font-size: 11px; font-weight: 700; }
+                Text { text: "Background workers keep your projects available when you close this window."; color: #afc4cf; font-size: 13px; wrap: word-wrap; }
+                Button { text: "About Telekinesis"; enabled: !root.modal; clicked => { root.about-visible = true; } }
+                Text { text: "Made with Slint"; color: #afc4cf; font-size: 12px; }
+            }
+        }
+        VerticalLayout {
+            padding: 28px; spacing: 18px;
+            HorizontalLayout {
+                VerticalLayout {
+                    spacing: 6px;
+                    Heading { text: root.first-run ? "Make room for your projects" : "Projects"; }
+                    Caption { text: root.first-run ? "One portable installation, independent local workspaces." : "Manage the workspaces running on this computer."; }
+                }
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                Button { text: root.connected ? "Refresh" : "Reconnect"; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
+                Button { text: "+ New project"; primary: true; enabled: root.connected && !root.working && !root.modal; visible: !root.first-run; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
+            }
+            Card {
+                height: 54px;
+                HorizontalLayout {
+                    padding: 16px; spacing: 12px;
+                    Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.connected ? #239675 : #c18c3f; }
+                    Text { text: root.connection; color: #142e3c; vertical-alignment: center; overflow: elide; }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Caption { text: root.working ? "Working…" : "Local only"; vertical-alignment: center; }
+                }
+            }
+            if root.first-run: Card {
+                VerticalLayout {
+                    padding: 26px; spacing: 16px;
+                    Text { text: "Choose two separate folders"; color: #142e3c; font-size: 19px; font-weight: 600; }
+                    Caption { text: "Native data holds the catalog and durable history. Project folders contain the mounted views you use in Explorer."; wrap: word-wrap; }
+                    Text { text: "Native data folder (new or empty)"; color: #142e3c; }
+                    HorizontalLayout { LineEdit { accessible-label: "Native data folder"; text <=> root.data-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(0); } } }
+                    Text { text: "Parent folder for project mounts"; color: #142e3c; }
+                    HorizontalLayout { LineEdit { accessible-label: "Project mount parent folder"; text <=> root.mount-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(1); } } }
+                    HorizontalLayout { Text { text: "Maximum running projects"; color: #142e3c; vertical-alignment: center; } SpinBox { value <=> root.worker-limit; minimum: 1; maximum: 64; enabled: !root.working && !root.modal; } Rectangle { horizontal-stretch: 1; } }
+                    Rectangle { height: 1px; background: #dde5e6; }
+                    Caption { text: "Configuration is saved beside this application:"; }
+                    Text { text: root.config-path; color: #142e3c; wrap: word-wrap; font-size: 12px; }
+                    Caption { text: "Mounting requires the installed WinFsp runtime. No network connection or service is configured."; wrap: word-wrap; }
+                    HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Save and connect"; primary: true; enabled: !root.working && !root.modal; clicked => { root.setup(); } } }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+            if !root.first-run: HorizontalLayout {
+                spacing: 18px;
+                Card {
+                    width: 300px;
+                    VerticalLayout {
+                        padding: 16px; spacing: 12px;
+                        Text { text: "WORKSPACES"; color: #657581; font-size: 11px; font-weight: 700; }
+                        if root.projects.length == 0: VerticalLayout {
+                            spacing: 12px;
+                            Text { text: root.connected ? "Your first project starts here" : "Projects are unavailable"; color: #142e3c; font-size: 19px; font-weight: 600; wrap: word-wrap; }
+                            Caption { text: root.connected ? "Create a project and choose its mount folder. Its history stays in your native data folder." : "Reconnect to load the catalog. Existing project data is preserved."; wrap: word-wrap; }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                        if root.projects.length > 0: ListView {
+                            for project[index] in root.projects: VerticalLayout {
+                                padding-bottom: 9px; spacing: 3px;
+                                Button { text: project.label; checkable: true; checked: root.selected == index; enabled: !root.working && !root.modal; clicked => { root.select-project(index); } }
+                                Caption { text: project.status; font-size: 12px; }
+                            }
+                        }
+                    }
+                }
+                Card {
+                    VerticalLayout {
+                        padding: 22px; spacing: 14px;
+                        Text { text: root.selected >= 0 && root.selected < root.projects.length ? root.projects[root.selected].label : "Project details"; color: #142e3c; font-size: 22px; font-weight: 600; }
+                        if root.selected >= 0 && root.selected < root.projects.length: HorizontalLayout {
+                            Button { text: "Open folder"; enabled: root.connected && !root.working && !root.modal && (root.projects[root.selected].status == "Running" || root.projects[root.selected].status == "Needs attention" || root.projects[root.selected].status == "Stopping · files in use") && root.projects[root.selected].mount != ""; clicked => { root.open-project(); } }
+                            Button { text: "Start"; enabled: root.connected && !root.working && !root.modal; clicked => { root.start-project(); } }
+                            Button { text: "Stop"; enabled: root.connected && !root.working && !root.modal; clicked => { root.stop-project(); } }
+                        }
+                        ScrollView { VerticalLayout {
+                            spacing: 16px;
+                            Text { text: root.status-detail; color: #334c59; wrap: word-wrap; font-size: 13px; }
+                            Text { text: root.branches-detail; color: #334c59; wrap: word-wrap; font-size: 13px; }
+                            Rectangle { vertical-stretch: 1; }
+                        } }
+                    }
+                }
+            }
+            if root.message != "": Rectangle {
+                background: root.error ? #fff0e9 : #e7f4ef; border-radius: 8px;
+                min-height: 56px;
+                HorizontalLayout { padding: 13px; spacing: 10px;
+                    Text { text: root.message; color: root.error ? #8c4028 : #23654e; wrap: word-wrap; font-size: 13px; }
+                    Button { text: "Retry exact request"; visible: root.can-retry; enabled: !root.working && !root.modal && root.connected; clicked => { root.retry(); } }
+                }
+            }
+            if root.operation-detail != "": Card {
+                max-height: 120px; min-height: 65px;
+                HorizontalLayout { padding: 12px; spacing: 10px;
+                    ScrollView { Text { text: root.operation-detail; color: #657581; font-size: 12px; wrap: word-wrap; } }
+                    Button { text: "Inspect operation"; enabled: !root.working && !root.modal && root.connected; clicked => { root.inspect-operation(); } }
+                }
+            }
+            if !root.first-run: HorizontalLayout {
+                Caption { text: "Closing this window keeps your projects running."; }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "Shut down supervisor…"; enabled: root.connected && !root.working && !root.modal; clicked => { root.shutdown-visible = true; } }
+            }
+        }
+    }
+    Rectangle {
+        visible: root.create-visible;
+        background: #142e3c99;
+        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 620px; height: 390px;
+            VerticalLayout { padding: 26px; spacing: 15px;
+                Heading { text: "New project"; }
+                Caption { text: "Creates a new independent local store and starts its worker."; wrap: word-wrap; }
+                Text { text: "Project name"; color: #142e3c; }
+                project-name-edit := LineEdit { accessible-label: "Project name"; text <=> root.project-name; placeholder-text: "My project"; enabled: !root.working; }
+                Text { text: "Mount path (a new folder, with an existing parent)"; color: #142e3c; }
+                HorizontalLayout { LineEdit { accessible-label: "Project mount path"; text <=> root.project-mount; placeholder-text: "Leave blank to use the default parent + project name"; enabled: !root.working; } Button { text: "Parent…"; enabled: !root.working; clicked => { root.browse(2); } } }
+                Caption { text: "The final mount folder must not already exist. Native data remains separate."; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Cancel"; enabled: !root.working; clicked => { root.create-visible = false; } } Button { text: "Create and mount"; primary: true; enabled: !root.working && root.project-name != ""; clicked => { root.create-visible = false; root.create-project(); } } }
+            }
+        }
+    }
+    if root.shutdown-visible: Rectangle {
+        background: #142e3c99;
+        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 570px; height: 250px;
+            VerticalLayout { padding: 26px; spacing: 16px;
+                Heading { text: "Shut down background workers?"; font-size: 23px; }
+                Caption { text: "All projects in this installation will be unmounted. Close editors and Explorer windows using these projects first. Projects marked to run will return on the next supervisor launch."; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Keep running"; clicked => { root.shutdown-visible = false; } } Button { text: "Shut down"; clicked => { root.shutdown-visible = false; root.shutdown(); } } }
+            }
+        }
+    }
+    if root.about-visible: Rectangle {
+        background: #142e3c99;
+        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 610px; height: 430px;
+            VerticalLayout { padding: 26px; spacing: 14px;
+                Heading { text: "Telekinesis 0.1.0"; }
+                Caption { text: "Experimental Windows local filesystem manager. One application executable; isolated supervisor and worker processes. WinFsp is required for mounted projects."; wrap: word-wrap; }
+                AboutSlint { height: 105px; }
+                Caption { text: "Slint 1.17.0 uses the Royalty-free Desktop, Mobile, and Web Applications License 2.0 with AboutSlint attribution. This does not impose GPL on your own application code. This repository already declares GPL-3.0-or-later independently. See the bundled license texts and THIRD-PARTY-NOTICES.md."; wrap: word-wrap; }
+                Caption { text: "This first slice supports local projects. Pairing, adoption, trash, and Windows service setup are deferred."; wrap: word-wrap; }
+                HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Close"; clicked => { root.about-visible = false; } } }
+            }
+        }
+    }
+}
