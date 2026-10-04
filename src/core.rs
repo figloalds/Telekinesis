@@ -20,6 +20,62 @@ pub const ROOT: &str = "root";
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
 pub const MAX_EVENT: usize = 8 * 1024 * 1024;
 pub const MAX_NAMESPACE_CUTS: usize = 4096;
+pub const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
+pub const BASIC_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x20 | 0x80;
+/// Both peers must understand durable basic metadata; format 2 is incompatible.
+pub const PEER_FORMAT: u32 = 3;
+pub fn filetime(ms: u64) -> u64 {
+    ms.saturating_mul(10_000).saturating_add(FILETIME_EPOCH)
+}
+/// One bounded atomic metadata register, separate from content revision clocks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BasicInfo {
+    pub attributes: u32,
+    pub creation_time: u64,
+    pub access_time: u64,
+    pub write_time: u64,
+    pub change_time: u64,
+}
+impl BasicInfo {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.attributes & !BASIC_ATTRIBUTES == 0,
+            "UNSUPPORTED_ATTRIBUTES"
+        );
+        ensure!(
+            self.attributes & 0x80 == 0 || self.attributes == 0x80,
+            "INVALID_ATTRIBUTES"
+        );
+        ensure!(
+            [
+                self.creation_time,
+                self.access_time,
+                self.write_time,
+                self.change_time
+            ]
+            .iter()
+            .all(|v| *v <= i64::MAX as u64),
+            "INVALID_TIMESTAMP"
+        );
+        Ok(())
+    }
+    pub fn attributes(kind: &str, attributes: u32) -> Result<u32> {
+        ensure!(
+            attributes & !BASIC_ATTRIBUTES == 0,
+            "UNSUPPORTED_ATTRIBUTES"
+        );
+        // DIRECTORY is an immutable type fact; NORMAL is the absence of flags.
+        let attributes = attributes & !(0x10 | 0x80);
+        Ok(if kind == "directory" {
+            attributes | 0x10
+        } else if attributes == 0 {
+            0x80
+        } else {
+            attributes
+        })
+    }
+}
 #[derive(Debug)]
 struct CausalPrerequisitesPending;
 impl std::fmt::Display for CausalPrerequisitesPending {
@@ -105,6 +161,29 @@ pub struct Entry {
     pub alive: bool,
     pub revisions: BTreeMap<String, String>,
     pub modified_ms: u64,
+    #[serde(default)]
+    pub created_ms: u64,
+    #[serde(default)]
+    pub basic: Option<BasicInfo>,
+}
+impl Entry {
+    pub fn basic_info(&self) -> BasicInfo {
+        let mut basic = self.basic.unwrap_or(BasicInfo {
+            attributes: if self.kind == "directory" { 0x10 } else { 0x20 },
+            creation_time: filetime(self.created_ms),
+            access_time: filetime(self.created_ms),
+            write_time: filetime(self.modified_ms),
+            change_time: filetime(self.modified_ms),
+        });
+        // The register cannot change the projected entry's immutable type.
+        basic.attributes &= !(0x10 | 0x80);
+        if self.kind == "directory" {
+            basic.attributes |= 0x10;
+        } else if basic.attributes == 0 {
+            basic.attributes = 0x80;
+        }
+        basic
+    }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Projection {
@@ -531,7 +610,7 @@ impl Store {
                 "INVALID_ENTITY"
             );
             ensure!(
-                ["kind", "location", "content", "alive"].contains(&change.field.as_str()),
+                ["kind", "location", "content", "alive", "basic"].contains(&change.field.as_str()),
                 "INVALID_FIELD"
             );
             ensure!(!change.parents.contains(&event.id), "CAUSAL_CYCLE");
@@ -549,6 +628,7 @@ impl Store {
                 ),
                 "alive" => ensure!(change.value.is_boolean(), "INVALID_ALIVE"),
                 "content" => ensure!(change.value.is_string(), "INVALID_CONTENT"),
+                "basic" => serde_json::from_value::<BasicInfo>(change.value.clone())?.validate()?,
                 _ => {}
             }
         }
@@ -616,9 +696,12 @@ impl Store {
     }
     fn content_successor(&self, event: &Event) -> Result<Option<Projection>> {
         if !event.reviewed.is_empty()
-            || !event.changes.iter().any(|c| c.field == "content")
+            || !event
+                .changes
+                .iter()
+                .any(|c| ["content", "basic"].contains(&c.field.as_str()))
             || event.changes.iter().any(|c| {
-                !["content", "alive"].contains(&c.field.as_str())
+                !["content", "alive", "basic"].contains(&c.field.as_str())
                     || (c.field == "alive" && c.value != true)
             })
         {
@@ -635,9 +718,12 @@ impl Store {
                 return Ok(None);
             };
             let Some(heads) = p.heads.get(&register(&change.entity, &change.field)) else {
+                if change.field == "basic" && change.parents.is_empty() && entry.alive {
+                    continue;
+                }
                 return Ok(None);
             };
-            if entry.kind != "file"
+            if (entry.kind != "file" && change.field != "basic")
                 || !entry.alive
                 || heads.len() != 1
                 || change.parents != vec![heads[0].revision.clone()]
@@ -675,6 +761,8 @@ impl Store {
                 .insert(change.field.clone(), event.id.clone());
             if change.field == "content" {
                 entry.content = change.value.as_str().map(str::to_owned);
+            } else if change.field == "basic" {
+                entry.basic = Some(serde_json::from_value(change.value.clone())?);
             }
         }
         for entity in event
@@ -743,6 +831,14 @@ impl Store {
         lookup(&self.projection(&self.active)?, path)
     }
     pub fn create(&mut self, path: &str, kind: &str) -> Result<Entry> {
+        self.create_with_attributes(path, kind, None)
+    }
+    pub fn create_with_attributes(
+        &mut self,
+        path: &str,
+        kind: &str,
+        attributes: Option<u32>,
+    ) -> Result<Entry> {
         let (parent, name) = split_path(path)?;
         let dir = self.lookup(&parent)?;
         ensure!(dir.kind == "directory", "NOT_DIRECTORY");
@@ -777,8 +873,43 @@ impl Store {
             });
         }
         let branch = self.branch(&self.active)?;
-        self.commit(self.event(&branch, changes), true)?;
+        let mut event = self.event(&branch, changes);
+        if let Some(attributes) = attributes {
+            let now = filetime(event.created_ms);
+            let basic = BasicInfo {
+                attributes: BasicInfo::attributes(kind, attributes)?,
+                creation_time: now,
+                access_time: now,
+                write_time: now,
+                change_time: now,
+            };
+            event.changes.push(Change {
+                entity,
+                field: "basic".into(),
+                parents: vec![],
+                value: json!(basic),
+            });
+        }
+        self.commit(event, true)?;
         self.lookup(path)
+    }
+    pub fn set_basic(&mut self, entity: &str, basic: BasicInfo) -> Result<()> {
+        basic.validate()?;
+        let entry = self
+            .projection(&self.active)?
+            .entries
+            .get(entity)
+            .cloned()
+            .context("FILE_NOT_FOUND")?;
+        ensure!(
+            basic.attributes == BasicInfo::attributes(&entry.kind, basic.attributes)?,
+            "INVALID_ATTRIBUTES"
+        );
+        if entry.basic_info() == basic {
+            return Ok(());
+        }
+        let change = self.current_change(entity, "basic", json!(basic))?;
+        self.commit(self.event(&self.branch(&self.active)?, vec![change]), true)
     }
     pub fn write_revision(
         &mut self,
@@ -786,26 +917,10 @@ impl Store {
         base: Option<String>,
         bytes: &[u8],
     ) -> Result<String> {
-        let object = self.put_object(bytes)?;
-        let branch = self.branch(&self.active)?;
         // An edit also asserts existence. Parent only the existence revision the
         // writer observed: callers needing an old base use write_with_base.
         let alive = self.current_change(entity, "alive", json!(true))?;
-        let event = self.event(
-            &branch,
-            vec![
-                Change {
-                    entity: entity.into(),
-                    field: "content".into(),
-                    parents: base.into_iter().collect(),
-                    value: json!(object),
-                },
-                alive,
-            ],
-        );
-        let rev = event.id.clone();
-        self.commit(event, true)?;
-        Ok(rev)
+        self.write_with_parents(entity, base, alive.parents, bytes, 0)
     }
     pub fn write_with_base(
         &mut self,
@@ -814,9 +929,35 @@ impl Store {
         alive_base: Option<String>,
         bytes: &[u8],
     ) -> Result<String> {
+        self.write_with_base_and_times(entity, content_base, alive_base, bytes, 0)
+    }
+    pub fn write_with_base_and_times(
+        &mut self,
+        entity: &str,
+        content_base: Option<String>,
+        alive_base: Option<String>,
+        bytes: &[u8],
+        preserve_times: u8,
+    ) -> Result<String> {
+        self.write_with_parents(
+            entity,
+            content_base,
+            alive_base.into_iter().collect(),
+            bytes,
+            preserve_times,
+        )
+    }
+    fn write_with_parents(
+        &mut self,
+        entity: &str,
+        content_base: Option<String>,
+        alive_parents: Vec<String>,
+        bytes: &[u8],
+        preserve_times: u8,
+    ) -> Result<String> {
         let object = self.put_object(bytes)?;
         let b = self.branch(&self.active)?;
-        let event = self.event(
+        let mut event = self.event(
             &b,
             vec![
                 Change {
@@ -828,11 +969,30 @@ impl Store {
                 Change {
                     entity: entity.into(),
                     field: "alive".into(),
-                    parents: alive_base.into_iter().collect(),
+                    parents: alive_parents,
                     value: json!(true),
                 },
             ],
         );
+        let entry = self
+            .projection(&self.active)?
+            .entries
+            .get(entity)
+            .cloned()
+            .context("FILE_NOT_FOUND")?;
+        if entry.basic.is_some() || preserve_times != 0 {
+            let mut basic = entry.basic_info();
+            if preserve_times & 2 == 0 {
+                basic.write_time = filetime(event.created_ms);
+            }
+            if preserve_times & 4 == 0 {
+                basic.change_time = filetime(event.created_ms);
+            }
+            basic.attributes = BasicInfo::attributes(&entry.kind, basic.attributes | 0x20)?;
+            event
+                .changes
+                .push(self.current_change(entity, "basic", json!(basic))?);
+        }
         let rev = event.id.clone();
         self.commit(event, true)?;
         Ok(rev)
@@ -906,6 +1066,7 @@ impl Store {
                 ("kind", json!(entry.kind)),
                 ("location", json!({"parent":entry.parent,"name":entry.name})),
                 ("alive", json!(true)),
+                ("basic", json!(entry.basic_info())),
             ] {
                 changes.push(Change {
                     entity: entry.id.clone(),
@@ -980,7 +1141,7 @@ impl Store {
                 .find(|c| &c.id == requested && c.resolved_by.is_none())
                 .context("CONFLICT_NOT_FOUND")?;
             ensure!(
-                ["content", "alive", "location", "kind"].contains(&c.field.as_str()),
+                ["content", "alive", "location", "kind", "basic"].contains(&c.field.as_str()),
                 "NAMESPACE_RESOLUTION_REQUIRES_RENAME_OR_DELETE"
             );
             groups
@@ -1137,7 +1298,12 @@ impl Store {
             )
             .context("CHECKPOINT_NOT_FOUND")?;
         let snapshot: Value = serde_json::from_slice(&self.read_object(&object)?)?;
-        ensure!(snapshot["format"] == "tkfs-snapshot-1", "INVALID_SNAPSHOT");
+        ensure!(
+            ["tkfs-snapshot-1", "tkfs-snapshot-2"]
+                .iter()
+                .any(|f| snapshot["format"] == *f),
+            "INVALID_SNAPSHOT"
+        );
         let p: Projection = serde_json::from_value(snapshot["state"].clone())?;
         let branch = Branch {
             id: id(),
@@ -1150,6 +1316,7 @@ impl Store {
                 ("kind", json!(entry.kind)),
                 ("alive", json!(true)),
                 ("location", json!({"parent":entry.parent,"name":entry.name})),
+                ("basic", json!(entry.basic_info())),
             ] {
                 changes.push(Change {
                     entity: entry.id.clone(),
@@ -1205,7 +1372,7 @@ impl Store {
         let snapshot = self.projection(&self.active)?;
         ensure!(snapshot.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
         let bytes = serde_json::to_vec(
-            &json!({"format":"tkfs-snapshot-1","branch":self.active,"state":snapshot}),
+            &json!({"format":"tkfs-snapshot-2","branch":self.active,"state":snapshot}),
         )?;
         let object = self.put_object(&bytes)?;
         let checkpoint = id();
@@ -1506,7 +1673,7 @@ impl Store {
         let outgoing = self.outgoing_unacknowledged()?;
         Ok(
             json!({"repo":self.repo,"device":self.device,"branch":self.branch(&self.active)?,"generation":self.generation,
-            "local_durability":"sqlite-full+verified-objects","outgoing_unacknowledged":outgoing,"incoming_pending":self.db.query_row("SELECT count(*) FROM incoming_events",[],|r|r.get::<_,i64>(0))?,"incoming_quarantined":self.db.query_row("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",[],|r|r.get::<_,i64>(0))?,"peer_protocol":2,
+            "local_durability":"sqlite-full+verified-objects","outgoing_unacknowledged":outgoing,"incoming_pending":self.db.query_row("SELECT count(*) FROM incoming_events",[],|r|r.get::<_,i64>(0))?,"incoming_quarantined":self.db.query_row("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",[],|r|r.get::<_,i64>(0))?,"peer_protocol":PEER_FORMAT,
             "caught_up":"unknown-until-peer-roundtrip","pending_causal_events":p.pending,"unresolved_conflicts":self.conflicts()?.iter().filter(|c|c.resolved_by.is_none()).count()}),
         )
     }
@@ -2360,15 +2527,21 @@ pub fn project(branch: &str, events: &[Event]) -> Result<Projection> {
         entry
             .revisions
             .insert(field.into(), winner.revision.clone());
-        entry.modified_ms = entry.modified_ms.max(winner.created_ms);
+        if field != "basic" {
+            entry.modified_ms = entry.modified_ms.max(winner.created_ms);
+        }
         match field {
-            "kind" => entry.kind = winner.value.as_str().unwrap().into(),
+            "kind" => {
+                entry.kind = winner.value.as_str().unwrap().into();
+                entry.created_ms = winner.created_ms;
+            }
             "location" => {
                 entry.parent = winner.value["parent"].as_str().unwrap().into();
                 entry.name = winner.value["name"].as_str().unwrap().into();
             }
             "alive" => entry.alive = winner.value.as_bool().unwrap(),
             "content" => entry.content = winner.value.as_str().map(str::to_owned),
+            "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
             _ => {}
         }
         if heads.len() > 1

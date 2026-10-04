@@ -16,7 +16,10 @@ static MOUNT: Mutex<Option<Mount>> = Mutex::new(None);
 #[derive(Default)]
 pub struct Info {
     size: u64,
-    time: u64,
+    creation_time: u64,
+    access_time: u64,
+    write_time: u64,
+    change_time: u64,
     index: u64,
     attributes: u32,
 }
@@ -146,12 +149,12 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
 }
 fn fill(info: &mut Info, entry: &Entry, size: usize) {
     info.size = size as u64;
-    info.attributes = if entry.kind == "directory" {
-        0x10
-    } else {
-        0x20
-    };
-    info.time = entry.modified_ms * 10_000 + 116_444_736_000_000_000;
+    let basic = entry.basic_info();
+    info.attributes = basic.attributes;
+    info.creation_time = basic.creation_time;
+    info.access_time = basic.access_time;
+    info.write_time = basic.write_time;
+    info.change_time = basic.change_time;
     let h = hash(entry.id.as_bytes());
     info.index = u64::from_str_radix(&h[..16], 16).unwrap();
 }
@@ -225,7 +228,13 @@ pub unsafe extern "C" fn tk_call(
                 } else {
                     None
                 };
-                let (handle, entry) = e.open(&path, create, flags & 2 != 0)?;
+                let attributes = if op == 2 && length == 4 {
+                    Some(unsafe { std::ptr::read_unaligned(buffer.cast::<u32>()) })
+                } else {
+                    None
+                };
+                let (handle, entry) =
+                    e.open_with_attributes(&path, create, flags & 2 != 0, attributes)?;
                 unsafe { *token = handle };
                 fill(&mut out, &entry, e.session(handle)?.bytes.len());
             }
@@ -257,6 +266,10 @@ pub unsafe extern "C" fn tk_call(
                     "PERMISSION_DENIED"
                 );
                 ensure!(
+                    s.entry.kind == "directory" || s.entry.basic_info().attributes & 1 == 0,
+                    "ACCESS_DENIED: readonly file"
+                );
+                ensure!(
                     !p.entries
                         .values()
                         .any(|v| v.alive && v.parent == s.entry.id),
@@ -279,15 +292,21 @@ pub unsafe extern "C" fn tk_call(
                     .filter(|entry| entry.alive && entry.parent == entity)
                     .cloned()
                     .collect();
-                if entity == ROOT {
-                    children.push(Entry {
-                        id: "control".into(),
-                        name: ".tkfs-runtime.json".into(),
-                        kind: "file".into(),
-                        ..Default::default()
-                    });
-                }
+                // Runtime discovery is direct-lookup-only, never a directory entry.
                 children.sort_by_key(|e| e.name.to_lowercase());
+                // FindFirstFile on a completely empty directory must still open a
+                // search handle. Git's Windows opendir rejects ERROR_FILE_NOT_FOUND;
+                // ordinary directory consumers discard these standard dot entries.
+                let directory = e.session(h)?.entry.clone();
+                let mut parent = p
+                    .entries
+                    .get(&directory.parent)
+                    .cloned()
+                    .unwrap_or(e.store.lookup("")?);
+                parent.name = "..".into();
+                let mut directory = directory;
+                directory.name = ".".into();
+                children.splice(0..0, [directory, parent]);
                 let Some(entry) = children.get(offset as usize) else {
                     return Ok(0x80000006);
                 };
@@ -312,9 +331,23 @@ pub unsafe extern "C" fn tk_call(
                 };
                 fill(&mut out, entry, size);
             }
+            14 => {
+                #[repr(C)]
+                #[derive(Clone, Copy)]
+                struct BasicUpdate {
+                    times: [u64; 4],
+                    attributes: u32,
+                }
+                ensure!(
+                    length as usize == std::mem::size_of::<BasicUpdate>(),
+                    "INVALID_PARAMETER"
+                );
+                let update = unsafe { std::ptr::read_unaligned(buffer.cast::<BasicUpdate>()) };
+                e.set_basic(h, update.attributes, update.times)?;
+            }
             _ => bail!("UNSUPPORTED_FS_OPERATION"),
         }
-        if [5, 6, 7, 8].contains(&op) && h != 0 {
+        if [5, 6, 7, 8, 14].contains(&op) && h != 0 {
             let s = e.session(h)?;
             fill(&mut out, &s.entry, s.bytes.len());
         }
@@ -351,6 +384,13 @@ pub unsafe extern "C" fn tk_call(
                 0xc0000033
             } else if message.contains("PERMISSION") || message.contains("ACCESS_DENIED") {
                 0xc0000022
+            } else if message.contains("UNSUPPORTED") {
+                0xc00000bb
+            } else if message.contains("INVALID_TIMESTAMP")
+                || message.contains("INVALID_ATTRIBUTES")
+                || message.contains("INVALID_PARAMETER")
+            {
+                0xc000000d
             } else {
                 0xc0000185
             }

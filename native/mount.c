@@ -3,7 +3,7 @@
 #include <sddl.h>
 #include <stdlib.h>
 #include <wchar.h>
-typedef struct {UINT64 size, time, index; UINT32 attributes;} TK_INFO;
+typedef struct {UINT64 size, creation_time, access_time, write_time, change_time, index; UINT32 attributes;} TK_INFO;
 typedef struct {UINT64 token;} TK_HANDLE;
 extern UINT32 tk_call(UINT32,const WCHAR*,UINT64*,UINT64,void*,UINT32,UINT32,TK_INFO*,UINT32*);
 static PSECURITY_DESCRIPTOR Security;
@@ -12,7 +12,8 @@ static void fill(FSP_FSCTL_FILE_INFO *out, TK_INFO *in) {
     if (!out) return;
     memset(out,0,sizeof *out);out->FileAttributes=in->attributes;out->FileSize=in->size;
     out->AllocationSize=(in->size+4095)/4096*4096;
-    out->CreationTime=out->LastAccessTime=out->LastWriteTime=out->ChangeTime=in->time;
+    out->CreationTime=in->creation_time;out->LastAccessTime=in->access_time;
+    out->LastWriteTime=in->write_time;out->ChangeTime=in->change_time;
     out->IndexNumber=in->index;
 }
 static NTSTATUS call(UINT32 op,PWSTR name,PVOID context,UINT64 offset,PVOID buffer,ULONG length,UINT32 flags,FSP_FSCTL_FILE_INFO *fi,PULONG count) {
@@ -32,18 +33,18 @@ static NTSTATUS security_name(FSP_FILE_SYSTEM *fs,PWSTR name,PUINT32 attrs,PSECU
     TK_INFO info={0};UINT64 token=0;NTSTATUS result=tk_call(1,name,&token,0,0,0,0,&info,0);
     if(!NT_SUCCESS(result))return result;if(attrs)*attrs=info.attributes;return sec(sd,size);
 }
-static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 op,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {
+static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,UINT32 op,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {
     TK_HANDLE *handle=calloc(1,sizeof *handle);if(!handle)return STATUS_INSUFFICIENT_RESOURCES;
     TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0);
-    NTSTATUS result=tk_call(op,name,&handle->token,0,0,0,flags,&info,0);
+    NTSTATUS result=tk_call(op,name,&handle->token,0,op==2?&attrs:0,op==2?sizeof attrs:0,flags,&info,0);
     if(!NT_SUCCESS(result)){free(handle);return result;}*context=handle;fill(fi,&info);
     /* Force ordinary reads/writes through Rust; kernel data caching would hide
        remotely updated bytes behind an existing file node. Public SDK wire flag. */
     FspFileSystemGetOperationContext()->Response->Rsp.Create.Opened.DisableCache=1;
     return result;
 }
-static NTSTATUS create(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,PSECURITY_DESCRIPTOR sd,UINT64 allocation,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,2,context,fi);}
-static NTSTATUS open_file(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,3,context,fi);}
+static NTSTATUS create(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,PSECURITY_DESCRIPTOR sd,UINT64 allocation,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,attrs,2,context,fi);}
+static NTSTATUS open_file(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,0,3,context,fi);}
 static NTSTATUS overwrite(FSP_FILE_SYSTEM *fs,PVOID context,UINT32 attrs,BOOLEAN replace,UINT64 allocation,FSP_FSCTL_FILE_INFO *fi) {return call(6,0,context,0,0,0,0,fi,0);}
 static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,0,context,0,0,0,(flags&FspCleanupDelete)?1:0,0,0);}
 static void close_file(FSP_FILE_SYSTEM *fs,PVOID context) {call(10,0,context,0,0,0,0,0,0);free(context);}
@@ -52,9 +53,8 @@ static NTSTATUS write_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64
 static NTSTATUS flush(FSP_FILE_SYSTEM *fs,PVOID context,FSP_FSCTL_FILE_INFO *fi) {return call(7,0,context,0,0,0,0,fi,0);}
 static NTSTATUS get_info(FSP_FILE_SYSTEM *fs,PVOID context,FSP_FSCTL_FILE_INFO *fi) {return call(8,0,context,0,0,0,0,fi,0);}
 static NTSTATUS basic(FSP_FILE_SYSTEM *fs,PVOID context,UINT32 attrs,UINT64 ct,UINT64 at,UINT64 wt,UINT64 cht,FSP_FSCTL_FILE_INFO *fi) {
-    if(attrs!=INVALID_FILE_ATTRIBUTES&&(attrs&~(FILE_ATTRIBUTE_ARCHIVE|FILE_ATTRIBUTE_NORMAL|FILE_ATTRIBUTE_DIRECTORY)))return STATUS_NOT_SUPPORTED;
-    if(ct||at||wt||cht)return STATUS_NOT_SUPPORTED;
-    return get_info(fs,context,fi);
+    struct {UINT64 times[4];UINT32 attributes;} update={{ct,at,wt,cht},attrs};
+    return call(14,0,context,0,&update,sizeof update,0,fi,0);
 }
 static NTSTATUS size_file(FSP_FILE_SYSTEM *fs,PVOID context,UINT64 size,BOOLEAN allocation,FSP_FSCTL_FILE_INFO *fi) {return call(6,0,context,size,0,0,allocation?1:0,fi,0);}
 static NTSTATUS can_delete(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name) {return call(11,0,context,0,0,0,0,0,0);}
@@ -112,7 +112,7 @@ UINT32 tk_mount_notify(FSP_FILE_SYSTEM *fs,PWSTR path,UINT32 action) {
     if(bytes>65535)return STATUS_NAME_TOO_LONG;
     FSP_FSCTL_NOTIFY_INFO *info=calloc(1,bytes);if(!info)return STATUS_INSUFFICIENT_RESOURCES;
     info->Size=(UINT16)bytes;info->Action=action;
-    info->Filter=FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_DIR_NAME|FILE_NOTIFY_CHANGE_SIZE|FILE_NOTIFY_CHANGE_LAST_WRITE;
+    info->Filter=FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_DIR_NAME|FILE_NOTIFY_CHANGE_SIZE|FILE_NOTIFY_CHANGE_LAST_WRITE|FILE_NOTIFY_CHANGE_ATTRIBUTES|FILE_NOTIFY_CHANGE_CREATION|FILE_NOTIFY_CHANGE_LAST_ACCESS;
     memcpy(info->FileNameBuf,path,wcslen(path)*sizeof(WCHAR));
     NTSTATUS result=FspFileSystemNotifyBegin(fs,100);
     if(NT_SUCCESS(result)){result=FspFileSystemNotify(fs,info,bytes);FspFileSystemNotifyEnd(fs);}

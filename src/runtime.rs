@@ -24,12 +24,14 @@ pub struct Session {
     pub alive_base: Option<String>,
     pub dirty: bool,
     pub references: usize,
+    pub preserve_times: u8,
 }
 pub struct Handle {
     pub entity: String,
     pub generation: u64,
     pub cleaned: bool,
     pub writable: bool,
+    pub time_update_disabled: u8,
 }
 pub struct Engine {
     pub store: Store,
@@ -68,6 +70,15 @@ impl Engine {
         create: Option<&str>,
         writable: bool,
     ) -> Result<(u64, Entry)> {
+        self.open_with_attributes(path, create, writable, None)
+    }
+    pub fn open_with_attributes(
+        &mut self,
+        path: &str,
+        create: Option<&str>,
+        writable: bool,
+        attributes: Option<u32>,
+    ) -> Result<(u64, Entry)> {
         ensure!(!self.switching, "BUSY_VIEW");
         let special = path
             .replace('\\', "/")
@@ -84,10 +95,17 @@ impl Engine {
                 ..Default::default()
             }
         } else if let Some(kind) = create {
-            self.store.create(path, kind)?
+            self.store.create_with_attributes(path, kind, attributes)?
         } else {
             self.store.lookup(path)?
         };
+        ensure!(
+            create.is_some()
+                || !writable
+                || entry.kind == "directory"
+                || entry.basic_info().attributes & 1 == 0,
+            "ACCESS_DENIED: readonly file"
+        );
         if !self.sessions.contains_key(&entry.id) {
             let bytes = if special {
                 self.discovery.clone()
@@ -108,6 +126,7 @@ impl Engine {
                     bytes,
                     dirty: false,
                     references: 0,
+                    preserve_times: 0,
                 },
             );
         }
@@ -122,6 +141,7 @@ impl Engine {
                 generation: self.store.generation,
                 cleaned: false,
                 writable,
+                time_update_disabled: 0,
             },
         );
         Ok((h, entry))
@@ -167,6 +187,7 @@ impl Engine {
             session.bytes.resize(end, 0);
         }
         session.bytes[start..end].copy_from_slice(&bytes[..count]);
+        session.preserve_times = handle.time_update_disabled;
         session.dirty = true;
         Ok(count)
     }
@@ -178,6 +199,7 @@ impl Engine {
         ensure!(size <= MAX_FILE as u64, "FILE_TOO_LARGE");
         if !allocation || size < (session.bytes.len() as u64) {
             session.bytes.resize(size as usize, 0);
+            session.preserve_times = handle.time_update_disabled;
             session.dirty = true;
         }
         Ok(())
@@ -198,17 +220,63 @@ impl Engine {
             .clone();
         let session = self.sessions.get_mut(&entity).unwrap();
         if session.dirty {
-            let rev = self.store.write_with_base(
+            let rev = self.store.write_with_base_and_times(
                 &entity,
                 session.content_base.clone(),
                 session.alive_base.clone(),
                 &session.bytes,
+                session.preserve_times,
             )?;
             session.content_base = Some(rev.clone());
             session.alive_base = Some(rev);
             session.dirty = false;
-            session.entry.content = Some(hash(&session.bytes));
-            session.entry.modified_ms = time();
+            session.entry = self.store.projection(&self.store.active)?.entries[&entity].clone();
+        }
+        Ok(())
+    }
+    /// Metadata-only durability never publishes an unrelated dirty content buffer.
+    pub fn set_basic(&mut self, h: u64, attributes: u32, times: [u64; 4]) -> Result<()> {
+        let entry = self.session(h)?.entry.clone();
+        ensure!(entry.id != "control", "PERMISSION_DENIED");
+        ensure!(entry.id != ROOT, "UNSUPPORTED_FS_OPERATION: root metadata");
+        let current = self
+            .store
+            .projection(&self.store.active)?
+            .entries
+            .get(&entry.id)
+            .cloned()
+            .context("FILE_NOT_FOUND")?;
+        let mut basic = current.basic_info();
+        if attributes != u32::MAX {
+            basic.attributes = BasicInfo::attributes(&entry.kind, attributes)?;
+        }
+        let mut disabled = self.handles[&h].time_update_disabled;
+        for (i, value) in times.into_iter().enumerate() {
+            let bit = if i == 0 { 0 } else { 1 << (i - 1) };
+            match value {
+                0 => {}
+                u64::MAX if i != 0 => disabled |= bit,
+                v if v == u64::MAX - 1 && i != 0 => disabled &= !bit,
+                v if v <= i64::MAX as u64 => match i {
+                    0 => basic.creation_time = v,
+                    1 => basic.access_time = v,
+                    2 => basic.write_time = v,
+                    _ => basic.change_time = v,
+                },
+                _ => bail!("INVALID_TIMESTAMP"),
+            }
+        }
+        self.store.set_basic(&entry.id, basic)?;
+        self.handles.get_mut(&h).unwrap().time_update_disabled = disabled;
+        let s = self.sessions.get_mut(&entry.id).unwrap();
+        s.entry.basic = Some(basic);
+        if s.dirty {
+            if times[2] != 0 {
+                s.preserve_times |= 2;
+            }
+            if times[3] != 0 {
+                s.preserve_times |= 4;
+            }
         }
         Ok(())
     }
@@ -264,6 +332,11 @@ impl Engine {
             .map(|h| h.entity.clone())
             .collect();
         for (entity, session) in &mut self.sessions {
+            if let Some(entry) = after.entries.get(entity).filter(|e| e.alive) {
+                // Metadata follows the canonical register without rebasing a
+                // writer's pinned content buffer or existence/content ancestry.
+                session.entry.basic = entry.basic;
+            }
             if !session.dirty
                 && !writers.contains(entity)
                 && let Some(entry) = after.entries.get(entity).filter(|e| e.alive)
@@ -432,6 +505,9 @@ impl Engine {
 }
 pub type Shared = Arc<Mutex<Engine>>;
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Format 3 requires the durable basic metadata register. Never negotiate down:
+/// a format-2 peer must not acknowledge or cache events it cannot project.
+pub use crate::core::PEER_FORMAT;
 pub fn send_frame(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     ensure!(bytes.len() <= MAX_FRAME, "FRAME_TOO_LARGE");
     stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
@@ -551,6 +627,7 @@ pub struct PeerConfig {
     pub key: [u8; 32],
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PeerMessage {
     format: u32,
     sender: String,
@@ -596,7 +673,11 @@ pub fn decrypt(key: &[u8; 32], bytes: &[u8]) -> Result<Vec<u8>> {
 }
 fn check_peer(e: &Engine, c: &PeerConfig, message: &PeerMessage) -> Result<()> {
     ensure!(
-        message.format == 2 && message.sender == c.peer && message.receiver == e.store.device,
+        message.format == PEER_FORMAT,
+        "INCOMPATIBLE_PEER_FORMAT: both peers require the metadata-capable build"
+    );
+    ensure!(
+        message.sender == c.peer && message.receiver == e.store.device,
         "UNAUTHORIZED_DEVICE"
     );
     ensure!(
@@ -634,7 +715,7 @@ pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
                 e.store
                     .remember_peer_objects(&sc.peer, &message.known_objects)?;
                 Ok(PeerMessage {
-                    format: 2,
+                    format: PEER_FORMAT,
                     sender: e.store.device.clone(),
                     receiver: sc.peer.clone(),
                     request: id(),
@@ -689,7 +770,7 @@ fn exchange_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
     let message = {
         let e = engine.lock().unwrap();
         PeerMessage {
-            format: 2,
+            format: PEER_FORMAT,
             sender: e.store.device.clone(),
             receiver: c.peer.clone(),
             request: request.clone(),
@@ -766,7 +847,11 @@ pub fn namespace_notifications(before: &Projection, after: &Projection) -> Vec<(
                 out.push((path.clone(), 2));
                 out.push((path.clone(), 1));
             }
-            Some(new) if old.content != new.content || old.modified_ms != new.modified_ms => {
+            Some(new)
+                if old.content != new.content
+                    || old.modified_ms != new.modified_ms
+                    || old.basic_info() != new.basic_info() =>
+            {
                 out.push((path.clone(), 3))
             }
             _ => {}

@@ -272,7 +272,7 @@ fn authenticated_retry_without_explicit_ack_recovers_reply_loss_and_status() {
             if attempt == 1 {
                 continue;
             } // durable receipt, reply deliberately lost
-            let response = json!({"format":2,"sender":b.device,"receiver":message["sender"],"request":id(),"reply_to":message["request"],"known":inventory(&b),"known_objects":b.shared_object_inventory().unwrap(),"pending_events":0,"bundle":b.shared_bundle(&known).unwrap(),"ack":[]});
+            let response = json!({"format":tkfs::runtime::PEER_FORMAT,"sender":b.device,"receiver":message["sender"],"request":id(),"reply_to":message["request"],"known":inventory(&b),"known_objects":b.shared_object_inventory().unwrap(),"pending_events":0,"bundle":b.shared_bundle(&known).unwrap(),"ack":[]});
             send_frame(
                 &mut stream,
                 &encrypt(&key, &serde_json::to_vec(&response).unwrap()).unwrap(),
@@ -330,6 +330,7 @@ fn wrong_device_unbound_response_and_inconsistent_ack_cannot_clear_queue() {
         (0, "UNAUTHORIZED_DEVICE"),
         (1, "UNBOUND_PEER_RESPONSE"),
         (2, "INVALID_PEER_ACK"),
+        (3, "INCOMPATIBLE_PEER_FORMAT"),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = PeerConfig {
@@ -347,11 +348,12 @@ fn wrong_device_unbound_response_and_inconsistent_ack_cannot_clear_queue() {
             let message: serde_json::Value =
                 serde_json::from_slice(&decrypt(&key, &read_frame(&mut stream).unwrap()).unwrap())
                     .unwrap();
-            let mut response = json!({"format":2,"sender":"expected-peer","receiver":message["sender"],"request":id(),"reply_to":message["request"],"known":message["known"],"known_objects":[],"pending_events":0,"bundle":null,"ack":[]});
+            let mut response = json!({"format":tkfs::runtime::PEER_FORMAT,"sender":"expected-peer","receiver":message["sender"],"request":id(),"reply_to":message["request"],"known":message["known"],"known_objects":[],"pending_events":0,"bundle":null,"ack":[]});
             match mode {
                 0 => response["sender"] = json!("wrong-peer"),
                 1 => response["reply_to"] = json!("old-request"),
-                _ => response["ack"] = json!(["not-in-accepted-inventory"]),
+                2 => response["ack"] = json!(["not-in-accepted-inventory"]),
+                _ => response["format"] = json!(2),
             }
             send_frame(
                 &mut stream,
