@@ -44,17 +44,21 @@ DWORD tk_pipe_listen(LPCWSTR name,HANDLE *out) {
 static DWORD finish_io(HANDLE pipe,OVERLAPPED *op,BOOL done,DWORD initial,DWORD timeout,DWORD *count) {
     DWORD e=0;
     if(!done && initial==ERROR_IO_PENDING){
-        if(WaitForSingleObject(op->hEvent,timeout)!=WAIT_OBJECT_0){CancelIoEx(pipe,op);GetOverlappedResult(pipe,op,count,TRUE);e=ERROR_SEM_TIMEOUT;}
+        if(WaitForSingleObject(op->hEvent,timeout)!=WAIT_OBJECT_0){CancelIoEx(pipe,op);if(!GetOverlappedResult(pipe,op,count,TRUE)){e=GetLastError();if(e==ERROR_OPERATION_ABORTED)e=ERROR_SEM_TIMEOUT;}}
         else if(!GetOverlappedResult(pipe,op,count,FALSE))e=GetLastError();
     } else if(!done)e=initial;
     CloseHandle(op->hEvent);return e;
 }
 DWORD tk_pipe_accept(HANDLE pipe) {
     OVERLAPPED op={0};DWORD count=0;op.hEvent=CreateEventW(0,TRUE,FALSE,0);
-    if(!op.hEvent)return GetLastError();DisconnectNamedPipe(pipe);
+    if(!op.hEvent)return GetLastError();
     BOOL done=ConnectNamedPipe(pipe,&op);DWORD e=done?0:GetLastError();
     if(e==ERROR_PIPE_CONNECTED){CloseHandle(op.hEvent);return 0;}
     return finish_io(pipe,&op,done,e,250,&count);
+}
+DWORD tk_pipe_disconnect(HANDLE pipe) {
+    if(DisconnectNamedPipe(pipe))return 0;
+    DWORD e=GetLastError();return e==ERROR_PIPE_NOT_CONNECTED?0:e;
 }
 DWORD tk_pipe_io(HANDLE pipe,void *buffer,DWORD length,DWORD *count,DWORD write,DWORD timeout) {
     OVERLAPPED op={0};op.hEvent=CreateEventW(0,TRUE,FALSE,0);if(!op.hEvent)return GetLastError();
@@ -77,9 +81,18 @@ done:
 }
 DWORD tk_pipe_connect(LPCWSTR name,HANDLE *out) {
     TOKEN_USER *owner=0,*server=0;DWORD size=0,e=0;ULONG pid=0;HANDLE process=0,token=0;
-    if(!WaitNamedPipeW(name,5000))return GetLastError();
-    *out=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,0,OPEN_EXISTING,FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,0);
-    if(*out==INVALID_HANDLE_VALUE)return GetLastError();
+    ULONGLONG deadline=GetTickCount64()+5000;
+    for(;;){
+        ULONGLONG now=GetTickCount64();
+        if(now>=deadline)return ERROR_SEM_TIMEOUT;
+        if(!WaitNamedPipeW(name,(DWORD)(deadline-now)))return GetLastError();
+        *out=CreateFileW(name,GENERIC_READ|GENERIC_WRITE,0,0,OPEN_EXISTING,FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,0);
+        if(*out!=INVALID_HANDLE_VALUE)break;
+        e=GetLastError();
+        // WaitNamedPipe does not reserve the instance. Another authorized client
+        // can win between wait and open; retry only that race, within the bound.
+        if(e!=ERROR_PIPE_BUSY)return e;
+    }
     e=current_user(&owner);if(e)goto done;
     if(!GetNamedPipeServerProcessId(*out,&pid)){e=GetLastError();goto done;}
     process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
