@@ -12,6 +12,13 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
+def evidence_ignore(directory, names):
+    """Package saved evidence without disposable research states or build outputs."""
+    return [name for name in names if (Path(directory) / name).is_dir()
+            and (name in {"target", "__pycache__"}
+                 or name.startswith(("fixtures-", "separate-", "isolated-source", "benchmark-"))
+                 or (Path(directory).name == "evidence" and name in {"stores", "tests", "correctness"}))]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
@@ -22,6 +29,9 @@ def main():
     shutil.copy2(args.exe, output / "tkfs.exe")
     for name in ("README.md", "THIRD-PARTY-NOTICES.md", "LICENSE-GPL-3.0.txt", "LICENSE-SLINT-ROYALTY-FREE-2.0.md"):
         shutil.copy2(ROOT / name, output / name)
+    shutil.copytree(ROOT / "docs", output / "docs", dirs_exist_ok=True)
+    shutil.copytree(ROOT / "test-evidence", output / "test-evidence",
+                    dirs_exist_ok=True, ignore=evidence_ignore)
     result = subprocess.run(["cargo","metadata","--offline","--locked","--filter-platform","x86_64-pc-windows-msvc","--format-version","1"],cwd=ROOT,capture_output=True,text=True,check=True)
     metadata = json.loads(result.stdout)
     selected = {node["id"] for node in metadata["resolve"]["nodes"]}
@@ -50,11 +60,14 @@ def main():
         inventory.append({"name":package["name"],"version":package["version"],"license":package["license"],"authors":package["authors"],"repository":package["repository"],"notices":files})
     (output / "DEPENDENCY-LICENSES.json").write_text(json.dumps(inventory,indent=2,ensure_ascii=False)+"\n",encoding="utf-8")
     with zipfile.ZipFile(output / "telekinesis-source.zip","w",zipfile.ZIP_DEFLATED) as archive:
-        for folder in ("src","ui","native","scripts","tests"):
+        for folder in ("src","ui","native","scripts","tests","docs","deploy"):
             for file in (ROOT / folder).rglob("*"):
                 if file.is_file() and "__pycache__" not in file.parts:
                     archive.write(file,file.relative_to(ROOT).as_posix())
-        for filename in ("Cargo.toml","Cargo.lock","build.rs","README.md","ORCHESTRATOR-PLAN.md","THIRD-PARTY-NOTICES.md","LICENSE-GPL-3.0.txt","LICENSE-SLINT-ROYALTY-FREE-2.0.md"):
+        for file in (output / "test-evidence").rglob("*"):
+            if file.is_file():
+                archive.write(file, file.relative_to(output).as_posix())
+        for filename in ("Cargo.toml","Cargo.lock","build.rs","README.md","THIRD-PARTY-NOTICES.md","LICENSE-GPL-3.0.txt","LICENSE-SLINT-ROYALTY-FREE-2.0.md"):
             archive.write(ROOT / filename,filename)
     print(json.dumps({"executable":str(output / "tkfs.exe"),"dependency_inventory_count":len(inventory),"packages_without_bundled_license_files":[f'{p["name"]} {p["version"]}' for p in inventory if not p["notices"]]},indent=2))
 

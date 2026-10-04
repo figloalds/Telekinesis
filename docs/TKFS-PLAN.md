@@ -234,9 +234,9 @@ revocation, OS-user authorization and acceptance gates for each stage.
 
 ## Validation and remaining gates
 
-[README.md](README.md) contains exact build/test/run/pairing commands and limits.
+[README.md](../README.md) contains exact build/test/run/pairing commands and limits.
 Core tests run with `cargo test --offline`; real mount/peer acceptance runs with
-`python scripts/e2e.py`. [VALIDATION.json](VALIDATION.json) records actual checks
+`python scripts/e2e.py`. [VALIDATION.json](../test-evidence/VALIDATION.json) records actual checks
 and the fixture/log directory under `test-runs/<UUID>/`. These are real WinFsp
 paths with normal PowerShell/Python OS I/O, not substituted native directories.
 

@@ -53,7 +53,7 @@ def basic(path, update=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", type=Path, required=True)
-    ap.add_argument("--report", type=Path, default=ROOT / "GIT-COMPATIBILITY-VALIDATION.json")
+    ap.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "GIT-COMPATIBILITY-VALIDATION.json")
     args = ap.parse_args()
     exe = args.exe.resolve()
     run = ROOT / "test-runs" / ("git-" + uuid.uuid4().hex[:8])

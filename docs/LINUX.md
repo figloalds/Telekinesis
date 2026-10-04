@@ -84,7 +84,8 @@ checkout or shutdown. A forced kill can leave a disconnected mount requiring
 ## Qualification and remaining scope
 
 Run `python3 scripts/linux_fuse_e2e.py` on Linux with `/dev/fuse` access. It creates
-only its own state, mount and Git fixtures under `linux-evidence`, retains logs
+only its own state, mount and Git fixtures under ignored `test-runs/linux-evidence`
+(or `--evidence PATH`), retains logs
 and JSON, and unmounts/stops its children. It checks disk staging, fsync, truncate,
 rename/replace, enumeration, timestamps, executable bits, case collision,
 explicit unsupported metadata, owner socket/lock, busy file and cwd checkout,

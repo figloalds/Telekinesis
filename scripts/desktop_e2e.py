@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
-    parser.add_argument("--report", type=Path, default=ROOT / "DESKTOP-VALIDATION.json")
+    parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "DESKTOP-VALIDATION.json")
     parser.add_argument("--theme", choices=("system", "light", "dark"), default="system")
     parser.add_argument("--branches", action="store_true", help="Exercise branch controls in the same disposable mounted installation")
     options = parser.parse_args()

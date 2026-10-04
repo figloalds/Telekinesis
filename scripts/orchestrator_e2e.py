@@ -169,7 +169,7 @@ def close_native_handle(handle):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/o1/debug/tkfs.exe")
-    parser.add_argument("--report", type=Path, default=ROOT / "ORCHESTRATOR-VALIDATION.json")
+    parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "ORCHESTRATOR-VALIDATION.json")
     options = parser.parse_args()
     run = ROOT / "test-runs" / f"orchestrator-{uuid.uuid4()}"
     run.mkdir()

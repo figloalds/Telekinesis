@@ -62,7 +62,8 @@ owner-authenticated named-pipe transport used by management; Linux keeps UID
 checked Unix sockets. TLS tickets, resumption and early data are disabled; fresh
 registry authorization occurs after handshakes and before data use. Local grants,
 revocation and data operations serialize through SQLite transactions. See
-`PAIRING.md` and `PAIRING-VALIDATION.json` for instructions, qualification and the
+[PAIRING.md](PAIRING.md) and
+[PAIRING-VALIDATION.json](../test-evidence/PAIRING-VALIDATION.json) for instructions, qualification and the
 two-replica/rotation boundaries. No installed user credential or system unit was
 created during this work.
 
@@ -81,5 +82,6 @@ adds an explicit outbound-only home mode with dialing independent of grants.
 Direct TLS termination, approved certificates, local enrollment approval,
 fresh per-operation authorization, device-wide connection/rate quotas, reserved
 control/bulk lanes, bounded pages and persistent pools are implemented. Raw TLS
-mode remains compatible. See `PAIRING-WSS.md` and `WSS-VALIDATION.json` for the
+mode remains compatible. See [PAIRING-WSS.md](PAIRING-WSS.md) and
+[WSS-VALIDATION.json](../test-evidence/WSS-VALIDATION.json) for the
 tested command flow, limits and remaining lifecycle/topology boundaries.

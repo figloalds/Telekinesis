@@ -115,7 +115,7 @@ class Device:
 def main():
     global EXE
     parser = argparse.ArgumentParser()
-    parser.add_argument("--report", type=Path, default=ROOT / "VALIDATION.json")
+    parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "VALIDATION.json")
     parser.add_argument("--exe", type=Path, default=EXE)
     args = parser.parse_args()
     EXE = args.exe.resolve()

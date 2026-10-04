@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Bounded real Linux mount qualification. Creates only its own state/mounts.
-Retains JSON/logs/state under linux-evidence; no network or live project access.
+Retains JSON/logs/state under test-runs/linux-evidence; no network or live project access.
 """
 import argparse, errno, json, os, pathlib, signal, stat, subprocess, tempfile, time, traceback
 
 def main():
     args=argparse.ArgumentParser()
     args.add_argument('--binary',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'target/debug/tkfs')
-    args.add_argument('--evidence',type=pathlib.Path,default=pathlib.Path('linux-evidence'))
-    args=args.parse_args(); binary=args.binary.resolve(); args.evidence.mkdir(exist_ok=True)
+    args.add_argument('--evidence',type=pathlib.Path,default=pathlib.Path(__file__).resolve().parents[1]/'test-runs/linux-evidence')
+    args=args.parse_args(); binary=args.binary.resolve(); args.evidence.mkdir(parents=True,exist_ok=True)
     root=pathlib.Path(tempfile.mkdtemp(prefix='mounted-',dir=args.evidence.resolve()))
     state=root/'state'; mount=root/'mount'; daemon=None; report={'root':str(root),'checks':[]}; log=(root/'daemon.log').open('w')
     def run(argv,cwd=None,ok=True):

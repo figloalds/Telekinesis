@@ -1,27 +1,69 @@
-# TKFS proof of concept
+# Telekinesis (TKFS)
 
-A real Windows WinFsp mount backed by a Rust runtime, immutable SHA-256 objects,
-local SQLite, causal file revisions and direct authenticated peer replication.
+A causal filesystem with Windows WinFsp and Linux headless FUSE mounts, backed
+by a Rust runtime, immutable SHA-256 objects, local SQLite and authenticated peer
+replication.
 Each branch **is** an independently writable worktree. The shared `main` branch
 propagates saves and namespace changes automatically; `branch` creates a private
 local branch. Checkpoints are coherent project snapshots, separate from saves.
 
 This is an experimental filesystem for small regular-file projects. The exact
-tested scope and remaining acceptance gaps are in [TKFS-PLAN.md](TKFS-PLAN.md).
-The prior 101,897-byte design is preserved unchanged in
-[TKFS-PLAN-2026-10-02-LEGACY.md](TKFS-PLAN-2026-10-02-LEGACY.md).
+tested scope and remaining acceptance gaps are in [TKFS-PLAN.md](docs/TKFS-PLAN.md).
+The prior design is archived in
+[TKFS-PLAN-2026-10-02-LEGACY.md](docs/TKFS-PLAN-2026-10-02-LEGACY.md).
+
+## Implemented today
+
+| Area | Implemented behavior | Scope |
+|---|---|---|
+| Storage and recovery | Verified immutable objects, SQLite journal, causal revisions/conflicts, disk-backed staging and retained failed saves | Native local state; 16 GiB streaming ceiling; buffered object APIs remain limited to 16 MiB |
+| Worktrees | Private branches, shared branches, fenced checkout, explicit current-state publication, checkpoints and restore | One selected branch per runtime; checkpoints/history stay local |
+| Windows | Real WinFsp mounts, basic attributes/four timestamps, notifications, directory scan cursors and portable Slint desktop | x64; installed WinFsp SDK/runtime required |
+| Linux | Headless CLI/daemon, real FUSE mounts, owner-authenticated Unix control, POSIX permission bits and graceful stop | No desktop or O1 supervisor port; case-insensitive portable names |
+| Local management | O1 supervisor, independent workers, durable operation receipts, start/stop/recovery and running limits | Windows, same-user named pipes; networking disabled in O1 |
+| Persistent pairing | TLS 1.3 device identities, owner-approved enrollment, repository/replica grants, revocation and restart retry | Separate service on Windows/Linux; published data only |
+| WSS | One enrollment/sync listener, outbound-only homes, persistent pools and bounded resumable pages | One active paired peer and two replica origins per repository |
+| Object backend | Explicit export of verified shared objects and manifests to a native directory | Local test adapter; no cloud provider or garbage collection |
+
+Shared saves propagate when replication is explicitly configured. A shared branch
+in a local managed project alone does not establish a network connection. Automatic
+text merging, writable simultaneous branch mounts, multi-peer relay and service
+installation remain outside the implemented scope.
+
+## Repository layout and reading guide
+
+```text
+src/             Rust core, runtime, platform adapters, desktop and transports
+native/          Windows WinFsp bridge, local control and DLL loader
+ui/              Slint desktop components
+tests/           Rust integration and regression tests
+scripts/         Acceptance harnesses, packaging and development helpers
+deploy/          Example Linux systemd units
+docs/            Platform guides, operating instructions, plans and validation notes
+test-evidence/   Saved JSON reports, provenance and isolated research harnesses
+test-runs/       Ignored disposable states, mounts, screenshots and logs
+```
+
+Start with the [documentation index](docs/README.md) and
+[test evidence index](test-evidence/README.md). Platform/network guides are
+[Linux headless/FUSE](docs/LINUX.md), [persistent pairing](docs/PAIRING.md),
+[one-port WSS](docs/PAIRING-WSS.md) and [orchestrator CLI](docs/ORCHESTRATOR-CLI.md).
+License texts and [third-party notices](THIRD-PARTY-NOTICES.md) remain at the root.
+Saved reports record their original binaries, commits and fixture locations;
+they are historical evidence, not a claim that every check ran against this checkout.
 
 ## Local orchestrator and later distribution
 
-[ORCHESTRATOR-PLAN.md](ORCHESTRATOR-PLAN.md) records the implemented local O1
+[ORCHESTRATOR-PLAN.md](docs/ORCHESTRATOR-PLAN.md) records the implemented local O1
 slice and later product direction. `orchestrator` supervises independent worker
 processes from one TOML defaults file and an owner-protected SQLite registry.
 `manage` uses a separate same-user Windows named pipe for create/list/inspect,
 start/stop, operation lookup and orderly supervisor shutdown. Managed O1 workers
 have no peer replication; existing mounted store commands remain compatible.
-Adoption, mount reassignment/trash/restore, persistent machine pairing, shared
-catalog/contracts and service installation are deferred. The first portable Slint
-desktop slice is implemented; it uses the same executable and management API.
+Adoption, mount reassignment/trash/restore, O1 integration of pairing/catalog
+contracts and service installation are deferred. Persistent pairing is implemented
+as a separate portable service, described below. The portable Slint desktop uses
+the same executable and management API.
 
 ## Portable desktop application
 
@@ -99,10 +141,10 @@ the UI does not expose networking, adoption, trash, mount reassignment, or servi
 Slint is pinned to 1.17.0 with the winit Windows backend, software renderer, and
 accessibility support. Slint uses the Royalty-free Desktop, Mobile, and Web
 Applications License 2.0 with the official AboutSlint widget in the accessible
-About screen. This does not impose GPL on the application's own code; the repo's
-pre-existing GPL-3.0-or-later declaration remains unchanged. The
+About screen. The repository declares GPL-3.0-or-later in Cargo.toml. The
 portable package contains attribution, license texts, registry notices/inventory,
-and the corresponding application source archive. See THIRD-PARTY-NOTICES.md.
+and the corresponding application source archive. See
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 This is an experimental local package, not an installer or release qualification.
 
 ```powershell
@@ -110,7 +152,7 @@ python scripts/desktop_e2e.py
 python scripts/desktop_e2e.py --exe target/desktop-branches/debug/tkfs.exe --theme light --branches --report test-runs/branches-light.json
 python scripts/desktop_e2e.py --exe target/desktop-branches/debug/tkfs.exe --theme dark --branches --report test-runs/branches-dark.json
 python scripts/catalog_startup_e2e.py
-python scripts/orchestrator_e2e.py --exe target/slint-ui/debug/tkfs.exe --report DESKTOP-ORCHESTRATOR-VALIDATION.json
+python scripts/orchestrator_e2e.py --exe target/slint-ui/debug/tkfs.exe --report test-evidence/DESKTOP-ORCHESTRATOR-VALIDATION.json
 ```
 
 `gui-test --report <path>` is an explicitly selected acceptance mode for an
@@ -119,13 +161,15 @@ component callbacks and toolkit keyboard events, and captures rendered BMP
 screenshots. It is not physical OS mouse/keyboard automation. The harness checks
 first run, two real independent mounts, busy stop/exact retry, durable data after
 start, GUI close/reopen, and cooperative shutdown; fixtures and screenshots remain
-under `test-runs/desktop-<UUID>`. Evidence is in DESKTOP-VALIDATION.json. Native
+under `test-runs/desktop-<UUID>`. Evidence is in
+[DESKTOP-VALIDATION.json](test-evidence/DESKTOP-VALIDATION.json). Native
 folder picker interaction and general screen-reader behavior require manual QA.
 
-## Build and test
+## Build and test on Windows
 
-Prerequisites: x64 Windows, Rust/MSVC and Windows SDK, and an installed WinFsp
-runtime **and SDK**. This implementation discovered WinFsp 2025, DLL version
+Prerequisites: x64 Windows, Rust/MSVC and Windows SDK, Python 3 for the acceptance
+harnesses, and an installed WinFsp runtime **and SDK**. This implementation
+discovered WinFsp 2025, DLL version
 `2.1.25156.ddca7bd`, at `C:\Program Files (x86)\WinFsp`. It did not install or
 change the driver. Rust `1.96.0` and the available MSVC toolchain built the code.
 `WINFSP_DIR` can select a different SDK directory. The current native link target
@@ -140,6 +184,12 @@ cargo fmt --check
 cargo clippy --offline --all-targets -- -D warnings
 python scripts\e2e.py
 ```
+
+These `--offline` commands require cached dependencies. On a fresh machine use
+`cargo build --locked` first; Cargo.lock pins the dependency set. Harnesses write
+summary reports to `test-evidence/` by default and retain disposable mount/state
+fixtures in ignored `test-runs/`. Use `--report <path>` to preserve a separate run.
+Packaging accepts `--exe <path>` and `--output <folder>` for an isolated build.
 
 No WinFsp `PATH` setup is needed for the new executable or test binaries. WinFsp
 is delay-loaded only for mounts, using an absolute path from `WINFSP_DIR` when
@@ -227,8 +277,8 @@ service/logoff/reboot or power-loss qualification in O1.
 The isolated acceptance harness checks real mounts without `WINFSP_DIR`/WinFsp
 PATH, lifecycle/ownership, five creation crash boundaries, retries, missing
 metadata, authorization, mappings, worker limits and partial startup failures.
-Evidence: [ORCHESTRATOR-VALIDATION.json](ORCHESTRATOR-VALIDATION.json) and
-[ORCHESTRATOR-COMPATIBILITY.json](ORCHESTRATOR-COMPATIBILITY.json).
+Evidence: [ORCHESTRATOR-VALIDATION.json](test-evidence/ORCHESTRATOR-VALIDATION.json) and
+[ORCHESTRATOR-COMPATIBILITY.json](test-evidence/ORCHESTRATOR-COMPATIBILITY.json).
 
 The offline commands use the dependencies already cached on the implementation
 machine. On a fresh development machine, fetch Cargo dependencies normally before
@@ -238,7 +288,7 @@ harness without third-party Python dependencies.
 The E2E harness launches **two local runtime processes and two real WinFsp
 mounts**. It generates an ephemeral 256-bit pairing key, binds only to loopback,
 and terminates its own processes in `finally`. Fixtures and stdout/stderr logs
-remain under `test-runs/<run UUID>/`. [VALIDATION.json](VALIDATION.json) records
+remain under `test-runs/<run UUID>/`. [VALIDATION.json](test-evidence/VALIDATION.json) records
 the actual run directory and checks. This is not real two-computer validation.
 
 ## Single-computer use
@@ -302,18 +352,92 @@ checkpoint intact. Checkpoint labels/history are not replicated between devices.
 | `state`, `events`, `cat-object` | Inspect canonical projection, journal, and immutable bytes |
 | `import`, `mkdir`, `rename`, `delete` | Basic administration through the runtime |
 
+## Linux headless/FUSE
+
+Linux builds reuse the core, SQLite/CAS, branch/privacy and replication code,
+with the kernel FUSE adapter in `src/fuse_linux.rs`. They do not compile Slint.
+Use a native Linux checkout/state directory, a C compiler for bundled SQLite,
+an available `/dev/fuse` and the installed `fusermount3` helper. Qualification
+used Ubuntu 24.04.4 x86_64 under WSL2 with Rust 1.88 and FUSE 3.14.
+
+```bash
+cargo build --locked
+cargo test --locked
+./target/debug/tkfs init --state /native/path/new-state
+./target/debug/tkfs daemon --state /native/path/new-state --mount /native/path/new-mount
+# In another shell outside the mount:
+./target/debug/tkfs --runtime /native/path/new-state/runtime.json status
+./target/debug/tkfs --runtime /native/path/new-state/runtime.json stop
+python3 scripts/linux_fuse_e2e.py
+```
+
+The mount target must not exist and its parent must exist. Local control checks
+Unix socket ownership and peer UID; an exclusive state lock prevents a second
+owner. Filesystem permissions 0000..0777, including executable bits, survive
+saves, branches, checkpoints and replication. UID/GID are the daemon user's;
+ownership changes, privileged modes, links, ACLs/xattrs and special files are
+unsupported. Names remain case-insensitive with Windows restrictions.
+
+Checkout and stop require a quiet view, including no open handles or cwd inside
+the mount. Inotify, arbitrary mapped writes/shared mmap, cross-platform mounted
+replication and installed no-login systemd operation remain unqualified. See
+[the complete platform contract](docs/LINUX.md) and
+[saved Linux report](test-evidence/LINUX-VALIDATION.json). Fresh Linux harness
+fixtures go to ignored `test-runs/linux-evidence/` unless `--evidence` overrides it.
+
+## Persistent pairing and published-data sync
+
+`tkfs pairing` is a separate portable service using TLS 1.3 and distinct persistent
+installation credentials. Windows credentials use CurrentUser DPAPI; Linux reads
+explicitly provisioned systemd credentials. The owner enrolls a peer with an
+expiring single-use invitation, approves its exact installation/certificate
+fingerprint, and grants a repository with explicit local/remote replica bindings.
+Approval alone grants no repository access. Private branches and private-only
+objects remain local; remote peers cannot dispatch local management or mount
+operations.
+
+The CLI provides `new-id`, `credential-init` (Windows), `credential-provision`
+(Linux), `run`, `status`, `invite`, `join`, `approve`, `revoke`, `grant`,
+`remote-list` and `sync`. Select the config with
+`tkfs pairing --defaults-file <pairing.toml> <command>`. Follow the complete
+[credential, configuration and enrollment flow](docs/PAIRING.md) before running
+the service; workers must be started independently. Persisted grants resume
+with bounded retry after service restart, and each data operation rechecks
+authorization/revocation. Unsafe private-storage ownership/ACLs fail closed.
+
+The [WSS transport](docs/PAIRING-WSS.md) adds one inbound enrollment/sync port
+and an outbound-only home configuration that binds no TCP listener. Direct TKFS
+TLS termination authenticates approved certificates; control and bulk pools have
+separate quotas, absolute deadlines and bounded resumable transfer pages. Raw TLS
+remains the default compatibility mode. The current WSS URLs require numeric IPs
+and explicit ports; DNS discovery, proxy trust and relay-only VPS operation are
+not implemented. One active paired peer and two replica origins per repository
+remain enforced. O1 does not supervise the transport service.
+
+Saved [pairing](test-evidence/PAIRING-VALIDATION.json) and
+[WSS](test-evidence/WSS-VALIDATION.json) reports cover disposable loopback peers,
+real local worker bridges, privacy, revocation, reconnect and process restarts.
+They do not qualify public WAN/VPS deployment, unattended boot or arbitrary
+multi-peer topologies. Example units are in `deploy/`; they are not installed
+automatically.
+
 ## Two explicitly configured devices
 
+This section documents the legacy, explicitly configured PSK transport. For
+persistent approved-device identities and repository grants, use the
+[pairing service](docs/PAIRING.md) or [WSS guide](docs/PAIRING-WSS.md).
+
 These steps configure the two devices. Ten live checks passed on
-FIGLOALDS/FELYPE at commit `303fec8`; the saved
-[physical report](test-runs/two-machine-448ed3f6-948d-4d90-b8b7-9b1cdbd82744/TWO-MACHINE-VALIDATION.json)
-records the results and acknowledgement finding. The correction below is validated
+FIGLOALDS/FELYPE at commit `303fec8`; the original physical report was saved in
+`test-runs/two-machine-448ed3f6-948d-4d90-b8b7-9b1cdbd82744/TWO-MACHINE-VALIDATION.json`
+(an ignored local artifact, absent from a fresh checkout). The
+[validation notes](docs/VALIDATION.md#physical-findings-and-acknowledgement-correction)
+record the results and acknowledgement finding. The correction below is validated
 locally, and has not been tested on two physical computers. The user configured the
 firewall exception; agents did not change network settings, drivers or credentials.
 
 1. Build/copy the executable onto each x64 Windows machine; verify the existing
-   WinFsp runtime/SDK and process-local DLL PATH. Installing a driver is a
-   separately authorized setup step if missing.
+   WinFsp runtime/SDK. New builds locate the installed DLL without PATH changes.
 2. On A, `tkfs init --state <A-native-state>`. Record its repository UUID and
    device UUID from the JSON. On B, `tkfs init --state <B-native-state> --repo
    <A-repository-UUID>`. B must have its own device UUID and SQLite, not a copy of
@@ -346,7 +470,8 @@ revocation. It is real TCP transport with real SQLite/object durability; no
 remote bucket or centralized authority is implemented or required.
 
 The sender transfers only events rooted in shared branches, and only the exact
-object hashes referenced by those events. Protocol version 2 paginates metadata
+object hashes referenced by those events. The current peer format is **5**;
+metadata and objects are paginated
 and objects under the frame bound, including a single atomic publication whose
 objects need several pages. Incomplete events and verified received objects are
 durably staged; metadata becomes visible and acknowledged only after all required
@@ -379,9 +504,9 @@ ambiguous name fails clearly; use the ID returned by `branches`.
 
 When an existing daemon locks the default executable, validate a separate build
 without stopping it: `cargo build --offline --target-dir target/ack-fix`, then
-`python scripts/e2e.py --exe target/ack-fix/debug/tkfs.exe --report ACK-FIX-VALIDATION.json`.
-The [local correction report](ACK-FIX-VALIDATION.json) preserves the prior physical
-and original local reports; exact commands/results are in [VALIDATION.md](VALIDATION.md).
+`python scripts/e2e.py --exe target/ack-fix/debug/tkfs.exe --report test-evidence/ACK-FIX-VALIDATION.json`.
+The [local correction report](test-evidence/ACK-FIX-VALIDATION.json) preserves the prior physical
+and original local reports; exact commands/results are in [VALIDATION.md](docs/VALIDATION.md).
 
 To reproduce the acceptance checks on two machines: save/rename on mounted
 `main` at A and reopen at B; stop both daemons, restart without peer arguments,
@@ -422,7 +547,7 @@ Pathological topology contention exceeding it refuses the new commit with
 `NAMESPACE_HISTORY_LIMIT` before acknowledgement, preserving existing records.
 It is not a limit on ordinary save count: 10,000 durable content saves, later
 delete/undelete, two 100-save offline replicas, and independent 65-rename chains
-pass. See [SCALABILITY.json](SCALABILITY.json) and [VALIDATION.md](VALIDATION.md).
+pass. See [SCALABILITY.json](test-evidence/SCALABILITY.json) and [VALIDATION.md](docs/VALIDATION.md).
 
 ```powershell
 tkfs --runtime <state>\runtime.json conflicts
@@ -480,9 +605,12 @@ test prefix/region, temporary authorized read/write credentials and approval for
 test writes. No remote adapter, account, bucket or persistent credentials were
 created. Provider consistency/checksum/retention behavior remains to be qualified.
 
-Limits: 16 MiB per object/file, 8 MiB per locally generated event, 64 MiB per peer
-frame, 4,096 competing topology witness cuts per dependency cone, whole-file buffering and
-unbounded retained history; no GC. Names use version-1 NFC plus Unicode lowercase,
+Limits: 16 GiB per streamed file/object, 16 MiB for buffered object APIs (including
+`import` and `cat-object`), 8 MiB per locally generated event, 64 MiB per legacy
+PSK peer frame (WSS pages are limited to 8 MiB), 4,096 competing topology witness
+cuts per dependency cone, and unbounded retained history; no GC. Staging keeps
+small files in memory and spools beyond 256 KiB to disk; immutable revisions still
+store complete file objects. Names use version-1 NFC plus Unicode lowercase,
 not full Windows ordinal casing equivalence. Links, reparse points, ADS, persistent
 ACL edits, attributes beyond basic Readonly/Hidden/System/Archive/Normal,
 root-directory metadata setters, distributed locks and live
@@ -507,8 +635,52 @@ replication, with deterministic concurrent winners and reviewable alternatives.
 Private metadata/history stays private; explicit publication copies only the
 current visible metadata. Requested timestamps do not alter causal event clocks.
 
+Upgrade **both replication peers** to this metadata-capable build. Peer protocol
+is now **5**, including portable POSIX permissions; older formats are rejected
+before receiving events or acknowledging any inventory, and the client retains
+its outgoing queue. Mixed-version replication
+is unsupported. Older incoming event validators also reject the unknown `basic`
+field, but the explicit protocol refusal avoids ambiguous partial operation.
+The SQL journal layout is unchanged and new builds read legacy stores (optional
+cached metadata fields have defaults and are rebuilt from events). New checkpoints
+use `tkfs-snapshot-2`; new builds also restore version 1, while old builds reject
+version 2. **Do not reopen an upgraded state directory with an old binary:** old
+store readers do not enforce a storage-version gate and can ignore new projected
+metadata when rebuilding caches. Preserve a pre-upgrade backup for downgrade;
+there is no claim of mixed-version or downgrade-safe storage support. Running
+user daemons are not automatically restarted by building or packaging this patch.
+
 Run the focused local Git acceptance with
 `python scripts/git_compatibility_e2e.py --exe <fresh-tkfs.exe>`.
 It covers default local/`--no-local` clones into the mount root and subfolder,
 Git locks/atomic replacement, four timestamps, readonly behavior, restart and
 nested discovery using disposable fixtures without an external repository.
+
+## Runtime availability and retained experiments
+
+The runtime publishes a small sampled health/status observation so probes can
+respond during longer serialized work. Directory enumeration uses the
+parent/name index for ordinary projections and a stable per-handle scan cut;
+continuations retain that cut until rewind, and every access checks the branch
+generation. Conflicted projections retain their conflict-aware enumeration.
+These changes preserve the existing checkout/shutdown busy guard.
+
+Large file saves stream from staging into verified immutable objects; peer
+transfers resume sequential parts after restart and acknowledge metadata only
+after complete object verification and causal activation. Availability regressions
+exercise files above 16 MiB, sparse/random-access edits, checkpoint/restore and
+export. The 16 GiB ceiling is a code limit, not a claim of acceptance at that size.
+
+[Saved availability evidence](test-evidence/availability-20261004/ENUMERATION.md)
+records a full local Godot clone, clean Git status, connectivity checks, concurrent
+health probes and a persisted byte/hash audit. Its full live native read sweep
+timed out, so the combined full-size run has no overall pass; cooperative shutdown
+was verified separately. These results describe the recorded fixture and binary.
+
+The [read-only generation experiment](test-evidence/read-lease-20261004/FINAL-REPORT.md)
+and [chunked-CAS research](test-evidence/tkfs-chunked-cas-research-20261004/REPORT.md)
+remain isolated research. Same-path live branch switching failed mapped-read
+isolation; separate paths passed a bounded read-only experiment. Production
+checkout still remounts a quiet view, and production CAS still stores whole-file
+objects. Research findings do not imply writable branch mounts or a storage
+format migration.

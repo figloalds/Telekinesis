@@ -5,8 +5,8 @@ implemented: defaults, registry/journal, create/list/inspect, strict store openi
 same-user management IPC, worker start/stop, crash reattachment and independent
 mounts. Adoption and the later lifecycle, service, pairing and sharing APIs below
 remain proposed. Filesystem contracts remain in [TKFS-PLAN.md](TKFS-PLAN.md).
-See [README.md](README.md) for available commands and
-[ORCHESTRATOR-VALIDATION.json](ORCHESTRATOR-VALIDATION.json) for local evidence.
+See [README.md](../README.md) for available commands and
+[ORCHESTRATOR-VALIDATION.json](../test-evidence/ORCHESTRATOR-VALIDATION.json) for local evidence.
 
 The first portable desktop slice is now implemented with Slint 1.17.0. A single
 application executable dispatches GUI, CLI, supervisor and worker modes, retaining
@@ -17,7 +17,8 @@ retry, explicit shutdown and About are implemented. Closing the GUI leaves mount
 alive. `hello` adds management identity and readiness context; optional
 `target_installation` binds a request to its intended registry. Config accepts
 optional `installation_id` and `default_mount_directory` while preserving legacy
-O1 files. DESKTOP-VALIDATION.json and DESKTOP-ORCHESTRATOR-VALIDATION.json record
+O1 files. [DESKTOP-VALIDATION.json](../test-evidence/DESKTOP-VALIDATION.json) and
+[DESKTOP-ORCHESTRATOR-VALIDATION.json](../test-evidence/DESKTOP-ORCHESTRATOR-VALIDATION.json) record
 the separate desktop evidence. Service/package upgrades, broader lifecycle,
 networking and distribution qualification below remain proposed.
 
@@ -26,7 +27,8 @@ open. Missing, empty, truncated or unrecognized established catalogs are refused
 Fresh creation writes an installation/owner/root-bound bootstrap marker before
 SQLite initialization; interrupted first startup recovers that same identity,
 and the marker is removed before state directories or workers can exist.
-DESKTOP-CATALOG-VALIDATION.json records bootstrap crash recovery and CLI/GUI
+[DESKTOP-CATALOG-VALIDATION.json](../test-evidence/DESKTOP-CATALOG-VALIDATION.json)
+records bootstrap crash recovery and CLI/GUI
 refusal with byte-for-byte retained fixture data.
 
 ## Accepted local O1 implementation contract (2026-10-03)

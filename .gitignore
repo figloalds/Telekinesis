@@ -1,4 +1,6 @@
 /target/
 /test-runs/
+/test-evidence/
 *.sqlite*
 *.log
+__pycache__/

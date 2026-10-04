@@ -15,7 +15,7 @@ from orchestrator_e2e import ENV, ROOT, Fixture
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
-    parser.add_argument("--report", type=Path, default=ROOT / "DESKTOP-CATALOG-VALIDATION.json")
+    parser.add_argument("--report", type=Path, default=ROOT / "test-evidence" / "DESKTOP-CATALOG-VALIDATION.json")
     options = parser.parse_args()
     exe = options.exe.resolve()
     run = ROOT / "test-runs" / f"catalog-startup-{uuid.uuid4()}"
