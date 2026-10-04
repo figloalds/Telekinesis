@@ -43,7 +43,7 @@ impl Paths {
     }
 }
 
-fn exclusive(path: &Path) -> Result<File> {
+pub(crate) fn exclusive(path: &Path) -> Result<File> {
     let deadline = Instant::now() + Duration::from_secs(6);
     loop {
         match OpenOptions::new().create(true).truncate(false).write(true).share_mode(0).open(path) {
@@ -53,7 +53,7 @@ fn exclusive(path: &Path) -> Result<File> {
         }
     }
 }
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let temporary = path.with_extension(format!("{}.tmp", id()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
@@ -421,6 +421,10 @@ impl Session {
         Ok(result)
     }
     pub fn runtime(&self, state: &str, payload: Value) -> Result<Value> {
+        self.runtime_request(state, &id(), payload)
+    }
+    pub fn runtime_request(&self, state: &str, request: &str, payload: Value) -> Result<Value> {
+        uuid::Uuid::parse_str(request).context("INVALID_RUNTIME_REQUEST_ID")?;
         uuid::Uuid::parse_str(state).context("INVALID_STATE_ID")?;
         let path = self
             .config
@@ -450,7 +454,7 @@ impl Session {
                 == fs::canonicalize(self.config.data_directory.join("states").join(state))?,
             "RUNTIME_STATE_PATH_MISMATCH"
         );
-        runtime::rpc(&discovery, &id(), payload)
+        runtime::rpc(&discovery, request, payload)
     }
 }
 

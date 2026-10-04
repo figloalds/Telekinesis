@@ -1,6 +1,8 @@
-import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint, Palette } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint, Palette, CheckBox } from "std-widgets.slint";
 
 export struct Project { label: string, id: string, status: string, mount: string, desired: bool }
+export struct BranchItem { id: string, label: string, shared: bool, current: bool }
+export struct CheckpointItem { id: string, label: string }
 
 // Standard controls and custom surfaces share Slint's resolved system palette.
 // Translucent Fluent controls must never sit on a fixed opposite-theme panel.
@@ -29,7 +31,8 @@ export component App inherits Window {
     in-out property <bool> about-visible;
     in-out property <bool> shutdown-visible;
     in-out property <bool> can-retry;
-    private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible;
+    in-out property <bool> show-activity;
+    private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible || root.branch-dialog != 0;
     out property <bool> can-start-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (!root.projects[root.selected].desired || root.projects[root.selected].status == "Unavailable");
     out property <bool> can-stop-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (root.projects[root.selected].desired || root.projects[root.selected].status != "Stopped");
     out property <bool> can-start-supervisor: !root.working && !root.modal && !root.first-run;
@@ -45,6 +48,29 @@ export component App inherits Window {
     in-out property <string> project-mount;
     in-out property <string> status-detail: "Choose a project to see its local state.";
     in-out property <string> branches-detail;
+    in-out property <[BranchItem]> branches;
+    in-out property <[CheckpointItem]> checkpoints;
+    in-out property <int> selected-branch: -1;
+    in-out property <int> selected-checkpoint: -1;
+    in-out property <int> details-page: 0;
+    in-out property <bool> runtime-ready;
+    in-out property <string> runtime-generation;
+    in-out property <string> current-branch-id;
+    in-out property <string> current-branch-name;
+    in-out property <bool> current-branch-shared;
+    in-out property <string> branch-operation-detail;
+    in-out property <bool> can-retry-branch;
+    in-out property <int> branch-dialog: 0;
+    in-out property <string> branch-input;
+    in-out property <bool> publication-confirmed;
+    in-out property <string> branch-source-project;
+    in-out property <string> branch-source-active;
+    in-out property <string> branch-source-generation;
+    in-out property <string> branch-target-id;
+    in-out property <string> branch-target-label;
+    out property <bool> can-branch-actions: root.connected && root.runtime-ready && !root.working && !root.modal && !root.can-retry-branch && root.selected >= 0 && root.selected < root.projects.length;
+    out property <bool> can-checkout: root.can-branch-actions && root.selected-branch >= 0 && root.selected-branch < root.branches.length && !root.branches[root.selected-branch].current;
+    out property <bool> can-submit-branch: !root.working && root.branch-dialog != 0 && (root.branch-dialog == 2 || root.branch-input != "") && (root.branch-dialog != 3 || root.publication-confirmed);
     in-out property <string> message;
     in-out property <string> operation-detail;
     in-out property <bool> error;
@@ -62,6 +88,23 @@ export component App inherits Window {
     callback browse(int);
     callback open-project;
     callback focus-project-name;
+    callback submit-branch;
+    callback retry-branch;
+    callback begin-branch-action(int);
+    callback cancel-branch-dialog;
+    cancel-branch-dialog => { root.branch-dialog = 0; root.branch-input = ""; root.publication-confirmed = false; }
+    begin-branch-action(kind) => {
+        if root.can-branch-actions {
+            root.branch-source-project = root.projects[root.selected].id;
+            root.branch-source-active = root.current-branch-id;
+            root.branch-source-generation = root.runtime-generation;
+            root.branch-target-id = kind == 5 && root.selected-checkpoint >= 0 ? root.checkpoints[root.selected-checkpoint].id : root.selected-branch >= 0 ? root.branches[root.selected-branch].id : "";
+            root.branch-target-label = kind == 5 && root.selected-checkpoint >= 0 ? root.checkpoints[root.selected-checkpoint].label : root.selected-branch >= 0 ? root.branches[root.selected-branch].label : "";
+            root.branch-input = "";
+            root.publication-confirmed = false;
+            root.branch-dialog = kind;
+        }
+    }
     // App-local override used by acceptance; no Windows settings are changed.
     callback set-theme(int);
     set-theme(mode) => { Palette.color-scheme = mode == 1 ? ColorScheme.light : mode == 2 ? ColorScheme.dark : ColorScheme.unknown; }
@@ -129,7 +172,7 @@ export component App inherits Window {
             if !root.first-run: HorizontalLayout {
                 spacing: 18px;
                 Card {
-                    width: 300px;
+                    width: 240px;
                     VerticalLayout {
                         padding: 16px; spacing: 12px;
                         Text { text: "WORKSPACES"; color: AppTheme.muted; font-size: 11px; font-weight: 700; }
@@ -157,11 +200,42 @@ export component App inherits Window {
                             Button { text: "Start project"; enabled: root.can-start-project; clicked => { root.start-project(); } }
                             Button { text: "Stop project"; enabled: root.can-stop-project; clicked => { root.stop-project(); } }
                         }
-                        ScrollView { VerticalLayout {
+                        if root.selected >= 0: HorizontalLayout {
+                            Button { text: "Overview"; checkable: true; checked: root.details-page == 0; enabled: !root.modal; clicked => { root.details-page = 0; } }
+                            Button { text: "Branches & snapshots"; checkable: true; checked: root.details-page == 1; enabled: !root.modal; clicked => { root.details-page = 1; } }
+                        }
+                        if root.details-page == 0: ScrollView { VerticalLayout {
                             spacing: 16px;
                             Text { text: root.status-detail; color: AppTheme.foreground; wrap: word-wrap; font-size: 13px; }
                             Text { text: root.branches-detail; color: AppTheme.foreground; wrap: word-wrap; font-size: 13px; }
                             Rectangle { vertical-stretch: 1; }
+                        } }
+                        if root.details-page == 1: ScrollView { VerticalLayout {
+                            spacing: 12px;
+                            Text { text: root.runtime-ready ? "Current: " + root.current-branch-name : "Branch controls unavailable"; color: AppTheme.foreground; font-size: 17px; font-weight: 600; wrap: word-wrap; }
+                            Caption { text: root.runtime-ready ? (root.current-branch-shared ? "Shared branch · no peer configured for this managed project" : "Private branch · stays on this computer") : "Start the project, then refresh. Sampled or unavailable runtime state cannot authorize branch actions."; wrap: word-wrap; }
+                            HorizontalLayout {
+                                Button { text: "New private branch…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(1); } }
+                                Button { text: "Switch to selected…"; enabled: root.can-checkout; clicked => { root.begin-branch-action(2); } }
+                            }
+                            ListView { height: min(180px, max(95px, root.branches.length * 52px));
+                                for branch[index] in root.branches: VerticalLayout { spacing: 3px; padding-bottom: 7px;
+                                    Button { text: branch.label + (branch.shared ? " · Shared" : " · Private") + (branch.current ? " · Current" : ""); checkable: true; checked: root.selected-branch == index; enabled: !root.working && !root.modal; clicked => { root.selected-branch = index; } }
+                                    Caption { text: branch.shared ? "Shared · no peer configured" : "Private · local only"; }
+                                }
+                            }
+                            Button { text: "Publish current visible state…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(3); } }
+                            Caption { text: "Publication creates a new shared branch. It does not publish private history or configure a peer."; wrap: word-wrap; }
+                            Rectangle { height: 1px; background: AppTheme.border; }
+                            Text { text: "Snapshots"; color: AppTheme.foreground; font-size: 17px; font-weight: 600; }
+                            HorizontalLayout {
+                                Button { text: "Save checkpoint…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(4); } }
+                                Button { text: "Restore to private branch…"; enabled: root.can-branch-actions && root.selected-checkpoint >= 0; clicked => { root.begin-branch-action(5); } }
+                            }
+                            if root.checkpoints.length == 0: Caption { text: "No checkpoints in this project yet."; }
+                            if root.checkpoints.length > 0: ListView { min-height: 75px; max-height: 140px;
+                                for checkpoint[index] in root.checkpoints: Button { text: checkpoint.label; checkable: true; checked: root.selected-checkpoint == index; enabled: !root.working && !root.modal; clicked => { root.selected-checkpoint = index; } }
+                            }
                         } }
                     }
                 }
@@ -174,16 +248,24 @@ export component App inherits Window {
                     Button { text: "Retry exact request"; visible: root.can-retry; enabled: !root.working && !root.modal && root.connected; clicked => { root.retry(); } }
                 }
             }
-            if root.operation-detail != "": Card {
+            if root.operation-detail != "" && (root.can-retry || root.show-activity): Card {
                 max-height: 120px; min-height: 65px;
                 HorizontalLayout { padding: 12px; spacing: 10px;
                     ScrollView { Text { text: root.operation-detail; color: AppTheme.muted; font-size: 12px; wrap: word-wrap; } }
                     Button { text: "Inspect operation"; enabled: !root.working && !root.modal && root.connected; clicked => { root.inspect-operation(); } }
                 }
             }
+            if root.branch-operation-detail != "" && (root.can-retry-branch || root.show-activity): Card {
+                max-height: 90px; min-height: 60px;
+                HorizontalLayout { padding: 12px; spacing: 10px;
+                    ScrollView { Text { text: root.branch-operation-detail; color: AppTheme.muted; font-size: 12px; wrap: word-wrap; } }
+                    Button { text: "Retry original branch request"; visible: root.can-retry-branch; enabled: !root.working && !root.modal && root.connected; clicked => { root.retry-branch(); } }
+                }
+            }
             if !root.first-run: HorizontalLayout {
-                Caption { text: "Closing this window keeps your projects running."; }
+                Caption { text: "Closing this window keeps your projects running."; wrap: word-wrap; horizontal-stretch: 1; }
                 Rectangle { horizontal-stretch: 1; }
+                Button { text: root.show-activity ? "Hide activity" : "Activity"; enabled: !root.modal; clicked => { root.show-activity = !root.show-activity; } }
                 Button { text: "Reconnect supervisor"; visible: root.connected; enabled: root.can-start-supervisor; clicked => { root.connect(); } }
                 Button { text: "Shut down supervisor…"; enabled: root.can-stop-supervisor; clicked => { root.shutdown-visible = true; } }
             }
@@ -214,6 +296,27 @@ export component App inherits Window {
                 Caption { text: "All projects in this installation will be unmounted. Close editors and Explorer windows using these projects first. Projects marked to run will return on the next supervisor launch."; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; }
                 HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Keep running"; clicked => { root.shutdown-visible = false; } } Button { text: "Shut down"; clicked => { root.shutdown-visible = false; root.shutdown(); } } }
+            }
+        }
+    }
+    if root.branch-dialog != 0: Rectangle {
+        background: #142e3c99;
+        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 610px; height: 410px;
+            VerticalLayout { padding: 26px; spacing: 15px;
+                Heading { font-size: 23px; text: root.branch-dialog == 1 ? "New private branch" : root.branch-dialog == 2 ? "Switch branch" : root.branch-dialog == 3 ? "Publish visible state" : root.branch-dialog == 4 ? "Save checkpoint" : "Restore to private branch"; }
+                Caption { text: "Project: " + (root.selected >= 0 ? root.projects[root.selected].label : "") + " · Current branch: " + root.current-branch-name; wrap: word-wrap; }
+                Caption { text: root.branch-dialog == 1 ? "Copies the current visible files into a new private branch. The current branch stays selected." : root.branch-dialog == 2 ? "Switch to " + root.branch-target-label + ". Close files, editors, and Explorer windows using this project first. The mounted view is rebound only after the runtime's busy checks pass." : root.branch-dialog == 3 ? "Creates a NEW shared branch from the visible files only. Private history, deleted private content, and private conflict alternatives remain on this computer. This project has no peer configured." : root.branch-dialog == 4 ? "Saves a local checkpoint of the current visible files. It does not switch branches or upload anything." : "Restores " + root.branch-target-label + " into a NEW private branch. Current files and the active branch stay unchanged; switch to the restored branch when ready."; wrap: word-wrap; }
+                if root.branch-dialog != 2: VerticalLayout {
+                    Text { text: root.branch-dialog == 4 ? "Checkpoint message" : "New branch name"; color: AppTheme.foreground; }
+                    LineEdit { accessible-label: root.branch-dialog == 4 ? "Checkpoint message" : "New branch name"; text <=> root.branch-input; enabled: !root.working; }
+                }
+                if root.branch-dialog == 3: CheckBox { text: "I confirm publication of the current visible state only"; checked <=> root.publication-confirmed; enabled: !root.working; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    Button { text: "Cancel"; enabled: !root.working; clicked => { root.cancel-branch-dialog(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: root.branch-dialog == 2 ? "Switch branch" : root.branch-dialog == 3 ? "Publish visible state" : root.branch-dialog == 4 ? "Save checkpoint" : "Create private branch"; primary: true; enabled: root.can-submit-branch; clicked => { root.submit-branch(); } }
+                }
             }
         }
     }

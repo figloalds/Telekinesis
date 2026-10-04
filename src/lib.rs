@@ -3,6 +3,8 @@ pub mod core;
 #[cfg(windows)]
 pub mod desktop;
 #[cfg(windows)]
+pub mod desktop_branch;
+#[cfg(windows)]
 pub mod local_ipc;
 #[cfg(windows)]
 pub mod mount;

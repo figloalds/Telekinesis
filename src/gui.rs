@@ -9,9 +9,12 @@ use std::{
 };
 use tkfs::{
     desktop::{self, Paths, Session},
+    desktop_branch::{BranchAction, BranchClient, BranchContext},
     orchestrator::Action,
 };
 slint::include_modules!();
+#[path = "gui_branch_acceptance.rs"]
+mod branch_acceptance;
 
 enum Job {
     Setup(PathBuf, PathBuf, usize),
@@ -26,6 +29,8 @@ enum Job {
     Operation,
     Browse(i32),
     Open,
+    Branch(BranchContext, BranchAction),
+    RetryBranch,
 }
 #[derive(Default)]
 struct View {
@@ -36,6 +41,15 @@ struct View {
     selected: i32,
     status: String,
     branches: String,
+    branch_rows: Vec<BranchItem>,
+    checkpoint_rows: Vec<CheckpointItem>,
+    runtime: Option<BranchContext>,
+    current_branch_name: String,
+    current_branch_shared: bool,
+    branch_operation: String,
+    retry_branch: bool,
+    preferred_branch: Option<String>,
+    preferred_checkpoint: Option<String>,
     message: Option<(String, bool)>,
     operation: String,
     retry: bool,
@@ -46,6 +60,7 @@ struct Controller {
     session: Option<Session>,
     selected: Option<String>,
     catalog: Value,
+    branch_client: Option<BranchClient>,
 }
 fn text(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().to_owned()
@@ -73,7 +88,10 @@ fn describe_error(message: &str) -> String {
         "Unsaved data is retained. Saving is retried automatically; switching or stopping stays blocked until it succeeds. Check the storage error if this continues.".into()
     } else if message.contains("BUSY_VIEW") {
         "This project is in use. Close files, editors, and Explorer windows using it, then retry the same request. Your data is preserved.".into()
-    } else if message.contains("STALE_MANAGEMENT_GENERATION") {
+    } else if message.contains("STALE_MANAGEMENT_GENERATION")
+        || message.contains("STALE_VIEW")
+        || message.contains("STALE_PROJECT_SELECTION")
+    {
         "The project changed in another client. Refresh, review its state, and try the action again.".into()
     } else if message.contains("OPERATION_PENDING") || message.contains("STATE_OPERATION_PENDING") {
         "An earlier operation is still pending. Inspect it and retry its exact request before starting another action.".into()
@@ -110,6 +128,7 @@ impl Controller {
             Job::Setup(data, mounts, limit) => {
                 desktop::bootstrap(&self.paths, &data, &mounts, limit)?;
                 self.session = Some(Session::connect(self.paths.clone())?);
+                self.branch_client = Some(BranchClient::open(self.session.as_ref().unwrap())?);
                 self.refresh(Some((
                     "Configuration saved. You're ready to create a project.".into(),
                     false,
@@ -117,6 +136,7 @@ impl Controller {
             }
             Job::Connect => {
                 self.session = Some(Session::connect(self.paths.clone())?);
+                self.branch_client = Some(BranchClient::open(self.session.as_ref().unwrap())?);
                 self.refresh(None)
             }
             Job::Refresh => self.refresh(None),
@@ -224,7 +244,53 @@ impl Controller {
                 let reply = self.session.as_mut().context("NOT_CONNECTED")?.retry()?;
                 self.after_mutation(reply)
             }
+            Job::Branch(context, action) => {
+                ensure!(
+                    self.selected.as_deref() == Some(context.state.as_str()),
+                    "STALE_PROJECT_SELECTION: review the selected project again"
+                );
+                let reply = self
+                    .branch_client
+                    .as_mut()
+                    .context("BRANCH_CLIENT_NOT_READY")?
+                    .mutate(
+                        self.session.as_ref().context("NOT_CONNECTED")?,
+                        context,
+                        action,
+                    )?;
+                self.after_branch(reply)
+            }
+            Job::RetryBranch => {
+                let reply = self
+                    .branch_client
+                    .as_mut()
+                    .context("BRANCH_CLIENT_NOT_READY")?
+                    .retry(self.session.as_ref().context("NOT_CONNECTED")?)?;
+                self.after_branch(reply)
+            }
         }
+    }
+    fn after_branch(&mut self, reply: Value) -> Result<View> {
+        if let Some(saved) = self
+            .branch_client
+            .as_ref()
+            .and_then(|client| client.saved.as_ref())
+        {
+            self.selected = Some(saved.context.state.clone());
+        }
+        let mut view = self.refresh(Some((
+            if reply["ok"] == true {
+                "Branch action completed. The displayed state is confirmed by the runtime.".into()
+            } else {
+                describe_error(&text(&reply, "error"))
+            },
+            reply["ok"] != true,
+        )))?;
+        if reply["ok"] == true {
+            view.preferred_branch = reply["result"]["id"].as_str().map(str::to_owned);
+            view.preferred_checkpoint = reply["result"]["checkpoint"].as_str().map(str::to_owned);
+        }
+        Ok(view)
     }
     fn selected_state(&self) -> Result<&Value> {
         self.catalog["states"]
@@ -277,6 +343,9 @@ impl Controller {
         )))
     }
     fn refresh(&mut self, message: Option<(String, bool)>) -> Result<View> {
+        if let Some(client) = &mut self.branch_client {
+            client.reload()?;
+        }
         let session = self.session.as_ref().context("NOT_CONNECTED")?;
         self.catalog = read_catalog(session)?;
         let states = self.catalog["states"]
@@ -312,6 +381,19 @@ impl Controller {
             ) {
                 match session.runtime(state["state_id"].as_str().unwrap(), json!({"op":"status"})) {
                     Ok(status) => {
+                        if status["busy"] != true
+                            && status["stale"] != true
+                            && let Some(generation) = status["generation"].as_u64()
+                            && let Some(active) = status["branch"]["id"].as_str()
+                        {
+                            view.runtime = Some(BranchContext {
+                                state: text(state, "state_id"),
+                                active: active.into(),
+                                generation,
+                            });
+                            view.current_branch_name = text(&status["branch"], "name");
+                            view.current_branch_shared = status["branch"]["shared"] == true;
+                        }
                         if status["busy"] == true {
                             view.status.push_str("\n\nFilesystem busy · showing the last observed counts; saving continues.");
                         }
@@ -331,6 +413,15 @@ impl Controller {
                 ) {
                     view.branches = "Branches\n".into();
                     for branch in branches.as_array().context("INVALID_BRANCHES")? {
+                        view.branch_rows.push(BranchItem {
+                            id: text(branch, "id").into(),
+                            label: text(branch, "name").into(),
+                            shared: branch["shared"] == true,
+                            current: view
+                                .runtime
+                                .as_ref()
+                                .is_some_and(|context| context.active == text(branch, "id")),
+                        });
                         view.branches.push_str(&format!(
                             "\n{} · {}",
                             text(branch, "name"),
@@ -340,6 +431,31 @@ impl Controller {
                                 "Private, local only"
                             }
                         ));
+                    }
+                }
+                if let Ok(history) =
+                    session.runtime(state["state_id"].as_str().unwrap(), json!({"op":"history"}))
+                {
+                    for checkpoint in history.as_array().context("INVALID_HISTORY")?.iter().rev() {
+                        let branch = view.branch_rows.iter().find(|row| {
+                            row.id.as_str() == checkpoint["branch"].as_str().unwrap_or_default()
+                        });
+                        let label = format!(
+                            "{} · {} ({})",
+                            text(checkpoint, "message"),
+                            branch
+                                .map(|row| row.label.as_str())
+                                .unwrap_or("Unknown branch"),
+                            if branch.is_some_and(|row| row.shared) {
+                                "shared"
+                            } else {
+                                "private"
+                            }
+                        );
+                        view.checkpoint_rows.push(CheckpointItem {
+                            id: text(checkpoint, "id").into(),
+                            label: label.into(),
+                        });
                     }
                 }
             } else if project_status(state) == "Unavailable" {
@@ -405,11 +521,91 @@ impl Controller {
                 }
             }
         }
+        if let Some(saved) = self
+            .branch_client
+            .as_ref()
+            .and_then(|client| client.saved.as_ref())
+        {
+            let label = self.catalog["states"]
+                .as_array()
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|row| row["state_id"] == saved.context.state)
+                })
+                .map(|row| text(row, "label"))
+                .unwrap_or_else(|| saved.context.state.clone());
+            view.retry_branch = saved.pending();
+            view.branch_operation = format!(
+                "Branch action: {} · Project: {}\nRequest {} · {}",
+                text(&saved.payload, "op"),
+                label,
+                saved.request,
+                if saved.uncertain {
+                    "Delivery uncertain · exact retry preserves the original project and payload"
+                } else if saved.pending() {
+                    "Busy or unavailable · exact retry available"
+                } else {
+                    "Runtime response recorded"
+                }
+            );
+            if view.retry_branch {
+                view.message = Some(("An earlier branch request needs attention. Retry its original request before starting another branch action.".into(),true));
+            }
+        }
         view
     }
 }
 
 fn apply(ui: &App, view: View) {
+    use slint::Model;
+    let old_project = ui
+        .get_projects()
+        .row_data(ui.get_selected() as usize)
+        .map(|row| row.id);
+    let new_project = view
+        .rows
+        .get(view.selected as usize)
+        .map(|row| row.1.as_str());
+    let same_project = old_project.as_ref().map(|id| id.as_str()) == new_project;
+    let old_branch = if same_project {
+        ui.get_branches()
+            .row_data(ui.get_selected_branch() as usize)
+            .map(|row| row.id)
+    } else {
+        None
+    };
+    let old_checkpoint = if same_project {
+        ui.get_checkpoints()
+            .row_data(ui.get_selected_checkpoint() as usize)
+            .map(|row| row.id)
+    } else {
+        None
+    };
+    let selected_branch = view
+        .branch_rows
+        .iter()
+        .position(|row| {
+            Some(row.id.as_str())
+                == view
+                    .preferred_branch
+                    .as_deref()
+                    .or(old_branch.as_ref().map(|id| id.as_str()))
+        })
+        .or_else(|| view.branch_rows.iter().position(|row| row.current))
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    let selected_checkpoint = view
+        .checkpoint_rows
+        .iter()
+        .position(|row| {
+            Some(row.id.as_str())
+                == view
+                    .preferred_checkpoint
+                    .as_deref()
+                    .or(old_checkpoint.as_ref().map(|id| id.as_str()))
+        })
+        .map(|i| i as i32)
+        .unwrap_or(-1);
     ui.set_working(false);
     ui.set_first_run(view.first_run);
     ui.set_connected(view.connected);
@@ -431,6 +627,29 @@ fn apply(ui: &App, view: View) {
         ui.set_status_detail(view.status.into());
     }
     ui.set_branches_detail(view.branches.into());
+    ui.set_branches(ModelRc::new(VecModel::from(view.branch_rows)));
+    ui.set_checkpoints(ModelRc::new(VecModel::from(view.checkpoint_rows)));
+    ui.set_selected_branch(selected_branch);
+    ui.set_selected_checkpoint(selected_checkpoint);
+    ui.set_runtime_ready(view.runtime.is_some());
+    ui.set_current_branch_name(view.current_branch_name.into());
+    ui.set_current_branch_shared(view.current_branch_shared);
+    ui.set_current_branch_id(
+        view.runtime
+            .as_ref()
+            .map(|context| context.active.as_str())
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_runtime_generation(
+        view.runtime
+            .as_ref()
+            .map(|context| context.generation.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_branch_operation_detail(view.branch_operation.into());
+    ui.set_can_retry_branch(view.retry_branch);
     if let Some((message, error)) = view.message {
         ui.set_message(message.into());
         ui.set_error(error);
@@ -489,6 +708,7 @@ pub fn run(report: Option<&Path>) -> Result<()> {
             session: None,
             selected: None,
             catalog: Value::Null,
+            branch_client: None,
         };
         for job in receiver {
             let refresh = matches!(job, Job::Refresh | Job::Connect | Job::Setup(..));
@@ -531,6 +751,48 @@ pub fn run(report: Option<&Path>) -> Result<()> {
     callback!(on_retry, Job::Retry);
     callback!(on_inspect_operation, Job::Operation);
     callback!(on_open_project, Job::Open);
+    callback!(on_retry_branch, Job::RetryBranch);
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_submit_branch(move || {
+            if let Some(ui) = weak.upgrade() {
+                if !ui.get_can_submit_branch() {
+                    return;
+                }
+                let action = match ui.get_branch_dialog() {
+                    1 => BranchAction::Create {
+                        name: ui.get_branch_input().to_string(),
+                    },
+                    2 => BranchAction::Checkout {
+                        branch: ui.get_branch_target_id().to_string(),
+                    },
+                    3 => BranchAction::Publish {
+                        name: ui.get_branch_input().to_string(),
+                        confirmed: ui.get_publication_confirmed(),
+                    },
+                    4 => BranchAction::Checkpoint {
+                        message: ui.get_branch_input().to_string(),
+                    },
+                    5 => BranchAction::Restore {
+                        checkpoint: ui.get_branch_target_id().to_string(),
+                        name: ui.get_branch_input().to_string(),
+                    },
+                    _ => return,
+                };
+                let Ok(generation) = ui.get_branch_source_generation().parse() else {
+                    return;
+                };
+                let context = BranchContext {
+                    state: ui.get_branch_source_project().to_string(),
+                    active: ui.get_branch_source_active().to_string(),
+                    generation,
+                };
+                ui.set_branch_dialog(0);
+                enqueue(&weak, &sender, Job::Branch(context, action));
+            }
+        });
+    }
     {
         let weak = weak.clone();
         let sender = sender.clone();
@@ -595,6 +857,8 @@ pub fn run(report: Option<&Path>) -> Result<()> {
                     && !ui.get_working()
                     && !ui.get_create_visible()
                     && !ui.get_shutdown_visible()
+                    && !ui.get_about_visible()
+                    && ui.get_branch_dialog() == 0
                 {
                     enqueue(&weak, &sender, Job::Refresh);
                 }
@@ -660,15 +924,19 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
     let mut step = 0;
     let mut checks = Vec::<String>::new();
     let mut busy = None;
+    let mut branch_acceptance = branch_acceptance::BranchAcceptance::default();
     let started = std::time::Instant::now();
     let mut ticks = 0;
     let phase = std::env::var("TKFS_UI_TEST_PHASE").unwrap_or_else(|_| "first".into());
+    branch_acceptance.set_phase(&phase);
     timer.start(slint::TimerMode::Repeated,Duration::from_millis(300),move || {
         let Some(ui)=weak.upgrade()else{return;};ticks+=1;
         let result=(||->Result<bool>{
             ensure!(started.elapsed()<Duration::from_secs(100),"UI_TEST_TIMEOUT at step {step}");
             if ticks<3 || ui.get_working(){return Ok(false);}
-            if phase=="invalid-catalog" {
+            if phase.starts_with("branches") {
+                return branch_acceptance.tick(&ui,&directory,&mut checks);
+            } else if phase=="invalid-catalog" {
                 ensure!(!ui.get_connected() && ui.get_error(),"INVALID_CATALOG_NOT_REFUSED: {}",ui.get_message());
                 ensure!(ui.get_projects().row_count()==0,"INVALID_CATALOG_PROJECTS_EXPOSED");
                 snapshot(&ui,&directory.join("startup-refused.bmp"))?;
@@ -705,6 +973,42 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn captured_branch_action_never_follows_a_changed_project_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut controller = Controller {
+            paths: Paths {
+                executable: directory.path().join("fixture.exe"),
+                folder: directory.path().into(),
+                config: directory.path().join("orchestrator.toml"),
+            },
+            session: None,
+            selected: Some(tkfs::core::id()),
+            catalog: Value::Null,
+            branch_client: None,
+        };
+        let context = BranchContext {
+            state: tkfs::core::id(),
+            active: tkfs::core::id(),
+            generation: 0,
+        };
+        let error = controller
+            .execute(Job::Branch(
+                context,
+                BranchAction::Create {
+                    name: "must not be created".into(),
+                },
+            ))
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("STALE_PROJECT_SELECTION"));
+        assert!(
+            !directory
+                .path()
+                .join(".tkfs-ui-branch-operation.json")
+                .exists()
+        );
+    }
     #[test]
     fn transient_transport_failure_preserves_controls_and_marks_stale_status() {
         let mut view = View {

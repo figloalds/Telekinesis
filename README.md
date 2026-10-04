@@ -57,13 +57,37 @@ interrupted first startup retains its installation identity. Legacy O1 configs
 remain accepted. A legacy config without
 `default_mount_directory` requires an explicit new-project mount path.
 
-The UI supports listing projects, create-and-mount, selected local status and
-branches, start/stop, opening a mounted folder in Explorer, operation inspection
-and exact retry, explicit supervisor shutdown, and About/attribution. All startup
+The UI supports listing projects, create-and-mount, selected local status,
+project start/stop, opening a mounted folder in Explorer, operation inspection
+and exact retry, explicit supervisor shutdown/reconnect, and About/attribution. All startup
 and RPC work runs off the Slint event loop. Standard controls have keyboard focus
 and accessible labels; layouts resize and use Windows DPI scaling. Closing the
 UI leaves the supervisor and workers alive. Shutdown preserves desired-running
 states for the next launch; stop changes one project's desired state.
+
+Custom panels and standard controls share Slint's system palette, so light and
+dark themes remain readable without changing Windows settings. Project lifecycle
+buttons distinguish start and stop; Start is available for stopped projects.
+Reconnect supervisor remains available after an interrupted connection. Completed
+request details are under Activity; pending requests and their retry buttons stay
+visible. Window close remains separate from supervisor shutdown.
+
+Branches & snapshots shows the current branch and private/shared state. Supported
+actions are new private branch, switch to a selected branch, publish the current
+visible state into a NEW shared branch (requiring explicit checkbox confirmation),
+save a checkpoint, and restore a checkpoint into a NEW private branch. Creating,
+publishing, and restoring do not switch the current branch. Managed projects have
+no configured peer; Shared does not mean uploaded. Branch deletion, rename,
+merging, pairing, and conflict resolution are not exposed by this slice.
+
+Branch requests are saved separately in `.tkfs-ui-branch-operation.json` before
+delivery, with installation/state/repository/device identity, original UUID,
+payload and view generation. Retry uses the original request even after a lost
+checkout response. Dialogs capture their project and active branch; a changed
+project selection or view is refused. Open handles and unsaved data remain subject
+to runtime busy checks. Cancel dismisses an unsent dialog; there is no in-flight
+abort API. Branch RPC stays on the controller worker, without shell commands or
+direct store access.
 
 Mutation UUIDs, exact payloads, and expected generations are persisted before
 send in `.tkfs-ui-operation.json`. A timeout is uncertain delivery, not cancellation.
@@ -83,6 +107,8 @@ This is an experimental local package, not an installer or release qualification
 
 ```powershell
 python scripts/desktop_e2e.py
+python scripts/desktop_e2e.py --exe target/desktop-branches/debug/tkfs.exe --theme light --branches --report test-runs/branches-light.json
+python scripts/desktop_e2e.py --exe target/desktop-branches/debug/tkfs.exe --theme dark --branches --report test-runs/branches-dark.json
 python scripts/catalog_startup_e2e.py
 python scripts/orchestrator_e2e.py --exe target/slint-ui/debug/tkfs.exe --report DESKTOP-ORCHESTRATOR-VALIDATION.json
 ```

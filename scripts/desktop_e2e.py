@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
     parser.add_argument("--report", type=Path, default=ROOT / "DESKTOP-VALIDATION.json")
     parser.add_argument("--theme", choices=("system", "light", "dark"), default="system")
+    parser.add_argument("--branches", action="store_true", help="Exercise branch controls in the same disposable mounted installation")
     options = parser.parse_args()
     run = ROOT / "test-runs" / f"desktop-{uuid.uuid4()}"
     app = run / "portable"
@@ -73,6 +74,12 @@ def main():
         assert hello["installation_id"] == tomllib.loads(config.read_text())["installation_id"]
         assert "ALREADY_OWNED" in cli("orchestrator","--defaults-file",config,good=False)
         checks.append("versioned installation handshake and duplicate supervisor refusal")
+        if options.branches:
+            phase("branches-pending")
+            pending = json.loads((app / ".tkfs-ui-branch-operation.json").read_text())
+            assert pending["response"]["retryable"] and pending["payload"]["op"] == "checkout"
+            assert len(manage("list")["states"]) == 2
+            phase("branches-resume")
         phase("reopen")
         assert config.read_bytes() == config_before
         for mount in (app / "Projects/Design studio", app / "Projects/Research lab"):
