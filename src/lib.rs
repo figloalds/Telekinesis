@@ -7,3 +7,4 @@ pub mod mount;
 #[cfg(windows)]
 pub mod orchestrator;
 pub mod runtime;
+pub mod staging;

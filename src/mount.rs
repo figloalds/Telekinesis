@@ -82,14 +82,18 @@ pub fn start(engine: Shared, path: &Path) -> Result<()> {
         native,
         path: path.to_owned(),
     });
-    engine.lock().unwrap().mounted = true;
+    let mut e = engine.lock().unwrap();
+    e.mounted = true;
+    e.publish_observation();
     Ok(())
 }
 /// Cooperative O1 stop. Never hold the engine mutex while stopping callbacks.
 pub fn stop(engine: &Shared) -> Result<()> {
     let mut guard = MOUNT.lock().unwrap();
     {
-        let mut e = engine.lock().unwrap();
+        let mut e = engine
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("BUSY_VIEW: filesystem operation in progress"))?;
         e.quiet()?;
         e.switching = true;
     }
@@ -100,6 +104,7 @@ pub fn stop(engine: &Shared) -> Result<()> {
     }
     let mut e = engine.lock().unwrap();
     e.mounted = false;
+    e.publish_observation();
     // Remain fenced until process exit; no new opens in the shutdown gap.
     Ok(())
 }
@@ -122,7 +127,7 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
         for entry in p.entries.values().filter(|e| e.alive) {
             if let Some(h) = &entry.content {
-                e.store.read_object(h)?;
+                e.store.verify_object(h)?;
             }
         }
         e.switching = true;
@@ -216,7 +221,7 @@ pub unsafe extern "C" fn tk_call(
                     entry
                         .content
                         .as_ref()
-                        .map(|h| e.store.read_object(h).map(|b| b.len()))
+                        .map(|h| e.store.object_size(h).map(|size| size as usize))
                         .transpose()?
                         .unwrap_or(0)
                 };
@@ -244,10 +249,9 @@ pub unsafe extern "C" fn tk_call(
                 if start >= s.bytes.len() {
                     return Ok(0xc0000011);
                 }
-                count = (length as usize).min(s.bytes.len() - start) as u32;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(s.bytes[start..].as_ptr(), buffer, count as usize)
-                };
+                count = s.bytes.read_at(start, unsafe {
+                    std::slice::from_raw_parts_mut(buffer, length as usize)
+                })? as u32;
             }
             5 => {
                 let bytes = unsafe { std::slice::from_raw_parts(buffer, length as usize) };
@@ -260,7 +264,6 @@ pub unsafe extern "C" fn tk_call(
             10 => e.close(h)?,
             11 => {
                 let s = e.session(h)?;
-                let p = e.store.projection(&e.store.active)?;
                 ensure!(
                     s.entry.id != ROOT && s.entry.id != "control",
                     "PERMISSION_DENIED"
@@ -270,9 +273,7 @@ pub unsafe extern "C" fn tk_call(
                     "ACCESS_DENIED: readonly file"
                 );
                 ensure!(
-                    !p.entries
-                        .values()
-                        .any(|v| v.alive && v.parent == s.entry.id),
+                    e.store.children(&s.entry.id)?.is_empty(),
                     "DIRECTORY_NOT_EMPTY"
                 );
             }
@@ -284,30 +285,13 @@ pub unsafe extern "C" fn tk_call(
                 e.sessions.get_mut(&entity).unwrap().entry = entry;
             }
             13 => {
-                let entity = e.session(h)?.entry.id.clone();
-                let p = e.store.projection(&e.store.active)?;
-                let mut children: Vec<_> = p
-                    .entries
-                    .values()
-                    .filter(|entry| entry.alive && entry.parent == entity)
-                    .cloned()
-                    .collect();
                 // Runtime discovery is direct-lookup-only, never a directory entry.
-                children.sort_by_key(|e| e.name.to_lowercase());
                 // FindFirstFile on a completely empty directory must still open a
                 // search handle. Git's Windows opendir rejects ERROR_FILE_NOT_FOUND;
                 // ordinary directory consumers discard these standard dot entries.
-                let directory = e.session(h)?.entry.clone();
-                let mut parent = p
-                    .entries
-                    .get(&directory.parent)
-                    .cloned()
-                    .unwrap_or(e.store.lookup("")?);
-                parent.name = "..".into();
-                let mut directory = directory;
-                directory.name = ".".into();
-                children.splice(0..0, [directory, parent]);
-                let Some(entry) = children.get(offset as usize) else {
+                let Some((entry, size)) =
+                    e.directory_entry(h, usize::try_from(offset)?, flags & 1 != 0)?
+                else {
                     return Ok(0x80000006);
                 };
                 let encoded: Vec<_> = entry.name.encode_utf16().chain(Some(0)).collect();
@@ -319,17 +303,7 @@ pub unsafe extern "C" fn tk_call(
                         encoded.len(),
                     )
                 };
-                let size = if entry.id == "control" {
-                    e.discovery.len()
-                } else {
-                    entry
-                        .content
-                        .as_ref()
-                        .map(|h| e.store.read_object(h).map(|b| b.len()))
-                        .transpose()?
-                        .unwrap_or(0)
-                };
-                fill(&mut out, entry, size);
+                fill(&mut out, &entry, size);
             }
             14 => {
                 #[repr(C)]
@@ -357,6 +331,7 @@ pub unsafe extern "C" fn tk_call(
         if !transferred.is_null() {
             unsafe { *transferred = count };
         }
+        e.publish_observation();
         Ok(0)
     });
     match run {
@@ -368,7 +343,10 @@ pub unsafe extern "C" fn tk_call(
                 && let Some(engine) = ENGINE.get()
                 && let Ok(mut e) = engine.lock()
             {
-                e.health = Some(message.clone());
+                if e.health.is_none() {
+                    e.health = Some(message.clone());
+                }
+                e.publish_observation();
             }
             if message.contains("FILE_NOT_FOUND") {
                 0xc0000034

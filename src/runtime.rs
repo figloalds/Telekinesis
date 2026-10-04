@@ -19,7 +19,7 @@ use std::{
 
 pub struct Session {
     pub entry: Entry,
-    pub bytes: Vec<u8>,
+    pub bytes: crate::staging::Staged,
     pub content_base: Option<String>,
     pub alive_base: Option<String>,
     pub dirty: bool,
@@ -32,6 +32,16 @@ pub struct Handle {
     pub cleaned: bool,
     pub writable: bool,
     pub time_update_disabled: u8,
+    directory: Option<Vec<(Entry, usize)>>,
+}
+#[derive(Serialize, Deserialize)]
+struct PendingSave {
+    branch: String,
+    entry: Entry,
+    stage: String,
+    content_base: Option<String>,
+    alive_base: Option<String>,
+    preserve_times: u8,
 }
 pub struct Engine {
     pub store: Store,
@@ -40,6 +50,8 @@ pub struct Engine {
     pub next_handle: u64,
     pub discovery: Vec<u8>,
     pub health: Option<String>,
+    pub observation: Arc<Mutex<Value>>,
+    recovery_health: bool,
     pub switching: bool,
     pub mounted: bool,
     pub last_sync: Option<Value>,
@@ -49,20 +61,170 @@ pub struct Engine {
 }
 impl Engine {
     pub fn new(store: Store) -> Self {
-        Self {
+        let mut engine = Self {
             store,
             sessions: BTreeMap::new(),
             handles: BTreeMap::new(),
             next_handle: 1,
             discovery: vec![],
             health: None,
+            observation: Arc::new(Mutex::new(Value::Null)),
+            recovery_health: false,
             switching: false,
             mounted: false,
             last_sync: None,
             peer: None,
             notifications: vec![],
             notification_error: None,
+        };
+        if let Err(error) = engine.load_pending() {
+            engine.health = Some(format!("RECOVERY_REQUIRED: {error:#}"));
         }
+        engine.publish_observation();
+        engine
+    }
+    pub fn publish_observation(&self) {
+        let branch = self.store.branch(&self.store.active).ok();
+        *self.observation.lock().unwrap() = json!({"repo":self.store.repo,"device":self.store.device,
+            "branch":branch,"generation":self.store.generation,"mounted":self.mounted,
+            "open_handles":self.handles.len(),"unflushed_files":self.sessions.values().filter(|s|s.dirty).count(),
+            "health":self.health,"sampled_at_ms":time(),"caught_up":false});
+    }
+    fn load_pending(&mut self) -> Result<()> {
+        self.store.db.execute_batch("CREATE TABLE IF NOT EXISTS pending_saves(entity TEXT PRIMARY KEY,payload TEXT NOT NULL)")?;
+        let records = self
+            .store
+            .db
+            .prepare("SELECT payload FROM pending_saves")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for record in records {
+            let pending: PendingSave = serde_json::from_str(&record)?;
+            ensure!(
+                pending.branch == self.store.active,
+                "RECOVERY_BRANCH_MISMATCH"
+            );
+            let bytes = crate::staging::Staged::recover(&self.store.root, &pending.stage)?;
+            self.sessions.insert(
+                pending.entry.id.clone(),
+                Session {
+                    entry: pending.entry,
+                    bytes,
+                    content_base: pending.content_base,
+                    alive_base: pending.alive_base,
+                    preserve_times: pending.preserve_times,
+                    dirty: true,
+                    references: 0,
+                },
+            );
+        }
+        if !self.sessions.is_empty() {
+            self.health = Some("PENDING_SAVES: recovery in progress".into());
+            self.recovery_health = true;
+        }
+        Ok(())
+    }
+    fn retain_pending(&mut self, entity: &str, error: &anyhow::Error) -> Result<()> {
+        self.recovery_health = self.health.is_none() || self.recovery_health;
+        if self.recovery_health {
+            self.health = Some(format!("PENDING_SAVE: {error:#}"));
+        }
+        let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
+        if !session.dirty {
+            return Ok(());
+        }
+        let stage = session.bytes.retain(&self.store.root)?;
+        let record = PendingSave {
+            branch: self.store.active.clone(),
+            entry: session.entry.clone(),
+            stage,
+            content_base: session.content_base.clone(),
+            alive_base: session.alive_base.clone(),
+            preserve_times: session.preserve_times,
+        };
+        self.store.db.execute("INSERT INTO pending_saves VALUES(?,?) ON CONFLICT(entity) DO UPDATE SET payload=excluded.payload",
+            rusqlite::params![entity,serde_json::to_string(&record)?])?;
+        Ok(())
+    }
+    fn flush_entity(&mut self, entity: &str) -> Result<()> {
+        let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
+        if !session.dirty {
+            return Ok(());
+        }
+        let pending: bool = self.store.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_saves WHERE entity=?)",
+            [entity],
+            |r| r.get(0),
+        )?;
+        if pending {
+            self.store.db.execute_batch("SAVEPOINT staged_save")?;
+        }
+        let result = (|| {
+            let revision = match &mut session.bytes {
+                crate::staging::Staged::Memory(bytes) => self.store.write_with_base_and_times(
+                    entity,
+                    session.content_base.clone(),
+                    session.alive_base.clone(),
+                    bytes,
+                    session.preserve_times,
+                )?,
+                staged => {
+                    let mut source = staged.reader()?;
+                    self.store.write_stream_with_base_and_times(
+                        entity,
+                        session.content_base.clone(),
+                        session.alive_base.clone(),
+                        &mut source,
+                        session.preserve_times,
+                    )?
+                }
+            };
+            if pending {
+                self.store
+                    .db
+                    .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
+                self.store.db.execute_batch("RELEASE staged_save")?;
+            }
+            Ok(revision)
+        })();
+        match result {
+            Ok(revision) => {
+                session.content_base = Some(revision.clone());
+                session.alive_base = Some(revision);
+                session.dirty = false;
+                session.bytes.release();
+                session.entry = self.store.entry(entity)?;
+                if self.recovery_health && !self.sessions.values().any(|s| s.dirty) {
+                    self.health = None;
+                    self.recovery_health = false;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if pending {
+                    let _ = self
+                        .store
+                        .db
+                        .execute_batch("ROLLBACK TO staged_save; RELEASE staged_save");
+                }
+                self.retain_pending(entity, &error)
+                    .context("PENDING_SAVE_PERSIST_FAILED")?;
+                Err(error)
+            }
+        }
+    }
+    pub fn retry_pending(&mut self) -> Result<()> {
+        let entities: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.dirty && s.references == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for entity in entities {
+            self.flush_entity(&entity)?;
+            self.sessions.remove(&entity);
+        }
+        Ok(())
     }
     pub fn open(
         &mut self,
@@ -108,14 +270,9 @@ impl Engine {
         );
         if !self.sessions.contains_key(&entry.id) {
             let bytes = if special {
-                self.discovery.clone()
+                crate::staging::Staged::memory(self.discovery.clone())
             } else {
-                entry
-                    .content
-                    .as_ref()
-                    .map(|h| self.store.read_object(h))
-                    .transpose()?
-                    .unwrap_or_default()
+                crate::staging::Staged::from_object(&self.store, entry.content.as_deref())?
             };
             self.sessions.insert(
                 entry.id.clone(),
@@ -142,6 +299,7 @@ impl Engine {
                 cleaned: false,
                 writable,
                 time_update_disabled: 0,
+                directory: None,
             },
         );
         Ok((h, entry))
@@ -150,6 +308,48 @@ impl Engine {
         let handle = self.handles.get(&h).context("INVALID_HANDLE")?;
         ensure!(handle.generation == self.store.generation, "STALE_VIEW");
         self.sessions.get(&handle.entity).context("INVALID_HANDLE")
+    }
+    /// One directory cut per enumeration, retained through marker continuations.
+    /// A rewind sees later mutations; close releases the cursor. Generation
+    /// validation applies even to an already populated cursor.
+    pub fn directory_entry(
+        &mut self,
+        h: u64,
+        ordinal: usize,
+        restart: bool,
+    ) -> Result<Option<(Entry, usize)>> {
+        let directory = self.session(h)?.entry.clone();
+        ensure!(directory.kind == "directory", "NOT_DIRECTORY");
+        if restart || self.handles[&h].directory.is_none() {
+            let mut children = self.store.children(&directory.id)?;
+            children.sort_by_key(|entry| entry.name.to_lowercase());
+            let mut parent = self
+                .store
+                .entry(&directory.parent)
+                .or_else(|_| self.store.lookup(""))?;
+            parent.name = "..".into();
+            let mut directory = directory;
+            directory.name = ".".into();
+            let mut cut = Vec::with_capacity(children.len() + 2);
+            cut.push((directory, 0));
+            cut.push((parent, 0));
+            for entry in children {
+                let size = entry
+                    .content
+                    .as_ref()
+                    .map(|object| self.store.object_size(object))
+                    .transpose()?
+                    .unwrap_or(0);
+                cut.push((entry, usize::try_from(size)?));
+            }
+            self.handles.get_mut(&h).unwrap().directory = Some(cut);
+        }
+        Ok(self.handles[&h]
+            .directory
+            .as_ref()
+            .unwrap()
+            .get(ordinal)
+            .cloned())
     }
     pub fn write(
         &mut self,
@@ -182,11 +382,13 @@ impl Engine {
             return Ok(0);
         }
         let end = start.checked_add(count).context("FILE_TOO_LARGE")?;
-        ensure!(end <= MAX_FILE, "FILE_TOO_LARGE");
+        ensure!(end as u64 <= MAX_CONTENT, "FILE_TOO_LARGE");
         if end > session.bytes.len() {
-            session.bytes.resize(end, 0);
+            session.bytes.resize(&self.store.root, end)?;
         }
-        session.bytes[start..end].copy_from_slice(&bytes[..count]);
+        session
+            .bytes
+            .write_at(&self.store.root, start, &bytes[..count])?;
         session.preserve_times = handle.time_update_disabled;
         session.dirty = true;
         Ok(count)
@@ -196,9 +398,9 @@ impl Engine {
         ensure!(handle.writable && !handle.cleaned, "PERMISSION_DENIED");
         let session = self.sessions.get_mut(&handle.entity).unwrap();
         ensure!(session.entry.kind == "file", "IS_DIRECTORY");
-        ensure!(size <= MAX_FILE as u64, "FILE_TOO_LARGE");
+        ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
         if !allocation || size < (session.bytes.len() as u64) {
-            session.bytes.resize(size as usize, 0);
+            session.bytes.resize(&self.store.root, size as usize)?;
             session.preserve_times = handle.time_update_disabled;
             session.dirty = true;
         }
@@ -206,10 +408,14 @@ impl Engine {
     }
     pub fn flush(&mut self, h: u64) -> Result<()> {
         if h == 0 {
-            let handles: Vec<_> = self.handles.keys().copied().collect();
-            for h in handles {
-                self.flush(h)?;
+            let entities: Vec<_> = self.sessions.keys().cloned().collect();
+            for entity in entities {
+                self.flush_entity(&entity)?;
             }
+            // A volume flush can commit a retained closed session before the
+            // periodic retry. Retire it before another view can reuse its ID.
+            self.sessions
+                .retain(|_, session| session.references > 0 || session.dirty);
             return Ok(());
         }
         let entity = self
@@ -218,34 +424,14 @@ impl Engine {
             .context("INVALID_HANDLE")?
             .entity
             .clone();
-        let session = self.sessions.get_mut(&entity).unwrap();
-        if session.dirty {
-            let rev = self.store.write_with_base_and_times(
-                &entity,
-                session.content_base.clone(),
-                session.alive_base.clone(),
-                &session.bytes,
-                session.preserve_times,
-            )?;
-            session.content_base = Some(rev.clone());
-            session.alive_base = Some(rev);
-            session.dirty = false;
-            session.entry = self.store.projection(&self.store.active)?.entries[&entity].clone();
-        }
-        Ok(())
+        self.flush_entity(&entity)
     }
     /// Metadata-only durability never publishes an unrelated dirty content buffer.
     pub fn set_basic(&mut self, h: u64, attributes: u32, times: [u64; 4]) -> Result<()> {
         let entry = self.session(h)?.entry.clone();
         ensure!(entry.id != "control", "PERMISSION_DENIED");
         ensure!(entry.id != ROOT, "UNSUPPORTED_FS_OPERATION: root metadata");
-        let current = self
-            .store
-            .projection(&self.store.active)?
-            .entries
-            .get(&entry.id)
-            .cloned()
-            .context("FILE_NOT_FOUND")?;
+        let current = self.store.entry(&entry.id)?;
         let mut basic = current.basic_info();
         if attributes != u32::MAX {
             basic.attributes = BasicInfo::attributes(&entry.kind, attributes)?;
@@ -295,21 +481,25 @@ impl Engine {
         Ok(())
     }
     pub fn close(&mut self, h: u64) -> Result<()> {
-        self.flush(h)?;
+        let result = self.flush(h);
         if let Some(handle) = self.handles.remove(&h) {
             let s = self.sessions.get_mut(&handle.entity).unwrap();
             s.references -= 1;
-            if s.references == 0 {
+            if s.references == 0 && !s.dirty {
                 self.sessions.remove(&handle.entity);
             }
         }
-        Ok(())
+        result
     }
     pub fn quiet(&self) -> Result<()> {
         ensure!(
-            self.handles.is_empty() && self.health.is_none(),
-            "BUSY_VIEW: {} open contexts",
-            self.handles.len()
+            self.handles.is_empty()
+                && self.health.is_none()
+                && !self.sessions.values().any(|s| s.dirty),
+            "BUSY_VIEW: {} open contexts, {} unsaved files; {}",
+            self.handles.len(),
+            self.sessions.values().filter(|s| s.dirty).count(),
+            self.health.as_deref().unwrap_or("healthy")
         );
         Ok(())
     }
@@ -341,13 +531,8 @@ impl Engine {
                 && !writers.contains(entity)
                 && let Some(entry) = after.entries.get(entity).filter(|e| e.alive)
             {
-                session.bytes = entry
-                    .content
-                    .as_ref()
-                    .map(|h| self.store.read_object(h))
-                    .transpose()?
-                    .unwrap_or_default();
-                session.entry = entry.clone();
+                session.bytes =
+                    crate::staging::Staged::from_object(&self.store, entry.content.as_deref())?;
                 session.content_base = entry.revisions.get("content").cloned();
                 session.alive_base = entry.revisions.get("alive").cloned();
             }
@@ -557,6 +742,17 @@ pub fn rpc(info: &Discovery, request: &str, payload: Value) -> Result<Value> {
 }
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
+    let recovery = engine.clone();
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Ok(mut engine) = recovery.try_lock() {
+                let _ = engine.retry_pending();
+                engine.publish_observation();
+            }
+            deliver_notifications(&recovery);
+        }
+    });
     let info = {
         let e = engine.lock().unwrap();
         Discovery {
@@ -575,6 +771,7 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
         serde_json::to_vec_pretty(&info)?,
     )?;
     let token = info.token.clone();
+    let observation = engine.lock().unwrap().observation.clone();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             match incoming {
@@ -586,6 +783,15 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
                         ensure!(r["token"] == token, "PERMISSION_DENIED");
                         let request = r["request"].as_str().context("INVALID_REQUEST_ID")?;
                         let payload = &r["payload"];
+                        if payload["op"] == "status" {
+                            if let Ok(mut e) = engine.try_lock() {
+                                return e.control(request, payload);
+                            }
+                            let mut status = observation.lock().unwrap().clone();
+                            status["busy"] = json!(true);
+                            status["stale"] = json!(true);
+                            return Ok(status);
+                        }
                         if payload["op"] == "sync" {
                             let config = engine
                                 .lock()
@@ -636,6 +842,10 @@ struct PeerMessage {
     reply_to: Option<String>,
     known: BTreeSet<String>,
     known_objects: BTreeSet<String>,
+    #[serde(default)]
+    partial_objects: BTreeMap<String, u64>,
+    #[serde(default)]
+    object_parts: BTreeMap<String, ObjectPart>,
     pending_events: usize,
     bundle: Option<Bundle>,
     ack: Vec<String>,
@@ -706,6 +916,8 @@ pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
                 ensure!(message.reply_to.is_none(), "INVALID_PEER_REQUEST");
                 let allowed = BTreeSet::from([e.store.device.clone(), sc.peer.clone()]);
                 let ack = if let Some(bundle) = message.bundle {
+                    e.store
+                        .receive_parts(message.object_parts, &bundle.events, &allowed)?;
                     e.receive_peer(bundle, &allowed)?
                 } else {
                     vec![]
@@ -714,6 +926,19 @@ pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
                 e.store.remember_peer_inventory(&sc.peer, &message.known)?;
                 e.store
                     .remember_peer_objects(&sc.peer, &message.known_objects)?;
+                e.store
+                    .remember_peer_partials(&sc.peer, &message.partial_objects)?;
+                let bundle = e.store.shared_page(
+                    &message.known,
+                    &message.known_objects,
+                    MAX_FRAME - 12 * 1024 * 1024,
+                )?;
+                let object_parts = e.store.shared_parts(
+                    &bundle,
+                    &message.known_objects,
+                    &message.partial_objects,
+                    MAX_FRAME - 8 * 1024 * 1024,
+                )?;
                 Ok(PeerMessage {
                     format: PEER_FORMAT,
                     sender: e.store.device.clone(),
@@ -722,16 +947,14 @@ pub fn start_peer(engine: Shared, config: PeerConfig) -> Result<()> {
                     reply_to: Some(message.request),
                     known: e.store.shared_event_inventory()?,
                     known_objects: e.store.shared_object_inventory()?,
+                    partial_objects: e.store.partial_objects()?,
+                    object_parts,
                     pending_events: e.store.db.query_row(
                         "SELECT count(*) FROM incoming_events",
                         [],
                         |r| r.get(0),
                     )?,
-                    bundle: Some(e.store.shared_page(
-                        &message.known,
-                        &message.known_objects,
-                        MAX_FRAME - 8 * 1024 * 1024,
-                    )?),
+                    bundle: Some(bundle),
                     ack,
                 })
             })();
@@ -769,6 +992,18 @@ fn exchange_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
     let request = id();
     let message = {
         let e = engine.lock().unwrap();
+        let known = e.store.known_by_peer(&c.peer)?;
+        let known_objects = e.store.known_objects_by_peer(&c.peer)?;
+        let offsets = e.store.peer_partial_objects(&c.peer)?;
+        let bundle = e
+            .store
+            .shared_page(&known, &known_objects, MAX_FRAME - 12 * 1024 * 1024)?;
+        let object_parts = e.store.shared_parts(
+            &bundle,
+            &known_objects,
+            &offsets,
+            MAX_FRAME - 8 * 1024 * 1024,
+        )?;
         PeerMessage {
             format: PEER_FORMAT,
             sender: e.store.device.clone(),
@@ -777,16 +1012,14 @@ fn exchange_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
             reply_to: None,
             known: e.store.shared_event_inventory()?,
             known_objects: e.store.shared_object_inventory()?,
+            partial_objects: e.store.partial_objects()?,
+            object_parts,
             pending_events: e.store.db.query_row(
                 "SELECT count(*) FROM incoming_events",
                 [],
                 |r| r.get(0),
             )?,
-            bundle: Some(e.store.shared_page(
-                &e.store.known_by_peer(&c.peer)?,
-                &e.store.known_objects_by_peer(&c.peer)?,
-                MAX_FRAME - 8 * 1024 * 1024,
-            )?),
+            bundle: Some(bundle),
             ack: vec![],
         }
     };
@@ -802,6 +1035,8 @@ fn exchange_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
     );
     let allowed = BTreeSet::from([e.store.device.clone(), c.peer.clone()]);
     if let Some(bundle) = response.bundle {
+        e.store
+            .receive_parts(response.object_parts, &bundle.events, &allowed)?;
         e.receive_peer(bundle, &allowed)?;
     }
     fault("peer_ack_received");
@@ -809,6 +1044,8 @@ fn exchange_once(engine: &Shared, c: &PeerConfig) -> Result<Value> {
     e.store.remember_peer_inventory(&c.peer, &response.known)?;
     e.store
         .remember_peer_objects(&c.peer, &response.known_objects)?;
+    e.store
+        .remember_peer_partials(&c.peer, &response.partial_objects)?;
     let local = e.store.shared_event_inventory()?;
     let pending: usize = e
         .store
@@ -868,12 +1105,17 @@ pub fn deliver_notifications(engine: &Shared) {
     #[cfg(windows)]
     {
         let pending = {
-            let mut e = engine.lock().unwrap();
+            let Ok(mut e) = engine.try_lock() else {
+                return;
+            };
             if !e.mounted || e.switching {
                 return;
             }
             std::mem::take(&mut e.notifications)
         };
+        if pending.is_empty() {
+            return;
+        }
         let mut retry = vec![];
         let mut error = None;
         for (path, action) in pending {
@@ -955,19 +1197,37 @@ fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
     }
     let backend = DirectoryBackend::new(&destination)?;
     // Capture only authorized immutable data under the lock; backend I/O outside.
-    let bundle = engine
-        .lock()
-        .unwrap()
-        .store
-        .shared_bundle(&BTreeSet::new())?;
-    for (object, bytes) in &bundle.objects {
+    let (repo, branches, events, objects) = {
+        let e = engine.lock().unwrap();
+        let events: Vec<_> = e
+            .store
+            .events()?
+            .into_iter()
+            .filter(|e| e.branch.shared)
+            .collect();
+        let objects: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
+        (
+            e.store.repo.clone(),
+            e.store
+                .branches()?
+                .into_iter()
+                .filter(|b| b.shared)
+                .collect::<Vec<_>>(),
+            events,
+            objects,
+        )
+    };
+    for object in &objects {
+        let mut file = {
+            let e = engine.lock().unwrap();
+            e.store.open_object(object)?
+        };
         ensure!(
-            backend.put_verified(&hex::decode(bytes)?)? == *object,
+            backend.put_stream(&mut file)? == *object,
             "BACKEND_HASH_MISMATCH"
         );
     }
-    let objects: Vec<_> = bundle.objects.keys().cloned().collect();
-    let manifest = json!({"format":"tkfs-shared-export-1","repo":bundle.repo,"branches":bundle.branches,"events":bundle.events,"objects":objects});
+    let manifest = json!({"format":"tkfs-shared-export-1","repo":repo,"branches":branches,"events":events,"objects":objects});
     let hash = backend.put_verified(&serde_json::to_vec(&manifest)?)?;
     Ok(
         json!({"backend":"local-directory-test-bucket","manifest":hash,"objects":objects.len(),"remote_validated":false}),

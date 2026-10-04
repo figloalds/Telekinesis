@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    cell::{Ref, RefCell},
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 use unicode_normalization::UnicodeNormalization;
@@ -18,12 +19,15 @@ use uuid::Uuid;
 
 pub const ROOT: &str = "root";
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
+/// Streaming file ceiling; buffered object APIs retain their 16 MiB bound.
+pub const MAX_CONTENT: u64 = 16 * 1024 * 1024 * 1024;
+pub const IO_CHUNK: usize = 1024 * 1024;
 pub const MAX_EVENT: usize = 8 * 1024 * 1024;
 pub const MAX_NAMESPACE_CUTS: usize = 4096;
 pub const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
 pub const BASIC_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x20 | 0x80;
 /// Both peers must understand durable basic metadata; format 2 is incompatible.
-pub const PEER_FORMAT: u32 = 3;
+pub const PEER_FORMAT: u32 = 4;
 pub fn filetime(ms: u64) -> u64 {
     ms.saturating_mul(10_000).saturating_add(FILETIME_EPOCH)
 }
@@ -89,6 +93,33 @@ pub fn id() -> String {
 }
 pub fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+pub(crate) fn valid_object(object: &str) -> Result<()> {
+    ensure!(
+        object.len() == 64 && object.bytes().all(|c| c.is_ascii_hexdigit()),
+        "INVALID_OBJECT_ID"
+    );
+    Ok(())
+}
+fn object_error(error: std::io::Error) -> anyhow::Error {
+    let label = if error.kind() == std::io::ErrorKind::NotFound {
+        "OFFLINE_OBJECT_MISSING"
+    } else {
+        "OBJECT_IO_ERROR"
+    };
+    anyhow::Error::new(error).context(label)
+}
+pub(crate) fn stream_hash(reader: &mut impl Read) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut bytes = [0; 64 * 1024];
+    loop {
+        let count = reader.read(&mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&bytes[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }
 pub fn time() -> u64 {
     std::time::SystemTime::now()
@@ -231,6 +262,14 @@ pub struct Store {
     pub device: String,
     pub active: String,
     pub generation: u64,
+    view_cache: RefCell<Option<ViewCache>>,
+}
+struct ViewCache {
+    branch: String,
+    changes: u64,
+    transactional: bool,
+    projection: Projection,
+    slots: BTreeMap<(String, String), String>,
 }
 impl Store {
     /// Initialize an operation-owned new store with identities chosen by its caller.
@@ -291,6 +330,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS branches(id TEXT PRIMARY KEY, name TEXT NOT NULL, shared INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS current_state(branch TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS current_parts(branch TEXT NOT NULL,entity TEXT NOT NULL,entry TEXT NOT NULL,heads TEXT NOT NULL,PRIMARY KEY(branch,entity));
             CREATE TABLE IF NOT EXISTS conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);
             CREATE TABLE IF NOT EXISTS outbox(event TEXT PRIMARY KEY, acknowledged INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS receipts(id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, result TEXT NOT NULL);
@@ -340,12 +380,13 @@ impl Store {
             device,
             active,
             generation,
+            view_cache: RefCell::new(None),
         };
         // Recompute from the journal and verify every referenced object before
         // serving anything, including alternatives that lost the visible tie-break.
         for event in store.events()? {
             for object in event.objects() {
-                store.read_object(&object)?;
+                store.verify_object(&object)?;
             }
         }
         store.evacuate_unvalidated_journal()?;
@@ -358,20 +399,84 @@ impl Store {
     }
     pub fn read_object(&self, object: &str) -> Result<Vec<u8>> {
         ensure!(
-            object.len() == 64 && object.bytes().all(|c| c.is_ascii_hexdigit()),
-            "INVALID_OBJECT_ID"
+            self.object_size(object)? <= MAX_FILE as u64,
+            "OBJECT_REQUIRES_STREAMING"
         );
-        let bytes =
-            fs::read(self.root.join("objects").join(object)).context("OFFLINE_OBJECT_MISSING")?;
-        ensure!(hash(&bytes) == object, "CORRUPT_OBJECT: {object}");
+        let mut file = self.open_object(object)?;
+        ensure!(
+            file.metadata()?.len() <= MAX_FILE as u64,
+            "OBJECT_REQUIRES_STREAMING"
+        );
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
         Ok(bytes)
+    }
+    pub fn object_size(&self, object: &str) -> Result<u64> {
+        valid_object(object)?;
+        Ok(fs::metadata(self.root.join("objects").join(object))
+            .map_err(object_error)?
+            .len())
+    }
+    pub fn open_object(&self, object: &str) -> Result<fs::File> {
+        valid_object(object)?;
+        let mut file =
+            fs::File::open(self.root.join("objects").join(object)).map_err(object_error)?;
+        ensure!(file.metadata()?.len() <= MAX_CONTENT, "FILE_TOO_LARGE");
+        ensure!(
+            stream_hash(&mut file)? == object,
+            "CORRUPT_OBJECT: {object}"
+        );
+        file.rewind()?;
+        Ok(file)
+    }
+    pub fn verify_object(&self, object: &str) -> Result<()> {
+        self.open_object(object).map(|_| ())
+    }
+    pub fn put_stream(&self, source: &mut impl Read) -> Result<String> {
+        let temp = self.root.join("objects").join(format!("{}.part", id()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 64 * 1024];
+            let mut size = 0u64;
+            loop {
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                size += count as u64;
+                ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
+                digest.update(&buffer[..count]);
+                file.write_all(&buffer[..count])?;
+            }
+            file.sync_all()?;
+            drop(file);
+            fault("object_flushed");
+            let object = hex::encode(digest.finalize());
+            let dest = self.root.join("objects").join(&object);
+            if dest.exists() {
+                self.verify_object(&object)?;
+                fs::remove_file(&temp)?;
+            } else {
+                install_object(&temp, &dest)?;
+            }
+            fault("object_installed");
+            Ok(object)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temp);
+        }
+        result
     }
     pub fn put_object(&self, bytes: &[u8]) -> Result<String> {
         ensure!(bytes.len() <= MAX_FILE, "FILE_TOO_LARGE");
         let object = hash(bytes);
         let dest = self.root.join("objects").join(&object);
         if dest.exists() {
-            self.read_object(&object)?;
+            self.verify_object(&object)?;
             return Ok(object);
         }
         let temp = self.root.join("objects").join(format!("{}.part", id()));
@@ -428,12 +533,57 @@ impl Store {
             .collect()
     }
     pub fn projection(&self, branch: &str) -> Result<Projection> {
-        let payload: String = self.db.query_row(
-            "SELECT payload FROM current_state WHERE branch=?",
-            [branch],
-            |r| r.get(0),
-        )?;
-        Ok(serde_json::from_str(&payload)?)
+        Ok(self.view(branch)?.projection.clone())
+    }
+    fn view(&self, branch: &str) -> Result<Ref<'_, ViewCache>> {
+        let changes = self.db.total_changes();
+        let transactional = !self.db.is_autocommit();
+        let fresh = self.view_cache.borrow().as_ref().is_some_and(|v| {
+            v.branch == branch && v.changes == changes && v.transactional == transactional
+        });
+        if !fresh {
+            let payload: String = self.db.query_row(
+                "SELECT payload FROM current_state WHERE branch=?",
+                [branch],
+                |r| r.get(0),
+            )?;
+            let mut projection: Projection = serde_json::from_str(&payload)?;
+            let mut statement = self
+                .db
+                .prepare("SELECT entry,heads FROM current_parts WHERE branch=?")?;
+            let rows = statement.query_map([branch], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (entry, heads) = row?;
+                let entry: Entry = serde_json::from_str(&entry)?;
+                projection.entries.insert(entry.id.clone(), entry);
+                let heads: BTreeMap<String, Vec<Version>> = serde_json::from_str(&heads)?;
+                projection.heads.extend(heads);
+            }
+            let slots = projection
+                .entries
+                .values()
+                .filter(|e| e.alive)
+                .map(|e| Ok(((e.parent.clone(), name_key(&e.name)?), e.id.clone())))
+                .collect::<Result<_>>()?;
+            *self.view_cache.borrow_mut() = Some(ViewCache {
+                branch: branch.into(),
+                changes,
+                transactional,
+                projection,
+                slots,
+            });
+        }
+        Ok(Ref::map(self.view_cache.borrow(), |v| v.as_ref().unwrap()))
+    }
+    pub fn entry(&self, entity: &str) -> Result<Entry> {
+        self.view(&self.active)?
+            .projection
+            .entries
+            .get(entity)
+            .cloned()
+            .context("FILE_NOT_FOUND")
     }
     fn rebuild(&mut self, branch: &str) -> Result<()> {
         let events: Vec<_> = self
@@ -597,7 +747,7 @@ impl Store {
             return Ok(());
         }
         for object in event.objects() {
-            self.read_object(&object)?;
+            self.verify_object(&object)?;
         }
         let mut seen = BTreeSet::new();
         for change in &event.changes {
@@ -635,7 +785,14 @@ impl Store {
         if let Ok(b) = self.branch(&event.branch.id) {
             ensure!(b == event.branch, "BRANCH_DESCRIPTOR_CHANGED");
         }
-        let fast = self.content_successor(&event)?;
+        let mut fast = self.content_successor(&event)?;
+        if fast.is_none() && local {
+            fast = self.creation_successor(&event)?;
+            if fast.is_none() {
+                fast = self.file_namespace_successor(&event)?;
+            }
+        }
+        let incremental = fast.is_some();
         let events = if fast.is_none() {
             let mut events: Vec<_> = self
                 .events()?
@@ -647,8 +804,8 @@ impl Store {
         } else {
             vec![]
         };
-        let projection = if let Some(p) = &fast {
-            p.clone()
+        let projection = if let Some(p) = fast.take() {
+            p
         } else {
             project(&event.branch.id, &events)?
         };
@@ -668,11 +825,23 @@ impl Store {
         if event.branch.shared {
             tx.execute("INSERT INTO outbox(event) VALUES(?)", [&event.id])?;
         }
-        if fast.is_some() {
-            tx.execute(
-                "UPDATE current_state SET payload=? WHERE branch=?",
-                params![serde_json::to_string(&projection)?, event.branch.id],
-            )?;
+        if incremental {
+            for entity in event
+                .changes
+                .iter()
+                .map(|c| &c.entity)
+                .collect::<BTreeSet<_>>()
+            {
+                let heads: BTreeMap<_, _> = ["kind", "location", "alive", "content", "basic"]
+                    .into_iter()
+                    .filter_map(|field| {
+                        let key = register(entity, field);
+                        projection.heads.get(&key).map(|v| (key, v))
+                    })
+                    .collect();
+                tx.execute("INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads",
+                    params![event.branch.id,entity,serde_json::to_string(&projection.entries[entity])?,serde_json::to_string(&heads)?])?;
+            }
         } else {
             persist_projection(&tx, &event.branch.id, &projection, &events, Some(&event.id))?;
         }
@@ -691,6 +860,34 @@ impl Store {
             params![event.branch.id, event.id],
         )?;
         tx.commit()?;
+        let mut cache = self.view_cache.borrow_mut();
+        if incremental && cache.as_ref().is_some_and(|v| v.branch == event.branch.id) {
+            let view = cache.as_mut().unwrap();
+            let entities: BTreeSet<_> = event.changes.iter().map(|c| &c.entity).collect();
+            // A replacement moves one entry into another's old slot. Remove
+            // all old slots first, independent of entity ID ordering.
+            for entity in &entities {
+                if let Some(old) = view.projection.entries.get(*entity).filter(|e| e.alive) {
+                    view.slots
+                        .remove(&(old.parent.clone(), name_key(&old.name)?));
+                }
+            }
+            for entity in entities {
+                let entry = &projection.entries[entity];
+                if entry.alive {
+                    view.slots.insert(
+                        (entry.parent.clone(), name_key(&entry.name)?),
+                        entity.clone(),
+                    );
+                }
+            }
+            view.projection.entries.extend(projection.entries);
+            view.projection.heads.extend(projection.heads);
+            view.changes = self.db.total_changes();
+            view.transactional = !self.db.is_autocommit();
+        } else {
+            *cache = None;
+        }
         fault("sql_committed");
         Ok(())
     }
@@ -707,17 +904,18 @@ impl Store {
         {
             return Ok(None);
         }
-        let Ok(mut p) = self.projection(&event.branch.id) else {
+        let Ok(view) = self.view(&event.branch.id) else {
             return Ok(None);
         };
-        if !p.pending.is_empty() {
+        let current = &view.projection;
+        if !current.pending.is_empty() {
             return Ok(None);
         }
         for change in &event.changes {
-            let Some(entry) = p.entries.get(&change.entity) else {
+            let Some(entry) = current.entries.get(&change.entity) else {
                 return Ok(None);
             };
-            let Some(heads) = p.heads.get(&register(&change.entity, &change.field)) else {
+            let Some(heads) = current.heads.get(&register(&change.entity, &change.field)) else {
                 if change.field == "basic" && change.parents.is_empty() && entry.alive {
                     continue;
                 }
@@ -742,6 +940,22 @@ impl Store {
                 .optional()?;
             if branch.as_deref() != Some(&event.branch.id) {
                 return Ok(None);
+            }
+        }
+        let mut p = Projection::default();
+        for entity in event
+            .changes
+            .iter()
+            .map(|c| &c.entity)
+            .collect::<BTreeSet<_>>()
+        {
+            p.entries
+                .insert(entity.clone(), current.entries[entity].clone());
+            for field in ["kind", "location", "alive", "content", "basic"] {
+                let key = register(entity, field);
+                if let Some(heads) = current.heads.get(&key) {
+                    p.heads.insert(key, heads.clone());
+                }
             }
         }
         for change in &event.changes {
@@ -788,6 +1002,243 @@ impl Store {
         // is possible. Existing durable records remain untouched.
         Ok(Some(p))
     }
+    /// A local fresh entry ordered after the entire accepted frontier cannot
+    /// introduce a concurrent namespace cut. All other placements use replay.
+    fn creation_successor(&self, event: &Event) -> Result<Option<Projection>> {
+        if event.device != self.device || !event.reviewed.is_empty() || event.changes.is_empty() {
+            return Ok(None);
+        }
+        let entity = &event.changes[0].entity;
+        if event
+            .changes
+            .iter()
+            .any(|c| &c.entity != entity || !c.parents.is_empty())
+        {
+            return Ok(None);
+        }
+        let fields: BTreeMap<_, _> = event
+            .changes
+            .iter()
+            .map(|c| (c.field.as_str(), &c.value))
+            .collect();
+        if !fields.contains_key("kind")
+            || !fields.contains_key("location")
+            || fields.get("alive") != Some(&&json!(true))
+        {
+            return Ok(None);
+        }
+        let kind = fields["kind"].as_str().context("INVALID_KIND")?;
+        if (kind == "file" && !fields.contains_key("content"))
+            || (kind == "directory" && fields.contains_key("content"))
+        {
+            return Ok(None);
+        }
+        let frontier = self
+            .db
+            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
+            .query_map([&event.branch.id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if event.dependencies != frontier {
+            return Ok(None);
+        }
+        let Ok(view) = self.view(&event.branch.id) else {
+            return Ok(None);
+        };
+        let current = &view.projection;
+        if current.entries.contains_key(entity)
+            || !current.pending.is_empty()
+            || !current.conflicts.is_empty()
+            || !self.conflicts()?.is_empty()
+        {
+            return Ok(None);
+        }
+        let parent = fields["location"]["parent"]
+            .as_str()
+            .context("INVALID_LOCATION")?;
+        let name = fields["location"]["name"]
+            .as_str()
+            .context("INVALID_LOCATION")?;
+        if parent != ROOT
+            && !current
+                .entries
+                .get(parent)
+                .is_some_and(|e| e.alive && e.kind == "directory")
+        {
+            return Ok(None);
+        }
+        let key = name_key(name)?;
+        if view.slots.contains_key(&(parent.into(), key)) {
+            return Ok(None);
+        }
+        let mut p = Projection::default();
+        let mut entry = Entry {
+            id: entity.clone(),
+            kind: kind.into(),
+            parent: parent.into(),
+            name: name.into(),
+            alive: true,
+            created_ms: event.created_ms,
+            modified_ms: event.created_ms,
+            ..Default::default()
+        };
+        for change in &event.changes {
+            entry
+                .revisions
+                .insert(change.field.clone(), event.id.clone());
+            if change.field == "content" {
+                entry.content = change.value.as_str().map(str::to_owned);
+            }
+            if change.field == "basic" {
+                entry.basic = Some(serde_json::from_value(change.value.clone())?);
+            }
+            p.heads.insert(
+                register(entity, &change.field),
+                vec![Version {
+                    revision: event.id.clone(),
+                    device: event.device.clone(),
+                    created_ms: event.created_ms,
+                    parents: vec![],
+                    value: change.value.clone(),
+                }],
+            );
+        }
+        p.entries.insert(entity.clone(), entry);
+        Ok(Some(p))
+    }
+    /// Sequential file placement/deletion, including an atomic replacement,
+    /// introduces no competing cut. Directories/reviews/concurrency use replay.
+    fn file_namespace_successor(&self, event: &Event) -> Result<Option<Projection>> {
+        if event.device != self.device
+            || !event.reviewed.is_empty()
+            || !(1..=2).contains(&event.changes.len())
+        {
+            return Ok(None);
+        }
+        let replacement = if event.changes.len() == 2 {
+            let location = event.changes.iter().find(|c| c.field == "location");
+            let removed = event
+                .changes
+                .iter()
+                .find(|c| c.field == "alive" && c.value == false);
+            match (location, removed) {
+                (Some(a), Some(b)) if a.entity != b.entity => Some((&a.entity, &b.entity)),
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
+        if event.changes.iter().any(|change| {
+            change.field != "location" && !(change.field == "alive" && change.value == false)
+        }) {
+            return Ok(None);
+        }
+        let frontier = self
+            .db
+            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
+            .query_map([&event.branch.id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if event.dependencies != frontier {
+            return Ok(None);
+        }
+        let Ok(view) = self.view(&event.branch.id) else {
+            return Ok(None);
+        };
+        let current = &view.projection;
+        if !current.pending.is_empty()
+            || !current.conflicts.is_empty()
+            || !self.conflicts()?.is_empty()
+        {
+            return Ok(None);
+        }
+        let mut delta = Projection::default();
+        for change in &event.changes {
+            let Some(entry) = current
+                .entries
+                .get(&change.entity)
+                .filter(|e| e.alive && e.kind == "file")
+            else {
+                return Ok(None);
+            };
+            let key = register(&change.entity, &change.field);
+            let Some(heads) = current.heads.get(&key) else {
+                return Ok(None);
+            };
+            if heads.len() != 1 || change.parents != vec![heads[0].revision.clone()] {
+                return Ok(None);
+            }
+            let mut entry = entry.clone();
+            if change.field == "location" {
+                let parent = change.value["parent"]
+                    .as_str()
+                    .context("INVALID_LOCATION")?;
+                let name = change.value["name"].as_str().context("INVALID_LOCATION")?;
+                if parent != ROOT
+                    && !current
+                        .entries
+                        .get(parent)
+                        .is_some_and(|e| e.alive && e.kind == "directory")
+                {
+                    return Ok(None);
+                }
+                let occupying = view.slots.get(&(parent.into(), name_key(name)?));
+                if let Some((source, removed)) = replacement {
+                    if source != &entry.id || occupying != Some(removed) {
+                        return Ok(None);
+                    }
+                } else if occupying.is_some_and(|e| e != &entry.id) {
+                    return Ok(None);
+                }
+                entry.parent = parent.into();
+                entry.name = name.into();
+            } else {
+                entry.alive = false;
+            }
+            entry
+                .revisions
+                .insert(change.field.clone(), event.id.clone());
+            entry.modified_ms = entry.modified_ms.max(event.created_ms);
+            for field in ["kind", "location", "alive", "content", "basic"] {
+                let key = register(&entry.id, field);
+                if let Some(heads) = current.heads.get(&key) {
+                    delta.heads.insert(key, heads.clone());
+                }
+            }
+            delta.heads.insert(
+                key,
+                vec![Version {
+                    revision: event.id.clone(),
+                    device: event.device.clone(),
+                    created_ms: event.created_ms,
+                    parents: change.parents.clone(),
+                    value: change.value.clone(),
+                }],
+            );
+            delta.entries.insert(entry.id.clone(), entry);
+        }
+        Ok(Some(delta))
+    }
+    pub fn children(&self, parent: &str) -> Result<Vec<Entry>> {
+        let view = self.view(&self.active)?;
+        // Keep the original projection-based enumeration for conflicted cuts;
+        // do not make the lookup index an additional choice of alternatives.
+        if !view.projection.conflicts.is_empty() {
+            return Ok(view
+                .projection
+                .entries
+                .values()
+                .filter(|entry| entry.alive && entry.parent == parent)
+                .cloned()
+                .collect());
+        }
+        // The existing live namespace index groups each parent's names. Avoid
+        // walking unrelated entries for every directory enumeration ordinal.
+        Ok(view
+            .slots
+            .range((parent.to_owned(), String::new())..)
+            .take_while(|((p, _), _)| p == parent)
+            .map(|(_, entity)| view.projection.entries[entity].clone())
+            .collect())
+    }
     pub fn event(&self, branch: &Branch, changes: Vec<Change>) -> Event {
         // Order observed namespace prerequisites without claiming an old writer
         // reviewed other file revisions. Registers still use their actual bases.
@@ -812,8 +1263,9 @@ impl Store {
         }
     }
     pub fn current_change(&self, entity: &str, field: &str, value: Value) -> Result<Change> {
-        let p = self.projection(&self.active)?;
-        let parents = p
+        let view = self.view(&self.active)?;
+        let parents = view
+            .projection
             .entries
             .get(entity)
             .and_then(|e| e.revisions.get(field))
@@ -828,7 +1280,19 @@ impl Store {
         })
     }
     pub fn lookup(&self, path: &str) -> Result<Entry> {
-        lookup(&self.projection(&self.active)?, path)
+        let view = self.view(&self.active)?;
+        let mut entry = Entry {
+            id: ROOT.into(),
+            kind: "directory".into(),
+            alive: true,
+            ..Default::default()
+        };
+        for component in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
+            let key = (entry.id, name_key(component)?);
+            let entity = view.slots.get(&key).context("FILE_NOT_FOUND")?;
+            entry = view.projection.entries[entity].clone();
+        }
+        Ok(entry)
     }
     pub fn create(&mut self, path: &str, kind: &str) -> Result<Entry> {
         self.create_with_attributes(path, kind, None)
@@ -895,12 +1359,7 @@ impl Store {
     }
     pub fn set_basic(&mut self, entity: &str, basic: BasicInfo) -> Result<()> {
         basic.validate()?;
-        let entry = self
-            .projection(&self.active)?
-            .entries
-            .get(entity)
-            .cloned()
-            .context("FILE_NOT_FOUND")?;
+        let entry = self.entry(entity)?;
         ensure!(
             basic.attributes == BasicInfo::attributes(&entry.kind, basic.attributes)?,
             "INVALID_ATTRIBUTES"
@@ -956,6 +1415,33 @@ impl Store {
         preserve_times: u8,
     ) -> Result<String> {
         let object = self.put_object(bytes)?;
+        self.write_object_with_parents(entity, content_base, alive_parents, object, preserve_times)
+    }
+    pub fn write_stream_with_base_and_times(
+        &mut self,
+        entity: &str,
+        content_base: Option<String>,
+        alive_base: Option<String>,
+        source: &mut impl Read,
+        preserve_times: u8,
+    ) -> Result<String> {
+        let object = self.put_stream(source)?;
+        self.write_object_with_parents(
+            entity,
+            content_base,
+            alive_base.into_iter().collect(),
+            object,
+            preserve_times,
+        )
+    }
+    fn write_object_with_parents(
+        &mut self,
+        entity: &str,
+        content_base: Option<String>,
+        alive_parents: Vec<String>,
+        object: String,
+        preserve_times: u8,
+    ) -> Result<String> {
         let b = self.branch(&self.active)?;
         let mut event = self.event(
             &b,
@@ -974,12 +1460,7 @@ impl Store {
                 },
             ],
         );
-        let entry = self
-            .projection(&self.active)?
-            .entries
-            .get(entity)
-            .cloned()
-            .context("FILE_NOT_FOUND")?;
+        let entry = self.entry(entity)?;
         if entry.basic.is_some() || preserve_times != 0 {
             let mut basic = entry.basic_info();
             if preserve_times & 2 == 0 {
@@ -1101,7 +1582,7 @@ impl Store {
         ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
         for e in p.entries.values().filter(|e| e.alive) {
             if let Some(h) = &e.content {
-                self.read_object(h)?;
+                self.verify_object(h)?;
             }
         }
         let generation = self.generation + 1;
@@ -1268,15 +1749,20 @@ impl Store {
     }
     /// Explicit export; all authorization remains rooted in shared events.
     pub fn export_shared_objects(&self, backend: &dyn ObjectBackend) -> Result<Value> {
-        let bundle = self.shared_bundle(&BTreeSet::new())?;
-        for (object, encoded) in &bundle.objects {
+        let events: Vec<_> = self
+            .events()?
+            .into_iter()
+            .filter(|e| e.branch.shared)
+            .collect();
+        let objects: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
+        for object in &objects {
             ensure!(
-                backend.put_verified(&hex::decode(encoded)?)? == *object,
+                backend.put_stream(&mut self.open_object(object)?)? == *object,
                 "BACKEND_HASH_MISMATCH"
             );
         }
-        let objects: Vec<_> = bundle.objects.keys().cloned().collect();
-        let manifest = json!({"format":"tkfs-shared-export-1","repo":self.repo,"branches":bundle.branches,"events":bundle.events,"objects":objects});
+        let branches: Vec<_> = self.branches()?.into_iter().filter(|b| b.shared).collect();
+        let manifest = json!({"format":"tkfs-shared-export-1","repo":self.repo,"branches":branches,"events":events,"objects":objects});
         let manifest_object = backend.put_verified(&serde_json::to_vec(&manifest)?)?;
         Ok(
             json!({"backend":"local-directory-test-bucket","manifest":manifest_object,"objects":objects.len(),"events":manifest["events"].as_array().unwrap().len(),"remote_validated":false}),
@@ -1326,7 +1812,7 @@ impl Store {
                 });
             }
             if let Some(h) = &entry.content {
-                self.read_object(h)?;
+                self.verify_object(h)?;
                 changes.push(Change {
                     entity: entry.id.clone(),
                     field: "content".into(),
@@ -1631,6 +2117,9 @@ impl Store {
         let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
         let mut objects = BTreeMap::new();
         for h in hashes.into_iter().filter(|h| !known_objects.contains(h)) {
+            if self.object_size(&h)? > MAX_FILE as u64 {
+                continue;
+            }
             let bytes = self.read_object(&h)?;
             let size = bytes.len() * 2 + h.len() + 8;
             if used + size > budget {
@@ -1705,6 +2194,191 @@ pub struct Bundle {
     pub events: Vec<Event>,
     pub objects: BTreeMap<String, String>,
 }
+/// A sequential, bounded transfer segment. Whole-object hash verification is
+/// required before it enters shared inventory or activates a semantic event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObjectPart {
+    pub offset: u64,
+    pub total: u64,
+    pub hex: String,
+}
+impl Store {
+    pub fn partial_objects(&self) -> Result<BTreeMap<String, u64>> {
+        let payloads = self
+            .db
+            .prepare("SELECT payload FROM incoming_events WHERE error IS NULL")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut offsets = BTreeMap::new();
+        for payload in payloads {
+            let event: Event = serde_json::from_str(&payload)?;
+            for object in event.objects() {
+                valid_object(&object)?;
+                if let Ok(meta) = fs::metadata(self.root.join("incoming-objects").join(&object)) {
+                    ensure!(meta.len() <= MAX_CONTENT, "FILE_TOO_LARGE");
+                    offsets.insert(object, meta.len());
+                }
+            }
+        }
+        Ok(offsets)
+    }
+    pub fn peer_partial_objects(&self, peer: &str) -> Result<BTreeMap<String, u64>> {
+        let payload: Option<String> = self
+            .db
+            .query_row(
+                "SELECT value FROM config WHERE key=?",
+                [format!("peer-partials:{peer}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|p| serde_json::from_str(&p).map_err(Into::into))
+            .transpose()
+            .map(|p| p.unwrap_or_default())
+    }
+    pub fn remember_peer_partials(
+        &self,
+        peer: &str,
+        offsets: &BTreeMap<String, u64>,
+    ) -> Result<()> {
+        ensure!(offsets.len() <= 10000, "PARTIAL_INVENTORY_TOO_LARGE");
+        for (object, offset) in offsets {
+            valid_object(object)?;
+            ensure!(*offset <= MAX_CONTENT, "FILE_TOO_LARGE");
+        }
+        self.db.execute(
+            "INSERT INTO config VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![
+                format!("peer-partials:{peer}"),
+                serde_json::to_string(offsets)?
+            ],
+        )?;
+        Ok(())
+    }
+    pub fn shared_parts(
+        &self,
+        page: &Bundle,
+        known: &BTreeSet<String>,
+        offsets: &BTreeMap<String, u64>,
+        budget: usize,
+    ) -> Result<BTreeMap<String, ObjectPart>> {
+        let mut parts = BTreeMap::new();
+        let mut used = serde_json::to_vec(page)?.len() + 1024;
+        for object in page
+            .events
+            .iter()
+            .flat_map(Event::objects)
+            .collect::<BTreeSet<_>>()
+        {
+            if known.contains(&object) || page.objects.contains_key(&object) {
+                continue;
+            }
+            let total = self.object_size(&object)?;
+            let offset = offsets.get(&object).copied().unwrap_or(0);
+            ensure!(offset < total, "INVALID_OBJECT_OFFSET");
+            let count = ((budget.saturating_sub(used + 256)) / 2)
+                .min(4 * IO_CHUNK)
+                .min((total - offset) as usize);
+            if count == 0 {
+                break;
+            }
+            // Immutable CAS was verified at installation/open; the receiver
+            // independently verifies its entire assembled object before ACK.
+            let mut file =
+                fs::File::open(self.root.join("objects").join(&object)).map_err(object_error)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut bytes = vec![0; count];
+            file.read_exact(&mut bytes)?;
+            used += count * 2 + 256;
+            parts.insert(
+                object,
+                ObjectPart {
+                    offset,
+                    total,
+                    hex: hex::encode(bytes),
+                },
+            );
+        }
+        Ok(parts)
+    }
+    pub fn receive_parts(
+        &mut self,
+        parts: BTreeMap<String, ObjectPart>,
+        events: &[Event],
+        allowed: &BTreeSet<String>,
+    ) -> Result<()> {
+        ensure!(
+            events
+                .iter()
+                .all(|e| e.repo == self.repo && e.branch.shared && allowed.contains(&e.device)),
+            "UNAUTHORIZED_EVENT"
+        );
+        let authorized: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
+        for (object, part) in parts {
+            valid_object(&object)?;
+            ensure!(authorized.contains(&object), "UNAUTHORIZED_OBJECT");
+            if self.shared_object_inventory()?.contains(&object) {
+                self.verify_object(&object)?;
+                continue;
+            }
+            ensure!(
+                part.total <= MAX_CONTENT && part.hex.len() <= 8 * IO_CHUNK,
+                "INVALID_OBJECT_PART"
+            );
+            let bytes = hex::decode(&part.hex)?;
+            ensure!(
+                !bytes.is_empty()
+                    && part
+                        .offset
+                        .checked_add(bytes.len() as u64)
+                        .is_some_and(|end| end <= part.total),
+                "INVALID_OBJECT_PART"
+            );
+            let folder = self.root.join("incoming-objects");
+            fs::create_dir_all(&folder)?;
+            let path = folder.join(&object);
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            let length = file.metadata()?.len();
+            ensure!(part.offset <= length, "OBJECT_PART_GAP");
+            if part.offset < length {
+                ensure!(
+                    part.offset + bytes.len() as u64 <= length,
+                    "OBJECT_PART_OVERLAP"
+                );
+                file.seek(SeekFrom::Start(part.offset))?;
+                let mut old = vec![0; bytes.len()];
+                file.read_exact(&mut old)?;
+                ensure!(old == bytes, "OBJECT_PART_CHANGED");
+            } else {
+                file.seek(SeekFrom::Start(length))?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+            }
+            if file.metadata()?.len() == part.total {
+                file.rewind()?;
+                if stream_hash(&mut file)? != object {
+                    drop(file);
+                    fs::remove_file(path)?;
+                    bail!("CORRUPT_OBJECT");
+                }
+                file.rewind()?;
+                ensure!(self.put_stream(&mut file)? == object, "CORRUPT_OBJECT");
+                self.db.execute(
+                    "INSERT OR IGNORE INTO received_shared_objects VALUES(?)",
+                    [object],
+                )?;
+                drop(file);
+                fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 fn persist_projection(
     tx: &Connection,
@@ -1713,6 +2387,7 @@ fn persist_projection(
     events: &[Event],
     new_event: Option<&str>,
 ) -> Result<()> {
+    tx.execute("DELETE FROM current_parts WHERE branch=?", [branch])?;
     tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload",params![branch,serde_json::to_string(p)?])?;
     // Derive historical concurrent pairs from the full activated DAG too, so a
     // fast-forward delivered before a competitor cannot hide the earlier pair.
