@@ -131,6 +131,14 @@ solely to keep an unused slot alive. Network cancellation is polled every 100 ms
 and shutdown drain is bounded at 35 seconds. Local worker RPC/storage scheduling
 retain their separate limits; these are not hard realtime guarantees.
 
+Each service tick prunes idle connections independently of outgoing requests.
+Idle/rotation expiry, certificate or endpoint changes, revocation, outbound-only
+advertisements, disabled dialing and loss of enabled outgoing grants release the
+shared quota guards. A lease completing after a policy change is discarded rather
+than recached. Changes take effect on the next completed service iteration
+(normally about 50 ms); config-file changes still require the existing restart
+workflow. Active already-authorized operations retain their existing deadlines.
+
 Reserved lanes, per-device quotas and earliest-eligible job scheduling prevent
 bulk payload reception from taking the control connection slot. Worker locks
 and SQLite authorization transactions can still delay control operations;

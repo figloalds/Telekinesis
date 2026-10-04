@@ -237,10 +237,42 @@ struct IdleConnection {
     endpoint: String,
     _quota: Option<Connection>,
 }
+impl IdleConnection {
+    fn reusable(&self, device: &str, policy: Option<&PoolPolicy>, now: Instant) -> bool {
+        now.saturating_duration_since(self.used) < RETAIN_IDLE
+            && now.saturating_duration_since(self.created) < Duration::from_secs(600)
+            && policy.is_none_or(|policy| policy.allows(device, &self.certificate, &self.endpoint))
+    }
+}
+struct PoolPolicy {
+    dial: bool,
+    peers: BTreeMap<String, Peer>,
+}
+impl PoolPolicy {
+    fn allows(&self, device: &str, certificate: &[u8], endpoint: &str) -> bool {
+        self.dial
+            && self.peers.get(device).is_some_and(|peer| {
+                !peer.revoked
+                    && peer.endpoint.starts_with("wss://")
+                    && peer.endpoint == endpoint
+                    && peer.certificate == certificate
+            })
+    }
+}
 #[derive(Default)]
 struct PoolState {
     idle: BTreeMap<(String, Lane), Vec<IdleConnection>>,
     busy: BTreeMap<(String, Lane), usize>,
+    policy: Option<PoolPolicy>,
+}
+impl PoolState {
+    fn prune(&mut self, now: Instant) {
+        let policy = self.policy.as_ref();
+        self.idle.retain(|(device, _), entries| {
+            entries.retain(|entry| entry.reusable(device, policy, now));
+            !entries.is_empty()
+        });
+    }
 }
 #[derive(Default)]
 pub(crate) struct Pool {
@@ -259,6 +291,7 @@ impl Drop for Lease<'_> {
         *state.busy.get_mut(&self.key).unwrap() -= 1;
         if self.keep
             && let Some(connection) = self.connection.take()
+            && connection.reusable(&self.key.0, state.policy.as_ref(), Instant::now())
         {
             state
                 .idle
@@ -285,12 +318,15 @@ impl Pool {
         let key = (peer.installation.clone(), lane);
         let mut state = self.state.lock().unwrap();
         let now = Instant::now();
-        for entries in state.idle.values_mut() {
-            entries.retain(|entry| {
-                now.duration_since(entry.used) < RETAIN_IDLE
-                    && now.duration_since(entry.created) < Duration::from_secs(600)
-            });
-        }
+        state.prune(now);
+        ensure!(
+            state.policy.as_ref().is_none_or(|policy| policy.allows(
+                &peer.installation,
+                &peer.certificate,
+                &peer.endpoint
+            )),
+            "WSS_DIAL_POLICY_CHANGED"
+        );
         let devices: std::collections::BTreeSet<_> = state
             .busy
             .iter()
@@ -365,15 +401,26 @@ impl Pool {
         }
         Ok(lease)
     }
-    fn retire(&self, allowed: &[Peer]) {
-        self.state.lock().unwrap().idle.retain(|(id, _), _| {
-            allowed
+    fn maintain(&self, allowed: &[Peer], dial: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.policy = Some(PoolPolicy {
+            dial,
+            peers: allowed
                 .iter()
-                .any(|peer| !peer.revoked && &peer.installation == id)
+                .map(|peer| (peer.installation.clone(), peer.clone()))
+                .collect(),
         });
+        // Run on every service tick, even when there is no future outgoing job.
+        // Dropping entries also drops their shared incoming/outgoing quota guards.
+        state.prune(Instant::now());
     }
     fn clear(&self) {
-        self.state.lock().unwrap().idle.clear();
+        let mut state = self.state.lock().unwrap();
+        state.policy = Some(PoolPolicy {
+            dial: false,
+            peers: BTreeMap::new(),
+        });
+        state.idle.clear();
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -809,8 +856,17 @@ fn run_with_admission(
         }
         let registry = config.registry()?;
         let peers = registry.peers()?;
-        pool.retire(&peers);
         let mut grants = registry.configurations()?;
+        let dial_peers: Vec<_> = peers
+            .iter()
+            .filter(|peer| {
+                grants
+                    .iter()
+                    .any(|grant| grant.enabled && grant.peer == peer.installation)
+            })
+            .cloned()
+            .collect();
+        pool.maintain(&dial_peers, config.dial);
         // Earliest eligible job first; no stable repo ordering monopolizes slots.
         grants.sort_by_key(|grant| {
             jobs.get(&(grant.peer.clone(), grant.repo.clone()))
@@ -1527,5 +1583,137 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn periodic_pool_maintenance_releases_idle_quotas_without_another_outgoing_lease() {
+        let a = fixture(Settings::default());
+        let b = fixture(Settings::default());
+        a.config.registry().unwrap().trust(&b.peer).unwrap();
+        b.config.registry().unwrap().trust(&a.peer).unwrap();
+        let pool = Pool::with_admission(a.admission.clone());
+        fn incoming(a: &Fixture, b: &Fixture) -> bool {
+            let Ok(mut socket) = connect(
+                &b.issuer,
+                &a.peer,
+                false,
+                Lane::Bulk,
+                Arc::new(AtomicBool::new(false)),
+            ) else {
+                return false;
+            };
+            socket.get_mut().budget(Duration::from_secs(1));
+            if socket
+                .send(Message::Ping(b"capacity".to_vec().into()))
+                .is_err()
+            {
+                return false;
+            }
+            matches!(socket.read(), Ok(Message::Pong(value)) if value.as_ref() == b"capacity")
+        }
+        // This is the maintenance operation called by each service tick. No
+        // additional outgoing lease/request is made after each policy change.
+        for case in 0..8 {
+            pool.maintain(std::slice::from_ref(&b.peer), true);
+            let mut first = pool
+                .lease(
+                    &a.issuer,
+                    &b.peer,
+                    Lane::Bulk,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            let mut second = pool
+                .lease(
+                    &a.issuer,
+                    &b.peer,
+                    Lane::Bulk,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            first.keep = true;
+            second.keep = true;
+            drop((first, second));
+            assert!(
+                !incoming(&a, &b),
+                "idle outgoing quotas did not fill both bulk slots"
+            );
+            let mut changed = b.peer.clone();
+            let mut allowed = vec![changed.clone()];
+            let mut dial = true;
+            match case {
+                0 => {
+                    changed.endpoint = "outbound-only".into();
+                    allowed = vec![changed];
+                }
+                1 => {
+                    changed.endpoint = "wss://127.0.0.1:1/tkfs/sync".into();
+                    allowed = vec![changed];
+                }
+                2 => {
+                    changed.certificate = a.home.certificate.clone();
+                    allowed = vec![changed];
+                }
+                3 => dial = false,
+                4 => allowed.clear(),
+                5 => {
+                    changed.revoked = true;
+                    allowed = vec![changed];
+                }
+                6 | 7 => {
+                    let mut state = pool.state.lock().unwrap();
+                    for entry in state.idle.values_mut().flatten() {
+                        if case == 6 {
+                            entry.used = Instant::now() - RETAIN_IDLE - Duration::from_secs(1);
+                        } else {
+                            entry.created = Instant::now() - Duration::from_secs(601);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            pool.maintain(&allowed, dial);
+            assert!(
+                pool.state.lock().unwrap().idle.is_empty(),
+                "stale idle pool survived maintenance case {case}"
+            );
+            assert_eq!(
+                a.admission.devices.lock().unwrap()[&b.issuer.installation].connections
+                    [&Lane::Bulk],
+                0
+            );
+            wait(|| {
+                b.admission.devices.lock().unwrap()[&a.issuer.installation].connections[&Lane::Bulk]
+                    == 0
+            });
+            assert!(
+                incoming(&a, &b),
+                "incoming capacity did not recover after maintenance case {case}"
+            );
+            wait(|| {
+                a.admission.devices.lock().unwrap()[&b.issuer.installation].connections[&Lane::Bulk]
+                    == 0
+            });
+        }
+        // A response completing after the tick must not put an obsolete lease
+        // back into the pool and reacquire its shared quota indefinitely.
+        pool.maintain(std::slice::from_ref(&b.peer), true);
+        let mut late = pool
+            .lease(
+                &a.issuer,
+                &b.peer,
+                Lane::Bulk,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap();
+        pool.maintain(std::slice::from_ref(&b.peer), false);
+        late.keep = true;
+        drop(late);
+        assert!(pool.state.lock().unwrap().idle.is_empty());
+        assert_eq!(
+            a.admission.devices.lock().unwrap()[&b.issuer.installation].connections[&Lane::Bulk],
+            0
+        );
+        assert!(incoming(&a, &b));
     }
 }
