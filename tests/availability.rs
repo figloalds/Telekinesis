@@ -1,9 +1,12 @@
 use serde_json::json;
+#[cfg(windows)]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::{
     collections::BTreeSet,
-    fs::{self, OpenOptions},
+    fs,
     io::{Read, Seek, SeekFrom},
-    os::windows::fs::OpenOptionsExt,
 };
 use tkfs::{
     backend::{DirectoryBackend, ObjectBackend},
@@ -12,6 +15,7 @@ use tkfs::{
     staging::Staged,
 };
 
+#[cfg(windows)]
 #[test]
 fn failed_close_retires_context_and_recovery_preserves_original_bases_and_bytes() {
     let dir = tempfile::tempdir().unwrap();
@@ -83,6 +87,7 @@ fn permanent_failed_save_stays_degraded_and_retains_staging() {
     assert!(engine.health.is_some());
     assert!(engine.quiet().is_err());
 }
+#[cfg(windows)]
 #[test]
 fn volume_flush_retires_recovered_closed_sessions_before_checkout() {
     let dir = tempfile::tempdir().unwrap();
@@ -257,6 +262,7 @@ fn large_peer_segments_survive_restart_and_never_ack_partial_or_private_content(
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn pending_save_keeps_its_base_when_a_peer_revision_arrives() {
     let a_dir = tempfile::tempdir().unwrap();

@@ -1128,7 +1128,15 @@ pub fn deliver_notifications(engine: &Shared) {
         e.notifications.extend(retry);
         e.notification_error = error;
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        // The Linux adapter uses zero entry/attribute TTLs and direct file I/O.
+        if let Ok(mut e) = engine.try_lock() {
+            e.notifications.clear();
+            e.notification_error = None;
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = engine;
     }

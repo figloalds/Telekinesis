@@ -16,7 +16,7 @@ mod gui;
 #[derive(Parser)]
 #[command(
     version,
-    about = "TKFS Windows mounted, causal filesystem proof of concept"
+    about = "TKFS causal filesystem: Windows WinFsp and Linux headless FUSE"
 )]
 struct Args {
     /// Resolve a mounted project from this directory (otherwise use cwd).
@@ -75,6 +75,8 @@ enum Command {
         #[arg(long, requires = "listen")]
         peer_device: Option<String>,
     },
+    #[cfg(target_os = "linux")]
+    Stop,
     Status,
     Branches,
     Conflicts,
@@ -205,6 +207,13 @@ fn main() {
         std::process::exit(1);
     }
 }
+#[cfg(target_os = "linux")]
+static LINUX_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(target_os = "linux")]
+extern "C" fn request_linux_stop(_: libc::c_int) {
+    LINUX_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn run() -> Result<()> {
     #[cfg(windows)]
     if std::env::args_os().len() == 1 {
@@ -312,7 +321,10 @@ fn run() -> Result<()> {
                 return Ok(());
             }
             #[cfg(not(windows))]
-            bail!("O1_WINDOWS_ONLY: {}", defaults_file.display());
+            {
+                let _ = action;
+                bail!("O1_WINDOWS_ONLY: {}", defaults_file.display());
+            }
         }
         Command::Init { state, repo } => {
             std::fs::create_dir_all(state)?;
@@ -372,16 +384,42 @@ fn run() -> Result<()> {
                 mount.as_ref().map(|m| m.to_string_lossy().into_owned()),
             )?;
             if let Some(m) = &mount {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 tkfs::mount::start(engine.clone(), m)?;
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "linux")))]
                 bail!("Windows WinFsp mount only in this PoC");
             }
             println!(
                 "{}",
                 json!({"ready":true,"repo":info.repo,"device":info.device,"runtime":state.join("runtime.json"),"mount":mount})
             );
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::signal(libc::SIGINT, request_linux_stop as libc::sighandler_t);
+                libc::signal(libc::SIGTERM, request_linux_stop as libc::sighandler_t);
+            }
             loop {
+                #[cfg(target_os = "linux")]
+                {
+                    if LINUX_STOP.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        let stopped = if engine.lock().unwrap().mounted {
+                            tkfs::mount::stop(&engine)
+                        } else {
+                            engine.lock().unwrap().quiet()
+                        };
+                        match stopped {
+                            Ok(()) => {
+                                let _ = std::fs::remove_file(state.join("control.sock"));
+                                return Ok(());
+                            }
+                            Err(error) => eprintln!(
+                                "SHUTDOWN_REFUSED: {error:#}; close clients and retry stop"
+                            ),
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                #[cfg(not(target_os = "linux"))]
                 std::thread::park();
             }
         }
@@ -389,6 +427,8 @@ fn run() -> Result<()> {
     }
     let info = discover(&args)?;
     let mut payload = match &args.command {
+        #[cfg(target_os = "linux")]
+        Command::Stop => json!({"op":"stop"}),
         Command::Status => json!({"op":"status"}),
         Command::Branches => json!({"op":"branches"}),
         Command::Conflicts => json!({"op":"conflicts"}),
