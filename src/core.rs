@@ -27,7 +27,7 @@ pub const MAX_NAMESPACE_CUTS: usize = 4096;
 pub const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
 pub const BASIC_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x20 | 0x80;
 /// Both peers must understand durable basic metadata; format 2 is incompatible.
-pub const PEER_FORMAT: u32 = 4;
+pub const PEER_FORMAT: u32 = 5;
 pub fn filetime(ms: u64) -> u64 {
     ms.saturating_mul(10_000).saturating_add(FILETIME_EPOCH)
 }
@@ -35,6 +35,9 @@ pub fn filetime(ms: u64) -> u64 {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BasicInfo {
+    /// Portable permission bits; Windows retains these without interpreting execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posix_mode: Option<u32>,
     pub attributes: u32,
     pub creation_time: u64,
     pub access_time: u64,
@@ -43,6 +46,10 @@ pub struct BasicInfo {
 }
 impl BasicInfo {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.posix_mode.is_none_or(|mode| mode & !0o777 == 0),
+            "UNSUPPORTED_POSIX_MODE"
+        );
         ensure!(
             self.attributes & !BASIC_ATTRIBUTES == 0,
             "UNSUPPORTED_ATTRIBUTES"
@@ -200,6 +207,7 @@ pub struct Entry {
 impl Entry {
     pub fn basic_info(&self) -> BasicInfo {
         let mut basic = self.basic.unwrap_or(BasicInfo {
+            posix_mode: None,
             attributes: if self.kind == "directory" { 0x10 } else { 0x20 },
             creation_time: filetime(self.created_ms),
             access_time: filetime(self.created_ms),
@@ -1341,6 +1349,7 @@ impl Store {
         if let Some(attributes) = attributes {
             let now = filetime(event.created_ms);
             let basic = BasicInfo {
+                posix_mode: None,
                 attributes: BasicInfo::attributes(kind, attributes)?,
                 creation_time: now,
                 access_time: now,
