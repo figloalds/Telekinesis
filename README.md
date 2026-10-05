@@ -171,6 +171,27 @@ folder picker interaction and general screen-reader behavior require manual QA.
 
 ## Build and test on Windows
 
+To build both x64 runnables from Windows, use Python 3.12+ and an Ubuntu WSL
+distribution with Rust, Python 3.12+ and a C compiler installed:
+
+```powershell
+python scripts/build.py
+```
+
+This produces release builds at `target/runnables/windows-x86_64/tkfs.exe`
+(desktop and CLI) and `target/runnables/linux-x86_64/tkfs` (headless CLI/FUSE).
+Each folder contains license notices and `BUILD.json` with version, toolchain
+and SHA-256. Linux builds use a temporary source snapshot on WSL's native
+filesystem. Temporary compiler output is removed after the build, including on
+failure; `--keep-build-cache` keeps one reusable cache per OS for faster rebuilds.
+Use `--offline` for cached dependencies, `--profile debug` for debug builds,
+`--linux-distro NAME` for another WSL distribution, or `--platform windows`
+to build Windows only. On native Linux, `python3 scripts/build.py` builds the
+Linux runnable. `--output PATH` selects a different destination.
+Windows mounts require an installed WinFsp runtime; Linux mounts require
+`fusermount3` and `/dev/fuse`. The Linux binary uses the build distribution's
+glibc and shared libraries, listed in its `BUILD.json`.
+
 Prerequisites: x64 Windows, Rust/MSVC and Windows SDK, Python 3 for the acceptance
 harnesses, and an installed WinFsp runtime **and SDK**. This implementation
 discovered WinFsp 2025, DLL version
