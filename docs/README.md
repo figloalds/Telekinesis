@@ -12,9 +12,11 @@ build/run commands. These guides add platform and operational detail.
 | [Validation notes](VALIDATION.md) | Historical implementation checks, physical-machine findings and acceptance gaps |
 
 Design documents contain proposed work as well as implemented slices; use the
-code and dated [test evidence](../test-evidence/README.md) to establish status.
-The evidence archive is ignored local output and is absent from a fresh clone;
-its links require a separately retained copy. Commit lasting findings here and
+code, repository tests and dated [validation notes](VALIDATION.md) to establish
+status. `test-evidence/` contains optional ignored local reports and is absent
+from a fresh clone. Paths in this documentation are relative to the repository
+root unless stated otherwise; example absolute paths are operator-selected
+placeholders or documented platform defaults. Commit lasting findings here and
 reusable acceptance harnesses under `scripts/`, keeping generated output local.
 
 | Design/history | Contents |

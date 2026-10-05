@@ -1,8 +1,9 @@
 # Multi-computer identity and pairing assessment
 
-Assessed 2026-10-04 after merging Linux commits de96171/fed668d into Windows
-`master`. This document proposes the next implementation; it does not enable
-networking, generate/store credentials or change running daemons.
+Historical assessment from 2026-10-04, after the initial Linux integration and
+before the persistent pairing service. The gaps below describe that baseline;
+see [PAIRING-IMPLEMENTATION.md](PAIRING-IMPLEMENTATION.md) and
+[PAIRING.md](PAIRING.md) for the implemented service and current operating guide.
 
 ## Current implementation and gaps
 

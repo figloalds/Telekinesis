@@ -4,8 +4,10 @@ The original 42-test/17-mount evidence below predates the acknowledgement correc
 from the later physical run. The separate correction validation and physical scope
 are recorded under "Physical findings and acknowledgement correction" below;
 the original JSON reports and benchmark observations are preserved.
-Paths under `test-runs/` refer to ignored local logs/fixtures and are not included
-in a fresh checkout or portable package.
+Paths under `test-evidence/` and `test-runs/` refer to optional ignored local
+reports/logs/fixtures and are absent from a fresh checkout. Exact fixture IDs,
+machine paths and process identities belong in those run reports. The commands
+and results below describe the dated qualification, not a new test run.
 
 ## Local orchestrator O1 and WinFsp loader — 2026-10-03
 
@@ -53,7 +55,7 @@ bootstrap, future schema refusal and wrong owner refusal, startup shutdown fenci
 recoverable staging installation and terminal-versus-retryable I/O classification.
 Final Clippy with warnings denied and formatting passed.
 
-[ORCHESTRATOR-VALIDATION.json](../test-evidence/ORCHESTRATOR-VALIDATION.json) records 22 local
+`test-evidence/ORCHESTRATOR-VALIDATION.json` records 22 local
 acceptance checks: two independent real mounts, durable isolated content,
 duplicate supervisor/store ownership refusal, exact replay/mismatch/stale
 generation behavior, API version/anonymous caller rejection, worker token and
@@ -67,7 +69,7 @@ loss. The harness removes WinFsp PATH and `WINFSP_DIR` from
 its environment and retains its own fixture directories under `test-runs/`.
 All successful-run fixture workers/mounts were cooperatively stopped.
 
-[ORCHESTRATOR-COMPATIBILITY.json](../test-evidence/ORCHESTRATOR-COMPATIBILITY.json) records all
+`test-evidence/ORCHESTRATOR-COMPATIBILITY.json` records all
 18 existing real mounted-filesystem/peer checks passing against the new binary,
 including notifications, retained mappings, private/current-state publication,
 offline conflict convergence and acknowledgement-loss replay. This remains
@@ -92,13 +94,10 @@ pending create/start, crash/restart, and a non-delete-sharing staging handle acr
 retry/restart/release. Both recovered with the same allocated IDs and preserved
 data. No deferred scope or machine configuration was changed.
 
-All commands ran from `C:\Users\felyp\Desktop\Projetos\Telekinesis` with the
-existing toolchain. WinFsp was discovered pre-existing; no driver was installed or
-changed. Its DLL at `C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll` reports
-`2.1.25156.ddca7bd` / WinFsp 2025. Rust/Cargo were `1.96.0`, with the available
-MSVC x64 compiler/Windows SDK; the OS reports `10.0.26300.0`. Python 3.12 runs
-the harness using only its standard library. No external service/bucket or
-persistent peer secret was created.
+Commands run from the repository root. The recorded Windows qualification used
+Rust/Cargo 1.96, an x64 MSVC compiler/Windows SDK, WinFsp 2025 (DLL
+`2.1.25156.ddca7bd`) and Python 3.12. These versions describe that test run;
+see the README for build prerequisites and configuration on another host.
 
 ## Implemented deliverables
 
@@ -116,7 +115,7 @@ persistent peer secret was created.
 ## Final commands and results
 
 ```powershell
-$env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
+# Historical commands used cached dependencies. Current builds locate WinFsp without PATH changes.
 cargo build --offline
 cargo test --offline
 cargo fmt --check
@@ -238,9 +237,8 @@ new pairs and skipping unready activation reduced a standalone debug rerun to
 verify every competing object, absence of quarantined backlog, restart equality,
 fast/full projection equality and backward-clock provenance behavior.
 
-Machine-readable benchmark: [SCALABILITY.json](../test-evidence/SCALABILITY.json). Final stdout:
-`test-runs/final-tests.log` and
-`test-runs/final-release-scalability.log`.
+Machine-readable benchmark: `test-evidence/SCALABILITY.json`. Test stdout belongs
+in the chosen run's local output directory.
 These benchmark core/Engine
 flushes to actual native Windows SQLite/CAS with FULL/write-through durability,
 small files and independent replica stores in **one process**, without the mount.
@@ -251,7 +249,7 @@ pairs (100 x 100 here), and larger files/history cost more memory, storage and I
 
 ## Mounted acceptance evidence
 
-Machine-readable result: [VALIDATION.json](../test-evidence/VALIDATION.json). Reproducible harness:
+Machine-readable result: `test-evidence/VALIDATION.json`. Reproducible harness:
 `scripts/e2e.py` (included in the portable package's source archive).
 Its result records the exact latest fixture
 directory/device UUIDs; preserved `a-<index>-stdout.log`, `a-<index>-stderr.log`
@@ -259,13 +257,9 @@ and equivalent `b-*` files live there, alongside `watch.events`/watcher logs.
 Each device retains its own SQLite database/CAS. The ephemeral peer key is not
 logged. The harness terminates its runtime/watcher processes after testing.
 
-Final fixture: `test-runs/e89b43d5-3878-4c31-afb1-fe240f99a82a/`.
-Devices: `21076db3-4f43-46f9-8ab9-f3dded73f8a7` and
-`e07f9f38-b46c-47bb-877d-692cd8fa2bb5`. Direct evidence:
-A initial stdout (`test-runs/e89b43d5-3878-4c31-afb1-fe240f99a82a/a-0-stdout.log`),
-B initial stdout (`test-runs/e89b43d5-3878-4c31-afb1-fe240f99a82a/b-0-stdout.log`),
-watcher events (`test-runs/e89b43d5-3878-4c31-afb1-fe240f99a82a/watch.events`),
-final mounted stdout (`test-runs/final-mounted.log`).
+Each run allocates a fresh fixture directory and independent device UUIDs.
+The local summary JSON records those IDs and paths; they are not prerequisites
+for rerunning the repository harness.
 After the run, no TKFS runtime process remained and both mount paths were absent.
 
 Verified actual mounted I/O includes ordinary Python save/fsync/read, PowerShell
@@ -279,8 +273,7 @@ offline conflicting durable saves/crash/restart/convergence, inspectable bytes/b
 provenance, exact reviewed resolution, namespace alternative recovery onto both
 mounts, lost acknowledgement replay, and persistent retry-safe RPC identities.
 
-PowerShell script-file execution was blocked by the host policy. The harness
-executes its trusted local watcher script body through a normal inline `-Command`;
+The harness executes its local watcher script body through an inline `-Command`;
 it does not change execution policy or security settings.
 
 Transport is AES-256-GCM authenticated/encrypted TCP, protocol version 2, between
@@ -290,18 +283,16 @@ central ref service or cloud bucket substitutes for the mount.
 
 ## Physical findings and acknowledgement correction
 
-The original physical report was retained at
-`test-runs/two-machine-448ed3f6-948d-4d90-b8b7-9b1cdbd82744/TWO-MACHINE-VALIDATION.json`
-(an ignored local artifact, not included in a fresh checkout). It
-records ten live checks on FIGLOALDS/FELYPE at commit
+The historical physical report records ten live checks on two Windows
+computers at commit
 `303fec87c02444d3c9790ac11268f9c396fb6527`: bidirectional mounted saves,
 stable-ID renames/delete, private branch/canary event/object isolation and
-bidirectional authentication after the user's firewall exception. Physical
+bidirectional authentication over explicitly configured reachable endpoints. Physical
 offline conflict/reconnect qualification was not completed. Both nodes reported
 caught-up while one/three received events remained queued despite durable copies.
 
 Two new baseline regressions reproduced the stale queue and stale caught-up flag
-before changes (failure log (`test-runs/ack-fix-before.log`)). The correction makes
+before changes. The correction makes
 authenticated accepted-event inventories authoritative receipts on both request
 and response paths. Peer inventory and outbox reconciliation are atomic; events
 withdrawn from the peer inventory are queued again. SQL acknowledgements apply
@@ -323,7 +314,7 @@ retry without explicit acks, wrong device, unbound responses and inconsistent ac
 claims. All passed, alongside the relevant existing suite:
 
 ```powershell
-$env:PATH = 'C:\Program Files (x86)\WinFsp\bin;' + $env:PATH
+# Historical commands used cached dependencies. Current builds locate WinFsp without PATH changes.
 cargo test --offline --target-dir target/ack-fix -- --nocapture --skip ten_thousand_durable_content_saves_and_later_delete_undelete --skip two_replicas_each_make_one_hundred_offline_saves_and_retain_all_pairs
 cargo fmt -- --check
 cargo clippy --offline --target-dir target/ack-fix --all-targets -- -D warnings
@@ -338,18 +329,13 @@ offline build, diff whitespace and harness syntax checks passed. **18 real WinFs
 checks passed**, adding both outgoing queues reaching zero after repeated two-way
 sync to the original mounted acceptance suite.
 
-Machine-readable correction result: [ACK-FIX-VALIDATION.json](../test-evidence/ACK-FIX-VALIDATION.json).
-Logs: focused tests (`test-runs/ack-fix-focused.log`),
-relevant suite (`test-runs/ack-fix-tests.log`),
-actual mounts (`test-runs/ack-fix-mounted.log`).
-Correction fixture: `test-runs/b6102308-b998-461b-bf77-f1ca5db437fd/`; each device's native SQLite/CAS and
-stdout/stderr logs are retained there. These are **two local processes**, not a
-retest on physical computers. Both disposable mounts/processes were removed.
-Original daemon PIDs `44164`/`66280`, the default executable, original physical/local
-reports and plan archive remain untouched. Those daemons still run the prior
-binary; no restart, second-machine operation, settings change or push occurred.
-The corrected executable is `target/ack-fix/debug/tkfs.exe`. Physical testing of the
-correction and offline/reconnect qualification await user-directed next steps.
+Machine-readable correction result: `test-evidence/ACK-FIX-VALIDATION.json`.
+Focused-test, regression-suite and mounted-run logs belong in the selected
+run's local output directory.
+The correction harness records its own disposable fixture paths in the local
+summary report. Both mounts and test processes were removed after that run.
+The corrected executable was `target/ack-fix/debug/tkfs.exe`; physical testing
+of the correction and offline/reconnect behavior remained acceptance gaps.
 
 ## Remaining setup and acceptance gaps
 
@@ -361,10 +347,9 @@ Real second-machine prerequisites/runbook are in
 [README.md](../README.md#two-explicitly-configured-devices): another x64 Windows
 computer with WinFsp, distinct device database/UUID, common repository UUID,
 authorized reachable endpoints and an ephemeral out-of-band pairing key. No
-driver, firewall or network-security setup was performed by agents; the physical
-report records the user's firewall exception. Both daemon peer
-endpoints/peer identity must be configured together; the secret is environment
-only. Pairing assumes trusted devices; no PKI, independent signing, forward
+automatic driver, firewall or network-security setup is provided by the
+repository. Both daemon peer endpoints/peer identity must be configured together;
+the secret is supplied through the launching environment. Pairing assumes trusted devices; no PKI, independent signing, forward
 secrecy, revocation or multi-user permissions are implemented.
 
 The object backend is a local native test directory, with no automatic uploader.
@@ -390,7 +375,5 @@ whole-file buffering and unbounded retained history with no GC. Only Windows
 regular files/directories and the documented name normalization are supported.
 The tested namespace permutations are evidence, not a proof of all graphs.
 
-The original plan remains byte-identical in its archive, verified SHA-256
-`dd00e62cd9e142a4b71e0715d9e77cff7476e6e72d680be85ce4aff1323d6fde`.
-The original workspace had no Git repository; no commits/pushes/external publishing
-or writes to other projects occurred. The tests use isolated workspace fixtures.
+The legacy design remains available in `docs/TKFS-PLAN-2026-10-02-LEGACY.md`,
+with machine-specific setup notes removed. Git history retains the original.

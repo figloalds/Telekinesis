@@ -35,13 +35,11 @@ Two separate mount promises must remain visible in the product:
 
 Default concurrency is one writable owner per worktree, with many independent worktrees and immutable readers. This is not a distributed coherent filesystem for multiple devices simultaneously editing the same mutable database. Shared trunk changes only through reviewed/authorized publication. Agents get scoped worktree capabilities; permission to edit files is distinct from permission to publish trunk, delete history, or administer storage.
 
-## 2. What to reuse from Enro Contador
+## 2. Namespace model
 
-Inspected `../Enro Contador/src/convex/schema.ts:151`, `src/convex/api/arquivos.ts`, and `src/convex/core/arquivos.ts`.
+The proposed namespace model uses stable entry IDs and parent/name relationships.
 
-The existing `arquivos` table is a Convex schema, rather than SQLite. Its fields are `name`, `isDirectory`, `isFile`, optional `storageId`, optional `parentDirectory`, and `idEmitente`. It has indexes by name, owner, and parent combined with type or owner. Helpers resolve paths segment by segment and reconstruct paths by following parents. The displayed schema has no explicit last-modified field or version history; Convex's implicit creation timestamp does not supply those semantics.
-
-Keep its **adjacency-list hierarchy for the local materialized worktree index**: each entry stores its parent's stable ID. This gives indexed direct-child listing, cheap directory moves, and stable identities through renames. A directory move changes its parent/name relationship without rewriting all descendants' paths. Normal enumeration needs no recursion. Recursive CTEs are useful for subtree operations, ancestry checks, and exports.
+Use an **adjacency-list hierarchy for the local materialized worktree index**: each entry stores its parent's stable ID. Index by parent and normalized name to resolve paths segment by segment; reconstruct paths by following parent IDs. Keep directory/file type and content references separate from causal metadata and version history. This gives indexed direct-child listing, cheap directory moves, and stable identities through renames. A directory move changes its parent/name relationship without rewriting all descendants' paths. Normal enumeration needs no recursion. Recursive CTEs are useful for subtree operations, ancestry checks, and exports.
 
 Tradeoffs: path lookup performs work proportional to path depth; subtree statistics need traversal or cached aggregates; parent pointers need cycle and same-share validation. Start with this model. Add path caches only after measurement. Nested-set numbering is a poor initial fit for frequent moves; a closure table adds storage and mutation work without solving the synchronization problem.
 
@@ -558,11 +556,10 @@ Passing mount smoke tests is necessary but insufficient. Beta requires evidence 
 
 ### 19.1 Observed implementation state
 
-Read-only inspection on 2026-10-02 found only `TKFS-PLAN.md` in `C:\Users\felyp\Desktop\Projetos\Telekinesis`, including hidden entries: there is no project source tree, `.git` directory, build manifest, daemon, CLI, or mount adapter here. Earlier references to Rust, SQLite, WinFsp, and Avalonia are proposed architecture, not existing Telekinesis code. The adjacent Enro Contador schema is useful namespace context but is not a reusable virtual-filesystem or version-control runtime.
-
-Guidance was rechecked at `C:\Users\felyp\AGENTS.md`. No project/Projects `.agents/skills` directory was found; the user's `C:\Users\felyp\.agents\skills` directory exists and is empty. Git, Cargo, Rust, and .NET command paths were found, and Rust toolchain directories exist. WinFsp was not found in the two usual Program Files locations. These are inventory observations only: compiler/linker readiness, driver installation elsewhere, driver loading, mount permissions, bucket credentials, and a running runtime were **not** tested. No software was installed or product code implemented for this assessment.
-
-Consequently this is a greenfield PoC in this folder. The smallest coherent implementation should prove the existing design's high-risk contracts before expanding its service/UI surface.
+At the time of this design, the repository contained only the initial plan;
+filesystem and runtime behavior was proposed rather than implemented. This
+section records the original greenfield approach. Consult the repository
+README and current plan for the implemented architecture and prerequisites.
 
 ### 19.2 Ownership and transport
 
@@ -622,7 +619,7 @@ Use explicit outcomes such as `DIRTY_WORKTREE`, `BUSY_VIEW`, `STALE_VIEW`, `STAL
 
 The calling shell itself can retain a cwd/directory reference under the mount. The CLI can capture cwd and leave the mount in its own process, but cannot move its parent shell. Therefore a full remount-based checkout must have an explicit PoC escape hatch: run from outside the mount with `-C` or an authorized project selector. Do not claim every in-mount shell supports seamless checkout before testing this on Windows.
 
-Illustrative flow, **not executed by this planning task**:
+Illustrative proposed flow; these verbs describe the legacy design rather than the current CLI:
 
 ```powershell
 # Parent shell stays outside the mount during checkout.
@@ -647,11 +644,11 @@ The final checkout explicitly adopts the authoritative published tip only after 
 
 Build one Windows-first repository with ordinary UTF-8 text files and directories, one mount at `C:\Work\Project` per computer, whole-file SHA-256 blobs, canonical immutable trees/commits, SQLite local journals/indexes, a Rust runtime, and the thin Rust CLI. Use WinFsp through a narrow native adapter after the driver/binding spike. Keep the backing store outside the mount. A local per-file COW staging copy is adequate; byte-level chunking and packfiles are unnecessary for proving branch isolation.
 
-Reuse the current proposal rather than inventing a broader stack: the existing environment has Rust toolchain directories, but actual MSVC/Windows SDK/linker and WinFsp compatibility still need verification in implementation. Start with one binary in separate `daemon`, `cli`, and later `serve` roles if that reduces deployment work; maintain module boundaries without creating many services/crates prematurely. No desktop UI, Android integration, or distributed metadata cluster is required to demonstrate the idea.
+Use Rust with the MSVC toolchain, Windows SDK/linker and WinFsp SDK/runtime for the Windows prototype; verify their compatibility with the native adapter. Start with one binary in separate `daemon`, `cli`, and later `serve` roles if that reduces deployment work; maintain module boundaries without creating many services/crates prematurely. No desktop UI, Android integration, or distributed metadata cluster is required to demonstrate the idea.
 
 For the remote slice, choose **one** real bucket provider and use the section 15 control-service design. A concrete qualification target is an AWS S3 general-purpose bucket because its relevant semantics have documented sources; an already available provider can substitute after the same capability tests. No provider/account/credentials have been inspected or provisioned. The minimal ref service uses one local SQLite database, one owner process, and expected-value transactions. It need not depend on bucket CAS for refs. Initially proxy bounded object uploads through that service so it can verify hashes and record durable availability; presigned direct uploads and distributed closure verification can wait. Transport/authentication must still protect actual source code and credentials.
 
-For three-way text merging, pick a deterministic existing merge primitive only after a small fixture spike. Since Git is present, invoking a pinned/validated `git merge-file` against private temporary base/ours/theirs files is an acceptable **PoC-only helper**, if its actual installed command behavior, binary detection, conflicts, and licensing/distribution implications are checked. The runtime still owns TKFS commits, refs, trees, merge sessions, and publication. This optional helper is not a dependency on a live Git repository and is not a final engine choice. Alternatively select a maintained embeddable three-way merge implementation after checking compatibility. Do not write a new diff3 engine before proving mounted worktrees. Detect namespace/binary conflicts separately and require explicit resolution. The documented primitive accepts current/base/other file inputs and reports unresolved merges; pin actual helper behavior before adoption. [Git merge-file documentation](https://git-scm.com/docs/git-merge-file).
+For three-way text merging, pick a deterministic existing merge primitive only after a small fixture spike. If Git is available, invoking a pinned/validated `git merge-file` against private temporary base/ours/theirs files is an acceptable **PoC-only helper**, if its actual installed command behavior, binary detection, conflicts, and licensing/distribution implications are checked. The runtime still owns TKFS commits, refs, trees, merge sessions, and publication. This optional helper is not a dependency on a live Git repository and is not a final engine choice. Alternatively select a maintained embeddable three-way merge implementation after checking compatibility. Do not write a new diff3 engine before proving mounted worktrees. Detect namespace/binary conflicts separately and require explicit resolution. The documented primitive accepts current/base/other file inputs and reports unresolved merges; pin actual helper behavior before adoption. [Git merge-file documentation](https://git-scm.com/docs/git-merge-file).
 
 Constrain the history demo to a single known common ancestor and ordinary fork/merge commits. Reject unsupported criss-cross/multiple-base or unrelated histories explicitly; implementing arbitrary topology is not a PoC requirement. Defer automatic offline reconciliation: offline checkpoints are preserved, and reconnect uses explicit fetch/merge/publication. Disable remote collection and retain all PoC objects.
 
@@ -700,4 +697,3 @@ The demo succeeds only when the runtime owns real mounted I/O and ref publicatio
 - **Tool compatibility:** ignored scratch, executable metadata, editor notifications, dependency links, and caches can invalidate a convincing toy demo. First decision: one real target project/toolchain and explicitly supported filesystem features after the fixture gate.
 
 Before implementation, finalize five short contracts inside the design: canonical object encoding, local RPC envelope/errors, overlay/capture journal transitions, sequential checkout lifecycle, and publication/ref receipt schema. Then implement P0/P1. This assessment authorizes no installs, service deployment, infrastructure changes, or coding by itself; those are follow-on work once requested.
-

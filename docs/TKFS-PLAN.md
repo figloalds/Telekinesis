@@ -4,9 +4,10 @@ Updated 2026-10-03 to the user-approved direction: a singular distributed
 filesystem with source control, where a branch **is a writable in-place worktree**.
 Shared-branch saves propagate directly between devices without checkpoint/merge.
 
-The previous 101,897-byte plan, including unrelated research/user notes, is
-preserved unchanged in [TKFS-PLAN-2026-10-02-LEGACY.md](TKFS-PLAN-2026-10-02-LEGACY.md).
-Its SHA-256 is `dd00e62cd9e142a4b71e0715d9e77cff7476e6e72d680be85ce4aff1323d6fde`.
+The earlier design is in
+[TKFS-PLAN-2026-10-02-LEGACY.md](TKFS-PLAN-2026-10-02-LEGACY.md). Its documentation
+has been edited to remove machine-specific setup notes; the original is retained
+in Git history.
 The old central ref service, private overlay, read-only shared trunk and automatic
 text-merge defaults are superseded by the contracts below.
 
@@ -236,7 +237,7 @@ revocation, OS-user authorization and acceptance gates for each stage.
 
 [README.md](../README.md) contains exact build/test/run/pairing commands and limits.
 Core tests run with `cargo test --offline`; real mount/peer acceptance runs with
-`python scripts/e2e.py`. [VALIDATION.json](../test-evidence/VALIDATION.json) records actual checks
+`python scripts/e2e.py`. `test-evidence/VALIDATION.json` records actual checks
 and the fixture/log directory under `test-runs/<UUID>/`. These are real WinFsp
 paths with normal PowerShell/Python OS I/O, not substituted native directories.
 
@@ -265,8 +266,8 @@ paths with normal PowerShell/Python OS I/O, not substituted native directories.
 | Peer notifications/read-only handle refresh | Passed actual mounted FileSystemWatcher/read checks |
 | Namespace recovery and checkpoint history/restore | Passed core tests and actual mounts |
 | Optional object backend | Local native test-bucket export/privacy passed; no remote provider validation |
-| Two real computers | Ten live mounted checks passed on FIGLOALDS/FELYPE at `303fec8`; stale acknowledgement counters found; correction validated locally only |
-| Physical offline/reconnect and corrected version | **Not run** on two computers; await user-directed next steps |
+| Two real computers | Ten live mounted checks passed on two Windows computers at `303fec8`; stale acknowledgement counters found; correction validated locally only |
+| Physical offline/reconnect and corrected version | **Not run** on two computers; remains an acceptance gap |
 | Chosen editor/build ecosystem | **Not qualified** |
 | All remount faults, disk-full, power loss | Remaining qualification |
 | Checkpoint replication/diff and branch merge | Subsequent source-control work |
@@ -276,10 +277,7 @@ witness cuts per namespace dependency cone (width >= 2), whole-file buffering, c
 history materialization. Links/reparse points/ADS, persistent ACL edits, arbitrary
 timestamp/attribute setters, distributed locks and live databases are unsupported.
 
-WinFsp was **already installed**, at `C:\Program Files (x86)\WinFsp`, DLL version
-`2.1.25156.ddca7bd` / WinFsp 2025. No driver/security/firewall changes, persistent
-peer credentials, infrastructure, pushes/external publishing or writes to other
-projects occurred. See the README for prerequisites and steps to validate a real
+See the README for WinFsp prerequisites and steps to validate a real
 second machine; the existing tests make no two-computer claim. Remote object-store
 qualification needs a selected provider/endpoint, bucket/container and test prefix,
 appropriate temporary read/write credentials and approval for writes to that

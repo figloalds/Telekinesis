@@ -6,16 +6,15 @@ supervisor remain Windows-only. Linux builds do not compile Slint.
 
 ## Build and run
 
-Use a native Linux filesystem for the checkout and state. Tested on Ubuntu
-24.04.4 x86_64, WSL2 kernel 6.18.33.2, Rust/Cargo 1.88, GCC 13.3, FUSE 3.14.
+Use a native Linux filesystem for the checkout and state, with Rust/Cargo, Python
+3 and a C compiler installed. Mounts require `/dev/fuse` access and `fusermount3`.
 The adapter speaks kernel FUSE protocol 7.31 and uses the installed owner-only
 `fusermount3` helper. It does not link libfuse or require its development headers.
 The FUSE adapter adds `libc`; the separate paired-data service adds standard
 Rustls/ring, rcgen and zeroize dependencies. Bundled SQLite needs a C compiler.
 
 ```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-export RUSTUP_AUTO_INSTALL=0
+# Run from the repository root, with cargo and rustc available on PATH.
 cargo build --locked
 ./target/debug/tkfs init --state /native/path/new-state
 # State must exist; mount folder must not exist, and its parent must exist.
@@ -30,6 +29,9 @@ From another shell outside the mount:
 ./target/debug/tkfs --runtime /native/path/new-state/runtime.json checkout private-work
 ./target/debug/tkfs --runtime /native/path/new-state/runtime.json stop
 ```
+
+`/native/path/new-state` and `/native/path/new-mount` are placeholders for paths
+you choose on a native Linux filesystem. State must be outside the mount.
 
 See [PAIRING.md](PAIRING.md) for the separate portable TLS data service,
 owner-scoped repository grants and systemd credential/unit templates. The
@@ -100,20 +102,25 @@ shared saves and executable-bit propagation/private isolation, reconnect and
 concurrent conflicts, then use an independent host/VPS for LAN/WAN conditions.
 No GUI port, chunk experiments or branch-mount experiments are included.
 
-## Local development transfer
+## Development and verification
 
-Implementation branch: `linux-headless-fuse`, native checkout
-`/home/figloalds/tkfs-linux-work-20261004`, based on Windows commit
-`354680de694296c83085a85f43b1fa51127e1e4f`.
+Use the repository checkout and Cargo.lock on each platform. No particular
+username, checkout directory, Git branch or private Cargo cache is required.
+Run from the repository root:
 
-The task uses a separate `.cargo-offline` cache seeded only from existing local
-crate archives/indexes; no toolchain or package installs/downloads were needed.
-Reproduce there with `CARGO_HOME="$PWD/.cargo-offline" CARGO_NET_OFFLINE=true`.
-Task evidence/cache directories are excluded locally, not committed.
+```bash
+cargo test --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+python3 scripts/linux_fuse_e2e.py
+```
 
-An incremental Git bundle transfers committed changes back without copying the
-Windows worktree. Fetch its `linux-headless-fuse` branch into a separate review
-branch, then cherry-pick the listed implementation/qualification commits after
-checking the Windows worktree. These commits do not edit README.md, preserving
-the existing unrelated README modification. Do not reset or clean the Windows
-worktree. All transfers stay on this machine; no push or remote was used.
+Add `--offline` to Cargo commands only after dependencies are cached. The mounted
+harness needs a built `target/debug/tkfs`; `--binary PATH` selects another build
+and `--evidence PATH` selects its disposable output directory. To assemble a
+Linux runnable with build metadata and license notices, use
+`python3 scripts/build.py --platform linux` (Python 3.12+).
+
+Historical qualification used Ubuntu 24.04.4 x86_64 under WSL2, Rust/Cargo 1.88,
+GCC 13.3 and FUSE 3.14. These are recorded test conditions, not required checkout
+paths or a guarantee for every distribution/kernel combination.

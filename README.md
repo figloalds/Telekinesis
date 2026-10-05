@@ -44,8 +44,7 @@ test-evidence/   Ignored local JSON reports, provenance and research archives
 test-runs/       Ignored disposable states, mounts, screenshots and logs
 ```
 
-Start with the [documentation index](docs/README.md) and
-[test evidence index](test-evidence/README.md). Platform/network guides are
+Start with the [documentation index](docs/README.md). Platform/network guides are
 [Linux headless/FUSE](docs/LINUX.md), [persistent pairing](docs/PAIRING.md),
 [one-port WSS](docs/PAIRING-WSS.md) and [orchestrator CLI](docs/ORCHESTRATOR-CLI.md).
 License texts and [third-party notices](THIRD-PARTY-NOTICES.md) remain at the root.
@@ -74,7 +73,7 @@ the same executable and management API.
 Build and launch the first Windows desktop slice:
 
 ```powershell
-cargo build --offline --target-dir target/slint-ui
+cargo build --locked --target-dir target/slint-ui
 python scripts/package_desktop.py
 .\target\desktop-portable\tkfs.exe
 ```
@@ -166,7 +165,7 @@ screenshots. It is not physical OS mouse/keyboard automation. The harness checks
 first run, two real independent mounts, busy stop/exact retry, durable data after
 start, GUI close/reopen, and cooperative shutdown; fixtures and screenshots remain
 under `test-runs/desktop-<UUID>`. Evidence is in
-[DESKTOP-VALIDATION.json](test-evidence/DESKTOP-VALIDATION.json). Native
+`test-evidence/DESKTOP-VALIDATION.json`. Native
 folder picker interaction and general screen-reader behavior require manual QA.
 
 ## Build and test on Windows
@@ -193,25 +192,24 @@ Windows mounts require an installed WinFsp runtime; Linux mounts require
 glibc and shared libraries, listed in its `BUILD.json`.
 
 Prerequisites: x64 Windows, Rust/MSVC and Windows SDK, Python 3 for the acceptance
-harnesses, and an installed WinFsp runtime **and SDK**. This implementation
-discovered WinFsp 2025, DLL version
-`2.1.25156.ddca7bd`, at `C:\Program Files (x86)\WinFsp`. It did not install or
-change the driver. Rust `1.96.0` and the available MSVC toolchain built the code.
-`WINFSP_DIR` can select a different SDK directory. The current native link target
+harnesses, and an installed WinFsp runtime **and SDK**. The native build defaults
+to `C:\Program Files (x86)\WinFsp`; set `WINFSP_DIR` to the SDK installation root
+when it is elsewhere. Building TKFS does not install the WinFsp driver.
+Cargo.toml and Cargo.lock define the Rust dependency set. The current native link target
 is x64; other Windows architectures are not supported by this build script.
 
 Run in PowerShell from this repository:
 
 ```powershell
-cargo build --offline
-cargo test --offline
+cargo build --locked
+cargo test --locked
 cargo fmt --check
-cargo clippy --offline --all-targets -- -D warnings
+cargo clippy --locked --all-targets -- -D warnings
 python scripts\e2e.py
 ```
 
-These `--offline` commands require cached dependencies. On a fresh machine use
-`cargo build --locked` first; Cargo.lock pins the dependency set. Harnesses write
+Cargo.lock pins the dependency set. Add `--offline` to Cargo commands when
+dependencies are already cached. Harnesses write
 summary reports to `test-evidence/` by default and retain disposable mount/state
 fixtures in ignored `test-runs/`. Use `--report <path>` to preserve a separate run.
 After stopping their own processes and mounts, acceptance harnesses delete
@@ -234,7 +232,7 @@ executables retain their original DLL lookup; use a newly built executable.
 For an isolated build while another daemon holds the default executable:
 
 ```powershell
-cargo build --offline --target-dir target/o1
+cargo build --locked --target-dir target/o1
 python scripts\orchestrator_e2e.py --exe .\target\o1\debug\tkfs.exe
 ```
 
@@ -310,18 +308,17 @@ service/logoff/reboot or power-loss qualification in O1.
 The isolated acceptance harness checks real mounts without `WINFSP_DIR`/WinFsp
 PATH, lifecycle/ownership, five creation crash boundaries, retries, missing
 metadata, authorization, mappings, worker limits and partial startup failures.
-Evidence: [ORCHESTRATOR-VALIDATION.json](test-evidence/ORCHESTRATOR-VALIDATION.json) and
-[ORCHESTRATOR-COMPATIBILITY.json](test-evidence/ORCHESTRATOR-COMPATIBILITY.json).
+Evidence: `test-evidence/ORCHESTRATOR-VALIDATION.json` and
+`test-evidence/ORCHESTRATOR-COMPATIBILITY.json`.
 
-The offline commands use the dependencies already cached on the implementation
-machine. On a fresh development machine, fetch Cargo dependencies normally before
-using `--offline`. Cargo.lock pins them. Python 3.12 runs the mount acceptance
+Use `--offline` only when Cargo dependencies are already cached. Cargo.lock pins
+them. Python 3.12 runs the mount acceptance
 harness without third-party Python dependencies.
 
 The E2E harness launches **two local runtime processes and two real WinFsp
 mounts**. It generates an ephemeral 256-bit pairing key, binds only to loopback,
 and terminates its own processes in `finally`. Fixtures and stdout/stderr logs
-remain under `test-runs/<run UUID>/`. [VALIDATION.json](test-evidence/VALIDATION.json) records
+remain under `test-runs/<run UUID>/`. `test-evidence/VALIDATION.json` records
 the actual run directory and checks. This is not real two-computer validation.
 
 ## Single-computer use
@@ -415,7 +412,7 @@ Checkout and stop require a quiet view, including no open handles or cwd inside
 the mount. Inotify, arbitrary mapped writes/shared mmap, cross-platform mounted
 replication and installed no-login systemd operation remain unqualified. See
 [the complete platform contract](docs/LINUX.md) and
-[saved Linux report](test-evidence/LINUX-VALIDATION.json). Fresh Linux harness
+saved Linux report (`test-evidence/LINUX-VALIDATION.json`). Fresh Linux harness
 fixtures go to ignored `test-runs/linux-evidence/` unless `--evidence` overrides it.
 
 ## Persistent pairing and published-data sync
@@ -447,8 +444,8 @@ and explicit ports; DNS discovery, proxy trust and relay-only VPS operation are
 not implemented. One active paired peer and two replica origins per repository
 remain enforced. O1 does not supervise the transport service.
 
-Saved [pairing](test-evidence/PAIRING-VALIDATION.json) and
-[WSS](test-evidence/WSS-VALIDATION.json) reports cover disposable loopback peers,
+Saved pairing (`test-evidence/PAIRING-VALIDATION.json`) and
+WSS (`test-evidence/WSS-VALIDATION.json`) reports cover disposable loopback peers,
 real local worker bridges, privacy, revocation, reconnect and process restarts.
 They do not qualify public WAN/VPS deployment, unattended boot or arbitrary
 multi-peer topologies. Example units are in `deploy/`; they are not installed
@@ -460,14 +457,12 @@ This section documents the legacy, explicitly configured PSK transport. For
 persistent approved-device identities and repository grants, use the
 [pairing service](docs/PAIRING.md) or [WSS guide](docs/PAIRING-WSS.md).
 
-These steps configure the two devices. Ten live checks passed on
-FIGLOALDS/FELYPE at commit `303fec8`; the original physical report was saved in
-`test-runs/two-machine-448ed3f6-948d-4d90-b8b7-9b1cdbd82744/TWO-MACHINE-VALIDATION.json`
-(an ignored local artifact, absent from a fresh checkout). The
+These steps configure two devices with independent native states. Ten live checks
+passed on two physical Windows computers at commit `303fec8`. The
 [validation notes](docs/VALIDATION.md#physical-findings-and-acknowledgement-correction)
 record the results and acknowledgement finding. The correction below is validated
-locally, and has not been tested on two physical computers. The user configured the
-firewall exception; agents did not change network settings, drivers or credentials.
+locally, and has not been tested on two physical computers. Configure reachable
+endpoints and the required firewall/VPN rules for your own deployment.
 
 1. Build/copy the executable onto each x64 Windows machine; verify the existing
    WinFsp runtime/SDK. New builds locate the installed DLL without PATH changes.
@@ -536,9 +531,9 @@ concurrent shared publications with one name remain distinct branches. An
 ambiguous name fails clearly; use the ID returned by `branches`.
 
 When an existing daemon locks the default executable, validate a separate build
-without stopping it: `cargo build --offline --target-dir target/ack-fix`, then
+without stopping it: `cargo build --locked --target-dir target/ack-fix`, then
 `python scripts/e2e.py --exe target/ack-fix/debug/tkfs.exe --report test-evidence/ACK-FIX-VALIDATION.json`.
-The [local correction report](test-evidence/ACK-FIX-VALIDATION.json) preserves the prior physical
+The local correction report (`test-evidence/ACK-FIX-VALIDATION.json`) preserves the prior physical
 and original local reports; exact commands/results are in [VALIDATION.md](docs/VALIDATION.md).
 
 To reproduce the acceptance checks on two machines: save/rename on mounted
@@ -580,7 +575,7 @@ Pathological topology contention exceeding it refuses the new commit with
 `NAMESPACE_HISTORY_LIMIT` before acknowledgement, preserving existing records.
 It is not a limit on ordinary save count: 10,000 durable content saves, later
 delete/undelete, two 100-save offline replicas, and independent 65-rename chains
-pass. See [SCALABILITY.json](test-evidence/SCALABILITY.json) and [VALIDATION.md](docs/VALIDATION.md).
+pass. See `test-evidence/SCALABILITY.json` and [VALIDATION.md](docs/VALIDATION.md).
 
 ```powershell
 tkfs --runtime <state>\runtime.json conflicts
@@ -704,14 +699,14 @@ after complete object verification and causal activation. Availability regressio
 exercise files above 16 MiB, sparse/random-access edits, checkpoint/restore and
 export. The 16 GiB ceiling is a code limit, not a claim of acceptance at that size.
 
-[Saved availability evidence](test-evidence/availability-20261004/ENUMERATION.md)
+Saved availability evidence (`test-evidence/availability-20261004/ENUMERATION.md`)
 records a full local Godot clone, clean Git status, connectivity checks, concurrent
 health probes and a persisted byte/hash audit. Its full live native read sweep
 timed out, so the combined full-size run has no overall pass; cooperative shutdown
 was verified separately. These results describe the recorded fixture and binary.
 
-The [read-only generation experiment](test-evidence/read-lease-20261004/FINAL-REPORT.md)
-and [chunked-CAS research](test-evidence/tkfs-chunked-cas-research-20261004/REPORT.md)
+The read-only generation experiment (`test-evidence/read-lease-20261004/FINAL-REPORT.md`)
+and chunked-CAS research (`test-evidence/tkfs-chunked-cas-research-20261004/REPORT.md`)
 remain isolated research. Same-path live branch switching failed mapped-read
 isolation; separate paths passed a bounded read-only experiment. Production
 checkout still remounts a quiet view, and production CAS still stores whole-file

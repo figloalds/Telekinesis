@@ -10,7 +10,8 @@ does not adopt/create states, mount filesystems, start workers or upgrade daemon
 Run existing workers under the same OS account first, then grant their runtimes.
 Windows workers now expose owner-authenticated named pipes rather than localhost
 TCP. Old running workers must be explicitly restarted with the new binary before
-new CLI/desktop/pairing clients can use them; this task did not upgrade live workers.
+new CLI/desktop/pairing clients can use them. Building a new executable does not
+restart running workers.
 Their authenticated pipe/socket discovery address can change after a restart;
 the service rereads the configured runtime file each sync attempt.
 
@@ -108,10 +109,10 @@ sudo /usr/local/bin/tkfs pairing -f /etc/tkfs/pairing.toml credential-provision 
   --encrypted-output /etc/credstore.encrypted/tkfs.identity
 ```
 
-Systemd 250+ is required for `LoadCredentialEncrypted`; Ubuntu 24.04 systemd 255
-was observed. The supplied unit is a template only. No account, credential,
-system service, linger setting, network rule or reboot was provisioned during
-implementation. Service accounts cannot use a desktop login keyring as their
+Systemd 250+ is required for `LoadCredentialEncrypted`. The supplied unit is a
+template: configure the service account, executable/configuration paths and
+credential location for the target host before installation. Service accounts
+cannot use a desktop login keyring as their
 sole unattended credential backend. To perform key-dependent local commands
 (`invite`, `join`, `remote-list`, `sync`) on Linux, run them under the same service
 account in an operator-created systemd unit/transient unit with the same
@@ -123,7 +124,7 @@ account in an operator-created systemd unit/transient unit with the same
 Set explicit reachable `listen` and `advertise` endpoints before running services
 on two computers. Endpoints are numeric IPv4/IPv6 socket addresses; this bounded
 slice does not perform DNS/MagicDNS resolution. The examples bind loopback for local testing. An operator can
-select a Tailscale address and ACLs later; this task does not configure it.
+select reachable LAN/VPN addresses and configure the corresponding network rules.
 
 1. Owner A runs `tkfs pairing invite --lifetime-seconds 300`. The one-line output
    is a secret bearer invitation containing A's public certificate. Transfer it
@@ -186,10 +187,9 @@ directories/files (0700/0600), rejects symlinks/hardlinks and unsafe ancestors,
 and permits root-owned sticky temporary directories.
 
 An existing ancestor with a foreign write grant also fails validation even if
-the final directory is private. For example, this development machine's
-`AppData` contains a sandbox capability SID with full control. Use a separately
-reviewed safe storage path; do not bypass the check or automatically change ACLs.
-Windows regression fixtures used a disposable sibling path with safe ancestors.
+the final directory is private. Choose a storage path whose complete ancestor
+chain meets the ownership/ACL requirements above. The service reports unsafe
+paths instead of bypassing the checks or repairing existing ACLs.
 
 `tkfs pairing revoke PEER_ID` persists revocation and stops that peer's data access
 on fresh and already-established sessions. Each request reloads registry state

@@ -2,7 +2,7 @@
 
 This portable transport uses one inbound TCP port for enrollment and published
 sync, regardless of repository count. Homes can initiate outbound connections
-without binding any TCP listener. Windows workers use local named pipes; Ubuntu
+without binding any TCP listener. Windows workers use local named pipes; Linux
 workers use local Unix sockets. The transport process remains separate from O1;
 Windows O1 can own workers, but does not yet supervise this transport process.
 Linux O1, relay-only VPS operation and several homes sharing the same repository
@@ -13,8 +13,8 @@ remain enforced. Different repositories can share the installation's listener.
 
 Use the normal distinct installation IDs and DPAPI/systemd credentials described
 in [PAIRING.md](PAIRING.md). Never copy a live key or worker state to create a new
-replica. Select private storage with safe ancestors; this development machine's
-AppData/workspace ACLs have foreign sandbox write grants and are rejected.
+replica. Select private storage with safe ancestors: foreign write/delete/security
+grants on any ancestor are rejected even if the final directory is private.
 
 VPS-style listener configuration (numeric loopback example, no deployment implied):
 
@@ -151,7 +151,9 @@ configuration fields/endpoints require the new binary on participating devices.
 
 Implementation uses pinned Tungstenite 0.28.0 (`handshake` only), over the existing
 Rustls 0.23.45/ring stack. Its archive declares Rust 1.63; the locked dependency
-set is verified on installed Rust 1.88 Ubuntu and Rust 1.96 Windows. The callback
+set was qualified with Rust 1.88 on Ubuntu and Rust 1.96 on Windows. These are
+recorded test versions; Cargo.toml and Cargo.lock define the build dependencies.
+The callback
 also validates that Sec-WebSocket-Key decodes to exactly 16 bytes. SHA-1 is used
 only for the standard WebSocket upgrade, never TLS or peer authentication.
 
