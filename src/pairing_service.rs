@@ -62,7 +62,7 @@ impl BudgetSocket {
             write_left: 128 * 1024,
         })
     }
-    fn remaining(&self) -> std::io::Result<Duration> {
+    pub(crate) fn remaining(&self) -> std::io::Result<Duration> {
         if self.stop.load(Ordering::Relaxed) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -387,7 +387,7 @@ fn join_with_identity(
         invitation,
         candidate,
     };
-    let response: Value = if issuer.endpoint.starts_with("wss://") {
+    let response: Value = if crate::wss_transport::is_websocket(&issuer.endpoint) {
         crate::wss_transport::enroll(identity, &issuer, &enrollment)?
     } else {
         let mut stream = client(identity, &issuer, true)?;
@@ -411,7 +411,7 @@ pub fn remote_list(config: &Config, peer_id: &str) -> Result<Value> {
         .into_iter()
         .find(|peer| peer.installation == peer_id && !peer.revoked)
         .context("PAIR_NOT_FOUND_OR_REVOKED")?;
-    if peer.endpoint.starts_with("wss://") {
+    if crate::wss_transport::is_websocket(&peer.endpoint) {
         let response = crate::wss_transport::request(
             &config.identity()?,
             &peer,
@@ -500,7 +500,7 @@ fn synchronize_budget(
             None,
             None,
             None,
-            if peer.endpoint.starts_with("wss://") {
+            if crate::wss_transport::is_websocket(&peer.endpoint) {
                 crate::wss_transport::MAX_PAGE
             } else {
                 runtime::MAX_FRAME
@@ -519,7 +519,7 @@ fn synchronize_budget(
         repo: grant.repo.clone(),
         page: Box::new(page),
     };
-    let response: Value = if peer.endpoint.starts_with("wss://") {
+    let response: Value = if crate::wss_transport::is_websocket(&peer.endpoint) {
         {
             let _access = registry.begin_access()?;
             registry.authenticate(&peer.certificate, &peer.installation)?;
@@ -701,6 +701,9 @@ impl Service {
         Self::open_identity(config, identity)
     }
     pub(crate) fn open_identity(config: Config, identity: Arc<Identity>) -> Result<Self> {
+        if config.transport == Transport::Wss {
+            crate::wss_transport::validate_config(&config)?;
+        }
         ensure!(
             identity.installation == config.installation,
             "CREDENTIAL_IDENTITY_MISMATCH"
@@ -733,7 +736,14 @@ impl Service {
             );
         }
         let sync = if config.inbound {
-            Some(TcpListener::bind(&config.listen)?)
+            let listener = TcpListener::bind(&config.listen)?;
+            if config.transport == Transport::Wss && config.advertise.starts_with("ws://") {
+                ensure!(
+                    crate::ws_tunnel::loopback(listener.local_addr()?.ip()),
+                    "WS_LOOPBACK_BIND_REQUIRED"
+                );
+            }
+            Some(listener)
         } else {
             None
         };
@@ -767,10 +777,15 @@ impl Service {
             .map(TcpListener::local_addr)
             .transpose()?;
         if self.config.transport == Transport::Wss {
+            let scheme = if self.config.advertise.starts_with("ws://") {
+                "ws"
+            } else {
+                "wss"
+            };
             Ok((
-                sync.map(|address| format!("wss://{address}/tkfs/sync"))
+                sync.map(|address| format!("{scheme}://{address}/tkfs/sync"))
                     .unwrap_or_else(|| "outbound-only".into()),
-                sync.map(|address| format!("wss://{address}/tkfs/enroll"))
+                sync.map(|address| format!("{scheme}://{address}/tkfs/enroll"))
                     .unwrap_or_else(|| "outbound-only".into()),
             ))
         } else {

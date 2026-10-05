@@ -530,7 +530,7 @@ impl Registry {
         );
         ensure!(
             peer.endpoint == "outbound-only"
-                || (peer.endpoint.starts_with("wss://")
+                || (crate::wss_transport::is_websocket(&peer.endpoint)
                     && crate::wss_transport::endpoint(&peer.endpoint, false).is_ok())
                 || peer
                     .endpoint

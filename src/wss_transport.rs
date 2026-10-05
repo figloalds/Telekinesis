@@ -1,4 +1,4 @@
-//! One direct TLS ingress. HTTP headers never establish an identity. Local
+//! One TLS ingress, optionally carried inside loopback WS. HTTP headers never establish an identity. Local
 //! management remains outside this protocol; each data operation reloads grants.
 use crate::{
     core::id,
@@ -52,19 +52,22 @@ impl Lane {
 trait TimedStream: Read + Write {
     fn budget(&mut self, duration: Duration);
 }
-impl TimedStream for rustls::StreamOwned<rustls::ClientConnection, BudgetSocket> {
+impl TimedStream for rustls::StreamOwned<rustls::ClientConnection, crate::ws_tunnel::Socket> {
     fn budget(&mut self, duration: Duration) {
         self.sock.stage(duration, Instant::now() + duration);
         self.sock.limit(MAX_PAGE + 64 * 1024);
     }
 }
-impl TimedStream for rustls::StreamOwned<rustls::ServerConnection, BudgetSocket> {
+impl TimedStream for rustls::StreamOwned<rustls::ServerConnection, crate::ws_tunnel::Socket> {
     fn budget(&mut self, duration: Duration) {
         self.sock.stage(duration, Instant::now() + duration);
         self.sock.limit(MAX_PAGE + 64 * 1024);
     }
 }
-type Client = WebSocket<rustls::StreamOwned<rustls::ClientConnection, BudgetSocket>>;
+type Client = WebSocket<rustls::StreamOwned<rustls::ClientConnection, crate::ws_tunnel::Socket>>;
+pub(crate) fn is_websocket(value: &str) -> bool {
+    value.starts_with("wss://") || value.starts_with("ws://")
+}
 fn websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .read_buffer_size(8192)
@@ -75,11 +78,20 @@ fn websocket_config() -> WebSocketConfig {
 }
 pub(crate) fn endpoint(value: &str, enrollment: bool) -> Result<String> {
     let uri: http::Uri = value.parse().context("INVALID_WSS_ENDPOINT")?;
-    ensure!(uri.scheme_str() == Some("wss"), "WSS_REQUIRED");
+    ensure!(
+        matches!(uri.scheme_str(), Some("wss" | "ws")),
+        "WSS_OR_LOOPBACK_WS_REQUIRED"
+    );
     let address = uri.authority().context("WSS_ADDRESS_REQUIRED")?.as_str();
     // Initial slice uses an explicit numeric address/port. TLS identity is the
     // approved installation certificate, never a hostname/proxy header.
     let socket: std::net::SocketAddr = address.parse().context("WSS_NUMERIC_ADDRESS_REQUIRED")?;
+    if uri.scheme_str() == Some("ws") {
+        ensure!(
+            crate::ws_tunnel::loopback(socket.ip()),
+            "WS_LOOPBACK_REQUIRED"
+        );
+    }
     ensure!(
         socket.port() != 0 && uri.query().is_none(),
         "INVALID_WSS_ENDPOINT"
@@ -98,13 +110,24 @@ pub(crate) fn endpoint(value: &str, enrollment: bool) -> Result<String> {
 pub(crate) fn validate_config(config: &Config) -> Result<()> {
     ensure!(config.enrollment_listen.is_empty(), "WSS_USES_ONE_LISTENER");
     if config.inbound {
-        config
+        let listen = config
             .listen
             .parse::<std::net::SocketAddr>()
             .context("INVALID_LISTEN_ADDRESS")?;
         let sync = endpoint(&config.advertise, false)?;
         let enrollment = endpoint(&config.enrollment_advertise, true)?;
         ensure!(sync == enrollment, "WSS_USES_ONE_PUBLIC_ENDPOINT");
+        ensure!(
+            config.advertise.starts_with("ws://")
+                == config.enrollment_advertise.starts_with("ws://"),
+            "WS_ENDPOINT_SCHEME_MISMATCH"
+        );
+        if config.advertise.starts_with("ws://") {
+            ensure!(
+                crate::ws_tunnel::loopback(listen.ip()),
+                "WS_LOOPBACK_BIND_REQUIRED"
+            );
+        }
     } else {
         ensure!(
             config.listen.is_empty()
@@ -162,7 +185,17 @@ fn connect(
     let name =
         rustls::pki_types::ServerName::try_from(format!("{}.tkfs.invalid", peer.installation))?;
     let mut conn = rustls::ClientConnection::new(identity.tls_wss_client(peer, enrollment)?, name)?;
-    let mut socket = BudgetSocket::new(crate::runtime::stream(&address)?, HANDSHAKE, stop)?;
+    let raw = crate::runtime::stream(&address)?;
+    let ws = peer.endpoint.starts_with("ws://");
+    if ws {
+        crate::ws_tunnel::check_socket(&raw)?;
+    }
+    let socket = BudgetSocket::new(raw, HANDSHAKE, stop)?;
+    let mut socket = if ws {
+        crate::ws_tunnel::Socket::client(socket, &address)?
+    } else {
+        crate::ws_tunnel::Socket::Direct(socket)
+    };
     while conn.is_handshaking() {
         conn.complete_io(&mut socket)?;
     }
@@ -253,7 +286,7 @@ impl PoolPolicy {
         self.dial
             && self.peers.get(device).is_some_and(|peer| {
                 !peer.revoked
-                    && peer.endpoint.starts_with("wss://")
+                    && is_websocket(&peer.endpoint)
                     && peer.endpoint == endpoint
                     && peer.certificate == certificate
             })
@@ -641,7 +674,16 @@ fn accepted(
     admission: &Arc<Admission>,
     pending: Count<'_>,
 ) -> Result<()> {
-    let mut socket = BudgetSocket::new(socket, admission.settings.handshake, stop.clone())?;
+    let ws = config.advertise.starts_with("ws://");
+    if ws {
+        crate::ws_tunnel::check_socket(&socket)?;
+    }
+    let socket = BudgetSocket::new(socket, admission.settings.handshake, stop.clone())?;
+    let mut socket = if ws {
+        crate::ws_tunnel::Socket::server(socket)?
+    } else {
+        crate::ws_tunnel::Socket::Direct(socket)
+    };
     let registry = config.registry()?;
     let mut conn = rustls::ServerConnection::new(identity.tls_wss_server(&registry.peers()?)?)?;
     while conn.is_handshaking() {
@@ -946,6 +988,9 @@ mod tests {
         _temp: tempfile::TempDir,
     }
     fn fixture(settings: Settings) -> Fixture {
+        fixture_scheme(settings, "wss")
+    }
+    fn fixture_scheme(settings: Settings, scheme: &str) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
         let issuer = Arc::new(Identity::generate(&id()).unwrap());
         let home = Identity::generate(&id()).unwrap();
@@ -964,8 +1009,8 @@ mod tests {
             },
             listen: address.clone(),
             enrollment_listen: String::new(),
-            advertise: format!("wss://{address}/tkfs/sync"),
-            enrollment_advertise: format!("wss://{address}/tkfs/enroll"),
+            advertise: format!("{scheme}://{address}/tkfs/sync"),
+            enrollment_advertise: format!("{scheme}://{address}/tkfs/enroll"),
         };
         validate_config(&config).unwrap();
         let peer = Peer {
@@ -1087,7 +1132,14 @@ mod tests {
     }
     #[test]
     fn wss_reuses_pool_transfers_large_objects_both_ways_and_keeps_private_cas_hidden() {
-        let mut fixture = fixture(Settings::default());
+        large_private_flow("wss");
+    }
+    #[test]
+    fn ws_loopback_preserves_large_transfer_private_isolation_and_live_revocation() {
+        large_private_flow("ws");
+    }
+    fn large_private_flow(scheme: &str) {
+        let mut fixture = fixture_scheme(Settings::default(), scheme);
         let pool = Pool::default();
         let bytes = vec![0x5a; 12 * 1024 * 1024];
         write(&mut fixture.client_engine, "large.bin", &bytes);
@@ -1184,12 +1236,22 @@ mod tests {
     }
     #[test]
     fn wss_device_limits_reserve_control_and_cancel_enrollment_and_bulk_trickles() {
-        let fixture = fixture(Settings {
-            operation: Duration::from_millis(350),
-            enrollment: Duration::from_millis(350),
-            handshake: Duration::from_millis(700),
-            idle: Duration::from_secs(2),
-        });
+        cancellation_flow("wss");
+    }
+    #[test]
+    fn ws_loopback_retains_quotas_and_absolute_trickle_deadlines() {
+        cancellation_flow("ws");
+    }
+    fn cancellation_flow(scheme: &str) {
+        let fixture = fixture_scheme(
+            Settings {
+                operation: Duration::from_millis(350),
+                enrollment: Duration::from_millis(350),
+                handshake: Duration::from_millis(700),
+                idle: Duration::from_secs(2),
+            },
+            scheme,
+        );
         let mut bulk = vec![];
         for _ in 0..2 {
             let mut socket = connect(
@@ -1715,5 +1777,102 @@ mod tests {
             0
         );
         assert!(incoming(&a, &b));
+    }
+    #[test]
+    fn ws_endpoints_require_numeric_loopback_and_matching_loopback_listener() {
+        for address in [
+            "127.0.0.1:1234",
+            "127.23.4.5:1234",
+            "[::1]:1234",
+            "[::ffff:127.0.0.1]:1234",
+        ] {
+            assert!(
+                endpoint(&format!("ws://{address}/tkfs/sync"), false).is_ok(),
+                "{address}"
+            );
+        }
+        for address in [
+            "localhost:1234",
+            "localhost.example:1234",
+            "127.0.0.1.example:1234",
+            "2130706433:1234",
+            "0.0.0.0:1234",
+            "192.168.1.2:1234",
+            "172.20.0.1:1234",
+            "[::]:1234",
+            "[::ffff:172.20.0.1]:1234",
+            "[::127.0.0.1]:1234",
+            "[fe80::1%25eth0]:1234",
+            "user@127.0.0.1:1234",
+            "127.0.0.1:0",
+        ] {
+            assert!(
+                endpoint(&format!("ws://{address}/tkfs/sync"), false).is_err(),
+                "{address}"
+            );
+        }
+        assert!(endpoint("ws://127.0.0.1:1234/tkfs/sync?token=invalid", false).is_err());
+        assert!(endpoint("wss://172.20.0.1:1234/tkfs/sync", false).is_ok());
+        let fixture = fixture_scheme(Settings::default(), "ws");
+        for address in [
+            "0.0.0.0:1234",
+            "172.20.0.1:1234",
+            "[::]:1234",
+            "[::ffff:172.20.0.1]:1234",
+        ] {
+            let mut config = fixture.config.clone();
+            config.listen = address.into();
+            assert!(validate_config(&config).is_err());
+        }
+        let mut config = fixture.config.clone();
+        config.enrollment_advertise = config.enrollment_advertise.replacen("ws://", "wss://", 1);
+        assert!(validate_config(&config).is_err());
+    }
+    #[test]
+    fn ws_http_upgrade_and_claimed_identity_do_not_authenticate_a_device() {
+        let fixture = fixture_scheme(Settings::default(), "ws");
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(
+            request(
+                &fixture.home,
+                &fixture.peer,
+                &NetworkRequest::ListPublished {},
+                None,
+                stop.clone()
+            )
+            .is_ok()
+        );
+        let impostor = Identity::generate(&fixture.home.installation).unwrap();
+        assert!(connect(&impostor, &fixture.peer, false, Lane::Control, stop.clone()).is_err());
+        let mut wrong_server = fixture.peer.clone();
+        wrong_server.certificate = impostor.certificate.clone();
+        assert!(
+            connect(
+                &fixture.home,
+                &wrong_server,
+                false,
+                Lane::Control,
+                stop.clone()
+            )
+            .is_err()
+        );
+        let address = endpoint(&fixture.peer.endpoint, false).unwrap();
+        let raw = crate::runtime::stream(&address).unwrap();
+        crate::ws_tunnel::check_socket(&raw).unwrap();
+        let mut carrier = crate::ws_tunnel::Socket::client(
+            BudgetSocket::new(raw, Duration::from_secs(2), stop).unwrap(),
+            &address,
+        )
+        .unwrap();
+        // Upgraded WS accepts only TLS bytes, never this plaintext identity claim.
+        carrier.write_all(serde_json::to_vec(&json!({"installation":fixture.home.installation,"certificate":fixture.home.certificate,"op":"stop"})).unwrap().as_slice()).unwrap();
+        let mut reply = [0; 64];
+        if let Ok(count) = carrier.read(&mut reply) {
+            assert!(
+                count == 0 || reply[0] == 21,
+                "plaintext claim received a non-TLS response"
+            );
+        }
+        assert!(!fixture.running.stop.load(Ordering::Relaxed));
     }
 }

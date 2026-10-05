@@ -125,13 +125,18 @@ fn fixture(path: &Path, ports: (&str, &str)) -> (Config, PathBuf, PathBuf, Ident
 }
 #[test]
 fn cli_pairing_and_configured_sync_resume_after_both_worker_and_service_process_restarts() {
-    process_flow(false);
+    process_flow(None);
 }
 #[test]
 fn wss_outbound_only_home_single_vps_ingress_two_way_sync_and_process_restart() {
-    process_flow(true);
+    process_flow(Some("wss"));
 }
-fn process_flow(wss: bool) {
+#[test]
+fn ws_loopback_tls_authenticated_two_way_sync_and_process_restart() {
+    process_flow(Some("ws"));
+}
+fn process_flow(scheme: Option<&str>) {
+    let wss = scheme.is_some();
     let temp = tempfile::tempdir().unwrap();
     let reserved: Vec<_> = (0..4)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
@@ -146,8 +151,8 @@ fn process_flow(wss: bool) {
         ca.transport = tkfs::pairing_service::Transport::Wss;
         ca.dial = false;
         ca.enrollment_listen.clear();
-        ca.advertise = format!("wss://{}/tkfs/sync", ca.listen);
-        ca.enrollment_advertise = format!("wss://{}/tkfs/enroll", ca.listen);
+        ca.advertise = format!("{}://{}/tkfs/sync", scheme.unwrap(), ca.listen);
+        ca.enrollment_advertise = format!("{}://{}/tkfs/enroll", scheme.unwrap(), ca.listen);
         cb.transport = tkfs::pairing_service::Transport::Wss;
         cb.inbound = false;
         cb.listen.clear();

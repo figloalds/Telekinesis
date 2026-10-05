@@ -56,6 +56,37 @@ discovery is not implemented. The synthetic certificate name is the installation
 UUID, verified with Rustls and the exact approved certificate. These are native
 TKFS client connections, not browser/public-PKI web endpoints.
 
+### Explicit loopback `ws`
+
+For local native clients, keep `transport = "wss"` and explicitly use matching
+`ws://127.0.0.1:PORT/tkfs/sync` and `ws://127.0.0.1:PORT/tkfs/enroll` URLs.
+The listener must bind a numeric loopback address. `::1` and IPv4-mapped IPv6
+loopback are accepted; unspecified, private/gateway and other non-loopback
+addresses are rejected. DNS names (including `localhost`), implicit ports,
+userinfo and URL query parameters are rejected. No DNS resolution, redirect or
+automatic downgrade occurs. The client verifies its connected local and peer
+addresses; the server checks the actual bound address and both accepted socket
+addresses. WSL gateway/private IPs are not loopback.
+
+This mode is an RFC 6455 binary carrier for the existing Rustls TLS 1.3 session:
+HTTP `GET /tkfs/tunnel` with subprotocol `tkfs-loopback-tls-v1`, then TLS records
+inside WS binary messages, then the existing authenticated `tkfs-wss-v1` exchange
+inside TLS. An HTTP upgrade grants no identity or data access. Exact server-key
+verification, proof of possession of the approved client key, anonymous enrollment
+only, invitation approval, per-operation grants and revocation remain identical
+to WSS. UUID/certificate claims and forwarded headers confer no access. Keys or
+invitation secrets never enter a URL. There is no plaintext data/authentication
+fallback. This preserves the established authentication instead of adding a new
+challenge/signature protocol; it adds framing overhead and retains TLS cost.
+
+Outer WS messages/frames are bounded at 16 KiB, with at most 32 control messages
+per phase and the existing absolute byte/time/cancellation budgets. The initial
+WS upgrade, TLS handshake and inner upgrade share one handshake deadline.
+Non-loopback WebSocket endpoints require `wss`.
+
+The layering uses [RFC 6455 binary frames](https://www.rfc-editor.org/rfc/rfc6455)
+and Rustls's existing [Read/Write stream interface](https://docs.rs/rustls/0.23.45/rustls/struct.StreamOwned.html).
+
 `dial` controls automatic outgoing sync only. It does not change repository
 authorization: VPS grants remain enabled with `dial=false`. Explicit local
 `sync`/`remote-list` commands may still dial. Peers advertising `outbound-only`
