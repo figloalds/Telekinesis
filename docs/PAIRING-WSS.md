@@ -84,6 +84,9 @@ per phase and the existing absolute byte/time/cancellation budgets. The initial
 WS upgrade, TLS handshake and inner upgrade share one handshake deadline.
 Non-loopback WebSocket endpoints require `wss`.
 
+See [foreground Windows–Linux acceptance](PAIRING-CROSS-OS.md) for a reproducible
+WSL test with mounted workers, fresh test credentials and no systemd activation.
+
 The layering uses [RFC 6455 binary frames](https://www.rfc-editor.org/rfc/rfc6455)
 and Rustls's existing [Read/Write stream interface](https://docs.rs/rustls/0.23.45/rustls/struct.StreamOwned.html).
 
