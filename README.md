@@ -1034,7 +1034,7 @@ and its exact object bytes. Repeat sync/status checks if transfer is still pendi
 ```bash
 B_HASH='<lowercase SHA-256 printed on B>'
 "$TKFS_A" --runtime "$RUNTIME_A" state | python3 -c 'import json,sys; e=[x for x in json.load(sys.stdin)["entries"].values() if x["alive"] and x["name"]=="from-B.txt"]; assert len(e)==1 and e[0]["content"]==sys.argv[1]; print("namespace/hash match")' "$B_HASH"
-"$TKFS_A" --runtime "$RUNTIME_A" cat-object "$B_HASH" | python3 -c 'import json,sys,hashlib; b=bytes.fromhex(json.load(sys.stdin)["hex"]); assert b==b"B-to-A byte test\n"; print(hashlib.sha256(b).hexdigest())'
+"$TKFS_A" --runtime "$RUNTIME_A" cat-object "$B_HASH" | python3 -c 'import sys,hashlib; b=sys.stdin.buffer.read(); assert b==b"B-to-A byte test\n"; print(hashlib.sha256(b).hexdigest())'
 ```
 
 If A is mounted, additionally compare `sha256sum /A/mount/from-B.txt` with B's
