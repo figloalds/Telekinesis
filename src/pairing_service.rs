@@ -296,6 +296,7 @@ fn read<T: DeserializeOwned>(stream: &mut impl Read, maximum: usize) -> Result<T
     stream.read_exact(&mut bytes)?;
     serde_json::from_slice(&bytes).context("INVALID_PAIRING_REQUEST")
 }
+#[cfg(test)]
 fn client(identity: &Identity, peer: &Peer, enrollment: bool) -> Result<Client> {
     client_budget(
         identity,
@@ -365,6 +366,32 @@ fn join_with_identity(
     identity: &Identity,
     invitation: Invitation,
 ) -> Result<Value> {
+    join_budget(
+        config,
+        identity,
+        invitation,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+/// Cancellation stops local I/O; an enrollment already submitted may be consumed.
+pub fn join_cancellable(
+    config: &Config,
+    invitation: Invitation,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    join_budget(config, &config.identity()?, invitation, stop)
+}
+fn join_budget(
+    config: &Config,
+    identity: &Identity,
+    invitation: Invitation,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    ensure!(
+        identity.installation == config.installation,
+        "CREDENTIAL_IDENTITY_MISMATCH"
+    );
+    cancelled(&stop)?;
     ensure!(
         crate::core::time() < invitation.expires_ms,
         "INVITATION_EXPIRED"
@@ -388,9 +415,9 @@ fn join_with_identity(
         candidate,
     };
     let response: Value = if crate::wss_transport::is_websocket(&issuer.endpoint) {
-        crate::wss_transport::enroll(identity, &issuer, &enrollment)?
+        crate::wss_transport::enroll(identity, &issuer, &enrollment, stop.clone())?
     } else {
-        let mut stream = client(identity, &issuer, true)?;
+        let mut stream = client_budget(identity, &issuer, true, stop.clone(), Limits::default())?;
         frame(&mut stream, &enrollment)?;
         read(&mut stream, 64 * 1024)?
     };
@@ -405,6 +432,14 @@ fn join_with_identity(
     )
 }
 pub fn remote_list(config: &Config, peer_id: &str) -> Result<Value> {
+    remote_list_cancellable(config, peer_id, Arc::new(AtomicBool::new(false)))
+}
+pub fn remote_list_cancellable(
+    config: &Config,
+    peer_id: &str,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    cancelled(&stop)?;
     let registry = config.registry()?;
     let peer = registry
         .peers()?
@@ -417,7 +452,7 @@ pub fn remote_list(config: &Config, peer_id: &str) -> Result<Value> {
             &peer,
             &NetworkRequest::ListPublished {},
             None,
-            Arc::new(AtomicBool::new(false)),
+            stop.clone(),
         )?;
         let _access = registry.begin_access()?;
         registry.authenticate(&peer.certificate, &peer.installation)?;
@@ -428,7 +463,13 @@ pub fn remote_list(config: &Config, peer_id: &str) -> Result<Value> {
         );
         return Ok(response["result"].clone());
     }
-    let mut stream = client(&config.identity()?, &peer, false)?;
+    let mut stream = client_budget(
+        &config.identity()?,
+        &peer,
+        false,
+        stop.clone(),
+        Limits::default(),
+    )?;
     {
         let _access = registry.begin_access()?;
         registry.authenticate(&peer.certificate, &peer.installation)?;
@@ -447,6 +488,20 @@ pub fn remote_list(config: &Config, peer_id: &str) -> Result<Value> {
 }
 pub fn synchronize(config: &Config, grant: &SyncConfiguration) -> Result<Value> {
     synchronize_with_identity(config, &config.identity()?, grant)
+}
+pub fn synchronize_cancellable(
+    config: &Config,
+    grant: &SyncConfiguration,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    synchronize_budget(
+        config,
+        &config.identity()?,
+        grant,
+        stop,
+        Limits::default(),
+        None,
+    )
 }
 fn synchronize_with_identity(
     config: &Config,

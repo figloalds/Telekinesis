@@ -249,14 +249,9 @@ pub(crate) fn enroll<T: Serialize>(
     identity: &Identity,
     issuer: &Peer,
     request: &T,
+    stop: Arc<AtomicBool>,
 ) -> Result<Value> {
-    let mut socket = connect(
-        identity,
-        issuer,
-        true,
-        Lane::Control,
-        Arc::new(AtomicBool::new(false)),
-    )?;
+    let mut socket = connect(identity, issuer, true, Lane::Control, stop)?;
     socket.get_mut().budget(Duration::from_secs(10));
     send(&mut socket, request, ENROLLMENT)?;
     receive(&mut socket, ENROLLMENT)
@@ -1579,6 +1574,7 @@ mod tests {
                     revoked: false,
                 },
             },
+            Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
         assert_eq!(response["ok"], true);
