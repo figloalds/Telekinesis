@@ -679,12 +679,16 @@ fn enqueue(ui: &slint::Weak<App>, sender: &mpsc::Sender<Job>, job: Job) {
         let _ = sender.send(job);
     }
 }
-pub fn run(report: Option<&Path>) -> Result<()> {
+pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name("software".into())
         .select()?;
-    let paths = Paths::from_executable(std::env::current_exe()?)?;
+    let paths = if let Some(config) = config {
+        Paths::from_config(std::env::current_exe()?, config)?
+    } else {
+        Paths::from_executable(std::env::current_exe()?)?
+    };
     let ui = App::new()?;
     ui.set_config_path(display_path(&paths.config).into());
     ui.set_data_folder(display_path(&paths.folder.join("data")).into());
@@ -1033,11 +1037,27 @@ mod tests {
         let name = format!("gui-retry-{}", tkfs::core::id());
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path,format!("format_version=1\ndata_directory='data'\n[control]\ntransport='named-pipe'\nname='{name}'")).unwrap();
+        let identity = tkfs::core::id();
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        let hello = json!({"ok":true,"result":{"api_version":1,"registry_version":1,
+            "installation_id":identity,"data_directory":std::fs::canonicalize(dir.path().join("data")).unwrap(),
+            "build_version":env!("CARGO_PKG_VERSION"),"capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1"]}});
         let listener = tkfs::local_ipc::Listener::bind(&name).unwrap();
         let thread = std::thread::spawn(move || {
             let mut listener = listener;
+            let hello_reply = |listener: &mut tkfs::local_ipc::Listener| {
+                loop {
+                    if let Some(request) = listener.receive::<Value>().unwrap() {
+                        assert_eq!(request["action"]["op"], "hello");
+                        break;
+                    }
+                }
+                listener.reply(&hello).unwrap();
+            };
+            hello_reply(&mut listener);
             loop {
-                if listener.receive::<Value>().unwrap().is_some() {
+                if let Some(request) = listener.receive::<Value>().unwrap() {
+                    assert_eq!(request["action"]["op"], "list");
                     break;
                 }
             }
@@ -1048,6 +1068,7 @@ mod tests {
                     Err(_) => std::thread::sleep(Duration::from_millis(10)),
                 }
             };
+            hello_reply(&mut listener);
             loop {
                 if let Some(request) = listener.receive::<Value>().unwrap() {
                     assert_eq!(request["action"]["op"], "list");
@@ -1066,7 +1087,7 @@ mod tests {
         let session = Session {
             paths,
             config: tkfs::orchestrator::Config::load(&config_path).unwrap(),
-            identity: "test".into(),
+            identity,
             hello: Value::Null,
             saved: None,
         };

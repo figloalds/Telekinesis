@@ -1032,6 +1032,8 @@ mod tests {
         let repo = id();
         let server_replica = id();
         let home_replica = id();
+        #[cfg(target_os = "linux")]
+        crate::private_storage::Directory::open(&temp.path().join("server-state")).unwrap();
         let engine = Arc::new(Mutex::new(Engine::new(
             Store::initialize(&temp.path().join("server-state"), &repo, &server_replica).unwrap(),
         )));

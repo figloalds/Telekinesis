@@ -22,10 +22,11 @@ static MOUNT: Mutex<Option<Mount>> = Mutex::new(None);
 const MAX_IO: usize = 1024 * 1024;
 struct Mount {
     path: PathBuf,
+    source: String,
     worker: Option<JoinHandle<()>>,
 }
 
-fn helper_mount(path: &Path) -> Result<File> {
+fn helper_mount(path: &Path, source: &str) -> Result<File> {
     let (parent, child) = UnixStream::pair()?;
     parent.set_read_timeout(Some(std::time::Duration::from_secs(3)))?;
     // Only the communication endpoint survives exec. Both sockets were CLOEXEC.
@@ -36,7 +37,7 @@ fn helper_mount(path: &Path) -> Result<File> {
     let output = Command::new("fusermount3")
         .args([
             "-o",
-            "rw,nosuid,nodev,default_permissions,fsname=tkfs,subtype=tkfs",
+            &format!("rw,nosuid,nodev,default_permissions,fsname={source},subtype=tkfs"),
             "--",
         ])
         .arg(path)
@@ -86,8 +87,8 @@ fn helper_mount(path: &Path) -> Result<File> {
     }
     result
 }
-fn launch(engine: Shared, path: &Path) -> Result<JoinHandle<()>> {
-    let device = helper_mount(path)?;
+fn launch(engine: Shared, path: &Path, source: &str) -> Result<JoinHandle<()>> {
+    let device = helper_mount(path, source)?;
     Ok(std::thread::spawn(move || {
         if let Err(error) = serve(device, engine.clone()) {
             let mut e = engine.lock().unwrap();
@@ -99,6 +100,13 @@ fn launch(engine: Shared, path: &Path) -> Result<JoinHandle<()>> {
     }))
 }
 pub fn start(engine: Shared, path: &Path) -> Result<()> {
+    start_source(engine, path, "tkfs")
+}
+pub fn start_managed(engine: Shared, path: &Path, instance: &str) -> Result<()> {
+    uuid::Uuid::parse_str(instance)?;
+    start_source(engine, path, &format!("tkfs-{instance}"))
+}
+fn start_source(engine: Shared, path: &Path, source: &str) -> Result<()> {
     let mut guard = MOUNT.lock().unwrap();
     ensure!(guard.is_none(), "ONE_MOUNT_PER_RUNTIME");
     ensure!(
@@ -108,7 +116,7 @@ pub fn start(engine: Shared, path: &Path) -> Result<()> {
     );
     std::fs::create_dir(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    let worker = match launch(engine.clone(), path) {
+    let worker = match launch(engine.clone(), path, source) {
         Ok(w) => w,
         Err(e) => {
             let _ = std::fs::remove_dir(path);
@@ -117,6 +125,7 @@ pub fn start(engine: Shared, path: &Path) -> Result<()> {
     };
     *guard = Some(Mount {
         path: path.into(),
+        source: source.into(),
         worker: Some(worker),
     });
     let mut e = engine.lock().unwrap();
@@ -161,6 +170,60 @@ pub fn stop(engine: &Shared) -> Result<()> {
     e.publish_observation();
     Ok(())
 }
+/// Called only after verifying the persistent worker record and acquiring a free
+/// state ownership lock. Never detach a responding or unrelated filesystem.
+pub fn recover_managed(path: &Path, instance: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    uuid::Uuid::parse_str(instance)?;
+    let source = format!("tkfs-{instance}");
+    let decode = |value: &str| {
+        value
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    };
+    for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() < 10 || Path::new(&decode(fields[4])) != path {
+            continue;
+        }
+        let separator = fields
+            .iter()
+            .position(|field| *field == "-")
+            .context("INVALID_MOUNTINFO")?;
+        ensure!(
+            fields.get(separator + 1) == Some(&"fuse.tkfs")
+                && fields.get(separator + 2) == Some(&source.as_str()),
+            "WORKER_START: unrelated mount occupies reservation"
+        );
+        ensure!(
+            std::fs::metadata(path)
+                .is_err_and(|error| error.raw_os_error() == Some(libc::ENOTCONN)),
+            "WORKER_START: mount still responds"
+        );
+        let result = Command::new("fusermount3")
+            .args(["-u", "--"])
+            .arg(path)
+            .output()?;
+        ensure!(
+            result.status.success(),
+            "WORKER_START: disconnected owned FUSE unmount refused"
+        );
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        ensure!(
+            metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o777 == 0o700
+                && std::fs::read_dir(path)?.next().is_none(),
+            "WORKER_START: mount directory occupied"
+        );
+        std::fs::remove_dir(path)?;
+    }
+    Ok(())
+}
 pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value> {
     let mut guard = MOUNT.lock().unwrap();
     let mount = guard.as_mut().context("MOUNT_NOT_RUNNING")?;
@@ -194,7 +257,7 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         e.mounted = false;
         e.control(request, payload)
     };
-    let worker = launch(engine.clone(), &mount.path);
+    let worker = launch(engine.clone(), &mount.path, &mount.source);
     let mut e = engine.lock().unwrap();
     e.switching = false;
     match worker {

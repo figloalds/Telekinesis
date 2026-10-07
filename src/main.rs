@@ -44,7 +44,10 @@ enum Command {
         action: PairingCommand,
     },
     /// Open the portable desktop application (also the default with no arguments).
-    Gui,
+    Gui {
+        #[arg(short = 'f', long)]
+        defaults_file: Option<PathBuf>,
+    },
     #[command(hide = true)]
     GuiTest {
         #[arg(long)]
@@ -68,9 +71,27 @@ enum Command {
     ManagedWorker,
     Init {
         #[arg(long)]
-        state: PathBuf,
-        #[arg(long)]
+        state: Option<PathBuf>,
+        #[arg(long, requires = "state")]
         repo: Option<String>,
+        #[arg(
+            short = 'f',
+            long,
+            default_value = "orchestrator.toml",
+            conflicts_with = "state"
+        )]
+        defaults_file: PathBuf,
+    },
+    /// Run the owner-local supervisor in the foreground.
+    Start {
+        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
+        defaults_file: PathBuf,
+    },
+    /// Create and start a managed project mounted under its configured parent.
+    Create {
+        label: String,
+        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
+        defaults_file: PathBuf,
     },
     Daemon {
         #[arg(long)]
@@ -428,7 +449,7 @@ extern "C" fn request_linux_stop(_: libc::c_int) {
 fn run() -> Result<()> {
     #[cfg(windows)]
     if std::env::args_os().len() == 1 {
-        return gui::run(None);
+        return gui::run(None, None);
     }
     #[cfg(windows)]
     if std::env::args_os()
@@ -449,100 +470,117 @@ fn run() -> Result<()> {
             defaults_file,
             action,
         } => return pairing_command(defaults_file, action),
-        Command::Gui => {
+        Command::Gui { defaults_file } => {
             #[cfg(windows)]
-            return gui::run(None);
+            return gui::run(None, defaults_file.as_deref());
             #[cfg(not(windows))]
-            bail!("DESKTOP_WINDOWS_ONLY");
+            {
+                let _ = defaults_file;
+                bail!("DESKTOP_WINDOWS_ONLY");
+            }
         }
         Command::GuiTest { report } => {
             #[cfg(windows)]
-            return gui::run(Some(report));
+            return gui::run(Some(report), None);
             #[cfg(not(windows))]
             bail!("DESKTOP_WINDOWS_ONLY: {}", report.display());
         }
-        Command::Orchestrator { defaults_file } => {
-            #[cfg(windows)]
-            return tkfs::orchestrator::Supervisor::open(tkfs::orchestrator::Config::load(
-                defaults_file,
-            )?)?
-            .run();
-            #[cfg(not(windows))]
-            bail!("O1_WINDOWS_ONLY: {}", defaults_file.display());
+        Command::Orchestrator { defaults_file } | Command::Start { defaults_file } => {
+            eprintln!(
+                "Supervisor runs in this terminal. In a second terminal in the same directory, run tkfs create MyProject."
+            );
+            return tkfs::onboarding::open(defaults_file)?.run();
         }
         Command::ManagedWorker => {
-            #[cfg(windows)]
             return tkfs::orchestrator::worker();
-            #[cfg(not(windows))]
-            bail!("O1_WINDOWS_ONLY");
         }
         Command::Manage {
             defaults_file,
             action,
         } => {
-            #[cfg(windows)]
-            {
-                use tkfs::orchestrator::{self, Action, Request};
-                let config = orchestrator::Config::load(defaults_file)?;
-                let action = match action {
-                    ManagementCommand::Hello => Action::Hello,
-                    ManagementCommand::Create { label, mount } => Action::Create {
-                        label: label.clone(),
-                        mount: mount.clone(),
-                    },
-                    ManagementCommand::List => Action::List,
-                    ManagementCommand::Inspect { state } => Action::Inspect {
-                        state: state.clone(),
-                    },
-                    ManagementCommand::Start { state } => Action::Start {
-                        state: state.clone(),
-                    },
-                    ManagementCommand::Stop { state } => Action::Stop {
-                        state: state.clone(),
-                    },
-                    ManagementCommand::Shutdown => Action::Shutdown,
-                    ManagementCommand::Operation { operation } => Action::Operation {
-                        operation: operation.clone(),
-                    },
-                };
-                if action.mutates() {
-                    ensure!(
-                        args.generation.is_some(),
-                        "MANAGEMENT_GENERATION_REQUIRED: inspect catalog/state generation; retry with the same --request-id and --generation"
-                    );
-                }
-                let request = Request {
-                    version: 1,
-                    target_installation: config.installation_id.clone(),
-                    operation_id: if action.mutates() {
-                        Some(args.request_id.clone().unwrap_or_else(id))
-                    } else {
-                        None
-                    },
-                    expected_generation: args.generation,
-                    action,
-                };
-                if request.action.mutates() && args.request_id.is_none() {
-                    eprintln!(
-                        "{}",
-                        json!({"operation_id":request.operation_id,"expected_generation":request.expected_generation,"retry":"repeat the same action with these --request-id and --generation values"})
-                    );
-                }
-                let response = orchestrator::client(&config, &request)?;
-                if response["ok"] != true {
-                    bail!("{}", response);
-                }
-                println!("{}", serde_json::to_string_pretty(&response["result"])?);
-                return Ok(());
+            use tkfs::orchestrator::{self, Action, Request};
+            let config = orchestrator::Config::load(defaults_file)?;
+            let action = match action {
+                ManagementCommand::Hello => Action::Hello,
+                ManagementCommand::Create { label, mount } => Action::Create {
+                    label: label.clone(),
+                    mount: mount.clone(),
+                },
+                ManagementCommand::List => Action::List,
+                ManagementCommand::Inspect { state } => Action::Inspect {
+                    state: state.clone(),
+                },
+                ManagementCommand::Start { state } => Action::Start {
+                    state: state.clone(),
+                },
+                ManagementCommand::Stop { state } => Action::Stop {
+                    state: state.clone(),
+                },
+                ManagementCommand::Shutdown => Action::Shutdown,
+                ManagementCommand::Operation { operation } => Action::Operation {
+                    operation: operation.clone(),
+                },
+            };
+            if action.mutates() {
+                ensure!(
+                    args.generation.is_some(),
+                    "MANAGEMENT_GENERATION_REQUIRED: inspect catalog/state generation; retry with the same --request-id and --generation"
+                );
             }
-            #[cfg(not(windows))]
-            {
-                let _ = action;
-                bail!("O1_WINDOWS_ONLY: {}", defaults_file.display());
+            let request = Request {
+                version: 1,
+                target_installation: config.installation_id.clone(),
+                operation_id: if action.mutates() {
+                    Some(args.request_id.clone().unwrap_or_else(id))
+                } else {
+                    None
+                },
+                expected_generation: args.generation,
+                action,
+            };
+            if request.action.mutates() && args.request_id.is_none() {
+                eprintln!(
+                    "{}",
+                    json!({"operation_id":request.operation_id,"expected_generation":request.expected_generation,"retry":"repeat the same action with these --request-id and --generation values"})
+                );
             }
+            let response = orchestrator::client(&config, &request)?;
+            if response["ok"] != true {
+                bail!("{response}");
+            }
+            println!("{}", serde_json::to_string_pretty(&response["result"])?);
+            return Ok(());
         }
-        Command::Init { state, repo } => {
+        Command::Create {
+            label,
+            defaults_file,
+        } => {
+            let result =
+                tkfs::onboarding::create(defaults_file, label, args.request_id.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
+        Command::Init {
+            state: None,
+            defaults_file,
+            ..
+        } => {
+            let config = tkfs::onboarding::initialize(defaults_file)?;
+            println!(
+                "{}",
+                json!({"config":std::path::absolute(defaults_file)?,"installation_id":config.installation_id,"data_directory":config.data_directory,"mount_parent":config.default_mount_directory,"next":"tkfs start"})
+            );
+            return Ok(());
+        }
+        Command::Init {
+            state: Some(state),
+            repo,
+            ..
+        } => {
+            #[cfg(windows)]
             std::fs::create_dir_all(state)?;
+            #[cfg(target_os = "linux")]
+            tkfs::private_storage::Directory::open(state)?;
             let _lock = lock_state(state)?;
             let store = Store::open(state, repo.as_deref())?;
             println!("{}", serde_json::to_string_pretty(&store.status()?)?);
@@ -700,33 +738,7 @@ fn run() -> Result<()> {
     Ok(())
 }
 fn lock_state(state: &Path) -> Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).truncate(false).write(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        opts.share_mode(0);
-    }
-    let file = opts
-        .open(state.join("owner.lock"))
-        .context("STATE_ALREADY_OWNED")?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let metadata = std::fs::metadata(state)?;
-        ensure!(
-            metadata.uid() == unsafe { libc::geteuid() },
-            "STATE_OWNER_MISMATCH"
-        );
-        std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700))?;
-        ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "STATE_ALREADY_OWNED: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(file)
+    tkfs::orchestrator::lock_state(state)
 }
 
 #[cfg(test)]

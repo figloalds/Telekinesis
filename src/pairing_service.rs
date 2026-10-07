@@ -1225,6 +1225,10 @@ mod tests {
         let db = id();
         let state_a = temp.path().join("worker-a");
         let state_b = temp.path().join("worker-b");
+        #[cfg(target_os = "linux")]
+        for path in [&state_a, &state_b] {
+            crate::private_storage::Directory::open(path).unwrap();
+        }
         let a = Arc::new(Mutex::new(Engine::new(
             Store::initialize(&state_a, &repo, &da).unwrap(),
         )));

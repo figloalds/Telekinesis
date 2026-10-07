@@ -316,6 +316,11 @@ fn status_is_authenticated_and_responsive_while_engine_is_busy() {
     let engine = Arc::new(Mutex::new(Engine::new(
         Store::open(dir.path(), Some("availability")).unwrap(),
     )));
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let info = tkfs::runtime::start_rpc(engine.clone(), dir.path(), None).unwrap();
     let guard = engine.lock().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();

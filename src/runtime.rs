@@ -786,7 +786,7 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
             #[cfg(windows)]
             address: format!("pipe:{pipe_name}"),
             #[cfg(target_os = "linux")]
-            address: format!("unix:{}", state.join("control.sock").display()),
+            address: format!("unix:{}", unix_control_path(state)?.display()),
             token: id(),
             state: state.to_string_lossy().into_owned(),
             mount,
@@ -1342,11 +1342,11 @@ fn authorize_unix(stream: &std::os::unix::net::UnixStream) -> Result<()> {
 }
 #[cfg(target_os = "linux")]
 fn unix_control_stream(address: &str) -> Result<std::os::unix::net::UnixStream> {
-    let stream = std::os::unix::net::UnixStream::connect(
+    let stream = crate::local_ipc::connect_socket(Path::new(
         address
             .strip_prefix("unix:")
             .context("LINUX_CONTROL_REQUIRES_UNIX_SOCKET")?,
-    )?;
+    ))?;
     authorize_unix(&stream)?;
     stream.set_read_timeout(Some(Duration::from_secs(15)))?;
     stream.set_write_timeout(Some(Duration::from_secs(15)))?;
@@ -1354,16 +1354,24 @@ fn unix_control_stream(address: &str) -> Result<std::os::unix::net::UnixStream> 
 }
 #[cfg(target_os = "linux")]
 fn bind_unix_control(state: &Path) -> Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    let path = state.join("control.sock");
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        ensure!(
-            metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() },
-            "UNSAFE_STALE_CONTROL_SOCKET"
-        );
-        std::fs::remove_file(&path)?;
+    use std::os::unix::fs::PermissionsExt;
+    let path = unix_control_path(state)?;
+    crate::local_ipc::protect_directory(path.parent().context("CONTROL_PARENT_REQUIRED")?)?;
+    if std::fs::symlink_metadata(&path).is_ok() {
+        crate::local_ipc::remove_stale_socket(&path)?;
     }
     let listener = std::os::unix::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+#[cfg(target_os = "linux")]
+fn unix_control_path(state: &Path) -> Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let state = state.canonicalize()?;
+    let path = state.join("control.sock");
+    if path.as_os_str().as_bytes().len() < 108 {
+        Ok(path)
+    } else {
+        Ok(crate::local_ipc::endpoint(&format!("runtime:{}", state.display())).into())
+    }
 }

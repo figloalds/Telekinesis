@@ -168,6 +168,10 @@ fn process_flow(scheme: Option<&str>) {
     let db = id();
     let sa = temp.path().join("state-a");
     let sb = temp.path().join("state-b");
+    #[cfg(target_os = "linux")]
+    for path in [&sa, &sb] {
+        tkfs::private_storage::Directory::open(path).unwrap();
+    }
     drop(Store::initialize(&sa, &repo, &da).unwrap());
     drop(Store::initialize(&sb, &repo, &db).unwrap());
     let mut wa = daemon(&sa, &temp.path().join("worker-a.log"));

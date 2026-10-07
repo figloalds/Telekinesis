@@ -23,6 +23,15 @@ pub struct Paths {
     pub config: PathBuf,
 }
 impl Paths {
+    pub fn from_config(executable: PathBuf, config: &Path) -> Result<Self> {
+        let config = std::path::absolute(config)?;
+        let folder = fs::canonicalize(config.parent().context("CONFIG_PARENT_REQUIRED")?)?;
+        Ok(Self {
+            executable: fs::canonicalize(executable)?,
+            config: folder.join(config.file_name().context("CONFIG_FILENAME_REQUIRED")?),
+            folder,
+        })
+    }
     pub fn from_executable(executable: PathBuf) -> Result<Self> {
         let executable = fs::canonicalize(executable)?;
         let folder = executable
@@ -36,10 +45,22 @@ impl Paths {
         })
     }
     fn pin(&self) -> PathBuf {
-        self.folder.join(".tkfs-ui-identity.json")
+        self.scoped_file("identity")
     }
     fn journal(&self) -> PathBuf {
-        self.folder.join(".tkfs-ui-operation.json")
+        self.scoped_file("operation")
+    }
+    fn scoped_file(&self, purpose: &str) -> PathBuf {
+        if self
+            .config
+            .file_name()
+            .is_some_and(|name| name == "orchestrator.toml")
+        {
+            self.folder.join(format!(".tkfs-ui-{purpose}.json"))
+        } else {
+            let scope = crate::core::hash(self.config.to_string_lossy().as_bytes());
+            self.folder.join(format!(".tkfs-ui-{scope}-{purpose}.json"))
+        }
     }
 }
 
@@ -71,64 +92,8 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     result
 }
-fn writable(directory: &Path) -> Result<()> {
-    let probe = directory.join(format!(".tkfs-write-{}", id()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe)
-        .context("FOLDER_NOT_WRITABLE")?;
-    file.write_all(b"probe")?;
-    file.sync_all()?;
-    drop(file);
-    fs::remove_file(probe)?;
-    Ok(())
-}
-fn overlap(a: &Path, b: &Path) -> bool {
-    let key = |p: &Path| {
-        p.to_string_lossy()
-            .trim_end_matches(['\\', '/'])
-            .replace('/', "\\")
-            .to_lowercase()
-    };
-    let (a, b) = (key(a), key(b));
-    a == b || a.starts_with(&format!("{b}\\")) || b.starts_with(&format!("{a}\\"))
-}
-
 pub fn bootstrap(paths: &Paths, data: &Path, mounts: &Path, limit: usize) -> Result<Config> {
-    let _guard = exclusive(&paths.folder.join(".tkfs-config.lock"))?;
-    if paths.config.try_exists()? {
-        return Config::load(&paths.config);
-    }
-    ensure!(
-        data.is_absolute() && mounts.is_absolute(),
-        "CHOOSE_ABSOLUTE_FOLDERS"
-    );
-    ensure!((1..=64).contains(&limit), "WORKER_LIMIT_MUST_BE_1_TO_64");
-    writable(&paths.folder)?;
-    if data.try_exists()? {
-        ensure!(
-            data.is_dir() && fs::read_dir(data)?.next().is_none(),
-            "DATA_FOLDER_MUST_BE_EMPTY: existing stores are not adopted by this release"
-        );
-    }
-    fs::create_dir_all(data)?;
-    fs::create_dir_all(mounts)?;
-    let data = fs::canonicalize(data)?;
-    let mounts = fs::canonicalize(mounts)?;
-    ensure!(
-        !overlap(&data, &mounts) && !paths.folder.starts_with(&data),
-        "DATA_FOLDER_OVERLAP: keep native data separate from application files and project mount folders"
-    );
-    writable(&data)?;
-    writable(&mounts)?;
-    let identity = id();
-    let text = toml::to_string_pretty(&json!({"format_version":1,"installation_id":identity,
-        "data_directory":data,"default_mount_directory":mounts,
-        "control":{"transport":"named-pipe","name":format!("tkfs-{}",id())},
-        "network":{"enabled":false},"workers":{"restart_policy":"on-failure","maximum_running":limit}}))?;
-    atomic_write(&paths.config, text.as_bytes())?;
-    Config::load(&paths.config)
+    crate::onboarding::bootstrap(&paths.config, data, mounts, limit, false)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -145,49 +110,7 @@ pub struct SavedOperation {
 }
 
 pub fn verify_hello(config: &Config, expected: Option<&str>, hello: &Value) -> Result<()> {
-    ensure!(
-        hello["api_version"] == 1 && hello["registry_version"] == 1,
-        "DESKTOP_API_VERSION_MISMATCH"
-    );
-    ensure!(
-        hello["build_version"] == env!("CARGO_PKG_VERSION"),
-        "DESKTOP_BUILD_VERSION_MISMATCH: close clients and perform an orderly upgrade"
-    );
-    let identity = hello["installation_id"]
-        .as_str()
-        .context("HELLO_IDENTITY_MISSING")?;
-    uuid::Uuid::parse_str(identity)?;
-    if let Some(expected) = expected.or(config.installation_id.as_deref()) {
-        ensure!(
-            identity == expected,
-            "INSTALLATION_ID_MISMATCH: this pipe belongs to another installation"
-        );
-    }
-    let root =
-        fs::canonicalize(&config.data_directory).context("CONFIGURED_DATA_FOLDER_MISSING")?;
-    let actual = PathBuf::from(
-        hello["data_directory"]
-            .as_str()
-            .context("HELLO_DATA_DIRECTORY_MISSING")?,
-    );
-    ensure!(
-        root == actual,
-        "DATA_DIRECTORY_MISMATCH: this pipe belongs to another installation"
-    );
-    let capabilities = hello["capabilities"]
-        .as_array()
-        .context("HELLO_CAPABILITIES_MISSING")?;
-    ensure!(
-        [
-            "local-management-v1",
-            "target-installation-v1",
-            "runtime-rpc-v1"
-        ]
-        .iter()
-        .all(|cap| capabilities.contains(&json!(cap))),
-        "DESKTOP_CAPABILITY_MISMATCH"
-    );
-    Ok(())
+    orchestrator::verify_hello(config, expected, hello)
 }
 fn request(action: Action, target: Option<String>) -> Request {
     Request {
@@ -585,7 +508,7 @@ mod tests {
     #[test]
     fn read_only_bootstrap_location_is_actionable() {
         let (temp, paths) = fixture();
-        let lock = paths.folder.join(".tkfs-config.lock");
+        let lock = paths.config.with_extension("tkfs-config.lock");
         fs::write(&lock, b"lock").unwrap();
         let mut permissions = fs::metadata(&lock).unwrap().permissions();
         let original_permissions = permissions.clone();
@@ -598,7 +521,7 @@ mod tests {
             8,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("APPLICATION_FOLDER_NOT_WRITABLE_OR_BUSY"));
+        assert!(format!("{error:#}").contains("CONFIG_FOLDER_NOT_WRITABLE_OR_BUSY"));
         assert!(!paths.config.exists());
         fs::set_permissions(lock, original_permissions).unwrap();
     }

@@ -6,12 +6,15 @@ pub mod desktop;
 pub mod desktop_branch;
 #[cfg(windows)]
 pub mod local_ipc;
+#[cfg(target_os = "linux")]
+#[path = "local_ipc_linux.rs"]
+pub mod local_ipc;
 #[cfg(windows)]
 pub mod mount;
 #[cfg(target_os = "linux")]
 #[path = "fuse_linux.rs"]
 pub mod mount;
-#[cfg(windows)]
+pub mod onboarding;
 pub mod orchestrator;
 pub mod paired_sync;
 pub mod pairing;

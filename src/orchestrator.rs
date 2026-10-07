@@ -1,4 +1,4 @@
-//! Bounded O1: single-user local supervisor. No machine sharing or adoption.
+//! Portable bounded O1: single-owner local supervisor. No machine sharing or adoption.
 use crate::{
     core::{Store, hash, id},
     local_ipc,
@@ -59,6 +59,22 @@ impl Default for Workers {
     }
 }
 impl Config {
+    pub fn control_endpoint(&self) -> String {
+        #[cfg(windows)]
+        {
+            self.control.name.clone()
+        }
+        #[cfg(target_os = "linux")]
+        {
+            local_ipc::endpoint(&format!(
+                "management:{}:{}",
+                fs::canonicalize(&self.data_directory)
+                    .unwrap_or_else(|_| self.data_directory.clone())
+                    .display(),
+                self.control.name
+            ))
+        }
+    }
     pub fn load(path: &Path) -> Result<Self> {
         let path = fs::canonicalize(path).with_context(|| {
             format!("ORCHESTRATOR_CONFIG_NOT_FOUND: {}; run in the directory containing orchestrator.toml or select --defaults-file / -f", path.display())
@@ -76,7 +92,12 @@ impl Config {
             *directory = std::path::absolute(&*directory)?;
         }
         ensure!(
-            config.control.transport == "named-pipe",
+            config.control.transport
+                == if cfg!(windows) {
+                    "named-pipe"
+                } else {
+                    "unix-socket"
+                },
             "UNSUPPORTED_CONTROL_TRANSPORT"
         );
         ensure!(
@@ -214,35 +235,97 @@ pub struct Supervisor {
     exit_requested: bool,
     instance: String,
 }
-fn lock(path: &Path) -> Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .share_mode(0)
-        .open(path)
-        .context("ALREADY_OWNED")
+pub(crate) fn lock(path: &Path) -> Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(path)
+            .context("ALREADY_OWNED")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::{
+            fd::AsRawFd,
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o077 == 0,
+            "UNSAFE_OWNERSHIP_LOCK"
+        );
+        ensure!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+            "ALREADY_OWNED"
+        );
+        let current = fs::symlink_metadata(path)?;
+        ensure!(
+            current.ino() == metadata.ino() && current.dev() == metadata.dev(),
+            "OWNERSHIP_LOCK_REPLACED"
+        );
+        Ok(file)
+    }
+}
+/// Standalone daemons and managed workers share this exact ownership inode.
+pub fn lock_state(state: &Path) -> Result<File> {
+    #[cfg(target_os = "linux")]
+    crate::local_ipc::protect_directory(state)?;
+    lock(&state.join("owner.lock")).context("STATE_ALREADY_OWNED_OR_UNSAFE")
 }
 fn no_reparse(path: &Path) -> Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    ensure!(
-        fs::symlink_metadata(path)?.file_attributes() & 0x400 == 0,
-        "REPARSE_POINT_REFUSED: {}",
-        path.display()
-    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        ensure!(
+            fs::symlink_metadata(path)?.file_attributes() & 0x400 == 0,
+            "REPARSE_POINT_REFUSED: {}",
+            path.display()
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(path)?;
+        ensure!(
+            !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o022 == 0,
+            "UNSAFE_NATIVE_PATH: {}",
+            path.display()
+        );
+    }
     Ok(())
 }
-fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let temp = path.with_extension(format!("{}.tmp", id()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp)?;
     file.write_all(&serde_json::to_vec(value)?)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&temp, path)?;
+    #[cfg(target_os = "linux")]
+    File::open(path.parent().context("PARENT_REQUIRED")?)?.sync_all()?;
     Ok(())
 }
 fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
@@ -259,9 +342,19 @@ fn retryable(error: &anyhow::Error) -> bool {
     // Preserve typed OS errors: sharing/lock violations are availability
     // failures, unlike invalid identities/markers or unsupported formats.
     if error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| matches!(io.raw_os_error(), Some(32 | 33 | 170)))
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            #[cfg(windows)]
+            {
+                matches!(io.raw_os_error(), Some(32 | 33 | 170))
+            }
+            #[cfg(target_os = "linux")]
+            {
+                matches!(
+                    io.raw_os_error(),
+                    Some(libc::EBUSY | libc::EAGAIN | libc::EINTR)
+                )
+            }
+        })
     }) {
         return true;
     }
@@ -392,6 +485,13 @@ fn catalog_preflight(
 }
 
 impl Supervisor {
+    pub fn validate_catalog(config: &Config) -> Result<()> {
+        if config.data_directory.exists() {
+            no_reparse(&config.data_directory)?;
+            catalog_preflight(&config.data_directory, config, &local_ipc::owner_sid()?)?;
+        }
+        Ok(())
+    }
     pub fn open(mut config: Config) -> Result<Self> {
         let caller = local_ipc::owner_sid()?;
         let root = &config.data_directory;
@@ -400,7 +500,10 @@ impl Supervisor {
             // Validate read-only before changing ACLs or opening a writable catalog.
             catalog_preflight(root, &config, &caller)?;
         } else {
+            #[cfg(windows)]
             fs::create_dir_all(root)?;
+            #[cfg(target_os = "linux")]
+            crate::private_storage::Directory::open(root)?;
         }
         local_ipc::protect_directory(root)?;
         config.data_directory = fs::canonicalize(root)?;
@@ -529,15 +632,23 @@ impl Supervisor {
         let parent = fs::canonicalize(mount.parent().context("MOUNT_REQUIRES_PARENT")?)?;
         let target = parent.join(mount.file_name().context("FOLDER_MOUNT_REQUIRED")?);
         let normalized = |p: &Path| {
-            p.to_string_lossy()
-                .trim_end_matches(['\\', '/'])
-                .replace('/', "\\")
-                .to_lowercase()
+            let value = p.to_string_lossy();
+            if cfg!(windows) {
+                value
+                    .trim_end_matches(['\\', '/'])
+                    .replace('/', "\\")
+                    .to_lowercase()
+            } else {
+                value.trim_end_matches('/').to_owned()
+            }
         };
         let target_key = normalized(&target);
         let data_key = normalized(&self.config.data_directory);
         let overlap = |a: &str, b: &str| {
-            a == b || a.starts_with(&format!("{b}\\")) || b.starts_with(&format!("{a}\\"))
+            let separator = if cfg!(windows) { "\\" } else { "/" };
+            a == b
+                || a.starts_with(&format!("{b}{separator}"))
+                || b.starts_with(&format!("{a}{separator}"))
         };
         ensure!(!overlap(&target_key, &data_key), "MOUNT_DATA_OVERLAP");
         for state in self.states()? {
@@ -591,7 +702,10 @@ impl Supervisor {
                     "STAGING_MARKER_MISMATCH"
                 );
             } else {
+                #[cfg(windows)]
                 fs::create_dir(&staging)?;
+                #[cfg(target_os = "linux")]
+                crate::private_storage::Directory::open(&staging)?;
                 crate::core::fault("orchestrator_staging_created");
                 atomic_json(&staging.join("state.json"), &state.marker)?;
             }
@@ -607,6 +721,11 @@ impl Supervisor {
             drop(guard);
             crate::core::fault("orchestrator_store_initialized");
             fs::rename(&staging, &root)?;
+            #[cfg(target_os = "linux")]
+            {
+                File::open(staging.parent().unwrap())?.sync_all()?;
+                File::open(root.parent().unwrap())?.sync_all()?;
+            }
             crate::core::fault("orchestrator_store_installed");
             self.verify(state)?;
         }
@@ -683,16 +802,39 @@ impl Supervisor {
                 !self.children.contains_key(&state.marker.state),
                 "WORKER_UNAVAILABLE: missing live owner record"
             );
+            #[cfg(target_os = "linux")]
+            if let Some(mount) = &state.mount {
+                ensure!(
+                    fs::symlink_metadata(mount)
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+                    "WORKER_UNAVAILABLE: missing state cannot authorize mount cleanup"
+                );
+            }
             return Ok(json!({"status":"stopped"}));
         }
         // Never use a stored PID for recovery. A free ownership lock is required
         // before creating a replacement, even when the old endpoint is unreachable.
         let guard = lock(&self.root(state).join("owner.lock"))
             .context("WORKER_UNAVAILABLE: unverified owner")?;
-        drop(guard);
         if !state.desired {
+            #[cfg(target_os = "linux")]
+            if let Some(mount) = &state.mount {
+                let absent = fs::symlink_metadata(mount)
+                    .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                if !absent {
+                    self.verify(state)
+                        .context("WORKER_UNAVAILABLE: cleanup identity")?;
+                    let record = self
+                        .record(state)
+                        .context("WORKER_UNAVAILABLE: cleanup record")?;
+                    // Keep exclusive ownership through normal unmount. A busy or
+                    // unrelated mount leaves stop/shutdown pending, never success.
+                    crate::mount::recover_managed(mount, &record.instance)?;
+                }
+            }
             return Ok(json!({"status":"stopped"}));
         }
+        drop(guard);
         ensure!(state.ready, "STATE_UNAVAILABLE: initialization pending");
         self.verify(state).context("STATE_UNAVAILABLE")?;
         let running = self
@@ -718,6 +860,10 @@ impl Supervisor {
             );
         }
         if let Some(mount) = &state.mount {
+            #[cfg(target_os = "linux")]
+            if let Ok(record) = self.record(state) {
+                crate::mount::recover_managed(mount, &record.instance)?;
+            }
             ensure!(!mount.exists(), "WORKER_START: mount occupied");
             let canonical = fs::canonicalize(mount.parent().context("MOUNT_REQUIRES_PARENT")?)?
                 .join(mount.file_name().context("FOLDER_MOUNT_REQUIRED")?);
@@ -729,7 +875,16 @@ impl Supervisor {
             root: self.root(state),
             mount: state.mount.clone(),
             instance: id(),
-            pipe: format!("tkfs-worker-{}", id()),
+            pipe: {
+                #[cfg(windows)]
+                {
+                    format!("tkfs-worker-{}", id())
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    local_ipc::endpoint(&format!("worker:{}:{}", self.root(state).display(), id()))
+                }
+            },
             token: format!("{}{}", id(), id()),
         };
         atomic_json(&self.root(state).join("worker.json"), &record)?;
@@ -737,10 +892,13 @@ impl Supervisor {
         let out = File::create(logs.join(format!("{}-stdout.log", state.marker.state)))?;
         let err = File::create(logs.join(format!("{}-stderr.log", state.marker.state)))?;
         let mut command = Command::new(std::env::current_exe()?);
-        use std::os::windows::process::CommandExt;
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
         command
             .arg("managed-worker")
-            .creation_flags(0x08000000)
             .stdin(Stdio::piped())
             .stdout(out)
             .stderr(err);
@@ -1016,7 +1174,11 @@ impl Supervisor {
         )?;
         match prepared {
             Err(e) => {
-                let response = error(format!("{e:#}"), false, Some(operation));
+                let mut response = error(format!("{e:#}"), false, Some(operation));
+                // This receipt and the absence of a state intent are committed
+                // in the same transaction. Clients may safely replace this
+                // rejected convenience request, never a pending/executed create.
+                response["intent_committed"] = json!(false);
                 tx.execute(
                     "UPDATE operations SET status='completed',response=? WHERE caller=? AND id=?",
                     params![serde_json::to_string(&response)?, self.caller, operation],
@@ -1111,7 +1273,7 @@ impl Supervisor {
         Ok(())
     }
     pub fn run(mut self) -> Result<()> {
-        let mut listener = local_ipc::Listener::bind(&self.config.control.name)?;
+        let mut listener = local_ipc::Listener::bind(&self.config.control_endpoint())?;
         self.recover()?;
         self.tick()?;
         println!(
@@ -1131,7 +1293,10 @@ impl Supervisor {
                         break;
                     }
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    #[cfg(target_os = "linux")]
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 Err(e) => {
                     let _ = listener.reply(&error(format!("{e:#}"), false, None));
                 }
@@ -1142,12 +1307,14 @@ impl Supervisor {
     }
 }
 
+#[cfg(windows)]
 unsafe extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
     fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
 }
 struct Process(File);
 impl Process {
+    #[cfg(windows)]
     fn open(pid: u32) -> Result<Self> {
         use std::os::windows::io::FromRawHandle;
         let handle = unsafe { OpenProcess(0x00100000, 0, pid) };
@@ -1158,10 +1325,33 @@ impl Process {
         );
         Ok(Self(unsafe { File::from_raw_handle(handle) }))
     }
+    #[cfg(windows)]
     fn wait(&self) -> Result<()> {
         use std::os::windows::io::AsRawHandle;
         ensure!(
             unsafe { WaitForSingleObject(self.0.as_raw_handle(), 5000) } == 0,
+            "WORKER_EXIT: process did not exit"
+        );
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn open(pid: u32) -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as i32;
+        ensure!(fd >= 0, "WORKER_EXIT: {}", std::io::Error::last_os_error());
+        Ok(Self(unsafe { File::from_raw_fd(fd) }))
+    }
+    #[cfg(target_os = "linux")]
+    fn wait(&self) -> Result<()> {
+        use std::os::fd::AsRawFd;
+        let mut descriptor = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        ensure!(
+            unsafe { libc::poll(&mut descriptor, 1, 5000) } == 1
+                && descriptor.revents & libc::POLLIN != 0,
             "WORKER_EXIT: process did not exit"
         );
         Ok(())
@@ -1182,7 +1372,7 @@ pub fn worker() -> Result<()> {
         load_json::<Marker>(&record.root.join("state.json"))? == record.marker,
         "STATE_MARKER_MISMATCH"
     );
-    let _guard = lock(&record.root.join("owner.lock"))?;
+    let _guard = lock_state(&record.root)?;
     let store = Store::open_existing(&record.root)?;
     ensure!(
         store.repo == record.marker.repo && store.device == record.marker.device,
@@ -1198,7 +1388,10 @@ pub fn worker() -> Result<()> {
             .map(|p| p.to_string_lossy().into_owned()),
     )?;
     if let Some(mount) = &record.mount {
+        #[cfg(windows)]
         crate::mount::start(engine.clone(), mount)?;
+        #[cfg(target_os = "linux")]
+        crate::mount::start_managed(engine.clone(), mount, &record.instance)?;
     }
     // Private lifecycle readiness is published AFTER mount installation.
     let mut listener = local_ipc::Listener::bind(&record.pipe)?;
@@ -1206,7 +1399,11 @@ pub fn worker() -> Result<()> {
     loop {
         let request = match listener.receive::<WorkerRequest>() {
             Ok(Some(r)) => r,
-            Ok(None) => continue,
+            Ok(None) => {
+                #[cfg(target_os = "linux")]
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
             Err(e) => {
                 let _ = listener.reply(&error(format!("{e:#}"), false, None));
                 continue;
@@ -1247,19 +1444,123 @@ pub fn worker() -> Result<()> {
     Ok(())
 }
 
+pub fn verify_hello(config: &Config, expected: Option<&str>, hello: &Value) -> Result<()> {
+    ensure!(
+        hello["api_version"] == 1 && hello["registry_version"] == 1,
+        "DESKTOP_API_VERSION_MISMATCH"
+    );
+    ensure!(
+        hello["build_version"] == env!("CARGO_PKG_VERSION"),
+        "DESKTOP_BUILD_VERSION_MISMATCH: close clients and perform an orderly upgrade"
+    );
+    let identity = hello["installation_id"]
+        .as_str()
+        .context("HELLO_IDENTITY_MISSING")?;
+    uuid::Uuid::parse_str(identity)?;
+    if let Some(expected) = expected.or(config.installation_id.as_deref()) {
+        ensure!(
+            identity == expected,
+            "INSTALLATION_ID_MISMATCH: this pipe belongs to another installation"
+        );
+    }
+    let root =
+        fs::canonicalize(&config.data_directory).context("CONFIGURED_DATA_FOLDER_MISSING")?;
+    let actual = PathBuf::from(
+        hello["data_directory"]
+            .as_str()
+            .context("HELLO_DATA_DIRECTORY_MISSING")?,
+    );
+    ensure!(
+        root == actual,
+        "DATA_DIRECTORY_MISMATCH: this pipe belongs to another installation"
+    );
+    let capabilities = hello["capabilities"]
+        .as_array()
+        .context("HELLO_CAPABILITIES_MISSING")?;
+    ensure!(
+        [
+            "local-management-v1",
+            "target-installation-v1",
+            "runtime-rpc-v1"
+        ]
+        .iter()
+        .all(|cap| capabilities.contains(&json!(cap))),
+        "DESKTOP_CAPABILITY_MISMATCH"
+    );
+    Ok(())
+}
 pub fn client(config: &Config, request: &Request) -> Result<Value> {
-    local_ipc::call(&config.control.name, request)
+    let hello_request = Request {
+        version: 1,
+        target_installation: request
+            .target_installation
+            .clone()
+            .or(config.installation_id.clone()),
+        operation_id: None,
+        expected_generation: None,
+        action: Action::Hello,
+    };
+    let hello: Value = local_ipc::call(&config.control_endpoint(), &hello_request)?;
+    ensure!(
+        hello["ok"] == true,
+        "CONNECTION_REJECTED: {}",
+        hello["error"]
+    );
+    verify_hello(
+        config,
+        hello_request.target_installation.as_deref(),
+        &hello["result"],
+    )?;
+    if matches!(request.action, Action::Hello) {
+        return Ok(hello);
+    }
+    let mut request = request.clone();
+    request.target_installation = Some(
+        hello["result"]["installation_id"]
+            .as_str()
+            .context("HELLO_IDENTITY_MISSING")?
+            .into(),
+    );
+    local_ipc::call(&config.control_endpoint(), &request)
 }
 
 #[cfg(test)]
 mod regressions {
     use super::*;
+    #[cfg(windows)]
     use std::os::windows::fs::OpenOptionsExt;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_owner_lock_rejects_aliases_replacement_and_inheritance() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owner.lock");
+        let guard = lock(&path).unwrap();
+        assert!(lock(&path).is_err());
+        assert_ne!(
+            unsafe { libc::fcntl(guard.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(lock(&alias).is_err());
+        fs::remove_file(&alias).unwrap();
+        fs::hard_link(&path, &alias).unwrap();
+        assert!(lock(&alias).is_err());
+        drop(guard);
+        assert!(lock(&path).is_err());
+    }
 
     fn fixture() -> (tempfile::TempDir, Supervisor) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("defaults.toml");
-        fs::write(&path,format!("format_version=1\ndata_directory='data'\n[control]\ntransport='named-pipe'\nname='regression-{}'",id())).unwrap();
+        let transport = if cfg!(windows) {
+            "named-pipe"
+        } else {
+            "unix-socket"
+        };
+        fs::write(&path,format!("format_version=1\ndata_directory='data'\n[control]\ntransport='{transport}'\nname='regression-{}'",id())).unwrap();
         let supervisor = Supervisor::open(Config::load(&path).unwrap()).unwrap();
         (temp, supervisor)
     }
@@ -1356,6 +1657,7 @@ mod regressions {
         assert!(!supervisor.root(&state).exists());
     }
     #[test]
+    #[cfg(windows)]
     fn installation_sharing_violation_keeps_create_pending_and_same_identities() {
         let (_temp, mut supervisor) = fixture();
         let (request, state) = pending_create(&mut supervisor);
@@ -1398,12 +1700,26 @@ mod regressions {
     }
     #[test]
     fn recoverable_io_classification_does_not_retry_invalid_permanent_failures() {
-        for code in [32, 33, 170] {
+        #[cfg(windows)]
+        let temporary = [32, 33, 170];
+        #[cfg(target_os = "linux")]
+        let temporary = [libc::EBUSY, libc::EAGAIN, libc::EINTR];
+        for code in temporary {
             assert!(retryable(&anyhow::Error::from(
                 std::io::Error::from_raw_os_error(code)
             )));
         }
-        for code in [2, 3, 5, 87, 123] {
+        #[cfg(windows)]
+        let permanent = [2, 3, 5, 87, 123];
+        #[cfg(target_os = "linux")]
+        let permanent = [
+            libc::ENOENT,
+            libc::EACCES,
+            libc::EINVAL,
+            libc::ENOTDIR,
+            libc::ELOOP,
+        ];
+        for code in permanent {
             assert!(!retryable(&anyhow::Error::from(
                 std::io::Error::from_raw_os_error(code)
             )));

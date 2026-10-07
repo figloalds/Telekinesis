@@ -1,4 +1,4 @@
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 use std::fs;
 use tempfile::tempdir;
 use tkfs::{
@@ -8,7 +8,12 @@ use tkfs::{
 
 fn config(root: &std::path::Path, extra: &str) -> std::path::PathBuf {
     let path = root.join("defaults.toml");
-    fs::write(&path,format!("format_version=1\ndata_directory='data'\n{extra}\n[control]\ntransport='named-pipe'\nname='test-{}'\n",id())).unwrap();
+    let transport = if cfg!(windows) {
+        "named-pipe"
+    } else {
+        "unix-socket"
+    };
+    fs::write(&path,format!("format_version=1\ndata_directory='data'\n{extra}\n[control]\ntransport='{transport}'\nname='test-{}'\n",id())).unwrap();
     path
 }
 #[test]
@@ -56,7 +61,14 @@ fn defaults_reject_unknown_version_fields_and_network_and_resolve_relative_paths
         original.replace("format_version=1", "format_version=2"),
         original.replace("format_version=1", "format_version=1\nunknown=true"),
         format!("{original}\n[network]\nenabled=true\n"),
-        original.replace("transport='named-pipe'", "transport='tcp'"),
+        original.replace(
+            if cfg!(windows) {
+                "transport='named-pipe'"
+            } else {
+                "transport='unix-socket'"
+            },
+            "transport='tcp'",
+        ),
     ] {
         fs::write(&path, bad).unwrap();
         assert!(Config::load(&path).is_err());
@@ -142,6 +154,16 @@ fn interrupted_bootstrap_recovers_and_future_registry_or_wrong_owner_refuses() {
     let data = temp.path().join("data");
     fs::create_dir(&data).unwrap();
     fs::write(data.join("orchestrator.lock"), "").unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            data.join("orchestrator.lock"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
     drop(Supervisor::open(Config::load(&path).unwrap()).unwrap());
     let db = rusqlite::Connection::open(data.join("orchestrator.sqlite")).unwrap();
     db.execute_batch("PRAGMA user_version=2").unwrap();
