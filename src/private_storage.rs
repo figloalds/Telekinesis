@@ -160,6 +160,16 @@ mod tests {
     }
 }
 impl Directory {
+    #[cfg(windows)]
+    pub(crate) fn reserve_publication(&mut self) -> Result<&File> {
+        let previous = self
+            ._handles
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("PAIRING_PARENT_PIN_MISSING"))?;
+        let parent = crate::local_ipc::storage_publication_parent(&self.path, previous)?;
+        self._handles.push(parent);
+        Ok(self._handles.last().expect("reserved directory pin"))
+    }
     pub fn open(path: &Path) -> Result<Self> {
         let path = std::path::absolute(path)?;
         #[cfg(windows)]

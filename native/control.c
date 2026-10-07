@@ -81,7 +81,8 @@ done:
     LocalFree(user);return e;
 }
 /* flags: directory=1, create-private=2, check-owner/DACL=4, share-delete=8,
- * attributes-only=16 (inspection only), trusted-ancestor=32.
+ * attributes-only=16 (inspection only), trusted-ancestor=32,
+ * publication-parent=64 (reserve FILE_ADD_FILE on a private directory).
  * Open the reparse point itself, reject it, and retain handles to prevent path
  * replacement. Files must be single-link disk files, never an alias or device. */
 DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
@@ -96,10 +97,10 @@ DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
     SECURITY_ATTRIBUTES sa={sizeof sa,created,FALSE};
     /* Attribute-only opens do not participate in Windows sharing checks. Read
      * data/list-directory access makes the no-share-delete pin effective. */
-    DWORD access=FILE_READ_ATTRIBUTES|((flags&16)?0:FILE_READ_DATA)|((flags&(4|32))?READ_CONTROL:0);
+    DWORD access=FILE_READ_ATTRIBUTES|((flags&16)?0:FILE_READ_DATA)|((flags&(4|32))?READ_CONTROL:0)|((flags&64)?FILE_ADD_FILE:0);
     /* Directory write handles can mutate reparse metadata without a rename.
      * Deny those too while the namespace is pinned. Child file IO is separate. */
-    DWORD share=FILE_SHARE_READ|((flags&1)?0:FILE_SHARE_WRITE)|((flags&8)?FILE_SHARE_DELETE:0);
+    DWORD share=FILE_SHARE_READ|((flags&1)&&!(flags&64)?0:FILE_SHARE_WRITE)|((flags&8)?FILE_SHARE_DELETE:0);
     *out=CreateFileW(path,access,share,created?&sa:0,
         (flags&2)&&!(flags&1)?OPEN_ALWAYS:OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,0);
     if(*out==INVALID_HANDLE_VALUE){e=GetLastError();goto done;}
@@ -117,6 +118,22 @@ DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
 done:
     LocalFree(created);LocalFree(actual);
     if(e&&*out!=INVALID_HANDLE_VALUE){CloseHandle(*out);*out=INVALID_HANDLE_VALUE;}
+    return e;
+}
+/* Consume the old leaf pin and reserve namespace publication on the same
+ * validated directory. Ancestors remain pinned by the Rust caller. Refuse a
+ * reparse point or changed file identity during the transition; no ACL repair
+ * or delete sharing is introduced. Write sharing is required by the kernel's
+ * rename target open; callers must use the returned handle as RootDirectory,
+ * never resolve the publication path again after this transition. */
+DWORD tk_storage_publication_parent(LPCWSTR path,HANDLE previous,HANDLE *out) {
+    BY_HANDLE_FILE_INFORMATION before,after;DWORD e=0;
+    if(!GetFileInformationByHandle(previous,&before))e=GetLastError();
+    CloseHandle(previous);*out=INVALID_HANDLE_VALUE;if(e)return e;
+    e=tk_storage_open(path,1|4|64,out);if(e)return e;
+    if(!GetFileInformationByHandle(*out,&after))e=GetLastError();
+    else if(before.dwVolumeSerialNumber!=after.dwVolumeSerialNumber||before.nFileIndexHigh!=after.nFileIndexHigh||before.nFileIndexLow!=after.nFileIndexLow)e=ERROR_ACCESS_DENIED;
+    if(e){CloseHandle(*out);*out=INVALID_HANDLE_VALUE;}
     return e;
 }
 DWORD tk_owner_sid(LPWSTR out,DWORD count) {

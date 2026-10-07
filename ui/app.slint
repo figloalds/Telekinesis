@@ -3,6 +3,9 @@ import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, Spi
 export struct Project { label: string, id: string, status: string, mount: string, desired: bool }
 export struct BranchItem { id: string, label: string, shared: bool, current: bool }
 export struct CheckpointItem { id: string, label: string }
+export struct PairPeer { id: string, fingerprint: string, revoked: bool }
+export struct PairRepo { id: string, label: string, replica: string, branches: string }
+export struct PairGrant { peer: string, repo: string, enabled: bool, revoked: bool }
 
 // Standard controls and custom surfaces share Slint's resolved system palette.
 // Translucent Fluent controls must never sit on a fixed opposite-theme panel.
@@ -25,6 +28,30 @@ export component App inherits Window {
     preferred-width: 1180px; preferred-height: 820px; min-width: 980px; min-height: 720px;
     background: AppTheme.background; default-font-family: "Segoe UI"; default-font-size: 14px;
     in-out property <bool> first-run;
+    in-out property <int> main-page: 0;
+    in-out property <string> pair-config;
+    in-out property <string> pair-endpoint;
+    in-out property <string> pair-token;
+    in-out property <string> pair-identity;
+    in-out property <string> pair-review;
+    in-out property <bool> pair-ready;
+    in-out property <bool> pair-confirmed;
+    in-out property <bool> pair-grant-confirmed;
+    in-out property <bool> pair-revoke-confirmed;
+    in-out property <bool> pair-cancellable;
+    in-out property <[PairPeer]> pair-peers;
+    in-out property <[PairRepo]> pair-repos;
+    in-out property <int> pair-selected-peer: -1;
+    in-out property <int> pair-selected-repo: -1;
+    in-out property <string> pair-runtime;
+    in-out property <string> pair-local;
+    in-out property <string> pair-syncs;
+    in-out property <[PairGrant]> pair-grants;
+    out property <bool> pair-peer-active: root.pair-selected-peer >= 0 && root.pair-selected-peer < root.pair-peers.length && !root.pair-peers[root.pair-selected-peer].revoked;
+    out property <bool> pair-repo-selected: root.pair-peer-active && root.pair-selected-repo >= 0 && root.pair-selected-repo < root.pair-repos.length;
+    callback pair-action(int);
+    callback pair-cancel;
+    callback pair-grant-action(int, int);
     in-out property <bool> connected;
     in-out property <bool> working;
     in-out property <bool> create-visible;
@@ -120,7 +147,8 @@ export component App inherits Window {
                 Text { text: "Telekinesis"; color: white; font-size: 22px; font-weight: 650; }
                 Text { text: "Your projects.\nYour computer."; color: #afc4cf; font-size: 14px; }
                 Rectangle { height: 1px; background: #35515f; }
-                Text { text: root.first-run ? "01  Set up" : "01  Projects"; color: #8de0c4; font-size: 16px; font-weight: 600; }
+                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: root.first-run ? "01  Set up" : "01  Projects"; checkable: true; checked: root.main-page == 0; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; } } }
+                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "02  Connect a server"; checkable: true; checked: root.main-page == 1; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; } } }
                 Text { text: "Local workspace manager"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 Text { text: "LOCAL MODE"; color: #8de0c4; font-size: 11px; font-weight: 700; }
@@ -134,14 +162,14 @@ export component App inherits Window {
             HorizontalLayout {
                 VerticalLayout {
                     spacing: 6px;
-                    Heading { text: root.first-run ? "Make room for your projects" : "Projects"; }
-                    Caption { text: root.first-run ? "One portable installation, independent local workspaces." : "Manage the workspaces running on this computer."; }
+                    Heading { text: root.main-page == 1 ? "Connect a server" : root.first-run ? "Make room for your projects" : "Projects"; }
+                    Caption { text: root.main-page == 1 ? "Pair this device for authorized published-data sync." : root.first-run ? "One portable installation, independent local workspaces." : "Manage the workspaces running on this computer."; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
-                Button { text: "+ New project"; primary: true; enabled: root.connected && !root.working && !root.modal; visible: !root.first-run; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
+                Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; visible: root.main-page == 0; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
+                Button { text: "+ New project"; primary: true; enabled: root.connected && !root.working && !root.modal; visible: !root.first-run && root.main-page == 0; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
             }
-            Card {
+            if root.main-page == 0: Card {
                 height: 54px;
                 HorizontalLayout {
                     padding: 16px; spacing: 12px;
@@ -151,7 +179,7 @@ export component App inherits Window {
                     Caption { text: root.working ? "Working…" : "Local only"; vertical-alignment: center; }
                 }
             }
-            if root.first-run: Card {
+            if root.first-run && root.main-page == 0: Card {
                 VerticalLayout {
                     padding: 26px; spacing: 16px;
                     Text { text: "Choose two separate folders"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
@@ -169,7 +197,69 @@ export component App inherits Window {
                     Rectangle { vertical-stretch: 1; }
                 }
             }
-            if !root.first-run: HorizontalLayout {
+            if root.main-page == 1: Card {
+                ScrollView {
+                    VerticalLayout { padding: 22px; spacing: 14px;
+                        Text { text: "1  Protect this device's identity"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        Caption { text: "Create an outbound-only client, or load an existing client config. Keys are protected by Windows CurrentUser DPAPI; config stores only the credential reference. No listener or service is installed."; wrap: word-wrap; }
+                        LineEdit { accessible-label: "Pairing configuration path"; text <=> root.pair-config; enabled: !root.working; }
+                        HorizontalLayout {
+                            Button { text: "Create protected client"; enabled: !root.working; clicked => { root.pair-action(1); } }
+                            Button { text: "Load / refresh client"; enabled: !root.working; clicked => { root.pair-confirmed = false; root.pair-action(0); } }
+                        }
+                        Text { text: root.pair-identity; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                        Rectangle { height: 1px; background: AppTheme.border; }
+                        Text { text: "2  Review the server invitation"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        Caption { text: "Use the server's numeric WSS address and /tkfs/sync path. Paste the one-time invitation privately; it is cleared from the input when inspected and never saved. WSS is required; no downgrade is offered."; wrap: word-wrap; }
+                        LineEdit { accessible-label: "Server WSS sync endpoint"; placeholder-text: "wss://192.0.2.1:8443/tkfs/sync"; text <=> root.pair-endpoint; enabled: root.pair-ready && !root.working; }
+                        LineEdit { accessible-label: "Secret one-time invitation"; input-type: password; placeholder-text: "Paste invitation privately"; text <=> root.pair-token; enabled: root.pair-ready && !root.working; }
+                        HorizontalLayout {
+                            Button { text: "Inspect invitation"; enabled: root.pair-ready && !root.working && root.pair-token != ""; clicked => { root.pair-action(2); } }
+                            Button { text: "Discard invitation"; enabled: !root.working && (root.pair-token != "" || root.pair-review != ""); clicked => { root.pair-action(10); } }
+                        }
+                        Text { text: root.pair-review; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                        CheckBox { text: "I verified the server's exact certificate fingerprint with its owner"; checked <=> root.pair-confirmed; enabled: root.pair-review != "" && !root.working; }
+                        Button { text: "Enroll this device"; primary: true; enabled: root.pair-ready && root.pair-review != "" && root.pair-confirmed && !root.working; clicked => { root.pair-action(3); } }
+                        Rectangle { height: 1px; background: AppTheme.border; }
+                        Text { text: "3  Wait for local approval on the server"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        Caption { text: "Give the server owner your installation ID and certificate fingerprint shown above. They must approve that exact key locally, then grant a published repository to your replica. This client cannot approve itself or administer the server."; wrap: word-wrap; }
+                        for peer[index] in root.pair-peers: VerticalLayout {
+                            Button { text: peer.id + (peer.revoked ? " · Revoked" : " · Locally trusted key"); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working; clicked => { root.pair-selected-peer = index; root.pair-action(11); } }
+                            Caption { text: "SHA-256: " + peer.fingerprint; wrap: word-wrap; font-size: 12px; }
+                        }
+                        Button { text: "Check approval / load published repositories"; enabled: root.pair-ready && root.pair-peer-active && !root.working; clicked => { root.pair-action(4); } }
+                        Rectangle { height: 1px; background: AppTheme.border; }
+                        Text { text: "4  Configure a matching local replica"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        for repo[index] in root.pair-repos: VerticalLayout {
+                            Button { text: repo.label + " · " + repo.id; checkable: true; checked: root.pair-selected-repo == index; enabled: !root.working; clicked => { root.pair-selected-repo = index; root.pair-grant-confirmed = false; } }
+                            Caption { text: "Published branches (all are synchronized):\n" + repo.branches; wrap: word-wrap; font-size: 12px; }
+                        }
+                        Caption { text: "A running replica with the same repository ID and a different device ID is required. Select its native runtime.json. New replica provisioning/adoption is not supported by this screen. Mounting is configured on that local worker; sync leaves its current branch selected. Choose the local view in Branches & snapshots or the CLI."; wrap: word-wrap; }
+                        LineEdit { accessible-label: "Matching local replica runtime discovery path"; placeholder-text: "C:\\path\\to\\replica\\runtime.json"; text <=> root.pair-runtime; enabled: !root.working; }
+                        CheckBox { text: "Enable bidirectional sync for all published branches in this repository"; checked <=> root.pair-grant-confirmed; enabled: root.pair-repo-selected && !root.working; }
+                        Button { text: "Configure published-data sync"; enabled: root.pair-repo-selected && root.pair-runtime != "" && root.pair-grant-confirmed && !root.working; clicked => { root.pair-action(5); } }
+                        Text { text: root.pair-local; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                        HorizontalLayout {
+                            Button { text: "Sync now / next page"; enabled: root.pair-ready && root.pair-repo-selected && !root.working; clicked => { root.pair-action(6); } }
+                            Button { text: "Pause sync"; enabled: root.pair-repo-selected && !root.working; clicked => { root.pair-action(7); } }
+                            Button { text: "Resume sync grant"; enabled: root.pair-repo-selected && !root.working; clicked => { root.pair-action(8); } }
+                        }
+                        Caption { text: "Private branches and deleted private history stay local. Cancel stops local I/O; it does not undo enrollment or committed sync data. An uncertain enrollment may require a fresh invitation. No background sync service is started by this flow."; wrap: word-wrap; }
+                        Button { text: "Cancel current network operation"; enabled: root.working && root.pair-cancellable; clicked => { root.pair-cancel(); } }
+                        Text { text: root.pair-syncs; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                        for grant[index] in root.pair-grants: VerticalLayout {
+                            Caption { text: "Configured repository: " + grant.repo + (grant.revoked ? " · Revoked" : grant.enabled ? " · Enabled" : " · Paused"); wrap: word-wrap; }
+                            HorizontalLayout {
+                                Button { text: "Sync configured repository"; enabled: root.pair-ready && grant.enabled && !grant.revoked && !root.working; clicked => { root.pair-grant-action(index, 0); } }
+                                Button { text: grant.enabled ? "Pause" : "Resume"; enabled: !grant.revoked && !root.working; clicked => { root.pair-grant-action(index, grant.enabled ? 1 : 2); } }
+                            }
+                        }
+                        CheckBox { text: "I understand revocation is local and cannot be undone with Resume"; checked <=> root.pair-revoke-confirmed; enabled: root.pair-peer-active && !root.working; }
+                        Button { text: "Revoke selected peer locally"; enabled: root.pair-peer-active && root.pair-revoke-confirmed && !root.working; clicked => { root.pair-action(9); } }
+                    }
+                }
+            }
+            if !root.first-run && root.main-page == 0: HorizontalLayout {
                 spacing: 18px;
                 Card {
                     width: 240px;
@@ -213,7 +303,7 @@ export component App inherits Window {
                         if root.details-page == 1: ScrollView { VerticalLayout {
                             spacing: 12px;
                             Text { text: root.runtime-ready ? "Current: " + root.current-branch-name : "Branch controls unavailable"; color: AppTheme.foreground; font-size: 17px; font-weight: 600; wrap: word-wrap; }
-                            Caption { text: root.runtime-ready ? (root.current-branch-shared ? "Shared branch · no peer configured for this managed project" : "Private branch · stays on this computer") : "Start the project, then refresh. Sampled or unavailable runtime state cannot authorize branch actions."; wrap: word-wrap; }
+                            Caption { text: root.runtime-ready ? (root.current-branch-shared ? "Shared branch · sync requires a published-data grant" : "Private branch · stays on this computer") : "Start the project, then refresh. Sampled or unavailable runtime state cannot authorize branch actions."; wrap: word-wrap; }
                             HorizontalLayout {
                                 Button { text: "New private branch…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(1); } }
                                 Button { text: "Switch to selected…"; enabled: root.can-checkout; clicked => { root.begin-branch-action(2); } }
@@ -221,7 +311,7 @@ export component App inherits Window {
                             ListView { height: min(180px, max(95px, root.branches.length * 52px));
                                 for branch[index] in root.branches: VerticalLayout { spacing: 3px; padding-bottom: 7px;
                                     Button { text: branch.label + (branch.shared ? " · Shared" : " · Private") + (branch.current ? " · Current" : ""); checkable: true; checked: root.selected-branch == index; enabled: !root.working && !root.modal; clicked => { root.selected-branch = index; } }
-                                    Caption { text: branch.shared ? "Shared · no peer configured" : "Private · local only"; }
+                                    Caption { text: branch.shared ? "Shared · published-data grants apply" : "Private · local only"; }
                                 }
                             }
                             Button { text: "Publish current visible state…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(3); } }
@@ -305,7 +395,7 @@ export component App inherits Window {
             VerticalLayout { padding: 26px; spacing: 15px;
                 Heading { font-size: 23px; text: root.branch-dialog == 1 ? "New private branch" : root.branch-dialog == 2 ? "Switch branch" : root.branch-dialog == 3 ? "Publish visible state" : root.branch-dialog == 4 ? "Save checkpoint" : "Restore to private branch"; }
                 Caption { text: "Project: " + (root.selected >= 0 ? root.projects[root.selected].label : "") + " · Current branch: " + root.current-branch-name; wrap: word-wrap; }
-                Caption { text: root.branch-dialog == 1 ? "Copies the current visible files into a new private branch. The current branch stays selected." : root.branch-dialog == 2 ? "Switch to " + root.branch-target-label + ". Close files, editors, and Explorer windows using this project first. The mounted view is rebound only after the runtime's busy checks pass." : root.branch-dialog == 3 ? "Creates a NEW shared branch from the visible files only. Private history, deleted private content, and private conflict alternatives remain on this computer. This project has no peer configured." : root.branch-dialog == 4 ? "Saves a local checkpoint of the current visible files. It does not switch branches or upload anything." : "Restores " + root.branch-target-label + " into a NEW private branch. Current files and the active branch stay unchanged; switch to the restored branch when ready."; wrap: word-wrap; }
+                Caption { text: root.branch-dialog == 1 ? "Copies the current visible files into a new private branch. The current branch stays selected." : root.branch-dialog == 2 ? "Switch to " + root.branch-target-label + ". Close files, editors, and Explorer windows using this project first. The mounted view is rebound only after the runtime's busy checks pass." : root.branch-dialog == 3 ? "Creates a NEW shared branch from the visible files only. Private history, deleted private content, and private conflict alternatives remain on this computer. Shared branches may synchronize when a published-data grant is enabled." : root.branch-dialog == 4 ? "Saves a local checkpoint of the current visible files. It does not switch branches or upload anything." : "Restores " + root.branch-target-label + " into a NEW private branch. Current files and the active branch stay unchanged; switch to the restored branch when ready."; wrap: word-wrap; }
                 if root.branch-dialog != 2: VerticalLayout {
                     Text { text: root.branch-dialog == 4 ? "Checkpoint message" : "New branch name"; color: AppTheme.foreground; }
                     LineEdit { accessible-label: root.branch-dialog == 4 ? "Checkpoint message" : "New branch name"; text <=> root.branch-input; enabled: !root.working; }
@@ -328,7 +418,7 @@ export component App inherits Window {
                 Caption { text: "Experimental Windows local filesystem manager. One application executable; isolated supervisor and worker processes. WinFsp is required for mounted projects."; wrap: word-wrap; }
                 AboutSlint { height: 105px; }
                 Caption { text: "Slint 1.17.0 uses the Royalty-free Desktop, Mobile, and Web Applications License 2.0 with AboutSlint attribution. This does not impose GPL on your own application code. This repository already declares GPL-3.0-or-later independently. See the bundled license texts and THIRD-PARTY-NOTICES.md."; wrap: word-wrap; }
-                Caption { text: "This first slice supports local projects. Pairing, adoption, trash, and Windows service setup are deferred."; wrap: word-wrap; }
+                Caption { text: "Local projects and guided outbound WSS pairing are supported. Replica provisioning/adoption, trash, and Windows service setup are deferred."; wrap: word-wrap; }
                 HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Close"; clicked => { root.about-visible = false; } } }
             }
         }

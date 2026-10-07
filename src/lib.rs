@@ -5,6 +5,8 @@ pub mod desktop;
 #[cfg(windows)]
 pub mod desktop_branch;
 #[cfg(windows)]
+pub mod desktop_pairing;
+#[cfg(windows)]
 pub mod local_ipc;
 #[cfg(target_os = "linux")]
 #[path = "local_ipc_linux.rs"]

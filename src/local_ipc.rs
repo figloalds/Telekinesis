@@ -9,6 +9,11 @@ use std::{
 
 unsafe extern "C" {
     fn tk_storage_open(path: *const u16, flags: u32, out: *mut *mut std::ffi::c_void) -> u32;
+    fn tk_storage_publication_parent(
+        path: *const u16,
+        previous: *mut std::ffi::c_void,
+        out: *mut *mut std::ffi::c_void,
+    ) -> u32;
     fn tk_pipe_listen(name: *const u16, out: *mut *mut std::ffi::c_void) -> u32;
     fn tk_pipe_accept(pipe: *mut std::ffi::c_void) -> u32;
     fn tk_pipe_disconnect(pipe: *mut std::ffi::c_void) -> u32;
@@ -31,6 +36,17 @@ pub(crate) fn storage_handle(path: &Path, flags: u32) -> Result<File> {
     let mut handle = std::ptr::null_mut();
     check(unsafe { tk_storage_open(encoded.as_ptr(), flags, &mut handle) })
         .with_context(|| format!("PAIRING_STORAGE_UNSAFE: {} (flags {flags})", path.display()))?;
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+pub(crate) fn storage_publication_parent(path: &Path, previous: File) -> Result<File> {
+    use std::os::windows::{ffi::OsStrExt, io::IntoRawHandle};
+    let encoded: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut handle = std::ptr::null_mut();
+    // The native routine consumes previous on every outcome.
+    check(unsafe {
+        tk_storage_publication_parent(encoded.as_ptr(), previous.into_raw_handle(), &mut handle)
+    })
+    .context("PAIRING_CONFIG_PARENT_RESERVATION")?;
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 fn check(code: u32) -> Result<()> {

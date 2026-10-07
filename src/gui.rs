@@ -10,13 +10,17 @@ use std::{
 use tkfs::{
     desktop::{self, Paths, Session},
     desktop_branch::{BranchAction, BranchClient, BranchContext},
+    desktop_pairing::{Client as PairClient, Snapshot as PairSnapshot},
     orchestrator::Action,
 };
 slint::include_modules!();
 #[path = "gui_branch_acceptance.rs"]
 mod branch_acceptance;
+#[path = "gui_pairing_acceptance.rs"]
+mod pairing_acceptance;
 
 enum Job {
+    Pair(PathBuf, PairJob),
     Setup(PathBuf, PathBuf, usize),
     Connect,
     Refresh,
@@ -32,8 +36,27 @@ enum Job {
     Branch(BranchContext, BranchAction),
     RetryBranch,
 }
+enum PairJob {
+    Load(PathBuf),
+    Create(PathBuf),
+    Inspect(zeroize::Zeroizing<String>, String),
+    Clear,
+    Join(String, bool),
+    List(String),
+    Configure(String, String, PathBuf, bool),
+    Enable(String, String, bool),
+    Sync(String, String),
+    Revoke(String, bool),
+    SelectPeer(String),
+}
+impl PairJob {
+    fn cancellable(&self) -> bool {
+        matches!(self, Self::Join(..) | Self::List(..) | Self::Sync(..))
+    }
+}
 #[derive(Default)]
 struct View {
+    pairing: PairSnapshot,
     connected: bool,
     first_run: bool,
     connection: String,
@@ -56,6 +79,8 @@ struct View {
     folder: Option<(i32, String)>,
 }
 struct Controller {
+    pairing: Option<PairClient>,
+    pair_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     paths: Paths,
     session: Option<Session>,
     selected: Option<String>,
@@ -125,6 +150,23 @@ fn connection_error(view: &mut View, has_session: bool, refresh: bool, error: &s
 impl Controller {
     fn execute(&mut self, job: Job) -> Result<View> {
         match job {
+            Job::Pair(path, job) => {
+                if !matches!(job, PairJob::Load(..) | PairJob::Create(..)) {
+                    ensure!(
+                        std::fs::canonicalize(path)?
+                            == self
+                                .pairing
+                                .as_ref()
+                                .context("PAIRING_CONFIG_REQUIRED")?
+                                .path(),
+                        "PAIRING_CONFIG_CHANGED"
+                    );
+                }
+                let message = self.pair_job(job)?;
+                let mut view = self.view();
+                view.message = Some((message, false));
+                Ok(view)
+            }
             Job::Setup(data, mounts, limit) => {
                 desktop::bootstrap(&self.paths, &data, &mounts, limit)?;
                 self.session = Some(Session::connect(self.paths.clone())?);
@@ -426,7 +468,7 @@ impl Controller {
                             "\n{} · {}",
                             text(branch, "name"),
                             if branch["shared"] == true {
-                                "Shared branch, no peer configured"
+                                "Shared branch, sync requires an explicit published-data grant"
                             } else {
                                 "Private, local only"
                             }
@@ -469,6 +511,11 @@ impl Controller {
     }
     fn view(&self) -> View {
         let mut view = View {
+            pairing: self
+                .pairing
+                .as_ref()
+                .map(PairClient::snapshot)
+                .unwrap_or_default(),
             first_run: !self.paths.config.exists(),
             connection: "Disconnected · reconnect to load projects".into(),
             selected: -1,
@@ -554,10 +601,146 @@ impl Controller {
         }
         view
     }
+    fn pair_job(&mut self, job: PairJob) -> Result<String> {
+        match job {
+            PairJob::Load(path) => {
+                self.pairing = None;
+                self.pairing = Some(PairClient::open(&path)?);
+                return Ok("Client configuration loaded. Review its credential reference and server invitation.".into());
+            }
+            PairJob::Create(path) => {
+                self.pairing = None;
+                self.pairing = Some(PairClient::create(&path)?);
+                return Ok("Outbound-only client created with a CurrentUser DPAPI credential. No listener or service was installed.".into());
+            }
+            _ => {}
+        }
+        let client = self.pairing.as_mut().context("PAIRING_CONFIG_REQUIRED")?;
+        let stop = self.pair_stop.clone();
+        match job {
+            PairJob::Inspect(token, endpoint) => {
+                client.inspect(token, &endpoint)?;
+                Ok("Invitation inspected locally. Verify the exact server fingerprint before enrollment.".into())
+            }
+            PairJob::Clear => {
+                client.clear_invitation();
+                Ok("Invitation discarded without sending it.".into())
+            }
+            PairJob::SelectPeer(peer) => {
+                client.select_peer(&peer);
+                Ok("Peer selected. Check approval to reload its authorized published repositories.".into())
+            }
+            PairJob::Join(endpoint, confirmed) => {
+                client.join(&endpoint, confirmed, stop)?;
+                Ok("Enrollment submitted. Ask the server owner to approve your exact installation and certificate, then check approval. Pairing grants no repository or administrative access.".into())
+            }
+            PairJob::List(peer) => {
+                client.list(&peer, stop)?;
+                Ok("Server authenticated this certificate. Only authorized published repositories are shown; an empty list means no repository grants.".into())
+            }
+            PairJob::Configure(peer, repo, runtime, confirmed) => {
+                client.configure(&peer, &repo, &runtime, confirmed)?;
+                Ok("Published-data sync configured for the matching running local replica. All shared branches in this repository are covered; no background service was started.".into())
+            }
+            PairJob::Enable(peer, repo, enabled) => {
+                client.enable(&peer, &repo, enabled)?;
+                Ok(if enabled {
+                    "Local sync grant resumed. Select Sync now to continue."
+                } else {
+                    "Local sync grant paused. Durable data is retained."
+                }
+                .into())
+            }
+            PairJob::Sync(peer, repo) => {
+                let reply = client.sync(&peer, &repo, stop)?;
+                Ok(format!(
+                    "Sync page committed. {} more work remains. Sync again to resume; the current mounted branch is unchanged.",
+                    if reply["caught_up"] == true {
+                        "No"
+                    } else {
+                        "Possibly"
+                    }
+                ))
+            }
+            PairJob::Revoke(peer, confirmed) => {
+                client.revoke(&peer, confirmed)?;
+                Ok("Peer revoked locally. Resume cannot restore a revoked pairing; the server owner must revoke their side separately.".into())
+            }
+            PairJob::Load(..) | PairJob::Create(..) => unreachable!(),
+        }
+    }
 }
 
 fn apply(ui: &App, view: View) {
     use slint::Model;
+    let old_peer = ui
+        .get_pair_peers()
+        .row_data(ui.get_pair_selected_peer() as usize)
+        .map(|p| p.id);
+    let old_repo = ui
+        .get_pair_repos()
+        .row_data(ui.get_pair_selected_repo() as usize)
+        .map(|r| r.id);
+    let peers = view
+        .pairing
+        .peers
+        .into_iter()
+        .map(|(id, fingerprint, revoked)| PairPeer {
+            id: id.into(),
+            fingerprint: fingerprint.into(),
+            revoked,
+        })
+        .collect::<Vec<_>>();
+    let peer = peers
+        .iter()
+        .position(|p| p.id.as_str() == view.pairing.peer)
+        .or_else(|| peers.iter().position(|p| Some(&p.id) == old_peer.as_ref()))
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+    let repos = view
+        .pairing
+        .published
+        .into_iter()
+        .map(|state| PairRepo {
+            id: state.repo.into(),
+            label: state.label.into(),
+            replica: state.replica.into(),
+            branches: state
+                .branches
+                .iter()
+                .map(|b| format!("{} · {}", b.name, b.id))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into(),
+        })
+        .collect::<Vec<_>>();
+    let repo = repos
+        .iter()
+        .position(|r| Some(&r.id) == old_repo.as_ref())
+        .map(|i| i as i32)
+        .unwrap_or(if repos.is_empty() { -1 } else { 0 });
+    ui.set_pair_ready(view.pairing.ready);
+    ui.set_pair_identity(view.pairing.identity.into());
+    ui.set_pair_review(view.pairing.review.into());
+    ui.set_pair_peers(ModelRc::new(VecModel::from(peers)));
+    ui.set_pair_repos(ModelRc::new(VecModel::from(repos)));
+    ui.set_pair_selected_peer(peer);
+    ui.set_pair_selected_repo(repo);
+    ui.set_pair_syncs(view.pairing.syncs.into());
+    ui.set_pair_local(view.pairing.local.into());
+    ui.set_pair_grants(ModelRc::new(VecModel::from(
+        view.pairing
+            .grants
+            .into_iter()
+            .map(|(peer, repo, enabled, revoked)| PairGrant {
+                peer: peer.into(),
+                repo: repo.into(),
+                enabled,
+                revoked,
+            })
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_pair_cancellable(false);
     let old_project = ui
         .get_projects()
         .row_data(ui.get_selected() as usize)
@@ -693,6 +876,7 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     ui.set_config_path(display_path(&paths.config).into());
     ui.set_data_folder(display_path(&paths.folder.join("data")).into());
     ui.set_mount_folder(display_path(&paths.folder.join("Projects")).into());
+    ui.set_pair_config(display_path(&paths.folder.join(".tkfs-pairing/client.toml")).into());
     let first_run = !paths.config.try_exists()?;
     ui.set_first_run(first_run);
     ui.set_connection(
@@ -706,8 +890,12 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     let weak = ui.as_weak();
     let worker_weak = weak.clone();
+    let pair_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stop = pair_stop.clone();
     std::thread::spawn(move || {
         let mut controller = Controller {
+            pairing: None,
+            pair_stop: worker_stop,
             paths,
             session: None,
             selected: None,
@@ -715,6 +903,7 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
             branch_client: None,
         };
         for job in receiver {
+            let pairing = matches!(job, Job::Pair(..));
             let refresh = matches!(job, Job::Refresh | Job::Connect | Job::Setup(..));
             let result = controller.execute(job);
             let view = match result {
@@ -727,8 +916,12 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                         refresh,
                         &format!("{e:#}"),
                     );
-                    view.message = Some((describe_error(&format!("{e:#}")), true));
-                    view.operation.push_str(&format!("\nDetails: {e:#}"));
+                    if pairing {
+                        view.message = Some((tkfs::desktop_pairing::error_message(&e), true));
+                    } else {
+                        view.message = Some((describe_error(&format!("{e:#}")), true));
+                        view.operation.push_str(&format!("\nDetails: {e:#}"));
+                    }
                     view
                 }
             };
@@ -756,6 +949,115 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     callback!(on_inspect_operation, Job::Operation);
     callback!(on_open_project, Job::Open);
     callback!(on_retry_branch, Job::RetryBranch);
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        let stop = pair_stop.clone();
+        ui.on_pair_action(move |action| {
+            use slint::Model;
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_working() {
+                return;
+            }
+            if matches!(action, 0 | 1 | 11) {
+                ui.set_pair_token("".into());
+                ui.set_pair_confirmed(false);
+                ui.set_pair_grant_confirmed(false);
+                ui.set_pair_revoke_confirmed(false);
+            }
+            if action == 4 {
+                ui.set_pair_grant_confirmed(false);
+            }
+            let peer = ui
+                .get_pair_peers()
+                .row_data(ui.get_pair_selected_peer() as usize)
+                .map(|p| p.id.to_string())
+                .unwrap_or_default();
+            let repo = ui
+                .get_pair_repos()
+                .row_data(ui.get_pair_selected_repo() as usize)
+                .map(|r| r.id.to_string())
+                .unwrap_or_default();
+            let job = match action {
+                0 => PairJob::Load(PathBuf::from(ui.get_pair_config().as_str())),
+                1 => PairJob::Create(PathBuf::from(ui.get_pair_config().as_str())),
+                2 => {
+                    let token = zeroize::Zeroizing::new(ui.get_pair_token().to_string());
+                    ui.set_pair_token("".into());
+                    ui.set_pair_confirmed(false);
+                    PairJob::Inspect(token, ui.get_pair_endpoint().to_string())
+                }
+                3 => PairJob::Join(ui.get_pair_endpoint().to_string(), ui.get_pair_confirmed()),
+                4 => PairJob::List(peer),
+                5 => PairJob::Configure(
+                    peer,
+                    repo,
+                    PathBuf::from(ui.get_pair_runtime().as_str()),
+                    ui.get_pair_grant_confirmed(),
+                ),
+                6 => PairJob::Sync(peer, repo),
+                7 => PairJob::Enable(peer, repo, false),
+                8 => PairJob::Enable(peer, repo, true),
+                9 => PairJob::Revoke(peer, ui.get_pair_revoke_confirmed()),
+                10 => {
+                    ui.set_pair_token("".into());
+                    ui.set_pair_confirmed(false);
+                    PairJob::Clear
+                }
+                11 => {
+                    ui.set_pair_confirmed(false);
+                    ui.set_pair_grant_confirmed(false);
+                    ui.set_pair_revoke_confirmed(false);
+                    PairJob::SelectPeer(peer)
+                }
+                _ => return,
+            };
+            stop.store(false, std::sync::atomic::Ordering::Relaxed);
+            ui.set_pair_cancellable(job.cancellable());
+            ui.set_message("Pairing operation in progress…".into());
+            ui.set_error(false);
+            enqueue(
+                &weak,
+                &sender,
+                Job::Pair(PathBuf::from(ui.get_pair_config().as_str()), job),
+            );
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        let stop = pair_stop.clone();
+        ui.on_pair_grant_action(move |index, action| {
+            use slint::Model;
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_working() {
+                return;
+            }
+            let Some(grant) = ui.get_pair_grants().row_data(index as usize) else {
+                return;
+            };
+            let job = if action == 0 {
+                PairJob::Sync(grant.peer.to_string(), grant.repo.to_string())
+            } else {
+                PairJob::Enable(grant.peer.to_string(), grant.repo.to_string(), action == 2)
+            };
+            stop.store(false, std::sync::atomic::Ordering::Relaxed);
+            ui.set_pair_cancellable(job.cancellable());
+            enqueue(
+                &weak,
+                &sender,
+                Job::Pair(PathBuf::from(ui.get_pair_config().as_str()), job),
+            );
+        });
+    }
+    {
+        let stop = pair_stop.clone();
+        ui.on_pair_cancel(move || stop.store(true, std::sync::atomic::Ordering::Relaxed));
+    }
     {
         let weak = weak.clone();
         let sender = sender.clone();
@@ -863,6 +1165,7 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                     && !ui.get_shutdown_visible()
                     && !ui.get_about_visible()
                     && ui.get_branch_dialog() == 0
+                    && ui.get_main_page() == 0
                 {
                     enqueue(&weak, &sender, Job::Refresh);
                 }
@@ -878,6 +1181,7 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
         None
     };
     ui.run()?;
+    pair_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     drop(test_timer);
     drop(timer);
     drop(sender);
@@ -932,13 +1236,20 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
     let started = std::time::Instant::now();
     let mut ticks = 0;
     let phase = std::env::var("TKFS_UI_TEST_PHASE").unwrap_or_else(|_| "first".into());
+    let mut pairing_acceptance = if phase == "pairing" {
+        Some(pairing_acceptance::Acceptance::from_stdin()?)
+    } else {
+        None
+    };
     branch_acceptance.set_phase(&phase);
     timer.start(slint::TimerMode::Repeated,Duration::from_millis(300),move || {
         let Some(ui)=weak.upgrade()else{return;};ticks+=1;
         let result=(||->Result<bool>{
             ensure!(started.elapsed()<Duration::from_secs(100),"UI_TEST_TIMEOUT at step {step}");
             if ticks<3 || ui.get_working(){return Ok(false);}
-            if phase.starts_with("branches") {
+            if let Some(pairing)=&mut pairing_acceptance {
+                return pairing.tick(&ui,&directory,&mut checks);
+            } else if phase.starts_with("branches") {
                 return branch_acceptance.tick(&ui,&directory,&mut checks);
             } else if phase=="invalid-catalog" {
                 ensure!(!ui.get_connected() && ui.get_error(),"INVALID_CATALOG_NOT_REFUSED: {}",ui.get_message());
@@ -981,6 +1292,8 @@ mod tests {
     fn captured_branch_action_never_follows_a_changed_project_selection() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller {
+            pairing: None,
+            pair_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paths: Paths {
                 executable: directory.path().join("fixture.exe"),
                 folder: directory.path().into(),
