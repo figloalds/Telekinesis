@@ -712,3 +712,400 @@ isolation; separate paths passed a bounded read-only experiment. Production
 checkout still remounts a quiet view, and production CAS still stores whole-file
 objects. Research findings do not imply writable branch mounts or a storage
 format migration.
+
+## Your own Dropbox: mount A's project on B over WSS
+
+This is the currently supported two-device workflow: Linux server A owns a
+project, Windows B mounts an independent local replica, and B initiates WSS
+connections that carry changes in both directions. B's mount reads its own local
+SQLite/CAS; it is not a remote filesystem mount or an ordinary folder watched by
+a sync agent. Save and close files inside the TKFS mount to publish shared changes.
+
+**Current integration gap:** O1 runs on Windows and Linux, but its
+`orchestrator.toml` must keep networking disabled. WSS uses a separate
+`pairing.toml` and `tkfs pairing ... run` process, which O1 does not supervise.
+O1 `create` cannot select an existing repository UUID or adopt a downloaded
+replica. Therefore A can use a managed worker, while B's replica below uses
+`init --state ... --repo ...` and a separately started `daemon`. B's O1/desktop
+can manage other local projects, but this replica is not added to that catalog.
+There is no remote create/mount command. See [local onboarding](docs/ONBOARDING.md).
+
+### 1. Choose owners, paths and an already authorized network route
+
+- Use compatible TKFS builds on both machines (current peer format **5**).
+  Windows B needs x64 Windows and installed WinFsp. A needs native Linux storage;
+  use `/home/...` rather than `/mnt/c` inside WSL. Headless A needs no FUSE mount;
+  mounting on Linux additionally needs `/dev/fuse` and `fusermount3`.
+- Run each machine's worker, pairing service and local CLI under the same OS
+  owner. Keep state, pairing storage and mounts in separate owner-controlled
+  native directories with safe ancestors. Linux private directories/files use
+  0700/0600. Windows checks actual ownership and ACLs. Unsafe existing storage is
+  refused; do not weaken ACLs or copy another machine's state to bypass this.
+- A needs one reachable **numeric** IP/port, for example your authorized LAN/VPN
+  address with port 43180. B needs only outbound access to it. Select and authorize
+  network/firewall rules separately; this guide does not change them. A WSL
+  loopback test does not prove another computer can reach that WSL instance.
+- Linux production credentials require systemd 250+ and an operator-configured
+  encrypted-credential policy. If this is unavailable, stop at credential setup;
+  there is no production plaintext fallback. Test helpers are not credential
+  providers. Service installation/no-login boot remains separate qualification.
+
+Replace every placeholder below before running it. Define these public path
+variables in each terminal where they are used; choose a **new** installation
+folder, and use absolute executable paths rather than depending on PATH.
+
+```bash
+# A: ordinary shell, as the intended Linux owner. Replace YOUR_USER and binary path.
+TKFS_A=/absolute/path/to/tkfs
+A=/home/YOUR_USER/TKFS-A
+umask 077
+mkdir -m 700 "$A"
+```
+
+```powershell
+# B: PowerShell, as the intended Windows owner. Replace the binary path.
+$tkfs = 'C:\absolute\path\tkfs.exe'
+$B = Join-Path $env:USERPROFILE 'TKFS-B'
+New-Item -ItemType Directory -Path $B | Out-Null
+```
+
+PowerShell examples pipe CLI output to `Out-Host` so the Windows desktop-subsystem
+executable is awaited and its output stays visible, including foreground processes.
+
+### 2. Start local orchestration and identify A's project
+
+On A, initialize its local catalog, then keep the foreground supervisor running:
+
+```bash
+"$TKFS_A" init -f "$A/orchestrator.toml"
+"$TKFS_A" start -f "$A/orchestrator.toml"
+```
+
+In a second A terminal, define `TKFS_A`/`A` again. For a fresh empty catalog, create
+a headless project; the expected catalog generation is initially 0:
+
+```bash
+"$TKFS_A" --generation 0 manage -f "$A/orchestrator.toml" create MyProject
+```
+
+Record `state_id`, `repo_id` and `device_id` from the result. If you already have
+A's project, use `manage ... list` / `manage ... inspect STATE_UUID` instead of
+creating another one. For a mounted A project with working FUSE, use
+`"$TKFS_A" create MyProject -f "$A/orchestrator.toml"` **instead of** the headless
+create. The rest of the pairing flow is identical.
+
+```bash
+# Public IDs from A's chosen project; replace these strings.
+A_STATE='<A state_id>'
+REPO='<A repo_id>'
+A_DEVICE='<A device_id>'
+RUNTIME_A="$A/.tkfs/data/states/$A_STATE/runtime.json"
+"$TKFS_A" --runtime "$RUNTIME_A" status
+"$TKFS_A" --runtime "$RUNTIME_A" branches
+```
+
+Keep the project on its shared `main` branch for the initial test. The pairing
+installation UUID, O1 installation UUID, repository UUID and worker device UUID
+are different concepts; a repo/device UUID alone grants no network access.
+
+On B, initialize and start its local O1 supervisor in another terminal if you want
+local management alongside the replica:
+
+```powershell
+& $tkfs init -f "$B\orchestrator.toml" | Out-Host
+& $tkfs start -f "$B\orchestrator.toml" | Out-Host
+```
+
+### 3. Initialize B's replica with the same repo and a NEW device
+
+In another B terminal, define `$tkfs`/`$B` again, then:
+
+```powershell
+$repo = '<A repo_id>'
+$StateB = Join-Path $B 'replicas\MyProject'
+$MountB = Join-Path $B 'SharedProjects\MyProject'
+New-Item -ItemType Directory -Path (Split-Path $MountB) | Out-Null
+& $tkfs init --state $StateB --repo $repo | Out-Host
+& $tkfs daemon --state $StateB --mount $MountB | Out-Host
+```
+
+The mount target itself must not exist. Record B's `device` UUID from `init`; it
+must differ from A's `device_id`. Keep this daemon running in its own terminal.
+Its discovery file is `$StateB\runtime.json`. Never initialize this replica with
+ordinary `tkfs create`: that allocates a different repository. Never copy A's
+SQLite, device identity, `runtime.json`, `worker.json` or private key to B.
+Exchange only the public repo/device/installation UUIDs and fingerprints.
+
+### 4. Configure separate WSS services and protect their credentials
+
+Run `tkfs pairing new-id` once on each machine. Put the two distinct returned
+public UUIDs into the respective configs. These are the pairing installation
+IDs `PAIR_A` and `PAIR_B`, not the worker device IDs.
+
+Create `$A/pairing.toml` on A with the following fields. Replace `PAIR_A_UUID` and
+`A_NUMERIC_IP`; use brackets around a numeric IPv6 address. Bind the intended
+interface and advertise exactly the reachable address, with an explicit port.
+
+```toml
+format_version = 1
+installation = "PAIR_A_UUID"
+transport = "wss"
+inbound = true
+dial = false
+data_directory = "pairing-data"
+listen = "A_NUMERIC_IP:43180"
+advertise = "wss://A_NUMERIC_IP:43180/tkfs/sync"
+enrollment_advertise = "wss://A_NUMERIC_IP:43180/tkfs/enroll"
+[credential]
+backend = "systemd"
+name = "tkfs.identity"
+```
+
+Create `$B\pairing.toml` on B, replacing `PAIR_B_UUID`:
+
+```toml
+format_version = 1
+installation = "PAIR_B_UUID"
+transport = "wss"
+inbound = false
+dial = true
+data_directory = "pairing-data"
+advertise = "outbound-only"
+[credential]
+backend = "windows-dpapi"
+file = "pairing-data/identity.dpapi"
+```
+
+Relative pairing paths resolve beside **pairing.toml**, not the shell's cwd.
+WSS has one A listener: omit `enrollment_listen`. Outbound-only B must omit
+`listen` and `enrollment_advertise`. Do not change O1's `network.enabled` to true.
+DNS names, browser login and trusted reverse-proxy TLS termination are not
+supported by this flow. TKFS terminates TLS 1.3 directly and pins the approved
+device certificate; non-loopback transport uses `wss`, with no insecure downgrade.
+
+On B, explicitly create its CurrentUser DPAPI credential, then run its service
+in a dedicated terminal:
+
+```powershell
+& $tkfs pairing -f "$B\pairing.toml" credential-init | Out-Host
+& $tkfs pairing -f "$B\pairing.toml" status | Out-Host
+& $tkfs pairing -f "$B\pairing.toml" run | Out-Host
+```
+
+On A, the operator first prepares a new encrypted credential destination and
+reviews the host/TPM policy described in [credential provisioning](docs/PAIRING.md#configuration-and-credentials).
+The command below invokes that policy; it does not install a persistent service.
+Do not overwrite an existing encrypted credential or generate a new key on restart.
+
+```bash
+# Operator-selected NEW destination under an existing protected directory.
+ENC_A=/etc/credstore.encrypted/tkfs-A.identity
+sudo "$TKFS_A" pairing -f "$A/pairing.toml" credential-provision \
+  --encrypted-output "$ENC_A"
+```
+
+Key-dependent A commands must run with `LoadCredentialEncrypted`, as the same
+owner as A's worker. This foreground helper uses an operator-created transient
+unit; define it in each A control/service terminal after defining the same public
+paths. `--pipe` keeps stdout on the caller's terminal rather than sending an
+invitation to the journal. Do not use terminal recording, `tee`, tracing or a
+PowerShell transcript during enrollment.
+
+```bash
+pairA() {
+  sudo systemd-run --quiet --collect --wait --pipe \
+    --uid="$(id -un)" --property=UMask=0077 \
+    --property="LoadCredentialEncrypted=tkfs.identity:$ENC_A" \
+    -- "$TKFS_A" pairing -f "$A/pairing.toml" "$@"
+}
+pairA status
+pairA run
+```
+
+Keep `pairA run` running in its own terminal, and use the helper from a separate
+control terminal. The credential name must match `name = "tkfs.identity"`.
+Do not manually export a plaintext production key through `CREDENTIALS_DIRECTORY`.
+See the upstream [transient-unit options](https://github.com/systemd/systemd/blob/main/man/systemd-run.xml)
+and [encrypted-credential settings](https://github.com/systemd/systemd/blob/v250/man/systemd.exec.xml).
+Provisioning failure/locked credentials are a prerequisite failure, not permission
+to use the test fixture helper. Installed unit templates in `deploy/` need separate
+operator review, particularly matching worker ownership, paths and mount namespaces.
+
+### 5. Invite B, verify the exact key, and approve locally on A
+
+In A's protected control terminal:
+
+```bash
+pairA invite --lifetime-seconds 300
+```
+
+The one-line output is a **secret bearer invitation**. Transfer it privately to
+the intended B owner; do not put it in argv, a URL, shell history, Git, tickets
+or logs. Do not retain a plaintext invitation file. In B's control terminal:
+
+```powershell
+& $tkfs pairing -f "$B\pairing.toml" join | Out-Host
+```
+
+Paste the invitation at the hidden-input prompt. B's response pins A's exact
+certificate and reports `awaiting-issuer-local-approval`. Compare A's installation
+and fingerprint with `pairA status` over your trusted handoff channel. On A,
+inspect `pairA status` and verify B's pending public installation/fingerprint
+against B's `pairing ... status` output before approving:
+
+```bash
+pairA approve '<invitation ID from A status>' \
+  --installation '<PAIR_B UUID>' --fingerprint '<verified B fingerprint>'
+```
+
+Approval alone exposes no repositories. A lost enrollment reply may consume the
+invitation; issue a fresh invitation and approve the intended exact key rather
+than retrying a consumed secret. Never bypass a fingerprint mismatch.
+
+### 6. Grant the same repository on BOTH sides and discover it from B
+
+Use the exact public IDs exchanged in steps 2--5. A grants B access to A's local
+worker, pinning B's independently initialized device UUID:
+
+```bash
+pairA grant '<PAIR_B UUID>' --repo "$REPO" --runtime "$RUNTIME_A" \
+  --remote-replica '<B device UUID>'
+```
+
+B can now authenticate and discover A's granted published state:
+
+```powershell
+& $tkfs pairing -f "$B\pairing.toml" remote-list '<PAIR_A UUID>' | Out-Host
+```
+
+Verify the listed `repo`, `replica` and shared branches match A's chosen project.
+This lists authorized published data, not A's local filesystem paths or complete
+O1 catalog. Discovery does not download/create/mount a replica. A cannot dial B's
+`outbound-only` endpoint; discovery here is deliberately B-to-A.
+
+Bind B's local runtime to A's exact replica UUID and enable its persisted grant:
+
+```powershell
+& $tkfs pairing -f "$B\pairing.toml" grant '<PAIR_A UUID>' --repo $repo `
+  --runtime "$StateB\runtime.json" --remote-replica '<A device_id>' | Out-Host
+& $tkfs pairing -f "$B\pairing.toml" sync '<PAIR_A UUID>' --repo $repo | Out-Host
+& $tkfs --runtime "$StateB\runtime.json" status | Out-Host
+& $tkfs --runtime "$StateB\runtime.json" branches | Out-Host
+```
+
+B's `dial=true` service now retries enabled grants automatically; A's
+`dial=false` service still accepts and returns shared changes over the same
+B-initiated connection. Leave both workers and pairing processes running.
+`pairing ... status` reports per-repository retry/error information. One explicit
+sync is useful diagnostically, but is not a global distributed barrier.
+
+### 7. Prove exact bytes in both directions before using real project data
+
+Start with two new filenames, one writer at a time, on shared `main`. A can seed
+its headless project through the authenticated local runtime without mounting it:
+
+```bash
+printf 'A-to-B byte test\n' > "$A/from-A.source"
+"$TKFS_A" --runtime "$RUNTIME_A" import from-A.txt "$A/from-A.source"
+sha256sum "$A/from-A.source"
+```
+
+On B, request sync and compare the mounted file's SHA-256 with A's printed hash:
+
+```powershell
+& $tkfs pairing -f "$B\pairing.toml" sync '<PAIR_A UUID>' --repo $repo | Out-Host
+(Get-FileHash -LiteralPath "$MountB\from-A.txt" -Algorithm SHA256).Hash.ToLowerInvariant()
+```
+
+Now write and explicitly flush bytes through B's **real mount**, then sync:
+
+```powershell
+$bytes = [Text.Encoding]::UTF8.GetBytes("B-to-A byte test`n")
+[IO.File]::WriteAllBytes("$B\from-B.source", $bytes)
+$file = [IO.File]::Open("$MountB\from-B.txt", [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try { $file.Write($bytes, 0, $bytes.Length); $file.Flush($true) } finally { $file.Dispose() }
+& $tkfs pairing -f "$B\pairing.toml" sync '<PAIR_A UUID>' --repo $repo | Out-Host
+(Get-FileHash -LiteralPath "$B\from-B.source" -Algorithm SHA256).Hash.ToLowerInvariant()
+```
+
+On headless A, use B's public content hash to verify both the live namespace entry
+and its exact object bytes. Repeat sync/status checks if transfer is still pending:
+
+```bash
+B_HASH='<lowercase SHA-256 printed on B>'
+"$TKFS_A" --runtime "$RUNTIME_A" state | python3 -c 'import json,sys; e=[x for x in json.load(sys.stdin)["entries"].values() if x["alive"] and x["name"]=="from-B.txt"]; assert len(e)==1 and e[0]["content"]==sys.argv[1]; print("namespace/hash match")' "$B_HASH"
+"$TKFS_A" --runtime "$RUNTIME_A" cat-object "$B_HASH" | python3 -c 'import json,sys,hashlib; b=bytes.fromhex(json.load(sys.stdin)["hex"]); assert b==b"B-to-A byte test\n"; print(hashlib.sha256(b).hexdigest())'
+```
+
+If A is mounted, additionally compare `sha256sum /A/mount/from-B.txt` with B's
+hash. Once these checks pass, import/copy the intended small regular-file project
+into A's shared branch and verify it appears under `$MountB`. Do not point TKFS
+at an existing folder and assume it watches that folder. Simultaneous divergent
+edits retain conflict alternatives; automatic text merging is not implemented.
+
+### 8. Keep private work local, and resume without changing identities
+
+Private branches are writable local worktrees. A can create a private canary:
+
+```bash
+"$TKFS_A" --runtime "$RUNTIME_A" branch local-private
+"$TKFS_A" --runtime "$RUNTIME_A" checkout local-private
+printf 'private canary\n' > "$A/private.source"
+"$TKFS_A" --runtime "$RUNTIME_A" import private-only.txt "$A/private.source"
+```
+
+After B syncs, `Test-Path "$MountB\private-only.txt"` must be false. Return A to
+`main` with `checkout main`. Private names/history and private-only objects are
+excluded; previously shared bytes cannot be made secret again. Only if you
+intentionally want to share a private branch's visible snapshot, run
+`publish Review --current-state-only` with that runtime. This creates a **new**
+shared branch and does not switch either mount or expose private history. After
+sync, select its exact UUID from `branches` and explicitly `checkout` that UUID
+on B to view it; switching refuses busy mounts.
+
+For restart, reuse the same states, configs, repo/device UUIDs and credentials.
+Restart A's O1 supervisor, B's standalone daemon, and the two separate pairing
+services using their original commands. Do not create new replicas/keys on
+restart. Persisted grants and partial transfers retry; the pairing service rereads
+each local `runtime.json` after worker restart. Closing a GUI does not stop O1,
+and O1 restart does not restart WSS. Stop only your own explicitly launched
+processes/units and close mounted handles before orderly unmount/shutdown.
+
+For Windows A, keep A's inbound WSS fields, use the Windows DPAPI credential
+section/`credential-init`, and replace `pairA ...` with
+`& $tkfs pairing -f 'C:\A\pairing.toml' ... | Out-Host`; no systemd helper is used.
+For Linux B, keep B outbound-only, use its own separately provisioned systemd
+credential context, initialize a fresh native state with `--repo` and mount it
+with `daemon --state STATE --mount MOUNT` using working FUSE. Neither OS variant
+changes repository/device identity rules or adds O1 replica adoption.
+
+### Troubleshooting and qualification limits
+
+| Symptom | Check/action |
+|---|---|
+| O1 refuses networking | Keep `network.enabled=false`; configure WSS in `pairing.toml` and run it separately. |
+| `CREDENTIAL_LOCKED`, missing/invalid credential | A must use its matching systemd credential context; B must use the DPAPI owner. Do not regenerate or copy live keys to bypass errors. |
+| Unsafe storage/ACL error | Select an owner-controlled native path with safe ancestors; existing permissions are not silently repaired. |
+| TLS/enrollment timeout | Verify A's exact numeric reachable IP/port, already authorized routing and listener; localhost/WSL tests are not cross-host reachability proof. |
+| Empty `remote-list` or denied sync | Verify exact-key approval plus enabled grants on both sides, the same repo UUID and distinct pinned replica UUIDs; approval alone is insufficient. |
+| Wrong repository/replica binding | Inspect local runtime `status`; do not reinitialize or copy a database. Correct the intended explicit grant. |
+| Files absent from B's mount | Check the selected shared branch, grants/status/backlog, workers and WSS processes, and saved/flushed bytes; a private branch is not uploaded. |
+| Mount occupied or checkout/shutdown busy | Use a new target and close files/directories/shell cwd in the mount; do not force-detach unrelated mounts. |
+| Peer should lose access | `pairing -f CONFIG revoke PEER_UUID` on the granting owner stops later authorized operations; it cannot erase bytes already received. |
+
+This is two writable replicas with **one active paired peer and two replica
+origins per repository**, not several clients sharing one relay-only Dropbox
+server. There is no remote O1 lifecycle control, managed replica adoption,
+on-demand/cloud-only files, multi-peer relay or automatic installed service flow.
+Case-insensitive portable names and unsupported symlinks/hardlinks/ACL/xattr
+semantics remain relevant when importing real projects.
+
+Commands/config fields here were checked against the current source and executable
+help. Existing tests cover real loopback WSS, outbound-only upload/download,
+worker/service restart, privacy and revocation; the foreground Windows/Ubuntu
+mount harness also records [cross-OS qualification](docs/PAIRING-CROSS-OS.md).
+Those are disposable local tests, not validation of this operator systemd setup
+or two separate machines on your LAN/VPS. The production credential handoff,
+cross-host reachability, installed/unattended services, multi-user security and
+power-loss behavior still need qualification on the intended machines. No real
+credential, listener, firewall rule or deployment was created to write this guide.
