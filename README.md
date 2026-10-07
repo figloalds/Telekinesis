@@ -47,6 +47,9 @@ test-runs/       Ignored disposable states, mounts, screenshots and logs
 Start with the [documentation index](docs/README.md). Platform/network guides are
 [Linux headless/FUSE](docs/LINUX.md), [persistent pairing](docs/PAIRING.md),
 [one-port WSS](docs/PAIRING-WSS.md) and [orchestrator CLI](docs/ORCHESTRATOR-CLI.md).
+For argument lookup and configuration, see the
+[TKFS command reference](docs/CLI.md) and
+[orchestrator TOML anatomy](docs/ORCHESTRATOR-CONFIG.md).
 License texts and [third-party notices](THIRD-PARTY-NOTICES.md) remain at the root.
 Saved reports record their original binaries, commits and fixture locations;
 they are historical evidence, not a claim that every check ran against this checkout.

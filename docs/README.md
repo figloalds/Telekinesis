@@ -5,10 +5,12 @@ build/run commands. These guides add platform and operational detail.
 
 | Guide | Contents |
 |---|---|
+| [TKFS command reference](CLI.md) | Global arguments, core commands, startup modes and pairing action syntax |
+| [Orchestrator TOML anatomy](ORCHESTRATOR-CONFIG.md) | Every root/table field, defaults, validation, path resolution and config lifecycle |
 | [Linux headless/FUSE](LINUX.md) | Build, owner control, POSIX metadata, mount contract and qualification |
 | [Persistent pairing](PAIRING.md) | Credentials, enrollment/approval, published repository grants, restart and revocation |
 | [One-port WSS](PAIRING-WSS.md) | Listener/outbound-only configurations, connection pools, deadlines and topology limits |
-| [Orchestrator CLI](ORCHESTRATOR-CLI.md) | Windows local management commands and retry semantics |
+| [Orchestrator CLI](ORCHESTRATOR-CLI.md) | Windows management actions, generation requirements and exact retries |
 | [Validation notes](VALIDATION.md) | Historical implementation checks, physical-machine findings and acceptance gaps |
 
 Design documents contain proposed work as well as implemented slices; use the
