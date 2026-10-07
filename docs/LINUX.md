@@ -1,8 +1,12 @@
 # TKFS Linux headless/FUSE
 
 The Linux CLI and daemon reuse the causal core, SQLite/CAS durability, staging,
-branch privacy and encrypted peer transport. Desktop UI and the O1 Windows
-supervisor remain Windows-only. Linux builds do not compile Slint.
+branch privacy and encrypted peer transport. O1 configuration, owner-local IPC,
+catalog and worker supervision run on both platforms. Desktop UI remains
+Windows-only; Linux builds do not compile Slint.
+
+For `tkfs init`, foreground `tkfs start`, and managed `tkfs create MyProject`, see
+[ONBOARDING.md](ONBOARDING.md). The standalone workflow below remains supported.
 
 ## Build and run
 
@@ -41,7 +45,8 @@ must not be treated as approved device authentication.
 `-C /native/path/new-mount` discovers the same daemon through its read-only
 `.tkfs-runtime.json`. Local control uses a mode-0600 Unix socket and checks both
 endpoint UIDs with SO_PEERCRED, plus the capability token. State is owner-only
-(0700). Nonblocking flock prevents competing state owners and releases on crash.
+(0700). Checked nonblocking flock prevents competing standalone/managed state owners
+and releases on crash. Socket connections and management frames have bounded deadlines.
 `stop` unmounts and exits only when the view is quiet. SIGINT/SIGTERM request the
 same quiet shutdown; busy shutdown is refused with a diagnostic. Close open
 files, directory iterators and shells whose cwd is inside the mount before
