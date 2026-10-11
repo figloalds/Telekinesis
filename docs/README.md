@@ -25,6 +25,7 @@ reusable acceptance harnesses under `scripts/`, keeping generated output local.
 |---|---|
 | [TKFS plan](TKFS-PLAN.md) | Causal filesystem contract and remaining scope |
 | [Orchestrator plan](ORCHESTRATOR-PLAN.md) | Local O1/desktop slices and later distribution design |
+| [Desktop evolution](DESKTOP-EVOLUTION.md) | 2026-10-11 baseline, phased delivery, ownership, pairing-code contracts and validation ledger |
 | [Pairing assessment](PAIRING-ASSESSMENT.md) | Historical starting-point assessment and architecture choices |
 | [Pairing implementation contract](PAIRING-IMPLEMENTATION.md) | Approved scope and implemented security/transport follow-ups |
 | [Legacy TKFS plan](TKFS-PLAN-2026-10-02-LEGACY.md) | Archived earlier design; not a description of current implementation |
