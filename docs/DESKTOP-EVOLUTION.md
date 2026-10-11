@@ -444,10 +444,9 @@ during the receive callback phase with `PAIRING_STORAGE_UNSAFE` on
 `client/registry/pairs.sqlite-shm`, flags 28, Windows access denied (error 5).
 The failing report is retained at
 `test-evidence/ui-receive-refinement/dark/report.json`; a single bounded rerun is
-kept separately. This is an **open intermittent workflow reliability finding**.
-Source-level security/architecture review is clear, but full product
-qualification is not clean. No storage guard was relaxed and no root cause is
-claimed. The bounded rerun passed both themes (30.03s), including transfer after
+kept separately. This was an **open intermittent workflow reliability finding**
+at feature milestone `4235167`; a passing rerun was not accepted as resolution.
+The bounded rerun passed both themes (30.03s), including transfer after
 GUI exit and orderly mount cleanup, in `ui-receive-refinement-rerun`.
 The source path is `private_storage.rs:261` (`validate_existing_files`) through
 `local_ipc.rs:36` to `native/control.c:88` (`tk_storage_open`). Error 5 currently
@@ -455,6 +454,43 @@ does not distinguish open, metadata/type/link or descriptor validation failure.
 A follow-up should add public validation-stage diagnostics and reproduce with
 concurrent SQLite open/close/checkpoint; it must not ignore AccessDenied or remove
 ACL/link/reparse checks.
+
+### R1 reliability follow-up
+
+Native validation-stage diagnostics reproduced three errors in 600 concurrent
+safe registry open/close operations: opening a sidecar pending deletion and
+inspecting its type/link metadata after last-close unlink. SQLite's normal
+last-connection cleanup raced the protected attribute inspection. The follow-up
+sets and verifies `SQLITE_FCNTL_PERSIST_WAL` on Windows private registry/verifier
+connections, including the managed read-only binding check. `journal_size_limit=0`
+lets a completed checkpoint truncate the WAL while retaining sidecar identity.
+This is a lifecycle correction: native owner, ACL, type, reparse and single-link
+validation is unchanged, and AccessDenied is neither ignored nor retried.
+
+Seven focused storage tests passed (1.29s): stable sidecar identities/link counts
+through writer and read-only last close, WAL truncation, reopened data, the
+original 600-operation churn with zero errors, and existing unsafe-storage
+rejection checks including persisted-sidecar hardlinks and foreign ACL writes.
+The combined pairing suite passed 35 tests (31.67s), with three subprocess helper
+tests ignored when run directly and invoked by their owning fixtures. Final native
+verification passed normal v3, advanced v2, verified first mount/background sync,
+and legacy WSS privacy/revocation in both themes, plus config crash/downgrade
+checks. Six desktop tests passed in the full batch. The profile test initially
+encountered an existing executable-adjacent config and correctly refused to treat
+it as first run; the test now copies the binary to its own empty temporary folder.
+Its two-process setup/reopen rerun passed (6.54s), giving passing coverage of all
+seven workflows without changing product behavior or the existing installation.
+CLI reset tests passed again (2, 0.99s). The final evidence manifest records the
+exact revision and binary; `ui-*-final` reports preserve the post-fix native runs.
+No protected-sidecar denial occurred in these final runs. Older binaries
+or external SQLite tools that omit persistence can still delete sidecars on last
+close; stop those processes before using this version on the same registry.
+Retained WAL/SHM files are expected private database files, not garbage to remove.
+The unrelated initial service fail-fast and WS carrier error remain unexplained.
+
+SQLite documents this lifecycle in its
+[persistent WAL file control](https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html)
+and [journal size limit](https://www.sqlite.org/pragma.html#pragma_journal_size_limit).
 
 Remaining product limits are explicit: numeric IP only; receiving address/port
 fixed after initial setup; source-owner folder grants still required; no general

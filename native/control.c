@@ -85,8 +85,9 @@ done:
  * publication-parent=64 (reserve FILE_ADD_FILE on a private directory).
  * Open the reparse point itself, reject it, and retain handles to prevent path
  * replacement. Files must be single-link disk files, never an alias or device. */
-DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
+DWORD tk_storage_open_diagnostic(LPCWSTR path,DWORD flags,HANDLE *out,DWORD *stage) {
     PSECURITY_DESCRIPTOR created=0,actual=0;DWORD e=0;*out=INVALID_HANDLE_VALUE;
+    *stage=0;
     if(flags&2){
         e=storage_descriptor(&created);if(e)return e;
         if((flags&1)&&GetFileAttributesW(path)==INVALID_FILE_ATTRIBUTES){
@@ -101,16 +102,22 @@ DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
     /* Directory write handles can mutate reparse metadata without a rename.
      * Deny those too while the namespace is pinned. Child file IO is separate. */
     DWORD share=FILE_SHARE_READ|((flags&1)&&!(flags&64)?0:FILE_SHARE_WRITE)|((flags&8)?FILE_SHARE_DELETE:0);
+    *stage=1; /* open */
     *out=CreateFileW(path,access,share,created?&sa:0,
         (flags&2)&&!(flags&1)?OPEN_ALWAYS:OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,0);
     if(*out==INVALID_HANDLE_VALUE){e=GetLastError();goto done;}
     BY_HANDLE_FILE_INFORMATION info;
+    *stage=2; /* handle metadata */
     if(!GetFileInformationByHandle(*out,&info)){e=GetLastError();goto done;}
+    *stage=3; /* type, reparse point, or link count */
     if((info.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||!!(info.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=!!(flags&1)||(!(flags&1)&&(GetFileType(*out)!=FILE_TYPE_DISK||info.nNumberOfLinks!=1))){e=ERROR_ACCESS_DENIED;goto done;}
     if(flags&(4|32)){
+        *stage=4; /* security descriptor read */
         e=GetSecurityInfo(*out,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,0,0,0,0,&actual);
         if(e)goto done;
+        *stage=5; /* owner and DACL validation */
         e=(flags&4)?tk_storage_validate_descriptor(actual):tk_storage_validate_ancestor(actual);if(e)goto done;
+        *stage=6; /* protected directory DACL */
         if((flags&1)&&(flags&4)){SECURITY_DESCRIPTOR_CONTROL control;DWORD revision;
             if(!GetSecurityDescriptorControl(actual,&control,&revision)||!(control&SE_DACL_PROTECTED))e=ERROR_ACCESS_DENIED;
         }
@@ -119,6 +126,10 @@ done:
     LocalFree(created);LocalFree(actual);
     if(e&&*out!=INVALID_HANDLE_VALUE){CloseHandle(*out);*out=INVALID_HANDLE_VALUE;}
     return e;
+}
+DWORD tk_storage_open(LPCWSTR path,DWORD flags,HANDLE *out) {
+    DWORD stage;
+    return tk_storage_open_diagnostic(path,flags,out,&stage);
 }
 /* Consume the old leaf pin and reserve namespace publication on the same
  * validated directory. Ancestors remain pinned by the Rust caller. Refuse a

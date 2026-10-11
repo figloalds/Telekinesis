@@ -115,6 +115,8 @@ impl Binding {
                 &database,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )?;
+            #[cfg(windows)]
+            crate::private_storage::retain_sqlite_sidecars(&db)?;
             let (count, identity): (u64, String) =
                 db.query_row("SELECT COUNT(*),MIN(id) FROM identity", [], |r| {
                     Ok((r.get(0)?, r.get(1)?))

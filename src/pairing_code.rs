@@ -516,6 +516,8 @@ impl Store {
         let path = path.join("verifier.sqlite");
         let file = directory.file(&path, true, false)?;
         let mut db = Connection::open(path)?;
+        #[cfg(windows)]
+        crate::private_storage::retain_sqlite_sidecars(&db)?;
         db.busy_timeout(std::time::Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS code(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,salt BLOB NOT NULL,verifier BLOB NOT NULL,generation INTEGER NOT NULL);

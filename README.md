@@ -19,8 +19,8 @@ The prior design is archived in
 | Storage and recovery | Verified immutable objects, SQLite journal, causal revisions/conflicts, disk-backed staging and retained failed saves | Native local state; 16 GiB streaming ceiling; buffered object APIs remain limited to 16 MiB |
 | Worktrees | Private branches, shared branches, fenced checkout, explicit current-state publication, checkpoints and restore | One selected branch per runtime; checkpoints/history stay local |
 | Windows | Real WinFsp mounts, basic attributes/four timestamps, notifications, directory scan cursors and portable Slint desktop | x64; installed WinFsp SDK/runtime required |
-| Linux | Headless CLI/daemon, real FUSE mounts, owner-authenticated Unix control, POSIX permission bits and graceful stop | No desktop or O1 supervisor port; case-insensitive portable names |
-| Local management | O1 supervisor, independent workers, durable operation receipts, start/stop/recovery and running limits | Windows, same-user named pipes; networking disabled in O1 |
+| Linux | Headless CLI/daemon and O1 supervisor, real FUSE mounts, owner-authenticated Unix control, POSIX permission bits and graceful stop | No desktop; case-insensitive portable names |
+| Local management | O1 supervisor, independent workers, durable operation receipts, start/stop/recovery and running limits | Windows same-user named pipes or Linux Unix sockets; optional supervised pairing services expose published data only |
 | Persistent pairing | TLS 1.3 device identities, owner-approved enrollment, repository/replica grants, revocation and restart retry | Separate service on Windows/Linux; published data only |
 | WSS | One enrollment/sync listener, outbound-only homes, persistent pools and bounded resumable pages | One active paired peer and two replica origins per repository |
 | Object backend | Explicit export of verified shared objects and manifests to a native directory | Local test adapter; no cloud provider or garbage collection |
@@ -67,7 +67,8 @@ processes from one TOML defaults file and an owner-protected SQLite registry.
 operation lookup, numeric pairing-code reset and orderly shutdown. Owner-mediated
 receive prepares a fresh same-repository replica and attaches its first mount
 after shared-branch verification. O1 can supervise a preprovisioned outbound WSS
-pairing service independently of the GUI. Adoption, general mount reassignment,
+pairing service independently of the GUI, and explicitly provision and supervise
+a separate receiving service. Adoption, general mount reassignment,
 trash/restore and service installation remain deferred. The Windows Slint desktop
 uses the same executable and management API; see the
 [desktop workflow](docs/DESKTOP-PAIRING.md) and [delivery ledger](docs/DESKTOP-EVOLUTION.md).

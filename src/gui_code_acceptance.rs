@@ -78,13 +78,12 @@ impl Acceptance {
                 ensure!(ui.get_server_code_visible(), "RESET_RESULT_MISSING");
                 let code = Zeroizing::new(ui.get_server_code().to_string());
                 pairing_code::validate(&code)?;
-                let db = rusqlite::Connection::open(
-                    pairing_code::Store::directory_for_config(&self.fixture.orchestrator)?
-                        .join("verifier.sqlite"),
-                )?;
-                let generation: i64 =
-                    db.query_row("SELECT generation FROM code", [], |r| r.get(0))?;
-                ensure!(generation == 1, "DUPLICATE_RESET_NOT_BLOCKED");
+                let status = pairing_code::Store::for_config(&self.fixture.orchestrator)?
+                    .protocol_status()?;
+                ensure!(
+                    status["generation"].as_u64() == Some(1),
+                    "DUPLICATE_RESET_NOT_BLOCKED"
+                );
                 ensure!(
                     snapshot(ui, &directory.join("forbidden-code.bmp")).is_err(),
                     "CODE_SCREENSHOT_NOT_BLOCKED"

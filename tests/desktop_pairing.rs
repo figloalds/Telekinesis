@@ -102,6 +102,10 @@ fn native_gui_explicit_profile_setup_and_relaunch_preserve_identity() -> Result<
             .context("EXPLICIT_TRUSTED_FIXTURE_ROOT_REQUIRED")?,
     );
     let temp = tempfile::tempdir_in(fixtures)?;
+    // Test normal executable-relative discovery in an owned empty folder.
+    // The build directory may contain an unrelated portable installation.
+    let binary = temp.path().join("tkfs.exe");
+    std::fs::copy(env!("CARGO_BIN_EXE_tkfs"), &binary)?;
     let profile = temp.path().join("profile");
     std::fs::create_dir(&profile)?;
     let config = profile.join(".telekinesis/orchestrator.toml");
@@ -120,7 +124,7 @@ fn native_gui_explicit_profile_setup_and_relaunch_preserve_identity() -> Result<
         std::fs::create_dir(&output)?;
         let report = output.join("report.json");
         let mut gui = Owned(
-            Command::new(env!("CARGO_BIN_EXE_tkfs"))
+            Command::new(&binary)
                 .args(["gui-test", "--report"])
                 .arg(&report)
                 .env("TKFS_UI_TEST_PHASE", phase)
@@ -142,8 +146,7 @@ fn native_gui_explicit_profile_setup_and_relaunch_preserve_identity() -> Result<
             result["error"]
         );
         let selected = tkfs::orchestrator::Config::load(&config)?;
-        let paths =
-            tkfs::desktop::Paths::from_config(PathBuf::from(env!("CARGO_BIN_EXE_tkfs")), &config)?;
+        let paths = tkfs::desktop::Paths::from_config(binary.clone(), &config)?;
         let identity = (
             selected.existing_installation()?,
             std::fs::canonicalize(selected.data_directory)?,

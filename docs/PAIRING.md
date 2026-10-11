@@ -254,6 +254,12 @@ the final directory is private. Choose a storage path whose complete ancestor
 chain meets the ownership/ACL requirements above. The service reports unsafe
 paths instead of bypassing the checks or repairing existing ACLs.
 
+On Windows, private registry/verifier WAL and SHM sidecars remain in place after
+connections close; completed checkpoints truncate the WAL. This prevents SQLite
+cleanup from racing security inspection. Do not manually delete these files.
+Before upgrading, stop older pairing processes and other SQLite tools using the
+same registry: their connection settings may still delete sidecars on last close.
+
 `tkfs pairing revoke PEER_ID` persists revocation and stops that peer's data access
 on fresh and already-established sessions. Each request reloads registry state
 after TLS; registry transactions serialize data operations with local revocation

@@ -434,6 +434,8 @@ impl Registry {
         directory.validate_existing_files()?;
         let file = directory.file(path, true, false)?;
         let db = Connection::open(path)?;
+        #[cfg(windows)]
+        crate::private_storage::retain_sqlite_sidecars(&db)?;
         directory.validate_existing_files()?;
         db.busy_timeout(std::time::Duration::from_secs(3))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
