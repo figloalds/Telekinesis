@@ -1,694 +1,328 @@
-import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint, Palette, CheckBox, TextEdit } from "std-widgets.slint";
-
-export struct Project { label: string, id: string, status: string, mount: string, desired: bool }
-export struct BranchItem { id: string, label: string, shared: bool, current: bool }
-export struct CheckpointItem { id: string, label: string }
-export struct PairPeer { id: string, fingerprint: string, revoked: bool }
-export struct PairRepo { id: string, label: string, replica: string, branches: string }
-export struct PairGrant { peer: string, repo: string, enabled: bool, revoked: bool }
-export struct PendingDevice { invitation: string, installation: string, fingerprint: string }
-
-// Standard controls and custom surfaces share Slint's resolved system palette.
-// Translucent Fluent controls must never sit on a fixed opposite-theme panel.
-export global AppTheme {
-    out property <brush> background: Palette.color-scheme == ColorScheme.dark ? #0e131b : Palette.background;
-    out property <brush> surface: Palette.color-scheme == ColorScheme.dark ? #161d28 : Palette.alternate-background;
-    out property <brush> foreground: Palette.foreground;
-    out property <brush> muted: Palette.foreground.with-alpha(0.78);
-    out property <brush> border: Palette.border;
+import { ScrollView, TextEdit, AboutSlint, Palette } from "std-widgets.slint";
+export struct FolderRow { state: string, label: string, mount: string, running: bool, error: string }
+export struct RemoteRow { repo: string, label: string }
+export struct PeerRow { endpoint: string, online: bool }
+global Theme {
+    out property <color> background: #0e131b;
+    out property <color> panel: #161d28;
+    out property <color> line: #263040;
+    out property <color> ink: #e6eaf0;
+    out property <color> muted: #97a1b2;
+    out property <color> accent: #7f9fff;
 }
-
-component Caption inherits Text { color: AppTheme.muted; font-size: 13px; }
-component Heading inherits Text { color: AppTheme.foreground; font-size: 26px; font-weight: 700; }
-component Card inherits Rectangle {
-    background: AppTheme.surface; border-color: AppTheme.border; border-width: 1px; border-radius: 12px;
+component Label inherits Text { color: Theme.ink; font-size: 14px; vertical-alignment: center; overflow: elide; }
+component Muted inherits Label { color: Theme.muted; font-size: 12px; }
+component ActionButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary;
+    in property <bool> quiet;
+    in property <bool> enabled: true;
+    callback clicked();
+    forward-focus: focus;
+    height: 34px;
+    min-width: caption.preferred-width + 24px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: focus.has-focus ? Theme.accent : root.primary ? Theme.accent : root.quiet ? transparent : Theme.line;
+    background: !root.enabled ? Theme.panel : touch.pressed ? #30416a : touch.has-hover ? #253047 : root.primary ? Theme.accent : root.quiet ? transparent : Theme.panel;
+    opacity: root.enabled ? 1 : 0.45;
+    caption := Label { text: root.text; color: root.primary ? #ffffff : Theme.ink; horizontal-alignment: center; font-size: 13px; font-weight: 600; }
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == "\n" || event.text == " " { root.clicked(); return accept; }
+            return reject;
+        }
+    }
+    touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { focus.focus(); root.clicked(); } }
+    accessible-role: button;
+    accessible-enabled: root.enabled;
+    accessible-label: root.text;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
 }
+component Field inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder;
+    in property <bool> enabled: true;
+    callback edited(string);
+    forward-focus: input;
+    height: 38px;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.line;
+    background: Theme.background;
+    if input.text == "": Muted { x: 12px; width: parent.width - 24px; text: root.placeholder; }
+    input := TextInput {
+        x: 12px; width: parent.width - 24px; height: parent.height;
+        color: Theme.ink; font-size: 14px; vertical-alignment: center;
+        single-line: true; enabled: root.enabled;
+        selection-background-color: #3558a1; selection-foreground-color: #ffffff;
+        edited => { root.edited(self.text); }
+        accessible-label: root.placeholder;
+    }
+}
+component Card inherits Rectangle { background: Theme.panel; border-color: Theme.line; border-width: 1px; border-radius: 11px; }
 component Stat inherits Card {
-    in property <string> label;
+    in property <string> title;
     in property <string> value;
-    VerticalLayout { padding: 16px; spacing: 6px;
-        Caption { text: root.label; }
-        Text { text: root.value; color: AppTheme.foreground; font-size: 25px; font-weight: 600; }
+    in property <string> detail;
+    height: 98px;
+    VerticalLayout { padding: 16px; spacing: 5px;
+        Muted { text: root.title; }
+        Label { text: root.value; font-size: 23px; font-weight: 600; }
+        Muted { text: root.detail; }
     }
 }
-
-export component App inherits Window {
-    title: "Telekinesis";
-    preferred-width: 1280px; preferred-height: 860px; min-width: 980px; min-height: 720px;
-    background: AppTheme.background; default-font-family: "Segoe UI"; default-font-size: 14px;
-    in-out property <bool> first-run;
-    in-out property <int> main-page: 0;
-    in-out property <string> receive-label;
-    in-out property <string> receive-repository;
-    in-out property <string> receive-state;
-    in-out property <string> receive-repo-id;
-    in-out property <string> receive-device;
-    in-out property <string> receive-runtime;
-    in-out property <string> receive-status;
-    in-out property <string> receive-mount;
-    in-out property <bool> receive-headless;
-    in-out property <bool> receive-running;
-    in-out property <bool> receive-caught-up;
-    in-out property <bool> receive-materialized;
-    in-out property <bool> receive-can-attach;
-    in-out property <bool> receive-confirmed;
-    in-out property <string> background-sync-status;
-    callback receive-action(int);
-    callback background-sync-action(bool);
-    in-out property <string> project-filter;
-    in-out property <[int]> visible-projects;
-    in-out property <int> running-count;
-    in-out property <int> attention-count;
-    in-out property <string> config-input;
-    in-out property <bool> config-visible;
-    callback filter-projects(string);
-    callback select-config;
-    in-out property <int> pairing-page: 0;
-    in-out property <string> pair-bootstrap;
-    in-out property <string> pair-enrollment;
-    in-out property <string> server-config;
-    in-out property <string> receiving-address;
-    in-out property <string> receiving-port: "7421";
-    in-out property <string> receiving-state;
-    in-out property <string> receiving-endpoint;
-    in-out property <string> receiving-error;
-    in-out property <string> receiving-key-status;
-    in-out property <bool> receiving-enabled;
-    in-out property <bool> receiving-configured;
-    in-out property <[PendingDevice]> pending-devices;
-    callback receiving-action(bool);
-    callback approve-device(string);
-    in-out property <string> server-code;
-    in-out property <bool> server-code-visible;
-    in-out property <bool> server-reset-confirmed;
-    callback reset-pairing-code;
-    callback dismiss-server-code;
-    dismiss-server-code => { root.server-code = ""; root.server-code-visible = false; }
-    in-out property <string> pair-config;
-    in-out property <string> pair-host;
-    in-out property <string> pair-port: "7421";
-    in-out property <bool> pair-advanced;
-    in-out property <string> pair-endpoint;
-    in-out property <string> pair-token;
-    in-out property <string> pair-identity;
-    in-out property <string> pair-review;
-    in-out property <bool> pair-ready;
-    in-out property <bool> pair-confirmed;
-    in-out property <bool> pair-grant-confirmed;
-    in-out property <bool> pair-revoke-confirmed;
-    in-out property <bool> pair-cancellable;
-    in-out property <[PairPeer]> pair-peers;
-    in-out property <[PairRepo]> pair-repos;
-    in-out property <int> pair-selected-peer: -1;
-    in-out property <int> pair-selected-repo: -1;
-    in-out property <string> pair-runtime;
-    in-out property <string> pair-local;
-    in-out property <string> pair-syncs;
-    in-out property <[PairGrant]> pair-grants;
-    out property <bool> pair-peer-active: root.pair-selected-peer >= 0 && root.pair-selected-peer < root.pair-peers.length && !root.pair-peers[root.pair-selected-peer].revoked;
-    out property <bool> pair-repo-selected: root.pair-peer-active && root.pair-selected-repo >= 0 && root.pair-selected-repo < root.pair-repos.length;
-    callback pair-action(int);
-    callback pair-cancel;
-    callback pair-grant-action(int, int);
-    callback toggle-mount(string, bool);
-    in-out property <bool> connected;
-    in-out property <bool> working;
-    in-out property <bool> create-visible;
-    in-out property <bool> about-visible;
-    in-out property <bool> shutdown-visible;
-    in-out property <bool> can-retry;
-    in-out property <bool> show-activity;
-    private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible || root.config-visible || root.server-code-visible || root.branch-dialog != 0;
-    out property <bool> can-start-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (!root.projects[root.selected].desired || root.projects[root.selected].status == "Unavailable");
-    out property <bool> can-stop-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (root.projects[root.selected].desired || root.projects[root.selected].status != "Stopped");
-    out property <bool> can-start-supervisor: !root.working && !root.modal && !root.first-run;
-    out property <bool> can-stop-supervisor: root.connected && !root.working && !root.modal;
-    in-out property <string> connection: "Connecting…";
-    in-out property <string> config-path;
-    in-out property <string> data-folder;
-    in-out property <bool> profile-setup;
-    in-out property <string> profile-config;
-    in-out property <string> profile-data;
-    in-out property <string> profile-mounts;
-    in-out property <bool> profile-exists;
-    callback open-profile;
-    in-out property <string> mount-folder;
-    in-out property <int> worker-limit: 8;
-    in-out property <[Project]> projects;
-    in-out property <int> selected: -1;
-    in-out property <string> project-name;
-    in-out property <string> project-mount;
-    in-out property <string> status-detail: "Choose a project to see its local state.";
-    in-out property <string> branches-detail;
-    in-out property <[BranchItem]> branches;
-    in-out property <[CheckpointItem]> checkpoints;
-    in-out property <int> selected-branch: -1;
-    in-out property <int> selected-checkpoint: -1;
-    in-out property <int> details-page: 0;
-    in-out property <bool> runtime-ready;
-    in-out property <string> runtime-generation;
-    in-out property <string> current-branch-id;
-    in-out property <string> current-branch-name;
-    in-out property <bool> current-branch-shared;
-    in-out property <string> branch-operation-detail;
-    in-out property <bool> can-retry-branch;
-    in-out property <int> branch-dialog: 0;
-    in-out property <string> branch-input;
-    in-out property <bool> publication-confirmed;
-    in-out property <string> branch-source-project;
-    in-out property <string> branch-source-active;
-    in-out property <string> branch-source-generation;
-    in-out property <string> branch-target-id;
-    in-out property <string> branch-target-label;
-    out property <bool> can-branch-actions: root.connected && root.runtime-ready && !root.working && !root.modal && !root.can-retry-branch && root.selected >= 0 && root.selected < root.projects.length;
-    out property <bool> can-checkout: root.can-branch-actions && root.selected-branch >= 0 && root.selected-branch < root.branches.length && !root.branches[root.selected-branch].current;
-    out property <bool> can-submit-branch: !root.working && root.branch-dialog != 0 && (root.branch-dialog == 2 || root.branch-input != "") && (root.branch-dialog != 3 || root.publication-confirmed);
-    in-out property <string> message;
-    in-out property <string> operation-detail;
-    in-out property <bool> error;
-    out property <bool> project-name-focused: project-name-edit.has-focus;
-    callback setup;
-    callback connect;
-    callback refresh;
-    callback select-project(int);
-    callback create-project;
-    callback start-project;
-    callback stop-project;
-    callback shutdown;
-    callback retry;
-    callback inspect-operation;
-    callback browse(int);
-    callback open-project;
-    callback focus-project-name;
-    callback submit-branch;
-    callback retry-branch;
-    callback begin-branch-action(int);
-    callback cancel-branch-dialog;
-    cancel-branch-dialog => { root.branch-dialog = 0; root.branch-input = ""; root.publication-confirmed = false; }
-    begin-branch-action(kind) => {
-        if root.can-branch-actions {
-            root.branch-source-project = root.projects[root.selected].id;
-            root.branch-source-active = root.current-branch-id;
-            root.branch-source-generation = root.runtime-generation;
-            root.branch-target-id = kind == 5 && root.selected-checkpoint >= 0 ? root.checkpoints[root.selected-checkpoint].id : root.selected-branch >= 0 ? root.branches[root.selected-branch].id : "";
-            root.branch-target-label = kind == 5 && root.selected-checkpoint >= 0 ? root.checkpoints[root.selected-checkpoint].label : root.selected-branch >= 0 ? root.branches[root.selected-branch].label : "";
-            root.branch-input = "";
-            root.publication-confirmed = false;
-            root.branch-dialog = kind;
-        }
+component FolderIcon inherits Rectangle {
+    width: 30px;
+    Rectangle { y: (parent.height - 26px) / 2; width: 30px; height: 26px; border-radius: 5px; background: #1b2a52;
+        Rectangle { x: 7px; y: 6px; width: 8px; height: 5px; background: #ffcf60; border-radius: 1px; }
+        Rectangle { x: 7px; y: 9px; width: 16px; height: 12px; background: #ffc44d; border-radius: 2px; }
     }
-    // App-local override used by acceptance; no Windows settings are changed.
-    callback set-theme(int);
-    set-theme(mode) => { Palette.color-scheme = mode == 1 ? ColorScheme.light : mode == 2 ? ColorScheme.dark : ColorScheme.unknown; }
-    focus-project-name => { project-name-edit.focus(); }
+}
+export component AppWindow inherits Window {
+    title: "Telekinesis — Virtual folders";
+    preferred-width: 1320px; preferred-height: 820px;
+    min-width: 1040px; min-height: 680px;
+    background: Theme.background;
+    init => { Palette.color-scheme = ColorScheme.dark; }
+    default-font-family: "Segoe UI";
+    in property <string> config-path;
+    in-out property <string> status: "Connecting to the local orchestrator…";
+    in property <bool> status-error;
+    in property <bool> connected;
+    in property <bool> busy;
+    in property <string> listen-address;
+    in property <string> host-name;
+    in property <int> folder-count;
+    in property <int> mounted-count;
+    in property <int> online-count;
+    in property <[FolderRow]> folders;
+    in property <[RemoteRow]> remote-folders;
+    in property <[PeerRow]> peer-rows;
+    in-out property <string> selected-state;
+    in-out property <string> selected-repo;
+    in-out property <string> selected-label;
+    in-out property <string> pairing-code;
+    in-out property <string> dialog;
+    in-out property <string> endpoint;
+    in-out property <string> folder-name;
+    in-out property <string> mount-path;
+    in-out property <string> remote-mount;
+    in-out property <string> code;
+    in-out property <string> search;
+    in property <string> remote-message: "Connect to an orchestrator, then browse its folders.";
+    callback search-folders(string);
+    callback remote-changed();
+    callback refresh();
+    callback create-folder(string, string);
+    callback start-folder(string);
+    callback stop-folder(string);
+    callback configure-mount(string, string);
+    callback pair(string, string);
+    callback remote-list(string);
+    callback receive-folder(string, string, string, string);
+    callback reset-code();
+    callback unpair(string);
+    callback peers();
+    callback shutdown();
+    private property <bool> interactive: root.dialog == "" && !root.busy;
+    private property <length> name-column: 190px;
+    forward-focus: keyboard;
+    keyboard := FocusScope {
 
-    HorizontalLayout {
-        spacing: 0px;
-        Rectangle {
-            width: 220px; background: #13203a;
-            VerticalLayout {
-                padding: 18px; spacing: 14px;
-                HorizontalLayout { spacing: 10px;
-                    Rectangle { width: 30px; height: 30px; border-radius: 7px; background: #2456d6; Text { text: "TK"; color: white; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; } }
-                    Text { text: "Telekinesis"; color: white; font-size: 19px; font-weight: 650; vertical-alignment: center; }
+        key-pressed(event) => {
+            if event.text == Key.Escape && root.dialog != "" && !root.busy { root.dialog = ""; return accept; }
+            return reject;
+        }
+    HorizontalLayout { spacing: 0px;
+        Rectangle { width: 248px; background: #0a1020;
+            VerticalLayout { padding: 14px; spacing: 10px;
+                HorizontalLayout { padding: 8px; spacing: 10px; height: 44px;
+                    Rectangle { width: 28px; height: 28px; background: #4778ed; border-radius: 8px; Image { source: @image-url("anchor.svg"); x: 5px; y: 5px; width: 18px; height: 18px; } }
+                    Label { text: "Telekinesis"; font-weight: 700; font-size: 18px; }
                 }
-                Text { text: "Virtual folders & history"; color: #afc4cf; font-size: 14px; }
-                Rectangle { height: 1px; background: #35515f; }
-                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: root.first-run ? "01  Set up" : "Virtual folders"; checkable: true; checked: root.main-page == 0 || root.main-page == 3; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; root.pair-token = ""; } } }
-                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "Peers & sync"; checkable: true; checked: root.main-page == 1; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; } } }
-                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "Receive repository"; checkable: true; checked: root.main-page == 4; enabled: !root.working && !root.modal && root.connected; clicked => { root.main-page = 4; root.pair-token = ""; root.refresh(); } } }
-                Text { text: "REMOTE CONNECTIONS"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
-                for peer[index] in root.pair-peers: VerticalLayout { spacing: 4px;
-                    Text { text: (peer.revoked ? "○  " : "●  ") + peer.id; color: peer.revoked ? #efadad : #c9d3e6; overflow: elide; font-size: 12px; }
-                    Text { text: peer.revoked ? "Revoked locally" : "Paired · availability not checked"; color: #afc4cf; font-size: 11px; }
-                }
-                if root.pair-peers.length == 0: Text { text: "No remote connections loaded"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
-                Rectangle { vertical-stretch: 1; background: transparent; }
-                Rectangle { border-width: 1px; border-color: #35515f; border-radius: 10px; background: transparent;
-                    VerticalLayout { padding: 12px; spacing: 8px;
-                        Text { text: "This computer"; color: white; font-weight: 600; }
-                        Text { text: root.connected ? "●  Supervisor connected" : "○  Supervisor offline"; color: root.connected ? #8de0c4 : #dfbe84; font-size: 11px; font-weight: 700; }
-                        Text { text: root.connected ? root.running-count + " running · " + root.projects.length + " folders" : "Status unavailable · " + root.projects.length + " folders last seen"; color: #c9d3e6; font-size: 12px; wrap: word-wrap; }
+                Rectangle { height: 38px; background: #2b3141; border-radius: 8px;
+                    HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 8px;
+                        Label { text: "Virtual folders"; }
+                        Muted { text: root.folder-count; horizontal-alignment: right; }
                     }
                 }
-                Text { text: root.working ? "An operation is in progress. Please wait for its result." : "This window manages only this computer. Pairing authorizes published-data sync."; color: #afc4cf; font-size: 13px; wrap: word-wrap; }
-                Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; HorizontalLayout { padding: 4px; Button { text: "About Telekinesis"; enabled: !root.modal; clicked => { root.about-visible = true; } } } }
-                Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; Button { text: "Configuration…"; enabled: !root.working && !root.modal && !root.can-retry && !root.can-retry-branch; clicked => { root.config-input = root.config-path; root.config-visible = true; } } }
-                Text { text: "Made with Slint"; color: #afc4cf; font-size: 12px; }
+                Muted { text: "Remote orchestrators"; height: 30px; color: #8393b3; }
+                ScrollView { vertical-stretch: 1;
+                    VerticalLayout { spacing: 5px;
+                        for peer in root.peer-rows: ActionButton { min-width: 0px; text: (peer.online ? "●  " : "○  ") + peer.endpoint; quiet: true; enabled: root.interactive;
+                            clicked => { root.endpoint = peer.endpoint; root.selected-repo = ""; root.dialog = "connect"; root.remote-list(peer.endpoint); }
+                        }
+                        if root.peer-rows.length == 0: Muted { text: "No remotes connected"; height: 28px; }
+                        ActionButton { text: "+  Connect orchestrator"; quiet: true; enabled: root.interactive; clicked => { root.dialog = "connect"; } }
+                        Rectangle { vertical-stretch: 1; }
+                    }
+                }
+                ActionButton { text: "Host settings"; quiet: true; enabled: root.interactive; clicked => { root.dialog = "host"; } }
+                Card { height: 140px; background: #0a1020;
+                    VerticalLayout { padding: 13px; spacing: 5px;
+                        Label { text: "Host · " + root.host-name; font-size: 12px; font-weight: 600; }
+                        HorizontalLayout { Muted { text: "Status"; } Label { text: root.connected ? "● Running" : "○ Offline"; color: root.connected ? #5fd0a6 : Theme.muted; horizontal-alignment: right; font-size: 12px; } }
+                        HorizontalLayout { Muted { text: "Listening"; } Muted { text: root.listen-address; horizontal-alignment: right; } }
+                        HorizontalLayout { Muted { text: "Mounted"; } Muted { text: root.mounted-count + " of " + root.folder-count; horizontal-alignment: right; } }
+                        HorizontalLayout { Muted { text: "Storage"; } Muted { text: "Not reported"; horizontal-alignment: right; } }
+                    }
+                }
             }
         }
-        VerticalLayout {
-            padding: 24px; spacing: 16px;
-            HorizontalLayout {
-                VerticalLayout {
-                    spacing: 6px;
-                    Heading { text: root.main-page == 4 ? "Receive a shared folder" : root.main-page == 1 ? "Connections" : root.first-run ? "Set up this computer" : root.main-page == 3 ? "Folder details" : "Virtual folders"; }
-                    Caption { text: root.main-page == 1 ? "Pair this device for authorized published-data sync." : root.first-run ? "One portable installation, independent local workspaces." : "Independent local states, mount paths and durable history."; }
-                }
-                Rectangle { horizontal-stretch: 1; background: transparent; }
-                Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; visible: root.main-page != 1; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
-            }
-            if !root.first-run && root.main-page == 0: VerticalLayout { spacing: 10px;
-                LineEdit { accessible-label: "Search virtual folders"; placeholder-text: "Search folders by name or mount path"; text <=> root.project-filter; edited => { root.filter-projects(self.text); } }
-                HorizontalLayout { spacing: 10px;
-                    Button { text: "Connect remote"; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; root.pairing-page = 0; root.pair-advanced = false; } }
-                    Button { text: "New folder"; primary: true; enabled: root.connected && !root.working && !root.modal; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
-                    Button { text: "Clear search"; visible: root.project-filter != ""; enabled: root.project-filter != ""; clicked => { root.project-filter = ""; root.filter-projects(""); } }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-            }
-            if root.main-page != 1: Card {
-                height: 54px;
-                HorizontalLayout {
-                    padding: 16px; spacing: 12px;
-                    Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.connected ? #239675 : #c18c3f; }
-                    Text { text: root.connection; color: AppTheme.foreground; vertical-alignment: center; overflow: elide; }
-                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Caption { text: root.working ? "Working… actions paused" : "Owner-local control"; vertical-alignment: center; }
-                }
-            }
-            if root.first-run && root.main-page == 0: Card { ScrollView {
-                VerticalLayout {
-                    padding: 26px; spacing: 16px;
-                    Text { text: "Choose where Telekinesis keeps your files"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                    Caption { text: "Native data holds the catalog and durable history. Project folders contain the mounted views you use in Explorer."; wrap: word-wrap; }
-                    if root.profile-exists: Button { text: "Open existing profile installation"; primary: true; enabled: !root.working && !root.modal; clicked => { root.open-profile(); } }
-                    if root.profile-exists: Caption { text: "A profile installation already exists at " + root.profile-config + ". Open it to continue with the same identity and folders, or explicitly choose a separate portable setup below."; wrap: word-wrap; }
-                    CheckBox { text: "Use a private location in my user profile"; checked <=> root.profile-setup; enabled: !root.profile-exists && root.profile-config != "" && !root.working && !root.modal; }
-                    Caption { text: root.profile-setup ? "This explicitly creates a separate profile installation when you select Save and connect. The executable-adjacent configuration is not moved." : "Portable setup keeps the configuration beside the executable. Pairing requires safe storage permissions; an unsafe location is refused, never repaired or relocated automatically."; wrap: word-wrap; }
-                    if !root.profile-setup: VerticalLayout { spacing: 12px;
-                    Text { text: "Native data folder (new or empty)"; color: AppTheme.foreground; }
-                    HorizontalLayout { LineEdit { accessible-label: "Native data folder"; text <=> root.data-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(0); } } }
-                    Text { text: "Parent folder for project mounts"; color: AppTheme.foreground; }
-                    HorizontalLayout { LineEdit { accessible-label: "Project mount parent folder"; text <=> root.mount-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(1); } } }
-                    HorizontalLayout { Text { text: "Maximum running projects"; color: AppTheme.foreground; vertical-alignment: center; } SpinBox { value <=> root.worker-limit; minimum: 1; maximum: 64; enabled: !root.working && !root.modal; } Rectangle { horizontal-stretch: 1; } }
-                    }
-                    if root.profile-setup: Caption { text: "Native data: " + root.profile-data + "\nVirtual folders: " + root.profile-mounts; wrap: word-wrap; }
-                    Rectangle { height: 1px; background: AppTheme.border; }
-                    Caption { text: "Configuration will be saved to:"; }
-                    Text { text: root.profile-setup ? root.profile-config : root.config-path; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                    Caption { text: "Mounting requires the installed WinFsp runtime. No network connection or service is configured."; wrap: word-wrap; }
-                    HorizontalLayout { Button { text: "Use existing configuration…"; enabled: !root.working && !root.modal; clicked => { root.config-input = root.config-path; root.config-visible = true; } } Rectangle { horizontal-stretch: 1; } Button { text: "Save and connect"; primary: true; enabled: !root.working && !root.modal; clicked => { root.setup(); } } }
-                    Rectangle { vertical-stretch: 1; }
-                }
-            }
-            }
-            if root.main-page == 1: VerticalLayout {
-                spacing: 12px;
-                HorizontalLayout {
-                    Button { text: "Connect remote"; checkable: true; checked: root.pairing-page == 0; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 0; } }
-                    Button { text: "Peers & sync"; checkable: true; checked: root.pairing-page == 1; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 1; root.pair-token = ""; } }
-                    Button { text: "Allow connections"; checkable: true; checked: root.pairing-page == 2; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 2; root.pair-token = ""; root.refresh(); } }
-                }
-                if root.pairing-page == 0: Card {
-                ScrollView {
-                    VerticalLayout { padding: 22px; spacing: 14px; alignment: start;
-                        if !root.pair-advanced: VerticalLayout { spacing: 16px; alignment: start; vertical-stretch: 0;
-                            Text { text: "Connect to another computer"; color: AppTheme.foreground; font-size: 22px; font-weight: 600; }
-                            Caption { text: "Enter the address and pairing key provided by its owner. Telekinesis protects this device's identity and authenticates the connection automatically."; wrap: word-wrap; }
-                            if root.first-run: Caption { text: "Set up this computer from Virtual folders first. Your chosen portable configuration will be used."; wrap: word-wrap; }
-                            HorizontalLayout { spacing: 16px;
-                                VerticalLayout { spacing: 6px; horizontal-stretch: 1;
-                                    Text { text: "IP address"; color: AppTheme.foreground; }
-                                    LineEdit { accessible-label: "Remote IP address"; placeholder-text: "192.168.1.20 or IPv6 address"; text <=> root.pair-host; enabled: !root.working && !root.modal; }
-                                }
-                                VerticalLayout { spacing: 6px; width: 120px;
-                                    Text { text: "Port"; color: AppTheme.foreground; }
-                                    LineEdit { accessible-label: "Remote pairing port"; text <=> root.pair-port; enabled: !root.working && !root.modal; }
-                                }
-                            }
-                            Text { text: "Pairing key"; color: AppTheme.foreground; }
-                            LineEdit { accessible-label: "Remote pairing key"; input-type: password; placeholder-text: "Paste the 200-digit key"; text <=> root.pair-token; enabled: !root.working && !root.modal; }
-                            Caption { text: "The key is cleared when you connect. The other computer's owner will approve this device before shared folders become available."; wrap: word-wrap; }
-                            HorizontalLayout { spacing: 10px;
-                                Button { text: root.working ? "Connecting…" : "Connect"; primary: true; enabled: !root.first-run && root.pair-host != "" && root.pair-port != "" && root.pair-token != "" && !root.working && !root.modal; clicked => { root.pair-action(14); } }
-                                Button { text: "Cancel"; visible: root.working && root.pair-cancellable; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
-                                Rectangle { horizontal-stretch: 1; }
-                            }
-                            Caption { text: "If a connection is interrupted, check pending approvals on the other computer before trying again. Pairing permits shared-folder sync only."; wrap: word-wrap; }
-                        }
-                        Button { height: 36px; text: root.pair-advanced ? "‹ Simple connection" : "Advanced connection settings"; enabled: !root.working && !root.modal; clicked => { root.pair-token = ""; root.pair-confirmed = false; root.pair-advanced = !root.pair-advanced; } }
-                        if root.pair-advanced: VerticalLayout { spacing: 14px;
-                        Text { text: "1  Protect this device's identity"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        Caption { text: "Create an outbound-only client, or load an existing client config. Keys are protected by Windows CurrentUser DPAPI; config stores only the credential reference. No listener or service is installed."; wrap: word-wrap; }
-                        LineEdit { accessible-label: "Pairing configuration path"; text <=> root.pair-config; enabled: !root.working && !root.modal; }
-                        HorizontalLayout {
-                            Button { text: "Create protected client"; enabled: !root.working && !root.modal; clicked => { root.pair-action(1); } }
-                            Button { text: "Load / refresh client"; enabled: !root.working && !root.modal; clicked => { root.pair-confirmed = false; root.pair-action(0); } }
-                        }
-                        Text { text: root.pair-identity; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                        Rectangle { height: 1px; background: AppTheme.border; }
-                        Text { text: "2  Review the server identity"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        Caption { text: "Ask the server owner for its public bootstrap JSON, enrollment WSS address and pairing code. The public certificate identifies the server; verify its fingerprint through a trusted channel."; wrap: word-wrap; }
-                        TextEdit { accessible-label: "Public server bootstrap JSON"; height: 110px; text <=> root.pair-bootstrap; enabled: root.pair-ready && !root.working && !root.modal; edited => { root.pair-confirmed = false; } }
-                        LineEdit { accessible-label: "Server WSS enrollment endpoint"; placeholder-text: "wss://192.0.2.1:8443/tkfs/enroll"; text <=> root.pair-enrollment; enabled: root.pair-ready && !root.working && !root.modal; edited => { root.pair-confirmed = false; } }
-                        Button { text: "Review public server identity"; enabled: root.pair-ready && !root.working && root.pair-bootstrap != "" && root.pair-enrollment != "" && !root.modal; clicked => { root.pair-action(12); } }
-                        Text { text: root.pair-review; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                        CheckBox { text: "I verified the exact certificate fingerprint with the server owner"; checked <=> root.pair-confirmed; enabled: root.pair-review != "" && !root.working && !root.modal; }
-                        Text { text: "3  Submit the pairing code"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        LineEdit { accessible-label: "200-digit server pairing code"; input-type: password; placeholder-text: "Paste exactly 200 decimal digits"; text <=> root.pair-token; enabled: root.pair-ready && !root.working && !root.modal; }
-                        Caption { text: "The code stays valid until the server owner resets it. It is cleared from this input on submission. A submitted enrollment still needs approval on the server; pairing never grants remote administration."; wrap: word-wrap; }
-                        HorizontalLayout {
-                            Button { text: "Submit enrollment"; primary: true; enabled: root.pair-ready && root.pair-confirmed && root.pair-token != "" && !root.working && !root.modal; clicked => { root.pair-action(13); } }
-                            Button { text: "Discard"; enabled: !root.working && !root.modal; clicked => { root.pair-action(10); } }
-                            Button { text: "Cancel network operation"; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
-                        }
-                        Caption { text: "Cancellation stops local I/O; a request already received by the server may still be pending approval. Refresh client status before resubmitting. No listener or background sync is started here."; wrap: word-wrap; }
-                        }
-                    }
-                }
-                }
-                if root.pairing-page == 1: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 14px;
-                        Text { text: "Your remote connections"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        Caption { text: "After connecting, ask the other computer's owner to approve this device. Then check which shared folders are available."; wrap: word-wrap; }
-                        Text { text: root.pair-identity; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                        for peer[index] in root.pair-peers: VerticalLayout {
-                            Button { text: peer.id + (peer.revoked ? " · Revoked" : " · Locally trusted key"); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working && !root.modal; clicked => { root.pair-selected-peer = index; root.pair-action(11); } }
-                            Caption { text: "SHA-256: " + peer.fingerprint; wrap: word-wrap; font-size: 12px; }
-                        }
-                        Button { text: "Check approval / load published repositories"; enabled: root.pair-ready && root.pair-peer-active && !root.working && !root.modal; clicked => { root.pair-action(4); } }
-                        Rectangle { height: 1px; background: AppTheme.border; }
-                        Text { text: "4  Configure a matching local replica"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        for repo[index] in root.pair-repos: VerticalLayout {
-                            Button { text: repo.label + " · " + repo.id; checkable: true; checked: root.pair-selected-repo == index; enabled: !root.working && !root.modal; clicked => { root.pair-selected-repo = index; root.pair-grant-confirmed = false; } }
-                            Button { text: "Receive into a new local replica…"; enabled: root.connected && !root.working; clicked => { root.receive-repository = repo.id; root.receive-label = repo.label; root.main-page = 4; root.refresh(); } }
-                            Caption { text: "Published branches (all are synchronized):\n" + repo.branches; wrap: word-wrap; font-size: 12px; }
-                        }
-                        Caption { text: "A running replica with the same repository ID and a different device ID is required. Select its native runtime.json. Use Receive repository to prepare a new managed replica. Adoption of external stores is unavailable. Mounting is configured on that local worker; sync leaves its current branch selected. Choose the local view in Branches & snapshots or the CLI."; wrap: word-wrap; }
-                        LineEdit { accessible-label: "Matching local replica runtime discovery path"; placeholder-text: "C:\\path\\to\\replica\\runtime.json"; text <=> root.pair-runtime; enabled: !root.working && !root.modal; }
-                        CheckBox { text: "Enable bidirectional sync for all published branches in this repository"; checked <=> root.pair-grant-confirmed; enabled: root.pair-repo-selected && !root.working && !root.modal; }
-                        Button { text: "Configure published-data sync"; enabled: root.pair-repo-selected && root.pair-runtime != "" && root.pair-grant-confirmed && !root.working && !root.modal; clicked => { root.pair-action(5); } }
-                        Text { text: root.pair-local; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                        HorizontalLayout {
-                            Button { text: "Sync now / next page"; enabled: root.pair-ready && root.pair-repo-selected && !root.working && !root.modal; clicked => { root.pair-action(6); } }
-                            Button { text: "Pause sync"; enabled: root.pair-repo-selected && !root.working && !root.modal; clicked => { root.pair-action(7); } }
-                            Button { text: "Resume sync grant"; enabled: root.pair-repo-selected && !root.working && !root.modal; clicked => { root.pair-action(8); } }
-                        }
-                        Caption { text: "Private branches and deleted private history stay local. Cancel stops local I/O; it does not undo enrollment or committed sync data. An interrupted enrollment may still await server approval. No background sync service is started by this flow."; wrap: word-wrap; }
-                        Button { text: "Cancel current network operation"; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
-                        Text { text: root.pair-syncs; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                        for grant[index] in root.pair-grants: VerticalLayout {
-                            Caption { text: "Configured repository: " + grant.repo + (grant.revoked ? " · Revoked" : grant.enabled ? " · Enabled" : " · Paused"); wrap: word-wrap; }
-                            HorizontalLayout {
-                                Button { text: "Sync configured repository"; enabled: root.pair-ready && grant.enabled && !grant.revoked && !root.working && !root.modal; clicked => { root.pair-grant-action(index, 0); } }
-                                Button { text: grant.enabled ? "Pause" : "Resume"; enabled: !grant.revoked && !root.working && !root.modal; clicked => { root.pair-grant-action(index, grant.enabled ? 1 : 2); } }
-                            }
-                        }
-                        CheckBox { text: "I understand revocation is local and cannot be undone with Resume"; checked <=> root.pair-revoke-confirmed; enabled: root.pair-peer-active && !root.working && !root.modal; }
-                        Button { text: "Revoke selected peer locally"; enabled: root.pair-peer-active && root.pair-revoke-confirmed && !root.working && !root.modal; clicked => { root.pair-action(9); } }
-                    }
-                }
-            }
-                if root.pairing-page == 2: Card { ScrollView { VerticalLayout { padding: 24px; spacing: 16px;
-                    Text { text: "Allow other computers to connect"; color: AppTheme.foreground; font-size: 21px; font-weight: 600; }
-                    Caption { text: "Enable receiving on this computer, create a pairing key, then share your IP address, port and key privately. Telekinesis manages the protected identity files."; wrap: word-wrap; }
-                    HorizontalLayout { spacing: 12px;
-                        LineEdit { accessible-label: "Receiving address, set at first setup"; placeholder-text: "This computer's IP address"; text <=> root.receiving-address; enabled: root.connected && !root.receiving-configured && !root.working && !root.modal; }
-                        LineEdit { accessible-label: "Receiving port, set at first setup"; width: 120px; text <=> root.receiving-port; enabled: root.connected && !root.receiving-configured && !root.working && !root.modal; }
-                    }
-                    if root.receiving-configured: Caption { text: "Address and port were fixed at first setup. This screen can disable or re-enable that endpoint; changing it requires owner-led configuration recovery."; wrap: word-wrap; }
+        VerticalLayout { spacing: 0px;
+            Rectangle { height: 158px; background: Theme.panel;
+                VerticalLayout { padding-top: 20px; padding-bottom: 15px; padding-left: 24px; padding-right: 24px; spacing: 10px;
+                    Label { text: "Virtual folders"; font-size: 20px; font-weight: 600; }
+                    Field { placeholder: "Search folders"; text <=> root.search; enabled: root.dialog == ""; edited(text) => { root.search-folders(text); } }
                     HorizontalLayout { spacing: 10px;
-                        Button { text: "Set up / enable receiving"; primary: true; enabled: root.connected && root.receiving-address != "" && root.receiving-port != "" && !root.working && !root.modal; clicked => { root.receiving-action(true); } }
-                        Button { text: "Disable receiving"; enabled: root.connected && root.receiving-enabled && !root.working && !root.modal; clicked => { root.receiving-action(false); } }
-                        Button { text: "Refresh status"; enabled: root.connected && !root.working && !root.modal; clicked => { root.refresh(); } }
-                    }
-                    Text { text: "Service: " + (root.receiving-state == "" ? "Not checked" : root.receiving-state) + "  ·  " + root.receiving-endpoint; color: AppTheme.foreground; wrap: word-wrap; }
-                    if root.receiving-error != "": Caption { text: root.receiving-error; wrap: word-wrap; }
-                    Caption { text: "Only Running confirms the listener is active. Enabling may take time or fail. Disabling preserves paired devices and grants; it does not change firewall settings."; wrap: word-wrap; }
-                    Rectangle { height: 1px; background: AppTheme.border; }
-                    Text { text: "Pairing key"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                    Caption { text: root.receiving-key-status; wrap: word-wrap; }
-                    if root.pair-advanced: LineEdit { accessible-label: "Server orchestrator configuration"; text <=> root.server-config; enabled: !root.working && !root.modal; edited => { root.server-reset-confirmed = false; } }
-                    Caption { text: "A reset creates exactly 200 decimal digits and displays them once. Protected verification data is stored; the pairing key itself is not saved. Save the key privately while it is visible; it cannot be recovered later."; wrap: word-wrap; }
-                    Caption { text: "The code can be used until the next reset. Resetting invalidates the old code for future enrollments. Existing peers, grants, sync and already submitted approvals remain unchanged."; wrap: word-wrap; }
-                    CheckBox { text: "I understand: the old code will stop working and the new code is shown once"; checked <=> root.server-reset-confirmed; enabled: !root.working && !root.modal; }
-                    Button { text: root.working ? "Resetting…" : "Reset pairing code"; primary: true; enabled: root.server-reset-confirmed && root.server-config != "" && !root.working && !root.modal; clicked => { root.reset-pairing-code(); } }
-                    Rectangle { height: 1px; background: AppTheme.border; }
-                    Text { text: "Devices waiting for your approval"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                    Caption { text: "Approve only a device you recognize. Compare its public device identity with the person who is connecting. Folder access is granted separately."; wrap: word-wrap; }
-                    if root.pending-devices.length == 0: Caption { text: "No pending requests in the last status check."; wrap: word-wrap; }
-                    for device in root.pending-devices: Card { VerticalLayout { padding: 12px; spacing: 8px;
-                        Text { text: device.installation; color: AppTheme.foreground; wrap: word-wrap; }
-                        Caption { text: "Certificate: " + device.fingerprint; wrap: word-wrap; font-size: 12px; }
-                        Button { text: "Approve this device"; enabled: root.connected && !root.working && !root.modal; clicked => { root.approve-device(device.invitation); } }
-                    } }
-                    Caption { text: "Lost the code or closed the result? Reset again explicitly. A failed or interrupted reset is never retried automatically."; wrap: word-wrap; }
-                    Rectangle { vertical-stretch: 1; }
-                } } }
-            }
-            if root.main-page == 4: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 16px;
-                if !root.pair-ready: Button { text: "Load or pair this device in Peers & sync…"; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; root.pairing-page = 0; } }
-                Text { text: "1  Prepare or resume a local replica"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
-                Caption { text: "Enter the source repository UUID, or use an authorized repository discovered in Peers & sync. Preparation creates a new local device and headless worker. It never mounts incomplete data or grants access on another computer."; wrap: word-wrap; }
-                HorizontalLayout {
-                    LineEdit { accessible-label: "Receiving replica label"; placeholder-text: "Local folder name"; text <=> root.receive-label; enabled: !root.working && root.connected && !root.modal; }
-                    LineEdit { accessible-label: "Source repository UUID"; placeholder-text: "Repository UUID supplied by source owner"; text <=> root.receive-repository; enabled: !root.working && root.connected && !root.modal; }
-                    Button { text: "Prepare headless replica"; enabled: root.connected && !root.working && !root.can-retry && root.receive-label != "" && root.receive-repository != "" && !root.modal; clicked => { root.receive-action(0); } }
-                }
-                Caption { text: "Resume from a managed state (identities and grants survive closing this window):"; }
-                for project[index] in root.projects: Button { text: project.label + (project.mount == "" ? " · Headless" : project.status == "Running" ? " · Mounted" : " · Mount reserved"); checkable: true; checked: root.selected == index; enabled: !root.working && root.connected && !root.modal; clicked => { root.select-project(index); } }
-                Text { text: root.receive-status; color: AppTheme.foreground; wrap: word-wrap; font-size: 16px; font-weight: 600; }
-                if root.receive-state != "": VerticalLayout { spacing: 12px;
-                    TextEdit { accessible-label: "Public receiving repository, device and state IDs"; text: "Repository: " + root.receive-repo-id + "\nLocal device: " + root.receive-device + "\nState: " + root.receive-state; read-only: true; height: 90px; font-size: 12px; }
-                    Caption { text: "Give this public local device ID to the source owner for their existing repository grant. Pairing alone grants no repository access. The source owner chooses its local runtime and grants your installation + this device; no remote grant command is sent here."; wrap: word-wrap; }
-                    Button { text: root.receive-headless ? "Start headless / resume validation" : "Start mounted worker"; enabled: !root.working && !root.receive-running && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(6); } }
-                    Text { text: "2  Discover, authorize locally and catch up"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
-                    Caption { text: "Select the source peer. Until its owner grants access, discovery may be empty or refused."; wrap: word-wrap; }
-                    for peer[index] in root.pair-peers: Button { text: peer.id + (peer.revoked ? " · Revoked" : ""); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working && !peer.revoked && root.connected && !root.modal; clicked => { root.pair-selected-peer = index; root.receive-confirmed = false; root.pair-action(11); } }
-                    Button { text: "Refresh source repository discovery"; enabled: !root.working && root.pair-peer-active && root.connected && !root.modal; clicked => { root.pair-action(4); } }
-                    for repo in root.pair-repos: Caption { text: repo.label + " · " + repo.id; wrap: word-wrap; }
-                    CheckBox { text: "Allow bidirectional sync of every published branch in this repository"; checked <=> root.receive-confirmed; enabled: !root.working && root.receive-headless && root.receive-running && root.pair-peer-active && root.connected && !root.modal; }
-                    Button { text: "Configure matching local replica"; enabled: !root.working && root.receive-confirmed && root.receive-headless && root.receive-running && root.connected && !root.modal; clicked => { root.receive-action(1); } }
-                    HorizontalLayout {
-                        Button { text: "Sync now / next page"; enabled: !root.working && root.receive-headless && root.receive-running && root.pair-peer-active && root.connected && !root.modal; clicked => { root.receive-action(2); } }
-                        Button { text: "Cancel sync"; enabled: root.working && root.pair-cancellable && root.connected && !root.modal; clicked => { root.pair-cancel(); } }
-                    }
-                    Caption { text: "Cancellation retains committed pages. A restarted worker, changed or paused grant, or new pending data requires fresh sync before mounting."; wrap: word-wrap; }
-                    Text { text: "3  Validate the received branch, then mount"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
-                    for branch[index] in root.branches: VerticalLayout { if branch.shared: Button { text: branch.label + (branch.current ? " · Current" : ""); checkable: true; checked: root.selected-branch == index; enabled: !root.working && root.connected && !root.modal; clicked => { root.selected-branch = index; } } }
-                    HorizontalLayout {
-                        Button { text: "Select and verify shared branch"; enabled: !root.working && root.receive-caught-up && root.receive-running && root.selected-branch >= 0 && !root.can-retry-branch && root.connected && !root.modal; clicked => { root.receive-action(3); } }
-                        Button { text: "Stop verified headless worker"; enabled: !root.working && root.receive-materialized && root.receive-running && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(4); } }
-                    }
-                    LineEdit { accessible-label: "First mount path for received replica"; placeholder-text: "New absolute mount folder, with an existing parent"; text <=> root.receive-mount; enabled: !root.working && root.receive-can-attach && root.connected && !root.modal; }
-                    Button { text: "Reserve first mount"; enabled: !root.working && root.receive-can-attach && root.receive-mount != "" && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(5); } }
-                    Caption { text: "Branch checkout verifies causal completeness and visible objects. Mount reservation leaves the worker stopped; start it explicitly afterward. If this window closes before reservation, start headless and repeat sync/branch verification."; wrap: word-wrap; }
-                }
-                Rectangle { height: 1px; background: AppTheme.border; }
-                Text { text: "Background published-data sync"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
-                Caption { text: "The local supervisor runs ALL configured enabled grants in the loaded outbound client configuration. Paused grants stay paused. Enabling is durable intent; service status below reports actual startup. Running service does not mean every repository is caught up."; wrap: word-wrap; }
-                Text { text: root.pair-config; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                Text { text: root.background-sync-status; color: AppTheme.foreground; wrap: word-wrap; }
-                HorizontalLayout {
-                    Button { text: "Enable supervised sync"; enabled: root.connected && root.pair-ready && !root.working && !root.can-retry && !root.modal; clicked => { root.background-sync-action(true); } }
-                    Button { text: "Disable supervised sync"; enabled: root.connected && !root.working && !root.can-retry && !root.modal; clicked => { root.background-sync-action(false); } }
-                }
-                Caption { text: "Uses the existing protected credential; no new listener or identity is created. Closing the GUI keeps desired background sync with the local supervisor. Disabling the service does not change repository grants."; wrap: word-wrap; }
-            } } }
-            if !root.first-run && root.main-page == 0: VerticalLayout {
-                spacing: 16px;
-                HorizontalLayout { spacing: 12px; height: 95px;
-                    Stat { label: "Local folders"; value: root.projects.length; }
-                    Stat { label: "Workers running"; value: root.connected ? root.running-count : "—"; }
-                    Stat { label: "Need attention"; value: root.connected ? root.attention-count : "—"; }
-                }
-                Card { VerticalLayout { padding: 16px; spacing: 12px;
-                    HorizontalLayout {
-                        Text { text: "Folders on this computer"; font-size: 17px; font-weight: 600; color: AppTheme.foreground; vertical-alignment: center; }
+                        ActionButton { text: "Connect remote"; enabled: root.interactive; clicked => { root.dialog = "connect"; } }
+                        ActionButton { text: "New folder"; primary: true; enabled: root.interactive; clicked => { root.folder-name = ""; root.mount-path = ""; root.dialog = "create"; } }
                         Rectangle { horizontal-stretch: 1; }
+                        ActionButton { text: "Refresh"; quiet: true; enabled: root.interactive; clicked => { root.refresh(); } }
                     }
-                    HorizontalLayout { padding: 8px; spacing: 14px;
-                        Caption { text: "Name"; width: 180px; }
-                        Caption { text: "Mount point"; horizontal-stretch: 1; }
-                        Caption { text: "Status"; width: 150px; }
-                        Caption { text: "Action"; width: 95px; }
-                    }
-                    Rectangle { height: 1px; background: AppTheme.border; }
-                    if root.visible-projects.length == 0: VerticalLayout { padding: 28px; spacing: 12px;
-                        Text { text: root.projects.length == 0 ? (root.connected ? "Create your first virtual folder" : "Connect to load your folders") : "No folders match your search"; color: AppTheme.foreground; font-size: 21px; wrap: word-wrap; }
-                        Caption { text: root.projects.length == 0 ? "Each project keeps an independent local store and durable history. Choose its mount path when creating it." : "Try a different name or path, or clear the search."; wrap: word-wrap; }
-                    }
-                    ListView {
-                        for index in root.visible-projects: VerticalLayout { spacing: 8px; padding-bottom: 10px;
-                            HorizontalLayout { spacing: 14px;
-                                Button { width: 180px; text: root.projects[index].label; accessible-label: "Open details for " + root.projects[index].label; enabled: root.connected && !root.working && !root.modal; clicked => { root.main-page = 3; root.select-project(index); } }
-                                Text { text: root.projects[index].mount; color: AppTheme.foreground; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; font-size: 12px; }
-                                Text { text: root.connected ? root.projects[index].status : "Unknown · stale"; color: AppTheme.foreground; width: 150px; vertical-alignment: center; overflow: elide; }
-                                Button { width: 95px; text: root.projects[index].desired ? "Unmount" : "Mount"; accessible-label: (root.projects[index].desired ? "Unmount " : "Mount ") + root.projects[index].label; enabled: root.connected && root.projects[index].mount != "" && !root.working && !root.modal && !root.can-retry; clicked => { root.toggle-mount(root.projects[index].id, root.projects[index].desired); } }
-                            }
-                            Rectangle { height: 1px; background: AppTheme.border; }
-                        }
-                    }
-                    Caption { text: root.visible-projects.length + " shown · " + root.projects.length + " total · this host"; }
-                } }
+                }
+                Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
             }
-            if !root.first-run && root.main-page == 3: VerticalLayout {
-                spacing: 12px;
-                HorizontalLayout { Button { text: "‹ All virtual folders"; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; root.pair-token = ""; } } Rectangle { horizontal-stretch: 1; } }
-                Card {
-                    VerticalLayout {
-                        padding: 22px; spacing: 14px;
-                        Text { text: root.selected >= 0 && root.selected < root.projects.length ? root.projects[root.selected].label : "Project details"; color: AppTheme.foreground; font-size: 22px; font-weight: 600; }
-                        if root.selected >= 0 && root.selected < root.projects.length: HorizontalLayout {
-                            Button { text: "Open folder"; enabled: root.connected && !root.working && !root.modal && (root.projects[root.selected].status == "Running" || root.projects[root.selected].status == "Needs attention" || root.projects[root.selected].status == "Stopping · files in use") && root.projects[root.selected].mount != ""; clicked => { root.open-project(); } }
-                            Button { text: "Start / mount"; enabled: root.can-start-project; clicked => { root.start-project(); } }
-                            Button { text: "Stop / unmount"; enabled: root.can-stop-project; clicked => { root.stop-project(); } }
+            VerticalLayout { padding: 24px; spacing: 18px;
+                HorizontalLayout { spacing: 12px;
+                    Stat { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; title: "Storage used"; value: "—"; detail: "Storage usage is not reported yet"; }
+                    Stat { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; title: "Folders mounted"; value: root.mounted-count + " / " + root.folder-count; detail: "On this host"; }
+                    Stat { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; title: "Orchestrators online"; value: root.online-count + " / " + root.peer-rows.length; detail: "Connected remote hosts"; }
+                }
+                Card { min-height: 104px; preferred-height: root.folders.length == 0 ? 260px : 46px + root.folders.length * 58px; vertical-stretch: 0;
+                    VerticalLayout { spacing: 0px; padding: 1px;
+                        HorizontalLayout { height: 42px; padding-left: 16px; padding-right: 16px; spacing: 14px;
+                            Muted { text: "Name"; width: root.name-column; }
+                            Muted { text: "Mount point"; horizontal-stretch: 1.2; }
+                            Muted { text: "Status"; width: 118px; }
+                            Muted { text: "Actions"; width: 186px; horizontal-alignment: right; }
                         }
-                        if root.selected >= 0: HorizontalLayout {
-                            Button { text: "Overview"; checkable: true; checked: root.details-page == 0; enabled: !root.modal; clicked => { root.details-page = 0; } }
-                            Button { text: "Branches & snapshots"; checkable: true; checked: root.details-page == 1; enabled: !root.modal; clicked => { root.details-page = 1; } }
-                        }
-                        if root.details-page == 0: ScrollView { VerticalLayout {
-                            spacing: 16px;
-                            Text { text: root.status-detail; color: AppTheme.foreground; wrap: word-wrap; font-size: 13px; }
-                            Text { text: root.branches-detail; color: AppTheme.foreground; wrap: word-wrap; font-size: 13px; }
-                            Rectangle { vertical-stretch: 1; }
-                        } }
-                        if root.details-page == 1: ScrollView { VerticalLayout {
-                            spacing: 12px;
-                            Text { text: root.runtime-ready ? "Current: " + root.current-branch-name : "Branch controls unavailable"; color: AppTheme.foreground; font-size: 17px; font-weight: 600; wrap: word-wrap; }
-                            Caption { text: root.runtime-ready ? (root.current-branch-shared ? "Shared branch · sync requires a published-data grant" : "Private branch · stays on this computer") : "Start the project, then refresh. Sampled or unavailable runtime state cannot authorize branch actions."; wrap: word-wrap; }
-                            HorizontalLayout {
-                                Button { text: "New private branch…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(1); } }
-                                Button { text: "Switch to selected…"; enabled: root.can-checkout; clicked => { root.begin-branch-action(2); } }
+                        Rectangle { height: 1px; background: Theme.line; }
+                        if root.folders.length > 0: ScrollView {
+                            VerticalLayout { spacing: 0px;
+                                for folder in root.folders: Rectangle { height: 58px; background: row-hover.has-hover ? #1b2432 : transparent;
+                                    row-hover := TouchArea {}
+                                    HorizontalLayout { padding-left: 16px; padding-right: 16px; padding-top: 12px; padding-bottom: 12px; spacing: 14px;
+                                        HorizontalLayout { width: root.name-column; spacing: 10px; alignment: start;
+                                            FolderIcon {}
+                                            Label { text: folder.label; font-weight: 600; horizontal-stretch: 1; }
+                                        }
+                                        Label { text: folder.mount == "" ? "No mount point" : folder.mount; font-family: "Consolas"; font-size: 12px; horizontal-stretch: 1.2; }
+                                        Rectangle { width: 118px;
+                                          Rectangle { y: (parent.height - 24px) / 2; width: parent.width; height: 24px; border-radius: 12px;
+                                            background: folder.error != "" ? #43262a : folder.running ? #12342a : #222a37;
+                                            Label { text: folder.error != "" ? "! Needs attention" : folder.running ? (folder.mount == "" ? "● Headless" : "● Mounted") : "○ Not mounted"; color: folder.error != "" ? #ff9d96 : folder.running ? #5fd0a6 : Theme.muted; font-size: 11px; horizontal-alignment: center; }
+                                          }
+                                        }
+                                        HorizontalLayout { width: 186px; spacing: 6px;
+                                            ActionButton { text: folder.running ? (folder.mount == "" ? "Stop" : "Unmount") : (folder.mount == "" ? "Start" : "Mount"); enabled: root.interactive;
+                                                clicked => { if folder.running { root.stop-folder(folder.state); } else { root.start-folder(folder.state); } }
+                                            }
+                                            ActionButton { text: "Change path"; enabled: root.interactive;
+                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.mount-path = folder.mount; root.dialog = folder.running ? "stop-first" : "mount"; }
+                                            }
+                                        }
+                                    }
+                                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                                }
+                                Rectangle { vertical-stretch: 1; }
                             }
-                            ListView { height: min(180px, max(95px, root.branches.length * 52px));
-                                for branch[index] in root.branches: VerticalLayout { spacing: 3px; padding-bottom: 7px;
-                                    Button { text: branch.label + (branch.shared ? " · Shared" : " · Private") + (branch.current ? " · Current" : ""); checkable: true; checked: root.selected-branch == index; enabled: !root.working && !root.modal; clicked => { root.selected-branch = index; } }
-                                    Caption { text: branch.shared ? "Shared · published-data grants apply" : "Private · local only"; }
+                        }
+                        if root.folders.length == 0: VerticalLayout { padding: 40px; spacing: 12px; alignment: center;
+                            Label { text: root.search != "" ? "No folders match your search" : "Your folders, all in one place"; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
+                            Muted { text: root.search != "" ? "Try another name or mount path." : "Create a virtual folder or connect a remote orchestrator to get started."; horizontal-alignment: center; }
+                            Rectangle { height: 12px; }
+                            HorizontalLayout { alignment: center;
+                                ActionButton { text: root.search != "" ? "Clear search" : "Create your first folder"; primary: true; enabled: root.interactive;
+                                    clicked => { if root.search != "" { root.search = ""; root.search-folders(""); } else { root.folder-name = ""; root.mount-path = ""; root.dialog = "create"; } }
                                 }
                             }
-                            Button { text: "Publish current visible state…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(3); } }
-                            Caption { text: "Publication creates a new shared branch. It does not publish private history or configure a peer."; wrap: word-wrap; }
-                            Rectangle { height: 1px; background: AppTheme.border; }
-                            Text { text: "Snapshots"; color: AppTheme.foreground; font-size: 17px; font-weight: 600; }
-                            HorizontalLayout {
-                                Button { text: "Save checkpoint…"; enabled: root.can-branch-actions; clicked => { root.begin-branch-action(4); } }
-                                Button { text: "Restore to private branch…"; enabled: root.can-branch-actions && root.selected-checkpoint >= 0; clicked => { root.begin-branch-action(5); } }
-                            }
-                            if root.checkpoints.length == 0: Caption { text: "No checkpoints in this project yet."; }
-                            if root.checkpoints.length > 0: ListView { min-height: 75px; max-height: 140px;
-                                for checkpoint[index] in root.checkpoints: Button { text: checkpoint.label; checkable: true; checked: root.selected-checkpoint == index; enabled: !root.working && !root.modal; clicked => { root.selected-checkpoint = index; } }
-                            }
-                        } }
+                        }
                     }
                 }
-            }
-            if root.message != "": Rectangle {
-                background: root.error ? #fff0e9 : #e7f4ef; border-radius: 8px;
-                min-height: 56px;
-                HorizontalLayout { padding: 13px; spacing: 10px;
-                    Text { text: root.message; color: root.error ? #8c4028 : #23654e; wrap: word-wrap; font-size: 13px; }
-                    Button { text: "Retry exact request"; visible: root.can-retry; enabled: !root.working && !root.modal && root.connected; clicked => { root.retry(); } }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout { height: 34px; spacing: 12px;
+                    Label { text: root.busy ? "Working…" : root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; horizontal-stretch: 1; }
+                    ActionButton { text: "Details"; quiet: true; enabled: root.dialog == ""; clicked => { root.dialog = "details"; } }
                 }
-            }
-            if root.operation-detail != "" && (root.can-retry || root.show-activity): Card {
-                max-height: 120px; min-height: 65px;
-                HorizontalLayout { padding: 12px; spacing: 10px;
-                    ScrollView { Text { text: root.operation-detail; color: AppTheme.muted; font-size: 12px; wrap: word-wrap; } }
-                    Button { text: "Inspect operation"; enabled: !root.working && !root.modal && root.connected; clicked => { root.inspect-operation(); } }
-                }
-            }
-            if root.branch-operation-detail != "" && (root.can-retry-branch || root.show-activity): Card {
-                max-height: 90px; min-height: 60px;
-                HorizontalLayout { padding: 12px; spacing: 10px;
-                    ScrollView { Text { text: root.branch-operation-detail; color: AppTheme.muted; font-size: 12px; wrap: word-wrap; } }
-                    Button { text: "Retry original branch request"; visible: root.can-retry-branch; enabled: !root.working && !root.modal && root.connected; clicked => { root.retry-branch(); } }
-                }
-            }
-            if !root.first-run: HorizontalLayout {
-                Caption { text: "Closing this window keeps your projects running."; wrap: word-wrap; horizontal-stretch: 1; }
-                Rectangle { horizontal-stretch: 1; }
-                Button { text: root.show-activity ? "Hide activity" : "Activity"; enabled: !root.modal; clicked => { root.show-activity = !root.show-activity; } }
-                Button { text: "Reconnect supervisor"; visible: root.connected; enabled: root.can-start-supervisor; clicked => { root.connect(); } }
-                Button { text: "Shut down supervisor…"; enabled: root.can-stop-supervisor; clicked => { root.shutdown-visible = true; } }
             }
         }
     }
-    Rectangle {
-        visible: root.create-visible;
-        background: #142e3c99;
-        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 620px; height: 390px;
-            VerticalLayout { padding: 26px; spacing: 15px;
-                Heading { text: "New project"; }
-                Caption { text: "Creates a new independent local store and starts its worker."; wrap: word-wrap; }
-                Text { text: "Project name"; color: AppTheme.foreground; }
-                project-name-edit := LineEdit { accessible-label: "Project name"; text <=> root.project-name; placeholder-text: "My project"; enabled: !root.working; }
-                Text { text: "Mount path (a new folder, with an existing parent)"; color: AppTheme.foreground; }
-                HorizontalLayout { LineEdit { accessible-label: "Project mount path"; text <=> root.project-mount; placeholder-text: "Leave blank to use the default parent + project name"; enabled: !root.working; } Button { text: "Parent…"; enabled: !root.working; clicked => { root.browse(2); } } }
-                Caption { text: "The final mount folder must not already exist. Native data remains separate."; wrap: word-wrap; }
-                Rectangle { vertical-stretch: 1; }
-                HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Cancel"; enabled: !root.working; clicked => { root.create-visible = false; } } Button { text: "Create and mount"; primary: true; enabled: !root.working && root.project-name != ""; clicked => { root.create-visible = false; root.create-project(); } } }
-            }
-        }
-    }
-    if root.shutdown-visible: Rectangle {
-        background: #142e3c99;
-        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 570px; height: 250px;
-            VerticalLayout { padding: 26px; spacing: 16px;
-                Heading { text: "Shut down background workers?"; font-size: 23px; }
-                Caption { text: "All projects in this installation will be unmounted. Close editors and Explorer windows using these projects first. Projects marked to run will return on the next supervisor launch."; wrap: word-wrap; }
-                Rectangle { vertical-stretch: 1; }
-                HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Keep running"; clicked => { root.shutdown-visible = false; } } Button { text: "Shut down"; clicked => { root.shutdown-visible = false; root.shutdown(); } } }
-            }
-        }
-    }
-    if root.branch-dialog != 0: Rectangle {
-        background: #142e3c99;
-        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 610px; height: 410px;
-            VerticalLayout { padding: 26px; spacing: 15px;
-                Heading { font-size: 23px; text: root.branch-dialog == 1 ? "New private branch" : root.branch-dialog == 2 ? "Switch branch" : root.branch-dialog == 3 ? "Publish visible state" : root.branch-dialog == 4 ? "Save checkpoint" : "Restore to private branch"; }
-                Caption { text: "Project: " + (root.selected >= 0 ? root.projects[root.selected].label : "") + " · Current branch: " + root.current-branch-name; wrap: word-wrap; }
-                Caption { text: root.branch-dialog == 1 ? "Copies the current visible files into a new private branch. The current branch stays selected." : root.branch-dialog == 2 ? "Switch to " + root.branch-target-label + ". Close files, editors, and Explorer windows using this project first. The mounted view is rebound only after the runtime's busy checks pass." : root.branch-dialog == 3 ? "Creates a NEW shared branch from the visible files only. Private history, deleted private content, and private conflict alternatives remain on this computer. Shared branches may synchronize when a published-data grant is enabled." : root.branch-dialog == 4 ? "Saves a local checkpoint of the current visible files. It does not switch branches or upload anything." : "Restores " + root.branch-target-label + " into a NEW private branch. Current files and the active branch stay unchanged; switch to the restored branch when ready."; wrap: word-wrap; }
-                if root.branch-dialog != 2: VerticalLayout {
-                    Text { text: root.branch-dialog == 4 ? "Checkpoint message" : "New branch name"; color: AppTheme.foreground; }
-                    LineEdit { accessible-label: root.branch-dialog == 4 ? "Checkpoint message" : "New branch name"; text <=> root.branch-input; enabled: !root.working; }
-                }
-                if root.branch-dialog == 3: CheckBox { text: "I confirm publication of the current visible state only"; checked <=> root.publication-confirmed; enabled: !root.working; }
-                Rectangle { vertical-stretch: 1; }
+    if root.dialog != "": Rectangle {
+        background: #050913bb;
+        TouchArea { clicked => { if !root.busy { root.dialog = ""; } } }
+        Card {
+            x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+            width: root.dialog == "connect" ? 600px : 510px;
+            height: self.preferred-height;
+            TouchArea {}
+            VerticalLayout { padding: 24px; spacing: 14px;
                 HorizontalLayout {
-                    Button { text: "Cancel"; enabled: !root.working; clicked => { root.cancel-branch-dialog(); } }
-                    Rectangle { horizontal-stretch: 1; }
-                    Button { text: root.branch-dialog == 2 ? "Switch branch" : root.branch-dialog == 3 ? "Publish visible state" : root.branch-dialog == 4 ? "Save checkpoint" : "Create private branch"; primary: true; enabled: root.can-submit-branch; clicked => { root.submit-branch(); } }
+                    Label { text: root.dialog == "create" ? "New virtual folder" : root.dialog == "mount" || root.dialog == "stop-first" ? "Change mount point" : root.dialog == "connect" ? "Connect remote orchestrator" : root.dialog == "host" ? "Host settings" : root.dialog == "shutdown" ? "Shut down host" : "Activity details"; font-size: 20px; font-weight: 600; }
+                    ActionButton { width: 34px; text: "×"; quiet: true; enabled: !root.busy; clicked => { root.dialog = ""; } }
                 }
+                if root.dialog == "create" || root.dialog == "mount": VerticalLayout { spacing: 10px;
+                    Muted { text: root.dialog == "create" ? "Create a folder on this host and choose where it appears on disk." : "Choose a new mount point for “" + root.selected-label + "”."; wrap: word-wrap; }
+                    if root.dialog == "create": VerticalLayout { spacing: 6px;
+                        Label { text: "Folder name"; }
+                        Field { placeholder: "Project files"; text <=> root.folder-name; enabled: !root.busy; }
+                    }
+                    Label { text: "Mount point"; }
+                    Field { placeholder: "e.g. C:\\Telekinesis\\projects"; text <=> root.mount-path; enabled: !root.busy; }
+                    Muted { text: root.dialog == "create" ? "Leave empty to use the default mount directory. The folder mounts immediately." : "Leave empty to run without a filesystem mount. Start the folder after saving."; wrap: word-wrap; }
+                    HorizontalLayout { alignment: end; spacing: 8px;
+                        ActionButton { text: "Cancel"; enabled: !root.busy; clicked => { root.dialog = ""; } }
+                        ActionButton { text: root.dialog == "create" ? "Create & mount" : "Save mount point"; primary: true; enabled: !root.busy && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path); } else { root.configure-mount(root.selected-state, root.mount-path); } } }
+                    }
+                }
+                if root.dialog == "stop-first": VerticalLayout { spacing: 16px;
+                    Label { text: "Unmount “" + root.selected-label + "” before changing its path. Close any open files in this folder first."; wrap: word-wrap; }
+                    ActionButton { text: "Stop folder to change path"; primary: true; enabled: !root.busy; clicked => { root.stop-folder(root.selected-state); } }
+                }
+                if root.dialog == "connect": VerticalLayout { spacing: 9px;
+                    Muted { text: "Pair with another host to browse and receive its shared folders."; }
+                    Label { text: "Orchestrator address"; }
+                    Field { placeholder: "ws://host:43180"; text <=> root.endpoint; enabled: !root.busy; edited(_) => { root.remote-changed(); } }
+                    Label { text: "Remote pairing code"; }
+                    Field { placeholder: "Enter the code from the remote host"; text <=> root.code; enabled: !root.busy; }
+                    HorizontalLayout { spacing: 8px;
+                        ActionButton { text: "Pair"; primary: true; enabled: !root.busy && root.endpoint != "" && root.code != ""; clicked => { root.pair(root.endpoint, root.code); } }
+                        ActionButton { text: "Browse folders"; enabled: !root.busy && root.endpoint != ""; clicked => { root.remote-list(root.endpoint); } }
+                        ActionButton { text: "Disconnect"; enabled: !root.busy && root.endpoint != ""; clicked => { root.unpair(root.endpoint); } }
+                    }
+                    Muted { text: root.remote-message; wrap: word-wrap; }
+                    ScrollView { height: 110px;
+                        VerticalLayout { spacing: 5px;
+                            for remote in root.remote-folders: ActionButton { min-width: 0px; text: (root.selected-repo == remote.repo ? "●  " : "○  ") + remote.label; enabled: !root.busy; clicked => { root.selected-repo = remote.repo; root.selected-label = remote.label; } }
+                            Rectangle { vertical-stretch: 1; }
+                        }
+                    }
+                    Field { placeholder: "Local mount point (optional)"; text <=> root.remote-mount; enabled: !root.busy; }
+                    ActionButton { min-width: 0px; text: root.selected-repo == "" ? "Select a folder to receive" : "Receive & mount “" + root.selected-label + "”"; primary: true; enabled: !root.busy && root.selected-repo != ""; clicked => { root.receive-folder(root.endpoint, root.selected-repo, root.selected-label, root.remote-mount); } }
+                }
+                if root.dialog == "host": VerticalLayout { spacing: 12px;
+                    Muted { text: "Configuration"; }
+                    Label { text: root.config-path; wrap: word-wrap; }
+                    Muted { text: "Generate a code to pair another host with this orchestrator. A new code replaces the old one; existing peers must pair again."; wrap: word-wrap; }
+                    ActionButton { text: "Generate new pairing code"; enabled: !root.busy; clicked => { root.reset-code(); } }
+                    TextEdit { text: root.pairing-code; read-only: true; height: 60px; }
+                    Muted { text: "Closing this window leaves the daemon and mounts running."; wrap: word-wrap; }
+                    HorizontalLayout { spacing: 8px;
+                        ActionButton { text: "About Slint"; clicked => { about.show(); } }
+                        ActionButton { text: "Shut down daemon"; enabled: !root.busy && root.connected; clicked => { root.dialog = "shutdown"; } }
+                    }
+                }
+                if root.dialog == "shutdown": VerticalLayout { spacing: 16px;
+                    Label { text: "Shut down this host? All running folders will stop and their mounts will become unavailable."; wrap: word-wrap; }
+                    ActionButton { text: "Shut down daemon"; enabled: !root.busy; clicked => { root.shutdown(); } }
+                }
+                if root.dialog == "details": TextEdit { text: root.status; read-only: true; height: 180px; }
+                if root.dialog != "details": Label { text: root.busy ? "Working…" : root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; wrap: word-wrap; }
             }
         }
     }
-    if root.server-code-visible: Rectangle {
-        background: #101828dd;
-        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 700px; height: 370px;
-            VerticalLayout { padding: 26px; spacing: 16px;
-                Heading { text: "Pairing code · shown once"; }
-                Caption { text: "Save these 200 digits privately now. Closing this result erases the displayed value. You cannot reveal it again; reset creates a replacement."; wrap: word-wrap; }
-                TextEdit { accessible-label: "Show-once 200-digit pairing code"; text: root.server-code; read-only: true; height: 125px; font-family: "Consolas"; font-size: 16px; }
-                Caption { text: "Valid until the next reset. Existing paired devices remain paired. This value is never copied to the clipboard automatically."; wrap: word-wrap; }
-                Button { text: "I saved it — close and erase"; primary: true; clicked => { root.dismiss-server-code(); } }
-            }
-        }
     }
-    if root.config-visible: Rectangle {
-        background: #101828aa;
-        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 650px; height: 310px;
-            VerticalLayout { padding: 26px; spacing: 16px;
-                Heading { text: "Choose configuration"; }
-                Caption { text: "Enter an existing orchestrator TOML file. Switching changes the installation managed by this window; existing workers keep running."; wrap: word-wrap; }
-                LineEdit { accessible-label: "Orchestrator configuration file"; text <=> root.config-input; placeholder-text: "C:\\Telekinesis\\orchestrator.toml"; enabled: !root.working; }
-                Caption { text: "The file is validated before switching. Pending requests must be resolved first. Pairing uses its own separate configuration."; wrap: word-wrap; }
-                HorizontalLayout { Button { text: "Cancel"; enabled: !root.working; clicked => { root.config-visible = false; } } Rectangle { horizontal-stretch: 1; } Button { text: "Load configuration"; primary: true; enabled: !root.working && root.config-input != ""; clicked => { root.select-config(); } } }
-            }
-        }
-    }
-    if root.about-visible: Rectangle {
-        background: #142e3c99;
-        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 610px; height: 430px;
-            VerticalLayout { padding: 26px; spacing: 14px;
-                Heading { text: "Telekinesis 0.1.0"; }
-                Caption { text: "Experimental Windows local filesystem manager. One application executable; isolated supervisor and worker processes. WinFsp is required for mounted projects."; wrap: word-wrap; }
-                AboutSlint { height: 105px; }
-                Caption { text: "Slint 1.17.0 uses the Royalty-free Desktop, Mobile, and Web Applications License 2.0 with AboutSlint attribution. This does not impose GPL on your own application code. This repository already declares GPL-3.0-or-later independently. See the bundled license texts and THIRD-PARTY-NOTICES.md."; wrap: word-wrap; }
-                Caption { text: "Local projects and guided outbound WSS pairing are supported. Managed replica receiving and supervised outbound sync are supported. External-store adoption, trash, and Windows service setup are deferred."; wrap: word-wrap; }
-                HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Close"; clicked => { root.about-visible = false; } } }
-            }
-        }
-    }
+    about := PopupWindow { VerticalLayout { AboutSlint {} } }
 }

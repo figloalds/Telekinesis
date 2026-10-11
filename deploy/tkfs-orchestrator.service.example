@@ -1,0 +1,16 @@
+[Unit]
+Description=Telekinesis folder orchestrator
+After=network.target
+
+[Service]
+Type=simple
+# Set User, WorkingDirectory and paths for your installation.
+User=tkfs
+WorkingDirectory=/var/lib/tkfs
+ExecStart=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml orchestrator
+ExecStop=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml manage shutdown
+Restart=on-failure
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

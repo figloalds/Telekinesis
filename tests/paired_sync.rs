@@ -2,38 +2,28 @@ use serde_json::json;
 use std::collections::BTreeSet;
 use tkfs::{
     core::*,
+    paired_sync::SyncRoute,
     paired_sync::{self, SyncPage},
-    pairing::SyncConfiguration,
     runtime::Engine,
 };
-fn fixture() -> (
-    tempfile::TempDir,
-    Engine,
-    Engine,
-    SyncConfiguration,
-    SyncConfiguration,
-) {
+fn fixture() -> (tempfile::TempDir, Engine, Engine, SyncRoute, SyncRoute) {
     let temp = tempfile::tempdir().unwrap();
     let repo = id();
     let da = id();
     let db = id();
     let a = Engine::new(Store::initialize(&temp.path().join("a"), &repo, &da).unwrap());
     let b = Engine::new(Store::initialize(&temp.path().join("b"), &repo, &db).unwrap());
-    let ga = SyncConfiguration {
+    let ga = SyncRoute {
         peer: id(),
         repo: repo.clone(),
-        local_runtime: temp.path().join("a/runtime.json"),
         local_replica: da.clone(),
         remote_replica: db.clone(),
-        enabled: true,
     };
-    let gb = SyncConfiguration {
+    let gb = SyncRoute {
         peer: id(),
         repo,
-        local_runtime: temp.path().join("b/runtime.json"),
         local_replica: db,
         remote_replica: da,
-        enabled: true,
     };
     (temp, a, b, ga, gb)
 }
@@ -41,12 +31,7 @@ fn write(engine: &mut Engine, name: &str, bytes: &[u8]) {
     let file = engine.store.create(name, "file").unwrap();
     engine.store.write_revision(&file.id, None, bytes).unwrap();
 }
-fn roundtrip(
-    a: &mut Engine,
-    b: &mut Engine,
-    ga: &SyncConfiguration,
-    gb: &SyncConfiguration,
-) -> serde_json::Value {
+fn roundtrip(a: &mut Engine, b: &mut Engine, ga: &SyncRoute, gb: &SyncRoute) -> serde_json::Value {
     let page = paired_sync::offer(a, ga, None).unwrap();
     let sent: BTreeSet<_> = page
         .bundle
@@ -56,10 +41,10 @@ fn roundtrip(
         .collect();
     let response = paired_sync::worker_control(
         b,
-        &json!({"op":"published-exchange","grant":gb,"page":page}),
+        &json!({"op":"published-exchange","route":gb,"page":page}),
     )
     .unwrap();
-    paired_sync::worker_control(a,&json!({"op":"published-apply","grant":ga,"page":response,"request":page.request,"sent":sent})).unwrap()
+    paired_sync::worker_control(a,&json!({"op":"published-apply","route":ga,"page":response,"request":page.request,"sent":sent})).unwrap()
 }
 #[test]
 fn published_only_sync_is_idempotent_and_durable_after_restart() {
@@ -146,7 +131,7 @@ fn missing_object_is_not_acked_and_unbound_or_early_ack_cannot_clear_outbox() {
     let response: SyncPage = serde_json::from_value(
         paired_sync::worker_control(
             &mut b,
-            &json!({"op":"published-exchange","grant":gb,"page":page}),
+            &json!({"op":"published-exchange","route":gb,"page":page}),
         )
         .unwrap(),
     )
@@ -162,10 +147,10 @@ fn missing_object_is_not_acked_and_unbound_or_early_ack_cannot_clear_outbox() {
     let original = a.store.outgoing_unacknowledged().unwrap();
     let mut wrong = response.clone();
     wrong.ack.push(content_event.id.clone());
-    assert!(paired_sync::worker_control(&mut a,&json!({"op":"published-apply","grant":ga,"page":wrong,"request":page.request,"sent":[content_event.id]})).is_err());
+    assert!(paired_sync::worker_control(&mut a,&json!({"op":"published-apply","route":ga,"page":wrong,"request":page.request,"sent":[content_event.id]})).is_err());
     assert_eq!(a.store.outgoing_unacknowledged().unwrap(), original);
     let mut wrong = response;
     wrong.reply_to = Some(id());
-    assert!(paired_sync::worker_control(&mut a,&json!({"op":"published-apply","grant":ga,"page":wrong,"request":page.request,"sent":[]})).is_err());
+    assert!(paired_sync::worker_control(&mut a,&json!({"op":"published-apply","route":ga,"page":wrong,"request":page.request,"sent":[]})).is_err());
     assert_eq!(a.store.outgoing_unacknowledged().unwrap(), original);
 }

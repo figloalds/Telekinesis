@@ -1,0 +1,10 @@
+format_version = 2
+data_directory = "data"
+default_mount_directory = "mounts"
+maximum_running = 8
+
+[network]
+# Set the interface/address you want to expose, or "" for outbound-only.
+listen = "127.0.0.1:43180"
+connections = 4
+sync_interval_ms = 500

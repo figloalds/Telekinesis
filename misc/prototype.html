@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Telekinesis – virtual folder host</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f3f5f7;--panel:#fff;--ink:#17202e;--mute:#667085;--line:#e3e7ec;--side:#13203a;--sideink:#c9d3e6;--acc:#2456d6;--accbg:#e8eefc;--ok:#13795b;--okbg:#e2f4ec;--rem:#6a3fb5;--rembg:#efe8fa;--off:#6b7280;--offbg:#eceef1;--err:#b42318;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e131b;--panel:#161d28;--ink:#e6eaf0;--mute:#97a1b2;--line:#263040;--side:#0a1020;--accbg:#1b2a52;--acc:#7fa2ff;--okbg:#12342a;--ok:#5fd0a6;--rembg:#2a2145;--rem:#b79cf0;--offbg:#222a37;--off:#9aa3b2}}
+:root[data-theme="dark"]{--bg:#0e131b;--panel:#161d28;--ink:#e6eaf0;--mute:#97a1b2;--line:#263040;--side:#0a1020;--accbg:#1b2a52;--acc:#7fa2ff;--okbg:#12342a;--ok:#5fd0a6;--rembg:#2a2145;--rem:#b79cf0;--offbg:#222a37;--off:#9aa3b2}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.45 "IBM Plex Sans",system-ui,sans-serif;display:flex}
+.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:12.5px}
+button{font:inherit;cursor:pointer}
+aside{width:260px;background:var(--side);color:var(--sideink);display:flex;flex-direction:column;padding:18px 12px;gap:4px;flex:none;overflow:auto}
+.brand{display:flex;align-items:center;gap:10px;padding:0 8px 14px;color:#fff;font-weight:600;font-size:17px}
+.brand i{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#5b8cff,#2456d6);display:grid;place-items:center;font-style:normal;font-size:14px}
+.nav{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:8px;background:none;border:0;color:inherit;text-align:left;width:100%}
+.nav:hover{background:rgba(255,255,255,.07)}.nav.on{background:rgba(255,255,255,.14);color:#fff}
+.nav .n{margin-left:auto;font-size:12px;opacity:.7}
+.sh{padding:14px 10px 4px;font-size:12px;color:#8393b3;font-weight:500}
+.dot{width:8px;height:8px;border-radius:50%;background:#59657d;flex:none}.dot.up{background:#4cd9a0}.dot.down{background:#f2796b}
+.host{margin-top:auto;border:1px solid rgba(255,255,255,.12);border-radius:10px;padding:12px;font-size:12.5px}
+.host b{color:#fff;display:block;margin-bottom:6px}.host div{display:flex;justify-content:space-between;padding:1px 0}
+main{flex:1;min-width:0;display:flex;flex-direction:column}
+header{display:flex;gap:10px;align-items:center;padding:14px 24px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:19px;margin:0;font-weight:600;margin-right:auto}
+.search{border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:8px;padding:7px 11px;width:200px}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:8px;padding:7px 13px;font-weight:500}
+.btn:hover{background:var(--bg)}.btn.p{background:var(--acc);border-color:var(--acc);color:#fff}.btn.p:hover{filter:brightness(1.1)}
+.btn.s{padding:4px 9px;font-size:12.5px}.btn.d{color:var(--err)}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.content{padding:22px 24px;overflow:auto;flex:1}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:18px}
+.stat{padding:14px 16px}.stat small{color:var(--mute)}.stat div{font-size:22px;font-weight:600}
+.bar{height:6px;border-radius:3px;background:var(--line);margin-top:8px;overflow:hidden}.bar span{display:block;height:100%;background:var(--acc)}
+.tw{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:720px}
+th{text-align:left;font-weight:500;color:var(--mute);font-size:12.5px;padding:10px 16px;border-bottom:1px solid var(--line)}
+td{padding:11px 16px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:last-child td{border-bottom:0}tbody tr.r:hover{background:var(--bg)}
+.nm{display:flex;align-items:center;gap:10px;font-weight:500;background:none;border:0;color:var(--ink);padding:0}
+.nm:hover{color:var(--acc)}
+.ic{width:30px;height:24px;border-radius:5px;background:var(--accbg);display:grid;place-items:center;font-size:14px;flex:none}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:500}
+.pill.m{background:var(--okbg);color:var(--ok)}.pill.u{background:var(--offbg);color:var(--off)}.pill.r{background:var(--rembg);color:var(--rem)}
+.act{display:flex;gap:6px;justify-content:flex-end}
+.crumb{display:flex;gap:6px;align-items:center;color:var(--mute);margin-bottom:14px}
+.crumb button{background:none;border:0;color:var(--acc);padding:0}
+.info{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;padding:16px;margin-bottom:16px}
+.info small{color:var(--mute);display:block}
+.empty{padding:40px;text-align:center;color:var(--mute)}
+.ov{position:fixed;inset:0;background:rgba(10,16,30,.5);display:none;align-items:center;justify-content:center;padding:16px;z-index:10}
+.ov.on{display:flex}
+.modal{background:var(--panel);border-radius:14px;width:100%;max-width:480px;max-height:90%;overflow:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modal h2{margin:0 0 4px;font-size:18px}.modal p{margin:0 0 14px;color:var(--mute)}
+label{display:block;font-weight:500;margin:12px 0 5px}
+input[type=text],input[type=number],select{width:100%;padding:8px 11px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+.row{display:flex;gap:10px}.row>*:first-child{flex:1}.row>*:last-child{width:110px}
+.foot{display:flex;justify-content:flex-end;gap:8px;margin-top:20px}
+.chk{display:flex;gap:10px;align-items:center;padding:9px 11px;border:1px solid var(--line);border-radius:8px;margin-top:6px;font-weight:400}
+.chk input{margin:0}.chk span:last-child{margin-left:auto;color:var(--mute)}
+.err{color:var(--err);font-size:12.5px;margin-top:6px}
+#toast{position:fixed;bottom:calc(20px + env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);background:#17202e;color:#fff;padding:10px 16px;border-radius:9px;display:none;z-index:20}
+@media(max-width:800px){aside{display:none}.search{width:100%}}
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand"><i>⚓</i>Telekinesis</div>
+  <button class="nav on" data-v="all">🗂 Virtual folders <span class="n" id="cnt"></span></button>
+  <div class="sh">Remote orchestrators</div>
+  <div id="orchNav"></div>
+  <button class="nav" data-v="connect">＋ Connect orchestrator</button>
+  <div class="host" id="host"></div>
+</aside>
+<main>
+  <header>
+    <h1 id="title">Virtual folders</h1>
+    <input class="search" id="q" type="text" placeholder="Search folders" aria-label="Search folders">
+    <button class="btn" id="bConn">Connect remote</button>
+    <button class="btn p" id="bNew">New folder</button>
+  </header>
+  <div class="content" id="view"></div>
+</main>
+<div class="ov" id="ov"><div class="modal" id="modal" role="dialog" aria-modal="true"></div></div>
+<div id="toast" role="status"></div>
+<script>
+const $=s=>document.querySelector(s);
+const S={view:'all',folder:null,q:'',
+folders:[
+{id:1,name:'Design assets',mp:'/mnt/Telekinesis/design',gb:42.6,mounted:true,src:'local',files:[['Brand guidelines.pdf','18 MB'],['Logos','—'],['Icons.fig','64 MB'],['Moodboard.png','4 MB']]},
+{id:2,name:'Team documents',mp:'/mnt/Telekinesis/docs',gb:8.2,mounted:true,src:'local',files:[['Q4 plan.docx','1.2 MB'],['Meeting notes','—'],['Budget.xlsx','860 KB']]},
+{id:3,name:'Photo archive',mp:'/mnt/Telekinesis/photos',gb:310.4,mounted:false,src:'local',files:[['2024','—'],['2025','—'],['index.db','12 MB']]},
+{id:4,name:'build-artifacts',mp:'/mnt/remote/ci/artifacts',gb:96.1,mounted:true,src:'ci-orch.lan:7421',files:[['release-2.4.1.tar.gz','212 MB'],['nightly','—'],['checksums.txt','2 KB']]}],
+orchs:[{host:'ci-orch.lan',port:7421,up:true,ms:14},{host:'studio-nas.local',port:9000,up:false,ms:0}],
+quota:1000,nid:5};
+const fmt=g=>g>=1000?(g/1000).toFixed(1)+' TB':g.toFixed(1)+' GB';
+function toast(t){const e=$('#toast');e.textContent=t;e.style.display='block';clearTimeout(toast.t);toast.t=setTimeout(()=>e.style.display='none',2400)}
+function modal(html){$('#modal').innerHTML=html;$('#ov').classList.add('on');const f=$('#modal input');if(f)f.focus()}
+function close(){$('#ov').classList.remove('on')}
+$('#ov').onclick=e=>{if(e.target.id==='ov')close()};document.onkeydown=e=>{if(e.key==='Escape')close()};
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const slug=n=>n.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+
+function side(){
+ const used=S.folders.reduce((a,f)=>a+f.gb,0),m=S.folders.filter(f=>f.mounted).length;
+ $('#cnt').textContent=S.folders.length;
+ $('#orchNav').innerHTML=S.orchs.map((o,i)=>`<button class="nav ${S.view==='o'+i?'on':''}" data-v="o${i}"><span class="dot ${o.up?'up':'down'}"></span>${esc(o.host)}<span class="n mono">:${o.port}</span></button>`).join('');
+ $('#host').innerHTML=`<b>Host · Telekinesis-01</b><div><span>Status</span><span style="color:#4cd9a0">● Running</span></div><div><span>Listening</span><span class="mono">0.0.0.0:7420</span></div><div><span>Mounted</span><span>${m} of ${S.folders.length}</span></div><div><span>Storage</span><span>${fmt(used)}</span></div>`;
+ document.querySelectorAll('.nav').forEach(b=>{b.onclick=()=>{if(b.dataset.v==='connect')return connect();S.view=b.dataset.v;S.folder=null;render()}});
+ document.querySelectorAll('.nav').forEach(b=>b.classList.toggle('on',b.dataset.v===S.view&&b.dataset.v!=='connect'));
+}
+function row(f){
+ const st=f.mounted?'<span class="pill m">● Mounted</span>':'<span class="pill u">○ Not mounted</span>';
+ const src=f.src==='local'?'<span class="mute">This host</span>':`<span class="pill r mono">${esc(f.src)}</span>`;
+ return `<tr class="r"><td><button class="nm" data-o="${f.id}"><span class="ic">📁</span>${esc(f.name)}</button></td>
+ <td class="mono">${esc(f.mp)}</td><td>${src}</td><td>${fmt(f.gb)}</td><td>${st}</td>
+ <td><div class="act"><button class="btn s" data-t="${f.id}">${f.mounted?'Unmount':'Mount'}</button><button class="btn s" data-m="${f.id}">Change path</button><button class="btn s d" data-d="${f.id}" aria-label="Delete">✕</button></div></td></tr>`;
+}
+function table(list,empty){
+ if(!list.length)return `<div class="card empty">${empty}</div>`;
+ return `<div class="card tw"><table><thead><tr><th>Name</th><th>Mount point</th><th>Source</th><th>Size</th><th>Status</th><th></th></tr></thead><tbody>${list.map(row).join('')}</tbody></table></div>`;
+}
+function render(){
+ side();const v=$('#view');let h='';
+ const used=S.folders.reduce((a,f)=>a+f.gb,0);
+ if(S.folder){
+  const f=S.folders.find(x=>x.id===S.folder);$('#title').textContent=f.name;
+  h=`<div class="crumb"><button data-v="all">Virtual folders</button> / ${esc(f.name)}</div>
+  <div class="card info"><div><small>Mount point</small><span class="mono">${esc(f.mp)}</span></div><div><small>Source</small>${f.src==='local'?'This host':esc(f.src)}</div><div><small>Size</small>${fmt(f.gb)}</div><div><small>Status</small>${f.mounted?'<span class="pill m">● Mounted</span>':'<span class="pill u">○ Not mounted</span>'}</div></div>
+  <div class="card tw"><table><thead><tr><th>Name</th><th>Size</th></tr></thead><tbody>${f.files.map(x=>`<tr class="r"><td><span class="ic" style="display:inline-grid;vertical-align:middle;margin-right:10px">${x[1]==='—'?'📁':'📄'}</span>${esc(x[0])}</td><td>${x[1]}</td></tr>`).join('')}</tbody></table></div>`;
+ }else if(S.view==='all'){
+  $('#title').textContent='Virtual folders';
+  const l=S.folders.filter(f=>(f.name+f.mp).toLowerCase().includes(S.q.toLowerCase()));
+  h=`<div class="stats"><div class="card stat"><small>Storage used</small><div>${fmt(used)}</div><div class="bar"><span style="width:${Math.min(100,used/S.quota*100)}%"></span></div></div>
+  <div class="card stat"><small>Folders mounted</small><div>${S.folders.filter(f=>f.mounted).length} / ${S.folders.length}</div></div>
+  <div class="card stat"><small>Orchestrators online</small><div>${S.orchs.filter(o=>o.up).length} / ${S.orchs.length}</div></div></div>`+table(l,'No folders match. Create a new virtual folder to get started.');
+ }else{
+  const o=S.orchs[+S.view.slice(1)];$('#title').textContent=o.host;
+  const l=S.folders.filter(f=>f.src===o.host+':'+o.port);
+  h=`<div class="card info"><div><small>Address</small><span class="mono">${esc(o.host)}:${o.port}</span></div><div><small>Connection</small>${o.up?`<span class="pill m">● Online · ${o.ms} ms</span>`:'<span class="pill u">○ Unreachable</span>'}</div><div><small>Folders mounted from here</small>${l.length}</div>
+  <div style="display:flex;gap:6px;align-items:center;justify-content:flex-end"><button class="btn s" data-rc="1">${o.up?'Disconnect':'Reconnect'}</button><button class="btn s d" data-rm="1">Remove</button></div></div>`+table(l,'Nothing mounted from this orchestrator yet. Use Connect remote to browse its folders.');
+ }
+ v.innerHTML=h;
+ v.querySelectorAll('[data-v]').forEach(b=>b.onclick=()=>{S.view='all';S.folder=null;render()});
+ v.querySelectorAll('[data-o]').forEach(b=>b.onclick=()=>{S.folder=+b.dataset.o;render()});
+ v.querySelectorAll('[data-t]').forEach(b=>b.onclick=()=>{const f=S.folders.find(x=>x.id==b.dataset.t);f.mounted=!f.mounted;toast((f.mounted?'Mounted ':'Unmounted ')+f.name);render()});
+ v.querySelectorAll('[data-m]').forEach(b=>b.onclick=()=>chPath(+b.dataset.m));
+ v.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>del(+b.dataset.d));
+ const rc=v.querySelector('[data-rc]');if(rc)rc.onclick=()=>{const o=S.orchs[+S.view.slice(1)];o.up=!o.up;o.ms=o.up?22:0;if(!o.up)S.folders.forEach(f=>{if(f.src===o.host+':'+o.port)f.mounted=false});toast(o.up?'Connected to '+o.host:'Disconnected; remote folders unmounted');render()};
+ const rm=v.querySelector('[data-rm]');if(rm)rm.onclick=()=>{const i=+S.view.slice(1),o=S.orchs[i];S.folders=S.folders.filter(f=>f.src!==o.host+':'+o.port);S.orchs.splice(i,1);S.view='all';toast('Removed '+o.host);render()};
+}
+function newFolder(){
+ modal(`<h2>New virtual folder</h2><p>Create a folder on this host and choose where it appears on disk.</p>
+ <label for="a">Folder name</label><input id="a" type="text" placeholder="Project files">
+ <label for="b">Mount point</label><input id="b" type="text" class="mono" value="/mnt/Telekinesis/">
+ <label for="c">Quota</label><select id="c"><option>No limit</option><option>50 GB</option><option>250 GB</option><option>1 TB</option></select>
+ <label class="chk" style="margin-top:14px"><input id="d" type="checkbox" checked><span>Mount immediately</span></label><div class="err" id="e"></div>
+ <div class="foot"><button class="btn" onclick="close()">Cancel</button><button class="btn p" id="ok">Create folder</button></div>`);
+ $('#a').oninput=()=>{$('#b').value='/mnt/Telekinesis/'+slug($('#a').value)};
+ $('#ok').onclick=()=>{const n=$('#a').value.trim(),m=$('#b').value.trim();
+  if(!n)return $('#e').textContent='Enter a folder name.';
+  if(!m.startsWith('/'))return $('#e').textContent='Mount point must be an absolute path, like /mnt/Telekinesis/projects.';
+  if(S.folders.some(f=>f.mp===m))return $('#e').textContent='That mount point is already in use.';
+  S.folders.push({id:S.nid++,name:n,mp:m,gb:0,mounted:$('#d').checked,src:'local',files:[]});close();S.view='all';S.folder=null;toast('Created '+n);render()};
+}
+function chPath(id){
+ const f=S.folders.find(x=>x.id===id);
+ modal(`<h2>Change mount point</h2><p>${esc(f.name)} will be remounted at the new path${f.mounted?'; open files may briefly disconnect':''}.</p>
+ <label>Current</label><div class="mono">${esc(f.mp)}</div><label for="a">New mount point</label><input id="a" type="text" class="mono" value="${esc(f.mp)}"><div class="err" id="e"></div>
+ <div class="foot"><button class="btn" onclick="close()">Cancel</button><button class="btn p" id="ok">Save mount point</button></div>`);
+ $('#ok').onclick=()=>{const m=$('#a').value.trim();
+  if(!m.startsWith('/'))return $('#e').textContent='Mount point must be an absolute path.';
+  if(S.folders.some(x=>x.mp===m&&x.id!==id))return $('#e').textContent='That mount point is already in use.';
+  f.mp=m;close();toast('Mount point saved');render()};
+}
+function del(id){
+ const f=S.folders.find(x=>x.id===id);
+ modal(`<h2>Delete “${esc(f.name)}”?</h2><p>${f.src==='local'?'The folder and its files will be removed from this host.':'The folder is unmounted here. Files stay on the remote orchestrator.'}</p>
+ <div class="foot"><button class="btn" onclick="close()">Cancel</button><button class="btn p" id="ok" style="background:var(--err);border-color:var(--err)">Delete folder</button></div>`);
+ $('#ok').onclick=()=>{S.folders=S.folders.filter(x=>x.id!==id);S.folder=null;close();toast('Deleted '+f.name);render()};
+}
+function connect(){
+ modal(`<h2>Connect remote orchestrator</h2><p>Enter the address of another Telekinesis host to browse and mount its folders.</p>
+ <div class="row"><div><label for="h">Host</label><input id="h" type="text" class="mono" placeholder="nas.example.com"></div><div><label for="p">Port</label><input id="p" type="number" value="7420"></div></div>
+ <div class="err" id="e"></div><div id="res"></div>
+ <div class="foot"><button class="btn" onclick="close()">Cancel</button><button class="btn p" id="ok">Connect</button></div>`);
+ $('#ok').onclick=()=>{
+  const h=$('#h').value.trim(),p=+$('#p').value;
+  if(!h)return $('#e').textContent='Enter a host name or IP address.';
+  if(!(p>0&&p<65536))return $('#e').textContent='Port must be between 1 and 65535.';
+  $('#e').textContent='';$('#ok').disabled=true;$('#ok').textContent='Connecting…';
+  setTimeout(()=>{
+   const rf=[['shared-media',512],['backups',1280],['project-x',23.4]];
+   $('#res').innerHTML=`<label>Folders on ${esc(h)}:${p}</label>`+rf.map((r,i)=>`<label class="chk"><input type="checkbox" value="${i}" ${i==0?'checked':''}><span>📁 ${r[0]}</span><span>${fmt(r[1])}</span></label>`).join('')+`<label for="b">Mount under</label><input id="b" type="text" class="mono" value="/mnt/remote/${slug(h.split('.')[0])}">`;
+   const ok=$('#ok');ok.disabled=false;ok.textContent='Mount selected';
+   ok.onclick=()=>{const sel=[...document.querySelectorAll('#res input[type=checkbox]:checked')].map(c=>rf[+c.value]);
+    if(!sel.length)return $('#e').textContent='Select at least one folder to mount.';
+    const base=$('#b').value.trim().replace(/\/$/,''),addr=h+':'+p;
+    if(!S.orchs.some(o=>o.host===h&&o.port===p))S.orchs.push({host:h,port:p,up:true,ms:31});
+    sel.forEach(r=>S.folders.push({id:S.nid++,name:r[0],mp:base+'/'+r[0],gb:r[1],mounted:true,src:addr,files:[['readme.txt','1 KB'],['data','—']]}));
+    close();S.view='o'+S.orchs.findIndex(o=>o.host===h&&o.port===p);S.folder=null;toast('Mounted '+sel.length+' folder'+(sel.length>1?'s':'')+' from '+addr);render()};
+  },800);
+ };
+}
+$('#bNew').onclick=newFolder;$('#bConn').onclick=connect;
+$('#q').oninput=e=>{S.q=e.target.value;S.view='all';S.folder=null;render();}
+render();
+</script>
+</body>
+</html>

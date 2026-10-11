@@ -1,5 +1,5 @@
 //! Linux FUSE protocol 7.31 adapter. No libfuse build dependency: fusermount3
-//! grants an owner-only mount and passes the device using SCM_RIGHTS.
+//! applies the OS mount policy and passes the device using SCM_RIGHTS.
 //! No writeback caching/mmap: direct I/O and zero lookup/attribute TTLs retain
 //! Engine's save boundaries and pinned writer ancestry. Unsupported POSIX kinds
 //! (symlinks, hardlinks, devices), ownership and privileged modes fail explicitly.
@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::fd::{AsRawFd, FromRawFd},
-    os::unix::{fs::PermissionsExt, net::UnixStream},
+    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -115,7 +115,6 @@ fn start_source(engine: Shared, path: &Path, source: &str) -> Result<()> {
         path.display()
     );
     std::fs::create_dir(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     let worker = match launch(engine.clone(), path, source) {
         Ok(w) => w,
         Err(e) => {
@@ -173,7 +172,6 @@ pub fn stop(engine: &Shared) -> Result<()> {
 /// Called only after verifying the persistent worker record and acquiring a free
 /// state ownership lock. Never detach a responding or unrelated filesystem.
 pub fn recover_managed(path: &Path, instance: &str) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
     uuid::Uuid::parse_str(instance)?;
     let source = format!("tkfs-{instance}");
     let decode = |value: &str| {
@@ -215,8 +213,6 @@ pub fn recover_managed(path: &Path, instance: &str) -> Result<()> {
         ensure!(
             metadata.is_dir()
                 && !metadata.file_type().is_symlink()
-                && metadata.uid() == unsafe { libc::geteuid() }
-                && metadata.mode() & 0o777 == 0o700
                 && std::fs::read_dir(path)?.next().is_none(),
             "WORKER_START: mount directory occupied"
         );

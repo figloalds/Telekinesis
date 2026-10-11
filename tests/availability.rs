@@ -310,7 +310,7 @@ fn pending_save_keeps_its_base_when_a_peer_revision_arrives() {
     assert_eq!(a.store.read_object(&hash(b"remote")).unwrap(), b"remote");
 }
 #[test]
-fn status_is_authenticated_and_responsive_while_engine_is_busy() {
+fn status_is_responsive_while_engine_is_busy() {
     use std::sync::{Arc, Mutex};
     let dir = tempfile::tempdir().unwrap();
     let engine = Arc::new(Mutex::new(Engine::new(
@@ -326,14 +326,6 @@ fn status_is_authenticated_and_responsive_while_engine_is_busy() {
     let (tx, rx) = std::sync::mpsc::channel();
     let client = std::thread::spawn(move || {
         let result = tkfs::runtime::rpc(&info, "status-busy", json!({"op":"status"}));
-        let mut wrong = info;
-        wrong.token = "wrong".into();
-        assert!(
-            tkfs::runtime::rpc(&wrong, "unauthorized", json!({"op":"status"}))
-                .unwrap_err()
-                .to_string()
-                .contains("PERMISSION_DENIED")
-        );
         tx.send(result).unwrap();
     });
     let status = rx

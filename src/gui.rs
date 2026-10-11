@@ -1,2100 +1,421 @@
-//! Slint view/controller. All management, startup and runtime I/O is serialized off the UI thread.
-use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
+//! The desktop is a client of the same folder/peer management API as the CLI.
+use anyhow::Result;
+use serde_json::Value;
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    rc::Rc,
     sync::mpsc,
     time::Duration,
 };
-use tkfs::{
-    desktop::{self, Paths, Session},
-    desktop_branch::{BranchAction, BranchClient, BranchContext},
-    desktop_pairing::{Client as PairClient, Snapshot as PairSnapshot},
-    orchestrator::Action,
-};
+use tkfs::orchestrator::{self, Action, Config};
 slint::include_modules!();
-#[path = "gui_address_acceptance.rs"]
-mod address_acceptance;
-#[path = "gui_branch_acceptance.rs"]
-mod branch_acceptance;
-#[path = "gui_code_acceptance.rs"]
-mod code_acceptance;
-#[path = "gui_dashboard_acceptance.rs"]
-mod dashboard_acceptance;
-#[path = "gui_profile_acceptance.rs"]
-mod profile_acceptance;
-#[path = "desktop_receive.rs"]
-mod receive;
-#[path = "gui_receive_acceptance.rs"]
-mod receive_acceptance;
 
-#[derive(Default)]
-struct UiLifetime(std::sync::atomic::AtomicBool);
-impl UiLifetime {
-    fn is_closed(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
-    }
-    fn close(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::Release);
-    }
-    fn deliver(&self, delivery: impl FnOnce()) {
-        if !self.is_closed() {
-            delivery();
-        }
-    }
-}
-fn close_ui(ui: &App, lifetime: &UiLifetime) {
-    lifetime.close();
-    ui.set_server_code("".into());
-    ui.set_server_code_visible(false);
-    ui.set_pair_token("".into());
-}
-#[path = "gui_pairing_acceptance.rs"]
-mod pairing_acceptance;
-
-enum Job {
-    Receive(PathBuf, receive::Request),
-    BackgroundSync(Option<PathBuf>),
-    ConfigureReceiving(Option<String>, String),
-    ApproveDevice(String),
-    ToggleMount(String, bool),
-    Pair(PathBuf, PairJob),
-    Setup(PathBuf, PathBuf, usize),
-    SetupProfile(PathBuf, usize),
-    Connect,
-    SelectConfig(PathBuf),
-    ResetPairingCode(PathBuf),
-    Refresh,
-    Select(String),
-    Create(String, Option<PathBuf>),
-    Start,
-    Stop,
-    Shutdown,
-    Retry,
-    Operation,
-    Browse(i32),
-    Open,
-    Branch(BranchContext, BranchAction),
-    RetryBranch,
-}
-enum PairJob {
-    Load(PathBuf),
-    Create(PathBuf),
-    Inspect(zeroize::Zeroizing<String>, String),
-    InspectCode(String, String),
-    JoinCode(String, String, zeroize::Zeroizing<String>, bool),
-    JoinAddress(String, String, zeroize::Zeroizing<String>),
-    Clear,
-    Join(String, bool),
-    List(String),
-    Configure(String, String, PathBuf, bool),
-    Enable(String, String, bool),
-    Sync(String, String),
-    Revoke(String, bool),
-    SelectPeer(String),
-}
-impl PairJob {
-    fn cancellable(&self) -> bool {
-        matches!(
-            self,
-            Self::Join(..)
-                | Self::JoinCode(..)
-                | Self::JoinAddress(..)
-                | Self::List(..)
-                | Self::Sync(..)
-        )
-    }
-}
-#[derive(Default)]
-struct View {
-    receive: receive::Snapshot,
-    background_sync: String,
-    show_once_code: Option<tkfs::pairing_code::ShowOnceCode>,
-    config_path: String,
-    pairing_config: String,
-    enrollment_submitted: bool,
-    receiving: Value,
-    pairing: PairSnapshot,
-    connected: bool,
-    first_run: bool,
-    connection: String,
-    rows: Vec<(String, String, String, String, bool)>,
-    selected: i32,
-    status: String,
-    branches: String,
-    branch_rows: Vec<BranchItem>,
-    checkpoint_rows: Vec<CheckpointItem>,
-    runtime: Option<BranchContext>,
-    current_branch_name: String,
-    current_branch_shared: bool,
-    branch_operation: String,
-    retry_branch: bool,
-    preferred_branch: Option<String>,
-    preferred_checkpoint: Option<String>,
-    message: Option<(String, bool)>,
-    operation: String,
-    retry: bool,
-    folder: Option<(i32, String)>,
-}
-struct Controller {
-    receive_proof: Option<receive::Proof>,
-    background_sync: String,
-    pairing: Option<PairClient>,
-    pair_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    paths: Paths,
-    session: Option<Session>,
-    selected: Option<String>,
-    catalog: Value,
-    branch_client: Option<BranchClient>,
-}
-fn text(value: &Value, key: &str) -> String {
-    value[key].as_str().unwrap_or_default().to_owned()
-}
-fn display_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else {
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
-    }
-}
-fn pairing_address(host: &str, port: &str, code: &str) -> Result<(String, u16)> {
-    let host: std::net::IpAddr = host.trim().parse().context("PAIRING_ADDRESS_INVALID")?;
-    let port: u16 = port.trim().parse().context("PAIRING_ADDRESS_INVALID")?;
-    ensure!(
-        port != 0 && !host.is_unspecified() && !host.is_multicast(),
-        "PAIRING_ADDRESS_INVALID"
-    );
-    ensure!(
-        code.len() == 200 && code.bytes().all(|byte| byte.is_ascii_digit()),
-        "PAIRING_CODE_MUST_BE_200_DIGITS"
-    );
-    Ok((host.to_string(), port))
-}
-fn project_status(state: &Value) -> &'static str {
-    match state["observation"]["status"].as_str() {
-        Some("running") => "Running",
-        Some("stopped") => "Stopped",
-        Some("unavailable") => "Unavailable",
-        Some("degraded") => "Needs attention",
-        Some("stop-pending") => "Stopping · files in use",
-        _ => "Recovering",
-    }
-}
-fn describe_error(message: &str) -> String {
-    if message.contains("PENDING_SAVE") {
-        "Unsaved data is retained. Saving is retried automatically; switching or stopping stays blocked until it succeeds. Check the storage error if this continues.".into()
-    } else if message.contains("BUSY_VIEW") {
-        "This project is in use. Close files, editors, and Explorer windows using it, then retry the same request. Your data is preserved.".into()
-    } else if message.contains("STALE_MANAGEMENT_GENERATION")
-        || message.contains("STALE_VIEW")
-        || message.contains("STALE_PROJECT_SELECTION")
-    {
-        "The project changed in another client. Refresh, review its state, and try the action again.".into()
-    } else if message.contains("OPERATION_PENDING") || message.contains("STATE_OPERATION_PENDING") {
-        "An earlier operation is still pending. Inspect it and retry its exact request before starting another action.".into()
-    } else if message.contains("WORKER_START") {
-        "The project worker could not become ready. Check the project's stderr log in the data folder; verify WinFsp and the mount path, then retry.".into()
-    } else {
-        message.into()
-    }
-}
-fn read_catalog(session: &Session) -> Result<Value> {
-    session.call(Action::List).or_else(|error| {
-        if !format!("{error:#}").contains("LOCAL_IPC") {
-            return Err(error);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        session.call(Action::List)
-    })
-}
-fn connection_error(view: &mut View, has_session: bool, refresh: bool, error: &str) {
-    if (refresh || error.contains("LOCAL_IPC")) && !has_session {
-        view.connected = false;
-        view.connection = "Disconnected · existing data preserved".into();
-        for row in &mut view.rows {
-            row.2 = "Unknown · disconnected".into();
-        }
-        view.status = "The supervisor is unavailable. Reconnect to refresh project status; existing data is preserved.".into();
-    } else if error.contains("LOCAL_IPC") {
-        view.connected = false;
-        view.runtime = None;
-        view.connection = "Connection interrupted · status may be stale · refresh to retry".into();
-    }
-}
-impl Controller {
-    fn execute(&mut self, job: Job) -> Result<View> {
-        if !matches!(&job, Job::Receive(..) | Job::Refresh | Job::Operation) {
-            self.receive_proof = None;
-        }
-        match job {
-            Job::SetupProfile(profile, limit) => {
-                let paths = desktop::profile_setup_paths(&self.paths, &profile)?;
-                let data = paths.folder.join("data");
-                let mounts = profile.join("Telekinesis");
-                desktop::bootstrap(&paths, &data, &mounts, limit)?;
-                self.paths = paths;
-                self.execute(Job::Connect)
-            }
-            Job::ToggleMount(state, desired) => {
-                let observed =
-                    self.session
-                        .as_ref()
-                        .context("NOT_CONNECTED")?
-                        .call(Action::Inspect {
-                            state: state.clone(),
-                        })?;
-                ensure!(
-                    observed["desired_running"] == desired,
-                    "STALE_PROJECT_SELECTION"
-                );
-                let generation = observed["management_generation"]
-                    .as_u64()
-                    .context("STATE_GENERATION_MISSING")?;
-                self.mutation(
-                    if desired {
-                        Action::Stop { state }
-                    } else {
-                        Action::Start { state }
-                    },
-                    generation,
-                )
-            }
-            Job::ConfigureReceiving(address, port) => {
-                let port = if address.is_some() {
-                    let port: u16 = port.parse().context("PAIRING_ADDRESS_INVALID")?;
-                    ensure!(port != 0, "PAIRING_ADDRESS_INVALID");
-                    address
-                        .as_deref()
-                        .unwrap()
-                        .parse::<std::net::IpAddr>()
-                        .context("PAIRING_ADDRESS_INVALID")?;
-                    port
-                } else {
-                    0
-                };
-                let generation = self
-                    .session
-                    .as_ref()
-                    .context("NOT_CONNECTED")?
-                    .call(Action::List)?["catalog_generation"]
-                    .as_u64()
-                    .context("CATALOG_GENERATION_MISSING")?;
-                self.mutation(Action::ConfigureReceiving { address, port }, generation)
-            }
-            Job::ApproveDevice(invitation) => {
-                tkfs::pairing_setup::approve(&self.paths.config, &invitation)?;
-                self.refresh(Some(("Device approved for pairing. Shared-folder access still requires a separate local grant.".into(), false)))
-            }
-            Job::Receive(path, request) => self.receive_execute(path, request),
-            Job::BackgroundSync(config) => {
-                let generation = self
-                    .session
-                    .as_ref()
-                    .context("NOT_CONNECTED")?
-                    .call(Action::List)?["catalog_generation"]
-                    .as_u64()
-                    .context("CATALOG_GENERATION_MISSING")?;
-                self.mutation(Action::ConfigureBackgroundSync { config }, generation)
-            }
-            Job::ResetPairingCode(path) => {
-                tkfs::orchestrator::Config::load(&path)?;
-                let code = tkfs::pairing_code::Store::for_config(&path)?.reset()?;
-                let mut view = self.view();
-                view.show_once_code = Some(code);
-                view.message = Some((
-                    "Pairing code rotated. Existing peers and sync grants are unchanged.".into(),
-                    false,
-                ));
-                Ok(view)
-            }
-            Job::Pair(path, job) => {
-                let enrollment = matches!(job, PairJob::JoinAddress(..));
-                if !matches!(
-                    job,
-                    PairJob::Load(..) | PairJob::Create(..) | PairJob::JoinAddress(..)
-                ) {
-                    ensure!(
-                        std::fs::canonicalize(path)?
-                            == self
-                                .pairing
-                                .as_ref()
-                                .context("PAIRING_CONFIG_REQUIRED")?
-                                .path(),
-                        "PAIRING_CONFIG_CHANGED"
-                    );
-                }
-                let message = self.pair_job(job)?;
-                let mut view = self.view();
-                view.enrollment_submitted = enrollment;
-                view.message = Some((message, false));
-                Ok(view)
-            }
-            Job::Setup(data, mounts, limit) => {
-                desktop::bootstrap(&self.paths, &data, &mounts, limit)?;
-                self.session = Some(Session::connect(self.paths.clone())?);
-                self.branch_client = Some(BranchClient::open(self.session.as_ref().unwrap())?);
-                self.refresh(Some((
-                    "Configuration saved. You're ready to create a project.".into(),
-                    false,
-                )))
-            }
-            Job::Connect => {
-                self.session = Some(Session::connect(self.paths.clone())?);
-                self.branch_client = Some(BranchClient::open(self.session.as_ref().unwrap())?);
-                let mut message = None;
-                if self.pairing.is_none() {
-                    match tkfs::pairing_setup::existing_client(&self.paths.config).and_then(|path| path.map(|path| PairClient::open(&path)).transpose()) {
-                        Ok(client) => self.pairing = client,
-                        Err(_) => message = Some(("Local folders are available, but the existing protected pairing identity needs recovery. Its files were preserved; reconnecting does not replace them.".into(), true)),
-                    }
-                }
-                self.refresh(message)
-            }
-            Job::SelectConfig(path) => {
-                let current = self.view();
-                ensure!(
-                    !current.retry && !current.retry_branch,
-                    "Resolve the pending request before switching configuration"
-                );
-                let paths = Paths::from_config(self.paths.executable.clone(), &path)?;
-                tkfs::orchestrator::Config::load(&paths.config)?;
-                self.paths = paths;
-                self.session = None;
-                self.pairing = None;
-                self.branch_client = None;
-                self.selected = None;
-                self.catalog = Value::Null;
-                self.execute(Job::Connect)
-            }
-            Job::Refresh => self.refresh(None),
-            Job::Select(state) => {
-                self.selected = Some(state);
-                self.refresh(None)
-            }
-            Job::Browse(kind) => {
-                let folder = desktop::pick_folder()?;
-                Ok(View {
-                    folder: folder.map(|p| (kind, p.to_string_lossy().into_owned())),
-                    ..self.view()
-                })
-            }
-            Job::Open => {
-                let state = self.selected_state()?;
-                desktop::open_folder(Path::new(
-                    state["mount"].as_str().context("PROJECT_HAS_NO_MOUNT")?,
-                ))?;
-                Ok(self.view())
-            }
-            Job::Operation => {
-                let result = self
-                    .session
-                    .as_mut()
-                    .context("NOT_CONNECTED")?
-                    .operation()?;
-                let mut view = self.view();
-                view.operation = serde_json::to_string_pretty(&result)?;
-                if let Some(response) = result.get("response").filter(|r| !r.is_null()) {
-                    view.retry = response["retryable"] == true;
-                    view.message = Some((
-                        if response["ok"] == true {
-                            "Operation completed.".into()
-                        } else {
-                            describe_error(&text(response, "error"))
-                        },
-                        response["ok"] != true,
-                    ));
-                }
-                Ok(view)
-            }
-            Job::Create(label, mount) => {
-                let label = label.trim().to_owned();
-                ensure!(!label.is_empty(), "PROJECT_NAME_REQUIRED");
-                let session = self.session.as_ref().context("NOT_CONNECTED")?;
-                let mount = match mount {
-                    Some(p) => p,
-                    None => {
-                        let parent = session.config.default_mount_directory.as_ref().context(
-                            "MOUNT_PATH_REQUIRED: this configuration has no default project parent",
-                        )?;
-                        ensure!(
-                            !label.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
-                                && !label.ends_with(['.', ' '])
-                                && label != "."
-                                && label != "..",
-                            "CHOOSE_A_VALID_WINDOWS_FOLDER_NAME_OR_EXPLICIT_MOUNT_PATH"
-                        );
-                        parent.join(&label)
-                    }
-                };
-                let generation = session.call(Action::List)?["catalog_generation"]
-                    .as_u64()
-                    .context("CATALOG_GENERATION_MISSING")?;
-                self.mutation(
-                    Action::Create {
-                        label,
-                        mount: Some(mount),
-                    },
-                    generation,
-                )
-            }
-            Job::Start | Job::Stop => {
-                let state = self.selected_state()?;
-                let id = text(state, "state_id");
-                let observed = self
-                    .session
-                    .as_ref()
-                    .context("NOT_CONNECTED")?
-                    .call(Action::Inspect { state: id.clone() })?;
-                let generation = observed["management_generation"]
-                    .as_u64()
-                    .context("STATE_GENERATION_MISSING")?;
-                self.mutation(
-                    if matches!(job, Job::Start) {
-                        Action::Start { state: id }
-                    } else {
-                        Action::Stop { state: id }
-                    },
-                    generation,
-                )
-            }
-            Job::Shutdown => {
-                let generation = self
-                    .session
-                    .as_ref()
-                    .context("NOT_CONNECTED")?
-                    .call(Action::List)?["catalog_generation"]
-                    .as_u64()
-                    .context("CATALOG_GENERATION_MISSING")?;
-                self.mutation(Action::Shutdown, generation)
-            }
-            Job::Retry => {
-                let reply = self.session.as_mut().context("NOT_CONNECTED")?.retry()?;
-                self.after_mutation(reply)
-            }
-            Job::Branch(context, action) => {
-                ensure!(
-                    self.selected.as_deref() == Some(context.state.as_str()),
-                    "STALE_PROJECT_SELECTION: review the selected project again"
-                );
-                let reply = self
-                    .branch_client
-                    .as_mut()
-                    .context("BRANCH_CLIENT_NOT_READY")?
-                    .mutate(
-                        self.session.as_ref().context("NOT_CONNECTED")?,
-                        context,
-                        action,
-                    )?;
-                self.after_branch(reply)
-            }
-            Job::RetryBranch => {
-                let reply = self
-                    .branch_client
-                    .as_mut()
-                    .context("BRANCH_CLIENT_NOT_READY")?
-                    .retry(self.session.as_ref().context("NOT_CONNECTED")?)?;
-                self.after_branch(reply)
-            }
-        }
-    }
-    fn after_branch(&mut self, reply: Value) -> Result<View> {
-        if let Some(saved) = self
-            .branch_client
-            .as_ref()
-            .and_then(|client| client.saved.as_ref())
-        {
-            self.selected = Some(saved.context.state.clone());
-        }
-        let mut view = self.refresh(Some((
-            if reply["ok"] == true {
-                "Branch action completed. The displayed state is confirmed by the runtime.".into()
-            } else {
-                describe_error(&text(&reply, "error"))
-            },
-            reply["ok"] != true,
-        )))?;
-        if reply["ok"] == true {
-            view.preferred_branch = reply["result"]["id"].as_str().map(str::to_owned);
-            view.preferred_checkpoint = reply["result"]["checkpoint"].as_str().map(str::to_owned);
-        }
-        Ok(view)
-    }
-    fn selected_state(&self) -> Result<&Value> {
-        self.catalog["states"]
-            .as_array()
-            .context("NO_CATALOG")?
-            .iter()
-            .find(|s| s["state_id"].as_str() == self.selected.as_deref())
-            .context("SELECT_A_PROJECT")
-    }
-    fn mutation(&mut self, action: Action, generation: u64) -> Result<View> {
-        let reply = self
-            .session
-            .as_mut()
-            .context("NOT_CONNECTED")?
-            .mutate(action, generation)?;
-        if reply["ok"] == true && reply["result"]["state_id"].is_string() {
-            self.selected = Some(text(&reply["result"], "state_id"));
-        }
-        self.after_mutation(reply)
-    }
-    fn after_mutation(&mut self, reply: Value) -> Result<View> {
-        if reply["ok"] == true
-            && self
-                .session
-                .as_ref()
-                .and_then(|s| s.saved.as_ref())
-                .is_some_and(|s| matches!(s.request.action, Action::Shutdown))
-        {
-            let mut view = self.view();
-            view.connected = false;
-            view.connection = "Supervisor stopped · projects will return on reconnect".into();
-            for row in &mut view.rows {
-                row.2 = "Stopped".into();
-            }
-            view.status =
-                "Background workers stopped. Native data and history are preserved.".into();
-            view.message = Some((
-                "Background workers stopped. You can close this window or reconnect.".into(),
-                false,
-            ));
-            return Ok(view);
-        }
-        self.refresh(Some((
-            if reply["ok"] == true {
-                "Operation completed.".into()
-            } else if self
-                .session
-                .as_ref()
-                .and_then(|session| session.saved.as_ref())
-                .is_some_and(|saved| {
-                    matches!(saved.request.action, Action::ConfigureReceiving { .. })
-                })
-            {
-                tkfs::desktop_pairing::error_message(&anyhow::anyhow!(text(&reply, "error")))
-            } else {
-                describe_error(&text(&reply, "error"))
-            },
-            reply["ok"] != true,
-        )))
-    }
-    fn refresh(&mut self, message: Option<(String, bool)>) -> Result<View> {
-        if let Some(client) = &mut self.branch_client {
-            client.reload()?;
-        }
-        let session = self.session.as_ref().context("NOT_CONNECTED")?;
-        self.catalog = read_catalog(session)?;
-        self.catalog["_desktop_receiving"] = session
-            .call(Action::ReceivingStatus)
-            .unwrap_or_else(|_| json!({"service":{"state":"unavailable"}}));
-        self.background_sync = match session.call(Action::BackgroundSyncStatus) {
-            Ok(status) => format!(
-                "Service: {} · desired: {}\nScope: all configured enabled grants\n{}",
-                text(&status["service"], "state"),
-                if status["desired_enabled"] == true {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                status["service"]["error"]
-                    .as_str()
-                    .unwrap_or("Service state does not prove that a repository has caught up.")
-            ),
-            Err(_) => "Background sync status unavailable. Refresh to retry.".into(),
-        };
-        let states = self.catalog["states"]
-            .as_array()
-            .context("CATALOG_STATES_MISSING")?;
-        if !states
-            .iter()
-            .any(|s| s["state_id"].as_str() == self.selected.as_deref())
-        {
-            self.selected = states.first().map(|s| text(s, "state_id"));
-        }
-        // Validate the transient receive proof against the new authenticated
-        // worker/grant observation before presenting any attach controls.
-        self.receive_refresh();
-        let session = self.session.as_ref().context("NOT_CONNECTED")?;
-        let states = self.catalog["states"]
-            .as_array()
-            .context("CATALOG_STATES_MISSING")?;
-        let mut view = self.view();
-        view.message = message;
-        if let Some(state) = states
-            .iter()
-            .find(|s| s["state_id"].as_str() == self.selected.as_deref())
-        {
-            view.status = format!(
-                "{}\n\nMount folder\n{}\n\nDesired state: {}",
-                project_status(state),
-                display_path(Path::new(
-                    state["mount"].as_str().unwrap_or("Headless worker")
-                )),
-                if state["desired_running"] == true {
-                    "Running"
-                } else {
-                    "Stopped"
-                }
-            );
-            if matches!(
-                project_status(state),
-                "Running" | "Needs attention" | "Stopping · files in use"
-            ) {
-                match session.runtime(state["state_id"].as_str().unwrap(), json!({"op":"status"})) {
-                    Ok(status) => {
-                        if status["busy"] != true
-                            && status["stale"] != true
-                            && let Some(generation) = status["generation"].as_u64()
-                            && let Some(active) = status["branch"]["id"].as_str()
-                        {
-                            view.runtime = Some(BranchContext {
-                                state: text(state, "state_id"),
-                                active: active.into(),
-                                generation,
-                            });
-                            view.current_branch_name = text(&status["branch"], "name");
-                            view.current_branch_shared = status["branch"]["shared"] == true;
-                        }
-                        if status["busy"] == true {
-                            view.status.push_str("\n\nFilesystem busy · showing the last observed counts; saving continues.");
-                        }
-                        view.status.push_str(&format!("\n\nCurrent branch: {}\nStorage: {}\nOpen files and folders: {}\nFiles awaiting flush: {}\nUnresolved conflicts: {}",text(&status["branch"],"name"),if status["health"].is_null(){"Healthy"}else{"Needs attention"},status["open_handles"],status["unflushed_files"],status["unresolved_conflicts"]));
-                        if !status["health"].is_null() {
-                            view.status
-                                .push_str(&format!("\nStorage health: {}", status["health"]));
-                        }
-                    }
-                    Err(e) => view
-                        .status
-                        .push_str(&format!("\n\nRuntime unavailable: {e:#}")),
-                }
-                if let Ok(branches) = session.runtime(
-                    state["state_id"].as_str().unwrap(),
-                    json!({"op":"branches"}),
-                ) {
-                    view.branches = "Branches\n".into();
-                    for branch in branches.as_array().context("INVALID_BRANCHES")? {
-                        view.branch_rows.push(BranchItem {
-                            id: text(branch, "id").into(),
-                            label: text(branch, "name").into(),
-                            shared: branch["shared"] == true,
-                            current: view
-                                .runtime
-                                .as_ref()
-                                .is_some_and(|context| context.active == text(branch, "id")),
-                        });
-                        view.branches.push_str(&format!(
-                            "\n{} · {}",
-                            text(branch, "name"),
-                            if branch["shared"] == true {
-                                "Shared branch, sync requires an explicit published-data grant"
-                            } else {
-                                "Private, local only"
-                            }
-                        ));
-                    }
-                }
-                if let Ok(history) =
-                    session.runtime(state["state_id"].as_str().unwrap(), json!({"op":"history"}))
-                {
-                    for checkpoint in history.as_array().context("INVALID_HISTORY")?.iter().rev() {
-                        let branch = view.branch_rows.iter().find(|row| {
-                            row.id.as_str() == checkpoint["branch"].as_str().unwrap_or_default()
-                        });
-                        let label = format!(
-                            "{} · {} ({})",
-                            text(checkpoint, "message"),
-                            branch
-                                .map(|row| row.label.as_str())
-                                .unwrap_or("Unknown branch"),
-                            if branch.is_some_and(|row| row.shared) {
-                                "shared"
-                            } else {
-                                "private"
-                            }
-                        );
-                        view.checkpoint_rows.push(CheckpointItem {
-                            id: text(checkpoint, "id").into(),
-                            label: label.into(),
-                        });
-                    }
-                }
-            } else if project_status(state) == "Unavailable" {
-                view.status.push_str(&format!(
-                    "\n\nDetails\n{}",
-                    text(&state["observation"], "error")
-                ));
-            }
-        }
-        Ok(view)
-    }
-    fn view(&self) -> View {
-        let mut view = View {
-            receive: self.receive_snapshot(),
-            background_sync: self.background_sync.clone(),
-            config_path: display_path(&self.paths.config),
-            pairing_config: self
-                .pairing
-                .as_ref()
-                .map(|client| display_path(client.path()))
-                .unwrap_or_default(),
-            receiving: self.catalog["_desktop_receiving"].clone(),
-            pairing: self
-                .pairing
-                .as_ref()
-                .map(PairClient::snapshot)
-                .unwrap_or_default(),
-            first_run: !self.paths.config.exists(),
-            connection: "Disconnected · reconnect to load projects".into(),
-            selected: -1,
-            ..View::default()
-        };
-        if let Some(session) = &self.session {
-            view.connected = true;
-            view.connection = if session.hello["shutdown_pending"] == true {
-                "Connected · unfinished shutdown requires its exact retry".into()
-            } else {
-                "Connected · local supervisor".into()
-            };
-            if let Some(states) = self.catalog["states"].as_array() {
-                for (i, state) in states.iter().enumerate() {
-                    if state["state_id"].as_str() == self.selected.as_deref() {
-                        view.selected = i as i32;
-                    }
-                    view.rows.push((
-                        text(state, "label"),
-                        text(state, "state_id"),
-                        project_status(state).into(),
-                        text(state, "mount"),
-                        state["desired_running"] == true,
-                    ));
-                }
-            }
-            if let Some(saved) = &session.saved {
-                view.operation = format!(
-                    "Operation {}\n{}",
-                    saved.request.operation_id.as_deref().unwrap_or(""),
-                    if saved.uncertain {
-                        "Delivery uncertain · inspect before retrying"
-                    } else if saved
-                        .response
-                        .as_ref()
-                        .is_some_and(|r| r["retryable"] == true)
-                    {
-                        "Pending · exact retry available"
-                    } else {
-                        "Completed receipt recorded"
-                    }
-                );
-                view.retry = saved.uncertain
-                    || saved
-                        .response
-                        .as_ref()
-                        .is_some_and(|r| r["retryable"] == true);
-                if view.retry {
-                    view.message=Some(("An earlier operation needs attention. Inspect its result or retry the exact request.".into(),true));
-                }
-            }
-        }
-        if let Some(saved) = self
-            .branch_client
-            .as_ref()
-            .and_then(|client| client.saved.as_ref())
-        {
-            let label = self.catalog["states"]
-                .as_array()
-                .and_then(|rows| {
-                    rows.iter()
-                        .find(|row| row["state_id"] == saved.context.state)
-                })
-                .map(|row| text(row, "label"))
-                .unwrap_or_else(|| saved.context.state.clone());
-            view.retry_branch = saved.pending();
-            view.branch_operation = format!(
-                "Branch action: {} · Project: {}\nRequest {} · {}",
-                text(&saved.payload, "op"),
-                label,
-                saved.request,
-                if saved.uncertain {
-                    "Delivery uncertain · exact retry preserves the original project and payload"
-                } else if saved.pending() {
-                    "Busy or unavailable · exact retry available"
-                } else {
-                    "Runtime response recorded"
-                }
-            );
-            if view.retry_branch {
-                view.message = Some(("An earlier branch request needs attention. Retry its original request before starting another branch action.".into(),true));
-            }
-        }
-        view
-    }
-    fn pair_job(&mut self, job: PairJob) -> Result<String> {
-        match job {
-            PairJob::JoinAddress(host, port, code) => {
-                let (host, port) = pairing_address(&host, &port, &code)?;
-                ensure!(
-                    !self.pair_stop.load(std::sync::atomic::Ordering::Relaxed),
-                    "PAIRING_CANCELLED"
-                );
-                // Explicit Connect is the only normal-flow provisioning entry.
-                // The setup helper preserves existing identities and refuses
-                // damaged/unsafe files rather than replacing them.
-                let path = tkfs::pairing_setup::client(&self.paths.config)
-                    .context("PAIRING_SETUP_RECOVERY_REQUIRED")?;
-                self.pairing =
-                    Some(PairClient::open(&path).context("PAIRING_SETUP_RECOVERY_REQUIRED")?);
-                ensure!(
-                    !self.pair_stop.load(std::sync::atomic::Ordering::Relaxed),
-                    "PAIRING_CANCELLED"
-                );
-                self.pairing.as_mut().unwrap().join_address(
-                    &host,
-                    port,
-                    code,
-                    self.pair_stop.clone(),
-                )?;
-                return Ok("Connection request sent. The server owner must approve this device before you can receive shared folders. Check approval below; do not submit the key again while approval is pending.".into());
-            }
-            PairJob::Load(path) => {
-                self.pairing = None;
-                self.pairing = Some(PairClient::open(&path)?);
-                return Ok("Client configuration loaded. Review its credential reference and server invitation.".into());
-            }
-            PairJob::Create(path) => {
-                self.pairing = None;
-                self.pairing = Some(PairClient::create(&path)?);
-                return Ok("Outbound-only client created with a CurrentUser DPAPI credential. No listener or service was installed.".into());
-            }
-            _ => {}
-        }
-        let client = self.pairing.as_mut().context("PAIRING_CONFIG_REQUIRED")?;
-        let stop = self.pair_stop.clone();
-        match job {
-            PairJob::InspectCode(public, endpoint) => {
-                client.inspect_code(&public, &endpoint)?;
-                Ok("Public server identity reviewed. Verify its exact certificate fingerprint before submitting the 200-digit code.".into())
-            }
-            PairJob::JoinCode(public, endpoint, code, confirmed) => {
-                client.join_code(&public, &endpoint, code, confirmed, stop)?;
-                Ok("Enrollment submitted; awaiting approval on the server. Ask its owner to approve your installation and certificate, then load / refresh this client and check approval. Pairing grants no administration access.".into())
-            }
-            PairJob::Inspect(token, endpoint) => {
-                client.inspect(token, &endpoint)?;
-                Ok("Invitation inspected locally. Verify the exact server fingerprint before enrollment.".into())
-            }
-            PairJob::Clear => {
-                client.clear_invitation();
-                Ok("Invitation discarded without sending it.".into())
-            }
-            PairJob::SelectPeer(peer) => {
-                client.select_peer(&peer);
-                Ok("Peer selected. Check approval to reload its authorized published repositories.".into())
-            }
-            PairJob::Join(endpoint, confirmed) => {
-                client.join(&endpoint, confirmed, stop)?;
-                Ok("Enrollment submitted. Ask the server owner to approve your exact installation and certificate, then check approval. Pairing grants no repository or administrative access.".into())
-            }
-            PairJob::List(peer) => {
-                client.list(&peer, stop)?;
-                Ok("Server authenticated this certificate. Only authorized published repositories are shown; an empty list means no repository grants.".into())
-            }
-            PairJob::Configure(peer, repo, runtime, confirmed) => {
-                client.configure(&peer, &repo, &runtime, confirmed)?;
-                Ok("Published-data sync configured for the matching running local replica. All shared branches in this repository are covered; no background service was started.".into())
-            }
-            PairJob::Enable(peer, repo, enabled) => {
-                client.enable(&peer, &repo, enabled)?;
-                Ok(if enabled {
-                    "Local sync grant resumed. Select Sync now to continue."
-                } else {
-                    "Local sync grant paused. Durable data is retained."
-                }
-                .into())
-            }
-            PairJob::Sync(peer, repo) => {
-                let reply = client.sync(&peer, &repo, stop)?;
-                Ok(format!(
-                    "Sync page committed. {} more work remains. Sync again to resume; the current mounted branch is unchanged.",
-                    if reply["caught_up"] == true {
-                        "No"
-                    } else {
-                        "Possibly"
-                    }
-                ))
-            }
-            PairJob::Revoke(peer, confirmed) => {
-                client.revoke(&peer, confirmed)?;
-                Ok("Peer revoked locally. Resume cannot restore a revoked pairing; the server owner must revoke their side separately.".into())
-            }
-            PairJob::Load(..) | PairJob::Create(..) | PairJob::JoinAddress(..) => unreachable!(),
-        }
-    }
+fn path(text: slint::SharedString) -> Option<PathBuf> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
-fn apply(ui: &App, view: View) {
-    use slint::Model;
-    if !view.pairing_config.is_empty() {
-        ui.set_pair_config(view.pairing_config.into());
-    }
-    if view.enrollment_submitted {
-        ui.set_pairing_page(1);
-    }
-    ui.set_receiving_state(text(&view.receiving["service"], "state").into());
-    ui.set_receiving_enabled(view.receiving["desired_enabled"] == true);
-    let configured = view.receiving["address"].is_string()
-        || view.receiving["desired_enabled"] == true
-        || !view.receiving["setup_error"].is_null();
-    ui.set_receiving_configured(configured);
-    if let Some(address) = view.receiving["address"].as_str() {
-        ui.set_receiving_address(address.into());
-        if let Some(port) = view.receiving["port"].as_u64() {
-            ui.set_receiving_port(port.to_string().into());
-        }
-    }
-    ui.set_receiving_endpoint(if view.receiving["desired_enabled"] == true {
-        format!(
-            "{}:{}",
-            text(&view.receiving, "address"),
-            view.receiving["port"]
-        )
-        .into()
-    } else {
-        "Receiving disabled".into()
-    });
-    ui.set_receiving_error(if !view.receiving["setup_error"].is_null() || !view.receiving["key_error"].is_null() {
-        "Protected pairing files need recovery. Existing files were preserved; disable receiving if needed, then restore the configured identity or key store.".into()
-    } else { text(&view.receiving["service"], "error").into() });
-    ui.set_receiving_key_status(if view.receiving["pairing_key"]["recovery_required"] == true {
-        "The protected pairing verifier cannot be used. Restore its protected files or explicitly reset the key. Existing paired devices are preserved."
-    } else if view.receiving["pairing_key"]["upgrade_required"] == true {
-        "A new pairing key is required. Reset explicitly below; existing paired devices are preserved."
-    } else if view.receiving["pairing_key"]["enabled"] == true {
-        "A pairing key is active. It cannot be displayed again. Reset it only if you need a new key."
-    } else { "No pairing key is active. Create one below after setting up receiving." }.into());
-    let pending = view.receiving["pending"]
+fn folder_rows(value: &Value) -> Vec<FolderRow> {
+    value["folders"]
         .as_array()
-        .map(|items| {
-            items
-                .iter()
-                .filter(|item| item["approved"] != true)
-                .map(|item| PendingDevice {
-                    invitation: text(item, "invitation").into(),
-                    installation: text(item, "installation").into(),
-                    fingerprint: text(item, "fingerprint").into(),
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    ui.set_pending_devices(ModelRc::new(VecModel::from(pending)));
-    if let Some(code) = &view.show_once_code {
-        ui.set_server_code(code.expose().into());
-        ui.set_server_code_visible(true);
-    }
-    ui.set_receive_state(view.receive.state.into());
-    ui.set_receive_repo_id(view.receive.repo.into());
-    ui.set_receive_device(view.receive.device.into());
-    ui.set_receive_runtime(view.receive.runtime.into());
-    ui.set_receive_status(view.receive.status.into());
-    ui.set_receive_headless(view.receive.headless);
-    ui.set_receive_running(view.receive.running);
-    ui.set_receive_caught_up(view.receive.caught_up);
-    ui.set_receive_materialized(view.receive.materialized);
-    ui.set_receive_can_attach(view.receive.can_attach);
-    ui.set_background_sync_status(view.background_sync.into());
-    let old_peer = ui
-        .get_pair_peers()
-        .row_data(ui.get_pair_selected_peer() as usize)
-        .map(|p| p.id);
-    let old_repo = ui
-        .get_pair_repos()
-        .row_data(ui.get_pair_selected_repo() as usize)
-        .map(|r| r.id);
-    let peers = view
-        .pairing
-        .peers
         .into_iter()
-        .map(|(id, fingerprint, revoked)| PairPeer {
-            id: id.into(),
-            fingerprint: fingerprint.into(),
-            revoked,
+        .flatten()
+        .map(|p| FolderRow {
+            state: p["state"].as_str().unwrap_or_default().into(),
+            label: p["label"].as_str().unwrap_or_default().into(),
+            mount: p["mount"].as_str().unwrap_or_default().into(),
+            running: p["running"] == true,
+            error: p["error"].as_str().unwrap_or_default().into(),
         })
-        .collect::<Vec<_>>();
-    let peer = peers
-        .iter()
-        .position(|p| p.id.as_str() == view.pairing.peer)
-        .or_else(|| peers.iter().position(|p| Some(&p.id) == old_peer.as_ref()))
-        .map(|i| i as i32)
-        .unwrap_or(-1);
-    let repos = view
-        .pairing
-        .published
-        .into_iter()
-        .map(|state| PairRepo {
-            id: state.repo.into(),
-            label: state.label.into(),
-            replica: state.replica.into(),
-            branches: state
-                .branches
-                .iter()
-                .map(|b| format!("{} · {}", b.name, b.id))
-                .collect::<Vec<_>>()
-                .join("\n")
-                .into(),
+        .collect()
+}
+
+fn filtered_folders(rows: &[FolderRow], query: &str) -> Vec<FolderRow> {
+    let query = query.trim().to_lowercase();
+    rows.iter()
+        .filter(|p| {
+            p.label.to_lowercase().contains(&query) || p.mount.to_lowercase().contains(&query)
         })
-        .collect::<Vec<_>>();
-    let repo = repos
-        .iter()
-        .position(|r| Some(&r.id) == old_repo.as_ref())
-        .map(|i| i as i32)
-        .unwrap_or(if repos.is_empty() { -1 } else { 0 });
-    ui.set_pair_ready(view.pairing.ready);
-    ui.set_pair_identity(view.pairing.identity.into());
-    ui.set_pair_review(view.pairing.review.into());
-    ui.set_pair_peers(ModelRc::new(VecModel::from(peers)));
-    ui.set_pair_repos(ModelRc::new(VecModel::from(repos)));
-    ui.set_pair_selected_peer(peer);
-    ui.set_pair_selected_repo(repo);
-    ui.set_pair_syncs(view.pairing.syncs.into());
-    ui.set_pair_local(view.pairing.local.into());
-    ui.set_pair_grants(ModelRc::new(VecModel::from(
-        view.pairing
-            .grants
-            .into_iter()
-            .map(|(peer, repo, enabled, revoked)| PairGrant {
-                peer: peer.into(),
-                repo: repo.into(),
-                enabled,
-                revoked,
-            })
-            .collect::<Vec<_>>(),
-    )));
-    ui.set_pair_cancellable(false);
-    let old_project = ui
-        .get_projects()
-        .row_data(ui.get_selected() as usize)
-        .map(|row| row.id);
-    let new_project = view
-        .rows
-        .get(view.selected as usize)
-        .map(|row| row.1.as_str());
-    let same_project = old_project.as_ref().map(|id| id.as_str()) == new_project;
-    let old_branch = if same_project {
-        ui.get_branches()
-            .row_data(ui.get_selected_branch() as usize)
-            .map(|row| row.id)
-    } else {
-        None
-    };
-    let old_checkpoint = if same_project {
-        ui.get_checkpoints()
-            .row_data(ui.get_selected_checkpoint() as usize)
-            .map(|row| row.id)
-    } else {
-        None
-    };
-    let selected_branch = view
-        .branch_rows
-        .iter()
-        .position(|row| {
-            Some(row.id.as_str())
-                == view
-                    .preferred_branch
-                    .as_deref()
-                    .or(old_branch.as_ref().map(|id| id.as_str()))
-        })
-        .or_else(|| view.branch_rows.iter().position(|row| row.current))
-        .map(|i| i as i32)
-        .unwrap_or(-1);
-    let selected_checkpoint = view
-        .checkpoint_rows
-        .iter()
-        .position(|row| {
-            Some(row.id.as_str())
-                == view
-                    .preferred_checkpoint
-                    .as_deref()
-                    .or(old_checkpoint.as_ref().map(|id| id.as_str()))
-        })
-        .map(|i| i as i32)
-        .unwrap_or(-1);
-    ui.set_working(false);
-    ui.set_first_run(view.first_run);
-    ui.set_connected(view.connected);
-    ui.set_connection(view.connection.into());
-    if !view.config_path.is_empty() {
-        if !ui.get_pair_advanced() {
-            ui.set_server_config(view.config_path.clone().into());
-        }
-        ui.set_config_path(view.config_path.into());
-    }
-    ui.set_running_count(view.rows.iter().filter(|row| row.2 == "Running").count() as i32);
-    ui.set_attention_count(
-        view.rows
-            .iter()
-            .filter(|row| !matches!(row.2.as_str(), "Running" | "Stopped"))
+        .cloned()
+        .collect()
+}
+
+fn update_folders(ui: &AppWindow, rows: &[FolderRow]) {
+    ui.set_folder_count(rows.len() as i32);
+    ui.set_mounted_count(
+        rows.iter()
+            .filter(|p| p.running && !p.mount.is_empty())
             .count() as i32,
     );
-    ui.set_projects(ModelRc::new(VecModel::from(
-        view.rows
-            .into_iter()
-            .map(|(label, id, status, mount, desired)| Project {
-                label: label.into(),
-                id: id.into(),
-                status: status.into(),
-                mount: mount.into(),
-                desired,
-            })
-            .collect::<Vec<_>>(),
-    )));
-    ui.set_selected(view.selected);
-    filter_projects(ui, ui.get_project_filter().as_str());
-    if !view.status.is_empty() {
-        ui.set_status_detail(view.status.into());
-    }
-    ui.set_branches_detail(view.branches.into());
-    ui.set_branches(ModelRc::new(VecModel::from(view.branch_rows)));
-    ui.set_checkpoints(ModelRc::new(VecModel::from(view.checkpoint_rows)));
-    ui.set_selected_branch(selected_branch);
-    ui.set_selected_checkpoint(selected_checkpoint);
-    ui.set_runtime_ready(view.runtime.is_some());
-    ui.set_current_branch_name(view.current_branch_name.into());
-    ui.set_current_branch_shared(view.current_branch_shared);
-    ui.set_current_branch_id(
-        view.runtime
-            .as_ref()
-            .map(|context| context.active.as_str())
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_runtime_generation(
-        view.runtime
-            .as_ref()
-            .map(|context| context.generation.to_string())
-            .unwrap_or_default()
-            .into(),
-    );
-    ui.set_branch_operation_detail(view.branch_operation.into());
-    ui.set_can_retry_branch(view.retry_branch);
-    if let Some((message, error)) = view.message {
-        ui.set_message(message.into());
-        ui.set_error(error);
-    }
-    ui.set_operation_detail(view.operation.into());
-    ui.set_can_retry(view.retry);
-    if let Some((kind, path)) = view.folder {
-        match kind {
-            0 => ui.set_data_folder(path.into()),
-            1 => ui.set_mount_folder(path.into()),
-            _ => ui.set_project_mount(
-                Path::new(&path)
-                    .join(ui.get_project_name().as_str())
-                    .to_string_lossy()
-                    .into_owned()
-                    .into(),
-            ),
-        }
-    }
+    ui.set_folders(ModelRc::new(VecModel::from(filtered_folders(
+        rows,
+        &ui.get_search(),
+    ))));
 }
-fn filter_projects(ui: &App, query: &str) {
-    use slint::Model;
-    let query = query.trim().to_lowercase();
-    let indices = ui
-        .get_projects()
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| {
-            format!("{} {}", row.label, row.mount)
-                .to_lowercase()
-                .contains(&query)
+
+fn peer_rows(value: &Value) -> Vec<PeerRow> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| PeerRow {
+            endpoint: p["endpoint"].as_str().unwrap_or_default().into(),
+            online: p["lanes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|lane| lane["connected"] == true),
         })
-        .map(|(index, _)| index as i32)
-        .collect::<Vec<_>>();
-    ui.set_visible_projects(ModelRc::new(VecModel::from(indices)));
+        .collect()
 }
-fn enqueue(ui: &slint::Weak<App>, sender: &mpsc::Sender<Job>, job: Job) {
-    if let Some(ui) = ui.upgrade() {
-        if ui.get_working() {
-            return;
-        }
-        ui.set_working(true);
-        if sender.send(job).is_err() {
-            ui.set_working(false);
-            ui.set_error(true);
-            ui.set_message(
-                "The desktop worker stopped. Close and reopen this window to reconnect.".into(),
-            );
-        }
-    }
+
+fn clear_remote(ui: &AppWindow) {
+    ui.set_selected_repo("".into());
+    ui.set_remote_folders(ModelRc::default());
+    ui.set_remote_message("Browse the selected orchestrator to see its shared folders.".into());
 }
-pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
-    slint::BackendSelector::new()
-        .backend_name("winit".into())
-        .renderer_name("software".into())
-        .select()?;
-    let paths = if let Some(config) = config {
-        Paths::from_config(std::env::current_exe()?, config)?
-    } else {
-        Paths::from_executable(std::env::current_exe()?)?
+
+fn submit(weak: &slint::Weak<AppWindow>, tx: &mpsc::Sender<Action>, action: Action) {
+    let Some(ui) = weak.upgrade() else {
+        return;
     };
-    let ui = App::new()?;
-    ui.set_config_path(display_path(&paths.config).into());
-    if let Some(profile) = std::env::var_os("USERPROFILE") {
-        let profile = PathBuf::from(profile);
-        ui.set_profile_config(display_path(&profile.join(".telekinesis/orchestrator.toml")).into());
-        ui.set_profile_data(display_path(&profile.join(".telekinesis/data")).into());
-        ui.set_profile_mounts(display_path(&profile.join("Telekinesis")).into());
-        ui.set_profile_exists(
-            profile
-                .join(".telekinesis/orchestrator.toml")
-                .try_exists()
-                .unwrap_or(false),
+    if ui.get_busy() {
+        return;
+    }
+    let invalid = match &action {
+        Action::Create { label, .. } => label.trim().is_empty().then_some("Enter a folder name."),
+        Action::Pair { endpoint, code, .. } => {
+            if !endpoint.starts_with("ws://") {
+                Some("Enter a WebSocket address, such as ws://host:43180.")
+            } else {
+                code.is_empty()
+                    .then_some("Enter the remote host's pairing code.")
+            }
+        }
+        Action::RemoteList { endpoint }
+        | Action::Receive { endpoint, .. }
+        | Action::Unpair { endpoint } => (!endpoint.starts_with("ws://"))
+            .then_some("Enter a WebSocket address, such as ws://host:43180."),
+        _ => None,
+    };
+    if let Some(message) = invalid {
+        ui.set_status_error(true);
+        ui.set_status(message.into());
+        return;
+    }
+    if matches!(
+        action,
+        Action::RemoteList { .. } | Action::Pair { .. } | Action::Unpair { .. }
+    ) {
+        clear_remote(&ui);
+    }
+    ui.set_status_error(false);
+    ui.set_busy(true);
+    if tx.send(action).is_err() {
+        ui.set_busy(false);
+        ui.set_status_error(true);
+        ui.set_status(
+            "The desktop connection worker has stopped. Reopen the window to reconnect.".into(),
         );
     }
-    ui.set_data_folder(display_path(&paths.folder.join("data")).into());
-    ui.set_mount_folder(display_path(&paths.folder.join("Projects")).into());
-    ui.set_pair_config(display_path(&paths.folder.join(".tkfs-pairing/client.toml")).into());
-    ui.set_server_config(display_path(&paths.config).into());
-    let first_run = !paths.config.try_exists()?;
-    ui.set_first_run(first_run);
-    ui.set_connection(
-        if first_run {
-            "Welcome · configuration required"
-        } else {
-            "Connecting to your installation…"
-        }
-        .into(),
+}
+
+pub fn run(config_path: &Path) -> Result<()> {
+    let config_path = std::path::absolute(config_path)?;
+    if !config_path.exists() {
+        Config::initialize(&config_path)?;
+    }
+    let config = Config::load(&config_path)?;
+    let ui = AppWindow::new()?;
+    ui.set_config_path(config_path.display().to_string().into());
+    ui.set_listen_address(
+        config
+            .network
+            .listen
+            .as_deref()
+            .unwrap_or("Disabled")
+            .into(),
     );
-    let (sender, receiver) = mpsc::channel();
-    let weak = ui.as_weak();
-    let worker_weak = weak.clone();
-    let lifetime = std::sync::Arc::new(UiLifetime::default());
-    let worker_lifetime = lifetime.clone();
-    let pair_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let worker_stop = pair_stop.clone();
+    ui.set_host_name(
+        std::env::var("COMPUTERNAME")
+            .unwrap_or_else(|_| "This computer".into())
+            .into(),
+    );
+    let (tx, rx) = mpsc::channel::<Action>();
+    // The boolean distinguishes user commands from quiet background snapshots.
+    let (results, out) = mpsc::channel::<(Action, bool, Result<Value, String>)>();
     std::thread::spawn(move || {
-        let mut controller = Controller {
-            receive_proof: None,
-            background_sync: String::new(),
-            pairing: None,
-            pair_stop: worker_stop,
-            paths,
-            session: None,
-            selected: None,
-            catalog: Value::Null,
-            branch_client: None,
-        };
-        for job in receiver {
-            let pairing = matches!(
-                job,
-                Job::Pair(..) | Job::ConfigureReceiving(..) | Job::ApproveDevice(..)
-            );
-            let refresh = matches!(
-                job,
-                Job::Refresh | Job::Connect | Job::Setup(..) | Job::SetupProfile(..)
-            );
-            let result = controller.execute(job);
-            let view = match result {
-                Ok(view) => view,
-                Err(e) => {
-                    let mut view = controller.view();
-                    connection_error(
-                        &mut view,
-                        controller.session.is_some(),
-                        refresh,
-                        &format!("{e:#}"),
-                    );
-                    if pairing {
-                        view.message = Some((tkfs::desktop_pairing::error_message(&e), true));
-                    } else {
-                        view.message = Some((describe_error(&format!("{e:#}")), true));
-                        view.operation.push_str(&format!("\nDetails: {e:#}"));
-                    }
-                    view
+        if orchestrator::client(&config, &Action::List).is_err() {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("-f")
+                .arg(&config_path)
+                .arg("orchestrator")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+            if let Err(error) = command.spawn() {
+                let _ = results.send((Action::List, false, Err(error.to_string())));
+            }
+            for _ in 0..50 {
+                if orchestrator::client(&config, &Action::List).is_ok() {
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        let snapshot = || {
+            for action in [Action::List, Action::Peers] {
+                let response = orchestrator::client(&config, &action).map_err(|e| format!("{e:#}"));
+                if results.send((action, false, response)).is_err() {
+                    return false;
+                }
+            }
+            true
+        };
+        if !snapshot() {
+            return;
+        }
+        let mut stopped = false;
+        loop {
+            let action = match rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(action) => action,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !stopped && !snapshot() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            if worker_lifetime.is_closed() {
+            let response = orchestrator::client(&config, &action).map_err(|e| format!("{e:#}"));
+            if matches!(action, Action::Shutdown) && response.is_ok() {
+                stopped = true;
+            }
+            if matches!(action, Action::List) && response.is_ok() {
+                stopped = false;
+            }
+            let pair_endpoint = match &action {
+                Action::Pair { endpoint, .. } if response.is_ok() => Some(endpoint.clone()),
+                _ => None,
+            };
+            if results.send((action, true, response)).is_err() {
                 break;
             }
-            let delivery_lifetime = worker_lifetime.clone();
-            if worker_weak
-                .upgrade_in_event_loop(move |ui| delivery_lifetime.deliver(|| apply(&ui, view)))
-                .is_err()
-            {
+            if let Some(endpoint) = pair_endpoint {
+                let action = Action::RemoteList { endpoint };
+                let response = orchestrator::client(&config, &action).map_err(|e| format!("{e:#}"));
+                if results.send((action, true, response)).is_err() {
+                    break;
+                }
+            }
+            if !stopped && !snapshot() {
                 break;
             }
         }
     });
-    macro_rules! callback {
-        ($method:ident,$job:expr) => {{
-            let weak = weak.clone();
-            let sender = sender.clone();
-            ui.$method(move || enqueue(&weak, &sender, $job));
+
+    let rows = Rc::new(RefCell::new(Vec::<FolderRow>::new()));
+    let cached = rows.clone();
+    let weak = ui.as_weak();
+    ui.on_search_folders(move |query| {
+        if let Some(ui) = weak.upgrade() {
+            ui.set_folders(ModelRc::new(VecModel::from(filtered_folders(
+                &cached.borrow(),
+                &query,
+            ))));
+        }
+    });
+    let weak = ui.as_weak();
+    ui.on_remote_changed(move || {
+        if let Some(ui) = weak.upgrade() {
+            clear_remote(&ui);
+        }
+    });
+
+    macro_rules! handler {
+        ($method:ident, || $action:expr) => {{
+            let t = tx.clone();
+            let weak = ui.as_weak();
+            ui.$method(move || submit(&weak, &t, $action));
+        }};
+        ($method:ident, |$($arg:ident),*| $action:expr) => {{
+            let t = tx.clone();
+            let weak = ui.as_weak();
+            ui.$method(move |$($arg: slint::SharedString),*| submit(&weak, &t, $action));
         }};
     }
-    callback!(on_connect, Job::Connect);
-    callback!(on_refresh, Job::Refresh);
-    callback!(on_start_project, Job::Start);
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_open_profile(move || {
-            if let Some(ui) = weak.upgrade() {
-                enqueue(
-                    &weak,
-                    &sender,
-                    Job::SelectConfig(PathBuf::from(ui.get_profile_config().as_str())),
-                );
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_toggle_mount(move |state, desired| {
-            enqueue(&weak, &sender, Job::ToggleMount(state.to_string(), desired))
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_receiving_action(move |enabled| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            enqueue(
-                &weak,
-                &sender,
-                Job::ConfigureReceiving(
-                    enabled.then(|| ui.get_receiving_address().trim().to_owned()),
-                    ui.get_receiving_port().trim().to_owned(),
-                ),
-            );
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_approve_device(move |invitation| {
-            enqueue(&weak, &sender, Job::ApproveDevice(invitation.to_string()))
-        });
-    }
-    callback!(on_stop_project, Job::Stop);
-    callback!(on_shutdown, Job::Shutdown);
-    callback!(on_retry, Job::Retry);
-    callback!(on_inspect_operation, Job::Operation);
-    callback!(on_open_project, Job::Open);
-    callback!(on_retry_branch, Job::RetryBranch);
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        let stop = pair_stop.clone();
-        ui.on_receive_action(move |kind| {
-            use slint::Model;
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            if ui.get_working() {
-                return;
-            }
-            let state = ui.get_receive_state().to_string();
-            let peer = ui
-                .get_pair_peers()
-                .row_data(ui.get_pair_selected_peer() as usize)
-                .map(|p| p.id.to_string())
-                .unwrap_or_default();
-            let request = match kind {
-                0 => receive::Request::Prepare {
-                    label: ui.get_receive_label().to_string(),
-                    repo: ui.get_receive_repository().to_string(),
-                },
-                1 if ui.get_receive_confirmed() => receive::Request::Configure { state, peer },
-                2 => receive::Request::Sync { state, peer },
-                3 => receive::Request::Materialize {
-                    state,
-                    branch: ui
-                        .get_branches()
-                        .row_data(ui.get_selected_branch() as usize)
-                        .map(|b| b.id.to_string())
-                        .unwrap_or_default(),
-                },
-                4 => receive::Request::Stop { state },
-                5 => receive::Request::Attach {
-                    state,
-                    mount: PathBuf::from(ui.get_receive_mount().as_str()),
-                },
-                6 => receive::Request::Start { state },
-                _ => return,
-            };
-            ui.set_receive_confirmed(false);
-            stop.store(false, std::sync::atomic::Ordering::Relaxed);
-            ui.set_pair_cancellable(kind == 2);
-            enqueue(
-                &weak,
-                &sender,
-                Job::Receive(PathBuf::from(ui.get_pair_config().as_str()), request),
-            );
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_background_sync_action(move |enabled| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            enqueue(
-                &weak,
-                &sender,
-                Job::BackgroundSync(enabled.then(|| PathBuf::from(ui.get_pair_config().as_str()))),
-            );
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_reset_pairing_code(move || {
-            if let Some(ui) = weak.upgrade() {
-                if ui.get_working()
-                    || !ui.get_server_reset_confirmed()
-                    || ui.get_server_code_visible()
-                {
-                    return;
-                }
-                ui.set_server_reset_confirmed(false);
-                ui.set_server_code("".into());
-                enqueue(
-                    &weak,
-                    &sender,
-                    Job::ResetPairingCode(PathBuf::from(ui.get_server_config().as_str())),
-                );
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        ui.on_filter_projects(move |query| {
-            if let Some(ui) = weak.upgrade() {
-                filter_projects(&ui, query.as_str());
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_select_config(move || {
-            if let Some(ui) = weak.upgrade() {
-                if ui.get_working() {
-                    return;
-                }
-                ui.set_config_visible(false);
-                enqueue(
-                    &weak,
-                    &sender,
-                    Job::SelectConfig(PathBuf::from(ui.get_config_input().as_str())),
-                );
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        let stop = pair_stop.clone();
-        ui.on_pair_action(move |action| {
-            use slint::Model;
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            if ui.get_working() {
-                return;
-            }
-            if matches!(action, 0 | 1 | 11) {
-                ui.set_pair_token("".into());
-                ui.set_pair_confirmed(false);
-                ui.set_pair_grant_confirmed(false);
-                ui.set_pair_revoke_confirmed(false);
-            }
-            if action == 4 {
-                ui.set_pair_grant_confirmed(false);
-            }
-            let peer = ui
-                .get_pair_peers()
-                .row_data(ui.get_pair_selected_peer() as usize)
-                .map(|p| p.id.to_string())
-                .unwrap_or_default();
-            let repo = ui
-                .get_pair_repos()
-                .row_data(ui.get_pair_selected_repo() as usize)
-                .map(|r| r.id.to_string())
-                .unwrap_or_default();
-            let job = match action {
-                14 => {
-                    let code = zeroize::Zeroizing::new(ui.get_pair_token().to_string());
-                    ui.set_pair_token("".into());
-                    PairJob::JoinAddress(
-                        ui.get_pair_host().to_string(),
-                        ui.get_pair_port().to_string(),
-                        code,
-                    )
-                }
-                12 => {
-                    ui.set_pair_confirmed(false);
-                    PairJob::InspectCode(
-                        ui.get_pair_bootstrap().to_string(),
-                        ui.get_pair_enrollment().to_string(),
-                    )
-                }
-                13 => {
-                    let code = zeroize::Zeroizing::new(ui.get_pair_token().to_string());
-                    ui.set_pair_token("".into());
-                    let confirmed = ui.get_pair_confirmed();
-                    ui.set_pair_confirmed(false);
-                    PairJob::JoinCode(
-                        ui.get_pair_bootstrap().to_string(),
-                        ui.get_pair_enrollment().to_string(),
-                        code,
-                        confirmed,
-                    )
-                }
-                0 => PairJob::Load(PathBuf::from(ui.get_pair_config().as_str())),
-                1 => PairJob::Create(PathBuf::from(ui.get_pair_config().as_str())),
-                2 => {
-                    let token = zeroize::Zeroizing::new(ui.get_pair_token().to_string());
-                    ui.set_pair_token("".into());
-                    ui.set_pair_confirmed(false);
-                    PairJob::Inspect(token, ui.get_pair_endpoint().to_string())
-                }
-                3 => PairJob::Join(ui.get_pair_endpoint().to_string(), ui.get_pair_confirmed()),
-                4 => PairJob::List(peer),
-                5 => PairJob::Configure(
-                    peer,
-                    repo,
-                    PathBuf::from(ui.get_pair_runtime().as_str()),
-                    ui.get_pair_grant_confirmed(),
-                ),
-                6 => PairJob::Sync(peer, repo),
-                7 => PairJob::Enable(peer, repo, false),
-                8 => PairJob::Enable(peer, repo, true),
-                9 => PairJob::Revoke(peer, ui.get_pair_revoke_confirmed()),
-                10 => {
-                    ui.set_pair_token("".into());
-                    ui.set_pair_confirmed(false);
-                    PairJob::Clear
-                }
-                11 => {
-                    ui.set_pair_confirmed(false);
-                    ui.set_pair_grant_confirmed(false);
-                    ui.set_pair_revoke_confirmed(false);
-                    PairJob::SelectPeer(peer)
-                }
-                _ => return,
-            };
-            stop.store(false, std::sync::atomic::Ordering::Relaxed);
-            ui.set_pair_cancellable(job.cancellable());
-            ui.set_message("Pairing operation in progress…".into());
-            ui.set_error(false);
-            enqueue(
-                &weak,
-                &sender,
-                Job::Pair(PathBuf::from(ui.get_pair_config().as_str()), job),
-            );
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        let stop = pair_stop.clone();
-        ui.on_pair_grant_action(move |index, action| {
-            use slint::Model;
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            if ui.get_working() {
-                return;
-            }
-            let Some(grant) = ui.get_pair_grants().row_data(index as usize) else {
-                return;
-            };
-            let job = if action == 0 {
-                PairJob::Sync(grant.peer.to_string(), grant.repo.to_string())
-            } else {
-                PairJob::Enable(grant.peer.to_string(), grant.repo.to_string(), action == 2)
-            };
-            stop.store(false, std::sync::atomic::Ordering::Relaxed);
-            ui.set_pair_cancellable(job.cancellable());
-            enqueue(
-                &weak,
-                &sender,
-                Job::Pair(PathBuf::from(ui.get_pair_config().as_str()), job),
-            );
-        });
-    }
-    {
-        let stop = pair_stop.clone();
-        ui.on_pair_cancel(move || stop.store(true, std::sync::atomic::Ordering::Relaxed));
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_submit_branch(move || {
-            if let Some(ui) = weak.upgrade() {
-                if !ui.get_can_submit_branch() {
-                    return;
-                }
-                let action = match ui.get_branch_dialog() {
-                    1 => BranchAction::Create {
-                        name: ui.get_branch_input().to_string(),
-                    },
-                    2 => BranchAction::Checkout {
-                        branch: ui.get_branch_target_id().to_string(),
-                    },
-                    3 => BranchAction::Publish {
-                        name: ui.get_branch_input().to_string(),
-                        confirmed: ui.get_publication_confirmed(),
-                    },
-                    4 => BranchAction::Checkpoint {
-                        message: ui.get_branch_input().to_string(),
-                    },
-                    5 => BranchAction::Restore {
-                        checkpoint: ui.get_branch_target_id().to_string(),
-                        name: ui.get_branch_input().to_string(),
-                    },
-                    _ => return,
-                };
-                let Ok(generation) = ui.get_branch_source_generation().parse() else {
-                    return;
-                };
-                let context = BranchContext {
-                    state: ui.get_branch_source_project().to_string(),
-                    active: ui.get_branch_source_active().to_string(),
-                    generation,
-                };
-                ui.set_branch_dialog(0);
-                enqueue(&weak, &sender, Job::Branch(context, action));
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_setup(move || {
-            if let Some(ui) = weak.upgrade() {
-                if ui.get_profile_setup() {
-                    if let Some(profile) = std::env::var_os("USERPROFILE") {
-                        enqueue(
-                            &weak,
-                            &sender,
-                            Job::SetupProfile(
-                                PathBuf::from(profile),
-                                ui.get_worker_limit() as usize,
-                            ),
-                        );
-                    }
-                    return;
-                }
-                enqueue(
-                    &weak,
-                    &sender,
-                    Job::Setup(
-                        PathBuf::from(ui.get_data_folder().as_str()),
-                        PathBuf::from(ui.get_mount_folder().as_str()),
-                        ui.get_worker_limit() as usize,
-                    ),
-                );
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_create_project(move || {
-            if let Some(ui) = weak.upgrade() {
-                let mount = ui.get_project_mount();
-                enqueue(
-                    &weak,
-                    &sender,
-                    Job::Create(
-                        ui.get_project_name().to_string(),
-                        (!mount.is_empty()).then(|| PathBuf::from(mount.as_str())),
-                    ),
-                );
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_select_project(move |index| {
-            use slint::Model;
-            if let Some(ui) = weak.upgrade()
-                && let Some(row) = ui.get_projects().row_data(index as usize)
-            {
-                enqueue(&weak, &sender, Job::Select(row.id.to_string()));
-            }
-        });
-    }
-    {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        ui.on_browse(move |kind| enqueue(&weak, &sender, Job::Browse(kind)));
-    }
+    handler!(on_refresh, || Action::List);
+    handler!(on_create_folder, |label, mount| Action::Create {
+        label: label.trim().into(),
+        mount: path(mount),
+        headless: false
+    });
+    handler!(on_start_folder, |state| Action::Start {
+        state: state.into()
+    });
+    handler!(on_stop_folder, |state| Action::Stop {
+        state: state.into()
+    });
+    handler!(on_configure_mount, |state, mount| Action::ConfigureMount {
+        state: state.into(),
+        mount: path(mount)
+    });
+    handler!(on_pair, |endpoint, code| Action::Pair {
+        endpoint: endpoint.trim().into(),
+        code: code.trim().into(),
+        connections: None
+    });
+    handler!(on_remote_list, |endpoint| Action::RemoteList {
+        endpoint: endpoint.trim().into()
+    });
+    handler!(on_receive_folder, |endpoint, repo, label, mount| {
+        Action::Receive {
+            endpoint: endpoint.trim().into(),
+            repo: repo.into(),
+            label: label.into(),
+            mount: path(mount),
+            headless: false,
+        }
+    });
+    handler!(on_reset_code, || Action::ResetPairingCode);
+    handler!(on_unpair, |endpoint| Action::Unpair {
+        endpoint: endpoint.trim().into()
+    });
+    handler!(on_peers, || Action::Peers);
+    handler!(on_shutdown, || Action::Shutdown);
+
+    let weak = ui.as_weak();
     let timer = slint::Timer::default();
-    {
-        let weak = weak.clone();
-        let stop = pair_stop.clone();
-        let lifetime = lifetime.clone();
-        ui.window().on_close_requested(move || {
-            if let Some(ui) = weak.upgrade() {
-                close_ui(&ui, &lifetime);
-            } else {
-                lifetime.close();
-            }
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            slint::CloseRequestResponse::HideWindow
-        });
-    }
-    if report.is_none() {
-        let weak = weak.clone();
-        let sender = sender.clone();
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_secs(3),
-            move || {
-                if let Some(ui) = weak.upgrade()
-                    && ui.get_connected()
-                    && !ui.get_working()
-                    && !ui.get_create_visible()
-                    && !ui.get_shutdown_visible()
-                    && !ui.get_about_visible()
-                    && !ui.get_config_visible()
-                    && ui.get_branch_dialog() == 0
-                    && !ui.get_server_code_visible()
-                    && ui.get_pair_token().is_empty()
-                    && (matches!(ui.get_main_page(), 0 | 3 | 4)
-                        || (ui.get_main_page() == 1 && ui.get_pairing_page() == 2))
-                {
-                    enqueue(&weak, &sender, Job::Refresh);
+    let mut previous_peers = Vec::new();
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
+        let Some(ui) = weak.upgrade() else { return; };
+        while let Ok((action, interactive, result)) = out.try_recv() {
+            if interactive { ui.set_busy(false); }
+            match result {
+                Err(error) => {
+                    if matches!(action, Action::List) { ui.set_connected(false); }
+                    if matches!(action, Action::RemoteList { .. }) {
+                        clear_remote(&ui);
+                        ui.set_remote_message("Unable to load remote folders. Check the address and pairing code.".into());
+                    }
+                    if interactive || !ui.get_status_error() {
+                        ui.set_status_error(true);
+                        ui.set_status(error.into());
+                    }
                 }
-            },
-        );
-    }
-    let synthetic = report.is_some()
-        && matches!(
-            std::env::var("TKFS_UI_TEST_PHASE").as_deref(),
-            Ok("dashboard"
-                | "pairing-code"
-                | "receive"
-                | "pairing-address"
-                | "profile-setup"
-                | "profile-reopen")
-        );
-    if !first_run && !synthetic {
-        enqueue(&weak, &sender, Job::Connect);
-    }
-    let test_timer = if let Some(report) = report {
-        Some(test_ui(&ui, report.to_owned())?)
-    } else {
-        None
-    };
+                Ok(value) => {
+                    let message = match action {
+                        Action::List => {
+                            ui.set_connected(true);
+                            let next_rows = folder_rows(&value);
+                            if *rows.borrow() != next_rows {
+                                *rows.borrow_mut() = next_rows;
+                                update_folders(&ui, &rows.borrow());
+                            }
+                            let failures: Vec<_> = rows.borrow().iter().filter(|p| !p.error.is_empty())
+                                .map(|p| format!("{}: {}", p.label, p.error)).collect();
+                            if !failures.is_empty() && !ui.get_busy() {
+                                ui.set_status_error(true);
+                                ui.set_status(failures.join("\n").into());
+                                continue;
+                            }
+                            "Folders are up to date."
+                        }
+                        Action::Peers => {
+                            let peers = peer_rows(&value);
+                            ui.set_online_count(peers.iter().filter(|p| p.online).count() as i32);
+                            if peers != previous_peers {
+                                ui.set_peer_rows(ModelRc::new(VecModel::from(peers.clone())));
+                                previous_peers = peers;
+                            }
+                            "Connection status updated."
+                        }
+                        Action::RemoteList { ref endpoint } => {
+                            if endpoint.trim() != ui.get_endpoint().trim() { continue; }
+                            ui.set_selected_repo("".into());
+                            let remotes = value.as_array().into_iter().flatten().map(|p| RemoteRow {
+                                repo: p["repo"].as_str().unwrap_or_default().into(),
+                                label: p["label"].as_str().unwrap_or_default().into(),
+                            }).collect::<Vec<_>>();
+                            ui.set_remote_message(if remotes.is_empty() { "This host has no shared folders available." } else { "Select a folder to receive on this host." }.into());
+                            ui.set_remote_folders(ModelRc::new(VecModel::from(remotes)));
+                            "Remote folders loaded."
+                        }
+                        Action::Create { .. } => { ui.set_dialog("".into()); "Folder created and mounted." }
+                        Action::Receive { .. } => { ui.set_dialog("".into()); "Remote folder received and mounted." }
+                        Action::ConfigureMount { .. } => { ui.set_dialog("".into()); "Mount point saved. Start the folder when you're ready." }
+                        Action::Start { .. } => "Folder started.",
+                        Action::Stop { .. } => {
+                            if ui.get_dialog() == "stop-first" { ui.set_dialog("mount".into()); }
+                            "Folder stopped."
+                        }
+                        Action::Pair { .. } => { ui.set_code("".into()); ui.set_busy(true); "Connected. Loading remote folders…" }
+                        Action::Unpair { .. } => { clear_remote(&ui); "Orchestrator disconnected. Local folders remain available." }
+                        Action::ResetPairingCode => {
+                            ui.set_pairing_code(value["code"].as_str().unwrap_or_default().into());
+                            "New pairing code generated. Existing peers must pair again."
+                        }
+                        Action::Shutdown => {
+                            ui.set_connected(false);
+                            for row in rows.borrow_mut().iter_mut() { row.running = false; }
+                            update_folders(&ui, &rows.borrow());
+                            ui.set_online_count(0);
+                            previous_peers.clear();
+                            ui.set_peer_rows(ModelRc::default());
+                            ui.set_dialog("".into());
+                            "Daemon shut down. Reopen this window to start it again."
+                        }
+                        _ => "Done.",
+                    };
+                    if interactive || ui.get_status().starts_with("Connecting") {
+                        ui.set_status_error(false);
+                        ui.set_status(message.into());
+                    }
+                }
+            }
+        }
+    });
     ui.run()?;
-    pair_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    drop(test_timer);
-    drop(timer);
-    drop(sender);
     Ok(())
 }
 
-// This mode is explicitly selected by the isolated acceptance runner. It exercises
-// real component callbacks and the native Windows window, never a headless mock.
-fn snapshot(ui: &App, path: &Path) -> Result<()> {
-    use std::io::Write;
-    ensure!(
-        ui.get_server_code().is_empty() && ui.get_pair_token().is_empty(),
-        "SECRET_SCREENSHOT_REFUSED"
-    );
-    let pixels = ui.window().take_snapshot()?;
-    let (w, h) = (pixels.width(), pixels.height());
-    let size = w * h * 4;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(b"BM")?;
-    file.write_all(&(54 + size).to_le_bytes())?;
-    file.write_all(&[0; 4])?;
-    file.write_all(&54u32.to_le_bytes())?;
-    file.write_all(&40u32.to_le_bytes())?;
-    file.write_all(&(w as i32).to_le_bytes())?;
-    file.write_all(&(-(h as i32)).to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&32u16.to_le_bytes())?;
-    file.write_all(&[0; 24])?;
-    let bytes = pixels
-        .as_slice()
-        .iter()
-        .flat_map(|pixel| [pixel.b, pixel.g, pixel.r, 255])
-        .collect::<Vec<_>>();
-    file.write_all(&bytes)?;
-    Ok(())
-}
-fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
-    use slint::Model;
-    let theme = std::env::var("TKFS_UI_TEST_THEME").unwrap_or_else(|_| "system".into());
-    match theme.as_str() {
-        "light" => ui.invoke_set_theme(1),
-        "dark" => ui.invoke_set_theme(2),
-        _ => {}
-    }
-    let directory = report
-        .parent()
-        .context("REPORT_PARENT_REQUIRED")?
-        .to_owned();
-    std::fs::create_dir_all(&directory)?;
-    let weak = ui.as_weak();
-    let timer = slint::Timer::default();
-    let mut step = 0;
-    let mut checks = Vec::<String>::new();
-    let mut busy = None;
-    let mut branch_acceptance = branch_acceptance::BranchAcceptance::default();
-    let started = std::time::Instant::now();
-    let mut ticks = 0;
-    let phase = std::env::var("TKFS_UI_TEST_PHASE").unwrap_or_else(|_| "first".into());
-    let mut pairing_acceptance = if phase == "pairing" {
-        Some(pairing_acceptance::Acceptance::from_stdin()?)
-    } else {
-        None
-    };
-    branch_acceptance.set_phase(&phase);
-    let mut address_acceptance = if phase == "pairing-address" {
-        Some(address_acceptance::Acceptance::from_stdin()?)
-    } else {
-        None
-    };
-    let mut code_acceptance = if phase == "pairing-code" {
-        Some(code_acceptance::Acceptance::from_stdin()?)
-    } else {
-        None
-    };
-    let mut receive_acceptance = if phase == "receive" {
-        Some(receive_acceptance::Acceptance::from_stdin()?)
-    } else {
-        None
-    };
-    timer.start(slint::TimerMode::Repeated,Duration::from_millis(300),move || {
-        let Some(ui)=weak.upgrade()else{return;};ticks+=1;
-        let result=(||->Result<bool>{
-            ensure!(started.elapsed()<Duration::from_secs(100),"UI_TEST_TIMEOUT at step {step}");
-            if ticks<3 || (ui.get_working() && phase != "dashboard"){return Ok(false);}
-            if phase == "profile-setup" || phase == "profile-reopen" { return profile_acceptance::tick(&ui, &directory, &mut step, phase == "profile-reopen", &mut checks); }
-            if let Some(address) = &mut address_acceptance { return address.tick(&ui, &directory, &mut checks); }
-            if let Some(receive) = &mut receive_acceptance { return receive.tick(&ui, &directory, &mut checks); }
-            if let Some(code) = &mut code_acceptance {
-                return code.tick(&ui, &directory, &mut checks);
-            } else if phase == "dashboard" {
-                return dashboard_acceptance::tick(&ui, &directory, &mut step, &mut checks);
-            } else if let Some(pairing)=&mut pairing_acceptance {
-                return pairing.tick(&ui,&directory,&mut checks);
-            } else if phase.starts_with("branches") {
-                return branch_acceptance.tick(&ui,&directory,&mut checks);
-            } else if phase=="invalid-catalog" {
-                ensure!(!ui.get_connected() && ui.get_error(),"INVALID_CATALOG_NOT_REFUSED: {}",ui.get_message());
-                ensure!(ui.get_projects().row_count()==0,"INVALID_CATALOG_PROJECTS_EXPOSED");
-                snapshot(&ui,&directory.join("startup-refused.bmp"))?;
-                checks.push(format!("GUI refuses invalid established catalog and shows startup error: {}",ui.get_message()));
-                return Ok(true);
-            } else if phase=="reopen" {
-                match step {
-                    0=>{ensure!(ui.get_connected(),"REOPEN_NOT_CONNECTED: {}",ui.get_message());ensure!(ui.get_projects().row_count()==2,"REOPEN_PROJECT_COUNT");snapshot(&ui,&directory.join("reopened.bmp"))?;checks.push("existing config reconnects to both running projects".into());ui.set_about_visible(true);step=1;},
-                    1=>{snapshot(&ui,&directory.join("about.bmp"))?;ui.set_about_visible(false);ui.invoke_shutdown();step=2;},
-                    2=>{ensure!(!ui.get_connected()&&!ui.get_error(),"SHUTDOWN_FAILED: {}",ui.get_message());ensure!(ui.get_can_start_supervisor()&&!ui.get_can_stop_supervisor(),"SUPERVISOR_CONTROL_STATE");checks.push("explicit GUI shutdown cooperatively stops test workers; start/reconnect remains available".into());snapshot(&ui,&directory.join("shutdown.bmp"))?;ui.invoke_connect();step=3;},
-                    3=>{ensure!(ui.get_connected(),"SUPERVISOR_RESTART_FAILED: {}",ui.get_message());if ui.get_projects().iter().any(|row|row.status!="Running"){ui.invoke_refresh();return Ok(false);}snapshot(&ui,&directory.join("supervisor-restarted.bmp"))?;checks.push("GUI reconnect starts stopped supervisor and restores desired project mounts".into());ui.invoke_shutdown();step=4;},
-                    _=>{ensure!(!ui.get_connected()&&!ui.get_error(),"FINAL_SHUTDOWN_FAILED: {}",ui.get_message());return Ok(true);}
-                }
-            } else {
-                match step {
-                    0=>{ensure!(ui.get_first_run(),"FIRST_RUN_WIZARD_MISSING");snapshot(&ui,&directory.join("first-run.bmp"))?;checks.push("native window shows first-run wizard".into());ui.invoke_setup();step=1;},
-                    1=>{ensure!(ui.get_connected(),"SETUP_FAILED: {}",ui.get_message());snapshot(&ui,&directory.join("empty.bmp"))?;checks.push("configuration saved and supervisor connected".into());ui.set_create_visible(true);ui.set_project_name("".into());step=2;},
-                    2=>{ui.invoke_focus_project_name();ensure!(ui.get_project_name_focused(),"PROJECT_NAME_FOCUS_FAILED");ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyPressed{text:slint::platform::Key::Tab.into()})?;ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyReleased{text:slint::platform::Key::Tab.into()})?;ensure!(!ui.get_project_name_focused(),"TAB_NAVIGATION_FAILED");ui.invoke_focus_project_name();for letter in "Design studio".chars(){ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyPressed{text:letter.to_string().into()})?;ui.window().try_dispatch_event(slint::platform::WindowEvent::KeyReleased{text:letter.to_string().into()})?;}ensure!(ui.get_project_name()=="Design studio","KEYBOARD_TEXT_ENTRY_FAILED");checks.push("toolkit keyboard focus, Tab navigation, and text entry work in create dialog".into());snapshot(&ui,&directory.join("create.bmp"))?;ui.set_create_visible(false);ui.invoke_create_project();step=3;},
-                    3=>{ensure!(ui.get_projects().row_count()==1&&!ui.get_error(),"FIRST_CREATE_FAILED: {}",ui.get_message());snapshot(&ui,&directory.join("project.bmp"))?;let row=ui.get_projects().row_data(ui.get_selected() as usize).context("NO_SELECTED_PROJECT")?;let file=PathBuf::from(row.mount.as_str()).join("hello.txt");std::fs::write(&file,b"UI acceptance durable data")?;busy=Some(std::fs::File::open(file)?);ui.invoke_stop_project();step=4;},
-                    4=>{ensure!(ui.get_error()&&ui.get_can_retry(),"BUSY_STOP_NOT_RETRYABLE: {}",ui.get_message());snapshot(&ui,&directory.join("busy.bmp"))?;checks.push("busy real file handle produces pending stop and exact retry UI".into());busy=None;ui.invoke_retry();step=5;},
-                    5=>{ensure!(!ui.get_error(),"EXACT_RETRY_FAILED: {}",ui.get_message());ensure!(ui.get_can_start_project()&&!ui.get_can_stop_project(),"STOPPED_PROJECT_CONTROLS");snapshot(&ui,&directory.join("stopped.bmp"))?;ui.invoke_start_project();step=6;},
-                    6=>{ensure!(!ui.get_error(),"RESTART_FAILED: {}",ui.get_message());let row=ui.get_projects().row_data(ui.get_selected() as usize).context("NO_SELECTED_PROJECT")?;ensure!(std::fs::read(PathBuf::from(row.mount.as_str()).join("hello.txt"))?==b"UI acceptance durable data","DATA_CHANGED");checks.push("exact retry stops worker; start restores durable mounted data".into());ui.set_project_name("Research lab".into());ui.set_project_mount("".into());ui.invoke_create_project();step=7;},
-                    7=>{ensure!(ui.get_projects().row_count()==2&&!ui.get_error(),"SECOND_CREATE_FAILED: {}",ui.get_message());snapshot(&ui,&directory.join("two-projects.bmp"))?;ui.window().set_size(slint::LogicalSize::new(980.0,720.0));step=8;}, _=>{snapshot(&ui,&directory.join("minimum-size.bmp"))?;checks.push("two independent stores mounted; minimum-size layout captured; GUI closes without shutdown".into());return Ok(true);}
-                }
-            }
-            Ok(false)
-        })();
-        match result {Ok(false)=>{},result=>{
-            let error=result.as_ref().err().map(|e|format!("{e:#}"));let passed=error.is_none();let _=std::fs::write(&report,serde_json::to_vec_pretty(&json!({"passed":passed,"phase":phase,"theme":theme,"checks":checks,"error":error,"elapsed_seconds":started.elapsed().as_secs_f64()})).unwrap());let _=ui.hide();let _=slint::quit_event_loop();
-        }}
-    });
-    Ok(timer)
-}
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn simple_pairing_validates_before_provisioning_without_echoing_input() {
-        let code = "0".repeat(200);
-        assert_eq!(
-            super::pairing_address("::1", "65535", &code).unwrap(),
-            ("::1".into(), 65535)
-        );
-        for (host, port) in [
-            ("name.example", "7421"),
-            ("127.0.0.1", "0"),
-            ("127.0.0.1", "65536"),
-            ("0.0.0.0", "7421"),
-            ("224.0.0.1", "7421"),
-        ] {
-            assert!(super::pairing_address(host, port, &code).is_err());
-        }
-        assert!(
-            super::pairing_address("127.0.0.1", "7421", "secret-invalid-fixture")
-                .unwrap_err()
-                .to_string()
-                .contains("200_DIGITS")
-        );
-    }
     use super::*;
+    use serde_json::json;
     #[test]
-    fn closed_window_discards_already_queued_delivery() {
-        let lifetime = UiLifetime::default();
-        let applied = std::cell::Cell::new(false);
-        let dropped = std::cell::Cell::new(false);
-        struct Pending<'a>(&'a std::cell::Cell<bool>);
-        impl Drop for Pending<'_> {
-            fn drop(&mut self) {
-                self.0.set(true);
-            }
-        }
-        let pending = Pending(&dropped);
-        let delivery = || {
-            drop(pending);
-            applied.set(true);
-        };
-        lifetime.close();
-        lifetime.deliver(delivery);
-        assert!(!applied.get());
-        assert!(dropped.get());
-    }
-    #[test]
-    fn captured_branch_action_never_follows_a_changed_project_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut controller = Controller {
-            receive_proof: None,
-            background_sync: String::new(),
-            pairing: None,
-            pair_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            paths: Paths {
-                executable: directory.path().join("fixture.exe"),
-                folder: directory.path().into(),
-                config: directory.path().join("orchestrator.toml"),
-            },
-            session: None,
-            selected: Some(tkfs::core::id()),
-            catalog: Value::Null,
-            branch_client: None,
-        };
-        let context = BranchContext {
-            state: tkfs::core::id(),
-            active: tkfs::core::id(),
-            generation: 0,
-        };
-        let error = controller
-            .execute(Job::Branch(
-                context,
-                BranchAction::Create {
-                    name: "must not be created".into(),
-                },
-            ))
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("STALE_PROJECT_SELECTION"));
-        assert!(
-            !directory
-                .path()
-                .join(".tkfs-ui-branch-operation.json")
-                .exists()
+    fn folder_snapshot_preserves_headless_and_failure_states() {
+        let rows = folder_rows(&json!({"folders": [
+            {"state":"a", "label":"Design Assets", "mount":"C:\\Work\\design", "running":true},
+            {"state":"b", "label":"Archive", "mount":null, "running":true},
+            {"state":"c", "label":"Failed", "mount":"X:", "running":false, "error":"Mount unavailable"}
+        ]}));
+        assert_eq!(
+            rows.iter()
+                .filter(|p| p.running && !p.mount.is_empty())
+                .count(),
+            1
         );
+        assert_eq!(filtered_folders(&rows, " DESIGN ").len(), 1);
+        assert_eq!(filtered_folders(&rows, "c:\\work")[0].state, "a");
+        assert!(filtered_folders(&rows, "missing").is_empty());
+        assert_eq!(rows[2].error, "Mount unavailable");
     }
     #[test]
-    fn transient_transport_failure_disables_mutations_and_marks_stale_status() {
-        let mut view = View {
-            connected: true,
-            rows: vec![(
-                "id".into(),
-                "project".into(),
-                "Running".into(),
-                "mount".into(),
-                true,
-            )],
-            ..Default::default()
-        };
-        connection_error(&mut view, true, true, "LOCAL_IPC: broken pipe");
-        assert!(!view.connected);
-        assert_eq!(view.rows[0].2, "Running");
-        assert!(view.connection.contains("stale"));
-    }
-    #[test]
-    fn catalog_read_retries_a_transient_disconnect_without_mutation() {
-        let dir = tempfile::tempdir().unwrap();
-        let name = format!("gui-retry-{}", tkfs::core::id());
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path,format!("format_version=1\ndata_directory='data'\n[control]\ntransport='named-pipe'\nname='{name}'")).unwrap();
-        let identity = tkfs::core::id();
-        std::fs::create_dir(dir.path().join("data")).unwrap();
-        let hello = json!({"ok":true,"result":{"api_version":1,"registry_version":1,
-            "installation_id":identity,"data_directory":std::fs::canonicalize(dir.path().join("data")).unwrap(),
-            "build_version":env!("CARGO_PKG_VERSION"),"capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1"]}});
-        let listener = tkfs::local_ipc::Listener::bind(&name).unwrap();
-        let thread = std::thread::spawn(move || {
-            let mut listener = listener;
-            let hello_reply = |listener: &mut tkfs::local_ipc::Listener| {
-                loop {
-                    if let Some(request) = listener.receive::<Value>().unwrap() {
-                        assert_eq!(request["action"]["op"], "hello");
-                        break;
-                    }
-                }
-                listener.reply(&hello).unwrap();
-            };
-            hello_reply(&mut listener);
-            loop {
-                if let Some(request) = listener.receive::<Value>().unwrap() {
-                    assert_eq!(request["action"]["op"], "list");
-                    break;
-                }
-            }
-            drop(listener);
-            let mut listener = loop {
-                match tkfs::local_ipc::Listener::bind(&name) {
-                    Ok(l) => break l,
-                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
-                }
-            };
-            hello_reply(&mut listener);
-            loop {
-                if let Some(request) = listener.receive::<Value>().unwrap() {
-                    assert_eq!(request["action"]["op"], "list");
-                    break;
-                }
-            }
-            listener
-                .reply(&json!({"ok":true,"result":{"states":[]}}))
-                .unwrap();
-        });
-        let paths = Paths {
-            executable: dir.path().join("test.exe"),
-            folder: dir.path().into(),
-            config: config_path.clone(),
-        };
-        let session = Session {
-            paths,
-            config: tkfs::orchestrator::Config::load(&config_path).unwrap(),
-            identity,
-            hello: Value::Null,
-            saved: None,
-        };
-        assert_eq!(read_catalog(&session).unwrap(), json!({"states":[]}));
-        thread.join().unwrap();
+    fn peer_is_online_when_any_lane_is_connected() {
+        let rows = peer_rows(&json!([
+            {"endpoint":"ws://one:123", "lanes":[{"connected":false},{"connected":true}]},
+            {"endpoint":"ws://two:123", "lanes":[]},
+            {"endpoint":"ws://three:123", "lanes":[{"connected":false}]}
+        ]));
+        assert!(rows[0].online);
+        assert!(!rows[1].online);
+        assert!(!rows[2].online);
     }
 }

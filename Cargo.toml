@@ -7,7 +7,6 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"
-aes-gcm = "0.10"
 clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
 rand = "0.8"
@@ -18,17 +17,10 @@ sha2 = "0.10"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 unicode-normalization = "0.1"
 toml = "0.9"
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }
-rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "crypto"] }
-zeroize = "1.8"
-subtle = "2.6"
-opaque-ke = { version = "=4.0.1", default-features = false, features = ["ristretto255", "argon2"] }
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
-data-encoding = "2"
 
 [target.'cfg(windows)'.dependencies]
 slint = { version = "=1.17.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2"] }
-windows = { version = "=0.61.3", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(windows)'.build-dependencies]
 cc = "1.2"

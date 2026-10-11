@@ -88,16 +88,10 @@ static NTSTATUS read_dir(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR pattern,PWSTR m
 static FSP_FILE_SYSTEM_INTERFACE Interface;
 UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out) {
     if(!Security) {
-        /* Mount ACL for the current user and SYSTEM. No host ACL changes. */
-        HANDLE token;DWORD length=0;
-        if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return FspNtStatusFromWin32(GetLastError());
-        GetTokenInformation(token,TokenUser,0,0,&length);TOKEN_USER *user=malloc(length);
-        if(!user){CloseHandle(token);return STATUS_INSUFFICIENT_RESOURCES;}
-        if(!GetTokenInformation(token,TokenUser,user,length,&length)){free(user);CloseHandle(token);return STATUS_ACCESS_DENIED;}
-        PWSTR sid=0;ConvertSidToStringSidW(user->User.Sid,&sid);WCHAR sddl[512];
-        swprintf_s(sddl,512,L"O:%sG:%sD:P(A;;FA;;;%s)(A;;FA;;;SY)",sid,sid,sid);
-        BOOL ok=ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl,SDDL_REVISION_1,&Security,&SecuritySize);
-        LocalFree(sid);free(user);CloseHandle(token);if(!ok)return FspNtStatusFromWin32(GetLastError());
+        /* WinFsp requires a descriptor; the mount adds no user/owner policy. */
+        if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:WDG:WDD:(A;;FA;;;WD)",SDDL_REVISION_1,&Security,&SecuritySize))
+            return FspNtStatusFromWin32(GetLastError());
     }
     memset(&Interface,0,sizeof Interface);
     Interface.GetVolumeInfo=volume;Interface.GetSecurityByName=security_name;

@@ -1,7 +1,7 @@
 """Default Git/Win32 acceptance on disposable local WinFsp mounts only.
 
 No remote repositories, ambient Git configuration, hooks, or user state. Only
-the daemon children created here are stopped; discovery credentials are removed.
+the daemon children created here are stopped; runtime discovery files are removed.
 """
 from __future__ import annotations
 import argparse

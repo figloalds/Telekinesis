@@ -1,9 +1,6 @@
 use serde_json::json;
 use std::{collections::BTreeSet, path::Path};
-use tkfs::{
-    core::*,
-    runtime::{Engine, decrypt, encrypt},
-};
+use tkfs::{core::*, runtime::Engine};
 
 fn store(path: &Path) -> Store {
     Store::open(path, Some("test-repo")).unwrap()
@@ -480,18 +477,6 @@ fn checkout_refusal_preserves_branch_and_retry_receipts_are_atomic() {
     let cp = json!({"op":"checkpoint","message":"coherent"});
     let first = e.control("cp", &cp).unwrap();
     assert_eq!(first, e.control("cp", &cp).unwrap());
-}
-
-#[test]
-fn authenticated_encrypted_transport_rejects_tamper_and_wrong_key() {
-    let k = [7; 32];
-    let ciphertext = encrypt(&k, b"SOURCE-CANARY").unwrap();
-    assert!(!ciphertext.windows(13).any(|w| w == b"SOURCE-CANARY"));
-    assert_eq!(decrypt(&k, &ciphertext).unwrap(), b"SOURCE-CANARY");
-    assert!(decrypt(&[8; 32], &ciphertext).is_err());
-    let mut bad = ciphertext;
-    bad[13] ^= 1;
-    assert!(decrypt(&k, &bad).is_err());
 }
 
 #[test]

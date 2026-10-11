@@ -1,14 +1,15 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::Duration,
 };
 use tkfs::{
     core::{Store, id},
-    runtime::{self, Discovery, Engine, PeerConfig},
+    orchestrator::{self, Action, Config},
+    runtime::{self, Discovery, Engine},
 };
 #[cfg(windows)]
 mod gui;
@@ -16,19 +17,17 @@ mod gui;
 #[derive(Parser)]
 #[command(
     version,
-    about = "TKFS causal filesystem: Windows WinFsp and Linux headless FUSE"
+    about = "Telekinesis: folders, workers and WebSocket orchestrators"
 )]
 struct Args {
-    /// Resolve a mounted project from this directory (otherwise use cwd).
+    #[arg(short = 'f', long, global = true, default_value = "orchestrator.toml")]
+    defaults_file: PathBuf,
     #[arg(short = 'C', global = true)]
     directory: Option<PathBuf>,
-    /// Runtime discovery file, for control from outside the mount.
     #[arg(long, global = true)]
     runtime: Option<PathBuf>,
-    /// Retry the same semantic request using the same UUID.
     #[arg(long, global = true)]
     request_id: Option<String>,
-    /// Reject an obsolete checkout or management generation.
     #[arg(long, global = true)]
     generation: Option<u64>,
     #[command(subcommand)]
@@ -36,83 +35,44 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// Owner-local pairing management and separate TLS published-data service.
-    Pairing {
-        #[arg(short = 'f', long, default_value = "pairing.toml")]
-        defaults_file: PathBuf,
-        #[command(subcommand)]
-        action: PairingCommand,
-    },
-    /// Open the portable desktop application (also the default with no arguments).
-    Gui {
-        #[arg(short = 'f', long)]
-        defaults_file: Option<PathBuf>,
-    },
-    #[command(hide = true)]
-    GuiTest {
-        #[arg(long)]
-        report: PathBuf,
-    },
-    /// Foreground O1 management supervisor; networking is disabled.
-    Orchestrator {
-        /// Configuration in the current directory; -f selects another file.
-        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
-        defaults_file: PathBuf,
-    },
-    /// Client of the same-user management API. Mutations require --generation.
-    Manage {
-        /// Configuration in the current directory; -f selects another file.
-        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
-        defaults_file: PathBuf,
-        #[command(subcommand)]
-        action: ManagementCommand,
-    },
-    #[command(hide = true)]
-    ManagedWorker,
+    /// Initialize a daemon configuration, or a standalone folder state.
     Init {
         #[arg(long)]
         state: Option<PathBuf>,
         #[arg(long, requires = "state")]
         repo: Option<String>,
-        #[arg(
-            short = 'f',
-            long,
-            default_value = "orchestrator.toml",
-            conflicts_with = "state"
-        )]
-        defaults_file: PathBuf,
     },
-    /// Run the owner-local supervisor in the foreground.
-    Start {
-        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
-        defaults_file: PathBuf,
+    /// Run the folder supervisor and its built-in WS listener.
+    #[command(alias = "start")]
+    Orchestrator,
+    /// Open the folder management desktop.
+    Gui,
+    /// Manage folders and network connections through the running daemon.
+    Manage {
+        #[command(subcommand)]
+        action: ManagementCommand,
     },
-    /// Create and start a managed project mounted under its configured parent.
+    /// Create and mount a folder using the daemon.
     Create {
         label: String,
-        #[arg(short = 'f', long, default_value = "orchestrator.toml")]
-        defaults_file: PathBuf,
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        #[arg(long)]
+        headless: bool,
     },
+    /// Run one mount worker. Workers expose loopback control only.
     Daemon {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
         mount: Option<PathBuf>,
-        #[arg(long,requires_all=["peer","peer_device"])]
-        listen: Option<String>,
-        #[arg(long, requires = "listen")]
-        peer: Option<String>,
-        #[arg(long, requires = "listen")]
-        peer_device: Option<String>,
     },
-    #[cfg(target_os = "linux")]
     Stop,
     Status,
     Branches,
     Conflicts,
     State,
     Events,
-    Sync,
     History,
     /// Export authorized shared objects to an explicit LOCAL test bucket directory.
     BucketExport {
@@ -177,51 +137,21 @@ enum Command {
 }
 #[derive(Subcommand)]
 enum ManagementCommand {
-    Hello,
-    /// Observe supervisor-owned synchronization of all enabled grants.
-    BackgroundSyncStatus,
-    /// Observe the local pairing listener and pending device approvals.
-    ReceivingStatus,
-    /// Explicitly create protected receiving identity/config and enable listening.
-    ConfigureReceiving {
-        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
-        address: Option<String>,
-        #[arg(long, default_value_t = 47443)]
-        port: u16,
-        #[arg(long)]
-        disable: bool,
-    },
-    /// Enable an existing outbound-only pairing config, or disable supervision.
-    ConfigureBackgroundSync {
-        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
-        config: Option<PathBuf>,
-        #[arg(long)]
-        disable: bool,
-    },
-    /// Rotate the enrollment code and print it once; never automatically retry.
-    ResetPairingCode,
-    /// Advanced pinned v2 only: rotate code and DISABLE simplified v3 enrollment.
-    ResetLegacyPairingCode,
-    /// Prepare a fresh headless replica of an existing logical repository.
-    PrepareReplica {
-        label: String,
-        #[arg(long)]
-        repo: String,
-    },
-    /// Reserve an initial mount for a stopped headless state; start separately.
-    AttachMount {
+    List,
+    Inspect {
         state: String,
-        #[arg(long)]
-        mount: PathBuf,
     },
     Create {
         label: String,
         #[arg(long)]
         mount: Option<PathBuf>,
+        #[arg(long)]
+        headless: bool,
     },
-    List,
-    Inspect {
+    ConfigureMount {
         state: String,
+        #[arg(long)]
+        mount: Option<PathBuf>,
     },
     Start {
         state: String,
@@ -230,262 +160,80 @@ enum ManagementCommand {
         state: String,
     },
     Shutdown,
-    Operation {
-        operation: String,
+    ResetPairingCode,
+    /// Pair to ws://host:port. Reads the remote code from stdin.
+    Pair {
+        endpoint: String,
+        #[arg(long)]
+        connections: Option<usize>,
     },
-}
-#[derive(Subcommand)]
-enum PairingCommand {
-    /// Print a fresh public installation ID for a new config.
-    NewId,
-    /// Generate this device's key, protected with Windows CurrentUser DPAPI.
-    CredentialInit,
-    /// Linux: pipe a new key directly to systemd-creds encrypt; no plaintext file.
-    CredentialProvision {
-        #[arg(long)]
-        encrypted_output: PathBuf,
+    Unpair {
+        endpoint: String,
     },
-    Run,
-    Status,
-    /// Print a secret invitation token; transfer it privately, never log it.
-    Invite {
-        #[arg(long, default_value_t = 300)]
-        lifetime_seconds: u64,
-    },
-    /// Paste a secret invitation on masked stdin; not argv or shell history.
-    Join,
-    /// Export this host's public identity; verify its fingerprint independently.
-    PublicBootstrap,
-    /// Reject a pending numeric-code candidate and release its enrollment slot.
-    RejectCodeCandidate {
-        invitation: String,
-    },
-    /// Submit a 200-digit code on masked stdin to an independently pinned host.
-    JoinCode {
-        /// Public Peer JSON supplied by the receiving host (contains no secret).
-        #[arg(long)]
-        issuer: PathBuf,
-        #[arg(long)]
-        enrollment_endpoint: String,
-        /// SHA-256 fingerprint confirmed independently with the receiving owner.
-        #[arg(long)]
-        fingerprint: String,
-    },
-    /// Approve the exact public installation and certificate fingerprint.
-    Approve {
-        invitation: String,
-        #[arg(long)]
-        installation: String,
-        #[arg(long)]
-        fingerprint: String,
-    },
-    Revoke {
-        peer: String,
-    },
-    /// Explicitly grant published-data sync for an already running local replica.
-    Grant {
-        peer: String,
-        #[arg(long)]
-        repo: String,
-        #[arg(long)]
-        runtime: PathBuf,
-        #[arg(long)]
-        remote_replica: String,
-        #[arg(long)]
-        disable: bool,
-    },
+    Peers,
     RemoteList {
-        peer: String,
+        endpoint: String,
     },
-    Sync {
-        peer: String,
-        #[arg(long)]
+    Receive {
+        endpoint: String,
         repo: String,
+        label: String,
+        #[arg(long)]
+        mount: Option<PathBuf>,
+        #[arg(long)]
+        headless: bool,
     },
 }
-fn pairing_command(path: &Path, action: &PairingCommand) -> Result<()> {
-    use tkfs::{
-        pairing::{CredentialSource, Identity, SyncConfiguration},
-        pairing_service::{self, Config},
-    };
-    if matches!(action, PairingCommand::NewId) {
-        println!("{}", id());
-        return Ok(());
-    }
-    let config = Config::load(path)?;
-    let output = match action {
-        PairingCommand::NewId => unreachable!(),
-        PairingCommand::CredentialInit => {
-            let identity = Identity::generate(&config.installation)?;
-            config.credential.save_windows(&identity)?;
-            json!({"installation":identity.installation,"fingerprint":identity.fingerprint(),"status":"credential-created"})
+fn management(action: ManagementCommand) -> Result<Action> {
+    Ok(match action {
+        ManagementCommand::List => Action::List,
+        ManagementCommand::Inspect { state } => Action::Inspect { state },
+        ManagementCommand::Create {
+            label,
+            mount,
+            headless,
+        } => Action::Create {
+            label,
+            mount,
+            headless,
+        },
+        ManagementCommand::ConfigureMount { state, mount } => {
+            Action::ConfigureMount { state, mount }
         }
-        PairingCommand::CredentialProvision { encrypted_output } => {
-            #[cfg(target_os = "linux")]
-            {
-                use std::io::Write;
-                use std::process::{Command, Stdio};
-                let CredentialSource::Systemd { name } = &config.credential else {
-                    bail!("SYSTEMD_CREDENTIAL_REQUIRED");
-                };
-                ensure!(!encrypted_output.exists(), "CREDENTIAL_ALREADY_EXISTS");
-                let identity = Identity::generate(&config.installation)?;
-                let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&identity)?);
-                let mut child = Command::new("systemd-creds")
-                    .args(["encrypt", "--name", name, "-"])
-                    .arg(encrypted_output)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .spawn()
-                    .context("SYSTEMD_CREDS_UNAVAILABLE")?;
-                child
-                    .stdin
-                    .take()
-                    .context("CREDENTIAL_PIPE_UNAVAILABLE")?
-                    .write_all(&bytes)?;
-                ensure!(child.wait()?.success(), "CREDENTIAL_ENCRYPTION_FAILED");
-                json!({"installation":identity.installation,"fingerprint":identity.fingerprint(),"status":"encrypted-credential-created","requires":"LoadCredentialEncrypted with same credential name"})
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = encrypted_output;
-                let _: Option<CredentialSource> = None;
-                bail!("SYSTEMD_CREDS_LINUX_ONLY");
-            }
-        }
-        PairingCommand::Run => {
-            let service = pairing_service::Service::open(config)?;
-            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            #[cfg(target_os = "linux")]
-            {
-                unsafe {
-                    libc::signal(libc::SIGINT, request_linux_stop as libc::sighandler_t);
-                    libc::signal(libc::SIGTERM, request_linux_stop as libc::sighandler_t);
-                }
-                let stop = stop.clone();
-                std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        if LINUX_STOP.load(std::sync::atomic::Ordering::Relaxed) {
-                            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                    }
-                });
-            }
-            return service.run(stop);
-        }
-        PairingCommand::Status => {
-            let registry = config.registry()?;
-            let credential = match config.identity() {
-                Ok(identity) => json!({"status":"available","fingerprint":identity.fingerprint()}),
-                Err(error) => json!({"status":"unavailable","error":format!("{error:#}")}),
-            };
-            json!({"installation":config.installation,"credential":credential,"peers":registry.peers()?.into_iter().map(|peer|json!({"installation":peer.installation,"fingerprint":peer.fingerprint(),"revoked":peer.revoked})).collect::<Vec<_>>(),"invitations":registry.pending()?,"syncs":registry.statuses()?})
-        }
-        PairingCommand::Invite { lifetime_seconds } => {
-            ensure!(config.inbound, "OUTBOUND_ONLY_CANNOT_ISSUE_INVITATIONS");
-            let lifetime = lifetime_seconds
-                .checked_mul(1000)
-                .context("INVALID_INVITATION_LIFETIME")?;
-            let invitation = config.registry()?.create_invitation(
-                &config.identity()?,
-                &config.enrollment_advertise,
-                &config.advertise,
-                lifetime,
-            )?;
-            let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&invitation)?);
-            println!("{}", hex::encode(&bytes));
-            return Ok(());
-        }
-        PairingCommand::Join => {
-            pairing_service::join(&config, pairing_service::read_invitation()?)?
-        }
-        PairingCommand::PublicBootstrap => {
-            serde_json::to_value(pairing_service::public_bootstrap(&config)?)?
-        }
-        PairingCommand::RejectCodeCandidate { invitation } => {
-            config.registry()?.reject_code_candidate(invitation)?;
-            json!({"invitation": invitation, "status": "candidate-rejected"})
-        }
-        PairingCommand::JoinCode {
-            issuer,
-            enrollment_endpoint,
-            fingerprint,
+        ManagementCommand::Start { state } => Action::Start { state },
+        ManagementCommand::Stop { state } => Action::Stop { state },
+        ManagementCommand::Shutdown => Action::Shutdown,
+        ManagementCommand::ResetPairingCode => Action::ResetPairingCode,
+        ManagementCommand::Pair {
+            endpoint,
+            connections,
         } => {
-            use std::io::Read;
-            let mut public = Vec::new();
-            std::fs::File::open(issuer)?
-                .take(128 * 1024 + 1)
-                .read_to_end(&mut public)?;
-            ensure!(public.len() <= 128 * 1024, "ISSUER_BOOTSTRAP_TOO_LARGE");
-            let issuer: tkfs::pairing::Peer = serde_json::from_slice(&public)
-                .map_err(|_| anyhow::anyhow!("INVALID_ISSUER_BOOTSTRAP"))?;
-            ensure!(
-                fingerprint.len() == 64
-                    && fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
-                    && issuer.fingerprint().eq_ignore_ascii_case(fingerprint),
-                "ISSUER_FINGERPRINT_MISMATCH"
-            );
-            pairing_service::join_code(
-                &config,
-                issuer,
-                enrollment_endpoint,
-                pairing_service::read_pairing_code()?,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            )?
+            eprintln!("Pairing code:");
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            Action::Pair {
+                endpoint,
+                connections,
+                code: code.trim().into(),
+            }
         }
-        PairingCommand::Approve {
-            invitation,
-            installation,
-            fingerprint,
-        } => {
-            let mut registry = config.registry()?;
-            let candidates = registry.pending()?;
-            ensure!(
-                candidates
-                    .as_array()
-                    .context("INVALID_PAIR_CANDIDATES")?
-                    .iter()
-                    .any(|candidate| candidate["invitation"] == *invitation
-                        && candidate["installation"] == *installation
-                        && candidate["fingerprint"] == *fingerprint),
-                "PAIR_APPROVAL_IDENTITY_MISMATCH"
-            );
-            let peer = registry.approve(invitation)?;
-            json!({"installation":peer.installation,"fingerprint":peer.fingerprint(),"status":"approved-no-repository-grants"})
-        }
-        PairingCommand::Revoke { peer } => {
-            config.registry()?.revoke(peer)?;
-            json!({"installation":peer,"status":"revoked"})
-        }
-        PairingCommand::Grant {
-            peer,
+        ManagementCommand::Unpair { endpoint } => Action::Unpair { endpoint },
+        ManagementCommand::Peers => Action::Peers,
+        ManagementCommand::RemoteList { endpoint } => Action::RemoteList { endpoint },
+        ManagementCommand::Receive {
+            endpoint,
             repo,
-            runtime,
-            remote_replica,
-            disable,
-        } => {
-            let runtime = std::fs::canonicalize(runtime)?;
-            let discovery: Discovery = serde_json::from_slice(&std::fs::read(&runtime)?)?;
-            let grant = SyncConfiguration {
-                peer: peer.clone(),
-                repo: repo.clone(),
-                local_runtime: runtime,
-                local_replica: discovery.device,
-                remote_replica: remote_replica.clone(),
-                enabled: !*disable,
-            };
-            pairing_service::worker(&grant, "published-summary", None, None, None)?;
-            config.registry()?.configure_sync(&grant)?;
-            json!({"status":"configured","grant":grant})
-        }
-        PairingCommand::RemoteList { peer } => pairing_service::remote_list(&config, peer)?,
-        PairingCommand::Sync { peer, repo } => {
-            pairing_service::synchronize(&config, &config.registry()?.grant(peer, repo)?)?
-        }
-    };
-    println!("{}", serde_json::to_string_pretty(&output)?);
-    Ok(())
+            label,
+            mount,
+            headless,
+        } => Action::Receive {
+            endpoint,
+            repo,
+            label,
+            mount,
+            headless,
+        },
+    })
 }
 fn discover(args: &Args) -> Result<Discovery> {
     if let Some(path) = &args.runtime {
@@ -498,331 +246,135 @@ fn discover(args: &Args) -> Result<Discovery> {
             return Ok(serde_json::from_slice(&std::fs::read(file)?)?);
         }
     }
-    bail!("PROJECT_NOT_FOUND: use -C <mounted path> or --runtime <state>/runtime.json")
+    bail!("FOLDER_NOT_FOUND: use -C MOUNT or --runtime STATE/runtime.json")
+}
+fn print(value: serde_json::Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("{}", json!({"ok":false,"error":format!("{e:#}")}));
-        #[cfg(windows)]
-        if std::env::args_os().nth(1).is_none_or(|arg| arg == "gui") {
-            use windows::{
-                Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
-                core::PCWSTR,
-            };
-            let message: Vec<u16> = format!("Telekinesis could not open.\n\n{e:#}")
-                .encode_utf16()
-                .chain(Some(0))
-                .collect();
-            let title: Vec<u16> = "Telekinesis".encode_utf16().chain(Some(0)).collect();
-            unsafe {
-                MessageBoxW(
-                    None,
-                    PCWSTR(message.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
-        }
+    if let Err(error) = run() {
+        eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
+
 #[cfg(target_os = "linux")]
-static LINUX_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "linux")]
-extern "C" fn request_linux_stop(_: libc::c_int) {
-    LINUX_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+extern "C" fn signal_stop(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
 }
 
+fn worker(state: &Path, mount: Option<&Path>) -> Result<()> {
+    let state = std::fs::canonicalize(state)?;
+    let _lock = orchestrator::lock_state(&state)?;
+    let store = Store::open_existing(&state)?;
+    let engine = Arc::new(Mutex::new(Engine::new(store)));
+    let mount = mount.map(std::path::absolute).transpose()?;
+    if let Some(path) = &mount {
+        let parent = path.parent().context("MOUNT_PARENT_REQUIRED")?;
+        std::fs::create_dir_all(parent)?;
+        let resolved =
+            std::fs::canonicalize(parent)?.join(path.file_name().context("MOUNT_NAME_REQUIRED")?);
+        ensure!(
+            !resolved.starts_with(&state) && !state.starts_with(&resolved),
+            "MOUNT_OVERLAPS_STATE"
+        );
+    }
+    // Publish discovery only after the real mount is ready.
+    if let Some(path) = &mount {
+        tkfs::mount::start(engine.clone(), path)?;
+    }
+    let info = runtime::start_rpc(
+        engine.clone(),
+        &state,
+        mount.as_ref().map(|p| p.to_string_lossy().into_owned()),
+    )?;
+    println!(
+        "{}",
+        json!({"ready":true,"runtime":state.join("runtime.json"),"repo":info.repo,"device":info.device})
+    );
+    let stop = engine.lock().unwrap().stopping.clone();
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::signal(libc::SIGINT, signal_stop as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_stop as libc::sighandler_t);
+    }
+    while !stop.load(Ordering::Relaxed) {
+        #[cfg(target_os = "linux")]
+        if STOP.swap(false, Ordering::Relaxed) {
+            match runtime::rpc(&info, &id(), json!({"op":"stop"})) {
+                Ok(_) => break,
+                Err(error) => eprintln!("Cannot stop while files are busy: {error:#}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Allow the control thread to flush the successful stop reply.
+    std::thread::sleep(Duration::from_millis(100));
+    let _ = std::fs::remove_file(state.join("runtime.json"));
+    Ok(())
+}
 fn run() -> Result<()> {
     #[cfg(windows)]
     if std::env::args_os().len() == 1 {
-        return gui::run(None, None);
-    }
-    #[cfg(windows)]
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|arg| arg != "gui" && arg != "gui-test")
-    {
-        unsafe extern "system" {
-            fn AttachConsole(pid: u32) -> i32;
-        }
-        // Redirected handles are preserved; interactive CLI attaches its parent's console.
-        unsafe {
-            AttachConsole(u32::MAX);
-        }
+        return gui::run(Path::new("orchestrator.toml"));
     }
     let args = Args::parse();
-    match &args.command {
-        Command::Pairing {
-            defaults_file,
-            action,
-        } => return pairing_command(defaults_file, action),
-        Command::Gui { defaults_file } => {
-            #[cfg(windows)]
-            return gui::run(None, defaults_file.as_deref());
-            #[cfg(not(windows))]
-            {
-                let _ = defaults_file;
-                bail!("DESKTOP_WINDOWS_ONLY");
-            }
-        }
-        Command::GuiTest { report } => {
-            #[cfg(windows)]
-            return gui::run(Some(report), None);
-            #[cfg(not(windows))]
-            bail!("DESKTOP_WINDOWS_ONLY: {}", report.display());
-        }
-        Command::Orchestrator { defaults_file } | Command::Start { defaults_file } => {
-            eprintln!(
-                "Supervisor runs in this terminal. In a second terminal in the same directory, run tkfs create MyProject."
-            );
-            return tkfs::onboarding::open(defaults_file)?.run();
-        }
-        Command::ManagedWorker => {
-            return tkfs::orchestrator::worker();
-        }
-        Command::Manage {
-            defaults_file,
-            action,
-        } => {
-            use tkfs::orchestrator::{self, Action, Request};
-            let reset_code = matches!(
-                action,
-                ManagementCommand::ResetPairingCode | ManagementCommand::ResetLegacyPairingCode
-            );
-            if reset_code {
-                ensure!(
-                    args.request_id.is_none() && args.generation.is_none(),
-                    "PAIRING_CODE_RESET_NOT_REPLAYABLE: omit --request-id and --generation; an uncertain response requires an explicit fresh reset"
-                );
-            }
-            let config = orchestrator::Config::load(defaults_file)?;
-            let action = match action {
-                ManagementCommand::Hello => Action::Hello,
-                ManagementCommand::BackgroundSyncStatus => Action::BackgroundSyncStatus,
-                ManagementCommand::ReceivingStatus => Action::ReceivingStatus,
-                ManagementCommand::ConfigureReceiving { address, port, .. } => {
-                    Action::ConfigureReceiving {
-                        address: address.clone(),
-                        port: *port,
-                    }
-                }
-                ManagementCommand::ConfigureBackgroundSync { config, .. } => {
-                    Action::ConfigureBackgroundSync {
-                        config: config.as_ref().map(std::fs::canonicalize).transpose()?,
-                    }
-                }
-                ManagementCommand::ResetPairingCode => Action::ResetPairingCode {},
-                ManagementCommand::ResetLegacyPairingCode => Action::ResetLegacyPairingCode {},
-                ManagementCommand::PrepareReplica { label, repo } => Action::PrepareReplica {
-                    label: label.clone(),
-                    repo: repo.clone(),
-                },
-                ManagementCommand::AttachMount { state, mount } => Action::AttachMount {
-                    state: state.clone(),
-                    mount: mount.clone(),
-                    expected_branch: None,
-                    expected_branch_generation: None,
-                },
-                ManagementCommand::Create { label, mount } => Action::Create {
-                    label: label.clone(),
-                    mount: mount.clone(),
-                },
-                ManagementCommand::List => Action::List,
-                ManagementCommand::Inspect { state } => Action::Inspect {
-                    state: state.clone(),
-                },
-                ManagementCommand::Start { state } => Action::Start {
-                    state: state.clone(),
-                },
-                ManagementCommand::Stop { state } => Action::Stop {
-                    state: state.clone(),
-                },
-                ManagementCommand::Shutdown => Action::Shutdown,
-                ManagementCommand::Operation { operation } => Action::Operation {
-                    operation: operation.clone(),
-                },
-            };
-            if action.mutates() && !reset_code {
-                ensure!(
-                    args.generation.is_some(),
-                    "MANAGEMENT_GENERATION_REQUIRED: inspect catalog/state generation; retry with the same --request-id and --generation"
-                );
-            }
-            let request = Request {
-                version: 1,
-                target_installation: config.installation_id.clone(),
-                operation_id: if action.mutates() && !reset_code {
-                    Some(args.request_id.clone().unwrap_or_else(id))
-                } else {
-                    None
-                },
-                expected_generation: args.generation,
-                action,
-            };
-            if request.action.mutates() && !reset_code && args.request_id.is_none() {
-                eprintln!(
-                    "{}",
-                    json!({"operation_id":request.operation_id,"expected_generation":request.expected_generation,"retry":"repeat the same action with these --request-id and --generation values"})
-                );
-            }
-            let mut response = orchestrator::client(&config, &request)?;
-            if response["ok"] != true {
-                bail!("{response}");
-            }
-            if reset_code {
-                let code = response["result"]["code"].take();
-                let serde_json::Value::String(code) = code else {
-                    bail!("INVALID_PAIRING_CODE_RESET_RESPONSE");
-                };
-                let code = zeroize::Zeroizing::new(code);
-                ensure!(
-                    code.len() == 200 && code.bytes().all(|b| b.is_ascii_digit()),
-                    "INVALID_PAIRING_CODE_RESET_RESPONSE"
-                );
-                println!("{}", code.as_str());
-                return Ok(());
-            }
-            println!("{}", serde_json::to_string_pretty(&response["result"])?);
-            return Ok(());
-        }
-        Command::Create {
-            label,
-            defaults_file,
-        } => {
-            let result =
-                tkfs::onboarding::create(defaults_file, label, args.request_id.as_deref())?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            return Ok(());
-        }
+    match args.command {
         Command::Init {
-            state: None,
-            defaults_file,
-            ..
+            ref state,
+            ref repo,
         } => {
-            let config = tkfs::onboarding::initialize(defaults_file)?;
-            println!(
-                "{}",
-                json!({"config":std::path::absolute(defaults_file)?,"installation_id":config.installation_id,"data_directory":config.data_directory,"mount_parent":config.default_mount_directory,"next":"tkfs start"})
-            );
-            return Ok(());
+            if let Some(state) = state {
+                std::fs::create_dir_all(state)?;
+                let _lock = orchestrator::lock_state(state)?;
+                return print(Store::open(state, repo.as_deref())?.status()?);
+            }
+            return print(json!(Config::initialize(&args.defaults_file)?));
         }
-        Command::Init {
-            state: Some(state),
-            repo,
-            ..
-        } => {
+        Command::Orchestrator => return orchestrator::run(Config::load(&args.defaults_file)?),
+        Command::Gui => {
             #[cfg(windows)]
-            std::fs::create_dir_all(state)?;
-            #[cfg(target_os = "linux")]
-            tkfs::private_storage::Directory::open(state)?;
-            let _lock = lock_state(state)?;
-            let store = Store::open(state, repo.as_deref())?;
-            println!("{}", serde_json::to_string_pretty(&store.status()?)?);
-            return Ok(());
+            return gui::run(&args.defaults_file);
+            #[cfg(not(windows))]
+            bail!("DESKTOP_WINDOWS_ONLY");
         }
         Command::Daemon {
-            state,
+            ref state,
+            ref mount,
+        } => return worker(state, mount.as_deref()),
+        Command::Create {
+            label,
             mount,
-            listen,
-            peer,
-            peer_device,
+            headless,
         } => {
-            ensure!(state.is_dir(), "STATE_NOT_INITIALIZED");
-            let state = std::fs::canonicalize(state)?;
-            // Native exclusive sharing prevents two owners of the same SQLite,
-            // even after crash: the OS releases the lock, no stale lockfile policy.
-            let _lock = lock_state(&state)?;
-            let store = Store::open_existing(&state)?;
-            let engine = Arc::new(Mutex::new(Engine::new(store)));
-            let mount = mount.as_ref().map(std::path::absolute).transpose()?;
-            if let Some(m) = &mount {
-                // Compare canonical parent paths, including Windows extended
-                // prefixes/junctions, rather than mixing C:\ and \\?\C:\ forms.
-                let resolved_mount =
-                    std::fs::canonicalize(m.parent().context("MOUNT_REQUIRES_PARENT")?)?
-                        .join(m.file_name().context("FOLDER_MOUNT_REQUIRED")?);
-                ensure!(
-                    !resolved_mount.starts_with(&state) && !state.starts_with(&resolved_mount),
-                    "STATE_MUST_BE_OUTSIDE_MOUNT"
-                );
-            }
-            if let Some(listen) = listen {
-                let bytes=hex::decode(std::env::var("TKFS_PEER_KEY").context("Set TKFS_PEER_KEY to an ephemeral 64-hex-character pairing secret; no key is persisted")?)?;
-                let key: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("INVALID_PEER_KEY"))?;
-                ensure!(
-                    peer_device.as_ref() != Some(&engine.lock().unwrap().store.device),
-                    "PEER_MUST_BE_DISTINCT_DEVICE"
-                );
-                runtime::start_peer(
-                    engine.clone(),
-                    PeerConfig {
-                        listen: listen.clone(),
-                        address: peer.clone().unwrap(),
-                        peer: peer_device.clone().unwrap(),
-                        key,
-                    },
-                )?;
-            }
-            let info = runtime::start_rpc(
-                engine.clone(),
-                &state,
-                mount.as_ref().map(|m| m.to_string_lossy().into_owned()),
-            )?;
-            if let Some(m) = &mount {
-                #[cfg(any(windows, target_os = "linux"))]
-                tkfs::mount::start(engine.clone(), m)?;
-                #[cfg(not(any(windows, target_os = "linux")))]
-                bail!("Windows WinFsp mount only in this PoC");
-            }
-            println!(
-                "{}",
-                json!({"ready":true,"repo":info.repo,"device":info.device,"runtime":state.join("runtime.json"),"mount":mount})
-            );
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::signal(libc::SIGINT, request_linux_stop as libc::sighandler_t);
-                libc::signal(libc::SIGTERM, request_linux_stop as libc::sighandler_t);
-            }
-            loop {
-                #[cfg(target_os = "linux")]
-                {
-                    if LINUX_STOP.swap(false, std::sync::atomic::Ordering::Relaxed) {
-                        let stopped = if engine.lock().unwrap().mounted {
-                            tkfs::mount::stop(&engine)
-                        } else {
-                            engine.lock().unwrap().quiet()
-                        };
-                        match stopped {
-                            Ok(()) => {
-                                let _ = std::fs::remove_file(state.join("control.sock"));
-                                return Ok(());
-                            }
-                            Err(error) => eprintln!(
-                                "SHUTDOWN_REFUSED: {error:#}; close clients and retry stop"
-                            ),
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                #[cfg(not(target_os = "linux"))]
-                std::thread::park();
-            }
+            return print(orchestrator::client(
+                &Config::load(&args.defaults_file)?,
+                &Action::Create {
+                    label,
+                    mount,
+                    headless,
+                },
+            )?);
+        }
+        Command::Manage { action } => {
+            return print(orchestrator::client(
+                &Config::load(&args.defaults_file)?,
+                &management(action)?,
+            )?);
         }
         _ => {}
     }
     let info = discover(&args)?;
     let mut payload = match &args.command {
-        #[cfg(target_os = "linux")]
         Command::Stop => json!({"op":"stop"}),
         Command::Status => json!({"op":"status"}),
         Command::Branches => json!({"op":"branches"}),
         Command::Conflicts => json!({"op":"conflicts"}),
         Command::State => json!({"op":"state"}),
         Command::Events => json!({"op":"events"}),
-        Command::Sync => json!({"op":"sync"}),
         Command::History => json!({"op":"history"}),
         Command::BucketExport { destination } => {
             json!({"op":"bucket-export","directory":std::path::absolute(destination)?})
@@ -871,76 +423,4 @@ fn run() -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&result)?);
     }
     Ok(())
-}
-fn lock_state(state: &Path) -> Result<std::fs::File> {
-    tkfs::orchestrator::lock_state(state)
-}
-
-#[cfg(test)]
-mod cli_tests {
-    use super::*;
-
-    #[test]
-    fn orchestrator_configuration_defaults_to_current_directory_only() {
-        let args = Args::try_parse_from(["tkfs", "orchestrator"]).unwrap();
-        let Command::Orchestrator { defaults_file } = args.command else {
-            panic!("wrong command")
-        };
-        assert_eq!(defaults_file, PathBuf::from("orchestrator.toml"));
-        let args = Args::try_parse_from(["tkfs", "manage", "list"]).unwrap();
-        let Command::Manage { defaults_file, .. } = args.command else {
-            panic!("wrong command")
-        };
-        assert_eq!(defaults_file, PathBuf::from("orchestrator.toml"));
-    }
-
-    #[test]
-    fn explicit_configuration_and_short_alias_preserve_paths_with_spaces() {
-        for option in ["--defaults-file", "-f"] {
-            let args = Args::try_parse_from([
-                "tkfs",
-                "manage",
-                option,
-                "some directory/custom.toml",
-                "list",
-            ])
-            .unwrap();
-            let Command::Manage { defaults_file, .. } = args.command else {
-                panic!("wrong command")
-            };
-            assert_eq!(defaults_file, PathBuf::from("some directory/custom.toml"));
-            let args = Args::try_parse_from([
-                "tkfs",
-                "orchestrator",
-                option,
-                "some directory/custom.toml",
-            ])
-            .unwrap();
-            let Command::Orchestrator { defaults_file } = args.command else {
-                panic!("wrong command")
-            };
-            assert_eq!(defaults_file, PathBuf::from("some directory/custom.toml"));
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn selected_configuration_rejects_missing_invalid_and_resolves_relative_paths() {
-        let directory = tempfile::tempdir().unwrap();
-        let missing = directory.path().join("orchestrator.toml");
-        let error = tkfs::orchestrator::Config::load(&missing).unwrap_err();
-        assert!(format!("{error:#}").contains("ORCHESTRATOR_CONFIG_NOT_FOUND"));
-        std::fs::write(&missing, "not valid toml [").unwrap();
-        let error = tkfs::orchestrator::Config::load(&missing).unwrap_err();
-        assert!(format!("{error:#}").contains("INVALID_ORCHESTRATOR_CONFIG"));
-        let explicit = directory.path().join("config with spaces.toml");
-        std::fs::write(&explicit, "format_version=1\ndata_directory='data'\n[control]\ntransport='named-pipe'\nname='cli-fixture-only'\n").unwrap();
-        let config = tkfs::orchestrator::Config::load(&explicit).unwrap();
-        assert_eq!(
-            config.data_directory,
-            std::fs::canonicalize(directory.path())
-                .unwrap()
-                .join("data")
-        );
-    }
 }

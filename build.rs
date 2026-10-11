@@ -1,6 +1,5 @@
 fn main() {
     println!("cargo:rerun-if-changed=native/mount.c");
-    println!("cargo:rerun-if-changed=native/control.c");
     println!("cargo:rerun-if-changed=native/winfsp_loader.c");
     println!("cargo:rerun-if-env-changed=WINFSP_DIR");
     #[cfg(windows)]
@@ -10,7 +9,6 @@ fn main() {
             std::env::var("WINFSP_DIR").unwrap_or_else(|_| "C:/Program Files (x86)/WinFsp".into());
         cc::Build::new()
             .file("native/mount.c")
-            .file("native/control.c")
             .file("native/winfsp_loader.c")
             .include(format!("{root}/inc"))
             .define("UNICODE", None)

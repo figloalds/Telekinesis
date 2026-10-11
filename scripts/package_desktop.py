@@ -21,7 +21,7 @@ def evidence_ignore(directory, names):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--exe", type=Path, default=ROOT / "target/slint-ui/debug/tkfs.exe")
+    parser.add_argument("--exe", type=Path, default=ROOT / "target/debug/tkfs.exe")
     parser.add_argument("--output", type=Path, default=ROOT / "target/desktop-portable")
     args = parser.parse_args()
     output = args.output.resolve()
