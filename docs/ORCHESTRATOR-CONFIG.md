@@ -1,10 +1,16 @@
 # Orchestrator TOML anatomy
 
+For the complete relationship between O1, app-managed client/receiver TOML,
+protected identities, directories, backup and recovery, start with
+[Configuration files and managed state](CONFIGURATION.md). This page is the
+narrow O1 settings reference; the files are TOML, not YAML.
+
 `orchestrator.toml` configures the portable O1 local supervisor and its Windows desktop
 client. The accepted schema is defined by `Config`, `Control`, `Network` and
 `Workers` in `src/orchestrator.rs`; desktop bootstrap is in `src/desktop.rs`.
-It does not configure standalone `daemon` PSK networking or the separate
-`pairing.toml` service.
+It does not contain standalone `daemon` PSK settings or the separate pairing
+schema. O1 can supervise pairing services, but their configuration and accepted
+bindings live in separate files and the catalog, not O1's `[network]` table.
 
 ## Find and load the file
 
@@ -20,8 +26,10 @@ configuration file's directory, independently of the process cwd.
 
 ## Minimal valid configuration
 
-Save this as `orchestrator.toml` at the repository root for a disposable local
-setup. Use native local storage and a fresh, otherwise empty data directory.
+This is a Windows parser-valid example, not a command to overwrite an existing
+config. For an explicitly chosen new setup, use native local storage with safe
+ownership/ancestors and a fresh, otherwise empty data directory. Pairing storage
+can reject an unsafe ancestor even when the final folder is private.
 
 ```toml
 format_version = 1
@@ -32,7 +40,8 @@ transport = 'named-pipe'
 name = 'telekinesis-local'
 ```
 
-Omitting `[network]` disables networking. Omitting `[workers]` selects
+Omitting `[network]` keeps O1's reserved network interface disabled; separately
+configured pairing services are independent. Omitting `[workers]` selects
 `restart_policy = 'on-failure'` and `maximum_running = 8`.
 
 ```powershell
@@ -75,7 +84,7 @@ The example UUID comment is a placeholder; do not enable it without a real UUID.
 | `data_directory` | Path string | Required | Nonempty native data root. Relative paths resolve beside the config; stores/catalog are kept here. Empty values fail with `INVALID_DATA_DIRECTORY`. |
 | `installation_id` | UUID string | Optional | Fresh catalogs use this ID, or generate one when omitted. When supplied for an existing catalog it must match that catalog's identity. It is not a credential; do not change it to relabel an existing installation. |
 | `default_mount_directory` | Path string | Optional | Parent folder used by the desktop's new-project flow. Relative values resolve beside the config. It does not mount existing states or supply `manage create`'s `--mount` argument automatically. |
-| `control` | Table | Required | Owner-local Windows management endpoint. |
+| `control` | Table | Required | Owner-local Windows named pipe or Linux Unix control endpoint. |
 | `network` | Table | Optional; disabled | Reserved O1 network fields described below. |
 | `workers` | Table | Optional; defaults below | Worker restart/running policy. |
 
@@ -128,11 +137,14 @@ The registry includes catalog identity, state IDs, mount reservations, desired
 running states and retry receipts. It creates `states/`, `staging/` and `logs/`
 below the data root. Keep mounts and application files separate from that root.
 
-The optional `local_services` catalog table stores the accepted public binding
-for supervised outbound WSS sync. Catalog format remains version 1; no TOML
+The optional `local_services` catalog table stores accepted public bindings and
+desired enablement for supervised outbound WSS sync and the receiving service.
+Catalog format remains version 1; no TOML
 field or credential is added automatically. Old valid catalogs gain this empty
 table only after identity/schema validation. Supervision defaults to disabled.
-Use `configure-background-sync` to accept a preprovisioned config explicitly.
+Use `configure-background-sync` to accept an already provisioned outbound config
+explicitly; the normal desktop can provision its client automatically. Explicit
+`configure-receiving`/desktop receiving setup provisions a separate receiver.
 
 New Linux catalogs are created mode 0600 independently of the process umask.
 Existing file permissions are preserved; pairing reset refuses an unsafe
@@ -140,6 +152,9 @@ existing catalog rather than repairing its permissions automatically.
 
 The GUI's first-run flow requires a new/empty data root and a separate mount
 parent, then writes absolute paths, an installation UUID and unique pipe name.
+GUI portable suggestions are `data` and `Projects` beside the selected config;
+CLI `init` suggests `.tkfs/data` and `Projects`. Explicit profile setup and reopen
+are described in the [main anatomy guide](CONFIGURATION.md#portable-and-profile-first-run).
 It pins the connected catalog in config-scoped `.tkfs-desktop/` metadata beside
 the selected config (beside the executable by default); legacy
 `.tkfs-ui-identity.json` is preserved during migration.
@@ -152,3 +167,9 @@ Changing the data root or installation identity is not a migration mechanism.
 Use the matching original config/catalog for reconnect and restore; do not point
 a pinned GUI at an empty replacement. See [management commands](ORCHESTRATOR-CLI.md)
 for cooperative stop/shutdown and retry handling.
+
+Existing config aliases resolve to the canonical file before relative fields are
+resolved. Do not move the selected file or its data root as an implicit migration:
+desktop/setup/verifier bindings may include those canonical paths. Updating an
+executable in a different folder does not select the old config automatically;
+pass `gui -f <original config>` after orderly shutdown of old processes.

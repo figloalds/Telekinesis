@@ -1,0 +1,12 @@
+# ADVANCED outbound service with an already provisioned legacy DPAPI identity.
+format_version = 1
+installation = '55555555-5555-4555-8555-555555555555'
+data_directory = 'registry'
+transport = 'wss'
+inbound = false
+dial = true
+advertise = 'outbound-only'
+
+[credential]
+backend = 'windows-dpapi'
+file = 'identity.dpapi'

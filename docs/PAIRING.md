@@ -1,5 +1,10 @@
 # Paired published-data service (first bounded slice)
 
+For normal desktop IP/port/key setup, use [desktop pairing](DESKTOP-PAIRING.md).
+[Configuration anatomy](CONFIGURATION.md) maps O1 versus pairing TOML, exact paths,
+protected credentials, generated files and backup/recovery. The standalone CLI
+and manual credential procedures below are advanced workflows.
+
 `tkfs pairing -f pairing.toml ...` manages a separate portable data service.
 For one-port WSS and outbound-only home clients, see
 [PAIRING-WSS.md](PAIRING-WSS.md). Raw TLS remains the default compatibility mode.

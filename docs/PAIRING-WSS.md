@@ -3,13 +3,18 @@
 This portable transport uses one inbound TCP port for enrollment and published
 sync, regardless of repository count. Homes can initiate outbound connections
 without binding any TCP listener. Windows workers use local named pipes; Linux
-workers use local Unix sockets. The transport process remains separate from O1;
-Windows O1 can own workers, but does not yet supervise this transport process.
-Linux O1, relay-only VPS operation and several homes sharing the same repository
-remain separate work. One active paired peer and two replica origins per repo
+workers use local Unix sockets. The transport has a separate identity/registry
+and can run standalone or be supervised by Windows/Linux O1 as an outbound or
+receiving service. Relay-only VPS deployment and several homes sharing the same
+repository remain outside qualification. One active paired peer and two replica origins per repo
 remain enforced. Different repositories can share the installation's listener.
 
 ## Configuration
+
+Ordinary desktop enrollment uses IP, port and key with app-managed configuration;
+see [configuration anatomy](CONFIGURATION.md) and [desktop pairing](DESKTOP-PAIRING.md).
+The examples below are **advanced standalone** services. In particular the
+`dial=false` listener is not an app-managed receiver, which requires `dial=true`.
 
 Use the normal distinct installation IDs and DPAPI/systemd credentials described
 in [PAIRING.md](PAIRING.md). Never copy a live key or worker state to create a new

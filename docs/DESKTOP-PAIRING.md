@@ -3,6 +3,10 @@
 Open **Connect remote** in the Windows desktop application. This screen uses
 the existing published-data protocol; it never exposes remote management.
 
+For exact config defaults, generated paths, field definitions, private files and
+recovery rules, see [Configuration files and managed state](CONFIGURATION.md).
+Normal pairing does not require editing TOML or transferring certificate files.
+
 1. On the server, open **Allow connections**, enter this computer's numeric IP
    reachable by the client and the chosen port (the GUI starts with 7421), then select
    **Set up / enable receiving**. Wait for **Running**. The
@@ -66,13 +70,17 @@ invitation is not replayed automatically after uncertain delivery: check approva
 if enrollment succeeded, otherwise request a fresh invitation. Sync can resume
 using its durable inventories and acknowledgements.
 
-Enable supervised sync for the selected preprovisioned outbound-only WSS config
+Enable supervised sync for the selected already provisioned outbound-only WSS config
 to continue after closing the GUI. Its immutable public config/credential binding
 is persisted in the supervisor catalog. Restart reuses existing credentials;
 drift is reported as unavailable rather than accepted silently. Service running
 does not mean every grant is caught up. Disable waits for actual service drain;
 an uncertain drain retains ownership and requires explicit process recovery.
 This manages all configured enabled grants and does not resume paused grants.
+Normal Connect creates the managed client config automatically; “provisioned” does
+not mean that users must manually create keys. Receiving has a separate supervised
+service and identity. Stop older processes before upgrading on the same registry;
+retained private WAL/SHM files must not be deleted as stale artifacts.
 
 Existing standalone stores are not adopted; automatic remote grant issuance,
 general remount/delete and service installation remain outside this workflow.

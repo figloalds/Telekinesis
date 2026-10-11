@@ -1,0 +1,18 @@
+# Windows example: invented identity, not an existing installation to restore.
+format_version = 1
+installation_id = '33333333-3333-4333-8333-333333333333'
+data_directory = 'data'
+default_mount_directory = 'Projects'
+
+[control]
+transport = 'named-pipe'
+name = 'tkfs-doc-expanded'
+
+[network]
+enabled = false # Must stay false even with separately supervised pairing.
+# Optional parsed-only address; this field does not bind a listener.
+listen = '127.0.0.1:7421'
+
+[workers]
+restart_policy = 'on-failure'
+maximum_running = 8 # Both fields required when this table is present.

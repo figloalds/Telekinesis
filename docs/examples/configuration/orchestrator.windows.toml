@@ -1,0 +1,7 @@
+# Minimal Windows O1 schema. Parser fixture only; does not initialize storage.
+format_version = 1
+data_directory = 'data'
+
+[control]
+transport = 'named-pipe'
+name = 'tkfs-doc-example'

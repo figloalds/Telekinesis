@@ -47,9 +47,11 @@ test-runs/       Ignored disposable states, mounts, screenshots and logs
 Start with the [documentation index](docs/README.md). Platform/network guides are
 [Linux headless/FUSE](docs/LINUX.md), [persistent pairing](docs/PAIRING.md),
 [one-port WSS](docs/PAIRING-WSS.md) and [orchestrator CLI](docs/ORCHESTRATOR-CLI.md).
-For argument lookup and configuration, see the
-[TKFS command reference](docs/CLI.md) and
-[orchestrator TOML anatomy](docs/ORCHESTRATOR-CONFIG.md).
+For configuration, start with **[Configuration files and managed state](docs/CONFIGURATION.md)**:
+which TOML to edit, annotated examples and field defaults, portable/profile path
+resolution, generated identity/registry files, backup/recovery and upgrade rules.
+The [TKFS command reference](docs/CLI.md) and
+[O1 field reference](docs/ORCHESTRATOR-CONFIG.md) provide narrower lookups.
 License texts and [third-party notices](THIRD-PARTY-NOTICES.md) remain at the root.
 Saved reports record their original binaries, commits and fixture locations;
 they are historical evidence, not a claim that every check ran against this checkout.
@@ -93,9 +95,9 @@ cwd. First run asks for a new/empty native data directory and a separate parent
 for mounted project folders, with a running-project limit. It creates a versioned
 config with a unique installation UUID and pipe name under an exclusive lock and
 publishes it atomically. Concurrent first-run clients reread the winning config.
-The application folder must be writable; for Program Files or a read-only folder,
-move the portable application to a writable folder. There is no silent fallback
-to another configuration or data root.
+Portable setup requires a writable config folder. Alternatively select an existing
+writable config with `gui -f <path>` or explicitly choose profile first-run setup.
+There is no silent fallback to another configuration or data root.
 
 Fresh setup can explicitly select a private profile location for protected
 pairing storage; the UI shows its paths. Existing adjacent or selected configs
@@ -107,6 +109,13 @@ authenticates public identity exchange through OPAQUE. See
 resetting its key remain explicit local actions; no firewall or OS trust changes
 are performed. The receiver endpoint is fixed by its initial setup in this slice;
 changing it in the application is not yet supported.
+
+O1 uses `orchestrator.toml`; the app creates separate
+`<O1 data>/desktop-pairing/client.toml` and
+`<O1 data>/receiving-pairing/server.toml`. Their protected identities and setup
+records are managed together. Do not hand-edit generated UUIDs, credential paths
+or backend names to repair an installation. See the
+[directory anatomy and recovery guide](docs/CONFIGURATION.md#identities-and-directory-anatomy).
 
 Existing configurations are validated, and the client checks API version,
 installation identity, effective data root, build version, and capabilities before

@@ -500,3 +500,27 @@ reopening require explicit selection. Exact comparison with the newly attached
 screenshot, cross-machine deployment and Linux GUI/installed-provider end-to-end
 qualification were not completed. The previously rendered prototype informed the
 layout; no screenshot pixel-match or formal cryptographic certification is claimed.
+
+### D1 configuration anatomy documentation
+
+The docs-only follow-up to `b42a76c` adds [configuration anatomy](CONFIGURATION.md),
+eight sanitized TOML examples and a parser-only Rust harness. It distinguishes
+owner-edited O1 settings from app-managed client/receiver identities and setup
+records, exact defaults and canonical path resolution, portable/profile choices,
+local runtime tokens, backup/restore constraints and enrollment versus grant
+revocation. The README/index and O1/pairing/WSS/desktop guides link the new guide;
+stale Windows-only management and unsupervised-transport claims are corrected.
+
+The actual O1 and pairing `Config::load` implementations accepted their native
+Windows and Linux examples and rejected opposite-platform control transports.
+The harness checked resolved credential/config/data paths and omitted pairing
+defaults, and compared all input bytes before and after loading. No catalog,
+registry, credential, listener or mount was opened or provisioned. Windows used
+a scratch dependent crate and a process-local path to the already installed
+WinFsp DLL; Linux used an isolated WSL source copy with offline dependencies,
+removed afterward. Initial harness launch issues (Windows DLL search and a
+temporary shell-script CRLF) were corrected without product changes. All 86
+checked local Markdown file links resolved; `git diff --check` passed.
+
+These are parser/schema checks, not live configuration, credential-provider,
+network or deployment qualification. Existing implementation limits above remain.
