@@ -182,7 +182,7 @@ endpoint-change workaround.
 
 | `backend` | Required fields | Actual protection/loading |
 |---|---|---|
-| `platform-encrypted` | `file`, `name` | Current app-managed envelope; file path is relative to this TOML. `name` is a cryptographic context, not a display label |
+| `platform-encrypted` | `file`, `name` | Current app-managed envelope; `file` accepts an absolute path or a path relative to this TOML. `name` is a cryptographic context, not a display label |
 | `windows-dpapi` | `file` | Existing advanced Windows CurrentUser DPAPI identity file; not interchangeable with a platform-encrypted envelope |
 | `systemd` | `name` | Existing Linux credential delivered as `$CREDENTIALS_DIRECTORY/<name>`; not a TOML path to an encrypted blob |
 
@@ -224,9 +224,10 @@ app-or-config-folder/
   orchestrator.tkfs-config.lock         # creation guard
   orchestrator.tkfs-bootstrap.json      # onboarding identity/data pin
   orchestrator.toml.pairing/
-    verifier.sqlite                    # enrollment binding/rate/generation,
-    verifier.sqlite-wal                 # salted v2 verifier + encrypted OPAQUE
-    verifier.sqlite-shm                 # registration AND private server setup
+    verifier.sqlite                    # binding/rate/generation, salted v2 verifier,
+                                       # encrypted OPAQUE registration/private setup
+    verifier.sqlite-wal                 # transaction journal
+    verifier.sqlite-shm                 # coordination / WAL index
   .tkfs-desktop/<canonical-config-hash>/
     identity/record.json                # O1 identity/data pin
     operation/record.json               # local lifecycle retry receipt
