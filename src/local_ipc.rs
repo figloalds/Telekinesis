@@ -150,12 +150,12 @@ fn read<T: DeserializeOwned>(file: &mut File, timeout: u32) -> Result<T> {
     transfer(file, &mut len, false, timeout)?;
     let len = u32::from_le_bytes(len) as usize;
     ensure!(len <= MAX_MANAGEMENT_FRAME, "MANAGEMENT_FRAME_TOO_LARGE");
-    let mut bytes = vec![0; len];
+    let mut bytes = zeroize::Zeroizing::new(vec![0; len]);
     transfer(file, &mut bytes, false, timeout)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 fn write<T: Serialize>(file: &mut File, value: &T) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
+    let mut bytes = zeroize::Zeroizing::new(serde_json::to_vec(value)?);
     ensure!(
         bytes.len() <= MAX_MANAGEMENT_FRAME,
         "MANAGEMENT_FRAME_TOO_LARGE"

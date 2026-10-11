@@ -178,6 +178,29 @@ enum Command {
 #[derive(Subcommand)]
 enum ManagementCommand {
     Hello,
+    /// Observe supervisor-owned synchronization of all enabled grants.
+    BackgroundSyncStatus,
+    /// Enable an existing outbound-only pairing config, or disable supervision.
+    ConfigureBackgroundSync {
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        disable: bool,
+    },
+    /// Rotate the enrollment code and print it once; never automatically retry.
+    ResetPairingCode,
+    /// Prepare a fresh headless replica of an existing logical repository.
+    PrepareReplica {
+        label: String,
+        #[arg(long)]
+        repo: String,
+    },
+    /// Reserve an initial mount for a stopped headless state; start separately.
+    AttachMount {
+        state: String,
+        #[arg(long)]
+        mount: PathBuf,
+    },
     Create {
         label: String,
         #[arg(long)]
@@ -218,6 +241,23 @@ enum PairingCommand {
     },
     /// Paste a secret invitation on masked stdin; not argv or shell history.
     Join,
+    /// Export this host's public identity; verify its fingerprint independently.
+    PublicBootstrap,
+    /// Reject a pending numeric-code candidate and release its enrollment slot.
+    RejectCodeCandidate {
+        invitation: String,
+    },
+    /// Submit a 200-digit code on masked stdin to an independently pinned host.
+    JoinCode {
+        /// Public Peer JSON supplied by the receiving host (contains no secret).
+        #[arg(long)]
+        issuer: PathBuf,
+        #[arg(long)]
+        enrollment_endpoint: String,
+        /// SHA-256 fingerprint confirmed independently with the receiving owner.
+        #[arg(long)]
+        fingerprint: String,
+    },
     /// Approve the exact public installation and certificate fingerprint.
     Approve {
         invitation: String,
@@ -346,6 +386,40 @@ fn pairing_command(path: &Path, action: &PairingCommand) -> Result<()> {
         }
         PairingCommand::Join => {
             pairing_service::join(&config, pairing_service::read_invitation()?)?
+        }
+        PairingCommand::PublicBootstrap => {
+            serde_json::to_value(pairing_service::public_bootstrap(&config)?)?
+        }
+        PairingCommand::RejectCodeCandidate { invitation } => {
+            config.registry()?.reject_code_candidate(invitation)?;
+            json!({"invitation": invitation, "status": "candidate-rejected"})
+        }
+        PairingCommand::JoinCode {
+            issuer,
+            enrollment_endpoint,
+            fingerprint,
+        } => {
+            use std::io::Read;
+            let mut public = Vec::new();
+            std::fs::File::open(issuer)?
+                .take(128 * 1024 + 1)
+                .read_to_end(&mut public)?;
+            ensure!(public.len() <= 128 * 1024, "ISSUER_BOOTSTRAP_TOO_LARGE");
+            let issuer: tkfs::pairing::Peer = serde_json::from_slice(&public)
+                .map_err(|_| anyhow::anyhow!("INVALID_ISSUER_BOOTSTRAP"))?;
+            ensure!(
+                fingerprint.len() == 64
+                    && fingerprint.bytes().all(|b| b.is_ascii_hexdigit())
+                    && issuer.fingerprint().eq_ignore_ascii_case(fingerprint),
+                "ISSUER_FINGERPRINT_MISMATCH"
+            );
+            pairing_service::join_code(
+                &config,
+                issuer,
+                enrollment_endpoint,
+                pairing_service::read_pairing_code()?,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?
         }
         PairingCommand::Approve {
             invitation,
@@ -499,9 +573,33 @@ fn run() -> Result<()> {
             action,
         } => {
             use tkfs::orchestrator::{self, Action, Request};
+            let reset_code = matches!(action, ManagementCommand::ResetPairingCode);
+            if reset_code {
+                ensure!(
+                    args.request_id.is_none() && args.generation.is_none(),
+                    "PAIRING_CODE_RESET_NOT_REPLAYABLE: omit --request-id and --generation; an uncertain response requires an explicit fresh reset"
+                );
+            }
             let config = orchestrator::Config::load(defaults_file)?;
             let action = match action {
                 ManagementCommand::Hello => Action::Hello,
+                ManagementCommand::BackgroundSyncStatus => Action::BackgroundSyncStatus,
+                ManagementCommand::ConfigureBackgroundSync { config, .. } => {
+                    Action::ConfigureBackgroundSync {
+                        config: config.as_ref().map(std::fs::canonicalize).transpose()?,
+                    }
+                }
+                ManagementCommand::ResetPairingCode => Action::ResetPairingCode {},
+                ManagementCommand::PrepareReplica { label, repo } => Action::PrepareReplica {
+                    label: label.clone(),
+                    repo: repo.clone(),
+                },
+                ManagementCommand::AttachMount { state, mount } => Action::AttachMount {
+                    state: state.clone(),
+                    mount: mount.clone(),
+                    expected_branch: None,
+                    expected_branch_generation: None,
+                },
                 ManagementCommand::Create { label, mount } => Action::Create {
                     label: label.clone(),
                     mount: mount.clone(),
@@ -521,7 +619,7 @@ fn run() -> Result<()> {
                     operation: operation.clone(),
                 },
             };
-            if action.mutates() {
+            if action.mutates() && !reset_code {
                 ensure!(
                     args.generation.is_some(),
                     "MANAGEMENT_GENERATION_REQUIRED: inspect catalog/state generation; retry with the same --request-id and --generation"
@@ -530,7 +628,7 @@ fn run() -> Result<()> {
             let request = Request {
                 version: 1,
                 target_installation: config.installation_id.clone(),
-                operation_id: if action.mutates() {
+                operation_id: if action.mutates() && !reset_code {
                     Some(args.request_id.clone().unwrap_or_else(id))
                 } else {
                     None
@@ -538,15 +636,28 @@ fn run() -> Result<()> {
                 expected_generation: args.generation,
                 action,
             };
-            if request.action.mutates() && args.request_id.is_none() {
+            if request.action.mutates() && !reset_code && args.request_id.is_none() {
                 eprintln!(
                     "{}",
                     json!({"operation_id":request.operation_id,"expected_generation":request.expected_generation,"retry":"repeat the same action with these --request-id and --generation values"})
                 );
             }
-            let response = orchestrator::client(&config, &request)?;
+            let mut response = orchestrator::client(&config, &request)?;
             if response["ok"] != true {
                 bail!("{response}");
+            }
+            if reset_code {
+                let code = response["result"]["code"].take();
+                let serde_json::Value::String(code) = code else {
+                    bail!("INVALID_PAIRING_CODE_RESET_RESPONSE");
+                };
+                let code = zeroize::Zeroizing::new(code);
+                ensure!(
+                    code.len() == 200 && code.bytes().all(|b| b.is_ascii_digit()),
+                    "INVALID_PAIRING_CODE_RESET_RESPONSE"
+                );
+                println!("{}", code.as_str());
+                return Ok(());
             }
             println!("{}", serde_json::to_string_pretty(&response["result"])?);
             return Ok(());

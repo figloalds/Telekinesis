@@ -49,9 +49,11 @@ Prototype source inspected in full. It proposes a navy sidebar, compact toolbar,
 searchable folder table, summary cards, details and modal forms. Its folder sizes,
 quota, online status, latency, remote mount/delete and path changes are in-memory
 mock data. Translate layout, not claims: expose measured states; omit unsupported
-controls instead of successful-looking no-ops. UI worker's browser rendering
-attempt failed at kernel initialization (`0x80070003`); native Slint synthetic
-snapshot acceptance is the fallback and does not prove backend operations.
+controls instead of successful-looking no-ops. Initial browser automation failed
+at kernel initialization (`0x80070003`); installed headless Chrome subsequently
+rendered the reference with a disposable profile. Its screenshot and native
+light/dark renders were inspected. Synthetic layout evidence is separate from
+the real backend callback tests.
 
 ## Ownership and API contracts (agreed)
 
@@ -116,7 +118,7 @@ existing approve command; enrollment alone does not grant a repository.
 
 | Milestone | Deliverable | Required evidence / status |
 |---|---|---|
-| M0 audit/contracts | This baseline, file ownership, rotation semantics, prototype mapping | Source inspection complete; browser rendering blocked; agreement recorded above |
+| M0 audit/contracts | This baseline, file ownership, rotation semantics, prototype mapping | Source and rendered prototype inspected; agreement recorded above |
 | M1 desktop usability | Search/table/sidebar/status hierarchy, config selection, real details, unchanged local lifecycle/branch safeguards | Native synthetic light/dark rendering, no invented counters; real callback regression where safe |
 | M2 code lifecycle | Owner reset, salted verifier, receiving-host check, protected input and approval, unchanged existing sync trust | Exact digit/length/leading-zero handling; old/new code rotation; persistence and malformed input; secret absence in DB/log/receipt; wrong pin, denied approval, revoked pair |
 | M3 integration | CLI + desktop consume same backend contracts; corrected operational docs | Offline build/tests and fixture reset/enroll/approve/grant/discover/sync/restart flow; report partial completion honestly |
@@ -181,12 +183,12 @@ Baseline lesson: the project already has
 substantial real lifecycle/sync machinery; the main product gaps are cohesive
 onboarding and durable integration, not reproducing prototype success messages.
 
-Open product decisions for the coordinator: accept reusable code until rotation
-and retention of pending exact-key approvals; prioritize the durable receive and
-service-supervision milestone; retain explicit fingerprint/bootstrap exchange
-until an independently reviewed authenticated discovery design is supplied.
+Resolved decisions: reusable code until rotation, retention of pending exact-key
+approvals, explicit fingerprint/bootstrap exchange, and the owner-mediated M4
+receive/supervision scope below were accepted. Automatic network grant issuance
+remains deferred until an independently reviewed protocol design is supplied.
 
-## M4 feasibility after current milestone
+## M4 feasibility at the original audit
 
 The discover-to-mount gap is concrete, not cosmetic. `ListPublished` lists only
 existing grants, and each grant already pins `remote_replica`; `Exchange` rejects
@@ -227,3 +229,112 @@ The remaining product choice is whether source-owner grant confirmation is
 acceptable for the first complete receive wizard or automatic offers are a
 hard requirement. Path 1 can proceed as the next implementation phase with
 clear UI waiting states; path 2 requires an explicit reviewed protocol contract.
+
+### M4 implementation contract (owner-mediated path approved)
+
+The coordinator selected path 1. No new remote protocol operations or automatic
+grant issuance are authorized by this stage. Integration owns `orchestrator.rs`,
+shared CLI, integration tests and docs; UI owns desktop adapters/views and
+native callback acceptance; pairing worker owns a new background-service
+controller module once its interface is agreed. All commits remain serialized.
+
+Owner-local `PrepareReplica { label, repo }` uses catalog generation and an
+operation UUID. It preallocates a new state/device with the supplied logical
+repo in the same intent transaction as ordinary create, always headless. Exact
+retry returns the same state/device, mismatched replay is refused, and existing
+managed repo duplication is refused before intent. Existing marker/staging/crash
+recovery and worker reconciliation are reused. No existing store is adopted.
+
+Owner-local `AttachMount { state, mount }` uses that state's management generation
+and a retry UUID. It requires the headless worker to be cooperatively stopped
+and ownership provable with its free state lock. It reserves a canonical unused
+mount outside data, commits the mount while leaving desired state stopped, and
+does not launch a worker. A separate existing Start action activates the mount.
+This intentionally does not implement general remount/move/delete.
+
+Wizard states: prepared headless -> waiting for source grant -> authorized
+discovery/local grant -> syncing -> caught-up observation -> choose published
+branch -> stop -> attach mount -> start. Public state/repo/device identities,
+existing journals and persisted grants allow resumption; no enrollment code is
+retained. After a worker restart, re-run initial sync to obtain a new caught-up
+observation before first mount. A paused/revoked/missing grant stays visible and
+must never be reported as mounted/caught up. Cancellation preserves committed
+local preparation and sync receipts. Receiving-owner actions never change the
+source owner's grant automatically.
+
+Supervised background sync initially accepts only an already provisioned
+outbound-only pairing config (no new key or public listener). Persist only its
+public path/identity binding and enabled state; closing the GUI leaves it under
+the local supervisor. Restart uses the configured protected credential, and
+locked/changed/missing credentials yield explicit unavailable status/backoff.
+Shutdown/disable must cancel and drain the service with bounded deadlines.
+
+Acceptance extends the existing isolated headless process flow: prepare with
+same logical repo/new device, duplicate/replay/crash invariants, source-owner
+grant, published catch-up/private exclusion, branch selection, stopped-only
+mount reservation and restart. Real fixture mount qualification runs only when
+the installed WinFsp/FUSE supports it. Preserve old format-v1 catalogs and
+generation semantics; any additional optional registry records require
+transactional initialization and fail-closed compatibility review.
+
+### M4 integration evidence and review resolutions
+
+Implemented owner-local `PrepareReplica`, `AttachMount`,
+`ConfigureBackgroundSync` and `BackgroundSyncStatus`. Prepare journals IDs before
+creation; mount assignment leaves the worker stopped. Desktop attachment carries
+the selected shared branch and view generation. The supervisor holds the state
+owner lock while checking the stopped store's actual branch/generation, complete
+causal history and visible content objects, then commits the mount reservation.
+
+The controller pins normalized public config, registry identity and credential
+fingerprint. It manages all enabled grants and never unpauses grants implicitly.
+Startup failures back off; config drift cancels the runner. An uncertain run or
+drain retains the actual Service/registry lock (or unfinished runner) for the
+process lifetime. A separate process therefore cannot overlap detached transport
+work. Supervisor Shutdown remains durably pending on uncertain drain and tick
+cannot restart desired-running workers. This condition requires explicit process
+recovery; automatic retries are not represented as a repair.
+
+Validated on Windows with a normal owner token and disposable protected fixtures:
+
+- CLI + supervisor + published-sync + onboarding regression command: 18 passed,
+  three unrelated mount tests ignored in that batch. Includes O1 background
+  binding persistence, restart, edited-config refusal, exact receipt replay,
+  disable with a missing config, and restart remaining disabled.
+- Managed controller: 8 passed plus a subprocess helper invoked by the retained
+  lock test. Actual WSS existing-grant sync receives later data after controller
+  restart without an enrollment code. Blocked child IPC plus forced outer-loop
+  failure refuses a separate process opener before and after Controller Drop.
+- Latest pairing service 4 and WSS 10 tests passed after lifetime changes.
+- `uncertain_background_drain_keeps_shutdown_durable_and_workers_fenced` passed.
+- The isolated WinFsp first-attach/start/write/stop/start fixture passed and
+  preserved repository/device identity and file bytes.
+- Actual numeric GUI callbacks passed both themes; see
+  `test-evidence/ui-code-callbacks/{light,dark}/report.json`. These cover reset,
+  enrollment, pin/config/address drift, code erasure/no disk leakage, existing
+  pair preservation, and late response rejection after window close.
+- Actual receive GUI callbacks passed both themes (26.43 seconds total); see
+  `test-evidence/ui-receive/{light,dark}/report.json` and prepared/verified/mounted
+  screenshots. Tests cover duplicate preparation, premature attach refusal,
+  source-owner grant/discovery/configuration, paused-grant proof invalidation,
+  shared checkout, planned stop, competing stopped-store checkout refusal,
+  restart/resync recovery, mounted verified bytes and private-canary exclusion.
+  Background service reaches running then disabled without resuming paused grants.
+- Twelve desktop/branch/migration library tests passed. Atomic UI records now
+  occupy dedicated config/purpose leaves under `.tkfs-desktop/`, avoiding a
+  Windows rename conflict with protected pairing ancestors. Original lock paths
+  remain; pending request bytes/IDs survive legacy migration, unrelated valid
+  branch journals are not imported into a different installation, and changed
+  legacy records fail closed. Public desktop metadata retains ordinary writable
+  AppData/Temp compatibility; pairing credential protections are unchanged.
+
+An offline isolated Ubuntu/WSL source copy passed 23 targeted checks: code-store
+7, shutdown fence 1, CLI 2, supervisor 7, published sync 3, prepare/attach crash
+recovery 2, and actual FUSE first mount/restart 1. The Linux run exposed fresh O1
+catalogs inheriting mode 0644 under umask 022; fresh creation now uses 0600 without
+repairing existing permissions. Existing unsafe catalogs still fail closed for
+pairing verification. No Linux desktop is claimed.
+
+All evidence directories are ignored local artifacts; tests and this ledger are
+versioned. No existing state/mount, live pairing code, credential, listener,
+firewall rule or installed service was changed by qualification.

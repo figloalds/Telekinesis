@@ -24,10 +24,11 @@ pub struct Paths {
 }
 impl Paths {
     pub fn from_config(executable: PathBuf, config: &Path) -> Result<Self> {
-        let config = std::path::absolute(config)?;
-        let folder = fs::canonicalize(config.parent().context("CONFIG_PARENT_REQUIRED")?)?;
+        let config = fs::canonicalize(config).context("CONFIG_PATH_CANONICALIZE")?;
+        let folder = fs::canonicalize(config.parent().context("CONFIG_PARENT_REQUIRED")?)
+            .context("CONFIG_PARENT_CANONICALIZE")?;
         Ok(Self {
-            executable: fs::canonicalize(executable)?,
+            executable: fs::canonicalize(executable).context("EXECUTABLE_CANONICALIZE")?,
             config: folder.join(config.file_name().context("CONFIG_FILENAME_REQUIRED")?),
             folder,
         })
@@ -51,6 +52,20 @@ impl Paths {
         self.scoped_file("operation")
     }
     fn scoped_file(&self, purpose: &str) -> PathBuf {
+        let scope = crate::core::hash(self.config.to_string_lossy().to_lowercase().as_bytes());
+        self.folder
+            .join(".tkfs-desktop")
+            .join(scope)
+            .join(purpose)
+            .join("record.json")
+    }
+    pub(crate) fn metadata_file(&self, purpose: &str) -> PathBuf {
+        self.scoped_file(purpose)
+    }
+    fn legacy_file(&self, purpose: &str) -> PathBuf {
+        if purpose == "branch-operation" {
+            return self.folder.join(".tkfs-ui-branch-operation.json");
+        }
         if self
             .config
             .file_name()
@@ -62,6 +77,82 @@ impl Paths {
             self.folder.join(format!(".tkfs-ui-{scope}-{purpose}.json"))
         }
     }
+    /// Caller holds the original launch/operation/branch lock. Legacy bytes are
+    /// retained; a hash records the migration baseline so an older binary cannot
+    /// silently replace a pending request after the new journal advances.
+    pub(crate) fn migrate_metadata(&self, purpose: &str) -> Result<()> {
+        self.migrate_metadata_if(purpose, |_| Ok(true))
+    }
+    pub(crate) fn migrate_metadata_if(
+        &self,
+        purpose: &str,
+        accept_legacy: impl FnOnce(&[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        let target = self.scoped_file(purpose);
+        // These are public desktop receipts, not pairing credentials. Preserve
+        // support for ordinary writable app folders without repairing their ACL
+        // or importing the credential store's strict ancestor policy.
+        let mut directory = self.folder.clone();
+        for component in target
+            .parent()
+            .unwrap()
+            .strip_prefix(&self.folder)?
+            .components()
+        {
+            directory.push(component);
+            match fs::create_dir(&directory) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+            drop(crate::local_ipc::storage_handle(&directory, 1)?);
+        }
+        let legacy = self.legacy_file(purpose);
+        let baseline = target.with_extension("legacy-sha256");
+        let old = if legacy.try_exists()? {
+            Some(read_metadata_file(&legacy)?)
+        } else {
+            None
+        };
+        if let Some(bytes) = &old {
+            if !accept_legacy(bytes)? {
+                ensure!(!baseline.try_exists()?, "LEGACY_DESKTOP_METADATA_CHANGED");
+                return Ok(());
+            }
+        }
+        if target.try_exists()? {
+            read_metadata_file(&target)?;
+        }
+        if baseline.try_exists()? {
+            let old = old.context("LEGACY_DESKTOP_METADATA_REMOVED")?;
+            ensure!(
+                read_metadata_file(&baseline)? == crate::core::hash(&old).as_bytes(),
+                "LEGACY_DESKTOP_METADATA_CHANGED: an older client changed its receipt; reconcile before continuing"
+            );
+            ensure!(target.is_file(), "MIGRATED_DESKTOP_METADATA_MISSING");
+        } else if let Some(old) = old {
+            if target.try_exists()? {
+                ensure!(
+                    read_metadata_file(&target)? == old,
+                    "CONFLICTING_DESKTOP_METADATA: preserve both receipts and reconcile before continuing"
+                );
+            } else {
+                atomic_write(&target, &old)?;
+            }
+            atomic_write(&baseline, crate::core::hash(&old).as_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+fn read_metadata_file(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    // A held native file handle rejects reparse points and hardlink aliases,
+    // and blocks replacement while bytes are read. No ACL is changed.
+    let mut file = crate::local_ipc::storage_handle(path, 0)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 pub(crate) fn exclusive(path: &Path) -> Result<File> {
@@ -80,11 +171,12 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+            .open(&temporary)
+            .context("ATOMIC_TEMP_CREATE")?;
+        file.write_all(bytes).context("ATOMIC_TEMP_WRITE")?;
+        file.sync_all().context("ATOMIC_TEMP_SYNC")?;
         drop(file);
-        fs::rename(&temporary, path)?;
+        fs::rename(&temporary, path).context("ATOMIC_REPLACE")?;
         Ok(())
     })();
     if result.is_err() {
@@ -145,6 +237,7 @@ impl Session {
     pub fn connect(paths: Paths) -> Result<Self> {
         let _guard = exclusive(&paths.folder.join(".tkfs-launch.lock"))?;
         let config = Config::load(&paths.config)?;
+        paths.migrate_metadata("identity")?;
         let pin: Option<Pin> = if paths.pin().try_exists()? {
             Some(
                 serde_json::from_slice(&fs::read(paths.pin())?)
@@ -182,7 +275,8 @@ impl Session {
                         reply["error"]
                     );
                     let hello = reply["result"].clone();
-                    verify_hello(&config, expected.as_deref(), &hello)?;
+                    verify_hello(&config, expected.as_deref(), &hello)
+                        .context("SUPERVISOR_IDENTITY_VERIFY")?;
                     break hello;
                 }
                 Err(e) => {
@@ -239,17 +333,23 @@ impl Session {
                 &paths.pin(),
                 &serde_json::to_vec(&Pin {
                     installation_id: identity.clone(),
-                    data_directory: fs::canonicalize(&config.data_directory)?,
+                    data_directory: fs::canonicalize(&config.data_directory)
+                        .context("DATA_DIRECTORY_CANONICALIZE")?,
                 })?,
-            )?;
-        }
-        let saved = if paths.journal().try_exists()? {
-            Some(
-                serde_json::from_slice(&fs::read(paths.journal())?)
-                    .context("INVALID_OPERATION_JOURNAL")?,
             )
-        } else {
-            None
+            .context("INSTALLATION_PIN_WRITE")?;
+        }
+        let saved = {
+            let _operation_guard = exclusive(&paths.folder.join(".tkfs-operation.lock"))?;
+            paths.migrate_metadata("operation")?;
+            if paths.journal().try_exists()? {
+                Some(
+                    serde_json::from_slice(&fs::read(paths.journal())?)
+                        .context("INVALID_OPERATION_JOURNAL")?,
+                )
+            } else {
+                None
+            }
         };
         Ok(Self {
             paths,
@@ -270,8 +370,13 @@ impl Session {
         Ok(response["result"].clone())
     }
     pub fn mutate(&mut self, action: Action, generation: u64) -> Result<Value> {
+        ensure!(
+            !matches!(action, Action::ResetPairingCode {}),
+            "PAIRING_CODE_RESET_NOT_JOURNALED: use the owner-local show-once reset path; never retry a lost response automatically"
+        );
         ensure!(action.mutates(), "NOT_A_MUTATION");
         let _guard = exclusive(&self.paths.folder.join(".tkfs-operation.lock"))?;
+        self.paths.migrate_metadata("operation")?;
         if self.paths.journal().try_exists()? {
             let previous: SavedOperation =
                 serde_json::from_slice(&fs::read(self.paths.journal())?)?;
@@ -319,6 +424,7 @@ impl Session {
     }
     pub fn retry(&mut self) -> Result<Value> {
         let _guard = exclusive(&self.paths.folder.join(".tkfs-operation.lock"))?;
+        self.paths.migrate_metadata("operation")?;
         self.saved = Some(serde_json::from_slice(&fs::read(self.paths.journal())?)?);
         self.send_saved()
     }
@@ -333,6 +439,7 @@ impl Session {
         })?;
         if let Some(response) = result.get("response").filter(|r| !r.is_null()) {
             let _guard = exclusive(&self.paths.folder.join(".tkfs-operation.lock"))?;
+            self.paths.migrate_metadata("operation")?;
             let current: SavedOperation = serde_json::from_slice(&fs::read(self.paths.journal())?)?;
             if current.request.operation_id == self.saved.as_ref().unwrap().request.operation_id {
                 let saved = self.saved.as_mut().unwrap();
@@ -429,6 +536,115 @@ mod tests {
         fs::write(&exe, b"fixture").unwrap();
         let paths = Paths::from_executable(exe).unwrap();
         (temp, paths)
+    }
+    #[test]
+    fn pairing_code_reset_never_enters_operation_journal() {
+        let (_temp, paths) = fixture();
+        fs::write(&paths.config, "format_version=1\ndata_directory='unused'\n[control]\ntransport='named-pipe'\nname='unused-test-pipe'\n").unwrap();
+        let config = Config::load(&paths.config).unwrap();
+        let mut session = Session {
+            paths: paths.clone(),
+            config,
+            identity: id(),
+            hello: Value::Null,
+            saved: None,
+        };
+        let error = session.mutate(Action::ResetPairingCode {}, 0).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PAIRING_CODE_RESET_NOT_JOURNALED")
+        );
+        assert!(!paths.journal().exists());
+        assert!(!paths.folder.join(".tkfs-operation.lock").exists());
+        assert!(session.saved.is_none());
+    }
+    #[test]
+    fn metadata_migrates_pending_bytes_with_pinned_ancestor_and_refuses_legacy_conflict() {
+        let (_temp, paths) = fixture();
+        let pending = serde_json::to_vec(&SavedOperation {
+            request: Request {
+                version: 1,
+                target_installation: Some(id()),
+                operation_id: Some(id()),
+                expected_generation: Some(7),
+                action: Action::Stop { state: id() },
+            },
+            response: None,
+            uncertain: true,
+        })
+        .unwrap();
+        fs::write(paths.legacy_file("operation"), &pending).unwrap();
+        let _held =
+            crate::private_storage::Directory::open(&paths.folder.join("protected-registry"))
+                .unwrap();
+        let _lock = exclusive(&paths.folder.join(".tkfs-operation.lock")).unwrap();
+        assert!(atomic_write(&paths.folder.join("blocked.json"), b"fixture").is_err());
+        paths.migrate_metadata("operation").unwrap();
+        assert_eq!(fs::read(paths.journal()).unwrap(), pending);
+        assert_eq!(fs::read(paths.legacy_file("operation")).unwrap(), pending);
+        let migrated: SavedOperation =
+            serde_json::from_slice(&fs::read(paths.journal()).unwrap()).unwrap();
+        assert!(migrated.uncertain && migrated.response.is_none());
+        let mut completed = migrated;
+        completed.uncertain = false;
+        completed.response = Some(json!({"ok":true}));
+        atomic_write(&paths.journal(), &serde_json::to_vec(&completed).unwrap()).unwrap();
+        paths.migrate_metadata("operation").unwrap();
+        fs::write(
+            paths.legacy_file("operation"),
+            b"older-client-changed-request",
+        )
+        .unwrap();
+        assert!(
+            format!("{:#}", paths.migrate_metadata("operation").unwrap_err())
+                .contains("LEGACY_DESKTOP_METADATA_CHANGED")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(paths.journal()).unwrap()).unwrap()["response"]
+                ["ok"],
+            true
+        );
+    }
+    #[test]
+    fn metadata_interrupted_migration_is_idempotent_and_conflicts_fail_closed() {
+        let (_temp, paths) = fixture();
+        paths.migrate_metadata("identity").unwrap();
+        fs::write(paths.legacy_file("identity"), b"original-pin").unwrap();
+        atomic_write(&paths.pin(), b"original-pin").unwrap();
+        paths.migrate_metadata("identity").unwrap();
+        paths.migrate_metadata("identity").unwrap();
+        fs::remove_file(paths.pin()).unwrap();
+        assert!(paths.migrate_metadata("identity").is_err());
+        paths.migrate_metadata("branch-operation").unwrap();
+        fs::write(paths.legacy_file("branch-operation"), b"pending-old").unwrap();
+        atomic_write(&paths.metadata_file("branch-operation"), b"pending-new").unwrap();
+        assert!(
+            format!(
+                "{:#}",
+                paths.migrate_metadata("branch-operation").unwrap_err()
+            )
+            .contains("CONFLICTING_DESKTOP_METADATA")
+        );
+        let mut other = paths.clone();
+        other.config = paths.folder.join("other.toml");
+        assert_ne!(
+            paths.metadata_file("branch-operation"),
+            other.metadata_file("branch-operation")
+        );
+    }
+    #[test]
+    fn public_metadata_supports_ordinary_temp_and_refuses_hardlink_aliases() {
+        let ordinary = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("Temp");
+        let temp = tempfile::tempdir_in(ordinary).unwrap();
+        let executable = temp.path().join("fixture.exe");
+        fs::write(&executable, b"fixture").unwrap();
+        let paths = Paths::from_executable(executable).unwrap();
+        paths.migrate_metadata("identity").unwrap();
+        atomic_write(&paths.pin(), b"public-test-record").unwrap();
+        paths.migrate_metadata("identity").unwrap();
+        fs::hard_link(paths.pin(), temp.path().join("alias.json")).unwrap();
+        assert!(paths.migrate_metadata("identity").is_err());
     }
     #[test]
     fn concurrent_first_run_keeps_one_config() {
@@ -536,6 +752,7 @@ mod tests {
         )
         .unwrap();
         let root = fs::canonicalize(&config.data_directory).unwrap();
+        paths.migrate_metadata("identity").unwrap();
         atomic_write(
             &paths.pin(),
             &serde_json::to_vec(&Pin {

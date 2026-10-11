@@ -59,6 +59,335 @@ struct Fixture {
     supervisor: Option<Child>,
     config: Config,
 }
+
+#[cfg(windows)]
+#[test]
+fn managed_background_binding_persists_restarts_and_drift_can_be_disabled() {
+    let mut fixture = Fixture::new();
+    tkfs::local_ipc::protect_directory(fixture.root.path()).unwrap();
+    let path = fixture.root.path().join("client.toml");
+    drop(tkfs::desktop_pairing::Client::create(&path).unwrap());
+    let before = fs::read(&path).unwrap();
+    let enabled = Action::ConfigureBackgroundSync {
+        config: Some(path.clone()),
+    };
+    let operation = id();
+    let accepted = api(
+        &fixture.config,
+        enabled.clone(),
+        Some(operation.clone()),
+        Some(0),
+    );
+    assert_eq!(accepted["ok"], true, "{accepted}");
+    let status = |fixture: &Fixture| {
+        api(&fixture.config, Action::BackgroundSyncStatus, None, None)["result"].clone()
+    };
+    wait(|| status(&fixture)["service"]["state"] == "running");
+    let binding = status(&fixture)["binding"].clone();
+    assert_eq!(status(&fixture)["scope"], "all-configured-enabled-grants");
+    assert_eq!(
+        api(
+            &fixture.config,
+            enabled.clone(),
+            Some(operation.clone()),
+            Some(0)
+        ),
+        accepted
+    );
+    fixture.crash_supervisor();
+    fixture.start(None);
+    wait(|| status(&fixture)["service"]["state"] == "running");
+    assert_eq!(status(&fixture)["binding"], binding);
+    assert_eq!(
+        api(&fixture.config, Action::List, None, None)["result"]["catalog_generation"],
+        1
+    );
+    // Editing this owned fixture's normalized public configuration stops the
+    // runner. An old receipt must not silently accept the changed binding.
+    let mut changed = tkfs::pairing_service::Config::load(&path).unwrap();
+    changed.dial = false;
+    fs::write(&path, toml::to_string(&changed).unwrap()).unwrap();
+    wait(|| status(&fixture)["service"]["state"] == "unavailable");
+    assert_eq!(
+        api(&fixture.config, enabled, Some(operation), Some(0)),
+        accepted
+    );
+    assert_eq!(status(&fixture)["binding"], binding);
+    fs::remove_file(&path).unwrap();
+    let disabled = api(
+        &fixture.config,
+        Action::ConfigureBackgroundSync { config: None },
+        Some(id()),
+        Some(1),
+    );
+    assert_eq!(disabled["ok"], true, "{disabled}");
+    wait(|| status(&fixture)["service"]["state"] == "disabled");
+    assert_eq!(status(&fixture)["desired_enabled"], false);
+    fixture.crash_supervisor();
+    fixture.start(None);
+    assert_eq!(status(&fixture)["desired_enabled"], false);
+    assert_eq!(status(&fixture)["service"]["state"], "disabled");
+    assert_eq!(
+        api(&fixture.config, Action::List, None, None)["result"]["catalog_generation"],
+        2
+    );
+    // Preserve only fixture public configuration for normal fixture teardown.
+    fs::write(path, before).unwrap();
+}
+
+#[test]
+fn managed_replica_preparation_replays_ids_and_attach_requires_stopped_ownership() {
+    let fixture = Fixture::new();
+    let repo = id();
+    let operation = id();
+    let prepare = Action::PrepareReplica {
+        label: "Received project".into(),
+        repo: repo.clone(),
+    };
+    let first = api(
+        &fixture.config,
+        prepare.clone(),
+        Some(operation.clone()),
+        Some(0),
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    let replica = &first["result"];
+    let state = replica["state_id"].as_str().unwrap();
+    assert_eq!(replica["repo_id"], repo);
+    assert!(replica["device_id"].as_str().unwrap() != repo);
+    assert!(replica["mount"].is_null());
+    assert_eq!(replica["observation"]["mounted"], false);
+    assert!(Path::new(replica["runtime_path"].as_str().unwrap()).is_file());
+    assert_eq!(
+        api(&fixture.config, prepare.clone(), Some(operation), Some(0)),
+        first
+    );
+    let duplicate = api(&fixture.config, prepare, Some(id()), Some(1));
+    assert_eq!(duplicate["ok"], false);
+    assert!(
+        duplicate["error"]
+            .as_str()
+            .unwrap()
+            .contains("REPOSITORY_ALREADY_MANAGED")
+    );
+    let target = fixture.root.path().join("received-mount");
+    let attach = Action::AttachMount {
+        state: state.into(),
+        mount: target.clone(),
+        expected_branch: None,
+        expected_branch_generation: None,
+    };
+    let active = api(&fixture.config, attach.clone(), Some(id()), Some(0));
+    assert_eq!(active["ok"], false);
+    assert!(
+        active["error"]
+            .as_str()
+            .unwrap()
+            .contains("HEADLESS_STATE_MUST_BE_STOPPED")
+    );
+    assert_eq!(
+        api(
+            &fixture.config,
+            Action::Stop {
+                state: state.into()
+            },
+            Some(id()),
+            Some(0)
+        )["ok"],
+        true
+    );
+    let held =
+        orchestrator::lock_state(Path::new(replica["native_directory"].as_str().unwrap())).unwrap();
+    let unavailable = api(&fixture.config, attach.clone(), Some(id()), Some(1));
+    assert_eq!(unavailable["ok"], false);
+    assert!(fixture.state(state)["mount"].is_null());
+    drop(held);
+    let mount_operation = id();
+    let attached = api(
+        &fixture.config,
+        attach.clone(),
+        Some(mount_operation.clone()),
+        Some(1),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    assert_eq!(attached["result"]["desired_running"], false);
+    assert_eq!(attached["result"]["management_generation"], 2);
+    assert!(
+        !target.exists(),
+        "attachment alone must not mount or start a worker"
+    );
+    assert_eq!(
+        api(&fixture.config, attach, Some(mount_operation), Some(1)),
+        attached
+    );
+    assert_eq!(
+        api(&fixture.config, Action::List, None, None)["result"]["states"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn managed_replica_prepare_and_attach_recover_committed_intents_after_crash() {
+    let mut fixture = Fixture::new();
+    fixture.crash_supervisor();
+    fixture.start(Some("orchestrator_intent_committed"));
+    let operation = id();
+    let repo = id();
+    let request = Request {
+        version: 1,
+        target_installation: fixture.config.installation_id.clone(),
+        operation_id: Some(operation.clone()),
+        expected_generation: Some(0),
+        action: Action::PrepareReplica {
+            label: "Recover receive".into(),
+            repo: repo.clone(),
+        },
+    };
+    assert!(orchestrator::client(&fixture.config, &request).is_err());
+    assert_eq!(
+        fixture.supervisor.as_mut().unwrap().wait().unwrap().code(),
+        Some(86)
+    );
+    fixture.supervisor = None;
+    let db = rusqlite::Connection::open_with_flags(
+        fixture.config.data_directory.join("orchestrator.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let before: (String, String) = db
+        .query_row(
+            "SELECT id,device FROM states WHERE operation=?",
+            [&operation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    drop(db);
+    fixture.start(None);
+    let replay = orchestrator::client(&fixture.config, &request).unwrap();
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["result"]["state_id"], before.0);
+    assert_eq!(replay["result"]["device_id"], before.1);
+    assert_eq!(replay["result"]["repo_id"], repo);
+    assert_eq!(
+        api(
+            &fixture.config,
+            Action::Stop {
+                state: before.0.clone()
+            },
+            Some(id()),
+            Some(0)
+        )["ok"],
+        true
+    );
+    fixture.crash_supervisor();
+    fixture.start(Some("orchestrator_intent_committed"));
+    let mount = fixture.root.path().join("recovered-mount");
+    let attach = Request {
+        action: Action::AttachMount {
+            state: before.0.clone(),
+            mount: mount.clone(),
+            expected_branch: None,
+            expected_branch_generation: None,
+        },
+        operation_id: Some(id()),
+        expected_generation: Some(1),
+        ..request
+    };
+    assert!(orchestrator::client(&fixture.config, &attach).is_err());
+    assert_eq!(
+        fixture.supervisor.as_mut().unwrap().wait().unwrap().code(),
+        Some(86)
+    );
+    fixture.supervisor = None;
+    fixture.start(None);
+    let replay = orchestrator::client(&fixture.config, &attach).unwrap();
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["result"]["desired_running"], false);
+    assert_eq!(replay["result"]["management_generation"], 2);
+    assert!(!mount.exists());
+}
+
+#[test]
+#[ignore = "requires installed WinFsp or /dev/fuse and fusermount3; owned fixture only"]
+fn managed_replica_first_mount_and_restart_preserve_identity_and_content() {
+    let fixture = Fixture::new();
+    let repo = id();
+    let prepared = api(
+        &fixture.config,
+        Action::PrepareReplica {
+            label: "Receive mount fixture".into(),
+            repo: repo.clone(),
+        },
+        Some(id()),
+        Some(0),
+    );
+    assert_eq!(prepared["ok"], true, "{prepared}");
+    let state = prepared["result"]["state_id"].as_str().unwrap();
+    let device = prepared["result"]["device_id"].clone();
+    assert_eq!(
+        api(
+            &fixture.config,
+            Action::Stop {
+                state: state.into()
+            },
+            Some(id()),
+            Some(0)
+        )["ok"],
+        true
+    );
+    let mount = fixture.root.path().join("first-received-mount");
+    let attached = api(
+        &fixture.config,
+        Action::AttachMount {
+            state: state.into(),
+            mount: mount.clone(),
+            expected_branch: None,
+            expected_branch_generation: None,
+        },
+        Some(id()),
+        Some(1),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    let started = api(
+        &fixture.config,
+        Action::Start {
+            state: state.into(),
+        },
+        Some(id()),
+        Some(2),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    fs::write(mount.join("persisted.txt"), b"owned received replica").unwrap();
+    assert_eq!(
+        api(
+            &fixture.config,
+            Action::Stop {
+                state: state.into()
+            },
+            Some(id()),
+            Some(3)
+        )["ok"],
+        true
+    );
+    let restarted = api(
+        &fixture.config,
+        Action::Start {
+            state: state.into(),
+        },
+        Some(id()),
+        Some(4),
+    );
+    assert_eq!(restarted["ok"], true, "{restarted}");
+    assert_eq!(restarted["result"]["repo_id"], repo);
+    assert_eq!(restarted["result"]["device_id"], device);
+    assert_eq!(
+        fs::read(mount.join("persisted.txt")).unwrap(),
+        b"owned received replica"
+    );
+}
 impl Fixture {
     fn retain_logs(&self) {
         let Some(evidence) = std::env::var_os("TKFS_TEST_EVIDENCE") else {

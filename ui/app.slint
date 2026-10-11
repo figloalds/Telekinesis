@@ -1,4 +1,4 @@
-import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint, Palette, CheckBox } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView, VerticalBox, HorizontalBox, ListView, SpinBox, AboutSlint, Palette, CheckBox, TextEdit } from "std-widgets.slint";
 
 export struct Project { label: string, id: string, status: string, mount: string, desired: bool }
 export struct BranchItem { id: string, label: string, shared: bool, current: bool }
@@ -22,13 +22,56 @@ component Heading inherits Text { color: AppTheme.foreground; font-size: 26px; f
 component Card inherits Rectangle {
     background: AppTheme.surface; border-color: AppTheme.border; border-width: 1px; border-radius: 12px;
 }
+component Stat inherits Card {
+    in property <string> label;
+    in property <string> value;
+    VerticalLayout { padding: 16px; spacing: 6px;
+        Caption { text: root.label; }
+        Text { text: root.value; color: AppTheme.foreground; font-size: 25px; font-weight: 600; }
+    }
+}
 
 export component App inherits Window {
     title: "Telekinesis";
-    preferred-width: 1180px; preferred-height: 820px; min-width: 980px; min-height: 720px;
+    preferred-width: 1280px; preferred-height: 860px; min-width: 980px; min-height: 720px;
     background: AppTheme.background; default-font-family: "Segoe UI"; default-font-size: 14px;
     in-out property <bool> first-run;
     in-out property <int> main-page: 0;
+    in-out property <string> receive-label;
+    in-out property <string> receive-repository;
+    in-out property <string> receive-state;
+    in-out property <string> receive-repo-id;
+    in-out property <string> receive-device;
+    in-out property <string> receive-runtime;
+    in-out property <string> receive-status;
+    in-out property <string> receive-mount;
+    in-out property <bool> receive-headless;
+    in-out property <bool> receive-running;
+    in-out property <bool> receive-caught-up;
+    in-out property <bool> receive-materialized;
+    in-out property <bool> receive-can-attach;
+    in-out property <bool> receive-confirmed;
+    in-out property <string> background-sync-status;
+    callback receive-action(int);
+    callback background-sync-action(bool);
+    in-out property <string> project-filter;
+    in-out property <[int]> visible-projects;
+    in-out property <int> running-count;
+    in-out property <int> attention-count;
+    in-out property <string> config-input;
+    in-out property <bool> config-visible;
+    callback filter-projects(string);
+    callback select-config;
+    in-out property <int> pairing-page: 0;
+    in-out property <string> pair-bootstrap;
+    in-out property <string> pair-enrollment;
+    in-out property <string> server-config;
+    in-out property <string> server-code;
+    in-out property <bool> server-code-visible;
+    in-out property <bool> server-reset-confirmed;
+    callback reset-pairing-code;
+    callback dismiss-server-code;
+    dismiss-server-code => { root.server-code = ""; root.server-code-visible = false; }
     in-out property <string> pair-config;
     in-out property <string> pair-endpoint;
     in-out property <string> pair-token;
@@ -59,7 +102,7 @@ export component App inherits Window {
     in-out property <bool> shutdown-visible;
     in-out property <bool> can-retry;
     in-out property <bool> show-activity;
-    private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible || root.branch-dialog != 0;
+    private property <bool> modal: root.create-visible || root.about-visible || root.shutdown-visible || root.config-visible || root.server-code-visible || root.branch-dialog != 0;
     out property <bool> can-start-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (!root.projects[root.selected].desired || root.projects[root.selected].status == "Unavailable");
     out property <bool> can-stop-project: root.connected && !root.working && !root.modal && root.selected >= 0 && root.selected < root.projects.length && (root.projects[root.selected].desired || root.projects[root.selected].status != "Stopped");
     out property <bool> can-start-supervisor: !root.working && !root.modal && !root.first-run;
@@ -140,43 +183,45 @@ export component App inherits Window {
     HorizontalLayout {
         spacing: 0px;
         Rectangle {
-            width: 214px; background: #142e3c;
+            width: 220px; background: #13203a;
             VerticalLayout {
-                padding: 24px; spacing: 18px;
-                Text { text: "TK"; color: #8de0c4; font-size: 36px; font-weight: 800; }
+                padding: 18px; spacing: 14px;
+                Text { text: "TK"; color: #89aaff; font-size: 30px; font-weight: 800; }
                 Text { text: "Telekinesis"; color: white; font-size: 22px; font-weight: 650; }
-                Text { text: "Your projects.\nYour computer."; color: #afc4cf; font-size: 14px; }
+                Text { text: "Virtual folders & history"; color: #afc4cf; font-size: 14px; }
                 Rectangle { height: 1px; background: #35515f; }
-                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: root.first-run ? "01  Set up" : "01  Projects"; checkable: true; checked: root.main-page == 0; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; } } }
-                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "02  Connect a server"; checkable: true; checked: root.main-page == 1; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; } } }
-                Text { text: "Local workspace manager"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
+                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: root.first-run ? "01  Set up" : "Virtual folders"; checkable: true; checked: root.main-page == 0 || root.main-page == 3; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; root.pair-token = ""; } } }
+                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "Peers & sync"; checkable: true; checked: root.main-page == 1; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; } } }
+                Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "Receive repository"; checkable: true; checked: root.main-page == 4; enabled: !root.working && !root.modal && root.connected; clicked => { root.main-page = 4; root.pair-token = ""; root.refresh(); } } }
+                Text { text: "OWNER-LOCAL CONTROL"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
-                Text { text: "LOCAL MODE"; color: #8de0c4; font-size: 11px; font-weight: 700; }
-                Text { text: "Background workers keep your projects available when you close this window."; color: #afc4cf; font-size: 13px; wrap: word-wrap; }
+                Text { text: root.connected ? "●  Supervisor connected" : "○  Supervisor offline"; color: #8de0c4; font-size: 11px; font-weight: 700; }
+                Text { text: root.working ? "An operation is in progress. Please wait for its result." : "This window manages only this computer. Pairing authorizes published-data sync."; color: #afc4cf; font-size: 13px; wrap: word-wrap; }
                 Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; HorizontalLayout { padding: 4px; Button { text: "About Telekinesis"; enabled: !root.modal; clicked => { root.about-visible = true; } } } }
+                Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; Button { text: "Configuration…"; enabled: !root.working && !root.modal && !root.can-retry && !root.can-retry-branch; clicked => { root.config-input = root.config-path; root.config-visible = true; } } }
                 Text { text: "Made with Slint"; color: #afc4cf; font-size: 12px; }
             }
         }
         VerticalLayout {
-            padding: 28px; spacing: 18px;
+            padding: 24px; spacing: 16px;
             HorizontalLayout {
                 VerticalLayout {
                     spacing: 6px;
-                    Heading { text: root.main-page == 1 ? "Connect a server" : root.first-run ? "Make room for your projects" : "Projects"; }
-                    Caption { text: root.main-page == 1 ? "Pair this device for authorized published-data sync." : root.first-run ? "One portable installation, independent local workspaces." : "Manage the workspaces running on this computer."; }
+                    Heading { text: root.main-page == 4 ? "Receive a published repository" : root.main-page == 1 ? "Peers & published-data sync" : root.first-run ? "Set up this computer" : root.main-page == 3 ? "Folder details" : "Virtual folders"; }
+                    Caption { text: root.main-page == 1 ? "Pair this device for authorized published-data sync." : root.first-run ? "One portable installation, independent local workspaces." : "Independent local states, mount paths and durable history."; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
-                Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; visible: root.main-page == 0; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
+                Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; visible: root.main-page != 1; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
                 Button { text: "+ New project"; primary: true; enabled: root.connected && !root.working && !root.modal; visible: !root.first-run && root.main-page == 0; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
             }
-            if root.main-page == 0: Card {
+            if root.main-page != 1: Card {
                 height: 54px;
                 HorizontalLayout {
                     padding: 16px; spacing: 12px;
                     Rectangle { width: 9px; height: 9px; border-radius: 5px; background: root.connected ? #239675 : #c18c3f; }
                     Text { text: root.connection; color: AppTheme.foreground; vertical-alignment: center; overflow: elide; }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Caption { text: root.working ? "Working…" : "Local only"; vertical-alignment: center; }
+                    Caption { text: root.working ? "Working… actions paused" : "Owner-local control"; vertical-alignment: center; }
                 }
             }
             if root.first-run && root.main-page == 0: Card {
@@ -190,105 +235,199 @@ export component App inherits Window {
                     HorizontalLayout { LineEdit { accessible-label: "Project mount parent folder"; text <=> root.mount-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(1); } } }
                     HorizontalLayout { Text { text: "Maximum running projects"; color: AppTheme.foreground; vertical-alignment: center; } SpinBox { value <=> root.worker-limit; minimum: 1; maximum: 64; enabled: !root.working && !root.modal; } Rectangle { horizontal-stretch: 1; } }
                     Rectangle { height: 1px; background: AppTheme.border; }
-                    Caption { text: "Configuration is saved beside this application:"; }
+                    Caption { text: "Configuration will be saved to:"; }
                     Text { text: root.config-path; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                     Caption { text: "Mounting requires the installed WinFsp runtime. No network connection or service is configured."; wrap: word-wrap; }
-                    HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Save and connect"; primary: true; enabled: !root.working && !root.modal; clicked => { root.setup(); } } }
+                    HorizontalLayout { Button { text: "Use existing configuration…"; enabled: !root.working && !root.modal; clicked => { root.config-input = root.config-path; root.config-visible = true; } } Rectangle { horizontal-stretch: 1; } Button { text: "Save and connect"; primary: true; enabled: !root.working && !root.modal; clicked => { root.setup(); } } }
                     Rectangle { vertical-stretch: 1; }
                 }
             }
-            if root.main-page == 1: Card {
+            if root.main-page == 1: VerticalLayout {
+                spacing: 12px;
+                HorizontalLayout {
+                    Button { text: "Connect a server"; checkable: true; checked: root.pairing-page == 0; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 0; } }
+                    Button { text: "Peers & sync"; checkable: true; checked: root.pairing-page == 1; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 1; root.pair-token = ""; } }
+                    Button { text: "Server pairing code"; checkable: true; checked: root.pairing-page == 2; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 2; root.pair-token = ""; } }
+                }
+                if root.pairing-page == 0: Card {
                 ScrollView {
                     VerticalLayout { padding: 22px; spacing: 14px;
                         Text { text: "1  Protect this device's identity"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
                         Caption { text: "Create an outbound-only client, or load an existing client config. Keys are protected by Windows CurrentUser DPAPI; config stores only the credential reference. No listener or service is installed."; wrap: word-wrap; }
-                        LineEdit { accessible-label: "Pairing configuration path"; text <=> root.pair-config; enabled: !root.working; }
+                        LineEdit { accessible-label: "Pairing configuration path"; text <=> root.pair-config; enabled: !root.working && !root.modal; }
                         HorizontalLayout {
-                            Button { text: "Create protected client"; enabled: !root.working; clicked => { root.pair-action(1); } }
-                            Button { text: "Load / refresh client"; enabled: !root.working; clicked => { root.pair-confirmed = false; root.pair-action(0); } }
+                            Button { text: "Create protected client"; enabled: !root.working && !root.modal; clicked => { root.pair-action(1); } }
+                            Button { text: "Load / refresh client"; enabled: !root.working && !root.modal; clicked => { root.pair-confirmed = false; root.pair-action(0); } }
                         }
                         Text { text: root.pair-identity; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                         Rectangle { height: 1px; background: AppTheme.border; }
-                        Text { text: "2  Review the server invitation"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        Caption { text: "Use the server's numeric WSS address and /tkfs/sync path. Paste the one-time invitation privately; it is cleared from the input when inspected and never saved. WSS is required; no downgrade is offered."; wrap: word-wrap; }
-                        LineEdit { accessible-label: "Server WSS sync endpoint"; placeholder-text: "wss://192.0.2.1:8443/tkfs/sync"; text <=> root.pair-endpoint; enabled: root.pair-ready && !root.working; }
-                        LineEdit { accessible-label: "Secret one-time invitation"; input-type: password; placeholder-text: "Paste invitation privately"; text <=> root.pair-token; enabled: root.pair-ready && !root.working; }
-                        HorizontalLayout {
-                            Button { text: "Inspect invitation"; enabled: root.pair-ready && !root.working && root.pair-token != ""; clicked => { root.pair-action(2); } }
-                            Button { text: "Discard invitation"; enabled: !root.working && (root.pair-token != "" || root.pair-review != ""); clicked => { root.pair-action(10); } }
-                        }
+                        Text { text: "2  Review the server identity"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        Caption { text: "Ask the server owner for its public bootstrap JSON, enrollment WSS address and pairing code. The public certificate identifies the server; verify its fingerprint through a trusted channel."; wrap: word-wrap; }
+                        TextEdit { accessible-label: "Public server bootstrap JSON"; height: 110px; text <=> root.pair-bootstrap; enabled: root.pair-ready && !root.working && !root.modal; edited => { root.pair-confirmed = false; } }
+                        LineEdit { accessible-label: "Server WSS enrollment endpoint"; placeholder-text: "wss://192.0.2.1:8443/tkfs/enroll"; text <=> root.pair-enrollment; enabled: root.pair-ready && !root.working && !root.modal; edited => { root.pair-confirmed = false; } }
+                        Button { text: "Review public server identity"; enabled: root.pair-ready && !root.working && root.pair-bootstrap != "" && root.pair-enrollment != "" && !root.modal; clicked => { root.pair-action(12); } }
                         Text { text: root.pair-review; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
-                        CheckBox { text: "I verified the server's exact certificate fingerprint with its owner"; checked <=> root.pair-confirmed; enabled: root.pair-review != "" && !root.working; }
-                        Button { text: "Enroll this device"; primary: true; enabled: root.pair-ready && root.pair-review != "" && root.pair-confirmed && !root.working; clicked => { root.pair-action(3); } }
-                        Rectangle { height: 1px; background: AppTheme.border; }
+                        CheckBox { text: "I verified the exact certificate fingerprint with the server owner"; checked <=> root.pair-confirmed; enabled: root.pair-review != "" && !root.working && !root.modal; }
+                        Text { text: "3  Submit the pairing code"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        LineEdit { accessible-label: "200-digit server pairing code"; input-type: password; placeholder-text: "Paste exactly 200 decimal digits"; text <=> root.pair-token; enabled: root.pair-ready && !root.working && !root.modal; }
+                        Caption { text: "The code stays valid until the server owner resets it. It is cleared from this input on submission. A submitted enrollment still needs approval on the server; pairing never grants remote administration."; wrap: word-wrap; }
+                        HorizontalLayout {
+                            Button { text: "Submit enrollment"; primary: true; enabled: root.pair-ready && root.pair-confirmed && root.pair-token != "" && !root.working && !root.modal; clicked => { root.pair-action(13); } }
+                            Button { text: "Discard"; enabled: !root.working && !root.modal; clicked => { root.pair-action(10); } }
+                            Button { text: "Cancel network operation"; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
+                        }
+                        Caption { text: "Cancellation stops local I/O; a request already received by the server may still be pending approval. Refresh client status before resubmitting. No listener or background sync is started here."; wrap: word-wrap; }
+                    }
+                }
+                }
+                if root.pairing-page == 1: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 14px;
                         Text { text: "3  Wait for local approval on the server"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
                         Caption { text: "Give the server owner your installation ID and certificate fingerprint shown above. They must approve that exact key locally, then grant a published repository to your replica. This client cannot approve itself or administer the server."; wrap: word-wrap; }
                         for peer[index] in root.pair-peers: VerticalLayout {
-                            Button { text: peer.id + (peer.revoked ? " · Revoked" : " · Locally trusted key"); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working; clicked => { root.pair-selected-peer = index; root.pair-action(11); } }
+                            Button { text: peer.id + (peer.revoked ? " · Revoked" : " · Locally trusted key"); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working && !root.modal; clicked => { root.pair-selected-peer = index; root.pair-action(11); } }
                             Caption { text: "SHA-256: " + peer.fingerprint; wrap: word-wrap; font-size: 12px; }
                         }
-                        Button { text: "Check approval / load published repositories"; enabled: root.pair-ready && root.pair-peer-active && !root.working; clicked => { root.pair-action(4); } }
+                        Button { text: "Check approval / load published repositories"; enabled: root.pair-ready && root.pair-peer-active && !root.working && !root.modal; clicked => { root.pair-action(4); } }
                         Rectangle { height: 1px; background: AppTheme.border; }
                         Text { text: "4  Configure a matching local replica"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
                         for repo[index] in root.pair-repos: VerticalLayout {
-                            Button { text: repo.label + " · " + repo.id; checkable: true; checked: root.pair-selected-repo == index; enabled: !root.working; clicked => { root.pair-selected-repo = index; root.pair-grant-confirmed = false; } }
+                            Button { text: repo.label + " · " + repo.id; checkable: true; checked: root.pair-selected-repo == index; enabled: !root.working && !root.modal; clicked => { root.pair-selected-repo = index; root.pair-grant-confirmed = false; } }
+                            Button { text: "Receive into a new local replica…"; enabled: root.connected && !root.working; clicked => { root.receive-repository = repo.id; root.receive-label = repo.label; root.main-page = 4; root.refresh(); } }
                             Caption { text: "Published branches (all are synchronized):\n" + repo.branches; wrap: word-wrap; font-size: 12px; }
                         }
-                        Caption { text: "A running replica with the same repository ID and a different device ID is required. Select its native runtime.json. New replica provisioning/adoption is not supported by this screen. Mounting is configured on that local worker; sync leaves its current branch selected. Choose the local view in Branches & snapshots or the CLI."; wrap: word-wrap; }
-                        LineEdit { accessible-label: "Matching local replica runtime discovery path"; placeholder-text: "C:\\path\\to\\replica\\runtime.json"; text <=> root.pair-runtime; enabled: !root.working; }
-                        CheckBox { text: "Enable bidirectional sync for all published branches in this repository"; checked <=> root.pair-grant-confirmed; enabled: root.pair-repo-selected && !root.working; }
-                        Button { text: "Configure published-data sync"; enabled: root.pair-repo-selected && root.pair-runtime != "" && root.pair-grant-confirmed && !root.working; clicked => { root.pair-action(5); } }
+                        Caption { text: "A running replica with the same repository ID and a different device ID is required. Select its native runtime.json. Use Receive repository to prepare a new managed replica. Adoption of external stores is unavailable. Mounting is configured on that local worker; sync leaves its current branch selected. Choose the local view in Branches & snapshots or the CLI."; wrap: word-wrap; }
+                        LineEdit { accessible-label: "Matching local replica runtime discovery path"; placeholder-text: "C:\\path\\to\\replica\\runtime.json"; text <=> root.pair-runtime; enabled: !root.working && !root.modal; }
+                        CheckBox { text: "Enable bidirectional sync for all published branches in this repository"; checked <=> root.pair-grant-confirmed; enabled: root.pair-repo-selected && !root.working && !root.modal; }
+                        Button { text: "Configure published-data sync"; enabled: root.pair-repo-selected && root.pair-runtime != "" && root.pair-grant-confirmed && !root.working && !root.modal; clicked => { root.pair-action(5); } }
                         Text { text: root.pair-local; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                         HorizontalLayout {
-                            Button { text: "Sync now / next page"; enabled: root.pair-ready && root.pair-repo-selected && !root.working; clicked => { root.pair-action(6); } }
-                            Button { text: "Pause sync"; enabled: root.pair-repo-selected && !root.working; clicked => { root.pair-action(7); } }
-                            Button { text: "Resume sync grant"; enabled: root.pair-repo-selected && !root.working; clicked => { root.pair-action(8); } }
+                            Button { text: "Sync now / next page"; enabled: root.pair-ready && root.pair-repo-selected && !root.working && !root.modal; clicked => { root.pair-action(6); } }
+                            Button { text: "Pause sync"; enabled: root.pair-repo-selected && !root.working && !root.modal; clicked => { root.pair-action(7); } }
+                            Button { text: "Resume sync grant"; enabled: root.pair-repo-selected && !root.working && !root.modal; clicked => { root.pair-action(8); } }
                         }
-                        Caption { text: "Private branches and deleted private history stay local. Cancel stops local I/O; it does not undo enrollment or committed sync data. An uncertain enrollment may require a fresh invitation. No background sync service is started by this flow."; wrap: word-wrap; }
-                        Button { text: "Cancel current network operation"; enabled: root.working && root.pair-cancellable; clicked => { root.pair-cancel(); } }
+                        Caption { text: "Private branches and deleted private history stay local. Cancel stops local I/O; it does not undo enrollment or committed sync data. An interrupted enrollment may still await server approval. No background sync service is started by this flow."; wrap: word-wrap; }
+                        Button { text: "Cancel current network operation"; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
                         Text { text: root.pair-syncs; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                         for grant[index] in root.pair-grants: VerticalLayout {
                             Caption { text: "Configured repository: " + grant.repo + (grant.revoked ? " · Revoked" : grant.enabled ? " · Enabled" : " · Paused"); wrap: word-wrap; }
                             HorizontalLayout {
-                                Button { text: "Sync configured repository"; enabled: root.pair-ready && grant.enabled && !grant.revoked && !root.working; clicked => { root.pair-grant-action(index, 0); } }
-                                Button { text: grant.enabled ? "Pause" : "Resume"; enabled: !grant.revoked && !root.working; clicked => { root.pair-grant-action(index, grant.enabled ? 1 : 2); } }
+                                Button { text: "Sync configured repository"; enabled: root.pair-ready && grant.enabled && !grant.revoked && !root.working && !root.modal; clicked => { root.pair-grant-action(index, 0); } }
+                                Button { text: grant.enabled ? "Pause" : "Resume"; enabled: !grant.revoked && !root.working && !root.modal; clicked => { root.pair-grant-action(index, grant.enabled ? 1 : 2); } }
                             }
                         }
-                        CheckBox { text: "I understand revocation is local and cannot be undone with Resume"; checked <=> root.pair-revoke-confirmed; enabled: root.pair-peer-active && !root.working; }
-                        Button { text: "Revoke selected peer locally"; enabled: root.pair-peer-active && root.pair-revoke-confirmed && !root.working; clicked => { root.pair-action(9); } }
+                        CheckBox { text: "I understand revocation is local and cannot be undone with Resume"; checked <=> root.pair-revoke-confirmed; enabled: root.pair-peer-active && !root.working && !root.modal; }
+                        Button { text: "Revoke selected peer locally"; enabled: root.pair-peer-active && root.pair-revoke-confirmed && !root.working && !root.modal; clicked => { root.pair-action(9); } }
                     }
                 }
             }
-            if !root.first-run && root.main-page == 0: HorizontalLayout {
-                spacing: 18px;
-                Card {
-                    width: 240px;
-                    VerticalLayout {
-                        padding: 16px; spacing: 12px;
-                        Text { text: "WORKSPACES"; color: AppTheme.muted; font-size: 11px; font-weight: 700; }
-                        if root.projects.length == 0: VerticalLayout {
-                            spacing: 12px;
-                            Text { text: root.connected ? "Your first project starts here" : "Projects are unavailable"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; wrap: word-wrap; }
-                            Caption { text: root.connected ? "Create a project and choose its mount folder. Its history stays in your native data folder." : "Reconnect to load the catalog. Existing project data is preserved."; wrap: word-wrap; }
-                            Rectangle { vertical-stretch: 1; }
-                        }
-                        if root.projects.length > 0: ListView {
-                            for project[index] in root.projects: VerticalLayout {
-                                padding-bottom: 9px; spacing: 3px;
-                                Button { text: project.label; checkable: true; checked: root.selected == index; enabled: !root.working && !root.modal; clicked => { root.select-project(index); } }
-                                Caption { text: project.status; font-size: 12px; }
+                if root.pairing-page == 2: Card { VerticalLayout { padding: 24px; spacing: 16px;
+                    Text { text: "Server pairing code"; color: AppTheme.foreground; font-size: 21px; font-weight: 600; }
+                    Caption { text: "Reset the code for an owner-local orchestrator configuration. The pairing service must explicitly reference this same configuration to accept it. This action does not start a listener."; wrap: word-wrap; }
+                    LineEdit { accessible-label: "Server orchestrator configuration"; text <=> root.server-config; enabled: !root.working && !root.modal; edited => { root.server-reset-confirmed = false; } }
+                    Caption { text: "A reset creates exactly 200 decimal digits and displays them once. Only a salted verifier is stored beside the configuration. Save the code privately while it is visible; it cannot be recovered later."; wrap: word-wrap; }
+                    Caption { text: "The code can be used until the next reset. Resetting invalidates the old code for future enrollments. Existing peers, grants, sync and already submitted approvals remain unchanged."; wrap: word-wrap; }
+                    CheckBox { text: "I understand: the old code will stop working and the new code is shown once"; checked <=> root.server-reset-confirmed; enabled: !root.working && !root.modal; }
+                    Button { text: root.working ? "Resetting…" : "Reset pairing code"; primary: true; enabled: root.server-reset-confirmed && root.server-config != "" && !root.working && !root.modal; clicked => { root.reset-pairing-code(); } }
+                    Caption { text: "Lost the code or closed the result? Reset again explicitly. A failed or interrupted reset is never retried automatically."; wrap: word-wrap; }
+                    Rectangle { vertical-stretch: 1; }
+                } }
+            }
+            if root.main-page == 4: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 16px;
+                Text { text: "1  Prepare or resume a local replica"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
+                Caption { text: "Enter the source repository UUID, or use an authorized repository discovered in Peers & sync. Preparation creates a new local device and headless worker. It never mounts incomplete data or grants access on another computer."; wrap: word-wrap; }
+                HorizontalLayout {
+                    LineEdit { accessible-label: "Receiving replica label"; placeholder-text: "Local folder name"; text <=> root.receive-label; enabled: !root.working && root.connected && !root.modal; }
+                    LineEdit { accessible-label: "Source repository UUID"; placeholder-text: "Repository UUID supplied by source owner"; text <=> root.receive-repository; enabled: !root.working && root.connected && !root.modal; }
+                    Button { text: "Prepare headless replica"; enabled: root.connected && !root.working && !root.can-retry && root.receive-label != "" && root.receive-repository != "" && !root.modal; clicked => { root.receive-action(0); } }
+                }
+                Caption { text: "Resume from a managed state (identities and grants survive closing this window):"; }
+                for project[index] in root.projects: Button { text: project.label + (project.mount == "" ? " · Headless" : " · Mount reserved"); checkable: true; checked: root.selected == index; enabled: !root.working && root.connected && !root.modal; clicked => { root.select-project(index); } }
+                Text { text: root.receive-status; color: AppTheme.foreground; wrap: word-wrap; font-size: 16px; font-weight: 600; }
+                if root.receive-state != "": VerticalLayout { spacing: 12px;
+                    Text { text: "Repository: " + root.receive-repo-id + "\nLocal device: " + root.receive-device + "\nState: " + root.receive-state; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                    Caption { text: "Give this public local device ID to the source owner for their existing repository grant. Pairing alone grants no repository access. The source owner chooses its local runtime and grants your installation + this device; no remote grant command is sent here."; wrap: word-wrap; }
+                    Button { text: root.receive-headless ? "Start headless / resume validation" : "Start mounted worker"; enabled: !root.working && !root.receive-running && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(6); } }
+                    Text { text: "2  Discover, authorize locally and catch up"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
+                    Caption { text: "Select the source peer. Until its owner grants access, discovery may be empty or refused."; wrap: word-wrap; }
+                    for peer[index] in root.pair-peers: Button { text: peer.id + (peer.revoked ? " · Revoked" : ""); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working && !peer.revoked && root.connected && !root.modal; clicked => { root.pair-selected-peer = index; root.receive-confirmed = false; root.pair-action(11); } }
+                    Button { text: "Refresh source repository discovery"; enabled: !root.working && root.pair-peer-active && root.connected && !root.modal; clicked => { root.pair-action(4); } }
+                    for repo in root.pair-repos: Caption { text: repo.label + " · " + repo.id; wrap: word-wrap; }
+                    CheckBox { text: "Allow bidirectional sync of every published branch in this repository"; checked <=> root.receive-confirmed; enabled: !root.working && root.receive-headless && root.receive-running && root.pair-peer-active && root.connected && !root.modal; }
+                    Button { text: "Configure matching local replica"; enabled: !root.working && root.receive-confirmed && root.receive-headless && root.receive-running && root.connected && !root.modal; clicked => { root.receive-action(1); } }
+                    HorizontalLayout {
+                        Button { text: "Sync now / next page"; enabled: !root.working && root.receive-headless && root.receive-running && root.pair-peer-active && root.connected && !root.modal; clicked => { root.receive-action(2); } }
+                        Button { text: "Cancel sync"; enabled: root.working && root.pair-cancellable && root.connected && !root.modal; clicked => { root.pair-cancel(); } }
+                    }
+                    Caption { text: "Cancellation retains committed pages. A restarted worker, changed or paused grant, or new pending data requires fresh sync before mounting."; wrap: word-wrap; }
+                    Text { text: "3  Validate the received branch, then mount"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
+                    for branch[index] in root.branches: VerticalLayout { if branch.shared: Button { text: branch.label + (branch.current ? " · Current" : ""); checkable: true; checked: root.selected-branch == index; enabled: !root.working && root.connected && !root.modal; clicked => { root.selected-branch = index; } } }
+                    HorizontalLayout {
+                        Button { text: "Select and verify shared branch"; enabled: !root.working && root.receive-caught-up && root.receive-running && root.selected-branch >= 0 && !root.can-retry-branch && root.connected && !root.modal; clicked => { root.receive-action(3); } }
+                        Button { text: "Stop verified headless worker"; enabled: !root.working && root.receive-materialized && root.receive-running && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(4); } }
+                    }
+                    LineEdit { accessible-label: "First mount path for received replica"; placeholder-text: "New absolute mount folder, with an existing parent"; text <=> root.receive-mount; enabled: !root.working && root.receive-can-attach && root.connected && !root.modal; }
+                    Button { text: "Reserve first mount"; enabled: !root.working && root.receive-can-attach && root.receive-mount != "" && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(5); } }
+                    Caption { text: "Branch checkout verifies causal completeness and visible objects. Mount reservation leaves the worker stopped; start it explicitly afterward. If this window closes before reservation, start headless and repeat sync/branch verification."; wrap: word-wrap; }
+                }
+                Rectangle { height: 1px; background: AppTheme.border; }
+                Text { text: "Background published-data sync"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
+                Caption { text: "The local supervisor runs ALL configured enabled grants in the loaded outbound client configuration. Paused grants stay paused. Enabling is durable intent; service status below reports actual startup. Running service does not mean every repository is caught up."; wrap: word-wrap; }
+                Text { text: root.pair-config; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                Text { text: root.background-sync-status; color: AppTheme.foreground; wrap: word-wrap; }
+                HorizontalLayout {
+                    Button { text: "Enable supervised sync"; enabled: root.connected && root.pair-ready && !root.working && !root.can-retry && !root.modal; clicked => { root.background-sync-action(true); } }
+                    Button { text: "Disable supervised sync"; enabled: root.connected && !root.working && !root.can-retry && !root.modal; clicked => { root.background-sync-action(false); } }
+                }
+                Caption { text: "Uses the existing protected credential; no new listener or identity is created. Closing the GUI keeps desired background sync with the local supervisor. Disabling the service does not change repository grants."; wrap: word-wrap; }
+            } } }
+            if !root.first-run && root.main-page == 0: VerticalLayout {
+                spacing: 16px;
+                HorizontalLayout { spacing: 12px; height: 95px;
+                    Stat { label: "Local folders"; value: root.projects.length; }
+                    Stat { label: "Workers running"; value: root.connected ? root.running-count : "—"; }
+                    Stat { label: "Need attention"; value: root.connected ? root.attention-count : "—"; }
+                }
+                Card { VerticalLayout { padding: 16px; spacing: 12px;
+                    HorizontalLayout {
+                        Text { text: "Folders on this computer"; font-size: 17px; font-weight: 600; color: AppTheme.foreground; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        LineEdit { accessible-label: "Search virtual folders"; placeholder-text: "Search name or mount path"; text <=> root.project-filter; edited => { root.filter-projects(self.text); } }
+                        Button { text: "Clear"; enabled: root.project-filter != ""; clicked => { root.project-filter = ""; root.filter-projects(""); } }
+                    }
+                    HorizontalLayout { padding: 8px; spacing: 14px;
+                        Caption { text: "Name"; width: 210px; }
+                        Caption { text: "Mount point"; horizontal-stretch: 1; }
+                        Caption { text: "Observed status"; width: 170px; }
+                    }
+                    Rectangle { height: 1px; background: AppTheme.border; }
+                    if root.visible-projects.length == 0: VerticalLayout { padding: 28px; spacing: 12px;
+                        Text { text: root.projects.length == 0 ? (root.connected ? "Create your first virtual folder" : "Connect to load your folders") : "No folders match your search"; color: AppTheme.foreground; font-size: 21px; wrap: word-wrap; }
+                        Caption { text: root.projects.length == 0 ? "Each project keeps an independent local store and durable history. Choose its mount path when creating it." : "Try a different name or path, or clear the search."; wrap: word-wrap; }
+                    }
+                    ListView {
+                        for index in root.visible-projects: VerticalLayout { spacing: 8px; padding-bottom: 10px;
+                            HorizontalLayout { spacing: 14px;
+                                Button { width: 210px; text: root.projects[index].label; accessible-label: "Open details for " + root.projects[index].label; enabled: root.connected && !root.working && !root.modal; clicked => { root.main-page = 3; root.select-project(index); } }
+                                Text { text: root.projects[index].mount; color: AppTheme.foreground; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; font-size: 12px; }
+                                Text { text: root.connected ? root.projects[index].status : "Unknown · stale"; color: AppTheme.foreground; width: 170px; vertical-alignment: center; overflow: elide; }
                             }
+                            Rectangle { height: 1px; background: AppTheme.border; }
                         }
                     }
-                }
+                    Caption { text: root.visible-projects.length + " shown · " + root.projects.length + " total · this host"; }
+                } }
+            }
+            if !root.first-run && root.main-page == 3: VerticalLayout {
+                spacing: 12px;
+                HorizontalLayout { Button { text: "‹ All virtual folders"; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; root.pair-token = ""; } } Rectangle { horizontal-stretch: 1; } }
                 Card {
                     VerticalLayout {
                         padding: 22px; spacing: 14px;
                         Text { text: root.selected >= 0 && root.selected < root.projects.length ? root.projects[root.selected].label : "Project details"; color: AppTheme.foreground; font-size: 22px; font-weight: 600; }
                         if root.selected >= 0 && root.selected < root.projects.length: HorizontalLayout {
                             Button { text: "Open folder"; enabled: root.connected && !root.working && !root.modal && (root.projects[root.selected].status == "Running" || root.projects[root.selected].status == "Needs attention" || root.projects[root.selected].status == "Stopping · files in use") && root.projects[root.selected].mount != ""; clicked => { root.open-project(); } }
-                            Button { text: "Start project"; enabled: root.can-start-project; clicked => { root.start-project(); } }
-                            Button { text: "Stop project"; enabled: root.can-stop-project; clicked => { root.stop-project(); } }
+                            Button { text: "Start / mount"; enabled: root.can-start-project; clicked => { root.start-project(); } }
+                            Button { text: "Stop / unmount"; enabled: root.can-stop-project; clicked => { root.stop-project(); } }
                         }
                         if root.selected >= 0: HorizontalLayout {
                             Button { text: "Overview"; checkable: true; checked: root.details-page == 0; enabled: !root.modal; clicked => { root.details-page = 0; } }
@@ -410,6 +549,30 @@ export component App inherits Window {
             }
         }
     }
+    if root.server-code-visible: Rectangle {
+        background: #101828dd;
+        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 700px; height: 370px;
+            VerticalLayout { padding: 26px; spacing: 16px;
+                Heading { text: "Pairing code · shown once"; }
+                Caption { text: "Save these 200 digits privately now. Closing this result erases the displayed value. You cannot reveal it again; reset creates a replacement."; wrap: word-wrap; }
+                TextEdit { accessible-label: "Show-once 200-digit pairing code"; text: root.server-code; read-only: true; height: 125px; font-family: "Consolas"; font-size: 16px; }
+                Caption { text: "Valid until the next reset. Existing paired devices remain paired. This value is never copied to the clipboard automatically."; wrap: word-wrap; }
+                Button { text: "I saved it — close and erase"; primary: true; clicked => { root.dismiss-server-code(); } }
+            }
+        }
+    }
+    if root.config-visible: Rectangle {
+        background: #101828aa;
+        Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 650px; height: 310px;
+            VerticalLayout { padding: 26px; spacing: 16px;
+                Heading { text: "Choose configuration"; }
+                Caption { text: "Enter an existing orchestrator TOML file. Switching changes the installation managed by this window; existing workers keep running."; wrap: word-wrap; }
+                LineEdit { accessible-label: "Orchestrator configuration file"; text <=> root.config-input; placeholder-text: "C:\\Telekinesis\\orchestrator.toml"; enabled: !root.working; }
+                Caption { text: "The file is validated before switching. Pending requests must be resolved first. Pairing uses its own separate configuration."; wrap: word-wrap; }
+                HorizontalLayout { Button { text: "Cancel"; enabled: !root.working; clicked => { root.config-visible = false; } } Rectangle { horizontal-stretch: 1; } Button { text: "Load configuration"; primary: true; enabled: !root.working && root.config-input != ""; clicked => { root.select-config(); } } }
+            }
+        }
+    }
     if root.about-visible: Rectangle {
         background: #142e3c99;
         Card { x: (parent.width - self.width)/2; y: (parent.height - self.height)/2; width: 610px; height: 430px;
@@ -418,7 +581,7 @@ export component App inherits Window {
                 Caption { text: "Experimental Windows local filesystem manager. One application executable; isolated supervisor and worker processes. WinFsp is required for mounted projects."; wrap: word-wrap; }
                 AboutSlint { height: 105px; }
                 Caption { text: "Slint 1.17.0 uses the Royalty-free Desktop, Mobile, and Web Applications License 2.0 with AboutSlint attribution. This does not impose GPL on your own application code. This repository already declares GPL-3.0-or-later independently. See the bundled license texts and THIRD-PARTY-NOTICES.md."; wrap: word-wrap; }
-                Caption { text: "Local projects and guided outbound WSS pairing are supported. Replica provisioning/adoption, trash, and Windows service setup are deferred."; wrap: word-wrap; }
+                Caption { text: "Local projects and guided outbound WSS pairing are supported. Managed replica receiving and supervised outbound sync are supported. External-store adoption, trash, and Windows service setup are deferred."; wrap: word-wrap; }
                 HorizontalLayout { Rectangle { horizontal-stretch: 1; } Button { text: "Close"; clicked => { root.about-visible = false; } } }
             }
         }

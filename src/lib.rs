@@ -11,6 +11,7 @@ pub mod local_ipc;
 #[cfg(target_os = "linux")]
 #[path = "local_ipc_linux.rs"]
 pub mod local_ipc;
+pub mod managed_pairing;
 #[cfg(windows)]
 pub mod mount;
 #[cfg(target_os = "linux")]
@@ -20,6 +21,7 @@ pub mod onboarding;
 pub mod orchestrator;
 pub mod paired_sync;
 pub mod pairing;
+pub mod pairing_code;
 pub mod pairing_service;
 pub mod private_storage;
 pub mod runtime;

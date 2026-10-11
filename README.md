@@ -63,13 +63,14 @@ lasting findings in `docs/` instead of committing generated reports or fixtures.
 [ORCHESTRATOR-PLAN.md](docs/ORCHESTRATOR-PLAN.md) records the implemented local O1
 slice and later product direction. `orchestrator` supervises independent worker
 processes from one TOML defaults file and an owner-protected SQLite registry.
-`manage` uses a separate same-user Windows named pipe for create/list/inspect,
-start/stop, operation lookup and orderly supervisor shutdown. Managed O1 workers
-have no peer replication; existing mounted store commands remain compatible.
-Adoption, mount reassignment/trash/restore, O1 integration of pairing/catalog
-contracts and service installation are deferred. Persistent pairing is implemented
-as a separate portable service, described below. The portable Slint desktop uses
-the same executable and management API.
+`manage` uses same-owner Windows named pipes or Linux Unix sockets for lifecycle,
+operation lookup, numeric pairing-code reset and orderly shutdown. Owner-mediated
+receive prepares a fresh same-repository replica and attaches its first mount
+after shared-branch verification. O1 can supervise a preprovisioned outbound WSS
+pairing service independently of the GUI. Adoption, general mount reassignment,
+trash/restore and service installation remain deferred. The Windows Slint desktop
+uses the same executable and management API; see the
+[desktop workflow](docs/DESKTOP-PAIRING.md) and [delivery ledger](docs/DESKTOP-EVOLUTION.md).
 
 ## Portable desktop application
 
@@ -97,7 +98,7 @@ to another configuration or data root.
 
 Existing configurations are validated, and the client checks API version,
 installation identity, effective data root, build version, and capabilities before
-attaching. After the first connection an adjacent `.tkfs-ui-identity.json` pins the
+attaching. After the first connection config-scoped desktop metadata pins the
 catalog identity; a missing pinned catalog is refused. Established missing,
 empty, truncated or unrecognized catalogs are never initialized again. Only a
 fresh empty directory or a valid initial-bootstrap marker allows creation;
@@ -125,10 +126,11 @@ actions are new private branch, switch to a selected branch, publish the current
 visible state into a NEW shared branch (requiring explicit checkbox confirmation),
 save a checkpoint, and restore a checkpoint into a NEW private branch. Creating,
 publishing, and restoring do not switch the current branch. Managed projects have
-no configured peer; Shared does not mean uploaded. Branch deletion, rename,
-merging, pairing, and conflict resolution are not exposed by this slice.
+no implicit configured peer; Shared does not mean uploaded. Pairing and configured
+published-data sync are separate explicit actions. Branch deletion, rename,
+merging and conflict resolution are not exposed by this slice.
 
-Branch requests are saved separately in `.tkfs-ui-branch-operation.json` before
+Branch requests are saved separately in desktop metadata before
 delivery, with installation/state/repository/device identity, original UUID,
 payload and view generation. Retry uses the original request even after a lost
 checkout response. Dialogs capture their project and active branch; a changed
@@ -138,11 +140,21 @@ abort API. Branch RPC stays on the controller worker, without shell commands or
 direct store access.
 
 Mutation UUIDs, exact payloads, and expected generations are persisted before
-send in `.tkfs-ui-operation.json`. A timeout is uncertain delivery, not cancellation.
+send in the desktop operation journal. A timeout is uncertain delivery, not cancellation.
 Pending operations are inspected/retried using the same request. Terminal stale
 generation failures require refreshing and issuing a new action. There are no
-percentage progress or cancellation APIs. Managed workers have no peer configured;
-the UI does not expose networking, adoption, trash, mount reassignment, or services.
+percentage progress or lifecycle cancellation APIs. Pairing network work has its
+own cancellation and grant controls. Adoption, trash and general mount
+reassignment remain unsupported.
+
+Desktop records live under `.tkfs-desktop/<canonical-config-scope>/`, in separate
+`identity`, `operation` and `branch-operation` directories. The dedicated leaf
+permits atomic journal replacement while protected pairing ancestors remain
+pinned. Matching legacy `.tkfs-ui-*.json` records migrate under the original
+locks with exact pending UUID/payload/generation preserved. Legacy bytes remain
+for verification; changes by an older client are refused rather than overwriting
+either history. Do not alternate old and new binaries against these journals
+without reconciling any reported conflict.
 
 Slint is pinned to 1.17.0 with the winit Windows backend, software renderer, and
 accessibility support. Slint uses the Royalty-free Desktop, Mobile, and Web
@@ -724,14 +736,14 @@ connections that carry changes in both directions. B's mount reads its own local
 SQLite/CAS; it is not a remote filesystem mount or an ordinary folder watched by
 a sync agent. Save and close files inside the TKFS mount to publish shared changes.
 
-**Current integration gap:** O1 runs on Windows and Linux, but its
-`orchestrator.toml` must keep networking disabled. WSS uses a separate
-`pairing.toml` and `tkfs pairing ... run` process, which O1 does not supervise.
-O1 `create` cannot select an existing repository UUID or adopt a downloaded
-replica. Therefore A can use a managed worker, while B's replica below uses
-`init --state ... --repo ...` and a separately started `daemon`. B's O1/desktop
-can manage other local projects, but this replica is not added to that catalog.
-There is no remote create/mount command. See [local onboarding](docs/ONBOARDING.md).
+The standalone workflow below remains supported. For a managed receiving replica,
+the desktop receive wizard (or owner-local `prepare-replica`) allocates the new
+device ID for A's existing grant authorization, verifies the received shared
+branch, and attaches a local mount. O1 can supervise B's separately configured
+outbound WSS service through `configure-background-sync`; its own TOML network
+section stays disabled. There is no remote create/mount command or automatic
+grant issuance. See [desktop pairing](docs/DESKTOP-PAIRING.md) and
+[local onboarding](docs/ONBOARDING.md).
 
 ### 1. Choose owners, paths and an already authorized network route
 

@@ -21,6 +21,8 @@ use std::{
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(skip)]
+    source_path: PathBuf,
     format_version: u32,
     pub installation_id: Option<String>,
     pub default_mount_directory: Option<PathBuf>,
@@ -59,6 +61,23 @@ impl Default for Workers {
     }
 }
 impl Config {
+    /// Read an already initialized local O1 identity without bootstrapping it.
+    pub fn existing_installation(&self) -> Result<String> {
+        ensure!(
+            self.data_directory.is_dir()
+                && self.data_directory.join("orchestrator.sqlite").is_file(),
+            "ORCHESTRATOR_NOT_INITIALIZED"
+        );
+        let directory = crate::private_storage::Directory::open(&self.data_directory)?;
+        let path = self.data_directory.join("orchestrator.sqlite");
+        let _file = directory.file(&path, false, false)?;
+        ensure!(
+            catalog_preflight(&self.data_directory, self, &local_ipc::owner_sid()?)?.is_none(),
+            "ORCHESTRATOR_NOT_INITIALIZED"
+        );
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(db.query_row("SELECT id FROM installation", [], |r| r.get(0))?)
+    }
     pub fn control_endpoint(&self) -> String {
         #[cfg(windows)]
         {
@@ -130,6 +149,7 @@ impl Config {
             config.data_directory = path.parent().unwrap().join(&config.data_directory);
         }
         config.data_directory = std::path::absolute(&config.data_directory)?;
+        config.source_path = path;
         Ok(config)
     }
 }
@@ -137,7 +157,12 @@ impl Config {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
+    ResetPairingCode {},
     Hello,
+    BackgroundSyncStatus,
+    ConfigureBackgroundSync {
+        config: Option<PathBuf>,
+    },
     List,
     Inspect {
         state: String,
@@ -148,6 +173,18 @@ pub enum Action {
     Create {
         label: String,
         mount: Option<PathBuf>,
+    },
+    PrepareReplica {
+        label: String,
+        repo: String,
+    },
+    AttachMount {
+        state: String,
+        mount: PathBuf,
+        #[serde(default)]
+        expected_branch: Option<String>,
+        #[serde(default)]
+        expected_branch_generation: Option<u64>,
     },
     Start {
         state: String,
@@ -161,7 +198,14 @@ impl Action {
     pub fn mutates(&self) -> bool {
         matches!(
             self,
-            Self::Create { .. } | Self::Start { .. } | Self::Stop { .. } | Self::Shutdown
+            Self::Create { .. }
+                | Self::ConfigureBackgroundSync { .. }
+                | Self::PrepareReplica { .. }
+                | Self::AttachMount { .. }
+                | Self::Start { .. }
+                | Self::Stop { .. }
+                | Self::Shutdown
+                | Self::ResetPairingCode {}
         )
     }
 }
@@ -234,6 +278,7 @@ pub struct Supervisor {
     children: BTreeMap<String, Child>,
     exit_requested: bool,
     instance: String,
+    background: crate::managed_pairing::Controller,
 }
 pub(crate) fn lock(path: &Path) -> Result<File> {
     #[cfg(windows)]
@@ -368,6 +413,9 @@ fn retryable(error: &anyhow::Error) -> bool {
         "WORKER_START",
         "WORKER_EXIT",
         "SHUTDOWN_PENDING",
+        // Uncertain service drain requires explicit operator recovery. Keep
+        // the shutdown intent pending so tick cannot restart stopped workers.
+        "MANAGED_PAIRING_DRAIN_UNCERTAIN",
     ]
     .iter()
     .any(|code| message.contains(code))
@@ -519,6 +567,18 @@ impl Supervisor {
             crate::core::fault("orchestrator_bootstrap_marked");
         }
         let mut db = if bootstrap.is_some() {
+            // SQLite inherits the process umask for a new database. Create it
+            // privately first; never change permissions of an existing catalog.
+            #[cfg(target_os = "linux")]
+            if !root.join("orchestrator.sqlite").try_exists()? {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(root.join("orchestrator.sqlite"))?;
+            }
             Connection::open(root.join("orchestrator.sqlite"))?
         } else {
             Connection::open_with_flags(
@@ -564,6 +624,8 @@ impl Supervisor {
             fs::create_dir_all(&path)?;
             no_reparse(&path)?;
         }
+        // Existing catalog identity/schema has already passed read-only validation.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS local_services(name TEXT PRIMARY KEY,binding TEXT NOT NULL)")?;
         Ok(Self {
             config,
             db,
@@ -573,7 +635,27 @@ impl Supervisor {
             children: BTreeMap::new(),
             exit_requested: false,
             instance: id(),
+            background: crate::managed_pairing::Controller::new(),
         })
+    }
+    fn background_binding(&self) -> Result<Option<crate::managed_pairing::Binding>> {
+        let value: Option<String> = self
+            .db
+            .query_row(
+                "SELECT binding FROM local_services WHERE name='pairing'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).context("INVALID_BACKGROUND_SYNC_BINDING"))
+            .transpose()
+    }
+    fn background_status(&self) -> Result<Value> {
+        let binding = self.background_binding()?;
+        Ok(
+            json!({"desired_enabled":binding.is_some(),"binding":binding,"service":self.background.status(),"scope":"all-configured-enabled-grants"}),
+        )
     }
     fn state(&self, state: &str) -> Result<State> {
         self.db.query_row("SELECT id,repo,device,operation,label,mount,desired,ready,generation FROM states WHERE id=?",[state],|r| {
@@ -591,7 +673,9 @@ impl Supervisor {
     }
     pub fn generation(&self, action: &Action) -> Result<u64> {
         match action {
-            Action::Start { state } | Action::Stop { state } => Ok(self.state(state)?.generation),
+            Action::Start { state }
+            | Action::Stop { state }
+            | Action::AttachMount { state, .. } => Ok(self.state(state)?.generation),
             _ => Ok(self
                 .db
                 .query_row("SELECT generation FROM installation", [], |r| r.get(0))?),
@@ -667,7 +751,7 @@ impl Supervisor {
             .get(&state.marker.state)
             .map(|o| o.value.clone())
             .unwrap_or(json!({"status":"pending"}));
-        json!({"state_id":state.marker.state,"repo_id":state.marker.repo,"device_id":state.marker.device,"label":state.label,"mount":state.mount,"desired_running":state.desired,"management_generation":state.generation,"observation":observation})
+        json!({"state_id":state.marker.state,"repo_id":state.marker.repo,"device_id":state.marker.device,"label":state.label,"mount":state.mount,"native_directory":self.root(state),"runtime_path":self.root(state).join("runtime.json"),"desired_running":state.desired,"management_generation":state.generation,"observation":observation})
     }
     fn create_native(&mut self, state: &State) -> Result<()> {
         if state.ready {
@@ -989,14 +1073,17 @@ impl Supervisor {
             .as_deref()
             .context("OPERATION_ID_REQUIRED")?;
         let result = (|| -> Result<Value> {
-            if matches!(request.action, Action::Create { .. } | Action::Start { .. }) {
+            if matches!(
+                request.action,
+                Action::Create { .. } | Action::PrepareReplica { .. } | Action::Start { .. }
+            ) {
                 ensure!(
                     !self.shutdown_pending()?,
                     "SHUTDOWN_PENDING: retry shutdown before resuming worker operations"
                 );
             }
             match &request.action {
-                Action::Create { .. } => {
+                Action::Create { .. } | Action::PrepareReplica { .. } => {
                     let state_id: String = self.db.query_row(
                         "SELECT id FROM states WHERE operation=?",
                         [operation],
@@ -1013,6 +1100,12 @@ impl Supervisor {
                     self.reconcile_one(&state, true)?;
                     Ok(self.observed(&state))
                 }
+                Action::AttachMount { state, .. } => Ok(self.observed(&self.state(state)?)),
+                Action::ConfigureBackgroundSync { .. } => {
+                    let binding = self.background_binding()?;
+                    self.background.reconcile(binding.as_ref())?;
+                    self.background_status()
+                }
                 Action::Shutdown => {
                     // Preflight ALL workers before fencing/stopping any. A racing
                     // new open can still make stop retryable; intent remains durable.
@@ -1027,6 +1120,7 @@ impl Supervisor {
                         state.desired = false;
                         self.reconcile_one(&state, true)?;
                     }
+                    self.background.shutdown()?;
                     self.exit_requested = true;
                     Ok(json!({"status":"stopped"}))
                 }
@@ -1043,7 +1137,7 @@ impl Supervisor {
         self.complete(operation, &response, response["retryable"] != true)?;
         if response["retryable"] == true {
             let state_id = match &request.action {
-                Action::Create { .. } => self
+                Action::Create { .. } | Action::PrepareReplica { .. } => self
                     .db
                     .query_row(
                         "SELECT id FROM states WHERE operation=?",
@@ -1074,17 +1168,36 @@ impl Supervisor {
         if let Some(expected) = &request.target_installation {
             ensure!(expected == &identity, "INSTALLATION_ID_MISMATCH");
         }
+        // A reset is intentionally outside durable/replayable operation receipts.
+        // Commit precedes delivery. Lost delivery requires another explicit reset.
+        if matches!(request.action, Action::ResetPairingCode {}) {
+            ensure!(
+                request.operation_id.is_none() && request.expected_generation.is_none(),
+                "PAIRING_RESET_CANNOT_BE_REPLAYED"
+            );
+            let current = Config::load(&self.config.source_path)?;
+            ensure!(
+                current.existing_installation()? == identity
+                    && fs::canonicalize(&current.data_directory)? == self.config.data_directory,
+                "PAIRING_ORCHESTRATOR_BINDING_MISMATCH"
+            );
+            let code = crate::pairing_code::Store::for_config(&self.config.source_path)?.reset()?;
+            return Ok(ok(
+                json!({"code":code.expose(),"generation":code.generation(),"display_once":true}),
+            ));
+        }
         if !request.action.mutates() {
             return match request.action {
                 Action::Hello => Ok(ok(json!({"api_version":1,"installation_id":identity,
                     "instance_id":self.instance,"data_directory":self.config.data_directory,
                     "build_version":env!("CARGO_PKG_VERSION"),"registry_version":1,
-                    "capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1"],
+                    "capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1","pairing-code-reset-v2","prepare-replica-v1","attach-mount-v1","background-sync-v1"],
                     "network_enabled":false,"shutdown_pending":self.shutdown_pending()?}))),
                 Action::List => Ok(ok(
                     json!({"api_version":1,"catalog_generation":self.generation(&Action::List)?,"states":self.states()?.iter().map(|s|self.observed(s)).collect::<Vec<_>>()}),
                 )),
                 Action::Inspect { state } => Ok(ok(self.observed(&self.state(&state)?))),
+                Action::BackgroundSyncStatus => Ok(ok(self.background_status()?)),
                 Action::Operation { operation } => {
                     let (status, response): (String, Option<String>) = self
                         .db
@@ -1123,6 +1236,10 @@ impl Supervisor {
             }
             return self.execute(&request);
         }
+        // Keep stopped-state ownership through the mount intent transaction.
+        // No worker or standalone daemon may appear between validation and commit.
+        let mut _mount_state_guard = None;
+        let mut background_binding = None;
         let prepared = (|| -> Result<Option<PathBuf>> {
             let pending = self
                 .db
@@ -1131,13 +1248,22 @@ impl Supervisor {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             for payload in pending {
                 let pending: Request = serde_json::from_str(&payload)?;
+                if matches!(request.action, Action::ConfigureBackgroundSync { .. }) {
+                    ensure!(
+                        !matches!(pending.action, Action::ConfigureBackgroundSync { .. }),
+                        "BACKGROUND_SYNC_OPERATION_PENDING"
+                    );
+                }
                 ensure!(
                     !matches!(pending.action, Action::Shutdown),
                     "SHUTDOWN_PENDING: retry the original operation"
                 );
-                if let Action::Start { state } | Action::Stop { state } = &request.action {
+                if let Action::Start { state }
+                | Action::Stop { state }
+                | Action::AttachMount { state, .. } = &request.action
+                {
                     let pending_state = match &pending.action {
-                        Action::Create { .. } => self
+                        Action::Create { .. } | Action::PrepareReplica { .. } => self
                             .db
                             .query_row(
                                 "SELECT id FROM states WHERE operation=?",
@@ -1145,7 +1271,9 @@ impl Supervisor {
                                 |r| r.get::<_, String>(0),
                             )
                             .optional()?,
-                        Action::Start { state } | Action::Stop { state } => Some(state.clone()),
+                        Action::Start { state }
+                        | Action::Stop { state }
+                        | Action::AttachMount { state, .. } => Some(state.clone()),
                         _ => None,
                     };
                     ensure!(
@@ -1164,6 +1292,65 @@ impl Supervisor {
                     "INVALID_STATE_LABEL"
                 );
                 return mount.as_ref().map(|p| self.validate_mount(p)).transpose();
+            }
+            if let Action::ConfigureBackgroundSync { config: Some(path) } = &request.action {
+                ensure!(path.is_absolute(), "PAIRING_CONFIG_MUST_BE_ABSOLUTE");
+                background_binding = Some(crate::managed_pairing::Binding::load(path)?);
+            }
+            if let Action::PrepareReplica { label, repo } = &request.action {
+                ensure!(
+                    !label.trim().is_empty() && label.len() <= 256,
+                    "INVALID_STATE_LABEL"
+                );
+                uuid::Uuid::parse_str(repo).context("INVALID_REPOSITORY_ID")?;
+                ensure!(
+                    !self
+                        .states()?
+                        .iter()
+                        .any(|state| state.marker.repo == *repo),
+                    "REPOSITORY_ALREADY_MANAGED: resume the existing local replica"
+                );
+            }
+            if let Action::AttachMount {
+                state,
+                mount,
+                expected_branch,
+                expected_branch_generation,
+            } = &request.action
+            {
+                let state = self.state(state)?;
+                ensure!(state.mount.is_none(), "MOUNT_ALREADY_ASSIGNED");
+                ensure!(
+                    !state.desired && state.ready,
+                    "HEADLESS_STATE_MUST_BE_STOPPED"
+                );
+                self.verify(&state)?;
+                _mount_state_guard = Some(lock_state(&self.root(&state)).context(
+                    "WORKER_UNAVAILABLE: stop the headless worker before attaching a mount",
+                )?);
+                ensure!(
+                    expected_branch.is_some() == expected_branch_generation.is_some(),
+                    "INCOMPLETE_BRANCH_PROOF"
+                );
+                if let (Some(branch), Some(generation)) =
+                    (expected_branch, expected_branch_generation)
+                {
+                    let store = Store::open_existing(&self.root(&state))?;
+                    ensure!(
+                        store.active == *branch
+                            && store.generation == *generation
+                            && store.branch(branch)?.shared,
+                        "RECEIVE_BRANCH_PROOF_CHANGED"
+                    );
+                    let projection = store.projection(branch)?;
+                    ensure!(projection.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
+                    for entry in projection.entries.values().filter(|entry| entry.alive) {
+                        if let Some(object) = &entry.content {
+                            store.verify_object(object)?;
+                        }
+                    }
+                }
+                return Ok(Some(self.validate_mount(mount)?));
             }
             Ok(None)
         })();
@@ -1187,12 +1374,16 @@ impl Supervisor {
                 return Ok(response);
             }
             Ok(mount) => match &request.action {
-                Action::Create { label, .. } => {
+                Action::Create { label, .. } | Action::PrepareReplica { label, .. } => {
+                    let repo = match &request.action {
+                        Action::PrepareReplica { repo, .. } => repo.clone(),
+                        _ => id(),
+                    };
                     tx.execute(
                         "INSERT INTO states VALUES(?,?,?,?,?,?,1,0,0)",
                         params![
                             id(),
-                            id(),
+                            repo,
                             id(),
                             operation,
                             label,
@@ -1207,7 +1398,21 @@ impl Supervisor {
                         params![matches!(request.action, Action::Start { .. }), state],
                     )?;
                 }
+                Action::AttachMount { state, .. } => {
+                    tx.execute(
+                        "UPDATE states SET mount=?,generation=generation+1 WHERE id=?",
+                        params![mount.map(|p| p.to_string_lossy().into_owned()), state],
+                    )?;
+                }
                 Action::Shutdown => {
+                    tx.execute("UPDATE installation SET generation=generation+1", [])?;
+                }
+                Action::ConfigureBackgroundSync { .. } => {
+                    if let Some(binding) = background_binding {
+                        tx.execute("INSERT INTO local_services VALUES('pairing',?) ON CONFLICT(name) DO UPDATE SET binding=excluded.binding", [serde_json::to_string(&binding)?])?;
+                    } else {
+                        tx.execute("DELETE FROM local_services WHERE name='pairing'", [])?;
+                    }
                     tx.execute("UPDATE installation SET generation=generation+1", [])?;
                 }
                 _ => unreachable!(),
@@ -1238,7 +1443,7 @@ impl Supervisor {
             // Shutdown intent is completed by the next explicit exact retry,
             // rather than repeatedly shutting down every fresh supervisor.
             let state_id = match &request.action {
-                Action::Create { .. } => self
+                Action::Create { .. } | Action::PrepareReplica { .. } => self
                     .db
                     .query_row(
                         "SELECT id FROM states WHERE operation=?",
@@ -1246,7 +1451,9 @@ impl Supervisor {
                         |r| r.get::<_, String>(0),
                     )
                     .optional()?,
-                Action::Start { state } | Action::Stop { state } => Some(state.clone()),
+                Action::Start { state }
+                | Action::Stop { state }
+                | Action::AttachMount { state, .. } => Some(state.clone()),
                 _ => None,
             };
             let waiting = state_id.as_ref().is_some_and(|state| {
@@ -1265,6 +1472,8 @@ impl Supervisor {
             return Ok(());
         }
         self.recover()?;
+        let binding = self.background_binding()?;
+        self.background.reconcile(binding.as_ref())?;
         for state in self.states()? {
             if state.ready {
                 let _ = self.reconcile_one(&state, false);
@@ -1283,10 +1492,13 @@ impl Supervisor {
         loop {
             match listener.receive::<Request>() {
                 Ok(Some(request)) => {
-                    let response = self
+                    let mut response = self
                         .handle(request)
                         .unwrap_or_else(|e| error(format!("{e:#}"), false, None));
                     let _ = listener.reply(&response);
+                    if let Some(Value::String(code)) = response.pointer_mut("/result/code") {
+                        zeroize::Zeroize::zeroize(code);
+                    }
                     // Replaying a completed shutdown from a previous instance
                     // returns its receipt; it must not stop this new supervisor.
                     if self.exit_requested && response["ok"] == true {
@@ -1655,6 +1867,37 @@ mod regressions {
                 .contains("SHUTDOWN_PENDING")
         );
         assert!(!supervisor.root(&state).exists());
+    }
+    #[test]
+    fn uncertain_background_drain_keeps_shutdown_durable_and_workers_fenced() {
+        let (_temp, mut supervisor) = fixture();
+        let (_create, state) = pending_create(&mut supervisor);
+        supervisor.background.simulate_uncertain_drain();
+        let shutdown = Request {
+            version: 1,
+            target_installation: None,
+            operation_id: Some(id()),
+            expected_generation: Some(1),
+            action: Action::Shutdown,
+        };
+        let response = supervisor.handle(shutdown.clone()).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["retryable"], true);
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("MANAGED_PAIRING_DRAIN_UNCERTAIN")
+        );
+        assert!(supervisor.shutdown_pending().unwrap());
+        for _ in 0..3 {
+            supervisor.tick().unwrap();
+        }
+        assert!(!supervisor.root(&state).exists());
+        assert!(supervisor.children.is_empty());
+        assert!(!supervisor.exit_requested);
+        assert_eq!(supervisor.handle(shutdown).unwrap()["retryable"], true);
+        assert!(supervisor.shutdown_pending().unwrap());
     }
     #[test]
     #[cfg(windows)]

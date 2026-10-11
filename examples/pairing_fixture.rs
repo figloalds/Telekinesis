@@ -53,6 +53,7 @@ fn main() -> Result<()> {
     };
     let inbound = args[4] != "outbound-only";
     let config = Config {
+        orchestrator_config: None,
         format_version: 1,
         installation: identity.installation.clone(),
         data_directory: root.join("pairing-data"),

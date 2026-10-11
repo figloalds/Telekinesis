@@ -1,6 +1,6 @@
 # Orchestrator TOML anatomy
 
-`orchestrator.toml` configures the Windows O1 local supervisor and its desktop
+`orchestrator.toml` configures the portable O1 local supervisor and its Windows desktop
 client. The accepted schema is defined by `Config`, `Control`, `Network` and
 `Workers` in `src/orchestrator.rs`; desktop bootstrap is in `src/desktop.rs`.
 It does not configure standalone `daemon` PSK networking or the separate
@@ -11,8 +11,8 @@ It does not configure standalone `daemon` PSK networking or the separate
 `tkfs orchestrator` and `tkfs manage ...` default to `orchestrator.toml` in the
 calling shell's current directory. `-f <PATH>`/`--defaults-file <PATH>` selects
 another file. There is no parent search, global fallback or automatic CLI config
-creation. The GUI always uses `orchestrator.toml` beside its actual executable;
-its first-run flow can create that file.
+creation. The GUI defaults to `orchestrator.toml` beside its actual executable;
+`gui -f <PATH>` selects another configuration and first-run can create a file.
 
 The file must exist and parse before the supervisor/client can proceed. Relative
 `data_directory` and `default_mount_directory` values resolve against the
@@ -88,7 +88,7 @@ Both fields are required whenever the config is loaded.
 
 | Field | Type | Accepted value |
 |---|---|---|
-| `transport` | String | Exactly `'named-pipe'`; otherwise `UNSUPPORTED_CONTROL_TRANSPORT`. |
+| `transport` | String | `'named-pipe'` on Windows or `'unix-socket'` on Linux; otherwise `UNSUPPORTED_CONTROL_TRANSPORT`. |
 | `name` | String | 1..100 ASCII letters, digits, hyphens or underscores; otherwise `INVALID_PIPE_NAME`. Supply the name, not a full pipe path. |
 
 The same Windows user/SID must own and manage the catalog. Choose a distinct pipe
@@ -128,9 +128,21 @@ The registry includes catalog identity, state IDs, mount reservations, desired
 running states and retry receipts. It creates `states/`, `staging/` and `logs/`
 below the data root. Keep mounts and application files separate from that root.
 
+The optional `local_services` catalog table stores the accepted public binding
+for supervised outbound WSS sync. Catalog format remains version 1; no TOML
+field or credential is added automatically. Old valid catalogs gain this empty
+table only after identity/schema validation. Supervision defaults to disabled.
+Use `configure-background-sync` to accept a preprovisioned config explicitly.
+
+New Linux catalogs are created mode 0600 independently of the process umask.
+Existing file permissions are preserved; pairing reset refuses an unsafe
+existing catalog rather than repairing its permissions automatically.
+
 The GUI's first-run flow requires a new/empty data root and a separate mount
 parent, then writes absolute paths, an installation UUID and unique pipe name.
-It pins the connected catalog in `.tkfs-ui-identity.json` beside the executable.
+It pins the connected catalog in config-scoped `.tkfs-desktop/` metadata beside
+the selected config (beside the executable by default); legacy
+`.tkfs-ui-identity.json` is preserved during migration.
 Legacy configs without `installation_id` remain accepted; without
 `default_mount_directory`, creating a project in the GUI needs an explicit path.
 

@@ -13,8 +13,8 @@ tkfs --version
 ```
 
 On Windows, no arguments opens the desktop; `tkfs gui` does the same. Linux
-requires a command and has no desktop. `orchestrator` and `manage` are
-Windows-only. `stop` is available only in Linux builds.
+requires a command and has no desktop. `orchestrator` and `manage` run on both
+platforms. `stop` is available only in Linux builds.
 
 ## Global arguments and project selection
 
@@ -125,13 +125,12 @@ also bypasses that check; inspect `stale` before using it as a current view.
 
 | Mode | Configuration/reference |
 |---|---|
-| `gui` | Windows desktop; `orchestrator.toml` beside the actual executable. No config-path argument. |
-| `orchestrator [-f <PATH>]` | Windows foreground supervisor; defaults to cwd `orchestrator.toml`. See [TOML anatomy](ORCHESTRATOR-CONFIG.md). |
-| `manage [-f <PATH>] <ACTION>` | Windows owner-local management client; same config default. See [management commands](ORCHESTRATOR-CLI.md). |
+| `gui [-f <PATH>]` | Windows desktop; defaults to `orchestrator.toml` beside the actual executable. Explicit config selection is supported. |
+| `orchestrator [-f <PATH>]` | Portable foreground supervisor; defaults to cwd `orchestrator.toml`. See [TOML anatomy](ORCHESTRATOR-CONFIG.md). |
+| `manage [-f <PATH>] <ACTION>` | Portable owner-local management client; same config default. See [management commands](ORCHESTRATOR-CLI.md). |
 | `pairing [-f <PATH>] <ACTION>` | Portable published-data service/management; defaults to cwd `pairing.toml`. See [pairing configuration and enrollment](PAIRING.md). |
 
-`-f` is the alias for `--defaults-file` on the last three modes. It is not a
-global flag or a way to select GUI configuration.
+`-f` is the alias for `--defaults-file` on these modes. It is not a global flag.
 
 Pairing actions are listed here for argument lookup; follow the operating guide
 for credential provisioning and enrollment order:
@@ -144,6 +143,9 @@ for credential provisioning and enrollment order:
 | `run`, `status` | Run the separate service or inspect credential/registry state. |
 | `invite [--lifetime-seconds <N>]` | Default lifetime is 300 seconds; prints a secret invitation for private transfer. |
 | `join` | Read the secret invitation from masked or piped stdin. |
+| `public-bootstrap` | Export public Peer JSON (installation, certificate and sync endpoint); contains no enrollment code/private key. |
+| `join-code --issuer <PUBLIC_JSON> --enrollment-endpoint <URL> --fingerprint <SHA256>` | Require an independently confirmed server fingerprint, then read exactly 200 digits through masked/piped stdin. No code argument exists. |
+| `reject-code-candidate <PENDING_ID>` | Reject an unapproved numeric-code candidate and release its pending slot. |
 | `approve <INVITATION_ID> --installation <UUID> --fingerprint <VALUE>` | Approve the exact pending identity. |
 | `revoke <PEER_INSTALLATION_ID>` | Persist peer revocation. |
 | `grant <PEER_INSTALLATION_ID> --repo <UUID> --runtime <PATH> --remote-replica <UUID> [--disable]` | Configure or disable a published repository sync; `--runtime` here identifies the granted local worker. |

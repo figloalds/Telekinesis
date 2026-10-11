@@ -16,13 +16,47 @@ use tkfs::{
 slint::include_modules!();
 #[path = "gui_branch_acceptance.rs"]
 mod branch_acceptance;
+#[path = "gui_code_acceptance.rs"]
+mod code_acceptance;
+#[path = "gui_dashboard_acceptance.rs"]
+mod dashboard_acceptance;
+#[path = "desktop_receive.rs"]
+mod receive;
+#[path = "gui_receive_acceptance.rs"]
+mod receive_acceptance;
+
+#[derive(Default)]
+struct UiLifetime(std::sync::atomic::AtomicBool);
+impl UiLifetime {
+    fn is_closed(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn close(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+    fn deliver(&self, delivery: impl FnOnce()) {
+        if !self.is_closed() {
+            delivery();
+        }
+    }
+}
+fn close_ui(ui: &App, lifetime: &UiLifetime) {
+    lifetime.close();
+    ui.set_server_code("".into());
+    ui.set_server_code_visible(false);
+    ui.set_pair_token("".into());
+}
 #[path = "gui_pairing_acceptance.rs"]
 mod pairing_acceptance;
 
 enum Job {
+    Receive(PathBuf, receive::Request),
+    BackgroundSync(Option<PathBuf>),
     Pair(PathBuf, PairJob),
     Setup(PathBuf, PathBuf, usize),
     Connect,
+    SelectConfig(PathBuf),
+    ResetPairingCode(PathBuf),
     Refresh,
     Select(String),
     Create(String, Option<PathBuf>),
@@ -40,6 +74,8 @@ enum PairJob {
     Load(PathBuf),
     Create(PathBuf),
     Inspect(zeroize::Zeroizing<String>, String),
+    InspectCode(String, String),
+    JoinCode(String, String, zeroize::Zeroizing<String>, bool),
     Clear,
     Join(String, bool),
     List(String),
@@ -51,11 +87,18 @@ enum PairJob {
 }
 impl PairJob {
     fn cancellable(&self) -> bool {
-        matches!(self, Self::Join(..) | Self::List(..) | Self::Sync(..))
+        matches!(
+            self,
+            Self::Join(..) | Self::JoinCode(..) | Self::List(..) | Self::Sync(..)
+        )
     }
 }
 #[derive(Default)]
 struct View {
+    receive: receive::Snapshot,
+    background_sync: String,
+    show_once_code: Option<tkfs::pairing_code::ShowOnceCode>,
+    config_path: String,
     pairing: PairSnapshot,
     connected: bool,
     first_run: bool,
@@ -79,6 +122,8 @@ struct View {
     folder: Option<(i32, String)>,
 }
 struct Controller {
+    receive_proof: Option<receive::Proof>,
+    background_sync: String,
     pairing: Option<PairClient>,
     pair_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     paths: Paths,
@@ -144,12 +189,39 @@ fn connection_error(view: &mut View, has_session: bool, refresh: bool, error: &s
         }
         view.status = "The supervisor is unavailable. Reconnect to refresh project status; existing data is preserved.".into();
     } else if error.contains("LOCAL_IPC") {
+        view.connected = false;
+        view.runtime = None;
         view.connection = "Connection interrupted · status may be stale · refresh to retry".into();
     }
 }
 impl Controller {
     fn execute(&mut self, job: Job) -> Result<View> {
+        if !matches!(&job, Job::Receive(..) | Job::Refresh | Job::Operation) {
+            self.receive_proof = None;
+        }
         match job {
+            Job::Receive(path, request) => self.receive_execute(path, request),
+            Job::BackgroundSync(config) => {
+                let generation = self
+                    .session
+                    .as_ref()
+                    .context("NOT_CONNECTED")?
+                    .call(Action::List)?["catalog_generation"]
+                    .as_u64()
+                    .context("CATALOG_GENERATION_MISSING")?;
+                self.mutation(Action::ConfigureBackgroundSync { config }, generation)
+            }
+            Job::ResetPairingCode(path) => {
+                tkfs::orchestrator::Config::load(&path)?;
+                let code = tkfs::pairing_code::Store::for_config(&path)?.reset()?;
+                let mut view = self.view();
+                view.show_once_code = Some(code);
+                view.message = Some((
+                    "Pairing code rotated. Existing peers and sync grants are unchanged.".into(),
+                    false,
+                ));
+                Ok(view)
+            }
             Job::Pair(path, job) => {
                 if !matches!(job, PairJob::Load(..) | PairJob::Create(..)) {
                     ensure!(
@@ -180,6 +252,21 @@ impl Controller {
                 self.session = Some(Session::connect(self.paths.clone())?);
                 self.branch_client = Some(BranchClient::open(self.session.as_ref().unwrap())?);
                 self.refresh(None)
+            }
+            Job::SelectConfig(path) => {
+                let current = self.view();
+                ensure!(
+                    !current.retry && !current.retry_branch,
+                    "Resolve the pending request before switching configuration"
+                );
+                let paths = Paths::from_config(self.paths.executable.clone(), &path)?;
+                tkfs::orchestrator::Config::load(&paths.config)?;
+                self.paths = paths;
+                self.session = None;
+                self.branch_client = None;
+                self.selected = None;
+                self.catalog = Value::Null;
+                self.execute(Job::Connect)
             }
             Job::Refresh => self.refresh(None),
             Job::Select(state) => {
@@ -390,6 +477,21 @@ impl Controller {
         }
         let session = self.session.as_ref().context("NOT_CONNECTED")?;
         self.catalog = read_catalog(session)?;
+        self.background_sync = match session.call(Action::BackgroundSyncStatus) {
+            Ok(status) => format!(
+                "Service: {} · desired: {}\nScope: all configured enabled grants\n{}",
+                text(&status["service"], "state"),
+                if status["desired_enabled"] == true {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status["service"]["error"]
+                    .as_str()
+                    .unwrap_or("Service state does not prove that a repository has caught up.")
+            ),
+            Err(_) => "Background sync status unavailable. Refresh to retry.".into(),
+        };
         let states = self.catalog["states"]
             .as_array()
             .context("CATALOG_STATES_MISSING")?;
@@ -399,6 +501,13 @@ impl Controller {
         {
             self.selected = states.first().map(|s| text(s, "state_id"));
         }
+        // Validate the transient receive proof against the new authenticated
+        // worker/grant observation before presenting any attach controls.
+        self.receive_refresh();
+        let session = self.session.as_ref().context("NOT_CONNECTED")?;
+        let states = self.catalog["states"]
+            .as_array()
+            .context("CATALOG_STATES_MISSING")?;
         let mut view = self.view();
         view.message = message;
         if let Some(state) = states
@@ -511,6 +620,9 @@ impl Controller {
     }
     fn view(&self) -> View {
         let mut view = View {
+            receive: self.receive_snapshot(),
+            background_sync: self.background_sync.clone(),
+            config_path: display_path(&self.paths.config),
             pairing: self
                 .pairing
                 .as_ref()
@@ -618,6 +730,14 @@ impl Controller {
         let client = self.pairing.as_mut().context("PAIRING_CONFIG_REQUIRED")?;
         let stop = self.pair_stop.clone();
         match job {
+            PairJob::InspectCode(public, endpoint) => {
+                client.inspect_code(&public, &endpoint)?;
+                Ok("Public server identity reviewed. Verify its exact certificate fingerprint before submitting the 200-digit code.".into())
+            }
+            PairJob::JoinCode(public, endpoint, code, confirmed) => {
+                client.join_code(&public, &endpoint, code, confirmed, stop)?;
+                Ok("Enrollment submitted; awaiting approval on the server. Ask its owner to approve your installation and certificate, then load / refresh this client and check approval. Pairing grants no administration access.".into())
+            }
             PairJob::Inspect(token, endpoint) => {
                 client.inspect(token, &endpoint)?;
                 Ok("Invitation inspected locally. Verify the exact server fingerprint before enrollment.".into())
@@ -673,6 +793,21 @@ impl Controller {
 
 fn apply(ui: &App, view: View) {
     use slint::Model;
+    if let Some(code) = &view.show_once_code {
+        ui.set_server_code(code.expose().into());
+        ui.set_server_code_visible(true);
+    }
+    ui.set_receive_state(view.receive.state.into());
+    ui.set_receive_repo_id(view.receive.repo.into());
+    ui.set_receive_device(view.receive.device.into());
+    ui.set_receive_runtime(view.receive.runtime.into());
+    ui.set_receive_status(view.receive.status.into());
+    ui.set_receive_headless(view.receive.headless);
+    ui.set_receive_running(view.receive.running);
+    ui.set_receive_caught_up(view.receive.caught_up);
+    ui.set_receive_materialized(view.receive.materialized);
+    ui.set_receive_can_attach(view.receive.can_attach);
+    ui.set_background_sync_status(view.background_sync.into());
     let old_peer = ui
         .get_pair_peers()
         .row_data(ui.get_pair_selected_peer() as usize)
@@ -793,6 +928,16 @@ fn apply(ui: &App, view: View) {
     ui.set_first_run(view.first_run);
     ui.set_connected(view.connected);
     ui.set_connection(view.connection.into());
+    if !view.config_path.is_empty() {
+        ui.set_config_path(view.config_path.into());
+    }
+    ui.set_running_count(view.rows.iter().filter(|row| row.2 == "Running").count() as i32);
+    ui.set_attention_count(
+        view.rows
+            .iter()
+            .filter(|row| !matches!(row.2.as_str(), "Running" | "Stopped"))
+            .count() as i32,
+    );
     ui.set_projects(ModelRc::new(VecModel::from(
         view.rows
             .into_iter()
@@ -806,6 +951,7 @@ fn apply(ui: &App, view: View) {
             .collect::<Vec<_>>(),
     )));
     ui.set_selected(view.selected);
+    filter_projects(ui, ui.get_project_filter().as_str());
     if !view.status.is_empty() {
         ui.set_status_detail(view.status.into());
     }
@@ -853,13 +999,35 @@ fn apply(ui: &App, view: View) {
         }
     }
 }
+fn filter_projects(ui: &App, query: &str) {
+    use slint::Model;
+    let query = query.trim().to_lowercase();
+    let indices = ui
+        .get_projects()
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            format!("{} {}", row.label, row.mount)
+                .to_lowercase()
+                .contains(&query)
+        })
+        .map(|(index, _)| index as i32)
+        .collect::<Vec<_>>();
+    ui.set_visible_projects(ModelRc::new(VecModel::from(indices)));
+}
 fn enqueue(ui: &slint::Weak<App>, sender: &mpsc::Sender<Job>, job: Job) {
     if let Some(ui) = ui.upgrade() {
         if ui.get_working() {
             return;
         }
         ui.set_working(true);
-        let _ = sender.send(job);
+        if sender.send(job).is_err() {
+            ui.set_working(false);
+            ui.set_error(true);
+            ui.set_message(
+                "The desktop worker stopped. Close and reopen this window to reconnect.".into(),
+            );
+        }
     }
 }
 pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
@@ -877,6 +1045,7 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     ui.set_data_folder(display_path(&paths.folder.join("data")).into());
     ui.set_mount_folder(display_path(&paths.folder.join("Projects")).into());
     ui.set_pair_config(display_path(&paths.folder.join(".tkfs-pairing/client.toml")).into());
+    ui.set_server_config(display_path(&paths.config).into());
     let first_run = !paths.config.try_exists()?;
     ui.set_first_run(first_run);
     ui.set_connection(
@@ -890,10 +1059,14 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     let (sender, receiver) = mpsc::channel();
     let weak = ui.as_weak();
     let worker_weak = weak.clone();
+    let lifetime = std::sync::Arc::new(UiLifetime::default());
+    let worker_lifetime = lifetime.clone();
     let pair_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker_stop = pair_stop.clone();
     std::thread::spawn(move || {
         let mut controller = Controller {
+            receive_proof: None,
+            background_sync: String::new(),
             pairing: None,
             pair_stop: worker_stop,
             paths,
@@ -925,8 +1098,12 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                     view
                 }
             };
+            if worker_lifetime.is_closed() {
+                break;
+            }
+            let delivery_lifetime = worker_lifetime.clone();
             if worker_weak
-                .upgrade_in_event_loop(move |ui| apply(&ui, view))
+                .upgrade_in_event_loop(move |ui| delivery_lifetime.deliver(|| apply(&ui, view)))
                 .is_err()
             {
                 break;
@@ -949,6 +1126,117 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     callback!(on_inspect_operation, Job::Operation);
     callback!(on_open_project, Job::Open);
     callback!(on_retry_branch, Job::RetryBranch);
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        let stop = pair_stop.clone();
+        ui.on_receive_action(move |kind| {
+            use slint::Model;
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            if ui.get_working() {
+                return;
+            }
+            let state = ui.get_receive_state().to_string();
+            let peer = ui
+                .get_pair_peers()
+                .row_data(ui.get_pair_selected_peer() as usize)
+                .map(|p| p.id.to_string())
+                .unwrap_or_default();
+            let request = match kind {
+                0 => receive::Request::Prepare {
+                    label: ui.get_receive_label().to_string(),
+                    repo: ui.get_receive_repository().to_string(),
+                },
+                1 if ui.get_receive_confirmed() => receive::Request::Configure { state, peer },
+                2 => receive::Request::Sync { state, peer },
+                3 => receive::Request::Materialize {
+                    state,
+                    branch: ui
+                        .get_branches()
+                        .row_data(ui.get_selected_branch() as usize)
+                        .map(|b| b.id.to_string())
+                        .unwrap_or_default(),
+                },
+                4 => receive::Request::Stop { state },
+                5 => receive::Request::Attach {
+                    state,
+                    mount: PathBuf::from(ui.get_receive_mount().as_str()),
+                },
+                6 => receive::Request::Start { state },
+                _ => return,
+            };
+            ui.set_receive_confirmed(false);
+            stop.store(false, std::sync::atomic::Ordering::Relaxed);
+            ui.set_pair_cancellable(kind == 2);
+            enqueue(
+                &weak,
+                &sender,
+                Job::Receive(PathBuf::from(ui.get_pair_config().as_str()), request),
+            );
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_background_sync_action(move |enabled| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            enqueue(
+                &weak,
+                &sender,
+                Job::BackgroundSync(enabled.then(|| PathBuf::from(ui.get_pair_config().as_str()))),
+            );
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_reset_pairing_code(move || {
+            if let Some(ui) = weak.upgrade() {
+                if ui.get_working()
+                    || !ui.get_server_reset_confirmed()
+                    || ui.get_server_code_visible()
+                {
+                    return;
+                }
+                ui.set_server_reset_confirmed(false);
+                ui.set_server_code("".into());
+                enqueue(
+                    &weak,
+                    &sender,
+                    Job::ResetPairingCode(PathBuf::from(ui.get_server_config().as_str())),
+                );
+            }
+        });
+    }
+    {
+        let weak = weak.clone();
+        ui.on_filter_projects(move |query| {
+            if let Some(ui) = weak.upgrade() {
+                filter_projects(&ui, query.as_str());
+            }
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_select_config(move || {
+            if let Some(ui) = weak.upgrade() {
+                if ui.get_working() {
+                    return;
+                }
+                ui.set_config_visible(false);
+                enqueue(
+                    &weak,
+                    &sender,
+                    Job::SelectConfig(PathBuf::from(ui.get_config_input().as_str())),
+                );
+            }
+        });
+    }
     {
         let weak = weak.clone();
         let sender = sender.clone();
@@ -981,6 +1269,25 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                 .map(|r| r.id.to_string())
                 .unwrap_or_default();
             let job = match action {
+                12 => {
+                    ui.set_pair_confirmed(false);
+                    PairJob::InspectCode(
+                        ui.get_pair_bootstrap().to_string(),
+                        ui.get_pair_enrollment().to_string(),
+                    )
+                }
+                13 => {
+                    let code = zeroize::Zeroizing::new(ui.get_pair_token().to_string());
+                    ui.set_pair_token("".into());
+                    let confirmed = ui.get_pair_confirmed();
+                    ui.set_pair_confirmed(false);
+                    PairJob::JoinCode(
+                        ui.get_pair_bootstrap().to_string(),
+                        ui.get_pair_enrollment().to_string(),
+                        code,
+                        confirmed,
+                    )
+                }
                 0 => PairJob::Load(PathBuf::from(ui.get_pair_config().as_str())),
                 1 => PairJob::Create(PathBuf::from(ui.get_pair_config().as_str())),
                 2 => {
@@ -1151,6 +1458,20 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
         ui.on_browse(move |kind| enqueue(&weak, &sender, Job::Browse(kind)));
     }
     let timer = slint::Timer::default();
+    {
+        let weak = weak.clone();
+        let stop = pair_stop.clone();
+        let lifetime = lifetime.clone();
+        ui.window().on_close_requested(move || {
+            if let Some(ui) = weak.upgrade() {
+                close_ui(&ui, &lifetime);
+            } else {
+                lifetime.close();
+            }
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
     if report.is_none() {
         let weak = weak.clone();
         let sender = sender.clone();
@@ -1164,15 +1485,21 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                     && !ui.get_create_visible()
                     && !ui.get_shutdown_visible()
                     && !ui.get_about_visible()
+                    && !ui.get_config_visible()
                     && ui.get_branch_dialog() == 0
-                    && ui.get_main_page() == 0
+                    && matches!(ui.get_main_page(), 0 | 3 | 4)
                 {
                     enqueue(&weak, &sender, Job::Refresh);
                 }
             },
         );
     }
-    if !first_run {
+    let synthetic = report.is_some()
+        && matches!(
+            std::env::var("TKFS_UI_TEST_PHASE").as_deref(),
+            Ok("dashboard" | "pairing-code" | "receive")
+        );
+    if !first_run && !synthetic {
         enqueue(&weak, &sender, Job::Connect);
     }
     let test_timer = if let Some(report) = report {
@@ -1192,6 +1519,10 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
 // real component callbacks and the native Windows window, never a headless mock.
 fn snapshot(ui: &App, path: &Path) -> Result<()> {
     use std::io::Write;
+    ensure!(
+        ui.get_server_code().is_empty() && ui.get_pair_token().is_empty(),
+        "SECRET_SCREENSHOT_REFUSED"
+    );
     let pixels = ui.window().take_snapshot()?;
     let (w, h) = (pixels.width(), pixels.height());
     let size = w * h * 4;
@@ -1242,12 +1573,27 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
         None
     };
     branch_acceptance.set_phase(&phase);
+    let mut code_acceptance = if phase == "pairing-code" {
+        Some(code_acceptance::Acceptance::from_stdin()?)
+    } else {
+        None
+    };
+    let mut receive_acceptance = if phase == "receive" {
+        Some(receive_acceptance::Acceptance::from_stdin()?)
+    } else {
+        None
+    };
     timer.start(slint::TimerMode::Repeated,Duration::from_millis(300),move || {
         let Some(ui)=weak.upgrade()else{return;};ticks+=1;
         let result=(||->Result<bool>{
             ensure!(started.elapsed()<Duration::from_secs(100),"UI_TEST_TIMEOUT at step {step}");
-            if ticks<3 || ui.get_working(){return Ok(false);}
-            if let Some(pairing)=&mut pairing_acceptance {
+            if ticks<3 || (ui.get_working() && phase != "dashboard"){return Ok(false);}
+            if let Some(receive) = &mut receive_acceptance { return receive.tick(&ui, &directory, &mut checks); }
+            if let Some(code) = &mut code_acceptance {
+                return code.tick(&ui, &directory, &mut checks);
+            } else if phase == "dashboard" {
+                return dashboard_acceptance::tick(&ui, &directory, &mut step, &mut checks);
+            } else if let Some(pairing)=&mut pairing_acceptance {
                 return pairing.tick(&ui,&directory,&mut checks);
             } else if phase.starts_with("branches") {
                 return branch_acceptance.tick(&ui,&directory,&mut checks);
@@ -1289,9 +1635,32 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
 mod tests {
     use super::*;
     #[test]
+    fn closed_window_discards_already_queued_delivery() {
+        let lifetime = UiLifetime::default();
+        let applied = std::cell::Cell::new(false);
+        let dropped = std::cell::Cell::new(false);
+        struct Pending<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let pending = Pending(&dropped);
+        let delivery = || {
+            drop(pending);
+            applied.set(true);
+        };
+        lifetime.close();
+        lifetime.deliver(delivery);
+        assert!(!applied.get());
+        assert!(dropped.get());
+    }
+    #[test]
     fn captured_branch_action_never_follows_a_changed_project_selection() {
         let directory = tempfile::tempdir().unwrap();
         let mut controller = Controller {
+            receive_proof: None,
+            background_sync: String::new(),
             pairing: None,
             pair_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paths: Paths {
@@ -1327,7 +1696,7 @@ mod tests {
         );
     }
     #[test]
-    fn transient_transport_failure_preserves_controls_and_marks_stale_status() {
+    fn transient_transport_failure_disables_mutations_and_marks_stale_status() {
         let mut view = View {
             connected: true,
             rows: vec![(
@@ -1340,7 +1709,7 @@ mod tests {
             ..Default::default()
         };
         connection_error(&mut view, true, true, "LOCAL_IPC: broken pipe");
-        assert!(view.connected);
+        assert!(!view.connected);
         assert_eq!(view.rows[0].2, "Running");
         assert!(view.connection.contains("stale"));
     }

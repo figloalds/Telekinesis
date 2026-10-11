@@ -352,6 +352,25 @@ impl Peer {
     pub fn fingerprint(&self) -> String {
         hash(&self.certificate)
     }
+    fn validate_endpoint(&self) -> Result<()> {
+        ensure!(self.endpoint.len() <= 512, "INVALID_PAIR_ENDPOINT");
+        if self.endpoint == "outbound-only" {
+            return Ok(());
+        }
+        if crate::wss_transport::is_websocket(&self.endpoint) {
+            crate::wss_transport::endpoint(&self.endpoint, false)?;
+        } else {
+            ensure!(
+                self.endpoint
+                    .parse::<std::net::SocketAddr>()
+                    .context("PAIR_ENDPOINT_REQUIRES_NUMERIC_ADDRESS")?
+                    .port()
+                    != 0,
+                "INVALID_PAIR_ENDPOINT"
+            );
+        }
+        Ok(())
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -504,6 +523,49 @@ impl Registry {
         tx.commit()?;
         Ok(())
     }
+    /// A v2 reusable-code enrollment still needs explicit local approval.
+    /// This stores public candidate metadata only, never the original code.
+    pub(crate) fn submit_code_candidate(&mut self, candidate: &Peer) -> Result<String> {
+        candidate.validate_endpoint()?;
+        ensure!(
+            candidate.installation != self.installation && !candidate.revoked,
+            "INVALID_PAIR_CANDIDATE"
+        );
+        uuid::Uuid::parse_str(&candidate.installation).context("INVALID_PAIR_CANDIDATE")?;
+        ensure!(
+            !candidate.certificate.is_empty()
+                && candidate.certificate.len() <= 8192
+                && candidate.endpoint.len() <= 512,
+            "INVALID_PAIR_CANDIDATE"
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(candidate.certificate.clone().into())
+            .context("INVALID_PAIR_CERTIFICATE")?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // One outstanding request per installation. A retry can reuse the same
+        // exact candidate, but cannot replace a key awaiting owner review.
+        let pending:Option<(String,String)> = tx.query_row("SELECT id,candidate FROM invitations WHERE verifier='' AND json_extract(candidate,'$.installation')=? LIMIT 1", [&candidate.installation], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        if let Some((pending, stored)) = pending {
+            ensure!(
+                stored == serde_json::to_string(candidate)?,
+                "PAIRING_CANDIDATE_ALREADY_PENDING"
+            );
+            tx.commit()?;
+            return Ok(pending);
+        }
+        let count:u64 = tx.query_row("SELECT COUNT(*) FROM invitations WHERE consumed=1 AND candidate IS NOT NULL AND json_extract(candidate,'$.installation') NOT IN (SELECT id FROM pairs WHERE revoked=0)", [], |r| r.get(0))?;
+        ensure!(count < 128, "PAIRING_PENDING_CAPACITY");
+        let pending = id();
+        tx.execute(
+            "INSERT INTO invitations VALUES(?,'',0,1,?)",
+            params![pending, serde_json::to_string(candidate)?],
+        )?;
+        tx.commit()?;
+        Ok(pending)
+    }
     pub fn approve(&mut self, invitation: &str) -> Result<Peer> {
         let candidate: String = self
             .db
@@ -515,7 +577,23 @@ impl Registry {
             .context("PAIR_CANDIDATE_NOT_FOUND")?;
         let peer: Peer = serde_json::from_str(&candidate)?;
         self.trust(&peer)?;
+        self.db.execute(
+            "DELETE FROM invitations WHERE id=? AND verifier=''",
+            [invitation],
+        )?;
         Ok(peer)
+    }
+    /// Owner-local dismissal releases bounded v2 pending capacity. This does
+    /// not revoke established trust or grant any network management authority.
+    pub fn reject_code_candidate(&mut self, invitation: &str) -> Result<()> {
+        ensure!(
+            self.db.execute(
+                "DELETE FROM invitations WHERE id=? AND verifier=''",
+                [invitation]
+            )? == 1,
+            "PAIR_CANDIDATE_NOT_FOUND"
+        );
+        Ok(())
     }
     pub fn trust(&mut self, peer: &Peer) -> Result<()> {
         let transaction = self.begin_access()?;
@@ -528,18 +606,7 @@ impl Registry {
             !peer.certificate.is_empty() && peer.certificate.len() <= 8192,
             "INVALID_PAIR_CERTIFICATE"
         );
-        ensure!(
-            peer.endpoint == "outbound-only"
-                || (crate::wss_transport::is_websocket(&peer.endpoint)
-                    && crate::wss_transport::endpoint(&peer.endpoint, false).is_ok())
-                || peer
-                    .endpoint
-                    .parse::<std::net::SocketAddr>()
-                    .context("PAIR_ENDPOINT_REQUIRES_NUMERIC_ADDRESS")?
-                    .port()
-                    != 0,
-            "INVALID_PAIR_ENDPOINT"
-        );
+        peer.validate_endpoint()?;
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(peer.certificate.clone().into())
@@ -802,6 +869,63 @@ mod tests {
         let mut rotated = grant.clone();
         rotated.peer = replacement.installation.clone();
         registry.configure_sync(&rotated).unwrap();
+    }
+    #[test]
+    fn reusable_code_pending_deduplicates_caps_and_can_be_dismissed() {
+        let temp = private_temp();
+        let a = Identity::generate(&id()).unwrap();
+        let b = Identity::generate(&id()).unwrap();
+        let mut registry = Registry::open(&temp.path().join("pairs.db"), &a.installation).unwrap();
+        let candidate = peer(&b);
+        for endpoint in [
+            "not-an-endpoint",
+            "127.0.0.1:0",
+            "ws://192.0.2.1:1234/tkfs/sync",
+            "wss://127.0.0.1:1234/tkfs/enroll",
+        ] {
+            assert!(
+                registry
+                    .submit_code_candidate(&Peer {
+                        endpoint: endpoint.into(),
+                        ..candidate.clone()
+                    })
+                    .is_err()
+            );
+        }
+        assert_eq!(registry.pending().unwrap(), serde_json::json!([]));
+        let pending = registry.submit_code_candidate(&candidate).unwrap();
+        assert_eq!(registry.submit_code_candidate(&candidate).unwrap(), pending);
+        let changed = peer(&Identity::generate(&b.installation).unwrap());
+        assert!(registry.submit_code_candidate(&changed).is_err());
+        for _ in 1..128 {
+            registry
+                .submit_code_candidate(&Peer {
+                    installation: id(),
+                    ..candidate.clone()
+                })
+                .unwrap();
+        }
+        let extra = Peer {
+            installation: id(),
+            ..candidate.clone()
+        };
+        assert_eq!(
+            registry
+                .submit_code_candidate(&extra)
+                .unwrap_err()
+                .to_string(),
+            "PAIRING_PENDING_CAPACITY"
+        );
+        registry.reject_code_candidate(&pending).unwrap();
+        let pending = registry.submit_code_candidate(&extra).unwrap();
+        registry.approve(&pending).unwrap();
+        assert_eq!(registry.pending().unwrap().as_array().unwrap().len(), 127);
+        assert!(registry.reject_code_candidate(&pending).is_err());
+        assert!(
+            registry
+                .authenticate(&extra.certificate, &extra.installation)
+                .is_ok()
+        );
     }
     #[test]
     fn expired_wrong_secret_and_wrong_identity_invitations_fail() {

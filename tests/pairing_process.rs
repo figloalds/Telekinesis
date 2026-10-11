@@ -107,6 +107,7 @@ fn fixture(path: &Path, ports: (&str, &str)) -> (Config, PathBuf, PathBuf, Ident
         }
     };
     let config = Config {
+        orchestrator_config: None,
         format_version: 1,
         transport: tkfs::pairing_service::Transport::Tls,
         inbound: true,

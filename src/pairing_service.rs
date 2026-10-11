@@ -160,6 +160,9 @@ fn cancelled(stop: &AtomicBool) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Explicit local config mapping for reusable enrollment v2; never a secret.
+    #[serde(default)]
+    pub orchestrator_config: Option<PathBuf>,
     pub format_version: u32,
     pub installation: String,
     pub data_directory: PathBuf,
@@ -215,6 +218,14 @@ impl Config {
             }
         }
         let parent = path.parent().unwrap();
+        if let Some(orchestrator) = &mut config.orchestrator_config {
+            if orchestrator.is_relative() {
+                *orchestrator = parent.join(&*orchestrator);
+            }
+            // Validate TOML and bind the exact existing config; do not migrate it.
+            crate::orchestrator::Config::load(orchestrator)?;
+            *orchestrator = std::fs::canonicalize(&*orchestrator)?;
+        }
         if config.data_directory.is_relative() {
             config.data_directory = parent.join(&config.data_directory);
         }
@@ -357,6 +368,131 @@ fn client_budget(
 pub(crate) struct Enrollment {
     pub(crate) invitation: Invitation,
     pub(crate) candidate: Peer,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodeEnrollment {
+    protocol_version: u32,
+    code: String,
+    candidate: Peer,
+}
+impl Drop for CodeEnrollment {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.code);
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum EnrollmentRequest {
+    Legacy(Enrollment),
+    Code(CodeEnrollment),
+}
+pub(crate) fn enrollment_response(config: &Config, request: EnrollmentRequest) -> Value {
+    let result = (|| -> Result<Value> {
+        match request {
+            EnrollmentRequest::Legacy(request) => {
+                config
+                    .registry()?
+                    .submit(&request.invitation, &request.candidate)?;
+                Ok(json!({"ok":true,"status":"pending-local-approval"}))
+            }
+            EnrollmentRequest::Code(request) => {
+                crate::pairing_code::validate(&request.code)?;
+                ensure!(
+                    request.protocol_version == 2,
+                    "UNSUPPORTED_ENROLLMENT_VERSION"
+                );
+                let path = config
+                    .orchestrator_config
+                    .as_ref()
+                    .context("PAIRING_CODE_NOT_CONFIGURED")?;
+                let pending = crate::pairing_code::Store::for_config(path)?
+                    .authorize(&request.code, || {
+                        config.registry()?.submit_code_candidate(&request.candidate)
+                    })?;
+                Ok(
+                    json!({"ok":true,"protocol_version":2,"invitation":pending,"status":"pending-local-approval"}),
+                )
+            }
+        }
+    })();
+    // Do not reflect parser, database, certificate or caller-controlled errors.
+    result.unwrap_or_else(|_| json!({"ok":false,"error":"ENROLLMENT_REJECTED"}))
+}
+pub fn public_bootstrap(config: &Config) -> Result<Peer> {
+    let identity = config.identity()?;
+    Ok(Peer {
+        installation: identity.installation.clone(),
+        certificate: identity.certificate.clone(),
+        endpoint: config.advertise.clone(),
+        revoked: false,
+    })
+}
+/// `issuer` is independently approved public server metadata. A decimal code is
+/// never used to bootstrap server authentication or sent before pin verification.
+pub fn join_code(
+    config: &Config,
+    issuer: Peer,
+    enrollment_endpoint: &str,
+    code: Zeroizing<String>,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    join_code_identity(
+        config,
+        &config.identity()?,
+        issuer,
+        enrollment_endpoint,
+        code,
+        stop,
+    )
+}
+fn join_code_identity(
+    config: &Config,
+    identity: &Identity,
+    issuer: Peer,
+    enrollment_endpoint: &str,
+    mut code: Zeroizing<String>,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    crate::pairing_code::validate(&code)?;
+    ensure!(
+        identity.installation == config.installation
+            && identity.installation != issuer.installation
+            && !issuer.revoked,
+        "INVALID_PAIR_CANDIDATE"
+    );
+    cancelled(&stop)?;
+    let mut target = issuer.clone();
+    target.endpoint = enrollment_endpoint.into();
+    let request = CodeEnrollment {
+        protocol_version: 2,
+        code: std::mem::take(&mut *code),
+        candidate: Peer {
+            installation: identity.installation.clone(),
+            certificate: identity.certificate.clone(),
+            endpoint: config.advertise.clone(),
+            revoked: false,
+        },
+    };
+    let response: Value = if crate::wss_transport::is_websocket(&target.endpoint) {
+        crate::wss_transport::enroll(identity, &target, &request, stop)?
+    } else {
+        let mut stream = client_budget(identity, &target, true, stop, Limits::default())?;
+        frame(&mut stream, &request)?;
+        read(&mut stream, 64 * 1024)?
+    };
+    ensure!(
+        response["ok"] == true && response["protocol_version"] == 2,
+        "ENROLLMENT_REJECTED_OR_UNSUPPORTED"
+    );
+    let pending = response["invitation"]
+        .as_str()
+        .context("INVALID_ENROLLMENT_RESPONSE")?;
+    uuid::Uuid::parse_str(pending).context("INVALID_ENROLLMENT_RESPONSE")?;
+    config.registry()?.trust(&issuer)?;
+    Ok(
+        json!({"invitation":pending,"issuer":issuer.installation,"fingerprint":issuer.fingerprint(),"status":"awaiting-issuer-local-approval"}),
+    )
 }
 pub fn join(config: &Config, invitation: Invitation) -> Result<Value> {
     join_with_identity(config, &config.identity()?, invitation)
@@ -707,13 +843,8 @@ fn accepted(
     socket.stage(frame_budget, total);
     let mut stream = rustls::StreamOwned::new(conn, socket);
     if enrollment {
-        let request: Enrollment = read(&mut stream, 64 * 1024)?;
-        let mut registry = config.registry()?;
-        let result = registry.submit(&request.invitation, &request.candidate);
-        let response = match result {
-            Ok(()) => json!({"ok":true,"status":"pending-local-approval"}),
-            Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
-        };
+        let request: EnrollmentRequest = read(&mut stream, 64 * 1024)?;
+        let response = enrollment_response(config, request);
         frame(&mut stream, &response)?;
     } else {
         // Authorization is reloaded AFTER the TLS handshake and request read.
@@ -854,6 +985,11 @@ impl Service {
         }
     }
     pub fn run(self, stop: Arc<AtomicBool>) -> Result<()> {
+        self.run_retained(stop)
+    }
+    /// Keep this service alive after an uncertain return: its registry lock
+    /// also fences transport children that may still be draining local IPC.
+    pub(crate) fn run_retained(&self, stop: Arc<AtomicBool>) -> Result<()> {
         if self.config.transport == Transport::Wss {
             return crate::wss_transport::run(
                 &self.config,
@@ -972,6 +1108,22 @@ impl Service {
 /// Invitation paste does not echo or enter argv/shell history. Noninteractive
 /// stdin is supported for pipelines; the application never writes it to disk.
 pub fn read_invitation() -> Result<Invitation> {
+    let input = read_hidden("Paste invitation (input hidden): ", 128 * 1024)?;
+    let encoded = Zeroizing::new(hex::decode(input.trim()).context("INVALID_INVITATION")?);
+    serde_json::from_slice(&encoded).context("INVALID_INVITATION")
+}
+pub fn read_pairing_code() -> Result<Zeroizing<String>> {
+    let mut code = read_hidden("Paste 200-digit pairing code (input hidden): ", 203)?;
+    if code.ends_with('\n') {
+        code.pop();
+        if code.ends_with('\r') {
+            code.pop();
+        }
+    }
+    crate::pairing_code::validate(&code)?;
+    Ok(code)
+}
+fn read_hidden(prompt: &str, maximum: usize) -> Result<Zeroizing<String>> {
     #[cfg(target_os = "linux")]
     let saved = {
         let mut old = std::mem::MaybeUninit::<libc::termios>::uninit();
@@ -999,12 +1151,12 @@ pub fn read_invitation() -> Result<Invitation> {
         }
         (handle, mode)
     };
-    eprint!("Paste invitation (input hidden): ");
+    eprint!("{prompt}");
     use std::io::BufRead;
     let mut input = Zeroizing::new(String::new());
     let result = std::io::stdin()
         .lock()
-        .take(128 * 1024)
+        .take(maximum as u64)
         .read_line(&mut input);
     #[cfg(target_os = "linux")]
     if let Some(old) = saved {
@@ -1015,10 +1167,9 @@ pub fn read_invitation() -> Result<Invitation> {
         set_console_mode(saved.0, mode);
     }
     eprintln!();
-    result?;
-    ensure!(input.len() < 128 * 1024, "INVITATION_TOO_LARGE");
-    let encoded = Zeroizing::new(hex::decode(input.trim()).context("INVALID_INVITATION")?);
-    serde_json::from_slice(&encoded).context("INVALID_INVITATION")
+    result.map_err(|_| anyhow::anyhow!("INVALID_SECRET_INPUT"))?;
+    ensure!(input.len() < maximum, "SECRET_INPUT_TOO_LARGE");
+    Ok(input)
 }
 #[cfg(windows)]
 fn console_mode() -> (*mut std::ffi::c_void, Option<u32>) {
@@ -1046,6 +1197,114 @@ mod tests {
     use super::*;
     use crate::{core::Store, runtime::Engine};
     use std::sync::Mutex;
+    #[test]
+    fn reusable_code_v2_tls_wss_and_encrypted_loopback_ws_rotation_and_pin() {
+        for scheme in ["tls", "wss", "ws"] {
+            let temp = tempfile::tempdir().unwrap();
+            let o1 = crate::pairing_code::tests::configuration(temp.path());
+            let ia = Arc::new(Identity::generate(&id()).unwrap());
+            let ib = Identity::generate(&id()).unwrap();
+            let ic = Identity::generate(&id()).unwrap();
+            // O1 identity is deliberately unrelated to the pairing identity.
+            assert_ne!(
+                crate::orchestrator::Config::load(&o1)
+                    .unwrap()
+                    .existing_installation()
+                    .unwrap(),
+                ia.installation
+            );
+            let mut ca = fixture_config(&temp.path().join("server"), &ia);
+            ca.orchestrator_config = Some(o1.clone());
+            ca.dial = false;
+            if scheme != "tls" {
+                ca.transport = Transport::Wss;
+                ca.enrollment_listen.clear();
+                ca.advertise = format!("{scheme}://127.0.0.1:1/tkfs/sync");
+                ca.enrollment_advertise = format!("{scheme}://127.0.0.1:1/tkfs/enroll");
+            }
+            let (ca, running) = start(ca, ia.clone());
+            let mut cb = fixture_config(&temp.path().join("client"), &ib);
+            cb.advertise = "outbound-only".into();
+            let mut cc = fixture_config(&temp.path().join("client2"), &ic);
+            cc.advertise = "outbound-only".into();
+            let mut codes = crate::pairing_code::Store::for_config(&o1).unwrap();
+            let code = codes.reset().unwrap();
+            let peer = endpoint(&ca, &ia);
+            let join = |cfg: &Config, identity: &Identity, issuer: Peer, secret: &str| {
+                join_code_identity(
+                    cfg,
+                    identity,
+                    issuer,
+                    &ca.enrollment_advertise,
+                    Zeroizing::new(secret.into()),
+                    Arc::new(AtomicBool::new(false)),
+                )
+            };
+            let impostor = Identity::generate(&ia.installation).unwrap();
+            assert!(join(&cb, &ib, endpoint(&ca, &impostor), code.expose()).is_err());
+            assert_eq!(ca.registry().unwrap().pending().unwrap(), json!([]));
+            let pending = join(&cb, &ib, peer.clone(), code.expose()).unwrap();
+            let retry = join(&cb, &ib, peer.clone(), code.expose()).unwrap();
+            assert_eq!(retry["invitation"], pending["invitation"]);
+            let pending2 = join(&cc, &ic, peer.clone(), code.expose()).unwrap();
+            assert_eq!(
+                ca.registry()
+                    .unwrap()
+                    .pending()
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+            ca.registry()
+                .unwrap()
+                .approve(pending["invitation"].as_str().unwrap())
+                .unwrap();
+            let grant = SyncConfiguration {
+                peer: ib.installation.clone(),
+                repo: id(),
+                local_runtime: temp.path().join("unused-runtime.json"),
+                local_replica: id(),
+                remote_replica: id(),
+                enabled: false,
+            };
+            ca.registry().unwrap().configure_sync(&grant).unwrap();
+            let grants_before =
+                serde_json::to_value(ca.registry().unwrap().configurations().unwrap()).unwrap();
+            let before = serde_json::to_value(ca.registry().unwrap().peers().unwrap()).unwrap();
+            let fresh = codes.reset().unwrap();
+            assert_eq!(
+                serde_json::to_value(ca.registry().unwrap().configurations().unwrap()).unwrap(),
+                grants_before
+            );
+            assert_eq!(
+                serde_json::to_value(ca.registry().unwrap().peers().unwrap()).unwrap(),
+                before
+            );
+            assert!(join(&cc, &ic, peer.clone(), code.expose()).is_err());
+            // Pending before reset remains explicitly approvable; reset is not revocation.
+            ca.registry()
+                .unwrap()
+                .approve(pending2["invitation"].as_str().unwrap())
+                .unwrap();
+            let response = if scheme == "tls" {
+                request(&ib, &peer, json!({"op":"list-published"})).unwrap()
+            } else {
+                crate::wss_transport::request(
+                    &ib,
+                    &peer,
+                    &NetworkRequest::ListPublished {},
+                    None,
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap()
+            };
+            assert_eq!(response["ok"], true);
+            assert!(join(&cb, &ib, peer, fresh.expose()).is_ok());
+            drop(running);
+        }
+    }
     struct Running {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<Result<()>>>,
@@ -1060,6 +1319,7 @@ mod tests {
     }
     fn fixture_config(path: &Path, identity: &Identity) -> Config {
         Config {
+            orchestrator_config: None,
             format_version: 1,
             transport: Transport::Tls,
             inbound: true,

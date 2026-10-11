@@ -5,7 +5,7 @@ For one-port WSS and outbound-only home clients, see
 [PAIRING-WSS.md](PAIRING-WSS.md). Raw TLS remains the default compatibility mode.
 The default is `./pairing.toml` in the current directory; there is no parent or
 global config search. Relative paths in the file resolve beside that file.
-Windows O1/GUI catalog management remains separate and Windows-only. This service
+O1 catalog management remains separate and portable; the GUI is Windows-only. This service
 does not adopt/create states, mount filesystems, start workers or upgrade daemons.
 Run existing workers under the same OS account first, then grant their runtimes.
 Windows workers now expose owner-authenticated named pipes rather than localhost
@@ -39,6 +39,45 @@ A second peer grant for the same repo is refused. A peer may echo identical
 already known local events, but cannot invent events under another replica's
 origin. This does not provide independently signed event provenance for a future
 multi-hop mesh; that extension needs a separate protocol design.
+
+## Numeric pairing codes
+
+The receiving host may opt into reusable 200-digit enrollment codes while keeping
+its existing identity, invitations and grants. In its pairing TOML, set the root
+field `orchestrator_config = '../orchestrator.toml'` to the selected initialized
+O1 configuration. This path resolves relative to the pairing TOML. The two
+installation UUIDs need not match. Missing or replaced O1 identity fails closed.
+
+1. On the receiving host, run `tkfs manage -f <O1_CONFIG> reset-pairing-code`.
+   The supervisor prints exactly 200 digits once; transfer them privately.
+2. Export `tkfs pairing -f <PAIRING_CONFIG> public-bootstrap` as public JSON.
+   Transfer this certificate/identity metadata separately and independently
+   confirm its SHA-256 fingerprint. It contains no code or private key.
+3. On the joining host, run `tkfs pairing -f <CLIENT_CONFIG> join-code
+   --issuer <PUBLIC_JSON> --enrollment-endpoint <ENROLLMENT_URL>
+   --fingerprint <CONFIRMED_SHA256>`. Paste the original code at masked input.
+   The fingerprint must match before input is read, and TLS must authenticate
+   that public certificate before any code is transmitted.
+4. The receiver uses `status` and the existing `approve <PENDING_ID>
+   --installation <JOINER_UUID> --fingerprint <JOINER_SHA256>` command to approve
+   the exact candidate. `reject-code-candidate <PENDING_ID>` dismisses an
+   unwanted numeric-code candidate and releases a pending slot.
+5. Configure repository grants and run the existing service/sync flow below.
+   Enrollment alone creates no replica, mount or data grant.
+
+Rotation rejects future submissions of the old numeric code. Already admitted
+pending candidates remain subject to local approval; approved peers, grants and
+resume receipts remain intact. Revoke a peer explicitly to remove its access.
+Legacy v1 invitations continue under their own one-use/expiry policy and are
+not invalidated by numeric-code rotation. Numeric enrollment never silently
+falls back to invitations or weaker authentication. Older binaries reject the
+new typed enrollment request; use the legacy flow explicitly when necessary.
+
+Only a salted verifier is stored in the protected sibling
+`<O1_CONFIG filename>.pairing/verifier.sqlite`, bound to that initialized O1
+installation. There is no retrieval API, logged response or replay journal for
+the code. If reset delivery is uncertain, explicitly reset again. See
+[management reset](ORCHESTRATOR-CLI.md#pairing-code-reset).
 
 ## Configuration and credentials
 
@@ -214,8 +253,9 @@ Qualification includes disposable Windows/Linux loopback TLS peers and actual
 owner pipe/Unix worker bridges, durable grant reload and process/service restart
 paths. No-login boot, installed system units, public networks, cross-host
 Tailscale/VPS connectivity, certificate expiry renewal and arbitrary multi-peer
-topologies remain unqualified. Do not claim a Linux O1 supervisor or a deployed
-production service from this slice.
+topologies remain unqualified. O1 lifecycle and first-mount/restart fixtures now
+run on Windows and Linux; that local qualification does not establish a deployed
+production service or cross-host connectivity.
 
 References: [DPAPI](https://learn.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata),
 [TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446),

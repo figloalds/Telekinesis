@@ -2,7 +2,7 @@
 //! only durable credential source is the existing protected platform backend.
 use crate::{
     core::id,
-    pairing::{CredentialSource, Identity, Invitation, PublishedState, SyncConfiguration},
+    pairing::{CredentialSource, Identity, Invitation, Peer, PublishedState, SyncConfiguration},
     pairing_service::{self, Config, Transport},
     private_storage::Directory,
     runtime::Discovery,
@@ -35,6 +35,7 @@ pub struct Client {
     invitation: Option<Invitation>,
     expected_endpoint: String,
     snapshot: Snapshot,
+    code_issuer: Option<(Peer, String)>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +145,7 @@ impl Client {
             invitation: None,
             expected_endpoint: String::new(),
             snapshot: Snapshot::default(),
+            code_issuer: None,
         };
         client.refresh()?;
         Ok(client)
@@ -185,6 +187,7 @@ impl Client {
             identity
         };
         let config = Config {
+            orchestrator_config: None,
             format_version: 1,
             installation: identity.installation.clone(),
             data_directory: parent.join("registry"),
@@ -329,8 +332,75 @@ impl Client {
     }
     pub fn clear_invitation(&mut self) {
         self.invitation = None;
+        self.code_issuer = None;
         self.snapshot.review.clear();
         self.expected_endpoint.clear();
+    }
+    /// Review public bootstrap data only. No code is retained by this adapter.
+    pub fn inspect_code(&mut self, public_json: &str, enrollment: &str) -> Result<()> {
+        self.clear_invitation();
+        self.current()?.identity()?;
+        ensure!(public_json.len() <= 65536, "INVALID_SERVER_BOOTSTRAP");
+        let issuer: Peer = serde_json::from_str(public_json).context("INVALID_SERVER_BOOTSTRAP")?;
+        uuid::Uuid::parse_str(&issuer.installation).context("INVALID_SERVER_BOOTSTRAP")?;
+        ensure!(
+            !issuer.revoked && issuer.installation != self.config.installation,
+            "INVALID_SERVER_BOOTSTRAP"
+        );
+        ensure!(
+            issuer.endpoint.starts_with("wss://") && enrollment.starts_with("wss://"),
+            "DESKTOP_WSS_REQUIRED"
+        );
+        ensure!(
+            crate::wss_transport::endpoint(&issuer.endpoint, false)?
+                == crate::wss_transport::endpoint(enrollment, true)?,
+            "INVITATION_ENDPOINT_MISMATCH"
+        );
+        ensure!(
+            !issuer.certificate.is_empty() && issuer.certificate.len() <= 8192,
+            "INVALID_SERVER_BOOTSTRAP"
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(issuer.certificate.clone().into())
+            .context("INVALID_SERVER_BOOTSTRAP")?;
+        self.snapshot.review = format!(
+            "Server installation: {}\nCertificate SHA-256: {}\nSync endpoint: {}\nEnrollment endpoint: {}\nVerify this fingerprint directly with the server owner before submitting the code.",
+            issuer.installation,
+            issuer.fingerprint(),
+            issuer.endpoint,
+            enrollment
+        );
+        self.code_issuer = Some((issuer, enrollment.into()));
+        Ok(())
+    }
+    pub fn join_code(
+        &mut self,
+        public_json: &str,
+        enrollment: &str,
+        code: Zeroizing<String>,
+        confirmed: bool,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Value> {
+        ensure!(confirmed, "EXACT_KEY_CONFIRMATION_REQUIRED");
+        let (issuer, reviewed_endpoint) =
+            self.code_issuer.take().context("REVIEW_SERVER_REQUIRED")?;
+        let current: Peer =
+            serde_json::from_str(public_json).context("INVALID_SERVER_BOOTSTRAP")?;
+        ensure!(
+            serde_json::to_value(&issuer)? == serde_json::to_value(current)?
+                && enrollment == reviewed_endpoint,
+            "SERVER_REVIEW_CHANGED"
+        );
+        ensure!(
+            code.len() == 200 && code.bytes().all(|b| b.is_ascii_digit()),
+            "PAIRING_CODE_MUST_BE_200_DIGITS"
+        );
+        self.snapshot.review.clear();
+        self.snapshot.peer = issuer.installation.clone();
+        let result = pairing_service::join_code(&self.current()?, issuer, enrollment, code, stop);
+        self.refresh()?;
+        result
     }
     pub fn select_peer(&mut self, peer: &str) {
         self.snapshot.peer = peer.into();
@@ -444,6 +514,22 @@ impl Client {
         let grant = config.registry()?.grant(peer, repo)?;
         pairing_service::synchronize_cancellable(&config, &grant, stop)
     }
+    /// Public identity/grant binding used by the receive wizard. No credential
+    /// material or runtime control token is included.
+    pub fn receive_binding(&self, peer: &str, repo: &str) -> Result<Value> {
+        let config = self.current()?;
+        let registry = config.registry()?;
+        let grant = registry.grant(peer, repo)?;
+        let issuer = registry
+            .peers()?
+            .into_iter()
+            .find(|p| p.installation == peer && !p.revoked)
+            .context("PAIR_REVOKED")?;
+        ensure!(grant.enabled, "SYNC_GRANT_PAUSED");
+        Ok(
+            serde_json::json!({"config":self.path,"installation":config.installation,"grant":grant,"peer":issuer}),
+        )
+    }
     pub fn revoke(&mut self, peer: &str, confirmed: bool) -> Result<()> {
         ensure!(confirmed, "REVOCATION_CONFIRMATION_REQUIRED");
         self.current()?.registry()?.revoke(peer)?;
@@ -455,11 +541,22 @@ impl Client {
 pub fn error_message(error: &anyhow::Error) -> String {
     let text = format!("{error:#}");
     let message = if text.contains("CANCELLED") {
-        "Stopped local pairing I/O. A submitted invitation may have been consumed and sync may have committed data. Check approval or sync again to resume; cancellation does not undo data."
+        "Stopped local pairing I/O. An enrollment may still await server approval and sync may have committed data. Check approval or sync again to resume; cancellation does not undo data."
+    } else if text.contains("PAIRING_CODE_MUST_BE_200_DIGITS")
+        || text.contains("INVALID_PAIRING_CODE")
+    {
+        "Enter exactly 200 decimal digits with no spaces. Ask the server owner for the current code."
+    } else if text.contains("INVALID_SERVER_BOOTSTRAP")
+        || text.contains("SERVER_REVIEW_CHANGED")
+        || text.contains("REVIEW_SERVER_REQUIRED")
+    {
+        "Review the server public bootstrap and enrollment address again, then confirm the exact certificate fingerprint."
+    } else if text.contains("ENROLLMENT_REJECTED") {
+        "The server did not accept enrollment. Check its current pairing code and service configuration with the owner; no trust is granted automatically."
     } else if text.contains("INVITATION_EXPIRED") {
         "This invitation expired. Ask for a fresh invitation."
     } else if text.contains("ENDPOINT_MISMATCH") {
-        "The endpoint differs from the invitation. Review the server endpoint and exact key again."
+        "The endpoint differs from the reviewed server. Review the public identity, address and exact fingerprint again."
     } else if text.contains("REPLICA_REPOSITORY_MISMATCH") {
         "This local replica belongs to a different repository. A matching running replica is required; this UI cannot provision or adopt it yet."
     } else if text.contains("CONFIRMATION_REQUIRED") {
@@ -475,7 +572,7 @@ pub fn error_message(error: &anyhow::Error) -> String {
     } else if text.contains("CREDENTIAL") || text.contains("PRIVATE_STORAGE") {
         "Protected credential/storage is unavailable or unsafe. Use the configured platform credential; existing permissions are never repaired automatically."
     } else {
-        "Pairing operation did not complete. Check endpoint, exact-key approval, repository grants and local worker readiness. After an uncertain enrollment, ask for a fresh invitation. Committed sync data is retained and can resume."
+        "Pairing operation did not complete. Check endpoint, exact-key approval, repository grants and local worker readiness. After an uncertain enrollment, check server approval before submitting again. Committed sync data is retained and can resume."
     };
     message.into()
 }

@@ -27,6 +27,121 @@ impl Drop for Owned {
         let _ = self.0.wait();
     }
 }
+
+#[test]
+fn native_gui_pairing_code_callbacks_and_late_close_result() -> Result<()> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_tkfs"));
+    let fixtures = std::env::var_os("TKFS_CODE_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-runs"));
+    std::fs::create_dir_all(&fixtures)?;
+    for theme in ["light", "dark"] {
+        let temp = tempfile::tempdir_in(&fixtures)?;
+        let root = temp.path();
+        let orchestrator = root.join("orchestrator.toml");
+        std::fs::write(
+            &orchestrator,
+            format!(
+                "format_version=1\ndata_directory='o1'\n[control]\ntransport='named-pipe'\nname='gui-code-{}'\n",
+                id()
+            ),
+        )?;
+        drop(tkfs::orchestrator::Supervisor::open(
+            tkfs::orchestrator::Config::load(&orchestrator)?,
+        )?);
+        let server_root = root.join("server");
+        tkfs::private_storage::Directory::open(&server_root)?;
+        let identity = Identity::generate(&id())?;
+        let credential = CredentialSource::WindowsDpapi {
+            file: server_root.join("identity.dpapi"),
+        };
+        credential.save_windows(&identity)?;
+        let address = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+        let server = Config {
+            orchestrator_config: Some(orchestrator.clone()),
+            format_version: 1,
+            installation: identity.installation.clone(),
+            data_directory: server_root.join("registry"),
+            credential,
+            transport: Transport::Wss,
+            inbound: true,
+            dial: false,
+            listen: address.to_string(),
+            enrollment_listen: String::new(),
+            advertise: format!("wss://{address}/tkfs/sync"),
+            enrollment_advertise: format!("wss://{address}/tkfs/enroll"),
+        };
+        let server_path = server_root.join("server.toml");
+        std::fs::write(&server_path, toml::to_string(&server)?)?;
+        let mut service = Owned(
+            Command::new(&binary)
+                .args(["pairing", "-f"])
+                .arg(&server_path)
+                .arg("run")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        wait(|| std::net::TcpStream::connect(address).is_ok())?;
+        let client = root.join("client/client.toml");
+        let _ = Client::create(&client)?;
+        let mut wrong_bootstrap = tkfs::pairing_service::public_bootstrap(&server)?;
+        wrong_bootstrap.certificate = Identity::generate(&id())?.certificate.clone();
+        let output = root.join("gui");
+        std::fs::create_dir(&output)?;
+        let report = output.join("report.json");
+        let mut gui = Owned(
+            Command::new(&binary)
+                .args(["gui-test", "--report"])
+                .arg(&report)
+                .env("TKFS_UI_TEST_PHASE", "pairing-code")
+                .env("TKFS_UI_TEST_THEME", theme)
+                .stdin(Stdio::piped())
+                .stdout(std::fs::File::create(output.join("stdout.log"))?)
+                .stderr(std::fs::File::create(output.join("stderr.log"))?)
+                .spawn()?,
+        );
+        gui.0.stdin.take().context("GUI_STDIN")?.write_all(&serde_json::to_vec(&json!({
+            "root": root, "orchestrator": orchestrator, "server": server_path, "client": client, "wrong_bootstrap": wrong_bootstrap
+        }))?)?;
+        let deadline = Instant::now() + Duration::from_secs(115);
+        while gui.0.try_wait()?.is_none() {
+            ensure!(Instant::now() < deadline, "GUI_CODE_TIMEOUT");
+            if output.join("stop-fixture-service").exists()
+                && !output.join("fixture-service-stopped").exists()
+            {
+                service.0.kill()?;
+                service.0.wait()?;
+                std::fs::write(output.join("fixture-service-stopped"), b"stopped")?;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result: Value =
+            serde_json::from_slice(&std::fs::read(&report).context("GUI_CODE_REPORT_MISSING")?)?;
+        if let Some(evidence) = std::env::var_os("TKFS_DESKTOP_CODE_EVIDENCE") {
+            let destination = PathBuf::from(evidence).join(theme);
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(&output)? {
+                let entry = entry?;
+                std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+            }
+        }
+        ensure!(
+            result["passed"] == true,
+            "GUI_CODE_ACCEPTANCE_FAILED: {}",
+            result["error"]
+        );
+        ensure!(
+            !root.join(".tkfs-ui-operation.json").exists(),
+            "RESET_JOURNAL_CREATED"
+        );
+        ensure!(
+            !root.join(".tkfs-desktop").exists(),
+            "RESET_DESKTOP_METADATA_CREATED"
+        );
+    }
+    Ok(())
+}
 fn daemon(state: &Path, mount: Option<&Path>) -> Owned {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tkfs"));
     command
@@ -38,6 +153,204 @@ fn daemon(state: &Path, mount: Option<&Path>) -> Owned {
         command.arg("--mount").arg(mount);
     }
     Owned(command.spawn().unwrap())
+}
+
+// Ensures a failed GUI assertion still shuts down only its owned supervisor and
+// workers before the enclosing temporary directory is removed.
+struct ManagedFixture(tkfs::orchestrator::Config);
+impl Drop for ManagedFixture {
+    fn drop(&mut self) {
+        use tkfs::orchestrator::{Action, Request, client};
+        let mut request = Request {
+            version: 1,
+            target_installation: self.0.installation_id.clone(),
+            operation_id: None,
+            expected_generation: None,
+            action: Action::List,
+        };
+        if let Ok(list) = client(&self.0, &request) {
+            request.action = Action::Shutdown;
+            request.operation_id = Some(id());
+            request.expected_generation = list["result"]["catalog_generation"].as_u64();
+            let _ = client(&self.0, &request);
+        }
+    }
+}
+
+#[test]
+fn native_gui_receive_replica_verified_first_mount_and_background_scope() -> Result<()> {
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_tkfs"));
+    let fixtures = std::env::var_os("TKFS_CODE_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .context("EXPLICIT_TRUSTED_FIXTURE_ROOT_REQUIRED")?;
+    for theme in ["light", "dark"] {
+        let temp = tempfile::tempdir_in(&fixtures)?;
+        let root = temp.path();
+        let orchestrator = root.join("orchestrator.toml");
+        std::fs::write(
+            &orchestrator,
+            format!(
+                "format_version=1\ndata_directory='o1'\n[control]\ntransport='named-pipe'\nname='gui-receive-{}'\n",
+                id()
+            ),
+        )?;
+        drop(tkfs::orchestrator::Supervisor::open(
+            tkfs::orchestrator::Config::load(&orchestrator)?,
+        )?);
+        let _supervisor = Owned(
+            Command::new(&binary)
+                .args(["orchestrator", "-f"])
+                .arg(&orchestrator)
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(root.join("supervisor.log"))?)
+                .spawn()?,
+        );
+        let _cleanup = ManagedFixture(tkfs::orchestrator::Config::load(&orchestrator)?);
+        let server_root = root.join("server");
+        tkfs::private_storage::Directory::open(&server_root)?;
+        let identity = Identity::generate(&id())?;
+        let credential = CredentialSource::WindowsDpapi {
+            file: server_root.join("identity.dpapi"),
+        };
+        credential.save_windows(&identity)?;
+        let address = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+        let server = Config {
+            orchestrator_config: None,
+            format_version: 1,
+            installation: identity.installation.clone(),
+            data_directory: server_root.join("registry"),
+            credential,
+            transport: Transport::Wss,
+            inbound: true,
+            dial: false,
+            listen: address.to_string(),
+            enrollment_listen: String::new(),
+            advertise: format!("wss://{address}/tkfs/sync"),
+            enrollment_advertise: format!("wss://{address}/tkfs/enroll"),
+        };
+        let server_path = server_root.join("server.toml");
+        std::fs::write(&server_path, toml::to_string(&server)?)?;
+        let client_path = root.join("client/client.toml");
+        let _ = Client::create(&client_path)?;
+        let client = Config::load(&client_path)?;
+        // Fixture owner pretrusts the two generated public identities locally.
+        client
+            .registry()?
+            .trust(&tkfs::pairing_service::public_bootstrap(&server)?)?;
+        server.registry()?.trust(&tkfs::pairing::Peer {
+            installation: client.installation.clone(),
+            certificate: client.identity()?.certificate.clone(),
+            endpoint: "outbound-only".into(),
+            revoked: false,
+        })?;
+        let _service = Owned(
+            Command::new(&binary)
+                .args(["pairing", "-f"])
+                .arg(&server_path)
+                .arg("run")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        wait(|| std::net::TcpStream::connect(address).is_ok())?;
+        let repo = id();
+        let source = root.join("source");
+        {
+            let mut store = Store::initialize(&source, &repo, &id())?;
+            let file = store.create("published.txt", "file")?;
+            store.write_revision(
+                &file.id,
+                file.revisions.get("content").cloned(),
+                b"receive wizard verified bytes",
+            )?;
+            store.fork("private-fixture", false)?;
+            store.checkout("private-fixture")?;
+            store.create("private-canary.txt", "file")?;
+            store.checkout("main")?;
+        }
+        let _source = daemon(&source, None);
+        wait(|| rpc(&source, json!({"op":"status"})).is_ok())?;
+        let output = root.join("gui");
+        std::fs::create_dir(&output)?;
+        let report = output.join("report.json");
+        let mut gui = Owned(
+            Command::new(&binary)
+                .args(["gui-test", "--report"])
+                .arg(&report)
+                .env("TKFS_UI_TEST_PHASE", "receive")
+                .env("TKFS_UI_TEST_THEME", theme)
+                .stdin(Stdio::piped())
+                .stdout(std::fs::File::create(output.join("stdout.log"))?)
+                .stderr(std::fs::File::create(output.join("stderr.log"))?)
+                .spawn()?,
+        );
+        gui.0.stdin.take().context("GUI_STDIN")?.write_all(&serde_json::to_vec(&json!({"orchestrator":orchestrator,"server":server_path,"client":client_path,"source_runtime":source.join("runtime.json"),"repo":repo,"mount":root.join("received-mount")}))?)?;
+        let deadline = Instant::now() + Duration::from_secs(115);
+        while gui.0.try_wait()?.is_none() {
+            ensure!(Instant::now() < deadline, "RECEIVE_GUI_TIMEOUT");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let mut result: Value =
+            serde_json::from_slice(&std::fs::read(&report).context("RECEIVE_REPORT_MISSING")?)?;
+        if result["passed"] == true {
+            let verification = (|| -> Result<()> {
+                let mount = root.join("received-mount");
+                std::fs::write(
+                    mount.join("after-gui-close.txt"),
+                    b"background sync outlives the window",
+                )?;
+                wait(|| {
+                    rpc(&source, json!({"op":"state"}))
+                        .ok()
+                        .is_some_and(|state| {
+                            state["entries"].as_object().is_some_and(|entries| {
+                                entries.values().any(|entry| {
+                                    entry["name"] == "after-gui-close.txt"
+                                        && entry["alive"] == true
+                                        && entry["content"].as_str().is_some_and(|object| {
+                                            rpc(&source, json!({"op":"cat-object","object":object}))
+                                                .ok()
+                                                .is_some_and(|bytes| {
+                                                    bytes["hex"]
+                                                        == hex::encode(
+                                                            b"background sync outlives the window",
+                                                        )
+                                                })
+                                        })
+                                })
+                            })
+                        })
+                })
+                .context("BACKGROUND_SYNC_AFTER_GUI_CLOSE")?;
+                drop(_cleanup);
+                wait(|| !mount.exists()).context("OWNED_MOUNT_CLEANUP")?;
+                Ok(())
+            })();
+            match verification {
+                Ok(()) => result["checks"].as_array_mut().unwrap().push(json!("After GUI process exited, a fresh mounted file synchronized over WSS with exact bytes to source; parent then orderly shut down supervisor and observed fixture mount disappear")),
+                Err(error) => {result["passed"]=json!(false);result["error"]=json!(format!("{error:#}"));}
+            }
+            std::fs::write(&report, serde_json::to_vec_pretty(&result)?)?;
+        }
+        if let Some(evidence) = std::env::var_os("TKFS_DESKTOP_RECEIVE_EVIDENCE") {
+            let destination = PathBuf::from(evidence).join(theme);
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(&output)? {
+                let entry = entry?;
+                std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+            }
+            std::fs::copy(
+                root.join("supervisor.log"),
+                destination.join("supervisor.log"),
+            )?;
+        }
+        ensure!(
+            result["passed"] == true,
+            "RECEIVE_GUI_FAILED: {}",
+            result["error"]
+        );
+    }
+    Ok(())
 }
 fn wait(mut predicate: impl FnMut() -> bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -192,6 +505,7 @@ fn native_gui_wss_pairing_light_dark_protected_keys_mount_privacy_and_revocation
         credential.save_windows(&server_identity)?;
         let address = TcpListener::bind("127.0.0.1:0")?.local_addr()?;
         let server = Config {
+            orchestrator_config: None,
             format_version: 1,
             installation: server_identity.installation.clone(),
             data_directory: server_root.join("registry"),

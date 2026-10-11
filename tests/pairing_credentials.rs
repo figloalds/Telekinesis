@@ -25,6 +25,7 @@ fn systemd_source_reports_locked_missing_invalid_and_refuses_unprotected_or_syml
     let temp = tempfile::tempdir().unwrap();
     let identity = Identity::generate(&id()).unwrap();
     let config = Config {
+        orchestrator_config: None,
         format_version: 1,
         transport: tkfs::pairing_service::Transport::Tls,
         inbound: true,

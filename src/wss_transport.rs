@@ -39,6 +39,18 @@ const RETAIN_IDLE: Duration = Duration::from_secs(30);
 const SHUTDOWN: Duration = Duration::from_secs(35);
 const MAX_DEVICES: usize = 8;
 
+#[cfg(test)]
+static FAIL_RUN: std::sync::OnceLock<Mutex<std::collections::BTreeSet<std::path::PathBuf>>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+pub(crate) fn fail_run_for_test(directory: &std::path::Path) {
+    FAIL_RUN
+        .get_or_init(|| Mutex::new(Default::default()))
+        .lock()
+        .unwrap()
+        .insert(directory.to_owned());
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Lane {
     Control,
@@ -738,14 +750,8 @@ fn accepted(
         None => {
             let _enrollment = count(&admission.enrollment, 2)?;
             socket.get_mut().budget(admission.settings.enrollment);
-            let request: pairing_service::Enrollment = receive(&mut socket, ENROLLMENT)?;
-            let result = config
-                .registry()?
-                .submit(&request.invitation, &request.candidate);
-            let response = match result {
-                Ok(()) => json!({"ok":true,"status":"pending-local-approval"}),
-                Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
-            };
+            let request: pairing_service::EnrollmentRequest = receive(&mut socket, ENROLLMENT)?;
+            let response = pairing_service::enrollment_response(config, request);
             send(&mut socket, &response, ENROLLMENT)?;
         }
         Some(lane) => {
@@ -847,6 +853,15 @@ fn run_with_admission(
     let mut jobs = BTreeMap::<(String, String), (Instant, Duration)>::new();
     let mut inflight = std::collections::BTreeSet::new();
     while !stop.load(Ordering::Relaxed) {
+        #[cfg(test)]
+        ensure!(
+            !FAIL_RUN
+                .get_or_init(|| Mutex::new(Default::default()))
+                .lock()
+                .unwrap()
+                .remove(&config.data_directory),
+            "SYNTHETIC_OUTER_SERVICE_FAILURE"
+        );
         if let Some(listener) = listener
             && let Ok((socket, _)) = listener.accept()
             && admission.pending.load(Ordering::Relaxed) < 8
@@ -993,6 +1008,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let config = Config {
+            orchestrator_config: None,
             format_version: 1,
             transport: Transport::Wss,
             inbound: true,

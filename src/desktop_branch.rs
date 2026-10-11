@@ -134,9 +134,20 @@ impl BranchClient {
         Ok(client)
     }
     fn journal(&self) -> std::path::PathBuf {
-        self.paths.folder.join(".tkfs-ui-branch-operation.json")
+        self.paths.metadata_file("branch-operation")
     }
     pub fn reload(&mut self) -> Result<()> {
+        let _guard = exclusive(&self.paths.folder.join(".tkfs-branch-operation.lock"))?;
+        self.reload_locked()
+    }
+    fn reload_locked(&mut self) -> Result<()> {
+        self.paths
+            .migrate_metadata_if("branch-operation", |bytes| {
+                let legacy: SavedBranchOperation =
+                    serde_json::from_slice(bytes).context("INVALID_LEGACY_BRANCH_OPERATION")?;
+                legacy.validate(&legacy.installation)?;
+                Ok(legacy.installation == self.installation)
+            })?;
         self.saved = if self.journal().try_exists()? {
             let saved: SavedBranchOperation = serde_json::from_slice(&fs::read(self.journal())?)
                 .context("INVALID_BRANCH_OPERATION_JOURNAL")?;
@@ -155,7 +166,7 @@ impl BranchClient {
     ) -> Result<Value> {
         let payload = action.payload(context.generation)?;
         let _guard = exclusive(&self.paths.folder.join(".tkfs-branch-operation.lock"))?;
-        self.reload()?;
+        self.reload_locked()?;
         ensure!(
             !self
                 .saved
@@ -194,7 +205,7 @@ impl BranchClient {
     }
     pub fn retry(&mut self, session: &Session) -> Result<Value> {
         let _guard = exclusive(&self.paths.folder.join(".tkfs-branch-operation.lock"))?;
-        self.reload()?;
+        self.reload_locked()?;
         ensure!(
             self.saved
                 .as_ref()
@@ -323,6 +334,24 @@ mod tests {
             installation,
             saved: Some(saved),
         };
+        // The old branch journal was global to its app folder. Another config
+        // must not import this installation's valid pending request.
+        let legacy = client.paths.folder.join(".tkfs-ui-branch-operation.json");
+        fs::write(
+            &legacy,
+            serde_json::to_vec(client.saved.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut other = BranchClient {
+            paths: client.paths.clone(),
+            installation: id(),
+            saved: None,
+        };
+        other.paths.config = other.paths.folder.join("other.toml");
+        other.reload().unwrap();
+        assert!(other.saved.is_none() && !other.journal().exists());
+        assert!(!other.journal().with_extension("legacy-sha256").exists());
+        client.paths.migrate_metadata("branch-operation").unwrap();
         client.persist().unwrap();
         client
             .deliver(|saved| {

@@ -79,6 +79,7 @@ impl BranchAcceptance {
                     })
                     .context("TEST_DESIGN_PROJECT_MISSING")?;
                 ui.set_details_page(1);
+                ui.set_main_page(3);
                 ui.invoke_select_project(index as i32);
             }
             1 => {

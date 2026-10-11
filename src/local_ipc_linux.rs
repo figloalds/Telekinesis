@@ -193,12 +193,12 @@ fn read<T: DeserializeOwned>(stream: &mut UnixStream, deadline: Instant) -> Resu
     transfer(stream, &mut length, false, deadline)?;
     let length = u32::from_le_bytes(length) as usize;
     ensure!(length <= MAX_FRAME, "MANAGEMENT_FRAME_TOO_LARGE");
-    let mut bytes = vec![0; length];
+    let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
     transfer(stream, &mut bytes, false, deadline)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 fn write<T: Serialize>(stream: &mut UnixStream, value: &T, deadline: Instant) -> Result<()> {
-    let mut bytes = serde_json::to_vec(value)?;
+    let mut bytes = zeroize::Zeroizing::new(serde_json::to_vec(value)?);
     ensure!(bytes.len() <= MAX_FRAME, "MANAGEMENT_FRAME_TOO_LARGE");
     transfer(
         stream,
