@@ -3,7 +3,7 @@
 use super::{App, snapshot};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
-use slint::Model;
+use slint::{ComponentHandle, Model};
 use std::path::{Path, PathBuf};
 use tkfs::{pairing::SyncConfiguration, pairing_service::Config, runtime::Discovery};
 
@@ -219,6 +219,13 @@ impl Acceptance {
                 );
                 checks.push("Real callbacks prepare one headless replica, refuse premature attach, discover an owner grant, sync, invalidate paused-grant proof, verify shared checkout, preserve proof through planned stop, attach once and mount verified bytes".into());
                 snapshot(ui, &directory.join("receive-mounted.bmp"))?;
+                ui.window().set_size(slint::LogicalSize::new(980.0, 720.0));
+                ui.window()
+                    .try_dispatch_event(slint::platform::WindowEvent::PointerScrolled {
+                        position: slint::LogicalPosition::new(700.0, 450.0),
+                        delta_x: 0.0,
+                        delta_y: -4000.0,
+                    })?;
                 self.pause(false)?;
                 ui.invoke_background_sync_action(true);
             }
@@ -232,6 +239,7 @@ impl Acceptance {
                     !Config::load(&f.client)?.registry()?.configurations()?[0].enabled,
                     "BACKGROUND_RESUMED_PAUSED_GRANT"
                 );
+                snapshot(ui, &directory.join("receive-background-minimum.bmp"))?;
                 ui.invoke_background_sync_action(false);
             }
             16 => {

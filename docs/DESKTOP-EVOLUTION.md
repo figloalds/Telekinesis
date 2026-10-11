@@ -119,10 +119,10 @@ existing approve command; enrollment alone does not grant a repository.
 | Milestone | Deliverable | Required evidence / status |
 |---|---|---|
 | M0 audit/contracts | This baseline, file ownership, rotation semantics, prototype mapping | Source and rendered prototype inspected; agreement recorded above |
-| M1 desktop usability | Search/table/sidebar/status hierarchy, config selection, real details, unchanged local lifecycle/branch safeguards | Native synthetic light/dark rendering, no invented counters; real callback regression where safe |
-| M2 code lifecycle | Owner reset, salted verifier, receiving-host check, protected input and approval, unchanged existing sync trust | Exact digit/length/leading-zero handling; old/new code rotation; persistence and malformed input; secret absence in DB/log/receipt; wrong pin, denied approval, revoked pair |
-| M3 integration | CLI + desktop consume same backend contracts; corrected operational docs | Offline build/tests and fixture reset/enroll/approve/grant/discover/sync/restart flow; report partial completion honestly |
-| M4 application completion | Fresh replica provisioning with same repo/new state+device, local mount, supervised background sync independent of GUI | Requires additional owner-local durable receive/service lifecycle APIs, crash recovery and two-host qualification; not completed by a dashboard/code feature |
+| M1 desktop usability | Search/table/sidebar/status hierarchy, config selection, real details, unchanged local lifecycle/branch safeguards | Passed native light/dark layout and callback qualification; measured counters and guarded real actions |
+| M2 code lifecycle | Owner reset, salted verifier, receiving-host check, protected input and approval, unchanged existing sync trust | Passed digit/rotation/crash/concurrency/private-storage/pin and secret-absence tests; legacy enrollment retained |
+| M3 integration | CLI + desktop consume same backend contracts; corrected operational docs | Passed CLI and real light/dark reset/enroll/approve callbacks; deployment remains separate |
+| M4 application completion | Fresh replica provisioning with same repo/new state+device, local mount, supervised background sync independent of GUI | Owner-mediated slice implemented; passed actual receive/WinFsp callbacks and post-GUI WSS transfer, Linux FUSE lifecycle, crash/retry and service ownership tests. Cross-host deployment remains unqualified |
 
 M4 API design must allocate local state/device IDs before work, preserve remote
 repo/branch identities, never copy a remote device ID, verify initial catch-up
@@ -320,13 +320,19 @@ Validated on Windows with a normal owner token and disposable protected fixtures
   shared checkout, planned stop, competing stopped-store checkout refusal,
   restart/resync recovery, mounted verified bytes and private-canary exclusion.
   Background service reaches running then disabled without resuming paused grants.
-- Twelve desktop/branch/migration library tests passed. Atomic UI records now
+  The final expanded run passed in 28.94 seconds: after the GUI process exits,
+  a fresh mounted-file write reaches the source over WSS with exact matching
+  bytes; fixture supervisor shutdown then removes the mount cleanly.
+- Thirteen desktop/branch/migration library tests passed (6.32 seconds). Atomic UI records now
   occupy dedicated config/purpose leaves under `.tkfs-desktop/`, avoiding a
   Windows rename conflict with protected pairing ancestors. Original lock paths
   remain; pending request bytes/IDs survive legacy migration, unrelated valid
   branch journals are not imported into a different installation, and changed
   legacy records fail closed. Public desktop metadata retains ordinary writable
   AppData/Temp compatibility; pairing credential protections are unchanged.
+  Default and explicit config selection resolve the full existing config path
+  before choosing the metadata scope and original locks; missing-file first-run
+  remains supported, while a broken config symlink is refused.
 
 An offline isolated Ubuntu/WSL source copy passed 23 targeted checks: code-store
 7, shutdown fence 1, CLI 2, supervisor 7, published sync 3, prepare/attach crash

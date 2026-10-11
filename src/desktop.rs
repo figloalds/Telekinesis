@@ -24,7 +24,16 @@ pub struct Paths {
 }
 impl Paths {
     pub fn from_config(executable: PathBuf, config: &Path) -> Result<Self> {
-        let config = fs::canonicalize(config).context("CONFIG_PATH_CANONICALIZE")?;
+        let config = match fs::canonicalize(config) {
+            Ok(path) => path,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && fs::symlink_metadata(config).is_err() =>
+            {
+                std::path::absolute(config)?
+            }
+            Err(error) => return Err(error).context("CONFIG_PATH_CANONICALIZE"),
+        };
         let folder = fs::canonicalize(config.parent().context("CONFIG_PARENT_REQUIRED")?)
             .context("CONFIG_PARENT_CANONICALIZE")?;
         Ok(Self {
@@ -39,11 +48,8 @@ impl Paths {
             .parent()
             .context("APPLICATION_DIRECTORY_MISSING")?
             .to_owned();
-        Ok(Self {
-            config: folder.join("orchestrator.toml"),
-            executable,
-            folder,
-        })
+        let config = folder.join("orchestrator.toml");
+        Self::from_config(executable, &config)
     }
     fn pin(&self) -> PathBuf {
         self.scoped_file("identity")
@@ -114,14 +120,14 @@ impl Paths {
         } else {
             None
         };
+        if target.try_exists()? {
+            read_metadata_file(&target)?;
+        }
         if let Some(bytes) = &old {
             if !accept_legacy(bytes)? {
                 ensure!(!baseline.try_exists()?, "LEGACY_DESKTOP_METADATA_CHANGED");
                 return Ok(());
             }
-        }
-        if target.try_exists()? {
-            read_metadata_file(&target)?;
         }
         if baseline.try_exists()? {
             let old = old.context("LEGACY_DESKTOP_METADATA_REMOVED")?;
@@ -645,6 +651,47 @@ mod tests {
         paths.migrate_metadata("identity").unwrap();
         fs::hard_link(paths.pin(), temp.path().join("alias.json")).unwrap();
         assert!(paths.migrate_metadata("identity").is_err());
+    }
+    #[test]
+    fn canonical_config_scope_preserves_first_run_and_case_aliases() {
+        let (_temp, paths) = fixture();
+        let first = Paths::from_config(paths.executable.clone(), &paths.config).unwrap();
+        fs::write(&paths.config, b"fixture-config").unwrap();
+        let canonical = Paths::from_config(paths.executable.clone(), &paths.config).unwrap();
+        assert_eq!(
+            Paths::from_executable(paths.executable.clone())
+                .unwrap()
+                .pin(),
+            canonical.pin()
+        );
+        let case = Paths::from_config(
+            paths.executable.clone(),
+            &paths.folder.join("ORCHESTRATOR.TOML"),
+        )
+        .unwrap();
+        assert_eq!(first.pin(), canonical.pin());
+        assert_eq!(canonical.pin(), case.pin());
+        let alias = paths.folder.join("alias.toml");
+        match std::os::windows::fs::symlink_file(&paths.config, &alias) {
+            Ok(()) => {
+                let linked = Paths::from_config(paths.executable.clone(), &alias).unwrap();
+                assert_eq!(linked.pin(), canonical.pin());
+                let target_folder = paths.folder.join("real-config");
+                fs::create_dir(&target_folder).unwrap();
+                let target = target_folder.join("control.toml");
+                fs::rename(&paths.config, &target).unwrap();
+                std::os::windows::fs::symlink_file(&target, &paths.config).unwrap();
+                let normal = Paths::from_executable(paths.executable.clone()).unwrap();
+                let explicit = Paths::from_config(paths.executable.clone(), &paths.config).unwrap();
+                assert_eq!(normal.config, explicit.config);
+                assert_eq!(normal.folder, explicit.folder);
+                assert_eq!(normal.pin(), explicit.pin());
+            }
+            Err(error) if error.raw_os_error() == Some(1314) => eprintln!(
+                "Symlink fixture unavailable: current token has no symlink privilege; no system policy changed"
+            ),
+            Err(error) => panic!("symlink fixture: {error}"),
+        }
     }
     #[test]
     fn concurrent_first_run_keeps_one_config() {

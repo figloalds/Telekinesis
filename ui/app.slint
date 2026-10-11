@@ -333,6 +333,7 @@ export component App inherits Window {
                 } }
             }
             if root.main-page == 4: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 16px;
+                if !root.pair-ready: Button { text: "Load or pair this device in Peers & sync…"; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; root.pairing-page = 0; } }
                 Text { text: "1  Prepare or resume a local replica"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }
                 Caption { text: "Enter the source repository UUID, or use an authorized repository discovered in Peers & sync. Preparation creates a new local device and headless worker. It never mounts incomplete data or grants access on another computer."; wrap: word-wrap; }
                 HorizontalLayout {
@@ -341,10 +342,10 @@ export component App inherits Window {
                     Button { text: "Prepare headless replica"; enabled: root.connected && !root.working && !root.can-retry && root.receive-label != "" && root.receive-repository != "" && !root.modal; clicked => { root.receive-action(0); } }
                 }
                 Caption { text: "Resume from a managed state (identities and grants survive closing this window):"; }
-                for project[index] in root.projects: Button { text: project.label + (project.mount == "" ? " · Headless" : " · Mount reserved"); checkable: true; checked: root.selected == index; enabled: !root.working && root.connected && !root.modal; clicked => { root.select-project(index); } }
+                for project[index] in root.projects: Button { text: project.label + (project.mount == "" ? " · Headless" : project.status == "Running" ? " · Mounted" : " · Mount reserved"); checkable: true; checked: root.selected == index; enabled: !root.working && root.connected && !root.modal; clicked => { root.select-project(index); } }
                 Text { text: root.receive-status; color: AppTheme.foreground; wrap: word-wrap; font-size: 16px; font-weight: 600; }
                 if root.receive-state != "": VerticalLayout { spacing: 12px;
-                    Text { text: "Repository: " + root.receive-repo-id + "\nLocal device: " + root.receive-device + "\nState: " + root.receive-state; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                    TextEdit { accessible-label: "Public receiving repository, device and state IDs"; text: "Repository: " + root.receive-repo-id + "\nLocal device: " + root.receive-device + "\nState: " + root.receive-state; read-only: true; height: 90px; font-size: 12px; }
                     Caption { text: "Give this public local device ID to the source owner for their existing repository grant. Pairing alone grants no repository access. The source owner chooses its local runtime and grants your installation + this device; no remote grant command is sent here."; wrap: word-wrap; }
                     Button { text: root.receive-headless ? "Start headless / resume validation" : "Start mounted worker"; enabled: !root.working && !root.receive-running && !root.can-retry && root.connected && !root.modal; clicked => { root.receive-action(6); } }
                     Text { text: "2  Discover, authorize locally and catch up"; color: AppTheme.foreground; font-size: 20px; font-weight: 600; }

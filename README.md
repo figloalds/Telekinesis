@@ -457,7 +457,8 @@ separate quotas, absolute deadlines and bounded resumable transfer pages. Raw TL
 remains the default compatibility mode. The current WSS URLs require numeric IPs
 and explicit ports; DNS discovery, proxy trust and relay-only VPS operation are
 not implemented. One active paired peer and two replica origins per repository
-remain enforced. O1 does not supervise the transport service.
+remain enforced. O1 can supervise an explicitly configured outbound-only WSS
+service; inbound server listeners remain separately operated.
 
 Saved pairing (`test-evidence/PAIRING-VALIDATION.json`) and
 WSS (`test-evidence/WSS-VALIDATION.json`) reports cover disposable loopback peers,
