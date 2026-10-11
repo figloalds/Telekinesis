@@ -61,7 +61,7 @@ impl Lane {
         if self == Self::Control { 1 } else { 2 }
     }
 }
-trait TimedStream: Read + Write {
+pub(crate) trait TimedStream: Read + Write {
     fn budget(&mut self, duration: Duration);
 }
 impl TimedStream for rustls::StreamOwned<rustls::ClientConnection, crate::ws_tunnel::Socket> {
@@ -80,7 +80,7 @@ type Client = WebSocket<rustls::StreamOwned<rustls::ClientConnection, crate::ws_
 pub(crate) fn is_websocket(value: &str) -> bool {
     value.starts_with("wss://") || value.starts_with("ws://")
 }
-fn websocket_config() -> WebSocketConfig {
+pub(crate) fn websocket_config() -> WebSocketConfig {
     WebSocketConfig::default()
         .read_buffer_size(8192)
         .write_buffer_size(0)
@@ -150,7 +150,7 @@ pub(crate) fn validate_config(config: &Config) -> Result<()> {
     }
     Ok(())
 }
-fn send<T: Serialize>(
+pub(crate) fn send<T: Serialize>(
     socket: &mut WebSocket<impl TimedStream>,
     value: &T,
     maximum: usize,
@@ -160,7 +160,7 @@ fn send<T: Serialize>(
     socket.send(Message::Binary(bytes.to_vec().into()))?;
     Ok(())
 }
-fn receive<T: DeserializeOwned>(
+pub(crate) fn receive<T: DeserializeOwned>(
     socket: &mut WebSocket<impl TimedStream>,
     maximum: usize,
 ) -> Result<T> {
@@ -709,6 +709,7 @@ fn accepted(
         .map(|certificate| pairing_service::authenticated(&registry, certificate))
         .transpose()?;
     let mut selected = None;
+    let mut bootstrap = false;
     // The library callback API fixes this error type to an HTTP response.
     #[allow(clippy::result_large_err)]
     let callback = |request: &Request, mut response: Response| {
@@ -729,6 +730,10 @@ fn accepted(
             return Err(rejected());
         }
         selected = match request.uri().path() {
+            "/tkfs/enroll-v3" if certificate.is_none() && !ws => {
+                bootstrap = true;
+                Some(None)
+            }
             "/tkfs/enroll" if certificate.is_none() => Some(None),
             "/tkfs/sync/control" if peer.is_some() => Some(Some(Lane::Control)),
             "/tkfs/sync/bulk" if peer.is_some() => Some(Some(Lane::Bulk)),
@@ -750,6 +755,9 @@ fn accepted(
         None => {
             let _enrollment = count(&admission.enrollment, 2)?;
             socket.get_mut().budget(admission.settings.enrollment);
+            if bootstrap {
+                return crate::pairing_bootstrap::serve(config, identity, &mut socket, &stop);
+            }
             let request: pairing_service::EnrollmentRequest = receive(&mut socket, ENROLLMENT)?;
             let response = pairing_service::enrollment_response(config, request);
             send(&mut socket, &response, ENROLLMENT)?;

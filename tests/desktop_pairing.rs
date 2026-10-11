@@ -29,6 +29,145 @@ impl Drop for Owned {
 }
 
 #[test]
+fn native_gui_ip_port_key_managed_setup_and_approval() -> Result<()> {
+    let fixtures = PathBuf::from(
+        std::env::var_os("TKFS_CODE_FIXTURE_ROOT")
+            .context("EXPLICIT_TRUSTED_FIXTURE_ROOT_REQUIRED")?,
+    );
+    for theme in ["light", "dark"] {
+        let temp = tempfile::tempdir_in(&fixtures)?;
+        let root = temp.path();
+        let orchestrator = root.join("orchestrator.toml");
+        std::fs::write(
+            &orchestrator,
+            format!(
+                "format_version=1\ndata_directory='o1'\n[control]\ntransport='named-pipe'\nname='gui-address-{}'\n",
+                id()
+            ),
+        )?;
+        drop(tkfs::orchestrator::Supervisor::open(
+            tkfs::orchestrator::Config::load(&orchestrator)?,
+        )?);
+        let _cleanup = ManagedFixture(tkfs::orchestrator::Config::load(&orchestrator)?);
+        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let output = root.join("gui");
+        std::fs::create_dir(&output)?;
+        let report = output.join("report.json");
+        let mut gui = Owned(
+            Command::new(env!("CARGO_BIN_EXE_tkfs"))
+                .args(["gui-test", "--report"])
+                .arg(&report)
+                .env("TKFS_UI_TEST_PHASE", "pairing-address")
+                .env("TKFS_UI_TEST_THEME", theme)
+                .stdin(Stdio::piped())
+                .stdout(std::fs::File::create(output.join("stdout.log"))?)
+                .stderr(std::fs::File::create(output.join("stderr.log"))?)
+                .spawn()?,
+        );
+        gui.0
+            .stdin
+            .take()
+            .context("GUI_STDIN")?
+            .write_all(&serde_json::to_vec(
+                &json!({"root":root,"orchestrator":orchestrator,"port":port}),
+            )?)?;
+        let deadline = Instant::now() + Duration::from_secs(115);
+        while gui.0.try_wait()?.is_none() {
+            ensure!(Instant::now() < deadline, "GUI_ADDRESS_TIMEOUT");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result: Value =
+            serde_json::from_slice(&std::fs::read(&report).context("GUI_ADDRESS_REPORT_MISSING")?)?;
+        if let Some(evidence) = std::env::var_os("TKFS_DESKTOP_ADDRESS_EVIDENCE") {
+            let destination = PathBuf::from(evidence).join(theme);
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(&output)? {
+                let entry = entry?;
+                std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+            }
+        }
+        ensure!(
+            result["passed"] == true,
+            "GUI_ADDRESS_ACCEPTANCE_FAILED: {}",
+            result["error"]
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn native_gui_explicit_profile_setup_and_relaunch_preserve_identity() -> Result<()> {
+    let fixtures = PathBuf::from(
+        std::env::var_os("TKFS_CODE_FIXTURE_ROOT")
+            .context("EXPLICIT_TRUSTED_FIXTURE_ROOT_REQUIRED")?,
+    );
+    let temp = tempfile::tempdir_in(fixtures)?;
+    let profile = temp.path().join("profile");
+    std::fs::create_dir(&profile)?;
+    let config = profile.join(".telekinesis/orchestrator.toml");
+    struct ProfileCleanup(PathBuf);
+    impl Drop for ProfileCleanup {
+        fn drop(&mut self) {
+            if let Ok(config) = tkfs::orchestrator::Config::load(&self.0) {
+                drop(ManagedFixture(config));
+            }
+        }
+    }
+    let _cleanup = ProfileCleanup(config.clone());
+    let mut original = None;
+    for phase in ["profile-setup", "profile-reopen"] {
+        let output = temp.path().join(phase);
+        std::fs::create_dir(&output)?;
+        let report = output.join("report.json");
+        let mut gui = Owned(
+            Command::new(env!("CARGO_BIN_EXE_tkfs"))
+                .args(["gui-test", "--report"])
+                .arg(&report)
+                .env("TKFS_UI_TEST_PHASE", phase)
+                .env("TKFS_UI_TEST_THEME", "light")
+                .env("USERPROFILE", &profile)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()?,
+        );
+        let deadline = Instant::now() + Duration::from_secs(115);
+        while gui.0.try_wait()?.is_none() {
+            ensure!(Instant::now() < deadline, "GUI_PROFILE_TIMEOUT");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result: Value = serde_json::from_slice(&std::fs::read(&report)?)?;
+        ensure!(
+            result["passed"] == true,
+            "GUI_PROFILE_ACCEPTANCE_FAILED: {}",
+            result["error"]
+        );
+        let selected = tkfs::orchestrator::Config::load(&config)?;
+        let paths =
+            tkfs::desktop::Paths::from_config(PathBuf::from(env!("CARGO_BIN_EXE_tkfs")), &config)?;
+        let identity = (
+            selected.existing_installation()?,
+            std::fs::canonicalize(selected.data_directory)?,
+            paths.config,
+            paths.folder,
+        );
+        if let Some(previous) = &original {
+            ensure!(&identity == previous, "PROFILE_RELAUNCH_IDENTITY_CHANGED");
+        } else {
+            original = Some(identity);
+        }
+        if let Some(evidence) = std::env::var_os("TKFS_DESKTOP_ADDRESS_EVIDENCE") {
+            let destination = PathBuf::from(evidence).join(phase);
+            std::fs::create_dir_all(&destination)?;
+            for entry in std::fs::read_dir(output)? {
+                let entry = entry?;
+                std::fs::copy(entry.path(), destination.join(entry.file_name()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn native_gui_pairing_code_callbacks_and_late_close_result() -> Result<()> {
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_tkfs"));
     let fixtures = std::env::var_os("TKFS_CODE_FIXTURE_ROOT")

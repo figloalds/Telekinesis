@@ -23,10 +23,22 @@ use std::{
 const DRAIN: Duration = Duration::from_secs(40);
 const RECHECK: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    #[default]
+    Outbound,
+    Receiver,
+}
+
 /// Public metadata only; never contains an enrollment code or a private key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
+    #[serde(default)]
+    pub role: Role,
+    #[serde(default)]
+    pub orchestrator_installation: Option<String>,
     pub format_version: u32,
     pub config_path: PathBuf,
     pub data_directory: PathBuf,
@@ -36,9 +48,18 @@ pub struct Binding {
 }
 impl Binding {
     pub fn load(path: &Path) -> Result<Self> {
-        Self::inspect(path).map(|(binding, _, _)| binding)
+        Self::inspect(path, Role::Outbound).map(|(binding, _, _)| binding)
     }
-    fn inspect(path: &Path) -> Result<(Self, Config, Identity)> {
+    pub fn load_receiver(path: &Path, orchestrator: &Path) -> Result<Self> {
+        let (binding, config, _) = Self::inspect(path, Role::Receiver)?;
+        ensure!(
+            config.orchestrator_config.as_deref()
+                == Some(std::fs::canonicalize(orchestrator)?.as_path()),
+            "MANAGED_PAIRING_BINDING_CHANGED"
+        );
+        Ok(binding)
+    }
+    fn inspect(path: &Path, role: Role) -> Result<(Self, Config, Identity)> {
         let path = std::fs::canonicalize(path)
             .map_err(|_| anyhow::anyhow!("MANAGED_PAIRING_CONFIG_UNAVAILABLE"))?;
         let parent = path
@@ -51,16 +72,32 @@ impl Binding {
             .map_err(|_| anyhow::anyhow!("MANAGED_PAIRING_STORAGE_UNSAFE"))?;
         let mut config = Config::load(&path)
             .map_err(|_| anyhow::anyhow!("MANAGED_PAIRING_CONFIG_UNAVAILABLE"))?;
-        ensure!(
-            config.transport == Transport::Wss
-                && !config.inbound
-                && config.dial
-                && config.listen.is_empty()
-                && config.enrollment_listen.is_empty()
-                && config.enrollment_advertise.is_empty()
-                && config.advertise == "outbound-only",
-            "MANAGED_PAIRING_OUTBOUND_WSS_REQUIRED"
-        );
+        let mut orchestrator_installation = None;
+        if role == Role::Outbound {
+            ensure!(
+                config.transport == Transport::Wss
+                    && !config.inbound
+                    && config.dial
+                    && config.listen.is_empty()
+                    && config.enrollment_listen.is_empty()
+                    && config.enrollment_advertise.is_empty()
+                    && config.advertise == "outbound-only",
+                "MANAGED_PAIRING_OUTBOUND_WSS_REQUIRED"
+            );
+        } else {
+            ensure!(
+                config.transport == Transport::Wss
+                    && config.inbound
+                    && config.dial
+                    && config.orchestrator_config.is_some()
+                    && config.advertise.starts_with("wss://")
+                    && !config.listen.is_empty(),
+                "MANAGED_PAIRING_RECEIVER_WSS_REQUIRED"
+            );
+            let owner = config.orchestrator_config.as_ref().unwrap();
+            orchestrator_installation =
+                Some(crate::orchestrator::Config::load(owner)?.existing_installation()?);
+        }
         config.data_directory = std::fs::canonicalize(&config.data_directory)
             .map_err(|_| anyhow::anyhow!("MANAGED_PAIRING_REGISTRY_UNAVAILABLE"))?;
         // Read existing trust without initializing or repairing a registry.
@@ -100,6 +137,8 @@ impl Binding {
         );
         Ok((
             Self {
+                role,
+                orchestrator_installation,
                 format_version: 1,
                 config_path: path,
                 data_directory: config.data_directory.clone(),
@@ -112,7 +151,7 @@ impl Binding {
         ))
     }
     fn checked(&self) -> Result<(Config, Identity)> {
-        let (current, config, identity) = Self::inspect(&self.config_path)?;
+        let (current, config, identity) = Self::inspect(&self.config_path, self.role)?;
         ensure!(self == &current, "MANAGED_PAIRING_BINDING_CHANGED");
         Ok((config, identity))
     }
@@ -373,11 +412,18 @@ impl Controller {
     pub fn shutdown(&mut self) -> Result<()> {
         self.shutdown_budget(DRAIN)
     }
+    pub(crate) fn request_stop(&mut self) {
+        self.stop();
+    }
+    pub(crate) fn shutdown_until(&mut self, deadline: Instant) -> Result<()> {
+        self.shutdown_budget(deadline.saturating_duration_since(Instant::now()))
+    }
     fn shutdown_budget(&mut self, budget: Duration) -> Result<()> {
         // A previous uncertain drain cannot be made safe by another bounded wait.
         ensure!(!self.uncertain, "MANAGED_PAIRING_DRAIN_UNCERTAIN");
         self.reconcile(None)?;
         let deadline = Instant::now() + budget;
+        self.harvest();
         while self.runner.is_some() && Instant::now() < deadline {
             self.harvest();
             if self.runner.is_some() {

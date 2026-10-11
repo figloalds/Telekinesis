@@ -6,12 +6,13 @@ export struct CheckpointItem { id: string, label: string }
 export struct PairPeer { id: string, fingerprint: string, revoked: bool }
 export struct PairRepo { id: string, label: string, replica: string, branches: string }
 export struct PairGrant { peer: string, repo: string, enabled: bool, revoked: bool }
+export struct PendingDevice { invitation: string, installation: string, fingerprint: string }
 
 // Standard controls and custom surfaces share Slint's resolved system palette.
 // Translucent Fluent controls must never sit on a fixed opposite-theme panel.
 export global AppTheme {
-    out property <brush> background: Palette.background;
-    out property <brush> surface: Palette.alternate-background;
+    out property <brush> background: Palette.color-scheme == ColorScheme.dark ? #0e131b : Palette.background;
+    out property <brush> surface: Palette.color-scheme == ColorScheme.dark ? #161d28 : Palette.alternate-background;
     out property <brush> foreground: Palette.foreground;
     out property <brush> muted: Palette.foreground.with-alpha(0.78);
     out property <brush> border: Palette.border;
@@ -66,6 +67,17 @@ export component App inherits Window {
     in-out property <string> pair-bootstrap;
     in-out property <string> pair-enrollment;
     in-out property <string> server-config;
+    in-out property <string> receiving-address;
+    in-out property <string> receiving-port: "7421";
+    in-out property <string> receiving-state;
+    in-out property <string> receiving-endpoint;
+    in-out property <string> receiving-error;
+    in-out property <string> receiving-key-status;
+    in-out property <bool> receiving-enabled;
+    in-out property <bool> receiving-configured;
+    in-out property <[PendingDevice]> pending-devices;
+    callback receiving-action(bool);
+    callback approve-device(string);
     in-out property <string> server-code;
     in-out property <bool> server-code-visible;
     in-out property <bool> server-reset-confirmed;
@@ -73,6 +85,9 @@ export component App inherits Window {
     callback dismiss-server-code;
     dismiss-server-code => { root.server-code = ""; root.server-code-visible = false; }
     in-out property <string> pair-config;
+    in-out property <string> pair-host;
+    in-out property <string> pair-port: "7421";
+    in-out property <bool> pair-advanced;
     in-out property <string> pair-endpoint;
     in-out property <string> pair-token;
     in-out property <string> pair-identity;
@@ -95,6 +110,7 @@ export component App inherits Window {
     callback pair-action(int);
     callback pair-cancel;
     callback pair-grant-action(int, int);
+    callback toggle-mount(string, bool);
     in-out property <bool> connected;
     in-out property <bool> working;
     in-out property <bool> create-visible;
@@ -110,6 +126,12 @@ export component App inherits Window {
     in-out property <string> connection: "Connecting…";
     in-out property <string> config-path;
     in-out property <string> data-folder;
+    in-out property <bool> profile-setup;
+    in-out property <string> profile-config;
+    in-out property <string> profile-data;
+    in-out property <string> profile-mounts;
+    in-out property <bool> profile-exists;
+    callback open-profile;
     in-out property <string> mount-folder;
     in-out property <int> worker-limit: 8;
     in-out property <[Project]> projects;
@@ -186,16 +208,29 @@ export component App inherits Window {
             width: 220px; background: #13203a;
             VerticalLayout {
                 padding: 18px; spacing: 14px;
-                Text { text: "TK"; color: #89aaff; font-size: 30px; font-weight: 800; }
-                Text { text: "Telekinesis"; color: white; font-size: 22px; font-weight: 650; }
+                HorizontalLayout { spacing: 10px;
+                    Rectangle { width: 30px; height: 30px; border-radius: 7px; background: #2456d6; Text { text: "TK"; color: white; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; } }
+                    Text { text: "Telekinesis"; color: white; font-size: 19px; font-weight: 650; vertical-alignment: center; }
+                }
                 Text { text: "Virtual folders & history"; color: #afc4cf; font-size: 14px; }
                 Rectangle { height: 1px; background: #35515f; }
                 Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: root.first-run ? "01  Set up" : "Virtual folders"; checkable: true; checked: root.main-page == 0 || root.main-page == 3; enabled: !root.working && !root.modal; clicked => { root.main-page = 0; root.pair-token = ""; } } }
                 Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "Peers & sync"; checkable: true; checked: root.main-page == 1; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; } } }
                 Rectangle { height: 42px; background: AppTheme.surface; border-radius: 6px; Button { text: "Receive repository"; checkable: true; checked: root.main-page == 4; enabled: !root.working && !root.modal && root.connected; clicked => { root.main-page = 4; root.pair-token = ""; root.refresh(); } } }
-                Text { text: "OWNER-LOCAL CONTROL"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
+                Text { text: "REMOTE CONNECTIONS"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
+                for peer[index] in root.pair-peers: VerticalLayout { spacing: 4px;
+                    Text { text: (peer.revoked ? "○  " : "●  ") + peer.id; color: peer.revoked ? #efadad : #c9d3e6; overflow: elide; font-size: 12px; }
+                    Text { text: peer.revoked ? "Revoked locally" : "Paired · availability not checked"; color: #afc4cf; font-size: 11px; }
+                }
+                if root.pair-peers.length == 0: Text { text: "No remote connections loaded"; color: #afc4cf; font-size: 12px; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
-                Text { text: root.connected ? "●  Supervisor connected" : "○  Supervisor offline"; color: #8de0c4; font-size: 11px; font-weight: 700; }
+                Rectangle { border-width: 1px; border-color: #35515f; border-radius: 10px; background: transparent;
+                    VerticalLayout { padding: 12px; spacing: 8px;
+                        Text { text: "This computer"; color: white; font-weight: 600; }
+                        Text { text: root.connected ? "●  Supervisor connected" : "○  Supervisor offline"; color: root.connected ? #8de0c4 : #dfbe84; font-size: 11px; font-weight: 700; }
+                        Text { text: root.connected ? root.running-count + " running · " + root.projects.length + " folders" : "Status unavailable · " + root.projects.length + " folders last seen"; color: #c9d3e6; font-size: 12px; wrap: word-wrap; }
+                    }
+                }
                 Text { text: root.working ? "An operation is in progress. Please wait for its result." : "This window manages only this computer. Pairing authorizes published-data sync."; color: #afc4cf; font-size: 13px; wrap: word-wrap; }
                 Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; HorizontalLayout { padding: 4px; Button { text: "About Telekinesis"; enabled: !root.modal; clicked => { root.about-visible = true; } } } }
                 Rectangle { height: 40px; background: AppTheme.surface; border-radius: 6px; Button { text: "Configuration…"; enabled: !root.working && !root.modal && !root.can-retry && !root.can-retry-branch; clicked => { root.config-input = root.config-path; root.config-visible = true; } } }
@@ -207,12 +242,20 @@ export component App inherits Window {
             HorizontalLayout {
                 VerticalLayout {
                     spacing: 6px;
-                    Heading { text: root.main-page == 4 ? "Receive a published repository" : root.main-page == 1 ? "Peers & published-data sync" : root.first-run ? "Set up this computer" : root.main-page == 3 ? "Folder details" : "Virtual folders"; }
+                    Heading { text: root.main-page == 4 ? "Receive a shared folder" : root.main-page == 1 ? "Connections" : root.first-run ? "Set up this computer" : root.main-page == 3 ? "Folder details" : "Virtual folders"; }
                     Caption { text: root.main-page == 1 ? "Pair this device for authorized published-data sync." : root.first-run ? "One portable installation, independent local workspaces." : "Independent local states, mount paths and durable history."; }
                 }
                 Rectangle { horizontal-stretch: 1; background: transparent; }
                 Button { text: root.connected ? "Refresh" : "Start / reconnect supervisor"; visible: root.main-page != 1; enabled: !root.working && !root.modal && !root.first-run; clicked => { root.connected ? root.refresh() : root.connect(); } }
-                Button { text: "+ New project"; primary: true; enabled: root.connected && !root.working && !root.modal; visible: !root.first-run && root.main-page == 0; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
+            }
+            if !root.first-run && root.main-page == 0: VerticalLayout { spacing: 10px;
+                LineEdit { accessible-label: "Search virtual folders"; placeholder-text: "Search folders by name or mount path"; text <=> root.project-filter; edited => { root.filter-projects(self.text); } }
+                HorizontalLayout { spacing: 10px;
+                    Button { text: "Connect remote"; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; root.pairing-page = 0; root.pair-advanced = false; } }
+                    Button { text: "New folder"; primary: true; enabled: root.connected && !root.working && !root.modal; clicked => { root.create-visible = true; root.project-name = ""; root.project-mount = ""; root.focus-project-name(); } }
+                    Button { text: "Clear search"; visible: root.project-filter != ""; enabled: root.project-filter != ""; clicked => { root.project-filter = ""; root.filter-projects(""); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
             }
             if root.main-page != 1: Card {
                 height: 54px;
@@ -224,34 +267,68 @@ export component App inherits Window {
                     Caption { text: root.working ? "Working… actions paused" : "Owner-local control"; vertical-alignment: center; }
                 }
             }
-            if root.first-run && root.main-page == 0: Card {
+            if root.first-run && root.main-page == 0: Card { ScrollView {
                 VerticalLayout {
                     padding: 26px; spacing: 16px;
-                    Text { text: "Choose two separate folders"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                    Text { text: "Choose where Telekinesis keeps your files"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
                     Caption { text: "Native data holds the catalog and durable history. Project folders contain the mounted views you use in Explorer."; wrap: word-wrap; }
+                    if root.profile-exists: Button { text: "Open existing profile installation"; primary: true; enabled: !root.working && !root.modal; clicked => { root.open-profile(); } }
+                    if root.profile-exists: Caption { text: "A profile installation already exists at " + root.profile-config + ". Open it to continue with the same identity and folders, or explicitly choose a separate portable setup below."; wrap: word-wrap; }
+                    CheckBox { text: "Use a private location in my user profile"; checked <=> root.profile-setup; enabled: !root.profile-exists && root.profile-config != "" && !root.working && !root.modal; }
+                    Caption { text: root.profile-setup ? "This explicitly creates a separate profile installation when you select Save and connect. The executable-adjacent configuration is not moved." : "Portable setup keeps the configuration beside the executable. Pairing requires safe storage permissions; an unsafe location is refused, never repaired or relocated automatically."; wrap: word-wrap; }
+                    if !root.profile-setup: VerticalLayout { spacing: 12px;
                     Text { text: "Native data folder (new or empty)"; color: AppTheme.foreground; }
                     HorizontalLayout { LineEdit { accessible-label: "Native data folder"; text <=> root.data-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(0); } } }
                     Text { text: "Parent folder for project mounts"; color: AppTheme.foreground; }
                     HorizontalLayout { LineEdit { accessible-label: "Project mount parent folder"; text <=> root.mount-folder; enabled: !root.working && !root.modal; } Button { text: "Browse…"; enabled: !root.working && !root.modal; clicked => { root.browse(1); } } }
                     HorizontalLayout { Text { text: "Maximum running projects"; color: AppTheme.foreground; vertical-alignment: center; } SpinBox { value <=> root.worker-limit; minimum: 1; maximum: 64; enabled: !root.working && !root.modal; } Rectangle { horizontal-stretch: 1; } }
+                    }
+                    if root.profile-setup: Caption { text: "Native data: " + root.profile-data + "\nVirtual folders: " + root.profile-mounts; wrap: word-wrap; }
                     Rectangle { height: 1px; background: AppTheme.border; }
                     Caption { text: "Configuration will be saved to:"; }
-                    Text { text: root.config-path; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
+                    Text { text: root.profile-setup ? root.profile-config : root.config-path; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                     Caption { text: "Mounting requires the installed WinFsp runtime. No network connection or service is configured."; wrap: word-wrap; }
                     HorizontalLayout { Button { text: "Use existing configuration…"; enabled: !root.working && !root.modal; clicked => { root.config-input = root.config-path; root.config-visible = true; } } Rectangle { horizontal-stretch: 1; } Button { text: "Save and connect"; primary: true; enabled: !root.working && !root.modal; clicked => { root.setup(); } } }
                     Rectangle { vertical-stretch: 1; }
                 }
             }
+            }
             if root.main-page == 1: VerticalLayout {
                 spacing: 12px;
                 HorizontalLayout {
-                    Button { text: "Connect a server"; checkable: true; checked: root.pairing-page == 0; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 0; } }
+                    Button { text: "Connect remote"; checkable: true; checked: root.pairing-page == 0; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 0; } }
                     Button { text: "Peers & sync"; checkable: true; checked: root.pairing-page == 1; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 1; root.pair-token = ""; } }
-                    Button { text: "Server pairing code"; checkable: true; checked: root.pairing-page == 2; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 2; root.pair-token = ""; } }
+                    Button { text: "Allow connections"; checkable: true; checked: root.pairing-page == 2; enabled: !root.working && !root.modal; clicked => { root.pairing-page = 2; root.pair-token = ""; root.refresh(); } }
                 }
                 if root.pairing-page == 0: Card {
                 ScrollView {
-                    VerticalLayout { padding: 22px; spacing: 14px;
+                    VerticalLayout { padding: 22px; spacing: 14px; alignment: start;
+                        if !root.pair-advanced: VerticalLayout { spacing: 16px; alignment: start; vertical-stretch: 0;
+                            Text { text: "Connect to another computer"; color: AppTheme.foreground; font-size: 22px; font-weight: 600; }
+                            Caption { text: "Enter the address and pairing key provided by its owner. Telekinesis protects this device's identity and authenticates the connection automatically."; wrap: word-wrap; }
+                            if root.first-run: Caption { text: "Set up this computer from Virtual folders first. Your chosen portable configuration will be used."; wrap: word-wrap; }
+                            HorizontalLayout { spacing: 16px;
+                                VerticalLayout { spacing: 6px; horizontal-stretch: 1;
+                                    Text { text: "IP address"; color: AppTheme.foreground; }
+                                    LineEdit { accessible-label: "Remote IP address"; placeholder-text: "192.168.1.20 or IPv6 address"; text <=> root.pair-host; enabled: !root.working && !root.modal; }
+                                }
+                                VerticalLayout { spacing: 6px; width: 120px;
+                                    Text { text: "Port"; color: AppTheme.foreground; }
+                                    LineEdit { accessible-label: "Remote pairing port"; text <=> root.pair-port; enabled: !root.working && !root.modal; }
+                                }
+                            }
+                            Text { text: "Pairing key"; color: AppTheme.foreground; }
+                            LineEdit { accessible-label: "Remote pairing key"; input-type: password; placeholder-text: "Paste the 200-digit key"; text <=> root.pair-token; enabled: !root.working && !root.modal; }
+                            Caption { text: "The key is cleared when you connect. The other computer's owner will approve this device before shared folders become available."; wrap: word-wrap; }
+                            HorizontalLayout { spacing: 10px;
+                                Button { text: root.working ? "Connecting…" : "Connect"; primary: true; enabled: !root.first-run && root.pair-host != "" && root.pair-port != "" && root.pair-token != "" && !root.working && !root.modal; clicked => { root.pair-action(14); } }
+                                Button { text: "Cancel"; visible: root.working && root.pair-cancellable; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+                            Caption { text: "If a connection is interrupted, check pending approvals on the other computer before trying again. Pairing permits shared-folder sync only."; wrap: word-wrap; }
+                        }
+                        Button { height: 36px; text: root.pair-advanced ? "‹ Simple connection" : "Advanced connection settings"; enabled: !root.working && !root.modal; clicked => { root.pair-token = ""; root.pair-confirmed = false; root.pair-advanced = !root.pair-advanced; } }
+                        if root.pair-advanced: VerticalLayout { spacing: 14px;
                         Text { text: "1  Protect this device's identity"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
                         Caption { text: "Create an outbound-only client, or load an existing client config. Keys are protected by Windows CurrentUser DPAPI; config stores only the credential reference. No listener or service is installed."; wrap: word-wrap; }
                         LineEdit { accessible-label: "Pairing configuration path"; text <=> root.pair-config; enabled: !root.working && !root.modal; }
@@ -277,12 +354,14 @@ export component App inherits Window {
                             Button { text: "Cancel network operation"; enabled: root.working && root.pair-cancellable && !root.modal; clicked => { root.pair-cancel(); } }
                         }
                         Caption { text: "Cancellation stops local I/O; a request already received by the server may still be pending approval. Refresh client status before resubmitting. No listener or background sync is started here."; wrap: word-wrap; }
+                        }
                     }
                 }
                 }
                 if root.pairing-page == 1: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 14px;
-                        Text { text: "3  Wait for local approval on the server"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
-                        Caption { text: "Give the server owner your installation ID and certificate fingerprint shown above. They must approve that exact key locally, then grant a published repository to your replica. This client cannot approve itself or administer the server."; wrap: word-wrap; }
+                        Text { text: "Your remote connections"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                        Caption { text: "After connecting, ask the other computer's owner to approve this device. Then check which shared folders are available."; wrap: word-wrap; }
+                        Text { text: root.pair-identity; color: AppTheme.foreground; wrap: word-wrap; font-size: 12px; }
                         for peer[index] in root.pair-peers: VerticalLayout {
                             Button { text: peer.id + (peer.revoked ? " · Revoked" : " · Locally trusted key"); checkable: true; checked: root.pair-selected-peer == index; enabled: !root.working && !root.modal; clicked => { root.pair-selected-peer = index; root.pair-action(11); } }
                             Caption { text: "SHA-256: " + peer.fingerprint; wrap: word-wrap; font-size: 12px; }
@@ -320,17 +399,42 @@ export component App inherits Window {
                     }
                 }
             }
-                if root.pairing-page == 2: Card { VerticalLayout { padding: 24px; spacing: 16px;
-                    Text { text: "Server pairing code"; color: AppTheme.foreground; font-size: 21px; font-weight: 600; }
-                    Caption { text: "Reset the code for an owner-local orchestrator configuration. The pairing service must explicitly reference this same configuration to accept it. This action does not start a listener."; wrap: word-wrap; }
-                    LineEdit { accessible-label: "Server orchestrator configuration"; text <=> root.server-config; enabled: !root.working && !root.modal; edited => { root.server-reset-confirmed = false; } }
-                    Caption { text: "A reset creates exactly 200 decimal digits and displays them once. Only a salted verifier is stored beside the configuration. Save the code privately while it is visible; it cannot be recovered later."; wrap: word-wrap; }
+                if root.pairing-page == 2: Card { ScrollView { VerticalLayout { padding: 24px; spacing: 16px;
+                    Text { text: "Allow other computers to connect"; color: AppTheme.foreground; font-size: 21px; font-weight: 600; }
+                    Caption { text: "Enable receiving on this computer, create a pairing key, then share your IP address, port and key privately. Telekinesis manages the protected identity files."; wrap: word-wrap; }
+                    HorizontalLayout { spacing: 12px;
+                        LineEdit { accessible-label: "Receiving address, set at first setup"; placeholder-text: "This computer's IP address"; text <=> root.receiving-address; enabled: root.connected && !root.receiving-configured && !root.working && !root.modal; }
+                        LineEdit { accessible-label: "Receiving port, set at first setup"; width: 120px; text <=> root.receiving-port; enabled: root.connected && !root.receiving-configured && !root.working && !root.modal; }
+                    }
+                    if root.receiving-configured: Caption { text: "Address and port were fixed at first setup. This screen can disable or re-enable that endpoint; changing it requires owner-led configuration recovery."; wrap: word-wrap; }
+                    HorizontalLayout { spacing: 10px;
+                        Button { text: "Set up / enable receiving"; primary: true; enabled: root.connected && root.receiving-address != "" && root.receiving-port != "" && !root.working && !root.modal; clicked => { root.receiving-action(true); } }
+                        Button { text: "Disable receiving"; enabled: root.connected && root.receiving-enabled && !root.working && !root.modal; clicked => { root.receiving-action(false); } }
+                        Button { text: "Refresh status"; enabled: root.connected && !root.working && !root.modal; clicked => { root.refresh(); } }
+                    }
+                    Text { text: "Service: " + (root.receiving-state == "" ? "Not checked" : root.receiving-state) + "  ·  " + root.receiving-endpoint; color: AppTheme.foreground; wrap: word-wrap; }
+                    if root.receiving-error != "": Caption { text: root.receiving-error; wrap: word-wrap; }
+                    Caption { text: "Only Running confirms the listener is active. Enabling may take time or fail. Disabling preserves paired devices and grants; it does not change firewall settings."; wrap: word-wrap; }
+                    Rectangle { height: 1px; background: AppTheme.border; }
+                    Text { text: "Pairing key"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                    Caption { text: root.receiving-key-status; wrap: word-wrap; }
+                    if root.pair-advanced: LineEdit { accessible-label: "Server orchestrator configuration"; text <=> root.server-config; enabled: !root.working && !root.modal; edited => { root.server-reset-confirmed = false; } }
+                    Caption { text: "A reset creates exactly 200 decimal digits and displays them once. Protected verification data is stored; the pairing key itself is not saved. Save the key privately while it is visible; it cannot be recovered later."; wrap: word-wrap; }
                     Caption { text: "The code can be used until the next reset. Resetting invalidates the old code for future enrollments. Existing peers, grants, sync and already submitted approvals remain unchanged."; wrap: word-wrap; }
                     CheckBox { text: "I understand: the old code will stop working and the new code is shown once"; checked <=> root.server-reset-confirmed; enabled: !root.working && !root.modal; }
                     Button { text: root.working ? "Resetting…" : "Reset pairing code"; primary: true; enabled: root.server-reset-confirmed && root.server-config != "" && !root.working && !root.modal; clicked => { root.reset-pairing-code(); } }
+                    Rectangle { height: 1px; background: AppTheme.border; }
+                    Text { text: "Devices waiting for your approval"; color: AppTheme.foreground; font-size: 19px; font-weight: 600; }
+                    Caption { text: "Approve only a device you recognize. Compare its public device identity with the person who is connecting. Folder access is granted separately."; wrap: word-wrap; }
+                    if root.pending-devices.length == 0: Caption { text: "No pending requests in the last status check."; wrap: word-wrap; }
+                    for device in root.pending-devices: Card { VerticalLayout { padding: 12px; spacing: 8px;
+                        Text { text: device.installation; color: AppTheme.foreground; wrap: word-wrap; }
+                        Caption { text: "Certificate: " + device.fingerprint; wrap: word-wrap; font-size: 12px; }
+                        Button { text: "Approve this device"; enabled: root.connected && !root.working && !root.modal; clicked => { root.approve-device(device.invitation); } }
+                    } }
                     Caption { text: "Lost the code or closed the result? Reset again explicitly. A failed or interrupted reset is never retried automatically."; wrap: word-wrap; }
                     Rectangle { vertical-stretch: 1; }
-                } }
+                } } }
             }
             if root.main-page == 4: Card { ScrollView { VerticalLayout { padding: 22px; spacing: 16px;
                 if !root.pair-ready: Button { text: "Load or pair this device in Peers & sync…"; enabled: !root.working && !root.modal; clicked => { root.main-page = 1; root.pairing-page = 0; } }
@@ -392,13 +496,12 @@ export component App inherits Window {
                     HorizontalLayout {
                         Text { text: "Folders on this computer"; font-size: 17px; font-weight: 600; color: AppTheme.foreground; vertical-alignment: center; }
                         Rectangle { horizontal-stretch: 1; }
-                        LineEdit { accessible-label: "Search virtual folders"; placeholder-text: "Search name or mount path"; text <=> root.project-filter; edited => { root.filter-projects(self.text); } }
-                        Button { text: "Clear"; enabled: root.project-filter != ""; clicked => { root.project-filter = ""; root.filter-projects(""); } }
                     }
                     HorizontalLayout { padding: 8px; spacing: 14px;
-                        Caption { text: "Name"; width: 210px; }
+                        Caption { text: "Name"; width: 180px; }
                         Caption { text: "Mount point"; horizontal-stretch: 1; }
-                        Caption { text: "Observed status"; width: 170px; }
+                        Caption { text: "Status"; width: 150px; }
+                        Caption { text: "Action"; width: 95px; }
                     }
                     Rectangle { height: 1px; background: AppTheme.border; }
                     if root.visible-projects.length == 0: VerticalLayout { padding: 28px; spacing: 12px;
@@ -408,9 +511,10 @@ export component App inherits Window {
                     ListView {
                         for index in root.visible-projects: VerticalLayout { spacing: 8px; padding-bottom: 10px;
                             HorizontalLayout { spacing: 14px;
-                                Button { width: 210px; text: root.projects[index].label; accessible-label: "Open details for " + root.projects[index].label; enabled: root.connected && !root.working && !root.modal; clicked => { root.main-page = 3; root.select-project(index); } }
+                                Button { width: 180px; text: root.projects[index].label; accessible-label: "Open details for " + root.projects[index].label; enabled: root.connected && !root.working && !root.modal; clicked => { root.main-page = 3; root.select-project(index); } }
                                 Text { text: root.projects[index].mount; color: AppTheme.foreground; overflow: elide; vertical-alignment: center; horizontal-stretch: 1; font-size: 12px; }
-                                Text { text: root.connected ? root.projects[index].status : "Unknown · stale"; color: AppTheme.foreground; width: 170px; vertical-alignment: center; overflow: elide; }
+                                Text { text: root.connected ? root.projects[index].status : "Unknown · stale"; color: AppTheme.foreground; width: 150px; vertical-alignment: center; overflow: elide; }
+                                Button { width: 95px; text: root.projects[index].desired ? "Unmount" : "Mount"; accessible-label: (root.projects[index].desired ? "Unmount " : "Mount ") + root.projects[index].label; enabled: root.connected && root.projects[index].mount != "" && !root.working && !root.modal && !root.can-retry; clicked => { root.toggle-mount(root.projects[index].id, root.projects[index].desired); } }
                             }
                             Rectangle { height: 1px; background: AppTheme.border; }
                         }

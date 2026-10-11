@@ -20,9 +20,16 @@ fn command(root: &Path) -> Command {
     command.current_dir(root).stdin(Stdio::null());
     command
 }
-fn reset(root: &Path) -> Zeroizing<String> {
+fn reset(root: &Path, legacy: bool) -> Zeroizing<String> {
     let mut output = command(root)
-        .args(["manage", "reset-pairing-code"])
+        .args([
+            "manage",
+            if legacy {
+                "reset-legacy-pairing-code"
+            } else {
+                "reset-pairing-code"
+            },
+        ])
         .output()
         .unwrap();
     assert!(
@@ -81,8 +88,16 @@ fn reset_cli_rotates_only_fixture_verifier_and_never_journals_code() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let first = reset(root.path());
-    let second = reset(root.path());
+    // Linux qualification does not invoke a real host credential provider.
+    let first = reset(root.path(), cfg!(target_os = "linux"));
+    let second = reset(root.path(), cfg!(target_os = "linux"));
+    let legacy = reset(root.path(), true);
+    let readiness = tkfs::pairing_code::Store::for_config(&path)
+        .unwrap()
+        .protocol_status()
+        .unwrap();
+    assert_eq!(readiness["upgrade_required"], true);
+    assert_eq!(readiness["protocol_version"], 2);
     assert!(
         first.as_str() != second.as_str(),
         "rotation must generate a new code"
@@ -108,7 +123,7 @@ fn reset_cli_rotates_only_fixture_verifier_and_never_journals_code() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_file() {
             let bytes = fs::read(entry.path()).unwrap();
-            for secret in [&first, &second] {
+            for secret in [&first, &second, &legacy] {
                 assert!(
                     !bytes.windows(200).any(|window| window == secret.as_bytes()),
                     "verifier files must not contain the original code"
@@ -121,16 +136,24 @@ fn reset_cli_rotates_only_fixture_verifier_and_never_journals_code() {
 #[test]
 fn reset_refuses_replay_flags_and_join_has_no_secret_argument() {
     let root = tempfile::tempdir().unwrap();
-    for flag in ["--request-id", "--generation"] {
-        let output = command(root.path())
-            .args([flag, "1", "manage", "reset-pairing-code"])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("PAIRING_CODE_RESET_NOT_REPLAYABLE")
-        );
+    for action in ["reset-pairing-code", "reset-legacy-pairing-code"] {
+        for flag in ["--request-id", "--generation"] {
+            let output = command(root.path())
+                .args([flag, "1", "manage", action])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("PAIRING_CODE_RESET_NOT_REPLAYABLE")
+            );
+        }
     }
+    let help = command(root.path())
+        .args(["manage", "reset-legacy-pairing-code", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("DISABLE simplified v3"));
     let output = command(root.path())
         .args(["pairing", "join-code", "--code", "secret-sentinel"])
         .output()

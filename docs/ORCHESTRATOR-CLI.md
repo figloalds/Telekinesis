@@ -42,6 +42,10 @@ tkfs [--request-id <UUID>] [--generation <N>] manage [-f <CONFIG_PATH>] <ACTION>
 |---|---|---|
 | `hello` | None; installation/API/build identity and readiness handshake | Not required |
 | `reset-pairing-code` | Print exactly 200 decimal digits once; rotate future code enrollment only | Forbidden; no request ID or replay |
+| `reset-legacy-pairing-code` | Advanced pinned-v2 only; print 200 digits once and **disable v3** enrollment | Forbidden; no request ID or replay |
+| `receiving-status` | Report desired/observed listener state, key readiness and pending approvals | Read-only |
+| `configure-receiving --address IP --port PORT` | Explicit initial protected receiver setup and enable | Catalog generation |
+| `configure-receiving --disable` | Stop receiving without revoking pairs or grants | Catalog generation |
 | `list` | None; catalog generation and states | Not required |
 | `inspect <STATE_ID>` | Stable managed state ID; state/worker observation | Not required |
 | `operation <OPERATION_UUID>` | Inspect an existing request's pending/completed receipt | Not required |

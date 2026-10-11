@@ -20,7 +20,9 @@ pub struct ShowOnceCode {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(windows)]
     use std::sync::{Arc, Barrier, mpsc};
+    #[cfg(windows)]
     use std::time::Duration;
 
     pub(crate) fn configuration(root: &Path) -> PathBuf {
@@ -57,7 +59,171 @@ pub(crate) mod tests {
             );
         }
     }
+    #[cfg(target_os = "linux")]
     #[test]
+    fn unavailable_encrypted_backend_refuses_reset_without_changing_legacy_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = configuration(temp.path());
+        let mut store = Store::for_config(&path).unwrap();
+        let legacy = "5".repeat(CODE_DIGITS);
+        let salt = [7u8; 32];
+        store
+            .db
+            .execute(
+                "INSERT INTO code VALUES(1,2,?,?,1)",
+                params![salt.as_slice(), verifier(&salt, &legacy)],
+            )
+            .unwrap();
+        crate::protected_secret::unavailable_fixture(|| {
+            assert!(
+                store
+                    .reset()
+                    .unwrap_err()
+                    .to_string()
+                    .starts_with("CREDENTIAL_BACKEND_UNAVAILABLE")
+            );
+        });
+        assert_eq!(
+            store.protocol_status().unwrap(),
+            serde_json::json!({"enabled":true,"protocol_version":2,"generation":1,"upgrade_required":true,"usable":false,"recovery_required":false})
+        );
+        store.authorize(&legacy, || Ok(())).unwrap();
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT COUNT(*) FROM opaque_code", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    #[test]
+    fn explicit_legacy_rotation_is_backend_independent_and_removes_v3_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = configuration(temp.path());
+        let mut store = Store::for_config(&path).unwrap();
+        let old = store.reset_legacy().unwrap();
+        validate(old.expose()).unwrap();
+        store.authorize(old.expose(), || Ok(())).unwrap();
+        // Synthetic stale encrypted record: the explicit downgrade must delete
+        // it without attempting platform decryption, including on Linux.
+        store
+            .db
+            .execute(
+                "INSERT INTO opaque_code VALUES(1,?,?)",
+                params![old.generation(), b"synthetic encrypted record".as_slice()],
+            )
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE rate SET attempts=30 WHERE id=1", [])
+            .unwrap();
+        let fresh = store.reset_legacy().unwrap();
+        assert_eq!(fresh.generation(), old.generation() + 1);
+        assert_ne!(old.expose(), fresh.expose());
+        assert_eq!(store.protocol_status().unwrap()["upgrade_required"], true);
+        assert_eq!(store.protocol_status().unwrap()["protocol_version"], 2);
+        assert_eq!(
+            store
+                .db
+                .query_row("SELECT attempts FROM rate WHERE id=1", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(store.authorize(old.expose(), || Ok(())).is_err());
+        store.authorize(fresh.expose(), || Ok(())).unwrap();
+        assert!(
+            store
+                .begin_opaque()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("PAIRING_PROTOCOL_UPGRADE_REQUIRED")
+        );
+        drop(store);
+        let mut reopened = Store::for_config(&path).unwrap();
+        reopened.authorize(fresh.expose(), || Ok(())).unwrap();
+        drop(reopened);
+        let bytes = std::fs::read(
+            Store::directory_for_config(&path)
+                .unwrap()
+                .join("verifier.sqlite"),
+        )
+        .unwrap();
+        assert!(
+            !bytes
+                .windows(CODE_DIGITS)
+                .any(|w| w == fresh.expose().as_bytes())
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn opaque_material_is_encrypted_abandoned_attempts_count_and_generation_fences_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = configuration(temp.path());
+        let mut store = Store::for_config(&path).unwrap();
+        assert_eq!(store.protocol_status().unwrap()["enabled"], false);
+        let old = store.reset().unwrap();
+        let snapshot = store.begin_opaque().unwrap();
+        assert_eq!(store.protocol_status().unwrap()["protocol_version"], 3);
+        let encrypted: Vec<u8> = store
+            .db
+            .query_row("SELECT envelope FROM opaque_code", [], |r| r.get(0))
+            .unwrap();
+        for secret in [
+            snapshot.setup.as_slice(),
+            snapshot.record.as_slice(),
+            old.expose().as_bytes(),
+        ] {
+            assert!(!encrypted.windows(secret.len()).any(|v| v == secret));
+        }
+        assert_eq!(store.protocol_status().unwrap()["usable"], true);
+        let mut damaged = encrypted.clone();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        store
+            .db
+            .execute("UPDATE opaque_code SET envelope=?", [damaged])
+            .unwrap();
+        let status = store.protocol_status().unwrap();
+        assert_eq!(status["usable"], false);
+        assert_eq!(status["recovery_required"], true);
+        assert_eq!(status["upgrade_required"], false);
+        assert!(store.begin_opaque().is_err());
+        let fresh = store.reset().unwrap();
+        let invoked = std::cell::Cell::new(false);
+        assert!(
+            store
+                .authorize_generation(snapshot.generation, || {
+                    invoked.set(true);
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!invoked.get());
+        store
+            .authorize_generation(fresh.generation(), || Ok(()))
+            .unwrap();
+        for _ in 0..ATTEMPTS_PER_MINUTE {
+            drop(store.begin_opaque().unwrap());
+        }
+        assert_eq!(
+            store.begin_opaque().err().unwrap().to_string(),
+            "PAIRING_CODE_RATE_LIMITED"
+        );
+        store.db.execute("DELETE FROM opaque_code", []).unwrap();
+        assert_eq!(store.protocol_status().unwrap()["upgrade_required"], true);
+        store.db.execute("UPDATE rate SET attempts=0", []).unwrap();
+        assert_eq!(
+            store.begin_opaque().err().unwrap().to_string(),
+            "PAIRING_PROTOCOL_UPGRADE_REQUIRED"
+        );
+        // Upgrade status never silently rotates or disables explicit pinned v2.
+        store.authorize(fresh.expose(), || Ok(())).unwrap();
+    }
+    #[test]
+    #[cfg(windows)]
     fn only_verifier_is_persisted_reuse_restart_rotation_and_redacted_debug() {
         let temp = tempfile::tempdir().unwrap();
         let path = configuration(temp.path());
@@ -91,6 +257,7 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    #[cfg(windows)]
     fn failed_attempt_budget_persists_and_rotation_restores_capacity() {
         let temp = tempfile::tempdir().unwrap();
         let path = configuration(temp.path());
@@ -119,6 +286,7 @@ pub(crate) mod tests {
         store.authorize(fresh.expose(), || Ok(())).unwrap();
     }
     #[test]
+    #[cfg(windows)]
     fn concurrent_rotations_are_atomic_and_admission_fences_reset() {
         let temp = tempfile::tempdir().unwrap();
         let path = configuration(temp.path());
@@ -170,6 +338,7 @@ pub(crate) mod tests {
         store.authorize(next.expose(), || Ok(())).unwrap();
     }
     #[test]
+    #[cfg(windows)]
     fn replacement_config_and_missing_catalog_fail_closed_without_provisioning() {
         let temp = tempfile::tempdir().unwrap();
         let path = configuration(temp.path());
@@ -193,6 +362,7 @@ pub(crate) mod tests {
         assert!(!temp.path().join("does-not-exist").exists());
     }
     #[test]
+    #[cfg(windows)]
     fn verifier_hardlink_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let path = configuration(temp.path());
@@ -206,6 +376,7 @@ pub(crate) mod tests {
         assert!(Store::for_config(&path).is_err());
     }
     #[test]
+    #[cfg(windows)]
     #[ignore = "subprocess crash fixture, invoked only by crash_atomicity"]
     fn crash_fixture() {
         let path = std::env::var_os("TKFS_PAIRING_CODE_TEST_CONFIG").expect("fixture path");
@@ -214,6 +385,7 @@ pub(crate) mod tests {
         panic!("expected crash fault");
     }
     #[test]
+    #[cfg(windows)]
     fn crash_atomicity_before_and_after_commit_never_recovers_secret() {
         let temp = tempfile::tempdir().unwrap();
         let path = configuration(temp.path());
@@ -283,7 +455,32 @@ pub struct Store {
     _file: std::fs::File,
     _directory: crate::private_storage::Directory,
 }
+pub(crate) struct OpaqueSnapshot {
+    pub generation: u64,
+    pub orchestrator: String,
+    pub setup: Zeroizing<Vec<u8>>,
+    pub record: Zeroizing<Vec<u8>>,
+}
+fn charge_attempt(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let now = crate::core::time();
+    let (window, attempts): (u64, u64) =
+        tx.query_row("SELECT window,attempts FROM rate WHERE id=1", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    let expired = now >= window.saturating_add(60_000);
+    let attempts = if expired { 0 } else { attempts };
+    ensure!(attempts < ATTEMPTS_PER_MINUTE, "PAIRING_CODE_RATE_LIMITED");
+    tx.execute(
+        "UPDATE rate SET window=?,attempts=? WHERE id=1",
+        params![if expired { now } else { window }, attempts + 1],
+    )?;
+    Ok(())
+}
 impl Store {
+    fn orchestrator(&self) -> Result<String> {
+        let (_, _, installation): (PathBuf, PathBuf, String) = serde_json::from_str(&self.binding)?;
+        Ok(installation)
+    }
     fn binding(path: &Path) -> Result<String> {
         let config = crate::orchestrator::Config::load(path)?;
         let identity = config.existing_installation()?;
@@ -324,6 +521,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS code(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL,salt BLOB NOT NULL,verifier BLOB NOT NULL,generation INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS rate(id INTEGER PRIMARY KEY CHECK(id=1),window INTEGER NOT NULL,attempts INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS binding(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS opaque_code(id INTEGER PRIMARY KEY CHECK(id=1),generation INTEGER NOT NULL,envelope BLOB NOT NULL);
             INSERT OR IGNORE INTO rate VALUES(1,0,0);")?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let bound: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM binding)", [], |r| r.get(0))?;
@@ -348,17 +546,118 @@ impl Store {
         let code = generate(&mut rand::rngs::OsRng);
         let salt: [u8; 32] = rand::rngs::OsRng.r#gen();
         let digest = verifier(&salt, &code);
+        let (setup, record) = crate::pairing_bootstrap::registration(&code)?;
+        let payload = Zeroizing::new(serde_json::to_vec(&(
+            &self.binding,
+            setup.as_slice(),
+            record.as_slice(),
+        ))?);
+        let envelope = crate::protected_secret::seal(
+            &format!("tkfs-opaque-{}", self.orchestrator()?),
+            &payload,
+        )?;
+        self.commit_reset(code, salt, digest, Some(&envelope))
+    }
+    /// Explicit advanced pinned-v2 compatibility only. Never an automatic
+    /// fallback from v3: selecting this removes the v3 enrollment record.
+    pub fn reset_legacy(&mut self) -> Result<ShowOnceCode> {
+        self.check_binding()?;
+        let code = generate(&mut rand::rngs::OsRng);
+        let salt: [u8; 32] = rand::rngs::OsRng.r#gen();
+        let digest = verifier(&salt, &code);
+        self.commit_reset(code, salt, digest, None)
+    }
+    fn commit_reset(
+        &mut self,
+        code: Zeroizing<String>,
+        salt: [u8; 32],
+        digest: Vec<u8>,
+        envelope: Option<&[u8]>,
+    ) -> Result<ShowOnceCode> {
+        // Registration/protected-storage work occurs before the short write
+        // transaction. Revalidate the selected installation after that work.
+        self.check_binding()?;
         let tx = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("INSERT INTO code VALUES(1,2,?,?,1) ON CONFLICT(id) DO UPDATE SET version=2,salt=excluded.salt,verifier=excluded.verifier,generation=generation+1", params![salt.as_slice(),digest])?;
         let generation =
             tx.query_row("SELECT generation FROM code WHERE id=1", [], |r| r.get(0))?;
+        if let Some(envelope) = envelope {
+            tx.execute("INSERT INTO opaque_code VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,envelope=excluded.envelope", params![generation, envelope])?;
+        } else {
+            tx.execute("DELETE FROM opaque_code", [])?;
+        }
         tx.execute("UPDATE rate SET window=0,attempts=0 WHERE id=1", [])?;
         crate::core::fault("pairing_code_reset_prepared");
         tx.commit()?;
         crate::core::fault("pairing_code_reset_committed");
         Ok(ShowOnceCode { code, generation })
+    }
+    /// No secret bytes or credential references are exposed by readiness.
+    pub fn protocol_status(&self) -> Result<serde_json::Value> {
+        self.check_binding()?;
+        let current: Option<(u64,Option<Vec<u8>>,Option<u64>)> = self.db.query_row("SELECT c.generation,o.envelope,o.generation FROM code c LEFT JOIN opaque_code o ON o.id=c.id WHERE c.id=1", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+        Ok(match current {
+            Some((generation, envelope, stored_generation)) => {
+                let configured = envelope.is_some();
+                let usable = stored_generation == Some(generation)
+                    && envelope
+                        .as_ref()
+                        .is_some_and(|bytes| self.unpack_opaque(generation, bytes).is_ok());
+                serde_json::json!({"enabled":true,"protocol_version":if configured {3} else {2},"generation":generation,"upgrade_required":!configured,"usable":usable,"recovery_required":configured&&!usable})
+            }
+            None => {
+                serde_json::json!({"enabled":false,"protocol_version":3,"generation":0,"upgrade_required":false,"usable":false,"recovery_required":false})
+            }
+        })
+    }
+    pub(crate) fn begin_opaque(&mut self) -> Result<OpaqueSnapshot> {
+        self.check_binding()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        charge_attempt(&tx)?;
+        let stored: Option<(u64,Vec<u8>)> = tx.query_row("SELECT o.generation,o.envelope FROM opaque_code o JOIN code c ON c.id=o.id AND c.generation=o.generation WHERE o.id=1", [], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+        tx.commit()?; // never hold a DB/reset lock while waiting for network IO
+        let (generation, envelope) = stored.context("PAIRING_PROTOCOL_UPGRADE_REQUIRED")?;
+        self.unpack_opaque(generation, &envelope)
+    }
+    fn unpack_opaque(&self, generation: u64, envelope: &[u8]) -> Result<OpaqueSnapshot> {
+        let orchestrator = self.orchestrator()?;
+        let payload =
+            crate::protected_secret::open(&format!("tkfs-opaque-{orchestrator}"), &envelope)?;
+        let (binding, setup, record): (String, Vec<u8>, Vec<u8>) =
+            serde_json::from_slice(&payload)?;
+        let setup = Zeroizing::new(setup);
+        let record = Zeroizing::new(record);
+        ensure!(
+            binding == self.binding,
+            "PAIRING_ORCHESTRATOR_BINDING_MISMATCH"
+        );
+        crate::pairing_bootstrap::validate_registration(&setup, &record)?;
+        Ok(OpaqueSnapshot {
+            generation,
+            orchestrator,
+            setup,
+            record,
+        })
+    }
+    /// Only a successful OPAQUE finish reaches this short cross-process fence.
+    pub(crate) fn authorize_generation<T>(
+        &mut self,
+        generation: u64,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.check_binding()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let current: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM code c JOIN opaque_code o ON c.id=o.id AND c.generation=o.generation WHERE c.id=1 AND c.generation=?)", [generation], |r| r.get(0))?;
+        ensure!(current, "PAIRING_CODE_REJECTED");
+        let result = action();
+        tx.commit()?;
+        result
     }
     /// Holds the reset fence until the authorized enrollment is committed.
     /// Attempts are committed even on failure and persist across restarts.

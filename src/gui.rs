@@ -14,12 +14,16 @@ use tkfs::{
     orchestrator::Action,
 };
 slint::include_modules!();
+#[path = "gui_address_acceptance.rs"]
+mod address_acceptance;
 #[path = "gui_branch_acceptance.rs"]
 mod branch_acceptance;
 #[path = "gui_code_acceptance.rs"]
 mod code_acceptance;
 #[path = "gui_dashboard_acceptance.rs"]
 mod dashboard_acceptance;
+#[path = "gui_profile_acceptance.rs"]
+mod profile_acceptance;
 #[path = "desktop_receive.rs"]
 mod receive;
 #[path = "gui_receive_acceptance.rs"]
@@ -52,8 +56,12 @@ mod pairing_acceptance;
 enum Job {
     Receive(PathBuf, receive::Request),
     BackgroundSync(Option<PathBuf>),
+    ConfigureReceiving(Option<String>, String),
+    ApproveDevice(String),
+    ToggleMount(String, bool),
     Pair(PathBuf, PairJob),
     Setup(PathBuf, PathBuf, usize),
+    SetupProfile(PathBuf, usize),
     Connect,
     SelectConfig(PathBuf),
     ResetPairingCode(PathBuf),
@@ -76,6 +84,7 @@ enum PairJob {
     Inspect(zeroize::Zeroizing<String>, String),
     InspectCode(String, String),
     JoinCode(String, String, zeroize::Zeroizing<String>, bool),
+    JoinAddress(String, String, zeroize::Zeroizing<String>),
     Clear,
     Join(String, bool),
     List(String),
@@ -89,7 +98,11 @@ impl PairJob {
     fn cancellable(&self) -> bool {
         matches!(
             self,
-            Self::Join(..) | Self::JoinCode(..) | Self::List(..) | Self::Sync(..)
+            Self::Join(..)
+                | Self::JoinCode(..)
+                | Self::JoinAddress(..)
+                | Self::List(..)
+                | Self::Sync(..)
         )
     }
 }
@@ -99,6 +112,9 @@ struct View {
     background_sync: String,
     show_once_code: Option<tkfs::pairing_code::ShowOnceCode>,
     config_path: String,
+    pairing_config: String,
+    enrollment_submitted: bool,
+    receiving: Value,
     pairing: PairSnapshot,
     connected: bool,
     first_run: bool,
@@ -142,6 +158,19 @@ fn display_path(path: &Path) -> String {
     } else {
         text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
     }
+}
+fn pairing_address(host: &str, port: &str, code: &str) -> Result<(String, u16)> {
+    let host: std::net::IpAddr = host.trim().parse().context("PAIRING_ADDRESS_INVALID")?;
+    let port: u16 = port.trim().parse().context("PAIRING_ADDRESS_INVALID")?;
+    ensure!(
+        port != 0 && !host.is_unspecified() && !host.is_multicast(),
+        "PAIRING_ADDRESS_INVALID"
+    );
+    ensure!(
+        code.len() == 200 && code.bytes().all(|byte| byte.is_ascii_digit()),
+        "PAIRING_CODE_MUST_BE_200_DIGITS"
+    );
+    Ok((host.to_string(), port))
 }
 fn project_status(state: &Value) -> &'static str {
     match state["observation"]["status"].as_str() {
@@ -200,6 +229,64 @@ impl Controller {
             self.receive_proof = None;
         }
         match job {
+            Job::SetupProfile(profile, limit) => {
+                let paths = desktop::profile_setup_paths(&self.paths, &profile)?;
+                let data = paths.folder.join("data");
+                let mounts = profile.join("Telekinesis");
+                desktop::bootstrap(&paths, &data, &mounts, limit)?;
+                self.paths = paths;
+                self.execute(Job::Connect)
+            }
+            Job::ToggleMount(state, desired) => {
+                let observed =
+                    self.session
+                        .as_ref()
+                        .context("NOT_CONNECTED")?
+                        .call(Action::Inspect {
+                            state: state.clone(),
+                        })?;
+                ensure!(
+                    observed["desired_running"] == desired,
+                    "STALE_PROJECT_SELECTION"
+                );
+                let generation = observed["management_generation"]
+                    .as_u64()
+                    .context("STATE_GENERATION_MISSING")?;
+                self.mutation(
+                    if desired {
+                        Action::Stop { state }
+                    } else {
+                        Action::Start { state }
+                    },
+                    generation,
+                )
+            }
+            Job::ConfigureReceiving(address, port) => {
+                let port = if address.is_some() {
+                    let port: u16 = port.parse().context("PAIRING_ADDRESS_INVALID")?;
+                    ensure!(port != 0, "PAIRING_ADDRESS_INVALID");
+                    address
+                        .as_deref()
+                        .unwrap()
+                        .parse::<std::net::IpAddr>()
+                        .context("PAIRING_ADDRESS_INVALID")?;
+                    port
+                } else {
+                    0
+                };
+                let generation = self
+                    .session
+                    .as_ref()
+                    .context("NOT_CONNECTED")?
+                    .call(Action::List)?["catalog_generation"]
+                    .as_u64()
+                    .context("CATALOG_GENERATION_MISSING")?;
+                self.mutation(Action::ConfigureReceiving { address, port }, generation)
+            }
+            Job::ApproveDevice(invitation) => {
+                tkfs::pairing_setup::approve(&self.paths.config, &invitation)?;
+                self.refresh(Some(("Device approved for pairing. Shared-folder access still requires a separate local grant.".into(), false)))
+            }
             Job::Receive(path, request) => self.receive_execute(path, request),
             Job::BackgroundSync(config) => {
                 let generation = self
@@ -223,7 +310,11 @@ impl Controller {
                 Ok(view)
             }
             Job::Pair(path, job) => {
-                if !matches!(job, PairJob::Load(..) | PairJob::Create(..)) {
+                let enrollment = matches!(job, PairJob::JoinAddress(..));
+                if !matches!(
+                    job,
+                    PairJob::Load(..) | PairJob::Create(..) | PairJob::JoinAddress(..)
+                ) {
                     ensure!(
                         std::fs::canonicalize(path)?
                             == self
@@ -236,6 +327,7 @@ impl Controller {
                 }
                 let message = self.pair_job(job)?;
                 let mut view = self.view();
+                view.enrollment_submitted = enrollment;
                 view.message = Some((message, false));
                 Ok(view)
             }
@@ -251,7 +343,14 @@ impl Controller {
             Job::Connect => {
                 self.session = Some(Session::connect(self.paths.clone())?);
                 self.branch_client = Some(BranchClient::open(self.session.as_ref().unwrap())?);
-                self.refresh(None)
+                let mut message = None;
+                if self.pairing.is_none() {
+                    match tkfs::pairing_setup::existing_client(&self.paths.config).and_then(|path| path.map(|path| PairClient::open(&path)).transpose()) {
+                        Ok(client) => self.pairing = client,
+                        Err(_) => message = Some(("Local folders are available, but the existing protected pairing identity needs recovery. Its files were preserved; reconnecting does not replace them.".into(), true)),
+                    }
+                }
+                self.refresh(message)
             }
             Job::SelectConfig(path) => {
                 let current = self.view();
@@ -263,6 +362,7 @@ impl Controller {
                 tkfs::orchestrator::Config::load(&paths.config)?;
                 self.paths = paths;
                 self.session = None;
+                self.pairing = None;
                 self.branch_client = None;
                 self.selected = None;
                 self.catalog = Value::Null;
@@ -465,6 +565,15 @@ impl Controller {
         self.refresh(Some((
             if reply["ok"] == true {
                 "Operation completed.".into()
+            } else if self
+                .session
+                .as_ref()
+                .and_then(|session| session.saved.as_ref())
+                .is_some_and(|saved| {
+                    matches!(saved.request.action, Action::ConfigureReceiving { .. })
+                })
+            {
+                tkfs::desktop_pairing::error_message(&anyhow::anyhow!(text(&reply, "error")))
             } else {
                 describe_error(&text(&reply, "error"))
             },
@@ -477,6 +586,9 @@ impl Controller {
         }
         let session = self.session.as_ref().context("NOT_CONNECTED")?;
         self.catalog = read_catalog(session)?;
+        self.catalog["_desktop_receiving"] = session
+            .call(Action::ReceivingStatus)
+            .unwrap_or_else(|_| json!({"service":{"state":"unavailable"}}));
         self.background_sync = match session.call(Action::BackgroundSyncStatus) {
             Ok(status) => format!(
                 "Service: {} · desired: {}\nScope: all configured enabled grants\n{}",
@@ -623,6 +735,12 @@ impl Controller {
             receive: self.receive_snapshot(),
             background_sync: self.background_sync.clone(),
             config_path: display_path(&self.paths.config),
+            pairing_config: self
+                .pairing
+                .as_ref()
+                .map(|client| display_path(client.path()))
+                .unwrap_or_default(),
+            receiving: self.catalog["_desktop_receiving"].clone(),
             pairing: self
                 .pairing
                 .as_ref()
@@ -715,6 +833,31 @@ impl Controller {
     }
     fn pair_job(&mut self, job: PairJob) -> Result<String> {
         match job {
+            PairJob::JoinAddress(host, port, code) => {
+                let (host, port) = pairing_address(&host, &port, &code)?;
+                ensure!(
+                    !self.pair_stop.load(std::sync::atomic::Ordering::Relaxed),
+                    "PAIRING_CANCELLED"
+                );
+                // Explicit Connect is the only normal-flow provisioning entry.
+                // The setup helper preserves existing identities and refuses
+                // damaged/unsafe files rather than replacing them.
+                let path = tkfs::pairing_setup::client(&self.paths.config)
+                    .context("PAIRING_SETUP_RECOVERY_REQUIRED")?;
+                self.pairing =
+                    Some(PairClient::open(&path).context("PAIRING_SETUP_RECOVERY_REQUIRED")?);
+                ensure!(
+                    !self.pair_stop.load(std::sync::atomic::Ordering::Relaxed),
+                    "PAIRING_CANCELLED"
+                );
+                self.pairing.as_mut().unwrap().join_address(
+                    &host,
+                    port,
+                    code,
+                    self.pair_stop.clone(),
+                )?;
+                return Ok("Connection request sent. The server owner must approve this device before you can receive shared folders. Check approval below; do not submit the key again while approval is pending.".into());
+            }
             PairJob::Load(path) => {
                 self.pairing = None;
                 self.pairing = Some(PairClient::open(&path)?);
@@ -786,13 +929,66 @@ impl Controller {
                 client.revoke(&peer, confirmed)?;
                 Ok("Peer revoked locally. Resume cannot restore a revoked pairing; the server owner must revoke their side separately.".into())
             }
-            PairJob::Load(..) | PairJob::Create(..) => unreachable!(),
+            PairJob::Load(..) | PairJob::Create(..) | PairJob::JoinAddress(..) => unreachable!(),
         }
     }
 }
 
 fn apply(ui: &App, view: View) {
     use slint::Model;
+    if !view.pairing_config.is_empty() {
+        ui.set_pair_config(view.pairing_config.into());
+    }
+    if view.enrollment_submitted {
+        ui.set_pairing_page(1);
+    }
+    ui.set_receiving_state(text(&view.receiving["service"], "state").into());
+    ui.set_receiving_enabled(view.receiving["desired_enabled"] == true);
+    let configured = view.receiving["address"].is_string()
+        || view.receiving["desired_enabled"] == true
+        || !view.receiving["setup_error"].is_null();
+    ui.set_receiving_configured(configured);
+    if let Some(address) = view.receiving["address"].as_str() {
+        ui.set_receiving_address(address.into());
+        if let Some(port) = view.receiving["port"].as_u64() {
+            ui.set_receiving_port(port.to_string().into());
+        }
+    }
+    ui.set_receiving_endpoint(if view.receiving["desired_enabled"] == true {
+        format!(
+            "{}:{}",
+            text(&view.receiving, "address"),
+            view.receiving["port"]
+        )
+        .into()
+    } else {
+        "Receiving disabled".into()
+    });
+    ui.set_receiving_error(if !view.receiving["setup_error"].is_null() || !view.receiving["key_error"].is_null() {
+        "Protected pairing files need recovery. Existing files were preserved; disable receiving if needed, then restore the configured identity or key store.".into()
+    } else { text(&view.receiving["service"], "error").into() });
+    ui.set_receiving_key_status(if view.receiving["pairing_key"]["recovery_required"] == true {
+        "The protected pairing verifier cannot be used. Restore its protected files or explicitly reset the key. Existing paired devices are preserved."
+    } else if view.receiving["pairing_key"]["upgrade_required"] == true {
+        "A new pairing key is required. Reset explicitly below; existing paired devices are preserved."
+    } else if view.receiving["pairing_key"]["enabled"] == true {
+        "A pairing key is active. It cannot be displayed again. Reset it only if you need a new key."
+    } else { "No pairing key is active. Create one below after setting up receiving." }.into());
+    let pending = view.receiving["pending"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item["approved"] != true)
+                .map(|item| PendingDevice {
+                    invitation: text(item, "invitation").into(),
+                    installation: text(item, "installation").into(),
+                    fingerprint: text(item, "fingerprint").into(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ui.set_pending_devices(ModelRc::new(VecModel::from(pending)));
     if let Some(code) = &view.show_once_code {
         ui.set_server_code(code.expose().into());
         ui.set_server_code_visible(true);
@@ -929,6 +1125,9 @@ fn apply(ui: &App, view: View) {
     ui.set_connected(view.connected);
     ui.set_connection(view.connection.into());
     if !view.config_path.is_empty() {
+        if !ui.get_pair_advanced() {
+            ui.set_server_config(view.config_path.clone().into());
+        }
         ui.set_config_path(view.config_path.into());
     }
     ui.set_running_count(view.rows.iter().filter(|row| row.2 == "Running").count() as i32);
@@ -1042,6 +1241,18 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     };
     let ui = App::new()?;
     ui.set_config_path(display_path(&paths.config).into());
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let profile = PathBuf::from(profile);
+        ui.set_profile_config(display_path(&profile.join(".telekinesis/orchestrator.toml")).into());
+        ui.set_profile_data(display_path(&profile.join(".telekinesis/data")).into());
+        ui.set_profile_mounts(display_path(&profile.join("Telekinesis")).into());
+        ui.set_profile_exists(
+            profile
+                .join(".telekinesis/orchestrator.toml")
+                .try_exists()
+                .unwrap_or(false),
+        );
+    }
     ui.set_data_folder(display_path(&paths.folder.join("data")).into());
     ui.set_mount_folder(display_path(&paths.folder.join("Projects")).into());
     ui.set_pair_config(display_path(&paths.folder.join(".tkfs-pairing/client.toml")).into());
@@ -1076,8 +1287,14 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
             branch_client: None,
         };
         for job in receiver {
-            let pairing = matches!(job, Job::Pair(..));
-            let refresh = matches!(job, Job::Refresh | Job::Connect | Job::Setup(..));
+            let pairing = matches!(
+                job,
+                Job::Pair(..) | Job::ConfigureReceiving(..) | Job::ApproveDevice(..)
+            );
+            let refresh = matches!(
+                job,
+                Job::Refresh | Job::Connect | Job::Setup(..) | Job::SetupProfile(..)
+            );
             let result = controller.execute(job);
             let view = match result {
                 Ok(view) => view,
@@ -1120,6 +1337,50 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     callback!(on_connect, Job::Connect);
     callback!(on_refresh, Job::Refresh);
     callback!(on_start_project, Job::Start);
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_open_profile(move || {
+            if let Some(ui) = weak.upgrade() {
+                enqueue(
+                    &weak,
+                    &sender,
+                    Job::SelectConfig(PathBuf::from(ui.get_profile_config().as_str())),
+                );
+            }
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_toggle_mount(move |state, desired| {
+            enqueue(&weak, &sender, Job::ToggleMount(state.to_string(), desired))
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_receiving_action(move |enabled| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            enqueue(
+                &weak,
+                &sender,
+                Job::ConfigureReceiving(
+                    enabled.then(|| ui.get_receiving_address().trim().to_owned()),
+                    ui.get_receiving_port().trim().to_owned(),
+                ),
+            );
+        });
+    }
+    {
+        let weak = weak.clone();
+        let sender = sender.clone();
+        ui.on_approve_device(move |invitation| {
+            enqueue(&weak, &sender, Job::ApproveDevice(invitation.to_string()))
+        });
+    }
     callback!(on_stop_project, Job::Stop);
     callback!(on_shutdown, Job::Shutdown);
     callback!(on_retry, Job::Retry);
@@ -1269,6 +1530,15 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                 .map(|r| r.id.to_string())
                 .unwrap_or_default();
             let job = match action {
+                14 => {
+                    let code = zeroize::Zeroizing::new(ui.get_pair_token().to_string());
+                    ui.set_pair_token("".into());
+                    PairJob::JoinAddress(
+                        ui.get_pair_host().to_string(),
+                        ui.get_pair_port().to_string(),
+                        code,
+                    )
+                }
                 12 => {
                     ui.set_pair_confirmed(false);
                     PairJob::InspectCode(
@@ -1411,6 +1681,19 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
         let sender = sender.clone();
         ui.on_setup(move || {
             if let Some(ui) = weak.upgrade() {
+                if ui.get_profile_setup() {
+                    if let Some(profile) = std::env::var_os("USERPROFILE") {
+                        enqueue(
+                            &weak,
+                            &sender,
+                            Job::SetupProfile(
+                                PathBuf::from(profile),
+                                ui.get_worker_limit() as usize,
+                            ),
+                        );
+                    }
+                    return;
+                }
                 enqueue(
                     &weak,
                     &sender,
@@ -1487,7 +1770,10 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
                     && !ui.get_about_visible()
                     && !ui.get_config_visible()
                     && ui.get_branch_dialog() == 0
-                    && matches!(ui.get_main_page(), 0 | 3 | 4)
+                    && !ui.get_server_code_visible()
+                    && ui.get_pair_token().is_empty()
+                    && (matches!(ui.get_main_page(), 0 | 3 | 4)
+                        || (ui.get_main_page() == 1 && ui.get_pairing_page() == 2))
                 {
                     enqueue(&weak, &sender, Job::Refresh);
                 }
@@ -1497,7 +1783,12 @@ pub fn run(report: Option<&Path>, config: Option<&Path>) -> Result<()> {
     let synthetic = report.is_some()
         && matches!(
             std::env::var("TKFS_UI_TEST_PHASE").as_deref(),
-            Ok("dashboard" | "pairing-code" | "receive")
+            Ok("dashboard"
+                | "pairing-code"
+                | "receive"
+                | "pairing-address"
+                | "profile-setup"
+                | "profile-reopen")
         );
     if !first_run && !synthetic {
         enqueue(&weak, &sender, Job::Connect);
@@ -1573,6 +1864,11 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
         None
     };
     branch_acceptance.set_phase(&phase);
+    let mut address_acceptance = if phase == "pairing-address" {
+        Some(address_acceptance::Acceptance::from_stdin()?)
+    } else {
+        None
+    };
     let mut code_acceptance = if phase == "pairing-code" {
         Some(code_acceptance::Acceptance::from_stdin()?)
     } else {
@@ -1588,6 +1884,8 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
         let result=(||->Result<bool>{
             ensure!(started.elapsed()<Duration::from_secs(100),"UI_TEST_TIMEOUT at step {step}");
             if ticks<3 || (ui.get_working() && phase != "dashboard"){return Ok(false);}
+            if phase == "profile-setup" || phase == "profile-reopen" { return profile_acceptance::tick(&ui, &directory, &mut step, phase == "profile-reopen", &mut checks); }
+            if let Some(address) = &mut address_acceptance { return address.tick(&ui, &directory, &mut checks); }
             if let Some(receive) = &mut receive_acceptance { return receive.tick(&ui, &directory, &mut checks); }
             if let Some(code) = &mut code_acceptance {
                 return code.tick(&ui, &directory, &mut checks);
@@ -1633,6 +1931,29 @@ fn test_ui(ui: &App, report: PathBuf) -> Result<slint::Timer> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn simple_pairing_validates_before_provisioning_without_echoing_input() {
+        let code = "0".repeat(200);
+        assert_eq!(
+            super::pairing_address("::1", "65535", &code).unwrap(),
+            ("::1".into(), 65535)
+        );
+        for (host, port) in [
+            ("name.example", "7421"),
+            ("127.0.0.1", "0"),
+            ("127.0.0.1", "65536"),
+            ("0.0.0.0", "7421"),
+            ("224.0.0.1", "7421"),
+        ] {
+            assert!(super::pairing_address(host, port, &code).is_err());
+        }
+        assert!(
+            super::pairing_address("127.0.0.1", "7421", "secret-invalid-fixture")
+                .unwrap_err()
+                .to_string()
+                .contains("200_DIGITS")
+        );
+    }
     use super::*;
     #[test]
     fn closed_window_discards_already_queued_delivery() {

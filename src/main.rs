@@ -180,6 +180,17 @@ enum ManagementCommand {
     Hello,
     /// Observe supervisor-owned synchronization of all enabled grants.
     BackgroundSyncStatus,
+    /// Observe the local pairing listener and pending device approvals.
+    ReceivingStatus,
+    /// Explicitly create protected receiving identity/config and enable listening.
+    ConfigureReceiving {
+        #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
+        address: Option<String>,
+        #[arg(long, default_value_t = 47443)]
+        port: u16,
+        #[arg(long)]
+        disable: bool,
+    },
     /// Enable an existing outbound-only pairing config, or disable supervision.
     ConfigureBackgroundSync {
         #[arg(long, required_unless_present = "disable", conflicts_with = "disable")]
@@ -189,6 +200,8 @@ enum ManagementCommand {
     },
     /// Rotate the enrollment code and print it once; never automatically retry.
     ResetPairingCode,
+    /// Advanced pinned v2 only: rotate code and DISABLE simplified v3 enrollment.
+    ResetLegacyPairingCode,
     /// Prepare a fresh headless replica of an existing logical repository.
     PrepareReplica {
         label: String,
@@ -573,7 +586,10 @@ fn run() -> Result<()> {
             action,
         } => {
             use tkfs::orchestrator::{self, Action, Request};
-            let reset_code = matches!(action, ManagementCommand::ResetPairingCode);
+            let reset_code = matches!(
+                action,
+                ManagementCommand::ResetPairingCode | ManagementCommand::ResetLegacyPairingCode
+            );
             if reset_code {
                 ensure!(
                     args.request_id.is_none() && args.generation.is_none(),
@@ -584,12 +600,20 @@ fn run() -> Result<()> {
             let action = match action {
                 ManagementCommand::Hello => Action::Hello,
                 ManagementCommand::BackgroundSyncStatus => Action::BackgroundSyncStatus,
+                ManagementCommand::ReceivingStatus => Action::ReceivingStatus,
+                ManagementCommand::ConfigureReceiving { address, port, .. } => {
+                    Action::ConfigureReceiving {
+                        address: address.clone(),
+                        port: *port,
+                    }
+                }
                 ManagementCommand::ConfigureBackgroundSync { config, .. } => {
                     Action::ConfigureBackgroundSync {
                         config: config.as_ref().map(std::fs::canonicalize).transpose()?,
                     }
                 }
                 ManagementCommand::ResetPairingCode => Action::ResetPairingCode {},
+                ManagementCommand::ResetLegacyPairingCode => Action::ResetLegacyPairingCode {},
                 ManagementCommand::PrepareReplica { label, repo } => Action::PrepareReplica {
                     label: label.clone(),
                     repo: repo.clone(),

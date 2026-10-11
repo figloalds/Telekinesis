@@ -162,10 +162,23 @@ impl Identity {
 pub enum CredentialSource {
     WindowsDpapi { file: PathBuf },
     Systemd { name: String },
+    PlatformEncrypted { file: PathBuf, name: String },
 }
 impl CredentialSource {
     pub fn load(&self, installation: &str) -> Result<Identity> {
         let bytes = match self {
+            Self::PlatformEncrypted { file, name } => {
+                let directory = crate::private_storage::Directory::open(
+                    file.parent().context("CREDENTIAL_DIRECTORY_REQUIRED")?,
+                )?;
+                let mut input = directory
+                    .file(file, false, false)
+                    .context("CREDENTIAL_MISSING_OR_UNSAFE")?;
+                ensure!(input.metadata()?.len() <= 131072, "CREDENTIAL_TOO_LARGE");
+                let mut encrypted = Zeroizing::new(Vec::new());
+                std::io::Read::read_to_end(&mut input, &mut encrypted)?;
+                crate::protected_secret::open(name, &encrypted)?
+            }
             Self::WindowsDpapi { file } => {
                 #[cfg(windows)]
                 {
@@ -267,7 +280,7 @@ impl CredentialSource {
     }
 }
 #[cfg(windows)]
-fn dpapi(bytes: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>> {
+pub(crate) fn dpapi(bytes: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>> {
     #[repr(C)]
     struct Blob {
         size: u32,

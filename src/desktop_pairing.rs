@@ -231,6 +231,9 @@ impl Client {
                 format!("Windows CurrentUser DPAPI · {}", file.display())
             }
             CredentialSource::Systemd { name } => format!("systemd credential · {name}"),
+            CredentialSource::PlatformEncrypted { file, .. } => {
+                format!("Platform-encrypted identity · {}", file.display())
+            }
         };
         self.snapshot.identity = format!(
             "Installation: {}\nCredential reference: {}",
@@ -335,6 +338,23 @@ impl Client {
         self.code_issuer = None;
         self.snapshot.review.clear();
         self.expected_endpoint.clear();
+    }
+    /// The pairing key authenticates the public-key exchange; callers do not
+    /// supply or silently accept a certificate fingerprint.
+    pub fn join_address(
+        &mut self,
+        host: &str,
+        port: u16,
+        code: Zeroizing<String>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Value> {
+        self.clear_invitation();
+        let reply = pairing_service::join_address(&self.current()?, host, port, code, stop)?;
+        self.refresh()?;
+        if let Some(issuer) = reply["issuer"].as_str() {
+            self.select_peer(issuer);
+        }
+        Ok(reply)
     }
     /// Review public bootstrap data only. No code is retained by this adapter.
     pub fn inspect_code(&mut self, public_json: &str, enrollment: &str) -> Result<()> {
@@ -540,7 +560,17 @@ impl Client {
 /// Do not echo remote error payloads, tokens, certificates or paths into logs.
 pub fn error_message(error: &anyhow::Error) -> String {
     let text = format!("{error:#}");
-    let message = if text.contains("CANCELLED") {
+    let message = if text.contains("PAIRING_PROTOCOL_UPGRADE_REQUIRED") {
+        "This server needs a new pairing key. Ask its owner to reset the key explicitly, then try again. Existing paired devices remain connected."
+    } else if text.contains("PAIRING_CODE_REJECTED") {
+        "The pairing key was not accepted. Check the IP address, port and current key with the server owner."
+    } else if text.contains("PAIRING_ADDRESS_INVALID") {
+        "Enter a numeric IPv4 or IPv6 address and a port from 1 to 65535."
+    } else if text.contains("PAIRING_UNAVAILABLE") {
+        "The server could not complete pairing. Check its IP address, port and receiving status. If delivery was interrupted, check pending approvals on the server before submitting again."
+    } else if text.contains("RECOVERY") || text.contains("SETUP") {
+        "This installation's protected pairing files need attention. Existing files and keys were preserved. Open Advanced to inspect the selected configuration; restore its protected identity instead of replacing it."
+    } else if text.contains("CANCELLED") {
         "Stopped local pairing I/O. An enrollment may still await server approval and sync may have committed data. Check approval or sync again to resume; cancellation does not undo data."
     } else if text.contains("PAIRING_CODE_MUST_BE_200_DIGITS")
         || text.contains("INVALID_PAIRING_CODE")
@@ -569,7 +599,10 @@ pub fn error_message(error: &anyhow::Error) -> String {
         "Use an outbound-only WSS client configuration. No plaintext or transport downgrade is offered."
     } else if text.contains("INVALID_INVITATION") {
         "The invitation is invalid. Paste a fresh invitation privately; it is never saved."
-    } else if text.contains("CREDENTIAL") || text.contains("PRIVATE_STORAGE") {
+    } else if text.contains("CREDENTIAL")
+        || text.contains("PRIVATE_STORAGE")
+        || text.contains("STORAGE_UNSAFE")
+    {
         "Protected credential/storage is unavailable or unsafe. Use the configured platform credential; existing permissions are never repaired automatically."
     } else {
         "Pairing operation did not complete. Check endpoint, exact-key approval, repository grants and local worker readiness. After an uncertain enrollment, check server approval before submitting again. Committed sync data is retained and can resume."

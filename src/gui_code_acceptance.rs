@@ -60,6 +60,7 @@ impl Acceptance {
     pub fn tick(&mut self, ui: &App, directory: &Path, checks: &mut Vec<String>) -> Result<bool> {
         match self.step {
             0 => {
+                ui.set_pair_advanced(true);
                 ui.set_main_page(1);
                 ui.set_pairing_page(2);
                 ui.set_server_config(
@@ -253,7 +254,7 @@ impl Acceptance {
         Ok(false)
     }
 }
-fn scan(path: &Path, secrets: &[Zeroizing<String>]) -> Result<()> {
+pub(super) fn scan(path: &Path, secrets: &[Zeroizing<String>]) -> Result<()> {
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {

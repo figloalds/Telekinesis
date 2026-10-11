@@ -229,7 +229,8 @@ impl Config {
         if config.data_directory.is_relative() {
             config.data_directory = parent.join(&config.data_directory);
         }
-        if let CredentialSource::WindowsDpapi { file } = &mut config.credential
+        if let CredentialSource::WindowsDpapi { file }
+        | CredentialSource::PlatformEncrypted { file, .. } = &mut config.credential
             && file.is_relative()
         {
             *file = parent.join(&*file);
@@ -427,6 +428,17 @@ pub fn public_bootstrap(config: &Config) -> Result<Peer> {
         endpoint: config.advertise.clone(),
         revoked: false,
     })
+}
+/// Authenticate automatic public-key exchange using only numeric IP, port and
+/// the enrollment capability. The code never crosses the network.
+pub fn join_address(
+    config: &Config,
+    host: &str,
+    port: u16,
+    code: Zeroizing<String>,
+    stop: Arc<AtomicBool>,
+) -> Result<Value> {
+    crate::pairing_bootstrap::join(config, host, port, code, stop)
 }
 /// `issuer` is independently approved public server metadata. A decimal code is
 /// never used to bootstrap server authentication or sent before pin verification.
@@ -1198,6 +1210,7 @@ mod tests {
     use crate::{core::Store, runtime::Engine};
     use std::sync::Mutex;
     #[test]
+    #[cfg(windows)]
     fn reusable_code_v2_tls_wss_and_encrypted_loopback_ws_rotation_and_pin() {
         for scheme in ["tls", "wss", "ws"] {
             let temp = tempfile::tempdir().unwrap();

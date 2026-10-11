@@ -96,6 +96,17 @@ The application folder must be writable; for Program Files or a read-only folder
 move the portable application to a writable folder. There is no silent fallback
 to another configuration or data root.
 
+Fresh setup can explicitly select a private profile location for protected
+pairing storage; the UI shows its paths. Existing adjacent or selected configs
+keep their identity and location. Reopening an existing profile installation is
+an explicit action. Ordinary pairing asks only for numeric IP, port and the
+200-digit key; the application creates and retains its private credentials and
+authenticates public identity exchange through OPAQUE. See
+[desktop pairing](docs/DESKTOP-PAIRING.md). Enabling a receiving listener and
+resetting its key remain explicit local actions; no firewall or OS trust changes
+are performed. The receiver endpoint is fixed by its initial setup in this slice;
+changing it in the application is not yet supported.
+
 Existing configurations are validated, and the client checks API version,
 installation identity, effective data root, build version, and capabilities before
 attaching. After the first connection config-scoped desktop metadata pins the

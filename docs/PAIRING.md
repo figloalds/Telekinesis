@@ -42,6 +42,13 @@ multi-hop mesh; that extension needs a separate protocol design.
 
 ## Numeric pairing codes
 
+The desktop's ordinary enrollment flow uses IP, port and pairing key. It
+automatically creates its local encrypted identity and uses OPAQUE v3 to
+authenticate the server certificate before trusting it. The original code is
+never sent on this flow. See [desktop pairing](DESKTOP-PAIRING.md) for explicit
+receiver setup, local approval and folder grants. The CLI procedure below is the
+separate advanced, pinned v2 compatibility path.
+
 The receiving host may opt into reusable 200-digit enrollment codes while keeping
 its existing identity, invitations and grants. In its pairing TOML, set the root
 field `orchestrator_config = '../orchestrator.toml'` to the selected initialized
@@ -73,11 +80,28 @@ not invalidated by numeric-code rotation. Numeric enrollment never silently
 falls back to invitations or weaker authentication. Older binaries reject the
 new typed enrollment request; use the legacy flow explicitly when necessary.
 
-Only a salted verifier is stored in the protected sibling
+An explicit reset now stores a salted verifier for advanced v2 compatibility and
+an encrypted OPAQUE registration/server-setup payload in the protected sibling
 `<O1_CONFIG filename>.pairing/verifier.sqlite`, bound to that initialized O1
 installation. There is no retrieval API, logged response or replay journal for
-the code. If reset delivery is uncertain, explicitly reset again. See
+the code. OPAQUE setup is private cryptographic material, not a harmless public
+verifier. Old hash-only records cannot be upgraded without the original code:
+create a new key explicitly to enable v3; existing pairs and grants survive.
+There is no automatic reset or downgrade. If reset delivery is uncertain,
+explicitly reset again. See
 [management reset](ORCHESTRATOR-CLI.md#pairing-code-reset).
+
+Windows uses CurrentUser DPAPI for the OPAQUE payload. Linux's app-managed
+encrypted provider requires an already-root process, systemd 256+ and an existing
+root-owned host credential key. It holds a shared lock until the direct helper
+exits, so a stale key cannot be replaced by systemd. It never elevates, invokes
+setup, reads the host-key payload or changes OS settings. Non-root, older or
+unavailable providers fail closed. Existing explicit `Systemd` identity loading
+is unchanged. The advanced command `manage reset-legacy-pairing-code` remains
+available on these hosts without an encrypted-provider call: it rotates the
+salted verifier and intentionally removes v3 registration in one transaction.
+Use it only with the pinned v2 procedure above. The normal UI and normal reset
+never invoke it as a fallback.
 
 ## Configuration and credentials
 

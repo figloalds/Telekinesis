@@ -344,3 +344,123 @@ pairing verification. No Linux desktop is claimed.
 All evidence directories are ignored local artifacts; tests and this ledger are
 versioned. No existing state/mount, live pairing code, credential, listener,
 firewall rule or installed service was changed by qualification.
+
+## Refinement R1: address, port and pairing key
+
+The follow-up product request removes certificate files and fingerprint chores
+from ordinary enrollment. Existing executable-adjacent and explicitly selected
+orchestrator TOML files keep their location and identity. A different first-run
+storage location must be a visible choice, never a silent migration. The requested
+new screenshot is not yet available locally; provisional UI work uses the already
+rendered `misc/prototype.html`, without claiming exact screenshot fidelity.
+
+Ownership remains UI/desktop adapters with the UI worker, protocol and dependencies
+with the pairing worker, shared setup/supervision/CLI/docs with integration, and
+independent read-only security review. New integration modules are
+`pairing_setup.rs` and `protected_secret.rs`.
+
+The normal protocol is v3 OPAQUE with pinned `opaque-ke` 4.0.1, fixed suite and
+bounded local Argon2 settings. Its dedicated provisional TLS 1.3 channel preserves
+TLS signature verification, then authenticates server metadata through OPAQUE and
+the TLS exporter. No original code is sent, no unverified fetched certificate is
+trusted, no automatic downgrade occurs. The context binds the actual leaf,
+exporter, protocol/suite/roles, generation, O1 identity and pairing identity.
+Admission rechecks the code generation in a short transaction after KE3. This is
+an integration requiring adversarial review, not a claim of formal cryptographic
+certification or an audit of this exact dependency release.
+
+The old salted hash cannot produce an OPAQUE registration. Existing installations
+therefore need an explicit new pairing-key reset to enable simplified enrollment.
+Reset still displays exactly 200 random decimal digits once; existing trusted
+pairs, grants and configured sync survive. Explicit pinned v2 CLI enrollment and
+v1 invitations remain compatibility paths; the normal UI never falls back to
+them. OPAQUE server setup and registration are private material, encrypted
+together with O1 binding before persistence. They are not harmless public hashes.
+
+Explicit Connect calls `pairing_setup::client` and uses the selected O1 root's
+`desktop-pairing/client.toml`. Explicit Enable receiving calls
+`ConfigureReceiving { address: Some(numeric_ip), port }`, creating
+`receiving-pairing/server.toml` and a separate supervised listener. These roles
+have separate registries to preserve the existing single-owner service lock.
+Setup commits one encrypted identity and its O1/role/address intent durably before
+publishing credentials and configuration; crash retries reuse that exact identity.
+Published configurations with missing, changed or corrupt credentials require
+recovery and are never silently re-keyed. Config publication is create-only.
+
+`ReceivingStatus` reports desired state separately from observed listener state,
+public address, pending approvals and key readiness. `ConfigureReceiving` with
+`address: None` disables; it does not revoke pairs or grants. Receiver bindings
+include the actual O1 identity and use the same bounded drain/quarantine and
+durable shutdown fence as outbound synchronization. Local pending approval does
+not grant folders or create remote administration rights. Folder access remains
+an explicit source-owner grant.
+
+Windows app-created credentials and OPAQUE material use CurrentUser DPAPI.
+Existing Systemd and WindowsDpapi credential configurations remain readable.
+Linux uses an existing root-owned systemd 256+ host-backed credential provider
+only when the process is already root. It does not elevate. A shared file lock
+is held through direct helper completion, preventing systemd from replacing a
+stale host secret; no host-key payload is read. Non-root IPC is excluded because
+its privileged daemon can outlive local cancellation. No plaintext fallback,
+host-secret initialization, unit installation, privilege prompt or OS security
+modification is introduced. This deliberately does not claim universal Linux v3
+availability. Existing advanced systemd deployments are not migrated. A separate
+explicit `reset-legacy-pairing-code` preserves advanced pinned-v2 rotation on
+unsupported hosts; it disables v3 enrollment and never runs as an automatic fallback.
+
+Qualification used only disposable fixtures. The final Windows native three-field
+callbacks passed in both themes (32.40s), including protected automatic setup,
+wrong-key refusal, cancellation, local approval, reopening without reentering a
+key, missing-registry recovery without repair, and plaintext-key file scans.
+The two-process explicit profile setup/reopen test passed (5.69s). Desktop tests
+(12), GUI tests (5), both reset journal guards, setup phase/crash tests (3),
+receiving lifecycle tests and the real-listener/uncertain-outbound shutdown test
+passed. The v3 protocol tests (3) include a TLS-terminating relay, wrong/changed
+pin, reset between KE2 and KE3, missing final acknowledgement, malformed and
+oversized messages, and replay on a fresh TLS channel. Store tests (8) cover
+encrypted records, rate limits, generation fences and crash boundaries. Updated
+CLI tests (2) and explicit legacy rotation also passed on Windows.
+
+Linux Rust 1.88 compiled the full library and checked all test targets. Thirteen focused
+tests passed: six protected-provider mock/subprocess tests, three real isolated
+O1 verifier tests, two portable OPAQUE tests and two CLI tests. No real systemd
+host secret or installed provider was invoked. The shared-lock synthetic test
+proved a stale-host replacement attempt was killed and reaped before releasing
+the lock, preserving the fixture inode and bytes. Helper I/O has a five-second
+deadline per invocation; final child reaping deliberately precedes lock release
+and is not an absolute wall-clock guarantee under an uninterruptible kernel wait.
+
+Initial regression attempts failed: a service process fail-fast, a WS TLS
+carrier error and a native legacy-callback live WAL access denial. Each passed a
+bounded isolated/full rerun without relaxing production guards. Their original
+causes are not established; passing reruns do not prove those failures harmless.
+Latest legacy callbacks passed both themes (34.79s). Reports and screenshots are
+under ignored `test-evidence/ui-address-pairing`, `ui-refinement` and
+`ui-code-callbacks`; the final integration manifest records the built revision.
+
+The final receive regression reproduced the protected-sidecar symptom in a
+second real workflow: light passed including post-GUI transfer, but dark failed
+during the receive callback phase with `PAIRING_STORAGE_UNSAFE` on
+`client/registry/pairs.sqlite-shm`, flags 28, Windows access denied (error 5).
+The failing report is retained at
+`test-evidence/ui-receive-refinement/dark/report.json`; a single bounded rerun is
+kept separately. This is an **open intermittent workflow reliability finding**.
+Source-level security/architecture review is clear, but full product
+qualification is not clean. No storage guard was relaxed and no root cause is
+claimed. The bounded rerun passed both themes (30.03s), including transfer after
+GUI exit and orderly mount cleanup, in `ui-receive-refinement-rerun`.
+The source path is `private_storage.rs:261` (`validate_existing_files`) through
+`local_ipc.rs:36` to `native/control.c:88` (`tk_storage_open`). Error 5 currently
+does not distinguish open, metadata/type/link or descriptor validation failure.
+A follow-up should add public validation-stage diagnostics and reproduce with
+concurrent SQLite open/close/checkpoint; it must not ignore AccessDenied or remove
+ACL/link/reparse checks.
+
+Remaining product limits are explicit: numeric IP only; receiving address/port
+fixed after initial setup; source-owner folder grants still required; no general
+change-path/remove workflow, automatic firewall changes or service installation.
+Portable application-folder configuration remains the default; profile setup and
+reopening require explicit selection. Exact comparison with the newly attached
+screenshot, cross-machine deployment and Linux GUI/installed-provider end-to-end
+qualification were not completed. The previously rendered prototype informed the
+layout; no screenshot pixel-match or formal cryptographic certification is claimed.

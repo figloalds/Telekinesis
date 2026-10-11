@@ -194,6 +194,22 @@ pub fn bootstrap(paths: &Paths, data: &Path, mounts: &Path, limit: usize) -> Res
     crate::onboarding::bootstrap(&paths.config, data, mounts, limit, false)
 }
 
+/// Resolve only on an explicitly selected first-run Save action. The caller
+/// supplies the profile root so acceptance tests never touch the real profile.
+pub fn profile_setup_paths(current: &Paths, profile: &Path) -> Result<Paths> {
+    ensure!(
+        !current.config.try_exists()?,
+        "EXISTING_CONFIGURATION_CANNOT_RELOCATE"
+    );
+    ensure!(profile.is_absolute(), "PROFILE_PATH_REQUIRED");
+    let directory = crate::private_storage::Directory::open(&profile.join(".telekinesis"))?;
+    drop(directory);
+    Paths::from_config(
+        current.executable.clone(),
+        &profile.join(".telekinesis/orchestrator.toml"),
+    )
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pin {
@@ -377,7 +393,10 @@ impl Session {
     }
     pub fn mutate(&mut self, action: Action, generation: u64) -> Result<Value> {
         ensure!(
-            !matches!(action, Action::ResetPairingCode {}),
+            !matches!(
+                action,
+                Action::ResetPairingCode {} | Action::ResetLegacyPairingCode {}
+            ),
             "PAIRING_CODE_RESET_NOT_JOURNALED: use the owner-local show-once reset path; never retry a lost response automatically"
         );
         ensure!(action.mutates(), "NOT_A_MUTATION");
@@ -534,6 +553,24 @@ pub fn open_folder(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explicit_profile_choice_preserves_existing_portable_configuration() {
+        let (temp, paths) = fixture();
+        let profile = temp.path().join("synthetic-profile");
+        fs::write(&paths.config, b"existing portable config").unwrap();
+        assert!(
+            profile_setup_paths(&paths, &profile)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("CANNOT_RELOCATE")
+        );
+        assert!(!profile.exists());
+        assert_eq!(
+            fs::read(&paths.config).unwrap(),
+            b"existing portable config"
+        );
+    }
     fn fixture() -> (tempfile::TempDir, Paths) {
         let temp = tempfile::tempdir().unwrap();
         let app = temp.path().join("app");
@@ -555,15 +592,20 @@ mod tests {
             hello: Value::Null,
             saved: None,
         };
-        let error = session.mutate(Action::ResetPairingCode {}, 0).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("PAIRING_CODE_RESET_NOT_JOURNALED")
-        );
-        assert!(!paths.journal().exists());
-        assert!(!paths.folder.join(".tkfs-operation.lock").exists());
-        assert!(session.saved.is_none());
+        for action in [
+            Action::ResetPairingCode {},
+            Action::ResetLegacyPairingCode {},
+        ] {
+            let error = session.mutate(action, 0).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("PAIRING_CODE_RESET_NOT_JOURNALED")
+            );
+            assert!(!paths.journal().exists());
+            assert!(!paths.folder.join(".tkfs-operation.lock").exists());
+            assert!(session.saved.is_none());
+        }
     }
     #[test]
     fn metadata_migrates_pending_bytes_with_pinned_ancestor_and_refuses_legacy_conflict() {

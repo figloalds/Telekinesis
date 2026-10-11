@@ -158,8 +158,14 @@ impl Config {
 #[serde(tag = "op", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Action {
     ResetPairingCode {},
+    ResetLegacyPairingCode {},
     Hello,
     BackgroundSyncStatus,
+    ReceivingStatus,
+    ConfigureReceiving {
+        address: Option<String>,
+        port: u16,
+    },
     ConfigureBackgroundSync {
         config: Option<PathBuf>,
     },
@@ -200,12 +206,14 @@ impl Action {
             self,
             Self::Create { .. }
                 | Self::ConfigureBackgroundSync { .. }
+                | Self::ConfigureReceiving { .. }
                 | Self::PrepareReplica { .. }
                 | Self::AttachMount { .. }
                 | Self::Start { .. }
                 | Self::Stop { .. }
                 | Self::Shutdown
                 | Self::ResetPairingCode {}
+                | Self::ResetLegacyPairingCode {}
         )
     }
 }
@@ -279,6 +287,7 @@ pub struct Supervisor {
     exit_requested: bool,
     instance: String,
     background: crate::managed_pairing::Controller,
+    receiving: crate::managed_pairing::Controller,
 }
 pub(crate) fn lock(path: &Path) -> Result<File> {
     #[cfg(windows)]
@@ -636,6 +645,7 @@ impl Supervisor {
             exit_requested: false,
             instance: id(),
             background: crate::managed_pairing::Controller::new(),
+            receiving: crate::managed_pairing::Controller::new(),
         })
     }
     fn background_binding(&self) -> Result<Option<crate::managed_pairing::Binding>> {
@@ -656,6 +666,65 @@ impl Supervisor {
         Ok(
             json!({"desired_enabled":binding.is_some(),"binding":binding,"service":self.background.status(),"scope":"all-configured-enabled-grants"}),
         )
+    }
+    fn receiving_binding(&self) -> Result<Option<crate::managed_pairing::Binding>> {
+        let payload: Option<String> = self
+            .db
+            .query_row(
+                "SELECT binding FROM local_services WHERE name='receiving'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        payload
+            .map(|value| serde_json::from_str(&value).context("INVALID_RECEIVING_BINDING"))
+            .transpose()
+    }
+    fn receiving_status(&self) -> Result<Value> {
+        let binding = self.receiving_binding()?;
+        let path = crate::pairing_setup::receiver_path(&self.config.source_path)?;
+        let mut status = json!({"desired_enabled":binding.is_some(),"config_path":path,"address":null,"port":null,"service":self.receiving.status(),"pairing_key":null,"pending":[]});
+        if path.try_exists()? {
+            let public = (|| -> Result<_> {
+                crate::managed_pairing::Binding::load_receiver(&path, &self.config.source_path)?;
+                let config = crate::pairing_service::Config::load(&path)?;
+                let address: std::net::SocketAddr = config.listen.parse()?;
+                Ok((address, config.registry()?.pending()?))
+            })();
+            match public {
+                Ok((address, pending)) => {
+                    status["address"] = json!(address.ip().to_string());
+                    status["port"] = json!(address.port());
+                    status["pending"] = pending;
+                }
+                Err(_) => status["setup_error"] = json!("PAIRING_SETUP_RECOVERY_REQUIRED"),
+            }
+        } else if binding.is_some() {
+            status["setup_error"] = json!("PAIRING_SETUP_RECOVERY_REQUIRED");
+        }
+        let mut verifier_name = self
+            .config
+            .source_path
+            .file_name()
+            .context("PAIRING_CONFIG_FILENAME_REQUIRED")?
+            .to_os_string();
+        verifier_name.push(".pairing");
+        if self
+            .config
+            .source_path
+            .with_file_name(verifier_name)
+            .try_exists()?
+        {
+            match crate::pairing_code::Store::for_config(&self.config.source_path)
+                .and_then(|s| s.protocol_status())
+            {
+                Ok(key) => status["pairing_key"] = key,
+                Err(_) => status["key_error"] = json!("PAIRING_KEY_RECOVERY_REQUIRED"),
+            }
+        } else {
+            status["pairing_key"] = json!({"enabled":false,"protocol_version":null,"generation":0,"upgrade_required":false});
+        }
+        Ok(status)
     }
     fn state(&self, state: &str) -> Result<State> {
         self.db.query_row("SELECT id,repo,device,operation,label,mount,desired,ready,generation FROM states WHERE id=?",[state],|r| {
@@ -1106,6 +1175,11 @@ impl Supervisor {
                     self.background.reconcile(binding.as_ref())?;
                     self.background_status()
                 }
+                Action::ConfigureReceiving { .. } => {
+                    let binding = self.receiving_binding()?;
+                    self.receiving.reconcile(binding.as_ref())?;
+                    self.receiving_status()
+                }
                 Action::Shutdown => {
                     // Preflight ALL workers before fencing/stopping any. A racing
                     // new open can still make stop retryable; intent remains durable.
@@ -1120,7 +1194,13 @@ impl Supervisor {
                         state.desired = false;
                         self.reconcile_one(&state, true)?;
                     }
-                    self.background.shutdown()?;
+                    self.background.request_stop();
+                    self.receiving.request_stop();
+                    let deadline = Instant::now() + Duration::from_secs(40);
+                    let background = self.background.shutdown_until(deadline);
+                    let receiving = self.receiving.shutdown_until(deadline);
+                    background?;
+                    receiving?;
                     self.exit_requested = true;
                     Ok(json!({"status":"stopped"}))
                 }
@@ -1170,7 +1250,10 @@ impl Supervisor {
         }
         // A reset is intentionally outside durable/replayable operation receipts.
         // Commit precedes delivery. Lost delivery requires another explicit reset.
-        if matches!(request.action, Action::ResetPairingCode {}) {
+        if matches!(
+            request.action,
+            Action::ResetPairingCode {} | Action::ResetLegacyPairingCode {}
+        ) {
             ensure!(
                 request.operation_id.is_none() && request.expected_generation.is_none(),
                 "PAIRING_RESET_CANNOT_BE_REPLAYED"
@@ -1181,7 +1264,12 @@ impl Supervisor {
                     && fs::canonicalize(&current.data_directory)? == self.config.data_directory,
                 "PAIRING_ORCHESTRATOR_BINDING_MISMATCH"
             );
-            let code = crate::pairing_code::Store::for_config(&self.config.source_path)?.reset()?;
+            let mut store = crate::pairing_code::Store::for_config(&self.config.source_path)?;
+            let code = if matches!(request.action, Action::ResetLegacyPairingCode {}) {
+                store.reset_legacy()?
+            } else {
+                store.reset()?
+            };
             return Ok(ok(
                 json!({"code":code.expose(),"generation":code.generation(),"display_once":true}),
             ));
@@ -1191,13 +1279,14 @@ impl Supervisor {
                 Action::Hello => Ok(ok(json!({"api_version":1,"installation_id":identity,
                     "instance_id":self.instance,"data_directory":self.config.data_directory,
                     "build_version":env!("CARGO_PKG_VERSION"),"registry_version":1,
-                    "capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1","pairing-code-reset-v2","prepare-replica-v1","attach-mount-v1","background-sync-v1"],
+                    "capabilities":["local-management-v1","target-installation-v1","runtime-rpc-v1","pairing-code-reset-v2","pairing-bootstrap-v3","receiving-v1","prepare-replica-v1","attach-mount-v1","background-sync-v1"],
                     "network_enabled":false,"shutdown_pending":self.shutdown_pending()?}))),
                 Action::List => Ok(ok(
                     json!({"api_version":1,"catalog_generation":self.generation(&Action::List)?,"states":self.states()?.iter().map(|s|self.observed(s)).collect::<Vec<_>>()}),
                 )),
                 Action::Inspect { state } => Ok(ok(self.observed(&self.state(&state)?))),
                 Action::BackgroundSyncStatus => Ok(ok(self.background_status()?)),
+                Action::ReceivingStatus => Ok(ok(self.receiving_status()?)),
                 Action::Operation { operation } => {
                     let (status, response): (String, Option<String>) = self
                         .db
@@ -1240,6 +1329,7 @@ impl Supervisor {
         // No worker or standalone daemon may appear between validation and commit.
         let mut _mount_state_guard = None;
         let mut background_binding = None;
+        let mut receiving_binding = None;
         let prepared = (|| -> Result<Option<PathBuf>> {
             let pending = self
                 .db
@@ -1248,6 +1338,12 @@ impl Supervisor {
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             for payload in pending {
                 let pending: Request = serde_json::from_str(&payload)?;
+                if matches!(request.action, Action::ConfigureReceiving { .. }) {
+                    ensure!(
+                        !matches!(pending.action, Action::ConfigureReceiving { .. }),
+                        "RECEIVING_OPERATION_PENDING"
+                    );
+                }
                 if matches!(request.action, Action::ConfigureBackgroundSync { .. }) {
                     ensure!(
                         !matches!(pending.action, Action::ConfigureBackgroundSync { .. }),
@@ -1296,6 +1392,18 @@ impl Supervisor {
             if let Action::ConfigureBackgroundSync { config: Some(path) } = &request.action {
                 ensure!(path.is_absolute(), "PAIRING_CONFIG_MUST_BE_ABSOLUTE");
                 background_binding = Some(crate::managed_pairing::Binding::load(path)?);
+            }
+            if let Action::ConfigureReceiving {
+                address: Some(address),
+                port,
+            } = &request.action
+            {
+                let path =
+                    crate::pairing_setup::receiver(&self.config.source_path, address, *port)?;
+                receiving_binding = Some(crate::managed_pairing::Binding::load_receiver(
+                    &path,
+                    &self.config.source_path,
+                )?);
             }
             if let Action::PrepareReplica { label, repo } = &request.action {
                 ensure!(
@@ -1415,6 +1523,14 @@ impl Supervisor {
                     }
                     tx.execute("UPDATE installation SET generation=generation+1", [])?;
                 }
+                Action::ConfigureReceiving { .. } => {
+                    if let Some(binding) = receiving_binding {
+                        tx.execute("INSERT INTO local_services VALUES('receiving',?) ON CONFLICT(name) DO UPDATE SET binding=excluded.binding",[serde_json::to_string(&binding)?])?;
+                    } else {
+                        tx.execute("DELETE FROM local_services WHERE name='receiving'", [])?;
+                    }
+                    tx.execute("UPDATE installation SET generation=generation+1", [])?;
+                }
                 _ => unreachable!(),
             },
         }
@@ -1474,6 +1590,8 @@ impl Supervisor {
         self.recover()?;
         let binding = self.background_binding()?;
         self.background.reconcile(binding.as_ref())?;
+        let receiving = self.receiving_binding()?;
+        self.receiving.reconcile(receiving.as_ref())?;
         for state in self.states()? {
             if state.ready {
                 let _ = self.reconcile_one(&state, false);
@@ -1898,6 +2016,132 @@ mod regressions {
         assert!(!supervisor.exit_requested);
         assert_eq!(supervisor.handle(shutdown).unwrap()["retryable"], true);
         assert!(supervisor.shutdown_pending().unwrap());
+    }
+    #[test]
+    fn uncertain_receiving_drain_keeps_shutdown_durable() {
+        let (_temp, mut supervisor) = fixture();
+        supervisor.receiving.simulate_uncertain_drain();
+        let request = Request {
+            version: 1,
+            target_installation: None,
+            operation_id: Some(id()),
+            expected_generation: Some(0),
+            action: Action::Shutdown,
+        };
+        let response = supervisor.handle(request).unwrap();
+        assert_eq!(response["retryable"], true);
+        assert!(supervisor.shutdown_pending().unwrap());
+        supervisor.tick().unwrap();
+        assert!(!supervisor.exit_requested);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn receiving_setup_readiness_replay_and_disable_preserve_identity() {
+        let (_temp, mut supervisor) = fixture();
+        let initial = supervisor.receiving_status().unwrap();
+        assert_eq!(initial["desired_enabled"], false);
+        assert!(
+            !crate::pairing_setup::receiver_path(&supervisor.config.source_path)
+                .unwrap()
+                .exists()
+        );
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let request = Request {
+            version: 1,
+            target_installation: None,
+            operation_id: Some(id()),
+            expected_generation: Some(0),
+            action: Action::ConfigureReceiving {
+                address: Some("127.0.0.1".into()),
+                port,
+            },
+        };
+        let response = supervisor.handle(request.clone()).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(supervisor.handle(request).unwrap(), response);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor.receiving.status()["state"] != "running" {
+            assert!(
+                Instant::now() < deadline,
+                "{}",
+                supervisor.receiving.status()
+            );
+            supervisor.tick().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let binding = supervisor.receiving_binding().unwrap().unwrap();
+        assert!(std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok());
+        let disable = Request {
+            version: 1,
+            target_installation: None,
+            operation_id: Some(id()),
+            expected_generation: Some(1),
+            action: Action::ConfigureReceiving {
+                address: None,
+                port: 0,
+            },
+        };
+        assert_eq!(supervisor.handle(disable).unwrap()["ok"], true);
+        supervisor.receiving.shutdown().unwrap();
+        assert!(supervisor.receiving_binding().unwrap().is_none());
+        assert_eq!(
+            crate::managed_pairing::Binding::load_receiver(
+                &binding.config_path,
+                &supervisor.config.source_path
+            )
+            .unwrap(),
+            binding
+        );
+        assert_eq!(supervisor.generation(&Action::List).unwrap(), 2);
+    }
+    #[test]
+    #[cfg(windows)]
+    fn uncertain_outbound_shutdown_also_stops_real_receiver() {
+        let (_temp, mut supervisor) = fixture();
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let enable = Request {
+            version: 1,
+            target_installation: None,
+            operation_id: Some(id()),
+            expected_generation: Some(0),
+            action: Action::ConfigureReceiving {
+                address: Some("127.0.0.1".into()),
+                port,
+            },
+        };
+        let response = supervisor.handle(enable).unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor.receiving.status()["state"] != "running" {
+            assert!(Instant::now() < deadline);
+            supervisor.tick().unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        supervisor.background.simulate_uncertain_drain();
+        let shutdown = Request {
+            version: 1,
+            target_installation: None,
+            operation_id: Some(id()),
+            expected_generation: Some(1),
+            action: Action::Shutdown,
+        };
+        let response = supervisor.handle(shutdown).unwrap();
+        assert_eq!(response["retryable"], true);
+        assert!(supervisor.shutdown_pending().unwrap());
+        assert_eq!(supervisor.receiving.status()["state"], "disabled");
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+                Duration::from_millis(200)
+            )
+            .is_err()
+        );
+        supervisor.tick().unwrap();
+        assert_eq!(supervisor.receiving.status()["state"], "disabled");
     }
     #[test]
     #[cfg(windows)]
