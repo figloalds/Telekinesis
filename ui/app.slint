@@ -1,5 +1,7 @@
 import { ScrollView, TextEdit, AboutSlint, Palette } from "std-widgets.slint";
 export struct FolderRow { state: string, label: string, mount: string, running: bool, starting: bool, error: string }
+export struct ConflictRow { id: string, description: string, field: string, entity: string }
+export struct RevisionRow { id: string, description: string }
 export struct RemoteRow { repo: string, label: string }
 export struct PeerRow { endpoint: string, online: bool }
 global Theme {
@@ -98,6 +100,24 @@ export component AppWindow inherits Window {
     in property <int> mounted-count;
     in property <int> online-count;
     in property <[FolderRow]> folders;
+    in property <string> folder-summary;
+    in property <int> conflict-count;
+    in property <int> conflict-offset;
+    callback conflict-page(int);
+    in property <[ConflictRow]> conflicts;
+    in property <[RevisionRow]> revisions;
+    in-out property <string> selected-conflict;
+    in-out property <string> selected-entity;
+    in-out property <string> selected-revision;
+    in-out property <string> conflict-field;
+    in-out property <string> recovery-target;
+    in property <string> conflict-preview;
+    callback folder-details(string);
+    callback select-conflict(string);
+    callback preview-revision(string);
+    callback resolve-conflict();
+    callback recover-conflict(string);
+
     in property <[RemoteRow]> remote-folders;
     in property <[PeerRow]> peer-rows;
     in-out property <string> selected-state;
@@ -197,7 +217,7 @@ export component AppWindow inherits Window {
                             Muted { text: "Name"; width: root.name-column; }
                             Muted { text: "Mount point"; horizontal-stretch: 1.2; }
                             Muted { text: "Status"; width: 118px; }
-                            Muted { text: "Actions"; width: 186px; horizontal-alignment: right; }
+                            Muted { text: "Actions"; width: 320px; horizontal-alignment: right; }
                         }
                         Rectangle { height: 1px; background: Theme.line; }
                         if root.folders.length > 0: ScrollView {
@@ -216,9 +236,12 @@ export component AppWindow inherits Window {
                                             Label { text: folder.starting ? "◌ Starting" : folder.error != "" ? "! Needs attention" : folder.running ? (folder.mount == "" ? "● Headless" : "● Mounted") : "○ Not mounted"; color: folder.error != "" ? #ff9d96 : folder.running ? #5fd0a6 : Theme.muted; font-size: 11px; horizontal-alignment: center; }
                                           }
                                         }
-                                        HorizontalLayout { width: 186px; spacing: 6px;
+                                        HorizontalLayout { width: 320px; spacing: 6px;
                                             ActionButton { text: folder.starting ? "Cancel" : folder.running ? (folder.mount == "" ? "Stop" : "Unmount") : (folder.mount == "" ? "Start" : "Mount"); enabled: root.interactive;
                                                 clicked => { if folder.running || folder.starting { root.stop-folder(folder.state); } else { root.start-folder(folder.state); } }
+                                            }
+                                            ActionButton { text: "Sync / conflicts"; enabled: root.interactive && folder.running;
+                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.selected-conflict = ""; root.selected-revision = ""; root.dialog = "folder"; root.folder-details(folder.state); }
                                             }
                                             ActionButton { text: "Change path"; enabled: root.interactive;
                                                 clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.mount-path = folder.mount; root.dialog = (folder.running || folder.starting) ? "stop-first" : "mount"; }
@@ -255,12 +278,12 @@ export component AppWindow inherits Window {
         TouchArea { clicked => { if !root.busy { root.dialog = ""; } } }
         Card {
             x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: root.dialog == "connect" ? 600px : 510px;
+            width: root.dialog == "folder" ? 880px : root.dialog == "connect" ? 600px : 510px;
             height: self.preferred-height;
             TouchArea {}
             VerticalLayout { padding: 24px; spacing: 14px;
                 HorizontalLayout {
-                    Label { text: root.dialog == "create" ? "New virtual folder" : root.dialog == "mount" || root.dialog == "stop-first" ? "Change mount point" : root.dialog == "connect" ? "Connect remote orchestrator" : root.dialog == "host" ? "Host settings" : root.dialog == "shutdown" ? "Shut down host" : "Activity details"; font-size: 20px; font-weight: 600; }
+                    Label { text: root.dialog == "folder" ? root.selected-label + " — Sync & conflicts" : root.dialog == "create" ? "New virtual folder" : root.dialog == "mount" || root.dialog == "stop-first" ? "Change mount point" : root.dialog == "connect" ? "Connect remote orchestrator" : root.dialog == "host" ? "Host settings" : root.dialog == "shutdown" ? "Shut down host" : "Activity details"; font-size: 20px; font-weight: 600; }
                     ActionButton { width: 34px; text: "×"; quiet: true; enabled: !root.busy; clicked => { root.dialog = ""; } }
                 }
                 if root.dialog == "create" || root.dialog == "mount": VerticalLayout { spacing: 10px;
@@ -317,6 +340,45 @@ export component AppWindow inherits Window {
                 if root.dialog == "shutdown": VerticalLayout { spacing: 16px;
                     Label { text: "Shut down this host? All running folders will stop and their mounts will become unavailable."; wrap: word-wrap; }
                     ActionButton { text: "Shut down daemon"; enabled: !root.busy; clicked => { root.shutdown(); } }
+                }
+                if root.dialog == "folder": VerticalLayout { spacing: 10px;
+                    TextEdit { text: root.folder-summary; read-only: true; height: 100px; }
+                    HorizontalLayout { spacing: 8px;
+                        Label { text: "Unresolved conflicts (" + root.conflict-count + ")"; font-weight: 600; horizontal-stretch: 1; }
+                        ActionButton { text: "Previous"; enabled: !root.busy && root.conflict-offset > 0; clicked => { root.conflict-page(max(0, root.conflict-offset - 100)); } }
+                        ActionButton { text: "Next"; enabled: !root.busy && root.conflict-offset + 100 < root.conflict-count; clicked => { root.conflict-page(root.conflict-offset + 100); } }
+                        ActionButton { text: "Refresh"; enabled: !root.busy; clicked => { root.folder-details(root.selected-state); } }
+                    }
+                    HorizontalLayout { spacing: 12px;
+                        ScrollView { width: 290px; height: 140px;
+                            VerticalLayout { spacing: 6px;
+                                for conflict in root.conflicts: ActionButton { min-width: 0px; text: (root.selected-conflict == conflict.id && root.selected-entity == conflict.entity ? "● " : "") + conflict.description;
+                                    enabled: !root.busy; clicked => { root.selected-conflict = conflict.id; root.selected-entity = conflict.entity; root.conflict-field = conflict.field; root.selected-revision = ""; root.select-conflict(conflict.id); }
+                                }
+                                Rectangle { vertical-stretch: 1; }
+                            }
+                        }
+                        ScrollView { height: 140px;
+                            VerticalLayout { spacing: 6px;
+                                for revision in root.revisions: ActionButton { min-width: 0px; text: (root.selected-revision == revision.id ? "● " : "") + revision.description;
+                                    enabled: !root.busy; clicked => { root.selected-revision = revision.id; root.preview-revision(revision.id); }
+                                }
+                                Rectangle { vertical-stretch: 1; }
+                            }
+                        }
+                    }
+                    TextEdit { text: root.conflict-preview; read-only: true; height: 128px; }
+                    if root.selected-conflict != "" && root.conflict-field != "namespace": ActionButton {
+                        text: "Use selected revision"; primary: true; enabled: !root.busy && root.selected-revision != "";
+                        clicked => { root.resolve-conflict(); }
+                    }
+                    if root.selected-conflict != "" && (root.conflict-field == "namespace" || root.conflict-field == "location"): HorizontalLayout { spacing: 8px;
+                        Field { text <=> root.recovery-target; placeholder: "New path for selected entry, e.g. recovered/file.txt"; enabled: !root.busy; }
+                        ActionButton { text: "Recover at path"; enabled: !root.busy && root.recovery-target != "" && root.selected-revision != "";
+                            clicked => { root.recover-conflict(root.recovery-target); }
+                        }
+                    }
+                    Muted { text: "Choosing a revision records an explicit resolution. Close open files before resolving. Missing previews download on demand."; wrap: word-wrap; }
                 }
                 if root.dialog == "details": TextEdit { text: root.status; read-only: true; height: 180px; }
                 if root.dialog != "details": Label { text: root.busy ? "Working…" : root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; wrap: word-wrap; }

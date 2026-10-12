@@ -1,6 +1,6 @@
 //! The desktop is a client of the same folder/peer management API as the CLI.
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{Value, json};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{
     cell::RefCell,
@@ -71,6 +71,80 @@ fn peer_rows(value: &Value) -> Vec<PeerRow> {
                 .any(|lane| lane["connected"] == true),
         })
         .collect()
+}
+
+fn folder_action(state: &str, payload: Value) -> Action {
+    Action::Folder {
+        state: state.into(),
+        request: tkfs::core::id(),
+        payload,
+    }
+}
+fn folder_summary(value: &Value) -> String {
+    let s = &value["status"];
+    if s["stale"] == true {
+        return "Worker busy; displaying an older observation. Fresh status will resume automatically.".into();
+    }
+    let c = &s["content"];
+    let peers = s["peers"]
+        .as_object()
+        .map(|p| {
+            p.values()
+                .map(|v| {
+                    let age =
+                        tkfs::core::time().saturating_sub(v["at"].as_u64().unwrap_or(0)) / 1000;
+                    format!(
+                        "{}: {} ({}s ago)",
+                        v["replica"].as_str().unwrap_or("peer"),
+                        if age >= 15 {
+                            "observation stale"
+                        } else if v["metadata_caught_up"] == true {
+                            "metadata up to date"
+                        } else {
+                            "syncing metadata"
+                        },
+                        age
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let pending = c["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|v| {
+            format!(
+                "{}: {} ({} / {} bytes){}",
+                v["path"].as_str().unwrap_or("file"),
+                v["state"].as_str().unwrap_or("missing"),
+                v["downloaded"],
+                v["size"],
+                v["error"]
+                    .as_str()
+                    .map(|e| format!(" — {e}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Metadata: {} | Content: {} / {} current objects available | {} downloading\nPending metadata: {} | Unflushed files: {} | Health: {}\n{}\n{}",
+        if s["metadata_caught_up"] == true {
+            "up to date"
+        } else {
+            "pending / awaiting peer observation"
+        },
+        c["current_available"],
+        c["current_objects"],
+        c["downloading"],
+        s["incoming_pending"],
+        s["unflushed_files"],
+        s["health"].as_str().unwrap_or("healthy"),
+        peers,
+        pending
+    )
 }
 
 fn clear_remote(ui: &AppWindow) {
@@ -146,6 +220,8 @@ pub fn run(config_path: &Path) -> Result<()> {
             .unwrap_or_else(|_| "This computer".into())
             .into(),
     );
+    let watched = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let watch_worker = watched.clone();
     let (tx, rx) = mpsc::channel::<Action>();
     // The boolean distinguishes user commands from quiet background snapshots.
     let (results, out) = mpsc::channel::<(Action, bool, Result<Value, String>)>();
@@ -172,7 +248,11 @@ pub fn run(config_path: &Path) -> Result<()> {
             }
         }
         let snapshot = || {
-            for action in [Action::List, Action::Peers] {
+            let mut actions = vec![Action::List, Action::Peers];
+            if let Some(state) = watch_worker.lock().unwrap().as_ref() {
+                actions.push(folder_action(state, json!({"op":"status"})));
+            }
+            for action in actions {
                 let response = orchestrator::client(&config, &action).map_err(|e| format!("{e:#}"));
                 if results.send((action, false, response)).is_err() {
                     return false;
@@ -202,12 +282,28 @@ pub fn run(config_path: &Path) -> Result<()> {
             if matches!(action, Action::List) && response.is_ok() {
                 stopped = false;
             }
+            let refresh_folder = match &action {
+                Action::Folder { state, payload, .. }
+                    if response.is_ok()
+                        && matches!(payload["op"].as_str(), Some("resolve" | "recover")) =>
+                {
+                    Some(state.clone())
+                }
+                _ => None,
+            };
             let pair_endpoint = match &action {
                 Action::Pair { endpoint, .. } if response.is_ok() => Some(endpoint.clone()),
                 _ => None,
             };
             if results.send((action, true, response)).is_err() {
                 break;
+            }
+            if let Some(state) = refresh_folder {
+                let action = folder_action(&state, json!({"op":"folder-details"}));
+                let response = orchestrator::client(&config, &action).map_err(|e| format!("{e:#}"));
+                if results.send((action, true, response)).is_err() {
+                    break;
+                }
             }
             if let Some(endpoint) = pair_endpoint {
                 let action = Action::RemoteList { endpoint };
@@ -292,11 +388,155 @@ pub fn run(config_path: &Path) -> Result<()> {
     handler!(on_peers, || Action::Peers);
     handler!(on_shutdown, || Action::Shutdown);
 
+    let detail = Rc::new(RefCell::new(Value::Null));
+    {
+        let weak = ui.as_weak();
+        let tx = tx.clone();
+        ui.on_folder_details(move |state| {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_folder_summary("Loading folder state…".into());
+            }
+            submit(
+                &weak,
+                &tx,
+                folder_action(&state, json!({"op":"folder-details"})),
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let tx = tx.clone();
+        ui.on_conflict_page(move |offset| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            submit(
+                &weak,
+                &tx,
+                folder_action(
+                    &ui.get_selected_state(),
+                    json!({"op":"folder-details","offset":offset}),
+                ),
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let detail = detail.clone();
+        ui.on_select_conflict(move |id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let data = detail.borrow();
+            let conflict = data["conflicts"]
+                .as_array()
+                .and_then(|cs| cs.iter().find(|c| c["id"] == id.as_str()));
+            let revisions = conflict
+                .into_iter()
+                .flat_map(|c| c["alternatives"].as_array().into_iter().flatten())
+                .filter(|v| {
+                    ui.get_conflict_field() != "namespace"
+                        || data["revision_entities"][v["revision"].as_str().unwrap_or_default()]
+                            .as_array()
+                            .is_some_and(|entities| {
+                                entities
+                                    .iter()
+                                    .any(|e| e == ui.get_selected_entity().as_str())
+                            })
+                })
+                .map(|v| RevisionRow {
+                    id: v["revision"].as_str().unwrap_or_default().into(),
+                    description: format!(
+                        "{} · {} · {}",
+                        v["device"].as_str().unwrap_or("unknown"),
+                        v["created_ms"],
+                        v["revision"].as_str().unwrap_or_default()
+                    )
+                    .into(),
+                })
+                .collect::<Vec<_>>();
+            ui.set_revisions(ModelRc::new(VecModel::from(revisions)));
+            ui.set_conflict_preview(
+                conflict
+                    .map(|c| {
+                        format!(
+                            "{}\nCommon bases: {}\nSelect an alternative to inspect it.",
+                            c["reason"].as_str().unwrap_or_default(),
+                            c["bases"]
+                        )
+                    })
+                    .unwrap_or_default()
+                    .into(),
+            );
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let detail = detail.clone();
+        let tx = tx.clone();
+        ui.on_preview_revision(move |revision| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let data = detail.borrow();
+            let conflict = data["conflicts"].as_array().and_then(|cs| {
+                cs.iter()
+                    .find(|c| c["id"] == ui.get_selected_conflict().as_str())
+            });
+            let Some(c) = conflict else {
+                return;
+            };
+            let Some(v) = c["alternatives"]
+                .as_array()
+                .and_then(|vs| vs.iter().find(|v| v["revision"] == revision.as_str()))
+            else {
+                return;
+            };
+            if c["field"] == "content" {
+                ui.set_conflict_preview("Loading and verifying content…".into());
+                submit(
+                    &weak,
+                    &tx,
+                    folder_action(
+                        &ui.get_selected_state(),
+                        json!({"op":"preview-object","object":v["value"]}),
+                    ),
+                );
+            } else {
+                ui.set_conflict_preview(serde_json::to_string_pretty(v).unwrap_or_default().into());
+            }
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let detail = detail.clone();
+        let tx = tx.clone();
+        ui.on_resolve_conflict(move || {
+            let Some(ui) = weak.upgrade() else { return; };
+            submit(&weak, &tx, folder_action(&ui.get_selected_state(), json!({"op":"resolve","conflicts":[ui.get_selected_conflict().as_str()],
+                "revision":ui.get_selected_revision().as_str(),"review_token":detail.borrow()["review_token"]})));
+        });
+    }
+    {
+        let weak = ui.as_weak();
+        let detail = detail.clone();
+        let tx = tx.clone();
+        ui.on_recover_conflict(move |target| {
+            let Some(ui) = weak.upgrade() else { return; };
+            let data = detail.borrow();
+            if !data["conflicts"].as_array().is_some_and(|cs| cs.iter().any(|c| c["id"] == ui.get_selected_conflict().as_str())) { return; }
+            // Namespace alternatives carry entry locations; use the selected
+            // revision's event to identify the affected entity in the backend.
+            submit(&weak, &tx, folder_action(&ui.get_selected_state(), json!({"op":"recover","conflicts":[ui.get_selected_conflict().as_str()],
+                "entity":ui.get_selected_entity().as_str(),"revision":ui.get_selected_revision().as_str(),"target":target.as_str(),"review_token":data["review_token"]})));
+        });
+    }
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
     let mut previous_peers = Vec::new();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
         let Some(ui) = weak.upgrade() else { return; };
+        *watched.lock().unwrap() = (ui.get_dialog() == "folder").then(|| ui.get_selected_state().to_string());
         while let Ok((action, interactive, result)) = out.try_recv() {
             if interactive { ui.set_busy(false); }
             match result {
@@ -313,6 +553,31 @@ pub fn run(config_path: &Path) -> Result<()> {
                 }
                 Ok(value) => {
                     let message = match action {
+                        Action::Folder { ref state, ref payload, .. } => {
+                            if state != ui.get_selected_state().as_str() { continue; }
+                            match payload["op"].as_str() {
+                                Some("status") => ui.set_folder_summary(folder_summary(&json!({"status":value})).into()),
+                                Some("folder-details") => {
+                                    ui.set_folder_summary(folder_summary(&value).into());
+                                    ui.set_conflict_count(value["conflict_count"].as_i64().unwrap_or(0) as i32);
+                                    ui.set_conflict_offset(value["offset"].as_i64().unwrap_or(0) as i32);
+                                    let conflicts = value["conflicts"].as_array().into_iter().flatten().filter(|c| c["resolved_by"].is_null()).flat_map(|c| {
+                                        c["entity"].as_str().unwrap_or_default().split(',').map(|entity| ConflictRow {
+                                            id:c["id"].as_str().unwrap_or_default().into(), entity:entity.into(),
+                                            field:c["field"].as_str().unwrap_or_default().into(),
+                                            description:format!("{} · {}",value["paths"][entity].as_str().unwrap_or(entity),c["field"].as_str().unwrap_or_default()).into(),
+                                        }).collect::<Vec<_>>()
+                                    }).collect::<Vec<_>>();
+                                    ui.set_conflicts(ModelRc::new(VecModel::from(conflicts)));
+                                    ui.set_selected_conflict("".into()); ui.set_selected_revision("".into());
+                                    ui.set_revisions(ModelRc::default()); ui.set_conflict_preview("Select a conflict to review its alternatives.".into());
+                                    *detail.borrow_mut() = value;
+                                }
+                                Some("preview-object") => ui.set_conflict_preview(format!("{} bytes{}\n\n{}",value["size"],if value["truncated"] == true { " (preview truncated)" } else { "" },value["text"].as_str().unwrap_or_default()).into()),
+                                _ => {}
+                            }
+                            "Folder details updated."
+                        }
                         Action::List => {
                             ui.set_connected(true);
                             let next_rows = folder_rows(&value);
@@ -327,7 +592,7 @@ pub fn run(config_path: &Path) -> Result<()> {
                                 ui.set_status(failures.join("\n").into());
                                 continue;
                             }
-                            "Folders are up to date."
+                            "Folder list refreshed."
                         }
                         Action::Peers => {
                             let peers = peer_rows(&value);
