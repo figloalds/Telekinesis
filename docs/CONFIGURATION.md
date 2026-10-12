@@ -23,7 +23,7 @@ sync_interval_ms = 500
 | `default_mount_directory` | Parent for automatically assigned mount paths. |
 | `maximum_running` | Maximum supervised workers, 1–64; default 8. |
 | `network.listen` | Plain WS bind address. Default `127.0.0.1:43180`. Use `""` to disable inbound networking, or `"0.0.0.0:43180"` to bind all IPv4 interfaces. |
-| `network.connections` | Default persistent connections per paired peer, 1–16; default 4. |
+| `network.connections` | Requested total persistent connections per peer, 1–16; default 4. Effective minimum 2: one reserved control/event lane plus at least one bulk lane. |
 | `network.sync_interval_ms` | Delay between sync passes, 50–60000 ms; default 500. |
 
 Restart the daemon after editing TOML. Folder mount changes and pairing changes

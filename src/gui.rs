@@ -28,6 +28,7 @@ fn folder_rows(value: &Value) -> Vec<FolderRow> {
             label: p["label"].as_str().unwrap_or_default().into(),
             mount: p["mount"].as_str().unwrap_or_default().into(),
             running: p["running"] == true,
+            starting: p["starting"] == true,
             error: p["error"].as_str().unwrap_or_default().into(),
         })
         .collect()
@@ -348,10 +349,10 @@ pub fn run(config_path: &Path) -> Result<()> {
                             ui.set_remote_folders(ModelRc::new(VecModel::from(remotes)));
                             "Remote folders loaded."
                         }
-                        Action::Create { .. } => { ui.set_dialog("".into()); "Folder created and mounted." }
-                        Action::Receive { .. } => { ui.set_dialog("".into()); "Remote folder received and mounted." }
+                        Action::Create { .. } => { ui.set_dialog("".into()); "Folder created. Starting filesystem…" }
+                        Action::Receive { .. } => { ui.set_dialog("".into()); "Remote folder added. Starting filesystem…" }
                         Action::ConfigureMount { .. } => { ui.set_dialog("".into()); "Mount point saved. Start the folder when you're ready." }
-                        Action::Start { .. } => "Folder started.",
+                        Action::Start { .. } => "Folder startup requested.",
                         Action::Stop { .. } => {
                             if ui.get_dialog() == "stop-first" { ui.set_dialog("mount".into()); }
                             "Folder stopped."

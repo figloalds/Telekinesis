@@ -73,7 +73,18 @@ impl Node {
         orchestrator::client(&self.config, &action)
     }
     fn call(&self, action: Action) -> Value {
-        self.try_call(action).unwrap()
+        let result = self.try_call(action).unwrap();
+        if result["starting"] == true {
+            let state = result["state"].as_str().unwrap().to_owned();
+            wait_for(|| {
+                self.try_call(Action::Inspect {
+                    state: state.clone(),
+                })
+                .is_ok_and(|p| p["running"] == true)
+            });
+            return self.try_call(Action::Inspect { state }).unwrap();
+        }
+        result
     }
     fn endpoint(&self) -> String {
         let d: Value = serde_json::from_slice(
@@ -167,7 +178,15 @@ fn wait_for(mut predicate: impl FnMut() -> bool) {
     }
 }
 fn has(p: &Value, name: &str, bytes: &[u8]) -> bool {
-    let Ok(state) = runtime::rpc(&info(p), &id(), json!({"op":"state"})) else {
+    let Ok(bytes_discovery) =
+        fs::read(Path::new(p["directory"].as_str().unwrap()).join("runtime.json"))
+    else {
+        return false;
+    };
+    let Ok(discovery) = serde_json::from_slice(&bytes_discovery) else {
+        return false;
+    };
+    let Ok(state) = runtime::rpc(&discovery, &id(), json!({"op":"state"})) else {
         return false;
     };
     state["entries"].as_object().is_some_and(|entries| {
@@ -286,6 +305,140 @@ fn pairing_code_only_rotation_invalidates_persistent_connections_and_rejects_leg
 }
 
 #[test]
+fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
+    let a = Node::new();
+    let b = Node::new();
+    let broken = a.create("A broken", true);
+    let healthy = a.create("Z healthy", true);
+    let bytes = b"repairable object";
+    write(&broken, "repair.txt", bytes);
+    let object = Path::new(broken["directory"].as_str().unwrap())
+        .join("objects")
+        .join(hash(bytes));
+    fs::write(&object, b"corrupt").unwrap();
+    b.call(Action::Pair {
+        endpoint: a.endpoint(),
+        code: a.code(),
+        connections: Some(2),
+    });
+    let broken_b = b.receive(&a, &broken);
+    let healthy_b = b.receive(&a, &healthy);
+    let repo = broken["repo"].as_str().unwrap();
+    wait_for(|| {
+        let peers = b.call(Action::Peers);
+        let lane = &peers[0]["lanes"][1];
+        lane["connected"] == true
+            && lane["repositories"][repo]["error"]
+                .as_str()
+                .is_some_and(|e| {
+                    e.contains("REMOTE_SYNC_EXCHANGE_FAILED") && e.contains("CORRUPT_OBJECT")
+                })
+    });
+    write(&healthy, "forward.txt", b"unblocked forward");
+    write(&healthy_b, "reverse.txt", b"unblocked reverse");
+    wait_for(|| {
+        has(&healthy_b, "forward.txt", b"unblocked forward")
+            && has(&healthy, "reverse.txt", b"unblocked reverse")
+    });
+    let peers = b.call(Action::Peers);
+    let lane = &peers[0]["lanes"][1];
+    assert_eq!(lane["connected"], true);
+    assert!(lane["error"].is_null());
+    assert!(
+        lane["repositories"][repo]["consecutive_failures"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(lane["repositories"][repo]["retry_at_ms"].is_u64());
+    fs::write(&object, bytes).unwrap();
+    wait_for(|| has(&broken_b, "repair.txt", bytes));
+    wait_for(|| b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["caught_up"] == true);
+
+    // A local offer failure must also leave the other folder and peer socket usable.
+    let state = broken["state"].as_str().unwrap().to_owned();
+    a.call(Action::Stop {
+        state: state.clone(),
+    });
+    let local_bytes = b"local unsent object";
+    write(&broken_b, "local-repair.txt", local_bytes);
+    let local_object = Path::new(broken_b["directory"].as_str().unwrap())
+        .join("objects")
+        .join(hash(local_bytes));
+    fs::write(&local_object, b"corrupt").unwrap();
+    a.call(Action::Start { state });
+    wait_for(|| {
+        b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("LOCAL_SYNC_OFFER_FAILED"))
+    });
+    write(&healthy, "still.txt", b"healthy during local failure");
+    wait_for(|| has(&healthy_b, "still.txt", b"healthy during local failure"));
+    fs::write(&local_object, local_bytes).unwrap();
+    wait_for(|| has(&broken, "local-repair.txt", local_bytes));
+    wait_for(|| {
+        let peers = b.call(Action::Peers);
+        let status = &peers[0]["lanes"][1]["repositories"][repo];
+        status["caught_up"] == true
+            && status["error"].is_null()
+            && status["retry_at_ms"].is_null()
+            && status["consecutive_failures"] == 0
+    });
+}
+
+#[test]
+fn unavailable_worker_does_not_fail_remote_discovery_and_reports_its_error() {
+    let a = Node::new();
+    let b = Node::new();
+    let unavailable = a.create("A unavailable", true);
+    let healthy = a.create("Z healthy", true);
+    b.pair(&a, &a.code());
+    let path = Path::new(unavailable["directory"].as_str().unwrap()).join("runtime.json");
+    let original = fs::read(&path).unwrap();
+    let mut discovery = info(&unavailable);
+    discovery.address = "ws://127.0.0.1:0".into();
+    fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
+    let result = b.try_call(Action::RemoteList {
+        endpoint: a.endpoint(),
+    });
+    let inspected = a.call(Action::Inspect {
+        state: unavailable["state"].as_str().unwrap().into(),
+    });
+    fs::write(&path, original).unwrap();
+    let published = result.unwrap();
+    assert!(
+        published
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["repo"] == healthy["repo"])
+    );
+    assert!(
+        !published
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["repo"] == unavailable["repo"])
+    );
+    assert!(
+        inspected["publication_error"]
+            .as_str()
+            .unwrap()
+            .contains("PUBLISHED_SUMMARY_FAILED")
+    );
+    wait_for(|| {
+        let published = b.call(Action::RemoteList {
+            endpoint: a.endpoint(),
+        });
+        published.as_array().unwrap().len() == 2
+            && a.call(Action::Inspect {
+                state: unavailable["state"].as_str().unwrap().into(),
+            })["publication_error"]
+                .is_null()
+    });
+}
+
+#[test]
 fn three_orchestrators_relay_origins_and_private_branches_stay_local() {
     let a = Node::new();
     let b = Node::new();
@@ -348,6 +501,33 @@ fn real_mount_can_write_stop_reconfigure_and_remount() {
 }
 
 #[test]
+fn startup_returns_observable_state_and_can_be_cancelled() {
+    let node = Node::new();
+    let folder = node
+        .try_call(Action::Create {
+            label: "Cancellable".into(),
+            mount: None,
+            headless: true,
+        })
+        .unwrap();
+    assert_eq!(folder["starting"], true);
+    assert_eq!(folder["running"], false);
+    assert!(folder["startup_phase"].is_string());
+    let state = folder["state"].as_str().unwrap().to_owned();
+    let stopped = node
+        .try_call(Action::Stop {
+            state: state.clone(),
+        })
+        .unwrap();
+    assert_eq!(stopped["starting"], false);
+    assert_eq!(stopped["running"], false);
+    assert_eq!(stopped["desired_running"], false);
+    assert_eq!(stopped["startup_phase"], Value::Null);
+    node.try_call(Action::ConfigureMount { state, mount: None })
+        .unwrap();
+}
+
+#[test]
 fn v2_configuration_uses_ordinary_paths_and_does_not_accept_credential_configuration() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("orchestrator.toml");
@@ -404,4 +584,170 @@ fn large_pages_resume_after_daemon_crash_and_server_restart_keeps_its_verifier()
     });
     write(&pb, "after-restart.txt", b"same code, same repository");
     wait_for(|| has(&pa, "after-restart.txt", b"same code, same repository"));
+}
+
+#[test]
+fn pairing_refuses_a_peer_that_does_not_reserve_lanes() {
+    let node = Node::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let mut socket = ws::accept(listener.accept().unwrap().0).unwrap();
+        let hello: Value = ws::receive(&mut socket).unwrap();
+        assert_eq!(hello["lane"], "control");
+        ws::reply(&mut socket, Ok(json!({"installation":id(),"version":2}))).unwrap();
+    });
+    let error = node
+        .try_call(Action::Pair {
+            endpoint,
+            code: "test".into(),
+            connections: None,
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("RESERVED_LANES_UNSUPPORTED"));
+    assert_eq!(node.call(Action::Peers), json!([]));
+    server.join().unwrap();
+}
+
+#[test]
+fn reserved_connection_delivers_events_while_bulk_is_blocked() {
+    use std::{
+        net::TcpListener,
+        sync::{Arc, Mutex, mpsc},
+    };
+    use tkfs::{
+        core::Store,
+        paired_sync::{self, SyncPage, SyncRoute},
+        runtime::Engine,
+    };
+
+    let mut node = Node::new();
+    let project = node.create("Reserved lane", true);
+    write(&project, "content.bin", &vec![3; 2 * 1024 * 1024]);
+    let remote_root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(Mutex::new(Engine::new(
+        Store::initialize(remote_root.path(), project["repo"].as_str().unwrap(), &id()).unwrap(),
+    )));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let server_remote = remote.clone();
+    let server =
+        thread::spawn(move || {
+            let installation = id();
+            let mut handlers = Vec::new();
+            // One pairing probe, then one reserved and one bulk connection even
+            // though the caller requested a pool of one.
+            for _ in 0..3 {
+                let (tcp, _) = listener.accept().unwrap();
+                let remote = server_remote.clone();
+                let installation = installation.clone();
+                let blocked = blocked_tx.clone();
+                let release = release_rx.clone();
+                handlers.push(thread::spawn(move || {
+                    let mut socket = ws::accept(tcp).unwrap();
+                    let hello: Value = ws::receive(&mut socket).unwrap();
+                    let role = hello["lane"].as_str().unwrap_or("probe");
+                    ws::reply(
+                        &mut socket,
+                        Ok(json!({"installation":installation,"version":2,"lane":hello["lane"]})),
+                    )
+                    .unwrap();
+                    let mut stalled = false;
+                    while let Ok(request) = ws::receive::<Value>(&mut socket) {
+                        if role == "bulk" && request["op"] == "exchange" && !stalled {
+                            blocked.send(()).unwrap();
+                            release
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(15))
+                                .unwrap();
+                            stalled = true;
+                        }
+                        let mut engine = remote.lock().unwrap();
+                        let response =
+                            match request["op"].as_str().unwrap() {
+                                "list" => {
+                                    assert_eq!(role, "control");
+                                    json!([paired_sync::summary(&engine).unwrap()])
+                                }
+                                "ping" => json!({"alive":true}),
+                                "exchange" => {
+                                    let page: SyncPage =
+                                        serde_json::from_value(request["page"].clone()).unwrap();
+                                    if role == "control" {
+                                        assert!(page.bundle.objects.is_empty());
+                                        assert!(page.object_parts.is_empty());
+                                    }
+                                    let route = SyncRoute {
+                                        peer: hello["installation"].as_str().unwrap().into(),
+                                        repo: engine.store.repo.clone(),
+                                        local_replica: engine.store.device.clone(),
+                                        remote_replica: page.sender.clone(),
+                                    };
+                                    paired_sync::worker_control(&mut engine, &json!({
+                                "op":"published-exchange","route":route,"page":page,
+                                "metadata_only":role == "control","max_frame":4*1024*1024
+                            })).unwrap()
+                                }
+                                other => panic!("unexpected request {other}"),
+                            };
+                        drop(engine);
+                        if ws::reply(&mut socket, Ok(response)).is_err() {
+                            break;
+                        }
+                    }
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+    let paired = node.call(Action::Pair {
+        endpoint,
+        code: "test".into(),
+        connections: Some(1),
+    });
+    assert_eq!(paired["connections"], 2);
+    blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    rpc(&project, json!({"op":"mkdir","path":"during-bulk-stall"}));
+    // An event created after the bulk exchange was blocked must arrive before
+    // release. It causally depends on the file write, so SQLite stages it until
+    // the bulk lane supplies the missing content; transport is still independent.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let delivered: bool = remote.lock().unwrap().store.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM incoming_events WHERE payload LIKE '%during-bulk-stall%')",
+            [], |row| row.get(0),
+        ).unwrap();
+        if delivered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control lane starved by bulk transfer"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(remote.lock().unwrap().store.lookup("content.bin").is_err());
+    let peers = node.call(Action::Peers);
+    assert_eq!(peers[0]["reserved_connections"], 1);
+    assert_eq!(peers[0]["configured_connections"], 1);
+    assert_eq!(peers[0]["lanes"][0]["role"], "control");
+    assert_eq!(peers[0]["lanes"][1]["role"], "bulk");
+    assert!(peers[0]["lanes"][0]["exchanges"].as_u64().unwrap() > 0);
+    release_tx.send(()).unwrap();
+    wait_for(|| remote.lock().unwrap().store.lookup("content.bin").is_ok());
+    wait_for(|| {
+        remote
+            .lock()
+            .unwrap()
+            .store
+            .lookup("during-bulk-stall")
+            .is_ok()
+    });
+    node.stop();
+    server.join().unwrap();
 }

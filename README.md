@@ -16,8 +16,10 @@ workers. The orchestrator starts/stops workers, configures mount paths, persists
 its folder catalog, and proxies replication between matching repositories.
 
 Networking runs inside the orchestrator daemon. WebSocket is the only transport,
-with four persistent connections per configured peer by default. Repositories
-are distributed across those connections. Requests carry local changes and
+with four persistent connections per configured peer by default. Lane 0 is
+reserved for discovery, events, and replication state; file content uses the
+other three lanes. Repositories are distributed across the bulk lanes, while
+the reserved lane visits all repositories. Requests carry local changes and
 responses carry remote changes, so an outbound-only orchestrator can both send
 and receive. Multiple peers and relayed replica origins are supported.
 
@@ -95,6 +97,17 @@ one folder changes its desired state. Open handles or pending writes can prevent
 an orderly stop. Failed worker starts remain visible in `manage list` with their
 log path; the daemon retries desired-running workers.
 
+Folder startup is asynchronous. Create, receive and start return with
+`starting: true`; poll `manage inspect STATE_ID` for `running: true` before
+accessing the mount or worker API. The desktop displays **Starting** and allows
+cancellation. `startup_phase` reports the latest recovery work.
+
+Workers have 30 seconds to report startup progress. Real recovery work renews
+this allowance, so large journal replays can finish without a fixed total time
+limit. If progress stops for 30 seconds, the daemon terminates the worker and
+reports the last phase in `WORKER_START_TIMEOUT`. Other folders and management
+requests remain available during recovery.
+
 ## Connect two orchestrators
 
 1. On A, configure `[network].listen` to the desired interface and start the daemon.
@@ -115,7 +128,11 @@ outbound pairing entry. Only running workers appear in the remote folder list.
 A paired orchestrator can discover all running folders and sync shared branches.
 Private branches and checkpoint history remain local.
 
-`manage pair ... --connections 6` selects a pool size. Pairing again updates the
+`manage pair ... --connections 6` selects a total pool size, including one
+reserved connection. A setting of 1 is promoted to 2 so file transfers never
+borrow the reserved lane. Both daemons must support lane negotiation; older
+servers report `RESERVED_LANES_UNSUPPORTED` and need upgrading.
+Pairing again updates the
 saved code/pool. `manage unpair ENDPOINT` removes the local outbound connection.
 `manage reset-pairing-code` replaces the receiving verifier and invalidates
 existing inbound sessions on their next request; reconnecting clients need the

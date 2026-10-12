@@ -154,3 +154,162 @@ fn missing_object_is_not_acked_and_unbound_or_early_ack_cannot_clear_outbox() {
     assert!(paired_sync::worker_control(&mut a,&json!({"op":"published-apply","route":ga,"page":wrong,"request":page.request,"sent":[]})).is_err());
     assert_eq!(a.store.outgoing_unacknowledged().unwrap(), original);
 }
+
+#[test]
+fn reserved_lane_transports_events_without_content_or_rewinding_bulk_cursors() {
+    let (_temp, mut a, mut b, ga, gb) = fixture();
+    write(&mut a, "payload.bin", &vec![7; 2 * 1024 * 1024]);
+    b.store.create("remote-directory", "directory").unwrap();
+    let page: SyncPage = serde_json::from_value(paired_sync::worker_control(
+        &mut a,
+        &json!({"op":"published-offer","route":ga,"metadata_only":true,"max_frame":4*1024*1024}),
+    ).unwrap()).unwrap();
+    assert!(!page.bundle.events.is_empty());
+    assert!(page.bundle.objects.is_empty());
+    assert!(page.object_parts.is_empty());
+    let response: SyncPage = serde_json::from_value(
+        paired_sync::worker_control(
+            &mut b,
+            &json!({"op":"published-exchange","route":gb,"page":page,"metadata_only":true}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(response.bundle.objects.is_empty());
+    assert!(response.object_parts.is_empty());
+    assert!(response.pending_events > 0);
+    for event in page
+        .bundle
+        .events
+        .iter()
+        .filter(|e| !e.objects().is_empty())
+    {
+        assert!(!response.ack.contains(&event.id));
+        assert!(!response.known.contains(&event.id));
+    }
+    let object = hash(&vec![7; 2 * 1024 * 1024]);
+    let offsets = [(object.clone(), 1024)].into_iter().collect();
+    a.store
+        .remember_peer_partials(&ga.remote_replica, &offsets)
+        .unwrap();
+    let sent: BTreeSet<_> = page.bundle.events.iter().map(|e| e.id.clone()).collect();
+    let result = paired_sync::worker_control(
+        &mut a,
+        &json!({
+            "op":"published-apply","route":ga,"page":response,"request":page.request,
+            "sent":sent,"metadata_only":true
+        }),
+    )
+    .unwrap();
+    assert_eq!(result["caught_up"], false);
+    assert!(a.store.lookup("remote-directory").is_ok());
+    assert_eq!(
+        a.store.peer_partial_objects(&ga.remote_replica).unwrap(),
+        offsets
+    );
+
+    // Clear the synthetic cursor, then let the bulk transport finish normally.
+    a.store
+        .remember_peer_partials(&ga.remote_replica, &Default::default())
+        .unwrap();
+    for _ in 0..4 {
+        roundtrip(&mut a, &mut b, &ga, &gb);
+    }
+    assert_eq!(
+        b.store.read_object(&object).unwrap(),
+        vec![7; 2 * 1024 * 1024]
+    );
+    assert_eq!(a.store.outgoing_unacknowledged().unwrap(), 0);
+}
+
+#[test]
+fn reserved_lane_rejects_bulk_before_applying_events() {
+    let (_temp, mut a, mut b, ga, gb) = fixture();
+    write(&mut a, "file", b"bulk payload");
+    let page = paired_sync::offer(&a, &ga, None).unwrap();
+    assert!(!page.bundle.objects.is_empty());
+    let error = paired_sync::worker_control(
+        &mut b,
+        &json!({
+            "op":"published-exchange","route":gb,"page":page,"metadata_only":true
+        }),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("BULK_ON_CONTROL_LANE"));
+    assert!(b.store.lookup("file").is_err());
+}
+
+#[test]
+fn apply_requires_an_explicit_valid_request_binding() {
+    let (_temp, mut a, mut b, ga, gb) = fixture();
+    write(
+        &mut b,
+        "remote.txt",
+        b"must not be applied without a request",
+    );
+    let page = paired_sync::offer(&b, &gb, None).unwrap();
+    let before = a.store.events().unwrap();
+    for request in [
+        serde_json::Value::Null,
+        json!(42),
+        json!("not-a-uuid"),
+        json!(id()),
+    ] {
+        assert!(
+            paired_sync::worker_control(
+                &mut a,
+                &json!({
+                    "op":"published-apply", "route":ga, "page":page,
+                    "request":request, "sent":[]
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(a.store.events().unwrap(), before);
+    }
+}
+
+#[test]
+fn invalid_inventory_cannot_apply_events_or_change_durable_receipts() {
+    let (_temp, mut a, mut b, ga, gb) = fixture();
+    write(&mut a, "local.txt", b"local unacknowledged save");
+    write(&mut b, "remote.txt", b"remote save");
+    let mut page = paired_sync::offer(&b, &gb, None).unwrap();
+    page.known = a.store.shared_event_inventory().unwrap();
+    let before = a.store.events().unwrap();
+    let outbox = a.store.outgoing_unacknowledged().unwrap();
+    let mut malformed_hash = page.clone();
+    malformed_hash.known_objects.insert("invalid".into());
+    let mut malformed_partial = page.clone();
+    malformed_partial
+        .partial_objects
+        .insert("invalid".into(), 0);
+    let mut oversized_partial = page.clone();
+    oversized_partial
+        .partial_objects
+        .insert(hash(b"partial"), MAX_CONTENT + 1);
+    let mut malformed_reply = page;
+    malformed_reply.reply_to = Some("invalid".into());
+    for invalid in [
+        malformed_hash,
+        malformed_partial,
+        oversized_partial,
+        malformed_reply,
+    ] {
+        assert!(paired_sync::receive(&mut a, &ga, &invalid).is_err());
+        assert_eq!(a.store.events().unwrap(), before);
+        assert_eq!(a.store.outgoing_unacknowledged().unwrap(), outbox);
+        assert!(
+            a.store
+                .known_by_peer(&ga.remote_replica)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            a.store
+                .known_objects_by_peer(&ga.remote_replica)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}

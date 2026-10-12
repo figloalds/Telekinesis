@@ -1,5 +1,5 @@
 import { ScrollView, TextEdit, AboutSlint, Palette } from "std-widgets.slint";
-export struct FolderRow { state: string, label: string, mount: string, running: bool, error: string }
+export struct FolderRow { state: string, label: string, mount: string, running: bool, starting: bool, error: string }
 export struct RemoteRow { repo: string, label: string }
 export struct PeerRow { endpoint: string, online: bool }
 global Theme {
@@ -213,15 +213,15 @@ export component AppWindow inherits Window {
                                         Rectangle { width: 118px;
                                           Rectangle { y: (parent.height - 24px) / 2; width: parent.width; height: 24px; border-radius: 12px;
                                             background: folder.error != "" ? #43262a : folder.running ? #12342a : #222a37;
-                                            Label { text: folder.error != "" ? "! Needs attention" : folder.running ? (folder.mount == "" ? "● Headless" : "● Mounted") : "○ Not mounted"; color: folder.error != "" ? #ff9d96 : folder.running ? #5fd0a6 : Theme.muted; font-size: 11px; horizontal-alignment: center; }
+                                            Label { text: folder.starting ? "◌ Starting" : folder.error != "" ? "! Needs attention" : folder.running ? (folder.mount == "" ? "● Headless" : "● Mounted") : "○ Not mounted"; color: folder.error != "" ? #ff9d96 : folder.running ? #5fd0a6 : Theme.muted; font-size: 11px; horizontal-alignment: center; }
                                           }
                                         }
                                         HorizontalLayout { width: 186px; spacing: 6px;
-                                            ActionButton { text: folder.running ? (folder.mount == "" ? "Stop" : "Unmount") : (folder.mount == "" ? "Start" : "Mount"); enabled: root.interactive;
-                                                clicked => { if folder.running { root.stop-folder(folder.state); } else { root.start-folder(folder.state); } }
+                                            ActionButton { text: folder.starting ? "Cancel" : folder.running ? (folder.mount == "" ? "Stop" : "Unmount") : (folder.mount == "" ? "Start" : "Mount"); enabled: root.interactive;
+                                                clicked => { if folder.running || folder.starting { root.stop-folder(folder.state); } else { root.start-folder(folder.state); } }
                                             }
                                             ActionButton { text: "Change path"; enabled: root.interactive;
-                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.mount-path = folder.mount; root.dialog = folder.running ? "stop-first" : "mount"; }
+                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.mount-path = folder.mount; root.dialog = (folder.running || folder.starting) ? "stop-first" : "mount"; }
                                             }
                                         }
                                     }

@@ -25,7 +25,12 @@ def main():
                               capture_output=True, check=check, timeout=25, **flags)
 
     def call(config, *arguments, input=None):
-        return json.loads(run("-f", config, *arguments, input=input).stdout)
+        result = json.loads(run("-f", config, *arguments, input=input).stdout)
+        if isinstance(result, dict) and result.get("starting"):
+            until(lambda: any(p["state"] == result["state"] and p["running"]
+                              for p in call(config, "manage", "list")["folders"]))
+            return json.loads(run("-f", config, "manage", "inspect", result["state"]).stdout)
+        return result
 
     def until(predicate):
         deadline = time.monotonic() + 30

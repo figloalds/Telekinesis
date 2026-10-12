@@ -34,6 +34,31 @@ and hostname verification. Use the same endpoint string for pairing, listing,
 receiving and unpairing. Both schemes use the remote pairing code; there is no
 certificate enrollment or approval step.
 
+`create`, `manage receive`, and `manage start` initiate asynchronous startup.
+Their response can have `starting: true` and `running: false`. Poll
+`manage inspect STATE_ID` until `running: true` before using the mount or
+`runtime.json`; `startup_phase` identifies the current recovery phase. Startup
+allows 30 seconds without progress, renewed by work on the recovery thread.
+`manage stop` also cancels a folder that is still starting.
+
+`manage peers` separates lane connection errors from folder sync errors. Each
+peer reports `connections` (effective total), `configured_connections`, and
+`reserved_connections` (one). Lane 0 has `role: "control"`; other lanes have
+`role: "bulk"`. `--connections 1` creates two connections to preserve the reserve.
+Both endpoints must support reserved lanes; upgrade the remote daemon if pairing
+reports `RESERVED_LANES_UNSUPPORTED`.
+
+Each lane's `repositories` map is keyed by repository ID and reports `caught_up`,
+`last_success_ms`, `error`, `consecutive_failures`, and `retry_at_ms` (Unix
+milliseconds). A connected lane can have a failing folder while other folders
+continue syncing. Failed folders retry with exponential delays from 1 to 30
+seconds; a successful exchange clears the error and retry state. These status
+fields describe the last exchange, not a distributed synchronization barrier.
+
+Remote discovery omits workers whose summaries cannot be read. Their local
+`manage inspect` / `manage list` results expose `publication_error`, which clears
+after a successful discovery pass.
+
 Filesystem commands work with `-C MOUNT` or `--runtime STATE/runtime.json`:
 `status`, `branches`, `conflicts`, `state`, `events`, `history`, `branch NAME`,
 `checkout NAME`, `publish NAME --current-state-only`, `checkpoint -m MESSAGE`,
