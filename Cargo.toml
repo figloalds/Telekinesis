@@ -17,7 +17,7 @@ sha2 = "0.10"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 unicode-normalization = "0.1"
 toml = "0.9"
-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake", "native-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 slint = { version = "=1.17.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2"] }
@@ -30,4 +30,5 @@ slint-build = "=1.17.0"
 libc = "0.2"
 
 [dev-dependencies]
+native-tls = "0.2"
 tempfile = "3.27"

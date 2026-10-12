@@ -281,7 +281,7 @@ fn pairing_code_only_rotation_invalidates_persistent_connections_and_rejects_leg
     });
     assert_eq!(b.call(Action::Peers), json!([]));
     assert!(ws::connect("https://127.0.0.1:1").is_err());
-    assert!(ws::connect("wss://127.0.0.1:1").is_err());
+    assert!(ws::endpoint_uri("wss://localhost:443/sync").is_ok());
     assert!(ws::connect("tcp://127.0.0.1:1").is_err());
 }
 

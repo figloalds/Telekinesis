@@ -1,6 +1,8 @@
 # Validation
 
 The folder-first rewrite was checked on Windows and Ubuntu/WSL on 2026-10-11.
+The reboot results below describe commit `26ab12d`; the outbound WSS follow-up
+has separate results at the end.
 
 ```sh
 cargo check --locked --lib --bin tkfs
@@ -44,3 +46,21 @@ The Windows Slint desktop compiles against the new management API. Physical UI
 interaction, real separate-machine networking, operator reverse proxies and
 unattended installed services are not qualified by these local tests. Test data
 is disposable; no user data/configuration is migrated or deployed by validation.
+
+## Outbound WSS follow-up
+
+On 2026-10-11, `cargo test --locked` passed all 80 Windows tests with no failures
+or ignored tests. Formatting and strict Clippy checks passed, and the public CLI
+harness passed its four-lane bidirectional WS scenario.
+
+The new transport tests cover WS/WSS endpoint validation, persistent WSS messages,
+preserved paths/query strings, rejection of an untrusted server certificate and
+rejection of a hostname mismatch with a trusted test CA. The test connector trusts
+the fixture CA in memory only. These tests do not install certificates or restore
+the retired enrollment, credential storage or ACL mechanisms.
+
+The follow-up Ubuntu/WSL run (`cargo test --locked --lib --test orchestrator
+--test paired_sync --target-dir target/linux-review`) stopped during the OpenSSL
+dependency build because `pkg-config` was unavailable. It did not run the Linux
+tests; install the build prerequisites in the [Linux guide](LINUX.md) before
+repeating it. The earlier reboot's Linux results do not qualify the WSS change.

@@ -284,7 +284,7 @@ export component AppWindow inherits Window {
                 if root.dialog == "connect": VerticalLayout { spacing: 9px;
                     Muted { text: "Pair with another host to browse and receive its shared folders."; }
                     Label { text: "Orchestrator address"; }
-                    Field { placeholder: "ws://host:43180"; text <=> root.endpoint; enabled: !root.busy; edited(_) => { root.remote-changed(); } }
+                    Field { placeholder: "ws://host:43180 or wss://host"; text <=> root.endpoint; enabled: !root.busy; edited(_) => { root.remote-changed(); } }
                     Label { text: "Remote pairing code"; }
                     Field { placeholder: "Enter the code from the remote host"; text <=> root.code; enabled: !root.busy; }
                     HorizontalLayout { spacing: 8px;

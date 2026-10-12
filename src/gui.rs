@@ -88,8 +88,8 @@ fn submit(weak: &slint::Weak<AppWindow>, tx: &mpsc::Sender<Action>, action: Acti
     let invalid = match &action {
         Action::Create { label, .. } => label.trim().is_empty().then_some("Enter a folder name."),
         Action::Pair { endpoint, code, .. } => {
-            if !endpoint.starts_with("ws://") {
-                Some("Enter a WebSocket address, such as ws://host:43180.")
+            if tkfs::ws::endpoint_uri(endpoint).is_err() {
+                Some("Enter a WebSocket address, such as ws://host:43180 or wss://host.")
             } else {
                 code.is_empty()
                     .then_some("Enter the remote host's pairing code.")
@@ -97,8 +97,9 @@ fn submit(weak: &slint::Weak<AppWindow>, tx: &mpsc::Sender<Action>, action: Acti
         }
         Action::RemoteList { endpoint }
         | Action::Receive { endpoint, .. }
-        | Action::Unpair { endpoint } => (!endpoint.starts_with("ws://"))
-            .then_some("Enter a WebSocket address, such as ws://host:43180."),
+        | Action::Unpair { endpoint } => tkfs::ws::endpoint_uri(endpoint)
+            .is_err()
+            .then_some("Enter a WebSocket address, such as ws://host:43180 or wss://host."),
         _ => None,
     };
     if let Some(message) = invalid {

@@ -79,8 +79,16 @@ location / {
 }
 ```
 
-Configure the HTTPS listener/certificates separately. TKFS itself dials only
-`ws://` URLs, including DNS hostnames and IPv6 addresses. If the remote route is
-TLS-only, supply a local WS-to-WSS proxy or tunnel on the dialing host and pair
-to that proxy's `ws://` address. No automatic TLS negotiation or custom certificate
-handling is built into TKFS. Listener exposure and TLS are wholly operator choices.
+Configure the HTTPS listener/certificates separately. The desktop and CLI can
+pair directly with `wss://host` or `wss://host:8443/path` endpoints. WSS defaults
+to port 443 and verifies the certificate chain and hostname using the platform
+trust store; private CA certificates must be trusted by that platform. Plain
+`ws://` endpoints remain supported and default to port 80. Paths and query
+strings are preserved during the WebSocket upgrade. TKFS does not terminate TLS
+on its listener or provide certificate-verification bypasses.
+
+WSS changes transport encryption only. Pairing still uses the receiving daemon's
+code and the same v2 catalog records. TKFS has no certificate installation,
+client-certificate enrollment, pinning, or custom CA-file setting, and never
+modifies the system trust store. TLS proxy configuration and any private CA trust
+are managed outside TKFS.

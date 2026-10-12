@@ -28,10 +28,13 @@ There are no OS credential providers, device certificates, approval ceremonies,
 repository grants, application ACL checks or permission repair. The process
 uses whatever filesystem access the OS already gives it.
 
-TKFS exposes plain `ws://` only. TLS, reverse proxies, access rules and service
-accounts are operator configuration. The client also uses `ws://`; to traverse
-a TLS endpoint, configure a local proxy/tunnel that forwards the client's WS
-connection to that endpoint. TKFS does not load certificates or terminate TLS.
+TKFS accepts outbound `ws://` and `wss://` connections in the desktop and CLI.
+Secure connections verify the server certificate and hostname using the platform
+trust store. The daemon listener remains plain WS; expose it through an
+operator-managed TLS reverse proxy for remote `wss://` access. Listener
+certificates, access rules and service accounts are operator configuration.
+TKFS does not generate or install certificates, enroll devices, or change the
+system trust store. WSS uses the same pairing-code exchange as WS.
 
 ## Build
 
@@ -42,7 +45,9 @@ python scripts/orchestrator_e2e.py --exe target/debug/tkfs.exe
 ```
 
 The CLI harness above uses the Windows executable; select the Linux executable
-on Linux. Windows needs the installed WinFsp SDK/runtime. Linux mounts need `fusermount3`
+on Linux. Windows needs the installed WinFsp SDK/runtime. Linux builds need the
+OpenSSL development libraries and pkg-config; see the [Linux guide](docs/LINUX.md).
+Linux mounts need `fusermount3`
 and `/dev/fuse`; headless workers need neither. `scripts/build.py` builds release
 runnables for Windows and Linux, using WSL for Linux when launched on Windows.
 The Windows desktop opens with `tkfs gui` or no arguments. To assemble a portable

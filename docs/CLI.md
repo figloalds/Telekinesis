@@ -22,11 +22,17 @@ Management lifecycle actions do not require a catalog generation.
 | `manage start STATE_ID` | Persist desired-running and start a worker. |
 | `manage shutdown` | Stop workers and daemon, preserving desired-running. |
 | `manage reset-pairing-code` | Return a new receiving code and persist its salted hash. |
-| `manage pair ws://HOST:PORT [--connections N]` | Read the remote code from stdin; persist and start the connection pool. |
+| `manage pair ENDPOINT [--connections N]` | Read the remote code from stdin; persist and start the connection pool. |
 | `manage peers` | Pool/lane status, without stored pairing codes. |
 | `manage unpair ENDPOINT` | Remove a local outbound pool; does not revoke a remote holder of your code. |
 | `manage remote-list ENDPOINT` | List paired server's running shared repositories. |
 | `manage receive ENDPOINT REPO LABEL [--mount PATH] [--headless]` | Create a same-repository local replica and begin sync. |
+
+`ENDPOINT` accepts `ws://HOST:PORT` or `wss://HOST[:PORT][/PATH]`, including query
+strings. WS defaults to port 80; WSS defaults to 443 and uses platform certificate
+and hostname verification. Use the same endpoint string for pairing, listing,
+receiving and unpairing. Both schemes use the remote pairing code; there is no
+certificate enrollment or approval step.
 
 Filesystem commands work with `-C MOUNT` or `--runtime STATE/runtime.json`:
 `status`, `branches`, `conflicts`, `state`, `events`, `history`, `branch NAME`,

@@ -27,5 +27,9 @@ WinFsp remains a separately installed system prerequisite with its own license.
 The desktop app does not install WinFsp, alter PATH, or configure a service.
 
 The WebSocket transport uses Tungstenite 0.28.0 (MIT OR Apache-2.0),
-https://github.com/snapview/tungstenite-rs, with the handshake feature over plain
-TCP. TKFS has no TLS provider. Cargo.lock records dependency versions/checksums.
+https://github.com/snapview/tungstenite-rs, with handshake and native-tls support.
+The native-tls crate (MIT OR Apache-2.0), https://github.com/sfackler/rust-native-tls,
+uses Schannel on Windows, Security Framework on macOS, and OpenSSL on other
+platforms for secure outbound WebSockets. Cargo.lock records dependency
+versions/checksums. Linux builds with WSS support require the OpenSSL development
+libraries and pkg-config.

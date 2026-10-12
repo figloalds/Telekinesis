@@ -1,7 +1,13 @@
 # Linux
 
-Build with `cargo build --locked`. Install the distribution's FUSE 3 runtime and
+Build with `cargo build --locked`; outbound WSS requires the OpenSSL development
+libraries and pkg-config (for example, `libssl-dev` and `pkg-config` on Debian/
+Ubuntu). Install the distribution's FUSE 3 runtime and
 make `/dev/fuse` available for mounting. Headless workers need no FUSE device.
+
+The executable needs the matching OpenSSL runtime libraries. WSS uses the
+distribution's CA trust bundle (commonly supplied by `ca-certificates`). These
+are platform dependencies; TKFS does not install certificates or configure trust.
 
 ```sh
 tkfs init -f ./orchestrator.toml
@@ -16,8 +22,9 @@ OS owner, private directory modes, systemd credentials or a keyring. It does not
 change permissions on backing state/config directories. FUSE's normal kernel
 permission checks and mount-helper policy still apply as configured by the OS.
 
-The daemon, management clients and workers use the same WS protocol on both
-platforms. For service startup, adapt `deploy/tkfs-orchestrator.service.example`;
+The daemon, management clients and workers use the same WebSocket protocol on
+both platforms. Remote dialing supports WS/WSS; local control and the daemon's
+listener use plain WS. For service startup, adapt `deploy/tkfs-orchestrator.service.example`;
 service identity, mount namespaces, paths and network exposure are OS configuration.
 
 `manage shutdown` gracefully stops managed mounts. Standalone workers also handle

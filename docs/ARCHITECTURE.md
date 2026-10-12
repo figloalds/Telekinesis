@@ -11,10 +11,15 @@
 3. **Networking in the daemon.** The same process runs the optional inbound WS
    listener and outbound connection pools. No pairing service or transport
    sidecar is spawned. `ws` owns handshake, message bounds and JSON framing.
+   Outbound pools accept WS or WSS. WSS verifies the server through the platform
+   TLS provider; the inbound listener uses plain WS behind any operator-managed
+   TLS proxy. TKFS does not generate/install certificates or modify system trust.
 4. **Pairing.** The first message supplies protocol version, installation ID
    and pairing code. The server checks its persisted salted verifier. The ID
    identifies a connection; it is not a certificate or credential.
    Code rotation invalidates subsequent operations on existing sessions.
+   This exchange is the same for WS and WSS. The receiving catalog keeps the
+   salted verifier; dialing peers keep the remote code as ordinary catalog data.
 5. **Replication.** The client lists running remote repositories, finds local
    matches, and shards repositories across persistent connection lanes. Each
    lane proxies bounded offer/exchange/apply pages to its local worker. Server

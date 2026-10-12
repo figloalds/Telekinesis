@@ -161,7 +161,7 @@ enum ManagementCommand {
     },
     Shutdown,
     ResetPairingCode,
-    /// Pair to ws://host:port. Reads the remote code from stdin.
+    /// Pair to ws://host:port or wss://host. Reads the remote code from stdin.
     Pair {
         endpoint: String,
         #[arg(long)]

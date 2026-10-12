@@ -6,5 +6,8 @@
 - [Linux](LINUX.md): building and running headless or FUSE workers.
 - [Validation](VALIDATION.md): reproducible checks and remaining limitations.
 
-The previous O1, protected-credential, TLS/WSS and desktop enrollment designs
-are retired. They are available through Git history rather than active guides.
+The reboot retired O1 catalogs, protected credential storage, application-managed
+certificates, the separate pairing service and desktop enrollment. Their designs
+are available through Git history rather than active guides. Current outbound
+WSS uses platform TLS verification and the same code-only pairing as WS; it does
+not restore those mechanisms.
