@@ -426,9 +426,192 @@ impl Store {
     }
     pub fn object_size(&self, object: &str) -> Result<u64> {
         valid_object(object)?;
+        if let Some(size) = self
+            .db
+            .query_row(
+                "SELECT size FROM object_sizes WHERE hash=?",
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return Ok(size);
+        }
         Ok(fs::metadata(self.root.join("objects").join(object))
             .map_err(object_error)?
             .len())
+    }
+    pub fn remember_object_size(&self, object: &str, size: u64) -> Result<()> {
+        valid_object(object)?;
+        ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
+        let old: Option<u64> = self
+            .db
+            .query_row(
+                "SELECT size FROM object_sizes WHERE hash=?",
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(old.is_none_or(|old| old == size), "OBJECT_SIZE_CHANGED");
+        self.db.execute(
+            "INSERT OR IGNORE INTO object_sizes VALUES(?,?)",
+            params![object, size],
+        )?;
+        Ok(())
+    }
+    pub fn object_available(&self, object: &str) -> bool {
+        valid_object(object).is_ok()
+            && fs::metadata(self.root.join("objects").join(object)).is_ok_and(|m| {
+                m.is_file() && self.object_size(object).is_ok_and(|size| size == m.len())
+            })
+    }
+    pub fn request_object(&self, object: &str) -> Result<()> {
+        valid_object(object)?;
+        ensure!(
+            self.events()?.iter().any(|e| e.objects().contains(object)),
+            "UNREFERENCED_OBJECT"
+        );
+        self.db.execute("INSERT INTO object_requests VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET requested_ms=excluded.requested_ms", params![object, time()])?;
+        Ok(())
+    }
+    pub fn wanted_objects(&self) -> Result<BTreeSet<String>> {
+        let requests = self
+            .db
+            .prepare("SELECT hash FROM object_requests ORDER BY requested_ms LIMIT 1024")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(requests
+            .into_iter()
+            .filter(|h| !self.object_available(h))
+            .collect())
+    }
+    pub fn object_state(&self, object: &str) -> Result<Value> {
+        let available = self.object_available(object);
+        let size = self.object_size(object)?;
+        let partial = fs::metadata(self.root.join("incoming-objects").join(object))
+            .ok()
+            .map(|m| m.len());
+        let requested: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM object_requests WHERE hash=?)",
+            [object],
+            |r| r.get(0),
+        )?;
+        let error: Option<String> = self
+            .db
+            .query_row(
+                "SELECT error FROM object_errors WHERE hash=?",
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let state = if available {
+            "available"
+        } else if error.is_some() {
+            "retrying"
+        } else if partial == Some(size) {
+            "verifying"
+        } else if partial.is_some() {
+            "downloading"
+        } else if requested {
+            "queued"
+        } else {
+            "missing"
+        };
+        Ok(
+            json!({"object":object,"size":size,"state":state,"downloaded":partial.unwrap_or(0),"error":if available { None } else { error }}),
+        )
+    }
+    /// Separate connection for bulk I/O. No replay, projection rebuild or engine
+    /// mutex; accepted metadata remains owned by the worker's semantic engine.
+    pub fn transfer_view(&self) -> Result<Self> {
+        let db = Connection::open(self.root.join("metadata.sqlite"))?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        db.execute_batch("PRAGMA synchronous=FULL;")?;
+        Ok(Self {
+            db,
+            root: self.root.clone(),
+            repo: self.repo.clone(),
+            device: self.device.clone(),
+            active: self.active.clone(),
+            generation: self.generation,
+            view_cache: RefCell::new(None),
+        })
+    }
+    pub fn peer_requests(&self, peer: &str) -> Result<BTreeSet<String>> {
+        Ok(self
+            .db
+            .prepare("SELECT hash FROM peer_requests WHERE peer=?")?
+            .query_map([peer], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    pub fn remember_requests(&self, peer: &str, wanted: &BTreeSet<String>) -> Result<()> {
+        let references: BTreeSet<_> = self
+            .events()?
+            .iter()
+            .filter(|e| e.branch.shared)
+            .flat_map(Event::objects)
+            .collect();
+        self.db
+            .execute("DELETE FROM peer_requests WHERE peer=?", [peer])?;
+        for object in wanted.intersection(&references) {
+            self.db.execute(
+                "INSERT OR IGNORE INTO peer_requests VALUES(?,?)",
+                params![peer, object],
+            )?;
+            if !self.object_available(object) {
+                self.request_object(object)?;
+            }
+        }
+        Ok(())
+    }
+    pub fn content_status(&self) -> Result<Value> {
+        let objects: BTreeSet<_> = self
+            .events()?
+            .iter()
+            .filter(|e| e.branch.shared)
+            .flat_map(Event::objects)
+            .collect();
+        let available = self.shared_object_inventory()?;
+        let partial = self.partial_objects()?;
+        let projection = self.projection(&self.active)?;
+        let current: BTreeSet<_> = projection
+            .entries
+            .values()
+            .filter(|e| e.alive)
+            .filter_map(|e| e.content.clone())
+            .collect();
+        let missing = projection
+            .entries
+            .values()
+            .filter(|e| e.alive)
+            .filter_map(|e| e.content.as_ref().map(|object| (e, object)))
+            .filter(|(_, h)| !self.object_available(h))
+            .take(20)
+            .map(|(entry, object)| {
+                let mut state = self.object_state(object)?;
+                let mut path = vec![entry.name.clone()];
+                let mut parent = &entry.parent;
+                let mut seen = BTreeSet::new();
+                while parent != ROOT && seen.insert(parent.clone()) {
+                    let Some(e) = projection.entries.get(parent) else {
+                        break;
+                    };
+                    path.push(e.name.clone());
+                    parent = &e.parent;
+                }
+                path.reverse();
+                state["path"] = json!(path.join("/"));
+                Ok(state)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let present = current.iter().filter(|h| self.object_available(h)).count();
+        Ok(
+            json!({"items":missing,"current_objects":current.len(),"current_available":present,
+            "current_missing":current.len()-present,"shared_objects":objects.len(),
+            "shared_available":objects.intersection(&available).count(),"downloading":partial.len(),
+            "partial_bytes":partial.values().sum::<u64>(),"complete":objects.is_subset(&available),
+            "requested":self.wanted_objects()?.len()}),
+        )
     }
     pub fn open_object(&self, object: &str) -> Result<fs::File> {
         valid_object(object)?;
@@ -760,8 +943,30 @@ impl Store {
             ensure!(old == payload, "EVENT_ID_REUSED");
             return Ok(());
         }
-        for object in event.objects() {
-            self.verify_object(&object)?;
+        let objects = event.objects();
+        ensure!(
+            event.object_sizes.keys().all(|h| objects.contains(h)),
+            "UNREFERENCED_OBJECT_SIZE"
+        );
+        for object in &objects {
+            valid_object(object)?;
+            if let Some(size) = event.object_sizes.get(object) {
+                ensure!(*size <= MAX_CONTENT, "FILE_TOO_LARGE");
+                if let Ok(old) = self.object_size(object) {
+                    ensure!(old == *size, "OBJECT_SIZE_CHANGED");
+                }
+            }
+            // Newly authored bytes must exist; metadata decisions may refer to
+            // previously accepted, currently unavailable revisions.
+            if local
+                && !self.db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM object_references WHERE hash=?)",
+                    [object],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                self.verify_object(object)?;
+            }
         }
         let mut seen = BTreeSet::new();
         for change in &event.changes {
@@ -828,6 +1033,30 @@ impl Store {
         }
         fault("before_sql");
         let tx = self.db.savepoint()?;
+        for object in &objects {
+            tx.execute(
+                "INSERT OR IGNORE INTO object_references VALUES(?)",
+                [object],
+            )?;
+        }
+        for (object, size) in &event.object_sizes {
+            tx.execute(
+                "INSERT OR IGNORE INTO object_sizes VALUES(?,?)",
+                params![object, size],
+            )?;
+        }
+        // Explicit content authorship/publication grants sharing. A resolution
+        // of an inbound hash alone must not expose private-only local bytes.
+        if local && event.branch.shared && event.reviewed.is_empty() {
+            for object in &objects {
+                if self.root.join("objects").join(object).is_file() {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO published_objects VALUES(?)",
+                        [object],
+                    )?;
+                }
+            }
+        }
         tx.execute(
             "INSERT OR IGNORE INTO branches VALUES(?,?,?)",
             params![event.branch.id, event.branch.name, event.branch.shared],
@@ -1265,7 +1494,14 @@ impl Store {
                     .collect::<rusqlite::Result<Vec<String>>>()
             })
             .expect("CAUSAL_FRONTIER_UNAVAILABLE");
+        let object_sizes = changes
+            .iter()
+            .filter(|c| c.field == "content")
+            .filter_map(|c| c.value.as_str())
+            .filter_map(|h| self.object_size(h).ok().map(|size| (h.to_owned(), size)))
+            .collect();
         Event {
+            object_sizes,
             id: id(),
             repo: self.repo.clone(),
             branch: branch.clone(),
@@ -1595,11 +1831,6 @@ impl Store {
         let b = self.branch(branch)?;
         let p = self.projection(&b.id)?;
         ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
-        for e in p.entries.values().filter(|e| e.alive) {
-            if let Some(h) = &e.content {
-                self.verify_object(h)?;
-            }
-        }
         let generation = self.generation + 1;
         let tx = self.db.savepoint()?;
         tx.execute("UPDATE config SET value=? WHERE key='active'", [&b.id])?;
@@ -1827,7 +2058,6 @@ impl Store {
                 });
             }
             if let Some(h) = &entry.content {
-                self.verify_object(h)?;
                 changes.push(Change {
                     entity: entry.id.clone(),
                     field: "content".into(),
@@ -1891,8 +2121,10 @@ impl Store {
             .collect();
         // Authorization starts with shared semantic events, never the object dir.
         let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
+        let available = self.shared_object_inventory()?;
         let objects = hashes
             .into_iter()
+            .filter(|h| available.contains(h))
             .map(|h| Ok((h.clone(), hex::encode(self.read_object(&h)?))))
             .collect::<Result<_>>()?;
         Ok(Bundle {
@@ -2029,7 +2261,6 @@ impl Store {
                 .filter(|(e, error)| error.is_some() && !committed.contains(&e.id))
                 .map(|(e, _)| e.id.clone())
                 .collect();
-            let authorized = self.shared_object_inventory()?;
             let mut progress = false;
             for (e, error) in &staged {
                 crate::startup::progress("recovering incoming events");
@@ -2039,7 +2270,6 @@ impl Store {
                 let links = validate_incoming_links(e, &known, &quarantined, &committed);
                 let result = match links {
                     Err(error) => Err(error),
-                    Ok(()) if !e.objects().iter().all(|h| authorized.contains(h)) => continue,
                     Ok(())
                         if !e
                             .dependencies
@@ -2076,19 +2306,17 @@ impl Store {
         Ok(accepted)
     }
     pub fn shared_object_inventory(&self) -> Result<BTreeSet<String>> {
-        let mut inventory: BTreeSet<_> = self
-            .events()?
-            .iter()
-            .filter(|e| e.branch.shared)
-            .flat_map(Event::objects)
-            .collect();
-        inventory.extend(
-            self.db
-                .prepare("SELECT hash FROM received_shared_objects")?
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        );
-        Ok(inventory)
+        let candidates = self
+            .db
+            .prepare(
+                "SELECT hash FROM published_objects UNION SELECT hash FROM received_shared_objects",
+            )?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(candidates
+            .into_iter()
+            .filter(|h| self.object_available(h))
+            .collect())
     }
     pub fn known_objects_by_peer(&self, peer: &str) -> Result<BTreeSet<String>> {
         Ok(self
@@ -2107,7 +2335,7 @@ impl Store {
         Ok(())
     }
     /// Manifests and objects can cross separately. A large atomic root remains
-    /// invisible in incoming_events until every hash has verified provenance.
+    /// visible after causal validation; content availability is tracked separately.
     pub fn shared_page(
         &self,
         known: &BTreeSet<String>,
@@ -2144,13 +2372,15 @@ impl Store {
             used += size;
             events.push(e);
         }
+        let available = self.shared_object_inventory()?;
         let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
         let mut objects = BTreeMap::new();
         for h in hashes
             .into_iter()
-            .filter(|h| include_objects && !known_objects.contains(h))
+            .filter(|h| include_objects && available.contains(h) && !known_objects.contains(h))
         {
-            if self.object_size(&h)? > MAX_FILE as u64 {
+            let length = self.object_size(&h)?;
+            if length > MAX_FILE as u64 || used + length as usize * 2 + h.len() + 8 > budget {
                 continue;
             }
             let bytes = self.read_object(&h)?;
@@ -2195,7 +2425,7 @@ impl Store {
         let outgoing = self.outgoing_unacknowledged()?;
         Ok(
             json!({"repo":self.repo,"device":self.device,"branch":self.branch(&self.active)?,"generation":self.generation,
-            "local_durability":"sqlite-full+verified-objects","outgoing_unacknowledged":outgoing,"incoming_pending":self.db.query_row("SELECT count(*) FROM incoming_events",[],|r|r.get::<_,i64>(0))?,"incoming_quarantined":self.db.query_row("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",[],|r|r.get::<_,i64>(0))?,"peer_protocol":PEER_FORMAT,
+            "content":self.content_status()?,"local_durability":"metadata:sqlite-full; content:per-object","outgoing_unacknowledged":outgoing,"incoming_pending":self.db.query_row("SELECT count(*) FROM incoming_events",[],|r|r.get::<_,i64>(0))?,"incoming_quarantined":self.db.query_row("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",[],|r|r.get::<_,i64>(0))?,"peer_protocol":PEER_FORMAT,
             "caught_up":"unknown-until-peer-roundtrip","pending_causal_events":p.pending,"unresolved_conflicts":self.conflicts()?.iter().filter(|c|c.resolved_by.is_none()).count()}),
         )
     }
@@ -2237,23 +2467,18 @@ pub struct ObjectPart {
 }
 impl Store {
     pub fn partial_objects(&self) -> Result<BTreeMap<String, u64>> {
-        let payloads = self
-            .db
-            .prepare("SELECT payload FROM incoming_events WHERE error IS NULL")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let mut offsets = BTreeMap::new();
-        for payload in payloads {
-            let event: Event = serde_json::from_str(&payload)?;
-            for object in event.objects() {
-                valid_object(&object)?;
-                if let Ok(meta) = fs::metadata(self.root.join("incoming-objects").join(&object)) {
-                    ensure!(meta.len() <= MAX_CONTENT, "FILE_TOO_LARGE");
-                    offsets.insert(object, meta.len());
+        let mut partial = BTreeMap::new();
+        let folder = self.root.join("incoming-objects");
+        if folder.is_dir() {
+            for entry in fs::read_dir(folder)? {
+                let entry = entry?;
+                let object = entry.file_name().to_string_lossy().into_owned();
+                if valid_object(&object).is_ok() && entry.file_type()?.is_file() {
+                    partial.insert(object, entry.metadata()?.len());
                 }
             }
         }
-        Ok(offsets)
+        Ok(partial)
     }
     pub fn peer_partial_objects(&self, peer: &str) -> Result<BTreeMap<String, u64>> {
         let payload: Option<String> = self
@@ -2295,24 +2520,46 @@ impl Store {
         offsets: &BTreeMap<String, u64>,
         budget: usize,
     ) -> Result<BTreeMap<String, ObjectPart>> {
+        self.transfer_parts(
+            page,
+            known,
+            offsets,
+            budget,
+            &self.shared_object_inventory()?,
+            &BTreeSet::new(),
+        )
+    }
+    pub fn transfer_parts(
+        &self,
+        page: &Bundle,
+        known: &BTreeSet<String>,
+        offsets: &BTreeMap<String, u64>,
+        budget: usize,
+        permitted: &BTreeSet<String>,
+        wanted: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, ObjectPart>> {
         let mut parts = BTreeMap::new();
         let mut used = serde_json::to_vec(page)?.len() + 1024;
-        for object in page
-            .events
-            .iter()
-            .flat_map(Event::objects)
-            .collect::<BTreeSet<_>>()
-        {
+        let mut candidates: Vec<_> = self
+            .shared_object_inventory()?
+            .intersection(permitted)
+            .cloned()
+            .collect();
+        candidates.sort_by_key(|h| (!wanted.contains(h), h.clone()));
+        for object in candidates {
             if known.contains(&object) || page.objects.contains_key(&object) {
                 continue;
             }
             let total = self.object_size(&object)?;
-            let offset = offsets.get(&object).copied().unwrap_or(0);
-            ensure!(offset < total, "INVALID_OBJECT_OFFSET");
+            let advertised = offsets.get(&object).copied().unwrap_or(0);
+            ensure!(advertised <= total, "INVALID_OBJECT_OFFSET");
+            // A crash may leave a complete spool before verification/install.
+            // Replay its final byte to trigger finalization without restarting.
+            let offset = advertised.min(total.saturating_sub(1));
             let count = ((budget.saturating_sub(used + 256)) / 2)
                 .min(4 * IO_CHUNK)
                 .min((total - offset) as usize);
-            if count == 0 {
+            if count == 0 && total != 0 {
                 break;
             }
             // Immutable CAS was verified at installation/open; the receiver
@@ -2340,13 +2587,45 @@ impl Store {
         events: &[Event],
         allowed: &BTreeSet<String>,
     ) -> Result<()> {
+        let completed = self.receive_parts_data(parts, events, allowed)?;
+        self.register_received(&completed)
+    }
+    pub fn register_received(&self, completed: &[(String, u64)]) -> Result<()> {
+        for (object, size) in completed {
+            self.remember_object_size(object, *size)?;
+            self.db.execute(
+                "INSERT OR IGNORE INTO received_shared_objects VALUES(?)",
+                [object],
+            )?;
+            self.db
+                .execute("DELETE FROM object_requests WHERE hash=?", [object])?;
+            self.db
+                .execute("DELETE FROM object_errors WHERE hash=?", [object])?;
+        }
+        Ok(())
+    }
+    /// File I/O only: the caller registers completed objects on its serialized
+    /// metadata connection. This avoids SQLite snapshot-upgrade races.
+    pub fn receive_parts_data(
+        &self,
+        parts: BTreeMap<String, ObjectPart>,
+        events: &[Event],
+        allowed: &BTreeSet<String>,
+    ) -> Result<Vec<(String, u64)>> {
+        let mut completed = vec![];
         ensure!(
             events
                 .iter()
                 .all(|e| e.repo == self.repo && e.branch.shared && allowed.contains(&e.device)),
             "UNAUTHORIZED_EVENT"
         );
-        let authorized: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
+        let authorized: BTreeSet<_> = self
+            .events()?
+            .iter()
+            .filter(|e| e.branch.shared)
+            .chain(events.iter())
+            .flat_map(Event::objects)
+            .collect();
         for (object, part) in parts {
             valid_object(&object)?;
             ensure!(authorized.contains(&object), "UNAUTHORIZED_OBJECT");
@@ -2358,9 +2637,12 @@ impl Store {
                 part.total <= MAX_CONTENT && part.hex.len() <= 8 * IO_CHUNK,
                 "INVALID_OBJECT_PART"
             );
+            if let Ok(size) = self.object_size(&object) {
+                ensure!(size == part.total, "OBJECT_SIZE_CHANGED");
+            }
             let bytes = hex::decode(&part.hex)?;
             ensure!(
-                !bytes.is_empty()
+                (!bytes.is_empty() || part.total == 0 && part.offset == 0)
                     && part
                         .offset
                         .checked_add(bytes.len() as u64)
@@ -2376,8 +2658,17 @@ impl Store {
                 .create(true)
                 .truncate(false)
                 .open(&path)?;
-            let length = file.metadata()?.len();
-            ensure!(part.offset <= length, "OBJECT_PART_GAP");
+            let mut length = file.metadata()?.len();
+            if length > part.total {
+                file.set_len(0)?;
+                file.sync_all()?;
+                length = 0;
+            }
+            // A peer may retain a pre-crash resume cursor. Return the current
+            // inventory without accepting a gap; the next bulk page rewinds.
+            if part.offset > length {
+                continue;
+            }
             if part.offset < length {
                 ensure!(
                     part.offset + bytes.len() as u64 <= length,
@@ -2386,30 +2677,38 @@ impl Store {
                 file.seek(SeekFrom::Start(part.offset))?;
                 let mut old = vec![0; bytes.len()];
                 file.read_exact(&mut old)?;
-                ensure!(old == bytes, "OBJECT_PART_CHANGED");
+                if old != bytes {
+                    file.set_len(0)?;
+                    file.sync_all()?;
+                    bail!("OBJECT_PART_CHANGED");
+                }
             } else {
                 file.seek(SeekFrom::Start(length))?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
             }
             if file.metadata()?.len() == part.total {
+                file.sync_all()?;
                 file.rewind()?;
                 if stream_hash(&mut file)? != object {
                     drop(file);
                     fs::remove_file(path)?;
                     bail!("CORRUPT_OBJECT");
                 }
-                file.rewind()?;
-                ensure!(self.put_stream(&mut file)? == object, "CORRUPT_OBJECT");
-                self.db.execute(
-                    "INSERT OR IGNORE INTO received_shared_objects VALUES(?)",
-                    [object],
-                )?;
                 drop(file);
-                fs::remove_file(path)?;
+                let dest = self.root.join("objects").join(&object);
+                if dest.exists() {
+                    self.verify_object(&object)?;
+                    fs::remove_file(&path)?;
+                } else {
+                    install_object(&path, &dest)?;
+                    #[cfg(unix)]
+                    fs::File::open(&folder)?.sync_all()?;
+                }
+                completed.push((object, part.total));
             }
         }
-        Ok(())
+        Ok(completed)
     }
 }
 

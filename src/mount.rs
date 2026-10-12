@@ -125,11 +125,6 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
             .branch(payload["name"].as_str().context("MISSING_ARGUMENT")?)?;
         let p = e.store.projection(&branch.id)?;
         ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
-        for entry in p.entries.values().filter(|e| e.alive) {
-            if let Some(h) = &entry.content {
-                e.store.verify_object(h)?;
-            }
-        }
         e.switching = true;
     }
     // New opens fenced before stopping. No engine mutex during dispatcher stop.
