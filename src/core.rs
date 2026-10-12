@@ -1008,7 +1008,7 @@ impl Store {
         if fast.is_none() && local {
             fast = self.creation_successor(&event)?;
             if fast.is_none() {
-                fast = self.file_namespace_successor(&event)?;
+                fast = self.namespace_successor(&event)?;
             }
         }
         let incremental = fast.is_some();
@@ -1348,9 +1348,12 @@ impl Store {
         p.entries.insert(entity.clone(), entry);
         Ok(Some(p))
     }
-    /// Sequential file placement/deletion, including an atomic replacement,
-    /// introduces no competing cut. Directories/reviews/concurrency use replay.
-    fn file_namespace_successor(&self, event: &Event) -> Result<Option<Projection>> {
+    /// A placement/deletion after the complete frontier adds only the new cut.
+    /// If it preserves a valid namespace, no historical conflict can be added.
+    /// Directory moves preserve descendant entity IDs; empty directory deletes
+    /// are equally safe. Replaying every historical cut here can hold the mounted
+    /// filesystem's engine and WinFsp namespace locks for minutes on IDE cleanup.
+    fn namespace_successor(&self, event: &Event) -> Result<Option<Projection>> {
         if event.device != self.device
             || !event.reviewed.is_empty()
             || !(1..=2).contains(&event.changes.len())
@@ -1395,11 +1398,7 @@ impl Store {
         }
         let mut delta = Projection::default();
         for change in &event.changes {
-            let Some(entry) = current
-                .entries
-                .get(&change.entity)
-                .filter(|e| e.alive && e.kind == "file")
-            else {
+            let Some(entry) = current.entries.get(&change.entity).filter(|e| e.alive) else {
                 return Ok(None);
             };
             let key = register(&change.entity, &change.field);
@@ -1425,15 +1424,47 @@ impl Store {
                 }
                 let occupying = view.slots.get(&(parent.into(), name_key(name)?));
                 if let Some((source, removed)) = replacement {
-                    if source != &entry.id || occupying != Some(removed) {
+                    if source != &entry.id
+                        || occupying != Some(removed)
+                        || entry.kind != "file"
+                        || current.entries[removed].kind != "file"
+                    {
                         return Ok(None);
                     }
                 } else if occupying.is_some_and(|e| e != &entry.id) {
                     return Ok(None);
                 }
+                // Validate here as well as in rename(): snapshot replay and
+                // direct commits also use this path. Cycles need the reducer.
+                if entry.kind == "directory" {
+                    let mut ancestor = parent;
+                    let mut seen = BTreeSet::new();
+                    while ancestor != ROOT {
+                        if ancestor == entry.id || !seen.insert(ancestor) {
+                            return Ok(None);
+                        }
+                        let Some(dir) = current
+                            .entries
+                            .get(ancestor)
+                            .filter(|e| e.alive && e.kind == "directory")
+                        else {
+                            return Ok(None);
+                        };
+                        ancestor = &dir.parent;
+                    }
+                }
                 entry.parent = parent.into();
                 entry.name = name.into();
             } else {
+                // Deleting a parent with live children can suppress their
+                // namespace and create conflicts, even on a sequential event.
+                if current
+                    .entries
+                    .values()
+                    .any(|e| e.alive && e.parent == entry.id)
+                {
+                    return Ok(None);
+                }
                 entry.alive = false;
             }
             entry
