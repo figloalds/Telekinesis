@@ -74,6 +74,15 @@ pub(crate) fn offer_bounded(
     inventory: Option<&SyncPage>,
     maximum: usize,
 ) -> Result<SyncPage> {
+    offer_for_lane(engine, route, inventory, maximum, false)
+}
+fn offer_for_lane(
+    engine: &Engine,
+    route: &SyncRoute,
+    inventory: Option<&SyncPage>,
+    maximum: usize,
+    metadata_only: bool,
+) -> Result<SyncPage> {
     binding(engine, route)?;
     let known = inventory
         .map(|page| Ok(page.known.clone()))
@@ -84,25 +93,30 @@ pub(crate) fn offer_bounded(
     let offsets = inventory
         .map(|page| Ok(page.partial_objects.clone()))
         .unwrap_or_else(|| engine.store.peer_partial_objects(&route.remote_replica))?;
-    let bundle = engine.store.shared_page(
-        &known,
-        &objects,
-        if maximum == MAX_FRAME {
-            MAX_FRAME - 12 * 1024 * 1024
-        } else {
-            maximum / 4
-        },
-    )?;
-    let parts = engine.store.shared_parts(
-        &bundle,
-        &objects,
-        &offsets,
-        if maximum == MAX_FRAME {
-            MAX_FRAME - 8 * 1024 * 1024
-        } else {
-            maximum / 2
-        },
-    )?;
+    let budget = if maximum == MAX_FRAME {
+        MAX_FRAME - 12 * 1024 * 1024
+    } else {
+        maximum / 4
+    };
+    let bundle = if metadata_only {
+        engine.store.shared_metadata_page(&known, budget)?
+    } else {
+        engine.store.shared_page(&known, &objects, budget)?
+    };
+    let parts = if metadata_only {
+        BTreeMap::new()
+    } else {
+        engine.store.shared_parts(
+            &bundle,
+            &objects,
+            &offsets,
+            if maximum == MAX_FRAME {
+                MAX_FRAME - 8 * 1024 * 1024
+            } else {
+                maximum / 2
+            },
+        )?
+    };
     Ok(SyncPage {
         format: PEER_FORMAT,
         repo: engine.store.repo.clone(),
@@ -124,6 +138,20 @@ pub(crate) fn offer_bounded(
     })
 }
 pub fn receive(engine: &mut Engine, route: &SyncRoute, page: &SyncPage) -> Result<Vec<String>> {
+    receive_for_lane(engine, route, page, false)
+}
+fn receive_for_lane(
+    engine: &mut Engine,
+    route: &SyncRoute,
+    page: &SyncPage,
+    metadata_only: bool,
+) -> Result<Vec<String>> {
+    if metadata_only {
+        ensure!(
+            page.bundle.objects.is_empty() && page.object_parts.is_empty(),
+            "BULK_ON_CONTROL_LANE"
+        );
+    }
     binding(engine, route)?;
     ensure!(page.format == PEER_FORMAT, "INCOMPATIBLE_PEER_PROTOCOL");
     ensure!(
@@ -135,11 +163,25 @@ pub fn receive(engine: &mut Engine, route: &SyncRoute, page: &SyncPage) -> Resul
         "REMOTE_REPLICA_BINDING_MISMATCH"
     );
     uuid::Uuid::parse_str(&page.request).context("INVALID_SYNC_REQUEST_ID")?;
+    if let Some(reply_to) = &page.reply_to {
+        uuid::Uuid::parse_str(reply_to).context("INVALID_SYNC_REPLY_ID")?;
+    }
     ensure!(
         page.known.len() <= 100000
             && page.known_objects.len() <= 100000
             && page.partial_objects.len() <= 10000,
         "INVENTORY_TOO_LARGE"
+    );
+    // Validate all advertised inventory before applying events or updating
+    // receipts. A malformed partial must not acknowledge a page that failed.
+    for object in page.known_objects.iter().chain(page.partial_objects.keys()) {
+        valid_object(object)?;
+    }
+    ensure!(
+        page.partial_objects
+            .values()
+            .all(|offset| *offset <= MAX_CONTENT),
+        "FILE_TOO_LARGE"
     );
     // Orchestrators relay events from any replica. Retain the immutable local
     // event check so a relayed page cannot rewrite this replica's history.
@@ -180,12 +222,16 @@ pub fn receive(engine: &mut Engine, route: &SyncRoute, page: &SyncPage) -> Resul
     engine
         .store
         .remember_peer_inventory(&route.remote_replica, &known)?;
-    engine
-        .store
-        .remember_peer_objects(&route.remote_replica, &page.known_objects)?;
-    engine
-        .store
-        .remember_peer_partials(&route.remote_replica, &page.partial_objects)?;
+    // Only the serial bulk lane owns the object cursor. A delayed metadata
+    // response must not rewind a concurrent resumable object transfer.
+    if !metadata_only {
+        engine
+            .store
+            .remember_peer_objects(&route.remote_replica, &page.known_objects)?;
+        engine
+            .store
+            .remember_peer_partials(&route.remote_replica, &page.partial_objects)?;
+    }
     Ok(ack)
 }
 pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
@@ -194,6 +240,7 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
         return Ok(json!(summary(engine)?));
     }
     let route: SyncRoute = serde_json::from_value(payload["route"].clone())?;
+    let metadata_only = payload["metadata_only"].as_bool().unwrap_or(false);
     binding(engine, &route)?;
     let maximum = payload["max_frame"].as_u64().unwrap_or(MAX_FRAME as u64) as usize;
     ensure!(
@@ -201,19 +248,29 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
         "INVALID_PAGE_BUDGET"
     );
     match op {
-        "published-offer" => Ok(json!(offer_bounded(engine, &route, None, maximum)?)),
+        "published-offer" => Ok(json!(offer_for_lane(
+            engine,
+            &route,
+            None,
+            maximum,
+            metadata_only
+        )?)),
         "published-exchange" => {
             let page: SyncPage = serde_json::from_value(payload["page"].clone())?;
             ensure!(page.reply_to.is_none(), "INVALID_SYNC_REQUEST");
-            let ack = receive(engine, &route, &page)?;
-            let mut response = offer_bounded(engine, &route, Some(&page), maximum)?;
+            let ack = receive_for_lane(engine, &route, &page, metadata_only)?;
+            let mut response = offer_for_lane(engine, &route, Some(&page), maximum, metadata_only)?;
             response.ack = ack;
             Ok(json!(response))
         }
         "published-apply" => {
             let page: SyncPage = serde_json::from_value(payload["page"].clone())?;
+            let request = payload["request"]
+                .as_str()
+                .context("SYNC_REQUEST_REQUIRED")?;
+            uuid::Uuid::parse_str(request).context("INVALID_SYNC_REQUEST_ID")?;
             ensure!(
-                page.reply_to.as_deref() == payload["request"].as_str(),
+                page.reply_to.as_deref() == Some(request),
                 "UNBOUND_PEER_RESPONSE"
             );
             let sent: BTreeSet<String> = serde_json::from_value(payload["sent"].clone())?;
@@ -223,7 +280,7 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
                     .all(|ack| sent.contains(ack) && page.known.contains(ack)),
                 "UNBOUND_OR_EARLY_ACK"
             );
-            receive(engine, &route, &page)?;
+            receive_for_lane(engine, &route, &page, metadata_only)?;
             engine.store.acknowledge(&page.ack)?;
             let pending: i64 =
                 engine

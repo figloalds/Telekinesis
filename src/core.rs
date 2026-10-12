@@ -2107,6 +2107,20 @@ impl Store {
         known_objects: &BTreeSet<String>,
         budget: usize,
     ) -> Result<Bundle> {
+        self.shared_page_content(known, known_objects, budget, true)
+    }
+    /// Event manifests without reading CAS content. Reserved network lanes must
+    /// never build bulk payloads only to discard them afterwards.
+    pub fn shared_metadata_page(&self, known: &BTreeSet<String>, budget: usize) -> Result<Bundle> {
+        self.shared_page_content(known, &BTreeSet::new(), budget, false)
+    }
+    fn shared_page_content(
+        &self,
+        known: &BTreeSet<String>,
+        known_objects: &BTreeSet<String>,
+        budget: usize,
+        include_objects: bool,
+    ) -> Result<Bundle> {
         let branches: Vec<_> = self.branches()?.into_iter().filter(|b| b.shared).collect();
         let mut used = serde_json::to_vec(&branches)?.len() + 1024;
         let mut events = vec![];
@@ -2125,7 +2139,10 @@ impl Store {
         }
         let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
         let mut objects = BTreeMap::new();
-        for h in hashes.into_iter().filter(|h| !known_objects.contains(h)) {
+        for h in hashes
+            .into_iter()
+            .filter(|h| include_objects && !known_objects.contains(h))
+        {
             if self.object_size(&h)? > MAX_FILE as u64 {
                 continue;
             }

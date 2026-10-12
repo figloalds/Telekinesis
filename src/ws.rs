@@ -13,6 +13,19 @@ use tungstenite::{
 pub type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
+/// A complete error reply leaves the connection usable. Transport and malformed
+/// reply errors do not: callers must reconnect before issuing another request.
+#[derive(Debug)]
+pub struct RemoteError(pub String);
+
+impl std::fmt::Display for RemoteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RemoteError {}
+
 fn config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
@@ -137,18 +150,75 @@ pub fn reply(socket: &mut Socket, result: Result<Value>) -> Result<()> {
 pub fn call<T: Serialize>(socket: &mut Socket, request: &T) -> Result<Value> {
     send(socket, request)?;
     let response: Value = receive(socket)?;
-    ensure!(
-        response["ok"] == true,
-        "{}",
-        response["error"].as_str().unwrap_or("WS_REQUEST_FAILED")
-    );
-    Ok(response["result"].clone())
+    match response.get("ok").and_then(Value::as_bool) {
+        Some(true) => response
+            .get("result")
+            .cloned()
+            .context("INVALID_WS_REPLY: missing result"),
+        Some(false) => {
+            let error = response["error"]
+                .as_str()
+                .context("INVALID_WS_REPLY: missing error")?;
+            Err(RemoteError(error.to_owned()).into())
+        }
+        None => bail!("INVALID_WS_REPLY: missing boolean ok"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{net::TcpListener, thread};
+
+    #[test]
+    fn remote_error_preserves_connection_for_the_next_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut socket = accept(listener.accept().unwrap().0).unwrap();
+            let _: Value = receive(&mut socket).unwrap();
+            reply(&mut socket, Err(anyhow::anyhow!("FOLDER_UNAVAILABLE"))).unwrap();
+            let request: Value = receive(&mut socket).unwrap();
+            reply(&mut socket, Ok(request)).unwrap();
+        });
+        let mut socket = connect(&endpoint).unwrap();
+        let error = call(&mut socket, &json!({"folder":"broken"})).unwrap_err();
+        assert!(error.downcast_ref::<RemoteError>().is_some());
+        assert_eq!(error.to_string(), "FOLDER_UNAVAILABLE");
+        assert_eq!(
+            call(&mut socket, &json!({"folder":"healthy"})).unwrap(),
+            json!({"folder":"healthy"})
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn malformed_replies_are_not_remote_application_errors() {
+        let replies = [
+            json!({}),
+            json!({"ok":"true","result":1}),
+            json!({"ok":true}),
+            json!({"ok":false}),
+            json!({"ok":false,"error":42}),
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let count = replies.len();
+        let server = thread::spawn(move || {
+            for response in replies {
+                let mut socket = accept(listener.accept().unwrap().0).unwrap();
+                let _: Value = receive(&mut socket).unwrap();
+                send(&mut socket, &response).unwrap();
+            }
+        });
+        for _ in 0..count {
+            let mut socket = connect(&endpoint).unwrap();
+            let error = call(&mut socket, &json!({})).unwrap_err();
+            assert!(error.downcast_ref::<RemoteError>().is_none());
+            assert!(error.to_string().contains("INVALID_WS_REPLY"));
+        }
+        server.join().unwrap();
+    }
 
     #[test]
     fn endpoint_validation_accepts_ws_and_wss() {
