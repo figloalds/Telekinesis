@@ -17,6 +17,8 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+mod snapshot;
+
 pub const ROOT: &str = "root";
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
 /// Streaming file ceiling; buffered object APIs retain their 16 MiB bound.
@@ -738,25 +740,7 @@ impl Store {
             v.branch == branch && v.changes == changes && v.transactional == transactional
         });
         if !fresh {
-            let payload: String = self.db.query_row(
-                "SELECT payload FROM current_state WHERE branch=?",
-                [branch],
-                |r| r.get(0),
-            )?;
-            let mut projection: Projection = serde_json::from_str(&payload)?;
-            let mut statement = self
-                .db
-                .prepare("SELECT entry,heads FROM current_parts WHERE branch=?")?;
-            let rows = statement.query_map([branch], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (entry, heads) = row?;
-                let entry: Entry = serde_json::from_str(&entry)?;
-                projection.entries.insert(entry.id.clone(), entry);
-                let heads: BTreeMap<String, Vec<Version>> = serde_json::from_str(&heads)?;
-                projection.heads.extend(heads);
-            }
+            let projection = snapshot::load_projection(&self.db, branch)?;
             let slots = projection
                 .entries
                 .values()
@@ -790,6 +774,7 @@ impl Store {
         let projection = project(branch, &events)?;
         let tx = self.db.savepoint()?;
         persist_projection(&tx, branch, &projection, &events, None)?;
+        snapshot::persist(&tx, branch)?;
         tx.commit()?;
         Ok(())
     }
@@ -1102,6 +1087,7 @@ impl Store {
             "INSERT INTO event_frontier VALUES(?,?)",
             params![event.branch.id, event.id],
         )?;
+        snapshot::maybe_persist(&tx, &event.branch.id, !incremental)?;
         tx.commit()?;
         let mut cache = self.view_cache.borrow_mut();
         if incremental && cache.as_ref().is_some_and(|v| v.branch == event.branch.id) {
