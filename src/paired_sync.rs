@@ -39,6 +39,8 @@ pub struct SyncPage {
     pub bundle: Bundle,
     pub ack: Vec<String>,
     pub pending_events: usize,
+    pub object_sizes: BTreeMap<String, u64>,
+    pub wanted_objects: BTreeSet<String>,
 }
 fn binding(engine: &Engine, route: &SyncRoute) -> Result<()> {
     ensure!(engine.store.repo == route.repo, "REPOSITORY_MISMATCH");
@@ -103,10 +105,26 @@ fn offer_for_lane(
     } else {
         engine.store.shared_page(&known, &objects, budget)?
     };
+    let permitted: BTreeSet<_> = bundle
+        .events
+        .iter()
+        .flat_map(Event::objects)
+        .chain(
+            engine
+                .store
+                .events()?
+                .iter()
+                .filter(|e| known.contains(&e.id))
+                .flat_map(Event::objects),
+        )
+        .collect();
+    let wanted = inventory
+        .map(|page| Ok(page.wanted_objects.clone()))
+        .unwrap_or_else(|| engine.store.peer_requests(&route.remote_replica))?;
     let parts = if metadata_only {
         BTreeMap::new()
     } else {
-        engine.store.shared_parts(
+        engine.store.transfer_parts(
             &bundle,
             &objects,
             &offsets,
@@ -115,9 +133,22 @@ fn offer_for_lane(
             } else {
                 maximum / 2
             },
+            &permitted,
+            &wanted,
         )?
     };
+    // Metadata descriptors are independent of actual possession. Never turn a
+    // reference into a possession claim or private-object authorization.
+    let object_sizes = bundle
+        .events
+        .iter()
+        .flat_map(Event::objects)
+        .map(|h| engine.store.object_size(&h).map(|size| (h, size)))
+        .collect::<Result<_>>()?;
+    let wanted_objects = engine.store.wanted_objects()?;
     Ok(SyncPage {
+        object_sizes,
+        wanted_objects,
         format: PEER_FORMAT,
         repo: engine.store.repo.clone(),
         sender: route.local_replica.clone(),
@@ -125,8 +156,16 @@ fn offer_for_lane(
         request: id(),
         reply_to: inventory.map(|page| page.request.clone()),
         known: engine.store.shared_event_inventory()?,
-        known_objects: engine.store.shared_object_inventory()?,
-        partial_objects: engine.store.partial_objects()?,
+        known_objects: if metadata_only {
+            BTreeSet::new()
+        } else {
+            engine.store.shared_object_inventory()?
+        },
+        partial_objects: if metadata_only {
+            BTreeMap::new()
+        } else {
+            engine.store.partial_objects()?
+        },
         object_parts: parts,
         bundle,
         ack: vec![],
@@ -169,12 +208,19 @@ fn receive_for_lane(
     ensure!(
         page.known.len() <= 100000
             && page.known_objects.len() <= 100000
-            && page.partial_objects.len() <= 10000,
+            && page.partial_objects.len() <= 10000
+            && page.object_sizes.len() <= 100000
+            && page.wanted_objects.len() <= 100000,
         "INVENTORY_TOO_LARGE"
     );
     // Validate all advertised inventory before applying events or updating
     // receipts. A malformed partial must not acknowledge a page that failed.
-    for object in page.known_objects.iter().chain(page.partial_objects.keys()) {
+    for object in page
+        .known_objects
+        .iter()
+        .chain(page.partial_objects.keys())
+        .chain(page.wanted_objects.iter())
+    {
         valid_object(object)?;
     }
     ensure!(
@@ -211,10 +257,34 @@ fn receive_for_lane(
         page.bundle.branches.iter().all(|branch| branch.shared),
         "PRIVATE_BRANCH_REJECTED"
     );
+    let referenced: BTreeSet<_> = page.bundle.events.iter().flat_map(Event::objects).collect();
+    for object in &referenced {
+        ensure!(
+            page.object_sizes.contains_key(object) || engine.store.object_size(object).is_ok(),
+            "CONTENT_SIZE_REQUIRED"
+        );
+    }
+    for event in &page.bundle.events {
+        for (object, size) in &event.object_sizes {
+            ensure!(
+                page.object_sizes
+                    .get(object)
+                    .is_none_or(|advertised| advertised == size),
+                "OBJECT_SIZE_CHANGED"
+            );
+        }
+    }
+    for (object, size) in &page.object_sizes {
+        ensure!(referenced.contains(object), "UNREFERENCED_OBJECT_SIZE");
+        engine.store.remember_object_size(object, *size)?;
+    }
+    let ack = engine.receive_peer(page.bundle.clone(), &allowed)?;
     engine
         .store
         .receive_parts(page.object_parts.clone(), &page.bundle.events, &allowed)?;
-    let ack = engine.receive_peer(page.bundle.clone(), &allowed)?;
+    engine
+        .store
+        .remember_requests(&route.remote_replica, &page.wanted_objects)?;
     // Advertised inventory means committed durable events, never pending
     // manifests. Discard unknown IDs; private events cannot alter the outbox.
     let shared = engine.store.shared_event_inventory()?;
@@ -232,6 +302,20 @@ fn receive_for_lane(
             .store
             .remember_peer_partials(&route.remote_replica, &page.partial_objects)?;
     }
+    let pending: i64 =
+        engine
+            .store
+            .db
+            .query_row("SELECT count(*) FROM incoming_events", [], |r| r.get(0))?;
+    let caught_up = engine.store.shared_event_inventory()? == page.known
+        && pending == 0
+        && page.pending_events == 0;
+    let observation = json!({"caught_up":caught_up,"metadata_caught_up":caught_up,
+        "at":time(),"peer":route.peer,"replica":route.remote_replica,"content":engine.store.content_status()?});
+    engine
+        .peer_sync
+        .insert(route.remote_replica.clone(), observation.clone());
+    engine.last_sync = Some(observation);
     Ok(ack)
 }
 pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
@@ -287,7 +371,7 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
                     .store
                     .db
                     .query_row("SELECT count(*) FROM incoming_events", [], |row| row.get(0))?;
-            let status = json!({"caught_up":engine.store.shared_event_inventory()?==page.known&&pending==0&&page.pending_events==0&&engine.store.outgoing_unacknowledged()?==0&&engine.health.is_none()&&!engine.sessions.values().any(|session|session.dirty),"peer":route.peer,"replica":route.remote_replica,"durability":"peer SQLite FULL + verified objects","at":time()});
+            let status = json!({"caught_up":engine.store.shared_event_inventory()?==page.known&&pending==0&&page.pending_events==0&&engine.store.outgoing_unacknowledged()?==0&&engine.health.is_none()&&!engine.sessions.values().any(|session|session.dirty),"peer":route.peer,"replica":route.remote_replica,"metadata_caught_up":engine.store.shared_event_inventory()?==page.known&&pending==0&&page.pending_events==0,"content":engine.store.content_status()?,"durability":"metadata acknowledged independently; objects verified separately","at":time()});
             engine.last_sync = Some(status.clone());
             Ok(status)
         }
