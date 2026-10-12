@@ -56,12 +56,34 @@ Legacy inbound sessions without a role remain supported. Idle bulk lanes use
 lightweight pings; only the reserved lane performs periodic discovery. Explicit
 remote-list/receive commands use a separate short-lived control session.
 
-Metadata pages stage events in SQLite even while file transfers are stalled.
-Events depending on missing content or causal predecessors become visible and
-are acknowledged only after those dependencies arrive. This reserves transport
-capacity, not disk/CPU bandwidth: worker operations still share their local
-engine. The orchestrator's local catalog, mount paths and pairing settings are
-not replicated; state sync covers shared filesystem events and inventories.
+Metadata pages validate and activate causal events in SQLite even while file
+transfers are stalled. Missing causal predecessors still defer activation;
+missing object bytes do not. Format 6 carries content sizes independently of
+possession, so namespace and file metadata remain meaningful on partial replicas.
+Metadata acknowledgements certify the journal, while object inventories certify
+available content with shared provenance. A hash-only manifest never grants
+permission to advertise private-only local bytes.
+
+The independent content scheduler compares available objects with peer object
+inventories, including references in already-acknowledged events. Requests for
+reads/previews persist by object hash, receive priority on bulk lanes, and are
+forwarded as bounded, deduplicated demand to adjacent peers. This supports relay
+without recursive blocking network calls. Background replication still attempts
+all shared history; selective retention and garbage collection are not added.
+
+Bulk receipt writes resumable spools, verifies the completed file once and moves
+it into CAS. Hashing, file flushes and installation run outside the engine mutex;
+the engine registers completed objects on its serialized SQLite connection.
+Registration is distinct from metadata activation. Interrupted registration can
+be recovered by retransmission, and stale/complete partial cursors are repairable.
+
+Read sessions refer to immutable objects without eager staging copies. A read
+hydrates and verifies its object outside the engine mutex. Mutation creates a
+private staging buffer; truncate-to-zero can discard the old reference directly.
+FUSE content requests use a bounded set of asynchronous completions so the device
+reader can continue servicing metadata. WinFsp uses namespace-only operation guards
+so waiting file reads do not hold a volume-wide native lock. The orchestrator's local catalog, mount
+paths and pairing settings remain local.
 
 Peer status reports effective/configured pool sizes, the reserved count, and
 each lane's role, connection state, exchange count and latest error. A repository
@@ -77,3 +99,61 @@ summaries and reports their errors on the receiving daemon's folder inspection.
 Single-writer locks, path overlap checks, finite frames and durable acknowledgements
 remain data-integrity mechanisms. Pairing-code validation is the only application
 network credential check.
+
+## Startup snapshots and cursor replay
+
+Each branch has a disposable, versioned startup snapshot in the metadata database.
+It contains the merged projection (including register heads and tombstones), all
+historical conflict/review records, the causal frontier, and a local acceptance
+cursor. A SHA-256 checksum protects the snapshot envelope; a separate digest binds
+it to the exact accepted journal prefix and sequence numbers. Repository, device,
+branch descriptor and projection format must match before reuse.
+
+`journal_sequence` assigns monotonic SQLite AUTOINCREMENT sequence numbers through
+an event-insertion trigger. These numbers order local replay only; they never
+decide a CRDT winner. Event updates/deletions invalidate snapshots through triggers,
+including when an older executable modifies the journal. No history is pruned.
+
+Snapshots are sealed in the same transaction as a full projection update and
+periodically during incremental commits (at most 128 local acceptance-sequence
+advances between seals for an active branch). Startup restores the base and replays
+the bounded suffix using the existing proven content/metadata and sequential local
+namespace successor rules. The replay only changes derived projection, conflict and
+frontier tables; events, receipts, outbox acknowledgements and peer state remain
+intact. Successful replay seals an updated snapshot atomically. Clean dismount is
+not required, and an outer transaction rollback also rolls back the snapshot.
+
+Missing/incompatible/damaged snapshots, a changed journal prefix, non-topological
+acceptance order, an excessive suffix, or edits outside the incremental rules use
+full reconstruction. A partially attempted replay is rolled back first. Sequential
+directory moves and empty directory deletions after the complete accepted frontier
+use incremental projection when the namespace is conflict-free. Directory moves
+validate ancestry and preserve descendant entity IDs. Deleting a parent with live
+children or introducing a cycle still requires the historical reducer, as do
+concurrent namespace changes and reviews; namespace replay on inactive branches also
+uses that fallback. An older state incurs one full reconstruction to seed snapshots.
+
+Startup still verifies available content, validates/repairs the journal, recovers
+incoming events and restores pending staged saves. A metadata snapshot neither
+claims missing object bytes are available nor claims the replica has caught up with
+remote peers. Change the snapshot format version whenever projection or validation
+semantics change.
+
+## Desktop and availability
+
+The worker status includes `content` counts and up to 20 missing current-file
+observations, plus fresh/stale per-replica metadata observations for either dial
+direction. Availability distinguishes missing, queued, downloading, verifying,
+retrying and available content. Metadata convergence can coexist with unresolved
+conflicts or unavailable file bytes.
+
+The desktop's folder panel uses orchestrator-proxied worker RPCs. Conflict pages
+contain at most 100 unresolved records; previews are limited to 64 KiB of text.
+Resolution and namespace recovery use exact conflict IDs, a review token and
+idempotent request receipts. No automatic text merge is performed. Existing
+open-handle/dirty-session guards still apply to semantic management mutations.
+
+The SHA-256 algorithm is unchanged. Directory exports now hash while copying;
+received objects no longer undergo a second copy-and-hash pass. Parallel hashing,
+binary wire frames and paginated peer inventories remain separate performance
+work requiring measurement and protocol design.

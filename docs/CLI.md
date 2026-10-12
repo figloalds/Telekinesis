@@ -72,3 +72,15 @@ Direct worker `stop` is intended for standalone workers. Network sync is automat
 in the daemon; direct worker peer keys/listeners and the old `pairing` service
 command are removed. The runtime API still refuses checkout/stop when the mount
 has open handles or unflushed writes.
+
+## Partial content availability
+
+Worker `status` distinguishes `metadata_caught_up`, `content_complete`, per-peer
+observations and `content` counters. `content.items` contains up to 20 current
+paths with missing bytes, their expected sizes, durable partial lengths and the
+latest transfer error. `caught_up` retains metadata-roundtrip semantics and does
+not certify a remote content backup. Peer observations expire after 15 seconds.
+
+Reads prioritize missing content over background objects and may report content
+unavailable after a bounded wait. The folder and its metadata remain accessible.
+All connected peers must support protocol 6 for independent metadata/content sync.

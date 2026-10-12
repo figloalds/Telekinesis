@@ -60,7 +60,12 @@ orchestrators and local host status. Use **New folder** to create and mount a
 folder, **Change path** to stop it and edit its mount point, and **Connect remote**
 to pair, browse and receive remote folders. **Host settings** contains the local
 pairing code and daemon shutdown controls. Counts refresh every five seconds;
-headless workers are not counted as mounted folders. Storage usage is marked as
+headless workers are not counted as mounted folders. **Sync / conflicts** opens a
+folder panel with per-peer metadata observations, partial content availability,
+paged conflict alternatives, bounded text previews and explicit resolution or
+recovery at a new path. The panel refreshes status every five seconds without
+replacing an ongoing conflict review. Stale reviews are rejected and can be
+refreshed. Storage usage is marked as
 unavailable because the management API does not report it. Folder deletion and
 quotas from the visual prototype are not implemented by the daemon.
 
@@ -101,6 +106,13 @@ Folder startup is asynchronous. Create, receive and start return with
 `starting: true`; poll `manage inspect STATE_ID` for `running: true` before
 accessing the mount or worker API. The desktop displays **Starting** and allows
 cancellation. `startup_phase` reports the latest recovery work.
+
+Remounts restore a checksummed local snapshot and replay events after its durable
+cursor. Snapshots are saved transactionally during operation, so crash recovery
+does not depend on a clean dismount. Older states need one full reconstruction;
+incompatible or damaged snapshots and replay requiring historical conflict analysis
+fall back to reconstruction automatically. Content verification and pending-save
+recovery still run.
 
 Workers have 30 seconds to report startup progress. Real recovery work renews
 this allowance, so large journal replays can finish without a fixed total time
@@ -158,6 +170,26 @@ text merging, symlinks, hardlinks, native ACL replication and garbage collection
 are not implemented. Streaming files are bounded at 16 GiB; buffered APIs at
 16 MiB. Sync transfers bounded resumable pages, with eventual per-peer progress
 rather than a global distributed barrier.
+
+Metadata and content now converge independently. Valid causal metadata can be
+listed, renamed, inspected and relayed while file bytes are missing. File sizes
+travel with metadata; `metadata_caught_up` and `content_complete` are separate.
+A metadata acknowledgement is not a content backup receipt. Background transfer
+continues after metadata acknowledgement, including historical shared objects.
+
+Reads and conflict previews prioritize an absent object's download through the
+orchestrator mesh. Reads wait up to 15 seconds for availability, then report an
+unavailable-content error while keeping the request queued. Only verified whole
+objects are exposed; a partial download never becomes an empty or truncated
+file. Other folders and metadata operations remain available. Explicit truncate
+to zero can replace a missing file without downloading its old contents.
+Missing content survives restart; corrupt existing objects are quarantined and
+can be downloaded again. Private branches have no automatic remote source.
+
+This change uses **peer protocol 6**. Upgrade both ends of each connection;
+protocol 5 peers cannot participate. Existing local journals are retained, and
+available legacy object sizes/provenance are indexed during first startup.
+SHA-256 object identities remain unchanged.
 
 ## Configuration and upgrade
 
