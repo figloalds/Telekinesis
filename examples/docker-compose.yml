@@ -1,0 +1,30 @@
+services:
+  tkfs-daemon:
+    image: ubuntu:24.04
+    container_name: tkfs_daemon
+    restart: unless-stopped
+    network_mode: host
+    ipc: host
+    working_dir: /app
+
+    # --- CONFIGURAÇÕES PARA O FUSE FUNCIONAR ---
+    devices:
+      - /dev/fuse:/dev/fuse  # Compartilha o driver FUSE do host com o container
+    cap_add:
+      - SYS_ADMIN            # Dá permissão para o container realizar operações de mount
+    security_opt:
+      - apparmor:unconfined  # Evita que o AppArmor bloqueie a montagem (comum no Ubuntu)
+    # -------------------------------------------
+
+    volumes:
+      - .:/app
+    # Platform packages only; TKFS does not install device certificates or CA roots.
+    command: >
+      sh -c "if ! dpkg -s fuse3 ca-certificates libssl3t64 >/dev/null 2>&1; then
+               apt-get update &&
+               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fuse3 ca-certificates libssl3t64 || exit 1;
+             fi &&
+             if [ ! -f orchestrator.toml ]; then
+               ./tkfs init || exit 1;
+             fi &&
+             exec ./tkfs start"
