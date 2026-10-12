@@ -105,7 +105,9 @@ fn caught_up_checks_current_queue_inventory_and_unflushed_work() {
     e.store
         .remember_peer_inventory("configured-peer", &known)
         .unwrap();
-    e.last_sync = Some(json!({"caught_up":true}));
+    e.last_sync = Some(json!({"caught_up":true,"at":time()}));
+    e.peer_sync
+        .insert("configured-peer".into(), json!({"at":time()}));
     assert_eq!(status(&mut e)["caught_up"], true);
     let (h, _) = e.open("code", None, true).unwrap();
     e.write(h, 0, b"new durable work", false, false).unwrap();
@@ -158,10 +160,11 @@ fn object_inventory_pending_quarantine_and_private_ids_are_not_event_receipts() 
     let mut missing = a.shared_bundle(&BTreeSet::new()).unwrap();
     let objects = missing.objects.keys().cloned().collect();
     missing.objects.clear();
-    assert!(b.receive(missing, &allowed).unwrap().is_empty());
+    assert_eq!(b.receive(missing, &allowed).unwrap().len(), 2);
     b.remember_peer_inventory(&a.device, &shared).unwrap();
-    assert!(inventory(&b).is_empty());
-    assert_eq!(b.status().unwrap()["incoming_pending"], 2);
+    assert_eq!(inventory(&b), shared);
+    assert_eq!(b.status().unwrap()["incoming_pending"], 0);
+    assert_eq!(b.status().unwrap()["content"]["complete"], false);
     assert_eq!(outgoing(&b), 0);
     a.remember_peer_objects(&b.device, &objects).unwrap();
     assert_eq!(

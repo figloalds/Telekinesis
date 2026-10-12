@@ -116,13 +116,17 @@ fn wrong_repo_replica_forged_origin_and_private_object_requests_fail() {
         }
     });
     wrong.bundle.objects.clear();
+    wrong.object_sizes.clear();
+    for event in &mut wrong.bundle.events {
+        event.object_sizes.clear();
+    }
     let ack = paired_sync::receive(&mut b, &gb, &wrong).unwrap();
-    assert!(ack.len() < wrong.bundle.events.len());
+    assert_eq!(ack.len(), wrong.bundle.events.len());
     assert!(!b.store.shared_object_inventory().unwrap().contains(&secret));
-    assert!(b.store.lookup("public.txt").is_err());
+    assert!(b.store.lookup("public.txt").is_ok());
 }
 #[test]
-fn missing_object_is_not_acked_and_unbound_or_early_ack_cannot_clear_outbox() {
+fn metadata_is_acked_without_content_but_unbound_ack_cannot_clear_outbox() {
     let (_temp, mut a, mut b, ga, gb) = fixture();
     write(&mut a, "large.txt", b"whole object required");
     let mut page = paired_sync::offer(&a, &ga, None).unwrap();
@@ -142,11 +146,12 @@ fn missing_object_is_not_acked_and_unbound_or_early_ack_cannot_clear_outbox() {
         .iter()
         .find(|event| !event.objects().is_empty())
         .unwrap();
-    assert!(!response.ack.contains(&content_event.id));
-    assert!(!response.known.contains(&content_event.id));
+    assert!(response.ack.contains(&content_event.id));
+    assert!(response.known.contains(&content_event.id));
+    assert!(response.known_objects.is_empty());
     let original = a.store.outgoing_unacknowledged().unwrap();
     let mut wrong = response.clone();
-    wrong.ack.push(content_event.id.clone());
+    wrong.ack.push(id());
     assert!(paired_sync::worker_control(&mut a,&json!({"op":"published-apply","route":ga,"page":wrong,"request":page.request,"sent":[content_event.id]})).is_err());
     assert_eq!(a.store.outgoing_unacknowledged().unwrap(), original);
     let mut wrong = response;
@@ -177,15 +182,17 @@ fn reserved_lane_transports_events_without_content_or_rewinding_bulk_cursors() {
     .unwrap();
     assert!(response.bundle.objects.is_empty());
     assert!(response.object_parts.is_empty());
-    assert!(response.pending_events > 0);
+    assert_eq!(response.pending_events, 0);
+    assert!(b.store.lookup("payload.bin").is_ok());
+    assert_eq!(b.store.content_status().unwrap()["complete"], false);
     for event in page
         .bundle
         .events
         .iter()
         .filter(|e| !e.objects().is_empty())
     {
-        assert!(!response.ack.contains(&event.id));
-        assert!(!response.known.contains(&event.id));
+        assert!(response.ack.contains(&event.id));
+        assert!(response.known.contains(&event.id));
     }
     let object = hash(&vec![7; 2 * 1024 * 1024]);
     let offsets = [(object.clone(), 1024)].into_iter().collect();
@@ -201,7 +208,7 @@ fn reserved_lane_transports_events_without_content_or_rewinding_bulk_cursors() {
         }),
     )
     .unwrap();
-    assert_eq!(result["caught_up"], false);
+    assert_eq!(result["metadata_caught_up"], true);
     assert!(a.store.lookup("remote-directory").is_ok());
     assert_eq!(
         a.store.peer_partial_objects(&ga.remote_replica).unwrap(),

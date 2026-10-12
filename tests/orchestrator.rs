@@ -315,7 +315,7 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     let object = Path::new(broken["directory"].as_str().unwrap())
         .join("objects")
         .join(hash(bytes));
-    fs::write(&object, b"corrupt").unwrap();
+    fs::write(&object, vec![0; bytes.len()]).unwrap();
     b.call(Action::Pair {
         endpoint: a.endpoint(),
         code: a.code(),
@@ -330,9 +330,7 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
         lane["connected"] == true
             && lane["repositories"][repo]["error"]
                 .as_str()
-                .is_some_and(|e| {
-                    e.contains("REMOTE_SYNC_EXCHANGE_FAILED") && e.contains("CORRUPT_OBJECT")
-                })
+                .is_some_and(|e| e.contains("CORRUPT_OBJECT"))
     });
     write(&healthy, "forward.txt", b"unblocked forward");
     write(&healthy_b, "reverse.txt", b"unblocked reverse");
@@ -355,7 +353,7 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     wait_for(|| has(&broken_b, "repair.txt", bytes));
     wait_for(|| b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["caught_up"] == true);
 
-    // A local offer failure must also leave the other folder and peer socket usable.
+    // Corrupt outbound content must also leave the other folder and socket usable.
     let state = broken["state"].as_str().unwrap().to_owned();
     a.call(Action::Stop {
         state: state.clone(),
@@ -365,12 +363,12 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     let local_object = Path::new(broken_b["directory"].as_str().unwrap())
         .join("objects")
         .join(hash(local_bytes));
-    fs::write(&local_object, b"corrupt").unwrap();
+    fs::write(&local_object, vec![0; local_bytes.len()]).unwrap();
     a.call(Action::Start { state });
     wait_for(|| {
         b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["error"]
             .as_str()
-            .is_some_and(|e| e.contains("LOCAL_SYNC_OFFER_FAILED"))
+            .is_some_and(|e| e.contains("CORRUPT_OBJECT"))
     });
     write(&healthy, "still.txt", b"healthy during local failure");
     wait_for(|| has(&healthy_b, "still.txt", b"healthy during local failure"));
@@ -714,14 +712,21 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     rpc(&project, json!({"op":"mkdir","path":"during-bulk-stall"}));
     // An event created after the bulk exchange was blocked must arrive before
-    // release. It causally depends on the file write, so SQLite stages it until
-    // the bulk lane supplies the missing content; transport is still independent.
+    // release. Its file-write ancestor is valid metadata even without bytes;
+    // both the file and the new directory must already be visible.
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        let delivered: bool = remote.lock().unwrap().store.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM incoming_events WHERE payload LIKE '%during-bulk-stall%')",
-            [], |row| row.get(0),
-        ).unwrap();
+        let delivered: bool = remote
+            .lock()
+            .unwrap()
+            .store
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE payload LIKE '%during-bulk-stall%')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         if delivered {
             break;
         }
@@ -731,7 +736,11 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
         );
         thread::sleep(Duration::from_millis(25));
     }
-    assert!(remote.lock().unwrap().store.lookup("content.bin").is_err());
+    assert!(remote.lock().unwrap().store.lookup("content.bin").is_ok());
+    assert_eq!(
+        remote.lock().unwrap().store.content_status().unwrap()["complete"],
+        false
+    );
     let peers = node.call(Action::Peers);
     assert_eq!(peers[0]["reserved_connections"], 1);
     assert_eq!(peers[0]["configured_connections"], 1);
@@ -739,7 +748,7 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     assert_eq!(peers[0]["lanes"][1]["role"], "bulk");
     assert!(peers[0]["lanes"][0]["exchanges"].as_u64().unwrap() > 0);
     release_tx.send(()).unwrap();
-    wait_for(|| remote.lock().unwrap().store.lookup("content.bin").is_ok());
+    wait_for(|| remote.lock().unwrap().store.content_status().unwrap()["complete"] == true);
     wait_for(|| {
         remote
             .lock()
@@ -750,4 +759,77 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     });
     node.stop();
     server.join().unwrap();
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn real_partial_mount_fetches_on_read_without_blocking_unrelated_metadata() {
+    #[cfg(target_os = "linux")]
+    if !Path::new("/dev/fuse").exists() {
+        return;
+    }
+    let a = Node::new();
+    let b = Node::new();
+    let pa = a.create("Demand source", true);
+    let bytes = b"remote content fetched after source returns";
+    write(&pa, "remote.txt", bytes);
+    b.pair(&a, &a.code());
+    let pb = b.receive(&a, &pa);
+    wait_for(|| {
+        rpc(&pb, json!({"op":"status"}))["content"]["complete"] == true
+            && has(&pb, "remote.txt", bytes)
+    });
+    a.call(Action::Stop {
+        state: pa["state"].as_str().unwrap().into(),
+    });
+    let state = pb["state"].as_str().unwrap().to_owned();
+    b.call(Action::Stop {
+        state: state.clone(),
+    });
+    fs::remove_file(
+        Path::new(pb["directory"].as_str().unwrap())
+            .join("objects")
+            .join(hash(bytes)),
+    )
+    .unwrap();
+    let mount = b.root.path().join("partial-mount");
+    b.call(Action::ConfigureMount {
+        state: state.clone(),
+        mount: Some(mount.clone()),
+    });
+    let pb = b.call(Action::Start { state });
+    assert_eq!(
+        fs::metadata(mount.join("remote.txt")).unwrap().len(),
+        bytes.len() as u64
+    );
+    assert!(
+        fs::read_dir(&mount)
+            .unwrap()
+            .any(|e| e.unwrap().file_name() == "remote.txt")
+    );
+    let reader_path = mount.join("remote.txt");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let _ = tx.send(fs::read(reader_path));
+    });
+    wait_for(|| {
+        rpc(&pb, json!({"op":"status"}))["content"]["requested"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    });
+    fs::create_dir(mount.join("while-downloading")).unwrap();
+    assert!(
+        fs::metadata(mount.join("while-downloading"))
+            .unwrap()
+            .is_dir()
+    );
+    a.call(Action::Start {
+        state: pa["state"].as_str().unwrap().into(),
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(15)).unwrap().unwrap(),
+        bytes
+    );
+    reader.join().unwrap();
 }

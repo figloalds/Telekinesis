@@ -180,7 +180,7 @@ fn large_random_access_file_is_disk_staged_durable_and_exportable() {
 }
 
 #[test]
-fn large_peer_segments_survive_restart_and_never_ack_partial_or_private_content() {
+fn large_peer_segments_survive_metadata_ack_and_restart_without_claiming_partial_content() {
     let a_dir = tempfile::tempdir().unwrap();
     let b_dir = tempfile::tempdir().unwrap();
     let mut a = Engine::new(Store::open(a_dir.path(), Some("availability")).unwrap());
@@ -195,7 +195,7 @@ fn large_peer_segments_survive_restart_and_never_ack_partial_or_private_content(
     let allowed = BTreeSet::from([a.store.device.clone()]);
     let object = a.store.lookup("large").unwrap().content.unwrap();
     let mut pages = 0;
-    while b.lookup("large").is_err() || b.lookup("large").unwrap().content != Some(object.clone()) {
+    while !b.shared_object_inventory().unwrap().contains(&object) {
         pages += 1;
         assert!(pages < 30);
         let page = a
@@ -228,7 +228,10 @@ fn large_peer_segments_survive_restart_and_never_ack_partial_or_private_content(
                 .find(|e| e.objects().contains(&object))
                 .unwrap()
                 .id;
-            assert!(!accepted.contains(&revision));
+            if pages == 1 {
+                assert!(accepted.contains(&revision));
+            }
+            assert!(b.lookup("large").is_ok());
             drop(b);
             b = Store::open_existing(b_dir.path()).unwrap();
         }
