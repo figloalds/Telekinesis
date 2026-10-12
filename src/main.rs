@@ -269,7 +269,9 @@ extern "C" fn signal_stop(_: libc::c_int) {
 fn worker(state: &Path, mount: Option<&Path>) -> Result<()> {
     let state = std::fs::canonicalize(state)?;
     let _lock = orchestrator::lock_state(&state)?;
+    let reporting = tkfs::startup::Reporting::begin();
     let store = Store::open_existing(&state)?;
+    tkfs::startup::progress("recovering pending saves");
     let engine = Arc::new(Mutex::new(Engine::new(store)));
     let mount = mount.map(std::path::absolute).transpose()?;
     if let Some(path) = &mount {
@@ -284,6 +286,7 @@ fn worker(state: &Path, mount: Option<&Path>) -> Result<()> {
     }
     // Publish discovery only after the real mount is ready.
     if let Some(path) = &mount {
+        tkfs::startup::progress("mounting filesystem");
         tkfs::mount::start(engine.clone(), path)?;
     }
     let info = runtime::start_rpc(
@@ -293,8 +296,9 @@ fn worker(state: &Path, mount: Option<&Path>) -> Result<()> {
     )?;
     println!(
         "{}",
-        json!({"ready":true,"runtime":state.join("runtime.json"),"repo":info.repo,"device":info.device})
+        json!({"ready":true,"runtime":state.join("runtime.json"),"repo":info.repo,"device":info.device,"mounted":mount.is_some()})
     );
+    drop(reporting);
     let stop = engine.lock().unwrap().stopping.clone();
     #[cfg(target_os = "linux")]
     unsafe {

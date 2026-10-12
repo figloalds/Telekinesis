@@ -95,6 +95,7 @@ impl Engine {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for record in records {
+            crate::startup::progress("recovering pending saves");
             let pending: PendingSave = serde_json::from_str(&record)?;
             ensure!(
                 pending.branch == self.store.active,

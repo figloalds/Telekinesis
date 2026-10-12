@@ -13,12 +13,14 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
+    io::{BufRead, BufReader, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
 };
@@ -408,7 +410,10 @@ impl Supervisor {
     }
     fn discovery(&self, state: &str) -> Result<Discovery> {
         let p = self.project(state)?;
-        ensure!(self.workers.contains_key(state), "WORKER_NOT_RUNNING");
+        ensure!(
+            self.workers.get(state).is_some_and(|w| w.startup.is_none()),
+            "WORKER_NOT_RUNNING"
+        );
         let info: Discovery = serde_json::from_slice(&fs::read(p.directory.join("runtime.json"))?)?;
         ensure!(
             info.repo == p.repo && info.device == p.device,
@@ -456,47 +461,93 @@ impl Supervisor {
         }
         command
             .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log);
+            .stdout(Stdio::piped())
+            .stderr(log.try_clone()?);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
         let mut child = command.spawn()?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let ready = (|| -> Result<()> {
-            loop {
-                if let Some(status) = child.try_wait()? {
-                    bail!(
-                        "WORKER_EXITED: {status}; see {}",
-                        p.directory.join("worker.log").display()
+        let stdout = child.stdout.take().expect("piped worker stdout");
+        let (sender, messages) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut log = log;
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    let _ = sender.send(value);
+                }
+                let _ = writeln!(log, "{line}");
+            }
+        });
+        self.workers.insert(
+            state.into(),
+            Worker {
+                child,
+                messages,
+                startup: Some(crate::startup::Watchdog::new(Instant::now())),
+            },
+        );
+        Ok(())
+    }
+    fn poll_worker(&mut self, state: &str) -> Result<()> {
+        let p = self.project(state)?;
+        let worker = self.workers.get_mut(state).context("WORKER_NOT_RUNNING")?;
+        if let Some(status) = worker.child.try_wait()? {
+            bail!(
+                "WORKER_EXITED: {status}; see {}",
+                p.directory.join("worker.log").display()
+            );
+        }
+        // Only this child's stdout can renew its lease. Old runtime.json files
+        // and a responsive side thread cannot keep stalled recovery alive.
+        for message in worker.messages.try_iter() {
+            if let Some(startup) = &mut worker.startup {
+                if let Some(sequence) = message["startup_progress"].as_u64() {
+                    startup.observe(
+                        sequence,
+                        message["phase"].as_str().unwrap_or("recovering"),
+                        Instant::now(),
                     );
                 }
-                if let Ok(bytes) = fs::read(p.directory.join("runtime.json"))
-                    && let Ok(info) = serde_json::from_slice::<Discovery>(&bytes)
-                    && let Ok(status) = runtime::rpc(&info, &id(), json!({"op":"status"}))
-                    && status["mounted"] == p.mount.is_some()
-                    && status["repo"] == p.repo
-                    && status["device"] == p.device
-                {
-                    return Ok(());
+                if message["ready"] == true {
+                    ensure!(
+                        message["repo"] == p.repo
+                            && message["device"] == p.device
+                            && message["mounted"] == p.mount.is_some(),
+                        "WORKER_STATE_MISMATCH"
+                    );
+                    worker.startup = None;
                 }
-                ensure!(Instant::now() < deadline, "WORKER_START_TIMEOUT");
-                std::thread::sleep(Duration::from_millis(50));
             }
-        })();
-        if let Err(error) = ready {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
         }
-        self.workers.insert(state.into(), Worker { child });
-        self.failures.remove(state);
+        if worker.startup.is_none() {
+            self.failures.remove(state);
+        }
+        if let Some(startup) = &worker.startup {
+            ensure!(
+                !startup.expired(Instant::now()),
+                "WORKER_START_TIMEOUT: no recovery progress for 30s during {}; see {}",
+                startup.phase,
+                p.directory.join("worker.log").display()
+            );
+        }
         Ok(())
     }
     fn stop(&mut self, state: &str) -> Result<()> {
         if !self.workers.contains_key(state) {
+            return Ok(());
+        }
+        // Drain readiness before deciding whether the worker can stop via RPC.
+        let _ = self.poll_worker(state);
+        if self.workers[state].startup.is_some() {
+            let worker = self.workers.get_mut(state).unwrap();
+            if worker.child.try_wait()?.is_none() {
+                worker.child.kill()?;
+            }
+            worker.child.wait()?;
+            self.workers.remove(state);
             return Ok(());
         }
         let info = self.discovery(state)?;
@@ -518,17 +569,22 @@ impl Supervisor {
     }
     fn inspect(&self, state: &str) -> Result<Value> {
         let mut value = json!(self.project(state)?);
-        value["running"] = json!(self.workers.contains_key(state));
+        let worker = self.workers.get(state);
+        value["running"] = json!(worker.is_some_and(|w| w.startup.is_none()));
+        value["starting"] = json!(worker.is_some_and(|w| w.startup.is_some()));
+        value["startup_phase"] = json!(worker.and_then(|w| w.startup.as_ref()).map(|s| &s.phase));
         value["error"] = json!(self.failures.get(state));
+        value["publication_error"] = json!(self.publication_errors.get(state));
         Ok(value)
     }
     fn reconcile(&mut self) -> Result<()> {
         let states: Vec<_> = self.workers.keys().cloned().collect();
         for state in states {
-            if let Some(status) = self.workers.get_mut(&state).unwrap().child.try_wait()? {
-                self.workers.remove(&state);
-                self.failures
-                    .insert(state, format!("WORKER_EXITED: {status}"));
+            if let Err(error) = self.poll_worker(&state) {
+                let mut worker = self.workers.remove(&state).unwrap();
+                let _ = worker.child.kill();
+                let _ = worker.child.wait();
+                self.failures.insert(state, format!("{error:#}"));
             }
         }
         for p in self.projects()? {

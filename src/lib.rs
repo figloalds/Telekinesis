@@ -10,4 +10,5 @@ pub mod paired_sync;
 pub mod pairing_code;
 pub mod runtime;
 pub mod staging;
+pub mod startup;
 pub mod ws;

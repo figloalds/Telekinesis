@@ -125,6 +125,7 @@ pub(crate) fn stream_hash(reader: &mut impl Read) -> Result<String> {
             break;
         }
         digest.update(&bytes[..count]);
+        crate::startup::progress("verifying objects");
     }
     Ok(hex::encode(digest.finalize()))
 }
@@ -393,15 +394,19 @@ impl Store {
         // Recompute from the journal and verify every referenced object before
         // serving anything, including alternatives that lost the visible tie-break.
         for event in store.events()? {
+            crate::startup::progress("verifying journal objects");
             for object in event.objects() {
                 store.verify_object(&object)?;
             }
         }
+        crate::startup::progress("validating journal");
         store.evacuate_unvalidated_journal()?;
+        crate::startup::progress("rebuilding frontiers");
         store.rebuild_frontiers()?;
         for branch in store.branches()? {
             store.rebuild(&branch.id)?;
         }
+        crate::startup::progress("recovering incoming events");
         store.drain_incoming()?;
         Ok(store)
     }
@@ -634,6 +639,7 @@ impl Store {
         let known: BTreeMap<_, _> = events.iter().map(|e| (e.id.clone(), e.clone())).collect();
         let mut rejected: BTreeMap<String, String> = BTreeMap::new();
         for e in &events {
+            crate::startup::progress("validating journal");
             if let Err(error) = validate_direct_links(e, &known, &BTreeSet::new()) {
                 rejected.insert(e.id.clone(), format!("{error:#}"));
             }
@@ -2026,6 +2032,7 @@ impl Store {
             let authorized = self.shared_object_inventory()?;
             let mut progress = false;
             for (e, error) in &staged {
+                crate::startup::progress("recovering incoming events");
                 if error.is_some() {
                     continue;
                 }
@@ -2463,6 +2470,7 @@ fn persist_projection(
         }
     }
     for (i, (a, ac)) in locations.iter().enumerate() {
+        crate::startup::progress("rebuilding namespace conflicts");
         for (b, bc) in &locations[i + 1..] {
             if ac.entity == bc.entity
                 || ac.value["parent"] != bc.value["parent"]
@@ -2517,6 +2525,7 @@ fn persist_projection(
     // budget refuses a commit before acknowledgement rather than losing history.
     conflicts.extend(namespace_history(branch, events)?);
     for (key, versions) in &history {
+        crate::startup::progress("rebuilding register conflicts");
         let candidate = new_event.and_then(|id| versions.iter().position(|v| v.revision == id));
         if new_event.is_some() && candidate.is_none() {
             continue;
@@ -2543,6 +2552,7 @@ fn persist_projection(
             )
         };
         for (i, j) in pairs {
+            crate::startup::progress("rebuilding register conflicts");
             let a = &versions[i];
             let b = &versions[j];
             if a.value != b.value && !reach.has(i, j) && !reach.has(j, i) {
@@ -2820,6 +2830,7 @@ fn activated_ids(events: &[Event]) -> BTreeSet<String> {
     }
     let mut active = BTreeSet::new();
     while let Some(id) = ready.pop_first() {
+        crate::startup::progress("validating causal history");
         active.insert(id.to_owned());
         if let Some(children) = children.get(id) {
             for child in children {
@@ -2846,6 +2857,7 @@ fn namespace_history(branch: &str, events: &[Event]) -> Result<Vec<Conflict>> {
     }
     let mut conflicts = BTreeMap::new();
     for members in cones.members() {
+        crate::startup::progress("rebuilding namespace history");
         let mut relevant = BTreeSet::new();
         for (i, e) in events.iter().enumerate() {
             if e.changes.iter().any(|c| {
@@ -2930,6 +2942,7 @@ fn namespace_history(branch: &str, events: &[Event]) -> Result<Vec<Conflict>> {
         for (i, &event) in relevant.iter().enumerate() {
             let before = antichains.len();
             for index in 0..before {
+                crate::startup::progress("replaying namespace cuts");
                 if !antichains[index].iter().all(|&j| {
                     !ancestors[i].contains(&relevant[j]) && !ancestors[j].contains(&event)
                 }) {
@@ -3129,6 +3142,7 @@ impl NamespaceCones {
     fn members(&self) -> BTreeSet<BTreeSet<String>> {
         let mut cones = BTreeSet::new();
         for entity in self.parents.keys() {
+            crate::startup::progress("analyzing namespace dependencies");
             let mut members = BTreeSet::new();
             let mut visited_slots = BTreeSet::new();
             let mut pending = vec![entity.clone()];
@@ -3208,6 +3222,7 @@ pub fn project(branch: &str, events: &[Event]) -> Result<Projection> {
         ..Default::default()
     };
     for (key, mut versions) in registers {
+        crate::startup::progress("projecting registers");
         // All ancestors are dominated before the stable concurrent rank is used.
         let dominated: BTreeSet<_> = versions
             .iter()
