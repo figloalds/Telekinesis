@@ -28,8 +28,8 @@ pub const MAX_EVENT: usize = 8 * 1024 * 1024;
 pub const MAX_NAMESPACE_CUTS: usize = 4096;
 pub const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
 pub const BASIC_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x20 | 0x80;
-/// Both peers must understand durable basic metadata; format 2 is incompatible.
-pub const PEER_FORMAT: u32 = 5;
+/// Format 6 acknowledges metadata independently and carries content descriptors.
+pub const PEER_FORMAT: u32 = 6;
 pub fn filetime(ms: u64) -> u64 {
     ms.saturating_mul(10_000).saturating_add(FILETIME_EPOCH)
 }
@@ -163,6 +163,8 @@ pub struct Event {
     pub dependencies: Vec<String>,
     #[serde(default)]
     pub reviewed: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub object_sizes: BTreeMap<String, u64>,
 }
 impl Event {
     pub fn objects(&self) -> BTreeSet<String> {
@@ -351,6 +353,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS incoming_events(id TEXT PRIMARY KEY,payload TEXT NOT NULL,error TEXT);
             CREATE TABLE IF NOT EXISTS peer_objects(peer TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(peer,hash));")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS event_frontier(branch TEXT NOT NULL,event TEXT NOT NULL,PRIMARY KEY(branch,event));")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS object_sizes(hash TEXT PRIMARY KEY,size INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS published_objects(hash TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS object_requests(hash TEXT PRIMARY KEY,requested_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS object_references(hash TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS object_errors(hash TEXT PRIMARY KEY,error TEXT NOT NULL,at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS peer_requests(peer TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(peer,hash));")?;
+        snapshot::initialize(&db)?;
         let schema: String = db.query_row(
             "SELECT sql FROM sqlite_master WHERE name='branches'",
             [],
@@ -393,20 +402,66 @@ impl Store {
             generation,
             view_cache: RefCell::new(None),
         };
-        // Recompute from the journal and verify every referenced object before
-        // serving anything, including alternatives that lost the visible tie-break.
-        for event in store.events()? {
-            crate::startup::progress("verifying journal objects");
+        // Missing content is a supported state. Verify existing bytes once during
+        // recovery, quarantine corrupt content, and keep the semantic journal.
+        let legacy = store
+            .db
+            .query_row(
+                "SELECT value FROM config WHERE key='availability_v1'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .is_none();
+        let events = store.events()?;
+        let shared: BTreeSet<_> = events
+            .iter()
+            .filter(|e| e.branch.shared)
+            .flat_map(Event::objects)
+            .collect();
+        let objects: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
+        for event in &events {
             for object in event.objects() {
-                store.verify_object(&object)?;
+                store.db.execute(
+                    "INSERT OR IGNORE INTO object_references VALUES(?)",
+                    [object],
+                )?;
+            }
+            for (object, size) in &event.object_sizes {
+                store.remember_object_size(object, *size)?;
             }
         }
+        for object in objects {
+            crate::startup::progress("verifying available objects");
+            let path = store.root.join("objects").join(&object);
+            if path.is_file() {
+                if let Err(error) = store.verify_object(&object) {
+                    fs::rename(&path, path.with_extension(format!("corrupt-{}", id())))?;
+                    store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", params![object, format!("{error:#}"), time()])?;
+                } else {
+                    store.remember_object_size(&object, fs::metadata(&path)?.len())?;
+                    if legacy && shared.contains(&object) {
+                        store.db.execute(
+                            "INSERT OR IGNORE INTO published_objects VALUES(?)",
+                            [&object],
+                        )?;
+                    }
+                }
+            }
+        }
+        store.db.execute(
+            "INSERT OR IGNORE INTO config VALUES('availability_v1','1')",
+            [],
+        )?;
         crate::startup::progress("validating journal");
         store.evacuate_unvalidated_journal()?;
         crate::startup::progress("rebuilding frontiers");
         store.rebuild_frontiers()?;
         for branch in store.branches()? {
-            store.rebuild(&branch.id)?;
+            if !store.resume_snapshot(&branch)? {
+                crate::startup::progress("reconstructing snapshot");
+                store.rebuild(&branch.id)?;
+            }
         }
         crate::startup::progress("recovering incoming events");
         store.drain_incoming()?;
@@ -2475,7 +2530,7 @@ pub struct Bundle {
     pub objects: BTreeMap<String, String>,
 }
 /// A sequential, bounded transfer segment. Whole-object hash verification is
-/// required before it enters shared inventory or activates a semantic event.
+/// required before it enters the available shared-object inventory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectPart {
     pub offset: u64,

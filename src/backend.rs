@@ -2,9 +2,10 @@
 //! bucket, not a remote-service durability/authentication qualification.
 use crate::core::{MAX_CONTENT, MAX_FILE, fault, hash, install_object, stream_hash};
 use anyhow::{Context, Result, ensure};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::{Read, Seek, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 pub trait ObjectBackend: Send + Sync {
@@ -71,11 +72,21 @@ impl ObjectBackend for DirectoryBackend {
                 .write(true)
                 .create_new(true)
                 .open(&temp)?;
-            let size = std::io::copy(&mut source.take(MAX_CONTENT + 1), &mut file)?;
-            ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 64 * 1024];
+            let mut size = 0u64;
+            loop {
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                size += count as u64;
+                ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
+                digest.update(&buffer[..count]);
+                file.write_all(&buffer[..count])?;
+            }
             file.sync_all()?;
-            file.rewind()?;
-            let object = stream_hash(&mut file)?;
+            let object = hex::encode(digest.finalize());
             drop(file);
             let dest = self.root.join(&object);
             if dest.exists() {
