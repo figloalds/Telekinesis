@@ -3,6 +3,7 @@ use crate::core::*;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Read;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::TcpListener,
@@ -49,7 +50,9 @@ pub struct Engine {
     pub switching: bool,
     pub mounted: bool,
     pub last_sync: Option<Value>,
+    pub transfers: Arc<Mutex<()>>,
     pub sync_peers: BTreeSet<String>,
+    pub peer_sync: BTreeMap<String, Value>,
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
     pub notifications: Vec<(String, u32)>,
     pub notification_error: Option<String>,
@@ -68,7 +71,9 @@ impl Engine {
             switching: false,
             mounted: false,
             last_sync: None,
+            transfers: Arc::new(Mutex::new(())),
             sync_peers: BTreeSet::new(),
+            peer_sync: BTreeMap::new(),
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             notifications: vec![],
             notification_error: None,
@@ -556,10 +561,15 @@ impl Engine {
                 s["notification_error"] = json!(self.notification_error);
                 s["pending_notifications"] = json!(self.notifications.len());
                 s["last_sync"] = json!(self.last_sync);
+                s["peers"] = json!(self.peer_sync);
+                s["sampled_at_ms"] = json!(time());
                 s["caught_up"] = json!(
                     self.last_sync
                         .as_ref()
-                        .is_some_and(|v| v["caught_up"] == true)
+                        .is_some_and(|v| v["caught_up"] == true
+                            && v["at"]
+                                .as_u64()
+                                .is_some_and(|at| time().saturating_sub(at) < 15000))
                         && s["outgoing_unacknowledged"] == 0
                         && s["incoming_pending"] == 0
                         && s["pending_causal_events"] == json!([])
@@ -567,10 +577,16 @@ impl Engine {
                         && self.health.is_none()
                         && !self.sync_peers.is_empty()
                         && self.sync_peers.iter().all(|peer| {
-                            self.store.shared_event_inventory().ok()
-                                == self.store.known_by_peer(peer).ok()
+                            self.peer_sync
+                                .get(peer)
+                                .and_then(|v| v["at"].as_u64())
+                                .is_some_and(|at| time().saturating_sub(at) < 15000)
+                                && self.store.shared_event_inventory().ok()
+                                    == self.store.known_by_peer(peer).ok()
                         })
                 );
+                s["metadata_caught_up"] = s["caught_up"].clone();
+                s["content_complete"] = s["content"]["complete"].clone();
                 s["upload_state"] = json!(if !self.store.branch(&self.store.active)?.shared {
                     "local-only"
                 } else if self.sync_peers.is_empty() {
@@ -581,6 +597,79 @@ impl Engine {
                     "peer-acknowledged"
                 });
                 return Ok(s);
+            }
+            "folder-details" => {
+                let status = self.control(request, &json!({"op":"status"}))?;
+                let conflicts = self.store.conflicts()?;
+                let review_token = hash(&serde_json::to_vec(&conflicts)?);
+                let offset = payload["offset"].as_u64().unwrap_or(0) as usize;
+                let unresolved: Vec<_> = conflicts
+                    .into_iter()
+                    .filter(|c| c.resolved_by.is_none())
+                    .collect();
+                let conflict_count = unresolved.len();
+                let conflicts: Vec<_> = unresolved.into_iter().skip(offset).take(100).collect();
+                let needed: BTreeSet<_> = conflicts
+                    .iter()
+                    .flat_map(|c| c.alternatives.iter().map(|v| v.revision.clone()))
+                    .collect();
+                let paths: BTreeMap<_, _> =
+                    visible_paths(&self.store.projection(&self.store.active)?)
+                        .into_iter()
+                        .map(|(path, entry)| (entry.id, path))
+                        .collect();
+                let revision_entities: BTreeMap<_, Vec<_>> = self
+                    .store
+                    .events()?
+                    .into_iter()
+                    .filter(|e| needed.contains(&e.id))
+                    .map(|e| {
+                        (
+                            e.id,
+                            e.changes
+                                .into_iter()
+                                .filter(|c| c.field == "location")
+                                .map(|c| c.entity)
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                let missing: Vec<_> = self
+                    .store
+                    .projection(&self.store.active)?
+                    .entries
+                    .values()
+                    .filter(|e| e.alive)
+                    .filter_map(|e| e.content.as_ref().map(|object| (e, object)))
+                    .filter(|(_, object)| !self.store.object_available(object))
+                    .take(20)
+                    .map(|(e, object)| {
+                        self.store
+                            .object_state(object)
+                            .map(|state| json!({"path":paths.get(&e.id),"content":state}))
+                    })
+                    .collect::<Result<_>>()?;
+                return Ok(
+                    json!({"status":status,"conflicts":conflicts,"paths":paths,"review_token":review_token,
+                    "revision_entities":revision_entities,"offset":offset,"conflict_count":conflict_count,"missing_content":missing}),
+                );
+            }
+            "preview-object" => {
+                let object = text("object")?;
+                let mut file = self.store.open_object(object)?;
+                let total = file.metadata()?.len();
+                let mut bytes = Vec::new();
+                std::io::Read::take(&mut file, 64 * 1024).read_to_end(&mut bytes)?;
+                let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+                return Ok(
+                    json!({"object":object,"size":total,"truncated":total > bytes.len() as u64,
+                    "text":if binary { "Binary content; text preview unavailable".to_owned() } else { String::from_utf8_lossy(&bytes).into_owned() }}),
+                );
+            }
+            "request-object" => {
+                let object = text("object")?;
+                self.store.request_object(object)?;
+                return Ok(json!({"queued":true,"object":object}));
             }
             "branches" => return Ok(json!(self.store.branches()?)),
             "conflicts" => return Ok(json!(self.store.conflicts()?)),
@@ -596,6 +685,14 @@ impl Engine {
             _ => {}
         }
         self.quiet()?;
+        if ["resolve", "recover"].contains(&op)
+            && let Some(token) = payload["review_token"].as_str()
+        {
+            ensure!(
+                token == hash(&serde_json::to_vec(&self.store.conflicts()?)?),
+                "STALE_CONFLICT_REVIEW: refresh and review the changed alternatives"
+            );
+        }
         let before = self.store.projection(&self.store.active)?;
         // Semantic mutation and retry receipt share an outer savepoint. All inner
         // journal/current-state/outbox changes commit together with the receipt.
@@ -687,7 +784,7 @@ impl Engine {
 }
 pub type Shared = Arc<Mutex<Engine>>;
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
-/// Format 5 includes durable basic metadata and portable POSIX permissions.
+/// Format 6 separates durable metadata from verified object availability.
 /// Never negotiate down or acknowledge events a peer cannot project.
 pub use crate::core::PEER_FORMAT;
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,7 +867,7 @@ fn dispatch_rpc(engine: &Shared, observation: &Arc<Mutex<Value>>, r: &Value) -> 
         .as_str()
         .is_some_and(|op| op.starts_with("published-"))
     {
-        return crate::paired_sync::worker_control(&mut engine.lock().unwrap(), payload);
+        return published_rpc(engine, payload);
     }
     if payload["op"] == "status" {
         if let Ok(mut e) = engine.try_lock() {
@@ -780,6 +877,30 @@ fn dispatch_rpc(engine: &Shared, observation: &Arc<Mutex<Value>>, r: &Value) -> 
         status["busy"] = json!(true);
         status["stale"] = json!(true);
         return Ok(status);
+    }
+    if payload["op"] == "preview-object" || payload["op"] == "cat-object" {
+        let object = payload["object"].as_str().context("MISSING_ARGUMENT")?;
+        let mut file = fetch_verified(
+            engine,
+            object,
+            std::time::Instant::now() + Duration::from_secs(15),
+        )?;
+        use std::io::Seek;
+        file.rewind()?;
+        let total = file.metadata()?.len();
+        if payload["op"] == "cat-object" {
+            ensure!(total <= MAX_FILE as u64, "OBJECT_REQUIRES_STREAMING");
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            return Ok(json!({"hex":hex::encode(bytes)}));
+        }
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+        return Ok(
+            json!({"object":object,"size":total,"truncated":total > bytes.len() as u64,
+            "text":if binary { "Binary content; text preview unavailable".to_owned() } else { String::from_utf8_lossy(&bytes).into_owned() }}),
+        );
     }
     if payload["op"] == "checkout" && engine.lock().unwrap().mounted {
         return crate::mount::checkout(engine, request, payload);
@@ -802,6 +923,150 @@ fn dispatch_rpc(engine: &Shared, observation: &Arc<Mutex<Value>>, r: &Value) -> 
     }
     engine.lock().unwrap().control(request, payload)
 }
+/// Metadata commits and acknowledgements never wait for object installation.
+/// Bulk hashing/fsync uses a separate connection and lock; filesystem metadata
+/// and control-lane calls remain able to acquire the semantic engine.
+fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
+    let mut metadata = payload.clone();
+    let mut parts = BTreeMap::new();
+    if let Some(page) = metadata.get_mut("page") {
+        let originals: crate::paired_sync::SyncPage = serde_json::from_value(page.clone())?;
+        if payload["metadata_only"] == true {
+            ensure!(
+                originals.object_parts.is_empty() && originals.bundle.objects.is_empty(),
+                "BULK_ON_CONTROL_LANE"
+            );
+        }
+        parts = originals.object_parts;
+        for (object, bytes) in originals.bundle.objects {
+            let total = hex::decode(&bytes)?.len() as u64;
+            parts.insert(
+                object,
+                ObjectPart {
+                    offset: 0,
+                    total,
+                    hex: bytes,
+                },
+            );
+        }
+        page["object_parts"] = json!({});
+        page["bundle"]["objects"] = json!({});
+    }
+    if parts.is_empty() {
+        return crate::paired_sync::worker_control(&mut engine.lock().unwrap(), &metadata);
+    }
+    let (mut result, transfer, lock) = {
+        let mut e = engine.lock().unwrap();
+        let result = crate::paired_sync::worker_control(&mut e, &metadata)?;
+        (result, e.store.transfer_view()?, e.transfers.clone())
+    };
+    if !parts.is_empty() {
+        let _guard = lock.lock().unwrap();
+        let objects: Vec<_> = parts.keys().cloned().collect();
+        let completed = match transfer.receive_parts_data(parts, &[], &BTreeSet::new()) {
+            Ok(completed) => completed,
+            Err(error) => {
+                let e = engine.lock().unwrap();
+                for object in objects {
+                    e.store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", rusqlite::params![object, format!("{error:#}"), time()])?;
+                }
+                return Err(error);
+            }
+        };
+        engine.lock().unwrap().store.register_received(&completed)?;
+        if result.get("known_objects").is_some() {
+            result["known_objects"] = json!(transfer.shared_object_inventory()?);
+            result["partial_objects"] = json!(transfer.partial_objects()?);
+        } else {
+            result["content"] = transfer.content_status()?;
+        }
+    }
+    Ok(result)
+}
+
+/// Hydrate only the requested handle. Waiting and verification happen outside
+/// the engine mutex. All peers see the durable request on their next exchange.
+pub fn prepare_content(engine: &Shared, handle: u64, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let reference = {
+            let e = engine.lock().unwrap();
+            e.session(handle)?
+                .bytes
+                .reference()
+                .map(|(_, object, size)| (object.to_owned(), size))
+        };
+        let Some((object, size)) = reference else {
+            return Ok(());
+        };
+        let file = fetch_verified(engine, &object, deadline)?;
+        let e = engine.lock().unwrap();
+        let session = e.session(handle)?;
+        if session
+            .bytes
+            .reference()
+            .is_some_and(|(_, h, n)| h == object && n == size)
+        {
+            session.bytes.prime(file);
+            return Ok(());
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "CONTENT_UNAVAILABLE: revision changed during download"
+        );
+    }
+}
+fn fetch_verified(
+    engine: &Shared,
+    object: &str,
+    deadline: std::time::Instant,
+) -> Result<std::fs::File> {
+    let (path, size, lock, stopping) = {
+        let e = engine.lock().unwrap();
+        valid_object(object)?;
+        (
+            e.store.root.join("objects").join(object),
+            e.store.object_size(object)?,
+            e.transfers.clone(),
+            e.stopping.clone(),
+        )
+    };
+    let mut queued = false;
+    loop {
+        ensure!(
+            !stopping.load(std::sync::atomic::Ordering::Relaxed),
+            "WORKER_STOPPING"
+        );
+        if path.is_file() {
+            let mut file = std::fs::File::open(&path)?;
+            if file.metadata()?.len() == size && stream_hash(&mut file)? == object {
+                return Ok(file);
+            }
+            drop(file);
+            let _guard = lock.lock().unwrap();
+            if path.is_file() {
+                // Recheck after acquiring the install lock: another request may
+                // have repaired the path while this reader verified old bytes.
+                let mut current = std::fs::File::open(&path)?;
+                if current.metadata()?.len() == size && stream_hash(&mut current)? == object {
+                    return Ok(current);
+                }
+                drop(current);
+                std::fs::rename(&path, path.with_extension(format!("corrupt-{}", id())))?;
+            }
+        }
+        if !queued {
+            engine.lock().unwrap().store.request_object(object)?;
+            queued = true;
+        }
+        ensure!(
+            std::time::Instant::now() < deadline,
+            "CONTENT_UNAVAILABLE: {object}; download queued, no verified copy available before deadline"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn visible_paths(p: &Projection) -> BTreeMap<String, Entry> {
     let mut result = BTreeMap::new();
     for e in p.entries.values().filter(|e| e.alive) {

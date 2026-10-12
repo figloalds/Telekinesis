@@ -116,6 +116,11 @@ pub enum Action {
     Inspect {
         state: String,
     },
+    Folder {
+        state: String,
+        request: String,
+        payload: Value,
+    },
     Create {
         label: String,
         mount: Option<PathBuf>,
@@ -627,6 +632,34 @@ pub fn client(config: &Config, action: &Action) -> Result<Value> {
 pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
     // Remote I/O runs without holding the lifecycle/catalog lock.
     match action {
+        Action::Folder {
+            state,
+            request,
+            payload,
+        } => {
+            ensure!(
+                matches!(
+                    payload["op"].as_str(),
+                    Some(
+                        "status"
+                            | "folder-details"
+                            | "conflicts"
+                            | "preview-object"
+                            | "request-object"
+                            | "resolve"
+                            | "recover"
+                            | "branches"
+                            | "history"
+                            | "checkpoint"
+                            | "branch"
+                            | "restore"
+                    )
+                ),
+                "UNSUPPORTED_FOLDER_ACTION"
+            );
+            let info = shared.lock().unwrap().discovery(&state)?;
+            return runtime::rpc(&info, &request, payload);
+        }
         Action::Pair {
             endpoint,
             code,
