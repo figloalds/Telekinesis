@@ -192,13 +192,15 @@ pub unsafe extern "C" fn tk_call(
     transferred: *mut u32,
 ) -> u32 {
     let run = std::panic::catch_unwind(|| -> Result<u32> {
-        let mut e = ENGINE
-            .get()
-            .context("ENGINE_NOT_READY")?
-            .lock()
-            .map_err(|_| anyhow::anyhow!("ENGINE_POISONED"))?;
+        let engine = ENGINE.get().context("ENGINE_NOT_READY")?;
         let h = unsafe { *token };
         let path = unsafe { string(name) };
+        if op == 4 || op == 5 || op == 6 && offset != 0 {
+            crate::runtime::prepare_content(engine, h, std::time::Duration::from_secs(15))?;
+        }
+        let mut e = engine
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ENGINE_POISONED"))?;
         let mut out = Info::default();
         let mut count = 0;
         match op {
@@ -348,7 +350,9 @@ pub unsafe extern "C" fn tk_call(
                 }
                 e.publish_observation();
             }
-            if message.contains("FILE_NOT_FOUND") {
+            if message.contains("CONTENT_UNAVAILABLE") {
+                0xc0000267 // STATUS_FILE_IS_OFFLINE
+            } else if message.contains("FILE_NOT_FOUND") {
                 0xc0000034
             } else if message.contains("NAME_COLLISION") {
                 0xc0000035

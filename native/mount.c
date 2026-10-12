@@ -105,7 +105,9 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out) {
     wcscpy_s(p.FileSystemName,sizeof p.FileSystemName/sizeof(WCHAR),L"TKFS");
     NTSTATUS status=FspFileSystemCreate(L"WinFsp.Disk",&p,&Interface,out);
     if(!NT_SUCCESS(status))return status;
-    FspFileSystemSetOperationGuardStrategy(*out,FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_COARSE);
+    /* Rust serializes semantic mutations. Keep only namespace guards here so
+       a read waiting for remote content cannot hold a volume-wide mutex. */
+    FspFileSystemSetOperationGuardStrategy(*out,FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
     status=FspFileSystemSetMountPoint(*out,path);
     if(NT_SUCCESS(status))status=FspFileSystemStartDispatcher(*out,0);
     if(!NT_SUCCESS(status)){FspFileSystemDelete(*out);*out=0;}return status;

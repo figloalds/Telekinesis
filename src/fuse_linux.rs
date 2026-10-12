@@ -300,7 +300,11 @@ fn name(bytes: &[u8]) -> Result<&str> {
 }
 fn errno(error: &anyhow::Error) -> i32 {
     let text = format!("{error:#}");
-    if text.contains("FILE_NOT_FOUND") {
+    if text.contains("UNSUPPORTED_FUSE_OPCODE") {
+        libc::ENOSYS // Let the kernel fall back (e.g. STATX to GETATTR).
+    } else if text.contains("CONTENT_UNAVAILABLE") {
+        libc::EAGAIN
+    } else if text.contains("FILE_NOT_FOUND") {
         libc::ENOENT
     } else if text.contains("NAME_COLLISION") {
         libc::EEXIST
@@ -813,7 +817,9 @@ impl Filesystem {
     }
 }
 fn serve(mut device: File, engine: Shared) -> Result<()> {
-    let mut fs = Filesystem::new();
+    let fs = std::sync::Arc::new(std::sync::Mutex::new(Filesystem::new()));
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(device.try_clone()?));
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut bytes = vec![0; MAX_IO + 4096];
     loop {
         let count = match device.read(&mut bytes) {
@@ -834,37 +840,73 @@ fn serve(mut device: File, engine: Shared) -> Result<()> {
         }
         let unique = u64_at(p, 8)?;
         let inode = u64_at(p, 16)?;
+        // Content waits must not stop the single /dev/fuse reader from serving
+        // unrelated lookups and metadata requests. Bound outstanding requests.
+        if [15, 16].contains(&op) {
+            let body = p[40..].to_vec();
+            let handle = u64_at(&body, 0)?;
+            if in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                write_reply(
+                    &writer,
+                    unique,
+                    Err(anyhow::anyhow!(
+                        "CONTENT_UNAVAILABLE: download capacity busy"
+                    )),
+                )?;
+                continue;
+            }
+            let engine = engine.clone();
+            let fs = fs.clone();
+            let writer = writer.clone();
+            let in_flight = in_flight.clone();
+            std::thread::spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::runtime::prepare_content(
+                        &engine,
+                        handle,
+                        std::time::Duration::from_secs(15),
+                    )?;
+                    let mut e = engine.lock().unwrap();
+                    let result = fs.lock().unwrap().dispatch(&mut e, op, inode, &body);
+                    e.publish_observation();
+                    result
+                }))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("FUSE_CALLBACK_PANIC")));
+                let _ = write_reply(&writer, unique, result);
+                in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            });
+            continue;
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut e = engine
                 .lock()
                 .map_err(|_| anyhow::anyhow!("ENGINE_POISONED"))?;
-            let result = fs.dispatch(&mut e, op, inode, &p[40..]);
+            let result = fs.lock().unwrap().dispatch(&mut e, op, inode, &p[40..]);
             e.publish_observation();
             result
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("FUSE_CALLBACK_PANIC")));
-        let (error, body) = match result {
-            Ok(body) => (0, body),
-            Err(error) => {
-                let code = errno(&error);
-                if code == libc::EIO {
-                    eprintln!("FUSE op={op}: {error:#}");
-                }
-                (-code, vec![])
-            }
-        };
-        let mut reply = Vec::with_capacity(16 + body.len());
-        push32(&mut reply, (16 + body.len()) as u32);
-        push32(&mut reply, error as u32);
-        push64(&mut reply, unique);
-        reply.extend(body);
-        if let Err(error) = device.write_all(&reply) {
-            if error.raw_os_error() == Some(libc::ENOENT) {
-                continue;
-            }
-            if error.raw_os_error() == Some(libc::ENODEV) {
-                break;
-            }
+        write_reply(&writer, unique, result)?;
+    }
+    Ok(())
+}
+fn write_reply(
+    writer: &std::sync::Mutex<File>,
+    unique: u64,
+    result: Result<Vec<u8>>,
+) -> Result<()> {
+    let (error, body) = match result {
+        Ok(body) => (0, body),
+        Err(error) => (-errno(&error), vec![]),
+    };
+    let mut reply = Vec::with_capacity(16 + body.len());
+    push32(&mut reply, (16 + body.len()) as u32);
+    push32(&mut reply, error as u32);
+    push64(&mut reply, unique);
+    reply.extend(body);
+    if let Err(error) = writer.lock().unwrap().write_all(&reply) {
+        if ![Some(libc::ENOENT), Some(libc::ENODEV)].contains(&error.raw_os_error()) {
             return Err(error.into());
         }
     }
