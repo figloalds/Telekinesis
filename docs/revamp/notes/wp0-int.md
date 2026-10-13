@@ -2,8 +2,8 @@
 
 Branch `revamp/wp0-int`, cut from `revamp/wave-0-base` (`4af40db`).
 `revamp/production-sync` was not touched and `revamp/wave-1-base` was not
-created: the coordinator does both after review (§13 rule 8, items 7 and the
-fast-forward).
+created: the coordinator does both after review (the fast-forward of §13
+rule 6 and item 7 of rule 8).
 
 ## Summary
 
@@ -84,8 +84,9 @@ fast-forward).
      than `MAX_IDLE = 8` are idle and it is in autocommit; otherwise it is
      closed (which rolls back anything left open). Pooled connections see the
      engine's commits through WP0.3's `data_version` view key (tested).
-   - **`EngineGaugeCell`** keeps everything in atomics plus a 1,024-sample
-     ring of waits for `wait_p99_ms` (nearest rank). `record_hold` counts the
+   - **`EngineGaugeCell`** keeps its counters in atomics, plus a
+     1,024-sample ring of waits for `wait_p99_ms` (nearest rank) behind a
+     short internal mutex (never the engine lock). `record_hold` counts the
      hold, updates `longest_hold_ms` and ends the hold in progress;
      `begin_hold` starts it, so `current_hold_ms` and `stalled`
      (> `timing::ENGINE_STALLED_AFTER`, 120 s) are computable without the
@@ -279,7 +280,71 @@ fast-forward).
 
 ## VERIFY
 
-VERIFY_RESULTS_PLACEHOLDER
+All on the final code (`1f16b00`; the commits after it only add these notes
+and the evidence file), Windows `CARGO_TARGET_DIR=C:/tkfs-target/wp0-int`,
+WSL `CARGO_TARGET_DIR=$HOME/tkfs-target/wp0-int`.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo build --all-targets` | pass, no warnings |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `powershell -NoProfile -File scripts/suite-lock.ps1 cargo test --all-targets` (the repo's lock script works and was used, see deviation 9) | **pass, EXIT=0: 194 passed, 0 failed, 80 ignored** across 38 test binaries |
+| WSL `cargo check --all-targets` | pass, no warnings |
+| WSL `cargo clippy --all-targets -- -D warnings` (extra: covers the `cfg(unix)` code) | pass |
+| WSL `cargo test --lib --test orchestrator --test seam_stubs --test worker_seams --test contracts --test harness_selftest --test partial_content --test oracle_smoke --test runtime_lanes --test availability --test paired_sync` | **pass: 124 passed, 0 failed** (lib 16 + 1 ignored, orchestrator 15, seam_stubs 7, worker_seams 3, contracts 31, harness_selftest 18 + 2 ignored, partial_content 8, oracle_smoke 4, runtime_lanes 3, availability 10, paired_sync 9). Of §13 rule 8's subset only `orchestrator` exists yet (`session_*`, `worker_lifecycle`, `mount_lifecycle` arrive in Wave 1); `/dev/fuse` is present, so the FUSE mount tests ran |
+| Legacy fixtures (§13 rule 8.3) | `harness_selftest::legacy_worker_fixture_opens_with_current_build` and `legacy_datadir_fixture_opens_with_current_build` pass on Windows and WSL; the release qual scenario `legacy_fixture_upgrade_then_sync` passes |
+| Compat goldens | `harness_selftest::compat_goldens_recapture_identically` passes on Windows and WSL |
+| Qualify baseline reproduced | see below |
+
+**Full-suite breakdown (Windows).** 194 = the 130 baseline tests (lib 13 +
+1 ignored, bin 4, integration 113) + `worker_seams` 3 (WP0.2) +
+`oracle_smoke` 4 (WP0.3) + `contracts` 31 (WP0.4) + `harness_selftest` 18
+(WP0.5) + `seam_stubs` 7 + the `pairing_code` unit test (lib is now 14). The
+80 ignored are the baseline's 1, WP0.5's 2 capture routines and the 77 qual
+scenarios. Per binary: lib 14 (+1 ignored), main 4, acknowledgements 3,
+additional 5, availability 13, basic_metadata 4, bulk_lanes 3, contracts 31,
+core 16, directory_progress 3, harness_selftest 18 (+2), oracle_smoke 4,
+orchestrator 15, paired_sync 9, partial_content 8, posix_metadata 3,
+recovery 6, replication_regressions 9, runtime_lanes 3, scalability 5,
+seam_stubs 7, startup_snapshots 8, worker_seams 3, and 15 qual binaries with
+0 run and 77 ignored. The brief's "135" baseline does not match the tree:
+like WP0.1–WP0.4, I count 131 listed (130 run + 1 ignored) on Windows at
+`4af40db`.
+
+**Flakes seen during the integration** (none in the final full suite):
+`partial_content::bulk_install_wait_does_not_block_control_rpc` once
+(fixed, CCR-WP0.INT-1) and
+`orchestrator::three_orchestrators_relay_origins_and_private_branches_stay_local`
+once in a targeted run (filed, CCR-WP0.INT-2).
+
+**Qualification baseline reproduced** (`test-evidence/qualification-wave-0.json`,
+committed now that CCR-WP0.5-2 un-ignores it). Command:
+`powershell -NoProfile -File scripts/qualify.ps1 -Baseline -BudgetS 60 -FileTimeoutMin 60 -Evidence test-evidence/qualification-wave-0.json`,
+the same settings as WP0.5's baseline, on a clean tree at `1f16b00`
+(`dirty: false`), release, 4,278 s (baseline: 3,956 s), same machine
+(Ryzen 9 7950X3D, rustc 1.96.0). `-Wave 0` does not exist (there are no
+Wave 0 floors), so `-Baseline` with a separate evidence file is the
+reproduction; `qualification-baseline.json` was not overwritten.
+
+| | WP0.5 baseline (`9454104`) | merged tree (`1f16b00`) |
+|---|---|---|
+| Scenarios | 77: pass 7, fail 38, timeout 31, skipped 1 | 77: pass 7, fail 38, timeout 31, skipped 1 |
+| Scenario statuses that differ | | **0** of 77 |
+| Floors | 49: pass 1, fail 21, incomplete 25, missing 2 | 49: pass 1, fail 21, incomplete 25, missing 2 |
+| Floor verdicts that differ | | **0** of 49 |
+| Files | 15 × fail (exit 101) | 15 × fail (exit 101), same passed/failed count in every `test result:` line |
+
+Measured values moved within run-to-run variation on a shared machine (other
+agents were running suites), for example `api_p99_under_churn` 23.0 → 15.8 ms,
+`scale_remote_linear_6400` 660 → 459 ms/event, `idle_exchange_50k_cpu`
+5,598 → 7,988 ms (WP0.5 recorded 5.9 s and 8.2 s in earlier baseline runs),
+`content_status_50k` 5,670 → 8,500 ms. The last one was checked by A/B:
+alternating the release `qual_wp1_8_objects` binary of this tree with the one
+WP0.5 built from the baseline sources (`C:/tkfs-target/wp0-5`, run, not
+modified), `content_status_50k` p50 was 9,640 / 9,241 / 6,369 ms for the
+baseline binary and 6,784 / 8,217 / 6,676 ms for this tree. It is the same
+single-connection `Store::content_status` code, moved verbatim by WP0.3.
 
 ## Known limitations
 
