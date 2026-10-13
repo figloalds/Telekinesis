@@ -1,20 +1,75 @@
 //! Multiplexed request/response connections over one authenticated socket
-//! (§6.2). Stub landed by WP0.4 with the final public API; WP1.9 implements
-//! it. Until then `Conn::from_established` fails with `NOT_IMPLEMENTED`, so no
-//! `Conn` can exist and the methods below are unreachable placeholders.
+//! (§6.2). Owned by WP1.9.
+//!
+//! A [`Conn`] is a handle to one WebSocket connection. One I/O thread
+//! (`super::io`) owns the socket; everything else talks to it through the
+//! shared state below and wakes it with `Poller::notify()`.
+//!
+//! * **Requests.** Only the client side originates requests; ids are
+//!   allocated by the client. [`Conn::call`] has an absolute deadline,
+//!   [`Conn::call_streaming`] an optional absolute deadline plus an idle
+//!   deadline that PROGRESS and CHUNK frames reset, and [`Conn::upload`]
+//!   streams the request body. On expiry, on an error from the chunk callback
+//!   and when an [`Upload`] is dropped unfinished, the call sends CANCEL and
+//!   drops whatever of it is still queued; a late reply is discarded. A
+//!   request whose connection fails is *uncertain* (`ConnectionLost`) and is
+//!   never replayed (invariant 16).
+//! * **Responses.** A RESPONSE with `ok:false` is a [`CallError::Remote`] and
+//!   leaves the connection usable (invariant 17).
+//! * **Serving.** [`Conn::serve`] starts the connection's handler pool
+//!   (`ConnOptions::handlers` threads). Requests wait in a bounded queue
+//!   (`ConnOptions::handler_queue`); a full queue answers `BUSY` (Contention)
+//!   at once. `ping` is answered by the I/O thread itself, so liveness checks
+//!   never wait behind busy handlers.
+//! * **Queues.** Outgoing frames wait in three queues, written in priority
+//!   order: control (header-only REQUEST/RESPONSE, PROGRESS, CANCEL,
+//!   HEARTBEAT, GOAWAY; ≤ `control_queue_bytes`), response bodies
+//!   (round-robin per request id) and data CHUNKs (round-robin per request id;
+//!   ≤ `data_queue_bytes`). Producers of data block, outside the I/O thread,
+//!   while the data queue is full (backpressure). All frames of one request id
+//!   stay in order: the final RESPONSE of a streamed reply follows its chunks
+//!   through the data queue.
+//! * **Bodies** larger than one chunk (`max_chunk`, 1 MiB) are split: the
+//!   REQUEST/RESPONSE frame carries the first part with `MORE` and
+//!   `total`, CHUNK frames (`hash: None`) carry the rest, the last one with
+//!   `LAST`. They are reassembled up to the per-op limit
+//!   (`protocol::max_body`, capped by `ConnOptions::max_body`).
+//! * **Streams.** A streamed response is CHUNK frames (`MORE`, each delivered
+//!   to the `call_streaming` callback) followed by the RESPONSE. A streamed
+//!   request is a REQUEST with `MORE` and no `total`, CHUNK frames with `MORE`
+//!   (delivered to [`Incoming::chunks`]), and an empty CHUNK without `MORE`
+//!   that ends the body.
 use crate::{
     model::{
         errors::ErrorWire,
         orchestrator::CallError,
-        protocol::{LaneRole, LaneSpec, frame},
+        protocol::{
+            self, LaneRole, LaneSpec,
+            frame::{
+                self as wire, CancelHeader, FLAG_LAST, FLAG_MORE, FrameKind, ProgressHeader,
+                RequestHeader, ResponseHeader,
+            },
+        },
     },
-    session::not_implemented,
+    session::{
+        frame::{FrameError, FrameLimits, encode_with},
+        io,
+    },
+    util::lock::lock,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    cell::Cell,
+    collections::{HashMap, VecDeque},
     net::TcpStream,
-    sync::{Arc, mpsc::Receiver},
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::Receiver,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use tungstenite::{WebSocket, stream::MaybeTlsStream};
@@ -58,15 +113,15 @@ pub struct ConnOptions {
 impl Default for ConnOptions {
     fn default() -> Self {
         Self {
-            heartbeat: frame::HEARTBEAT_AFTER,
-            dead_after: frame::DEAD_AFTER,
-            max_header: frame::MAX_HEADER,
-            max_chunk: frame::MAX_CHUNK,
-            max_body: frame::MAX_BODY_META,
+            heartbeat: wire::HEARTBEAT_AFTER,
+            dead_after: wire::DEAD_AFTER,
+            max_header: wire::MAX_HEADER,
+            max_chunk: wire::MAX_CHUNK,
+            max_body: wire::MAX_BODY_META,
             handlers: crate::model::orchestrator::limits::CONTROL_HANDLERS,
             handler_queue: crate::model::orchestrator::limits::HANDLER_QUEUE,
-            control_queue_bytes: frame::CONTROL_QUEUE_BYTES,
-            data_queue_bytes: frame::DATA_QUEUE_BYTES,
+            control_queue_bytes: wire::CONTROL_QUEUE_BYTES,
+            data_queue_bytes: wire::DATA_QUEUE_BYTES,
         }
     }
 }
@@ -79,6 +134,28 @@ impl ConnOptions {
             options.handlers = crate::model::orchestrator::limits::BULK_HANDLERS;
         }
         options
+    }
+
+    /// The options a connection actually runs with: timers of at least 10 ms
+    /// (`dead_after` ≥ `heartbeat`), a chunk size within the wire bound of
+    /// 1 MiB, at least one handler thread, and queue bounds that admit one
+    /// full frame.
+    pub fn sanitized(self) -> Self {
+        let max_chunk = self.max_chunk.clamp(1, wire::MAX_CHUNK);
+        let max_header = self.max_header.clamp(256, wire::MAX_HEADER);
+        let frame = wire::PREFIX_LEN + max_header + max_chunk;
+        let heartbeat = self.heartbeat.max(Duration::from_millis(10));
+        Self {
+            heartbeat,
+            dead_after: self.dead_after.max(heartbeat),
+            max_header,
+            max_chunk,
+            max_body: self.max_body.max(max_chunk),
+            handlers: self.handlers.max(1),
+            handler_queue: self.handler_queue,
+            control_queue_bytes: self.control_queue_bytes.max(frame),
+            data_queue_bytes: self.data_queue_bytes.max(frame),
+        }
     }
 }
 
@@ -115,17 +192,23 @@ pub struct PeerInfo {
 /// What the accepting side learns about the dialer.
 pub type AcceptedPeer = PeerInfo;
 
-/// Connection metrics (WP1.9).
+/// Connection metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnHealth {
+    /// When the connection was established (Unix ms).
     pub since_ms: u64,
+    /// Round-trip time from the last heartbeat echo.
     #[serde(default)]
     pub rtt_ms: Option<u64>,
+    /// Last frame received / written (Unix ms).
     pub last_rx_ms: u64,
     pub last_tx_ms: u64,
+    /// Frame bytes written / received.
     pub bytes_up: u64,
     pub bytes_down: u64,
+    /// Requests in flight: pending calls plus requests being served.
     pub inflight: u32,
+    /// Bytes waiting in the outgoing queues.
     pub queued_bytes: u64,
 }
 
@@ -133,20 +216,13 @@ pub struct ConnHealth {
 /// not close it: call [`Conn::close`] or [`Conn::goaway`].
 #[derive(Clone)]
 pub struct Conn {
-    inner: Arc<Inner>,
-}
-
-// Constructed by `from_established` once WP1.9 lands.
-#[allow(dead_code)]
-struct Inner {
-    side: Side,
-    peer: PeerInfo,
-    options: ConnOptions,
+    inner: Arc<Shared>,
 }
 
 impl std::fmt::Debug for Conn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Conn")
+            .field("name", &self.inner.name)
             .field("side", &self.inner.side)
             .field("peer", &self.inner.peer)
             .field("options", &self.inner.options)
@@ -154,23 +230,814 @@ impl std::fmt::Debug for Conn {
     }
 }
 
-fn unavailable() -> CallError {
-    CallError::Unavailable(not_implemented("session::Conn").message)
+// ---------------------------------------------------------------------------
+// Shared state between the API, the handler pool and the I/O thread.
+
+/// How long a waiter sleeps before re-checking cancellation flags.
+pub(crate) const RECHECK: Duration = wire::DEADLINE_SCAN;
+/// A stand-in for "no deadline" that cannot overflow `Instant`.
+const FAR: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Longest error message carried in a RESPONSE or GOAWAY header.
+const MAX_ERROR_MESSAGE: usize = 4096;
+
+pub(crate) fn ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+pub(crate) fn after(start: Instant, duration: Duration) -> Instant {
+    start.checked_add(duration).unwrap_or_else(|| start + FAR)
+}
+
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+fn truncate(mut text: String) -> String {
+    if text.len() > MAX_ERROR_MESSAGE {
+        let mut end = MAX_ERROR_MESSAGE;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+/// A local refusal for a frame that cannot be encoded (nothing was sent).
+fn local_error(error: FrameError) -> CallError {
+    match error {
+        FrameError::HeaderTooLarge { .. } | FrameError::BodyTooLarge { .. } => {
+            CallError::Remote(ErrorWire::coded("WS_MESSAGE_TOO_LARGE", error))
+        }
+        other => CallError::Remote(ErrorWire::new("PROTOCOL_VIOLATION", other.to_string())),
+    }
+}
+
+/// Outgoing queue a frame waits in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    Control,
+    Response,
+    Data,
+}
+
+/// Per-request-id FIFO queues served round-robin.
+#[derive(Default)]
+pub(crate) struct RoundRobin {
+    streams: HashMap<u64, VecDeque<Vec<u8>>>,
+    order: VecDeque<u64>,
+    bytes: usize,
+}
+
+impl RoundRobin {
+    fn push(&mut self, id: u64, frame: Vec<u8>) {
+        self.bytes += frame.len();
+        match self.streams.get_mut(&id) {
+            Some(queue) => queue.push_back(frame),
+            None => {
+                self.streams.insert(id, VecDeque::from([frame]));
+                self.order.push_back(id);
+            }
+        }
+    }
+
+    fn pop(&mut self) -> Option<Vec<u8>> {
+        while let Some(id) = self.order.pop_front() {
+            let Some(queue) = self.streams.get_mut(&id) else {
+                continue;
+            };
+            let frame = queue.pop_front();
+            if queue.is_empty() {
+                self.streams.remove(&id);
+            } else {
+                self.order.push_back(id);
+            }
+            if let Some(frame) = frame {
+                self.bytes -= frame.len();
+                return Some(frame);
+            }
+        }
+        None
+    }
+
+    fn purge(&mut self, id: u64) -> usize {
+        let Some(queue) = self.streams.remove(&id) else {
+            return 0;
+        };
+        self.order.retain(|other| *other != id);
+        let bytes = queue.iter().map(Vec::len).sum::<usize>();
+        self.bytes -= bytes;
+        bytes
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.streams.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
+/// The three outgoing queues of a connection.
+#[derive(Default)]
+pub(crate) struct Queues {
+    control: VecDeque<(u64, Vec<u8>)>,
+    control_bytes: usize,
+    response: RoundRobin,
+    pub(crate) data: RoundRobin,
+}
+
+impl Queues {
+    pub(crate) fn push(&mut self, lane: Lane, id: u64, frame: Vec<u8>) {
+        match lane {
+            Lane::Control => {
+                self.control_bytes += frame.len();
+                self.control.push_back((id, frame));
+            }
+            Lane::Response => self.response.push(id, frame),
+            Lane::Data => self.data.push(id, frame),
+        }
+    }
+
+    /// The next frame in priority order, and whether it came from the data
+    /// queue (whose producers may be waiting for space).
+    pub(crate) fn pop(&mut self) -> Option<(Vec<u8>, bool)> {
+        if let Some((_, frame)) = self.control.pop_front() {
+            self.control_bytes -= frame.len();
+            return Some((frame, false));
+        }
+        if let Some(frame) = self.response.pop() {
+            return Some((frame, false));
+        }
+        self.data.pop().map(|frame| (frame, true))
+    }
+
+    /// Drops every queued frame of request `id`; returns the data bytes freed.
+    pub(crate) fn purge(&mut self, id: u64) -> usize {
+        let mut freed = 0;
+        self.control.retain(|(other, frame)| {
+            let keep = *other != id;
+            if !keep {
+                freed += frame.len();
+            }
+            keep
+        });
+        self.control_bytes -= freed;
+        self.response.purge(id);
+        self.data.purge(id)
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.control_bytes + self.response.bytes() + self.data.bytes()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.control.is_empty() && self.response.is_empty() && self.data.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.control.clear();
+        self.control_bytes = 0;
+        self.response.clear();
+        self.data.clear();
+    }
+}
+
+/// What a waiting call receives from the I/O thread. A stream chunk is a
+/// zero-copy slice of the received WebSocket message.
+pub(crate) enum Event {
+    Chunk(ChunkHeader, tungstenite::Bytes),
+    Progress,
+    Done(Result<Reply, ErrorWire>),
+    Lost(String),
+}
+
+/// One pending client call. The I/O thread pushes events only while holding
+/// the state lock and while the call is still in `State::pending`, so a
+/// caller that removes its own entry under the lock knows no more events can
+/// arrive.
+pub(crate) struct Slot {
+    /// Reassembly limit of the response body.
+    pub(crate) limit: usize,
+    events: Mutex<VecDeque<Event>>,
+    ready: Condvar,
+}
+
+impl Slot {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            events: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn push(&self, event: Event) {
+        lock(&self.events).push_back(event);
+        self.ready.notify_one();
+    }
+
+    /// The next event, waiting until `until` (`None`: no limit). `None` on
+    /// timeout.
+    fn next(&self, until: Option<Instant>) -> Option<Event> {
+        let mut events = lock(&self.events);
+        loop {
+            if let Some(event) = events.pop_front() {
+                return Some(event);
+            }
+            match until {
+                None => {
+                    events = self
+                        .ready
+                        .wait(events)
+                        .unwrap_or_else(PoisonError::into_inner)
+                }
+                Some(until) => {
+                    let now = Instant::now();
+                    if now >= until {
+                        return None;
+                    }
+                    events = self
+                        .ready
+                        .wait_timeout(events, until - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+        }
+    }
+
+    fn drain(&self) -> Vec<Event> {
+        lock(&self.events).drain(..).collect()
+    }
+
+    /// The error an unfinished upload reports once its request has ended.
+    fn ended_error(&self) -> CallError {
+        let events = lock(&self.events);
+        for event in events.iter() {
+            match event {
+                Event::Done(Err(error)) => return CallError::Remote(error.clone()),
+                Event::Lost(detail) => return CallError::ConnectionLost(detail.clone()),
+                _ => {}
+            }
+        }
+        // Answered before the body ended (or abandoned): `finish` returns the
+        // reply, if there is one.
+        CallError::Cancelled
+    }
+}
+
+/// A request being served.
+pub(crate) struct Serving {
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) deadline: Instant,
+}
+
+#[derive(Default)]
+pub(crate) struct State {
+    pub(crate) queues: Queues,
+    /// Client calls in flight.
+    pub(crate) pending: HashMap<u64, Arc<Slot>>,
+    /// Server requests dispatched (queued or running) and not yet answered.
+    pub(crate) serving: HashMap<u64, Serving>,
+    /// Requests waiting for a handler thread.
+    pub(crate) incoming: VecDeque<Incoming>,
+    pub(crate) handler: Option<Arc<dyn Handler>>,
+    handler_threads: usize,
+    pub(crate) space_waiters: usize,
+    pub(crate) close_request: Option<ErrorWire>,
+    pub(crate) goaway_sent: Option<ErrorWire>,
+    pub(crate) goaway_received: Option<ErrorWire>,
+    pub(crate) goaway_deadline: Option<Instant>,
+    /// Why the connection closed; set once, by the I/O thread.
+    pub(crate) closed: Option<ErrorWire>,
+    /// The I/O thread released the socket.
+    pub(crate) finished: bool,
+}
+
+impl State {
+    /// Why a new request is refused (nothing is sent), if it is.
+    fn refusal(&self) -> Option<String> {
+        self.closed
+            .as_ref()
+            .or(self.close_request.as_ref())
+            .or(self.goaway_received.as_ref())
+            .or(self.goaway_sent.as_ref())
+            .map(ToString::to_string)
+    }
+
+    /// Takes queued (not yet running) requests matching `pick` out of the
+    /// handler queue. The caller drops them after releasing the lock.
+    pub(crate) fn take_incoming(&mut self, pick: impl Fn(u64) -> bool) -> Vec<Incoming> {
+        let mut taken = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.incoming.len());
+        for incoming in self.incoming.drain(..) {
+            if pick(incoming.id) {
+                taken.push(incoming);
+            } else {
+                kept.push_back(incoming);
+            }
+        }
+        self.incoming = kept;
+        taken
+    }
+}
+
+pub(crate) struct Shared {
+    pub(crate) name: String,
+    pub(crate) side: Side,
+    pub(crate) peer: PeerInfo,
+    pub(crate) options: ConnOptions,
+    pub(crate) poller: Arc<polling::Poller>,
+    pub(crate) state: Mutex<State>,
+    /// Producers waiting for data-queue space.
+    pub(crate) space: Condvar,
+    /// Handler threads waiting for requests.
+    pub(crate) work: Condvar,
+    /// `wait_closed` callers.
+    pub(crate) finished: Condvar,
+    /// Next client request id (ids start at 1).
+    pub(crate) next_id: AtomicU64,
+    pub(crate) since_ms: u64,
+    pub(crate) last_rx_ms: AtomicU64,
+    pub(crate) last_tx_ms: AtomicU64,
+    pub(crate) bytes_up: AtomicU64,
+    pub(crate) bytes_down: AtomicU64,
+    /// `u64::MAX` until the first heartbeat echo.
+    pub(crate) rtt_ms: AtomicU64,
+    /// Received stream bytes not yet taken by their callers.
+    pub(crate) rx_buffered: AtomicUsize,
+    /// The I/O thread stopped reading because receivers are behind.
+    pub(crate) rx_paused: AtomicBool,
+}
+
+impl Shared {
+    pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
+        lock(&self.state)
+    }
+
+    /// Wakes the I/O thread.
+    pub(crate) fn wake(&self) {
+        let _ = self.poller.notify();
+    }
+
+    /// Bounds for frames this side encodes.
+    pub(crate) fn send_limits(&self) -> FrameLimits {
+        FrameLimits {
+            max_header: self.options.max_header,
+            max_body: self.options.max_chunk,
+        }
+    }
+
+    /// Bounds for frames received from the peer (the wire bound for bodies).
+    pub(crate) fn receive_limits(&self) -> FrameLimits {
+        FrameLimits {
+            max_header: self.options.max_header,
+            max_body: wire::MAX_CHUNK,
+        }
+    }
+
+    /// Reassembled body limit of `op`.
+    pub(crate) fn body_limit(&self, op: &str) -> usize {
+        protocol::max_body(op).min(self.options.max_body)
+    }
+
+    /// Received-but-undelivered bytes above which the I/O thread stops reading.
+    pub(crate) fn rx_cap(&self) -> usize {
+        self.options.data_queue_bytes
+    }
+
+    fn rx_consumed(&self, bytes: usize) {
+        let before = self.rx_buffered.fetch_sub(bytes, Ordering::AcqRel);
+        if self.rx_paused.load(Ordering::Acquire)
+            && before.saturating_sub(bytes) <= self.rx_cap() / 2
+        {
+            self.wake();
+        }
+    }
+
+    fn data_room(&self, state: &State, bytes: usize) -> bool {
+        let queued = state.queues.data.bytes();
+        queued == 0 || queued + bytes <= self.options.data_queue_bytes
+    }
+
+    fn wait_space<'a>(
+        &self,
+        mut state: MutexGuard<'a, State>,
+        until: Instant,
+    ) -> MutexGuard<'a, State> {
+        let now = Instant::now();
+        let wait = until.saturating_duration_since(now).min(RECHECK);
+        state.space_waiters += 1;
+        let mut state = self
+            .space
+            .wait_timeout(state, wait)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+        state.space_waiters -= 1;
+        state
+    }
+
+    fn ensure_client(&self) -> Result<(), CallError> {
+        if self.side == Side::Client {
+            Ok(())
+        } else {
+            Err(CallError::Unavailable(
+                "UNSUPPORTED_OPERATION: only the client side of a session originates requests"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Frames of one request: the REQUEST (with the first body part) and, for
+    /// bodies above one chunk, CHUNK continuations. `upload` marks a streamed
+    /// body (`MORE` without `total`).
+    #[allow(clippy::too_many_arguments)]
+    fn request_frames(
+        &self,
+        id: u64,
+        op: &str,
+        header: Value,
+        body: &[u8],
+        deadline: Option<Duration>,
+        idle: Option<Duration>,
+        prio: Priority,
+        upload: bool,
+    ) -> Result<Vec<(Lane, Vec<u8>)>, CallError> {
+        let chunk = self.options.max_chunk;
+        let split = body.len() > chunk;
+        let first = &body[..body.len().min(chunk)];
+        let request = RequestHeader {
+            id,
+            op: op.to_owned(),
+            deadline_ms: deadline.map(ms),
+            idle_ms: idle.map(ms),
+            header,
+            total: split.then_some(body.len() as u64),
+        };
+        let flags = if split || upload { FLAG_MORE } else { 0 };
+        let head = encode_with(
+            FrameKind::Request,
+            flags,
+            &request,
+            first,
+            self.send_limits(),
+        )
+        .map_err(local_error)?;
+        let head_lane = match prio {
+            Priority::Control if first.is_empty() => Lane::Control,
+            Priority::Control | Priority::Response => Lane::Response,
+            Priority::Data => Lane::Data,
+        };
+        let rest_lane = if prio == Priority::Data {
+            Lane::Data
+        } else {
+            Lane::Response
+        };
+        let mut frames = vec![(head_lane, head)];
+        frames.extend(
+            self.continuation(id, body, first.len())
+                .map_err(local_error)?
+                .into_iter()
+                .map(|frame| (rest_lane, frame)),
+        );
+        Ok(frames)
+    }
+
+    /// CHUNK continuations of `body` after its first `sent` bytes.
+    fn continuation(&self, id: u64, body: &[u8], sent: usize) -> Result<Vec<Vec<u8>>, FrameError> {
+        let chunk = self.options.max_chunk;
+        let mut frames = Vec::new();
+        let mut offset = sent;
+        while offset < body.len() {
+            let end = (offset + chunk).min(body.len());
+            let last = end == body.len();
+            let header = ChunkHeader {
+                id,
+                hash: None,
+                offset: offset as u64,
+                total: body.len() as u64,
+                last,
+            };
+            let flags = if last { FLAG_LAST } else { FLAG_MORE };
+            frames.push(encode_with(
+                FrameKind::Chunk,
+                flags,
+                &header,
+                &body[offset..end],
+                self.send_limits(),
+            )?);
+            offset = end;
+        }
+        Ok(frames)
+    }
+
+    /// Frames of one response. A streamed reply (chunks already sent) goes
+    /// through the data queue behind its chunks; otherwise a header-only
+    /// RESPONSE is a control frame and a body goes through the response queue.
+    pub(crate) fn response_frames(
+        &self,
+        id: u64,
+        result: Result<Value, ErrorWire>,
+        body: &[u8],
+        streamed: bool,
+    ) -> Vec<(Lane, Vec<u8>)> {
+        let (header, error, body) = match result {
+            Ok(header) => (header, None, body),
+            Err(mut error) => {
+                error.message = truncate(error.message);
+                (Value::Null, Some(error), &[][..])
+            }
+        };
+        let ok = error.is_none();
+        let chunk = self.options.max_chunk;
+        let split = body.len() > chunk;
+        let first = &body[..body.len().min(chunk)];
+        let response = ResponseHeader {
+            id,
+            ok,
+            header,
+            error,
+            total: split.then_some(body.len() as u64),
+        };
+        let flags = if split { FLAG_MORE } else { 0 };
+        let head = encode_with(
+            FrameKind::Response,
+            flags,
+            &response,
+            first,
+            self.send_limits(),
+        )
+        .and_then(|head| Ok((head, self.continuation(id, body, first.len())?)));
+        let (head, rest) = match head {
+            Ok(frames) => frames,
+            Err(error) => {
+                // The reply header or body could not be encoded: answer with
+                // an error instead, so the caller is not left waiting.
+                let fallback = ResponseHeader {
+                    id,
+                    ok: false,
+                    header: Value::Null,
+                    error: Some(ErrorWire::coded(
+                        "WS_MESSAGE_TOO_LARGE",
+                        truncate(error.to_string()),
+                    )),
+                    total: None,
+                };
+                match encode_with(FrameKind::Response, 0, &fallback, &[], self.send_limits()) {
+                    Ok(head) => (head, Vec::new()),
+                    Err(_) => return Vec::new(),
+                }
+            }
+        };
+        let (head_lane, rest_lane) = if streamed {
+            (Lane::Data, Lane::Data)
+        } else if first.is_empty() {
+            (Lane::Control, Lane::Response)
+        } else {
+            (Lane::Response, Lane::Response)
+        };
+        let mut frames = vec![(head_lane, head)];
+        frames.extend(rest.into_iter().map(|frame| (rest_lane, frame)));
+        frames
+    }
+
+    /// Queues a request's frames once there is room, and registers its slot.
+    fn submit(
+        &self,
+        id: u64,
+        slot: &Arc<Slot>,
+        frames: Vec<(Lane, Vec<u8>)>,
+        space_until: Instant,
+    ) -> Result<(), CallError> {
+        let bytes = |lane: Lane| -> usize {
+            frames
+                .iter()
+                .filter(|(other, _)| *other == lane)
+                .map(|(_, frame)| frame.len())
+                .sum()
+        };
+        let (data, control) = (bytes(Lane::Data), bytes(Lane::Control));
+        let mut state = self.lock();
+        loop {
+            if let Some(reason) = state.refusal() {
+                return Err(CallError::Unavailable(reason));
+            }
+            if data == 0 || self.data_room(&state, data) {
+                break;
+            }
+            if Instant::now() >= space_until {
+                return Err(CallError::Busy);
+            }
+            state = self.wait_space(state, space_until);
+        }
+        if control > 0 && state.queues.control_bytes + control > self.options.control_queue_bytes {
+            return Err(CallError::Busy);
+        }
+        state.pending.insert(id, slot.clone());
+        for (lane, frame) in frames {
+            state.queues.push(lane, id, frame);
+        }
+        drop(state);
+        self.wake();
+        Ok(())
+    }
+
+    /// Gives up on call `id`: unregisters it, drops its queued frames and
+    /// sends CANCEL. Returns `false` when the call had already ended (its
+    /// final event is then in the slot).
+    fn abandon(&self, id: u64, slot: &Slot) -> bool {
+        let removed = {
+            let mut state = self.lock();
+            let removed = state.pending.remove(&id).is_some();
+            if removed {
+                let freed = state.queues.purge(id);
+                if state.closed.is_none()
+                    && let Ok(cancel) = encode_with(
+                        FrameKind::Cancel,
+                        0,
+                        &CancelHeader { id },
+                        &[],
+                        self.send_limits(),
+                    )
+                {
+                    state.queues.push(Lane::Control, id, cancel);
+                }
+                if freed > 0 && state.space_waiters > 0 {
+                    self.space.notify_all();
+                }
+            }
+            removed
+        };
+        if removed {
+            self.wake();
+            for event in slot.drain() {
+                if let Event::Chunk(_, bytes) = event {
+                    self.rx_consumed(bytes.len());
+                }
+            }
+        }
+        removed
+    }
+
+    /// Waits for the outcome of call `id`.
+    fn await_reply(
+        &self,
+        id: u64,
+        slot: &Slot,
+        started: Instant,
+        until: Option<Instant>,
+        idle: Option<Duration>,
+        on_chunk: &mut OnChunk<'_>,
+    ) -> Result<Reply, CallError> {
+        let mut guard = PendingGuard {
+            shared: self,
+            id,
+            slot,
+            armed: true,
+        };
+        let mut active = Instant::now();
+        let mut ended = false;
+        loop {
+            let wait = if ended {
+                None
+            } else {
+                earliest(until, idle.map(|idle| after(active, idle)))
+            };
+            let Some(event) = slot.next(wait) else {
+                if guard.abandon() {
+                    return Err(CallError::Timeout {
+                        after_ms: ms(started.elapsed()),
+                    });
+                }
+                // The outcome arrived as the deadline passed; it is queued.
+                ended = true;
+                continue;
+            };
+            match event {
+                Event::Chunk(header, bytes) => {
+                    self.rx_consumed(bytes.len());
+                    if let Err(error) = on_chunk(header, &bytes) {
+                        guard.abandon();
+                        return Err(CallError::Remote(error));
+                    }
+                    active = Instant::now();
+                }
+                Event::Progress => active = Instant::now(),
+                Event::Done(result) => {
+                    guard.armed = false;
+                    return result.map_err(CallError::Remote);
+                }
+                Event::Lost(detail) => {
+                    guard.armed = false;
+                    return Err(CallError::ConnectionLost(detail));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        &self,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+        prio: Priority,
+        deadline: Option<Duration>,
+        idle: Option<Duration>,
+        on_chunk: &mut OnChunk<'_>,
+    ) -> Result<Reply, CallError> {
+        let started = Instant::now();
+        self.ensure_client()?;
+        let limit = self.body_limit(op);
+        if body.len() > limit {
+            return Err(CallError::Remote(ErrorWire::coded(
+                "WS_MESSAGE_TOO_LARGE",
+                format!("{op} body of {} bytes exceeds {limit}", body.len()),
+            )));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frames = self.request_frames(id, op, header, &body, deadline, idle, prio, false)?;
+        drop(body);
+        let slot = Arc::new(Slot::new(limit));
+        let until = deadline.map(|deadline| after(started, deadline));
+        let space_until = until
+            .or_else(|| idle.map(|idle| after(started, idle)))
+            .unwrap_or_else(|| after(started, FAR));
+        self.submit(id, &slot, frames, space_until)?;
+        self.await_reply(id, &slot, started, until, idle, on_chunk)
+    }
+}
+
+/// Abandons a call (CANCEL) when its caller returns or unwinds early.
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    id: u64,
+    slot: &'a Slot,
+    armed: bool,
+}
+
+impl PendingGuard<'_> {
+    fn abandon(&mut self) -> bool {
+        self.armed = false;
+        self.shared.abandon(self.id, self.slot)
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.abandon(self.id, self.slot);
+        }
+    }
+}
+
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+
 impl Conn {
-    /// Takes over an authenticated socket and starts its I/O thread.
+    /// Takes over an authenticated socket and starts its I/O thread. The
+    /// socket is switched to non-blocking mode (its handshake timeouts are
+    /// cleared); frames already buffered by tungstenite are processed first.
     pub fn from_established(
         ws: WebSocket<MaybeTlsStream<TcpStream>>,
         side: Side,
         peer: PeerInfo,
         o: ConnOptions,
     ) -> std::io::Result<Conn> {
-        let _ = (ws, side, peer, o);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            not_implemented("session::Conn::from_established").message,
-        ))
+        let options = o.sanitized();
+        let now_ms = crate::util::time::now_ms();
+        let shared = Arc::new(Shared {
+            name: format!("sess-{}", NEXT_SESSION.fetch_add(1, Ordering::Relaxed)),
+            side,
+            peer,
+            options,
+            poller: Arc::new(polling::Poller::new()?),
+            state: Mutex::new(State::default()),
+            space: Condvar::new(),
+            work: Condvar::new(),
+            finished: Condvar::new(),
+            next_id: AtomicU64::new(1),
+            since_ms: now_ms,
+            last_rx_ms: AtomicU64::new(now_ms),
+            last_tx_ms: AtomicU64::new(now_ms),
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
+            rtt_ms: AtomicU64::new(u64::MAX),
+            rx_buffered: AtomicUsize::new(0),
+            rx_paused: AtomicBool::new(false),
+        });
+        io::start(ws, shared.clone())?;
+        Ok(Conn { inner: shared })
     }
 
     /// One request with an absolute deadline. On expiry a CANCEL is sent and
@@ -183,13 +1050,30 @@ impl Conn {
         prio: Priority,
         deadline: Duration,
     ) -> Result<Reply, CallError> {
-        let _ = (op, header, body, prio, deadline);
-        Err(unavailable())
+        let mut unexpected = |header: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+            Err(ErrorWire::new(
+                "PROTOCOL_VIOLATION",
+                format!(
+                    "PROTOCOL_VIOLATION: request {} received a stream chunk (use call_streaming)",
+                    header.id
+                ),
+            ))
+        };
+        self.inner.request(
+            op,
+            header,
+            body,
+            prio,
+            Some(deadline),
+            None,
+            &mut unexpected,
+        )
     }
 
     /// A request whose response streams CHUNK frames into `on_chunk` before the
     /// final RESPONSE. PROGRESS and chunks reset the `idle` deadline. An error
-    /// from `on_chunk` cancels the request.
+    /// from `on_chunk` cancels the request and is returned as
+    /// `CallError::Remote` (the connection stays usable).
     #[allow(clippy::too_many_arguments)]
     pub fn call_streaming(
         &self,
@@ -201,11 +1085,12 @@ impl Conn {
         idle: Duration,
         on_chunk: &mut OnChunk<'_>,
     ) -> Result<Reply, CallError> {
-        let _ = (op, header, body, prio, deadline, idle, on_chunk);
-        Err(unavailable())
+        self.inner
+            .request(op, header, body, prio, deadline, Some(idle), on_chunk)
     }
 
-    /// Starts a request whose body is streamed with [`Upload::chunk`].
+    /// Starts a request whose body is streamed with [`Upload::chunk`]. The
+    /// REQUEST frame goes out with `prio`; chunks use the data queue.
     pub fn upload(
         &self,
         op: &str,
@@ -213,35 +1098,150 @@ impl Conn {
         prio: Priority,
         idle: Duration,
     ) -> Result<Upload, CallError> {
-        let _ = (op, header, prio, idle);
-        Err(unavailable())
+        let shared = &self.inner;
+        let started = Instant::now();
+        shared.ensure_client()?;
+        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let frames = shared.request_frames(id, op, header, &[], None, Some(idle), prio, true)?;
+        let slot = Arc::new(Slot::new(shared.body_limit(op)));
+        shared.submit(id, &slot, frames, after(started, idle))?;
+        Ok(Upload {
+            conn: self.clone(),
+            id,
+            slot,
+            idle,
+            sent: 0,
+            started,
+            done: false,
+        })
     }
 
-    /// Serves incoming requests on this (server-side) connection.
+    /// Serves incoming requests on this (server-side) connection with
+    /// `ConnOptions::handlers` threads. Calling it again replaces the handler.
+    /// Requests that arrived before the first call wait in the queue.
     pub fn serve(&self, handler: Arc<dyn Handler>) {
-        let _ = handler;
+        let shared = &self.inner;
+        if shared.side != Side::Server {
+            return;
+        }
+        let spawn = {
+            let mut state = shared.lock();
+            state.handler = Some(handler);
+            if state.closed.is_some() {
+                0
+            } else {
+                let spawn = shared
+                    .options
+                    .handlers
+                    .saturating_sub(state.handler_threads);
+                state.handler_threads += spawn;
+                spawn
+            }
+        };
+        for index in 0..spawn {
+            let worker = shared.clone();
+            let spawned = thread::Builder::new()
+                .name(format!("{}-h{index}", shared.name))
+                .spawn(move || handler_loop(worker));
+            if spawned.is_err() {
+                shared.lock().handler_threads -= 1;
+            }
+        }
+        shared.work.notify_all();
     }
 
     /// No new requests; in-flight requests complete; close after idle or 5 s.
     pub fn goaway(&self, code: &str, message: &str) {
-        let _ = (code, message);
+        let shared = &self.inner;
+        let message = truncate(message.to_owned());
+        let error = ErrorWire::new(code, message.clone());
+        let frame = encode_with(
+            FrameKind::Goaway,
+            0,
+            &wire::Goaway {
+                code: code.to_owned(),
+                message,
+            },
+            &[],
+            shared.send_limits(),
+        );
+        {
+            let mut state = shared.lock();
+            if state.closed.is_some() || state.goaway_sent.is_some() {
+                return;
+            }
+            state.goaway_sent = Some(error);
+            let deadline = after(Instant::now(), wire::GOAWAY_GRACE);
+            state.goaway_deadline =
+                Some(state.goaway_deadline.map_or(deadline, |d| d.min(deadline)));
+            if let Ok(frame) = frame {
+                state.queues.push(Lane::Control, 0, frame);
+            }
+        }
+        shared.wake();
     }
 
-    pub fn close(&self) {}
+    /// Closes the connection now: calls in flight fail with `ConnectionLost`
+    /// (uncertain), requests being served see `cancelled()`.
+    pub fn close(&self) {
+        let shared = &self.inner;
+        {
+            let mut state = shared.lock();
+            if state.closed.is_none() && state.close_request.is_none() {
+                state.close_request = Some(ErrorWire::coded(
+                    "WS_CLOSED",
+                    "the connection was closed locally",
+                ));
+            }
+        }
+        shared.wake();
+    }
 
     pub fn health(&self) -> ConnHealth {
-        ConnHealth::default()
+        let shared = &self.inner;
+        let (inflight, queued) = {
+            let state = shared.lock();
+            (
+                state.pending.len() + state.serving.len(),
+                state.queues.bytes(),
+            )
+        };
+        let rtt = shared.rtt_ms.load(Ordering::Relaxed);
+        ConnHealth {
+            since_ms: shared.since_ms,
+            rtt_ms: (rtt != u64::MAX).then_some(rtt),
+            last_rx_ms: shared.last_rx_ms.load(Ordering::Relaxed),
+            last_tx_ms: shared.last_tx_ms.load(Ordering::Relaxed),
+            bytes_up: shared.bytes_up.load(Ordering::Relaxed),
+            bytes_down: shared.bytes_down.load(Ordering::Relaxed),
+            inflight: u32::try_from(inflight).unwrap_or(u32::MAX),
+            queued_bytes: queued as u64,
+        }
     }
 
     /// Why the connection closed, once it has.
     pub fn closed(&self) -> Option<ErrorWire> {
-        Some(not_implemented("session::Conn"))
+        self.inner.lock().closed.clone()
     }
 
-    /// Waits up to `t` for the connection to close.
+    /// Waits up to `t` for the connection to close and its socket to be
+    /// released; returns the reason if it closed.
     pub fn wait_closed(&self, t: Duration) -> Option<ErrorWire> {
-        let _ = t;
-        self.closed()
+        let shared = &self.inner;
+        let until = after(Instant::now(), t);
+        let mut state = shared.lock();
+        while !state.finished {
+            let now = Instant::now();
+            if now >= until {
+                break;
+            }
+            state = shared
+                .finished
+                .wait_timeout(state, until - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        state.closed.clone()
     }
 
     pub fn peer(&self) -> &PeerInfo {
@@ -249,22 +1249,107 @@ impl Conn {
     }
 }
 
-/// A streaming request body in progress.
+/// A streaming request body in progress. Dropping it unfinished cancels the
+/// request.
 pub struct Upload {
-    id: u64,
     conn: Conn,
+    id: u64,
+    slot: Arc<Slot>,
+    idle: Duration,
+    sent: u64,
+    started: Instant,
+    done: bool,
 }
 
 impl Upload {
+    /// Queues one part of the body (blocks while the data queue is full, at
+    /// most `idle`). `h.id` is set to this request's id. Fails once the
+    /// request has ended: `Remote` if the server answered with an error,
+    /// `Cancelled` if it answered early (call [`Upload::finish`] for the
+    /// reply), `ConnectionLost` if the connection failed.
     pub fn chunk(&mut self, h: ChunkHeader, bytes: &[u8]) -> Result<(), CallError> {
-        let _ = (self.id, &self.conn, h, bytes);
-        Err(unavailable())
+        if self.done {
+            return Err(CallError::Cancelled);
+        }
+        let shared = self.conn.inner.clone();
+        let mut header = h;
+        header.id = self.id;
+        let flags = FLAG_MORE | if header.last { FLAG_LAST } else { 0 };
+        let frame = encode_with(
+            FrameKind::Chunk,
+            flags,
+            &header,
+            bytes,
+            shared.send_limits(),
+        )
+        .map_err(local_error)?;
+        let until = after(Instant::now(), self.idle);
+        let mut state = shared.lock();
+        loop {
+            if !state.pending.contains_key(&self.id) {
+                drop(state);
+                return Err(self.slot.ended_error());
+            }
+            if shared.data_room(&state, frame.len()) {
+                break;
+            }
+            if Instant::now() >= until {
+                drop(state);
+                self.done = true;
+                shared.abandon(self.id, &self.slot);
+                return Err(CallError::Timeout {
+                    after_ms: ms(self.started.elapsed()),
+                });
+            }
+            state = shared.wait_space(state, until);
+        }
+        state.queues.push(Lane::Data, self.id, frame);
+        drop(state);
+        shared.wake();
+        self.sent += bytes.len() as u64;
+        Ok(())
     }
 
-    /// Ends the body and waits for the response.
-    pub fn finish(self) -> Result<Reply, CallError> {
-        let _ = (self.id, self.conn);
-        Err(unavailable())
+    /// Ends the body and waits for the response (idle deadline; PROGRESS
+    /// resets it).
+    pub fn finish(mut self) -> Result<Reply, CallError> {
+        self.done = true;
+        let shared = self.conn.inner.clone();
+        {
+            let mut state = shared.lock();
+            if state.pending.contains_key(&self.id) {
+                let end = ChunkHeader {
+                    id: self.id,
+                    hash: None,
+                    offset: self.sent,
+                    total: self.sent,
+                    last: true,
+                };
+                if let Ok(frame) =
+                    encode_with(FrameKind::Chunk, FLAG_LAST, &end, &[], shared.send_limits())
+                {
+                    state.queues.push(Lane::Data, self.id, frame);
+                }
+            }
+        }
+        shared.wake();
+        let mut ignore = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> { Ok(()) };
+        shared.await_reply(
+            self.id,
+            &self.slot,
+            self.started,
+            None,
+            Some(self.idle),
+            &mut ignore,
+        )
+    }
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        if !self.done {
+            self.conn.inner.abandon(self.id, &self.slot);
+        }
     }
 }
 
@@ -279,38 +1364,187 @@ pub struct Incoming {
     pub op: String,
     pub header: Value,
     pub body: Vec<u8>,
-    /// Streamed request parts (`objects.push`), when the op streams.
+    /// Streamed request parts (`objects.push`), when the op streams. The
+    /// channel disconnects when the body ends, or early when the request is
+    /// cancelled (check [`Responder::cancelled`]).
     pub chunks: Option<Receiver<(ChunkHeader, Vec<u8>)>>,
     pub deadline: Instant,
     pub responder: Responder,
 }
 
-/// Answers one request. Exactly one of `reply` or `error` should be called.
+/// Answers one request. Exactly one of `reply` or `error` should be called;
+/// dropping it unanswered replies `UNKNOWN_ERROR`.
 pub struct Responder {
     id: u64,
+    shared: Arc<Shared>,
+    cancel: Arc<AtomicBool>,
+    /// Response body limit of the op.
+    limit: usize,
+    streamed: Cell<bool>,
+    answered: Cell<bool>,
 }
 
 impl Responder {
-    /// Streams one response part (backpressured by the data queue).
+    pub(crate) fn new(shared: Arc<Shared>, id: u64, cancel: Arc<AtomicBool>, limit: usize) -> Self {
+        Self {
+            id,
+            shared,
+            cancel,
+            limit,
+            streamed: Cell::new(false),
+            answered: Cell::new(false),
+        }
+    }
+
+    /// Streams one response part (backpressured by the data queue). `h.id` is
+    /// set to this request's id.
     pub fn chunk(&self, h: ChunkHeader, bytes: &[u8]) -> Result<(), CallError> {
-        let _ = (self.id, h, bytes);
-        Err(unavailable())
+        if self.cancelled() {
+            return Err(CallError::Cancelled);
+        }
+        let shared = &self.shared;
+        let mut header = h;
+        header.id = self.id;
+        let flags = FLAG_MORE | if header.last { FLAG_LAST } else { 0 };
+        let frame = encode_with(
+            FrameKind::Chunk,
+            flags,
+            &header,
+            bytes,
+            shared.send_limits(),
+        )
+        .map_err(local_error)?;
+        let mut state = shared.lock();
+        loop {
+            if let Some(closed) = &state.closed {
+                return Err(CallError::ConnectionLost(closed.to_string()));
+            }
+            if self.cancelled() || !state.serving.contains_key(&self.id) {
+                return Err(CallError::Cancelled);
+            }
+            if shared.data_room(&state, frame.len()) {
+                break;
+            }
+            state = shared.wait_space(state, after(Instant::now(), RECHECK));
+        }
+        state.queues.push(Lane::Data, self.id, frame);
+        drop(state);
+        shared.wake();
+        self.streamed.set(true);
+        Ok(())
     }
 
     /// Resets the client's idle deadline.
-    pub fn progress(&self) {}
+    pub fn progress(&self) {
+        if self.cancelled() {
+            return;
+        }
+        let shared = &self.shared;
+        let Ok(frame) = encode_with(
+            FrameKind::Progress,
+            0,
+            &ProgressHeader {
+                id: self.id,
+                bytes: None,
+            },
+            &[],
+            shared.send_limits(),
+        ) else {
+            return;
+        };
+        {
+            let mut state = shared.lock();
+            if !state.serving.contains_key(&self.id) {
+                return;
+            }
+            state.queues.push(Lane::Control, self.id, frame);
+        }
+        shared.wake();
+    }
 
     pub fn reply(self, header: Value, body: Vec<u8>) {
-        let _ = (self.id, header, body);
+        if body.len() > self.limit {
+            let error = ErrorWire::coded(
+                "WS_MESSAGE_TOO_LARGE",
+                format!("reply body of {} bytes exceeds {}", body.len(), self.limit),
+            );
+            self.answer(Err(error), &[]);
+        } else {
+            self.answer(Ok(header), &body);
+        }
     }
 
     /// A Remote error: the connection stays usable (invariant 17).
     pub fn error(self, e: ErrorWire) {
-        let _ = (self.id, e);
+        self.answer(Err(e), &[]);
     }
 
-    /// Whether the client cancelled or the connection closed.
+    /// Whether the client cancelled, the request's deadline passed, or the
+    /// connection closed.
     pub fn cancelled(&self) -> bool {
-        false
+        self.cancel.load(Ordering::Acquire)
+    }
+
+    fn answer(&self, result: Result<Value, ErrorWire>, body: &[u8]) {
+        self.answered.set(true);
+        if self.cancelled() {
+            return;
+        }
+        let shared = &self.shared;
+        let frames = shared.response_frames(self.id, result, body, self.streamed.get());
+        {
+            let mut state = shared.lock();
+            if state.serving.remove(&self.id).is_none() {
+                return;
+            }
+            for (lane, frame) in frames {
+                state.queues.push(lane, self.id, frame);
+            }
+        }
+        shared.wake();
+    }
+}
+
+impl Drop for Responder {
+    fn drop(&mut self) {
+        if !self.answered.get() && !self.cancelled() {
+            self.answer(
+                Err(ErrorWire::coded(
+                    "UNKNOWN_ERROR",
+                    "the handler dropped the request without replying",
+                )),
+                &[],
+            );
+        }
+    }
+}
+
+/// One thread of a connection's handler pool.
+fn handler_loop(shared: Arc<Shared>) {
+    loop {
+        let (incoming, handler) = {
+            let mut state = shared.lock();
+            loop {
+                if let Some(incoming) = state.incoming.pop_front() {
+                    break (incoming, state.handler.clone());
+                }
+                if state.closed.is_some() {
+                    state.handler_threads = state.handler_threads.saturating_sub(1);
+                    return;
+                }
+                state = shared
+                    .work
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        match handler {
+            // A panicking handler drops its responder, which answers
+            // `UNKNOWN_ERROR`; the pool thread survives.
+            Some(handler) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| handler.handle(incoming)));
+            }
+            None => drop(incoming),
+        }
     }
 }

@@ -1,49 +1,176 @@
 //! Qualification scenarios for WP1.9 (session core: frames, I/O thread,
 //! multiplexing). REVAMP_PLAN §14.6, §6.2.
 //!
-//! Created by WP0.5, `#[ignore = "WP1.9"]`. The session API does not exist at
-//! 6298d0b, so each scenario measures the same property on the legacy
-//! transport (`tkfs::ws`, one blocking request/response per socket) to record
-//! the baseline. WP1.9 replaces the transport calls with `session::Conn`
-//! (`call`, `call_streaming`, `upload`, `health`) and un-ignores them.
+//! Created by WP0.5 against the legacy transport for the baseline record;
+//! WP1.9 measures the same properties on `session::Conn` over in-process
+//! loopback WebSocket pairs (the v3 handshake is WP1.10's), with production
+//! `ConnOptions` unless a scenario says otherwise.
 //! `cargo test --release --test qual_wp1_9_session -- --ignored --test-threads=1 --nocapture`
 mod support;
 
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
-    net::TcpListener,
-    sync::{Arc, Mutex},
+    net::{TcpListener, TcpStream},
+    sync::{Arc, Mutex, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use support::*;
-use tkfs::{core::id, ws};
+use tkfs::{
+    model::{errors::ErrorWire, protocol::LaneRole},
+    session::{
+        CallError, ChunkHeader, Conn, ConnOptions, Handler, Incoming, PeerInfo, Priority, Side,
+    },
+};
+use tungstenite::{WebSocket, stream::MaybeTlsStream};
 
 const FILE: &str = "qual_wp1_9_session";
+const MIB: usize = 1024 * 1024;
 
-/// A legacy echo server: replies with the request after `sleep_ms` (if any).
-fn echo_server() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
+
+fn accept(listener: TcpListener, tls: bool) -> thread::JoinHandle<Ws> {
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            thread::spawn(move || {
-                let Ok(mut socket) = ws::accept(stream) else {
-                    return;
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(false).unwrap();
+        let stream = if tls {
+            let identity = native_tls::Identity::from_pkcs12(
+                include_bytes!("fixtures/tls/localhost.p12"),
+                "telekinesis-test",
+            )
+            .unwrap();
+            let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
+            MaybeTlsStream::NativeTls(acceptor.accept(stream).ok().expect("TLS accept"))
+        } else {
+            MaybeTlsStream::Plain(stream)
+        };
+        tungstenite::accept(stream).ok().expect("WebSocket accept")
+    })
+}
+
+fn connect(port: u16, tls: bool) -> Ws {
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let (url, connector) = if tls {
+        let ca = native_tls::Certificate::from_pem(include_bytes!("fixtures/tls/ca.pem")).unwrap();
+        let connector = native_tls::TlsConnector::builder()
+            .add_root_certificate(ca)
+            .build()
+            .unwrap();
+        (
+            format!("wss://localhost:{port}/"),
+            Some(tungstenite::Connector::NativeTls(connector)),
+        )
+    } else {
+        (format!("ws://127.0.0.1:{port}/"), None)
+    };
+    tungstenite::client_tls_with_config(url, stream, None, connector)
+        .ok()
+        .expect("WebSocket connect")
+        .0
+}
+
+fn peer() -> PeerInfo {
+    PeerInfo {
+        installation: "qual".into(),
+        role: LaneRole::Control,
+        lane: None,
+        session: "qual-session".into(),
+        verifier_generation: 1,
+    }
+}
+
+/// A (client, server) session pair, optionally through a `FaultProxy`.
+fn session(tls: bool, proxied: bool, options: ConnOptions) -> (Conn, Conn, Option<FaultProxy>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let proxy = proxied.then(|| FaultProxy::start(&format!("127.0.0.1:{port}")));
+    let server = accept(listener, tls);
+    let client = connect(proxy.as_ref().map_or(port, |p| p.addr().port()), tls);
+    let client = Conn::from_established(client, Side::Client, peer(), options).unwrap();
+    let server =
+        Conn::from_established(server.join().unwrap(), Side::Server, peer(), options).unwrap();
+    (client, server, proxy)
+}
+
+struct FnHandler<F>(F);
+
+impl<F: Fn(Incoming) + Send + Sync> Handler for FnHandler<F> {
+    fn handle(&self, req: Incoming) {
+        (self.0)(req)
+    }
+}
+
+/// `download {count}` streams `count` 1 MiB chunks; `upload` consumes the
+/// streamed body and replies with its length; anything else echoes.
+fn service() -> Arc<dyn Handler> {
+    let block = Arc::new(seeded_bytes(31, MIB));
+    Arc::new(FnHandler(move |req: Incoming| match req.op.as_str() {
+        "download" => {
+            let count = req.header["count"].as_u64().unwrap();
+            for i in 0..count {
+                let header = ChunkHeader {
+                    id: 0,
+                    hash: None,
+                    offset: i * MIB as u64,
+                    total: count * MIB as u64,
+                    last: i + 1 == count,
                 };
-                while let Ok(request) = ws::receive::<Value>(&mut socket) {
-                    if let Some(ms) = request["sleep_ms"].as_u64() {
-                        thread::sleep(Duration::from_millis(ms));
-                    }
-                    if ws::reply(&mut socket, Ok(request)).is_err() {
-                        return;
-                    }
+                if req.responder.chunk(header, &block).is_err() {
+                    return;
                 }
-            });
+            }
+            req.responder.reply(json!({ "count": count }), vec![]);
         }
-    });
-    endpoint
+        "upload" => {
+            let bytes: usize = req
+                .chunks
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|(_, data)| data.len())
+                .sum();
+            req.responder.reply(json!({ "bytes": bytes }), vec![]);
+        }
+        _ => req.responder.reply(req.header, req.body),
+    }))
+}
+
+/// Streams `count` MiB down; returns the bytes received.
+fn download(conn: &Conn, count: u64) -> Result<u64, CallError> {
+    let mut bytes = 0u64;
+    let mut on_chunk = |_: ChunkHeader, data: &[u8]| -> Result<(), ErrorWire> {
+        bytes += data.len() as u64;
+        Ok(())
+    };
+    conn.call_streaming(
+        "download",
+        json!({ "count": count }),
+        vec![],
+        Priority::Control,
+        None,
+        Duration::from_secs(30),
+        &mut on_chunk,
+    )?;
+    Ok(bytes)
+}
+
+/// Streams `count` MiB up; returns the bytes the server counted.
+fn upload(conn: &Conn, count: u64, block: &[u8]) -> Result<u64, CallError> {
+    let mut upload = conn.upload("upload", json!({}), Priority::Data, Duration::from_secs(30))?;
+    for i in 0..count {
+        upload.chunk(
+            ChunkHeader {
+                id: 0,
+                hash: None,
+                offset: i * MIB as u64,
+                total: count * MIB as u64,
+                last: i + 1 == count,
+            },
+            block,
+        )?;
+    }
+    let reply = upload.finish()?;
+    Ok(reply.header["bytes"].as_u64().unwrap_or(0))
 }
 
 /// A slow request on one stream must not delay fast requests on another
@@ -52,134 +179,261 @@ fn echo_server() -> String {
 #[ignore = "WP1.9"]
 fn slow_does_not_block_fast() {
     let mut s = Scenario::new(FILE, "slow_does_not_block_fast");
-    s.note("baseline transport: legacy ws (no multiplexing; one in-flight request per socket)");
-    let endpoint = echo_server();
-    let socket = Arc::new(Mutex::new(ws::connect(&endpoint).unwrap()));
-    let slow_socket = socket.clone();
-    let slow = thread::spawn(move || {
-        let mut socket = slow_socket.lock().unwrap();
-        ws::call(&mut socket, &json!({"sleep_ms": 3000})).unwrap();
-    });
-    thread::sleep(Duration::from_millis(100));
+    s.note("session::Conn, production options; one 20 s handler on stream A, 50 calls on stream B");
+    let (client, server, _) = session(false, false, ConnOptions::default());
+    let (release, released) = mpsc::channel::<()>();
+    let released = Mutex::new(released);
+    let echo = service();
+    server.serve(Arc::new(FnHandler(move |req: Incoming| {
+        if req.op == "slow" {
+            let _ = released
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(20));
+            req.responder.reply(json!({ "slow": true }), vec![]);
+        } else {
+            echo.handle(req);
+        }
+    })));
+    let slow = {
+        let client = client.clone();
+        thread::spawn(move || {
+            client.call(
+                "slow",
+                json!({}),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(30),
+            )
+        })
+    };
+    let started = Instant::now();
+    while server.health().inflight == 0 && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(1));
+    }
     let mut samples = vec![];
     for i in 0..50 {
         let (r, ms) = time_ms(|| {
-            let mut socket = socket.lock().unwrap();
-            ws::call(&mut socket, &json!({"fast": i}))
+            client.call(
+                "echo",
+                json!({ "fast": i }),
+                vec![0; 1024],
+                Priority::Control,
+                Duration::from_secs(5),
+            )
         });
-        s.check(r.is_ok(), "fast call ok");
+        s.check(
+            r.as_ref().is_ok_and(|reply| reply.header["fast"] == i),
+            format!("fast call {i}: {r:?}"),
+        );
         samples.push(ms);
     }
-    slow.join().unwrap();
+    s.check(!slow.is_finished(), "the slow call was still running");
+    release.send(()).unwrap();
+    let slow = slow.join().unwrap();
+    s.check(slow.is_ok(), format!("slow call: {slow:?}"));
     let summary = summarize(&samples);
     s.metric_with("fast_p99_ms", summary.p99, "ms", summary.json());
     s.finish();
 }
 
-/// An idle authenticated peer connection stays usable for 60 s.
+/// An idle connection stays usable for 60 s (heartbeats; no reconnect).
 #[test]
 #[ignore = "WP1.9"]
 fn idle_60s() {
     let mut s = Scenario::new(FILE, "idle_60s");
-    let a = Node::new();
-    let code = a.code();
-    let mut socket = ws::connect(&a.endpoint()).unwrap();
-    let hello = ws::call(
-        &mut socket,
-        &json!({"op":"pair","version":2,"code":code,"installation":id(),"lane":"control",
-            "bulk_protocol":1,"bulk_lane":null}),
+    s.note("session::Conn through a FaultProxy, production heartbeat 5 s / dead 20 s");
+    let (client, server, proxy) = session(false, true, ConnOptions::default());
+    let proxy = proxy.unwrap();
+    server.serve(service());
+    let first = client.call(
+        "ping",
+        json!({}),
+        vec![],
+        Priority::Control,
+        Duration::from_secs(5),
     );
-    s.check(hello.is_ok(), format!("pair hello: {hello:?}"));
+    s.check(first.is_ok(), format!("first ping: {first:?}"));
     let idle = budget_or(60).min(Duration::from_secs(60));
     thread::sleep(idle);
-    let (ping, ms) = time_ms(|| ws::call(&mut socket, &json!({"op":"ping"})));
+    let (ping, ms) = time_ms(|| {
+        client.call(
+            "ping",
+            json!({}),
+            vec![],
+            Priority::Control,
+            Duration::from_secs(5),
+        )
+    });
     s.metric("ping_after_idle_ms", ms, "ms");
     s.check(
         ping.is_ok(),
         format!("usable after {} s idle: {ping:?}", idle.as_secs()),
     );
+    s.check(
+        client.closed().is_none() && server.closed().is_none(),
+        "the connection stayed open",
+    );
+    s.check(
+        proxy.connections() == 1 && proxy.resets() == 0,
+        format!(
+            "no reconnect: {} connections, {} resets",
+            proxy.connections(),
+            proxy.resets()
+        ),
+    );
+    let health = client.health();
+    s.metric_with(
+        "rtt_ms",
+        health.rtt_ms.map_or(f64::NAN, |rtt| rtt as f64),
+        "ms",
+        json!({ "health": health }),
+    );
     s.finish();
 }
 
-/// A peer that stops responding is detected by liveness, without a request in
-/// flight (session heartbeats: dead after `dead_after`).
+/// A peer that stops responding is detected by liveness, without depending on
+/// a request deadline (session heartbeats: dead after `dead_after`).
 #[test]
 #[ignore = "WP1.9"]
 fn dead_peer_detection() {
     let mut s = Scenario::new(FILE, "dead_peer_detection");
-    let endpoint = echo_server();
-    let proxy = FaultProxy::start(&endpoint);
-    let mut socket = ws::connect(&proxy.endpoint()).unwrap();
-    ws::call(&mut socket, &json!({"warm": true})).unwrap();
+    let options = ConnOptions::default();
+    s.note(format!(
+        "session::Conn through a FaultProxy blackhole; heartbeat {:?}, dead after {:?}",
+        options.heartbeat, options.dead_after
+    ));
+    let (client, server, proxy) = session(false, true, options);
+    let proxy = proxy.unwrap();
+    server.serve(Arc::new(FnHandler(|req: Incoming| {
+        while !req.responder.cancelled() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    })));
+    let in_flight = {
+        let client = client.clone();
+        thread::spawn(move || {
+            let result = client.call(
+                "hold",
+                json!({}),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(120),
+            );
+            (result, Instant::now())
+        })
+    };
+    let started = Instant::now();
+    while server.health().inflight == 0 && started.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let blackholed = Instant::now();
     proxy.blackhole(true);
-    // The legacy transport has no liveness: only the next request notices,
-    // after its 15 s socket timeout. Record that as the baseline number.
-    let (r, ms) = time_ms(|| ws::call(&mut socket, &json!({"after": "blackhole"})));
+    let (result, failed_at) = in_flight.join().unwrap();
+    let detect_ms = (failed_at - blackholed).as_secs_f64() * 1000.0;
+    let closed = client.wait_closed(Duration::from_secs(5));
     s.metric_with(
-        "request_detect_ms",
-        ms,
+        "detect_ms",
+        detect_ms,
         "ms",
-        json!({"result": format!("{r:?}")}),
+        json!({ "result": format!("{result:?}"), "closed": closed }),
     );
-    s.unsupported("idle dead-peer detection needs session heartbeats (WP1.9 Conn::health)");
+    s.check(
+        matches!(result, Err(CallError::ConnectionLost(_))),
+        format!("the in-flight call failed as uncertain: {result:?}"),
+    );
+    s.check(
+        closed.as_ref().is_some_and(|e| e.code == "TRANSPORT_DEAD"),
+        format!("closed as TRANSPORT_DEAD: {closed:?}"),
+    );
+    let limit = options.dead_after + Duration::from_secs(2);
+    s.check(
+        detect_ms <= limit.as_secs_f64() * 1000.0,
+        format!("detected within {limit:?}"),
+    );
     s.finish();
 }
 
-/// 16 MiB of payload each way at the same time on one connection (32 MiB of
-/// hex on the wire per direction) completes without deadlock.
+/// 32 MiB each way at the same time on one connection completes without
+/// deadlock.
 #[test]
 #[ignore = "WP1.9"]
 fn duplex_32mib() {
     let mut s = Scenario::new(FILE, "duplex_32mib");
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let payload = hex::encode(seeded_bytes(21, 16 * 1024 * 1024));
-    let server_payload = payload.clone();
-    let server = thread::spawn(move || -> anyhow::Result<usize> {
-        let mut socket = ws::accept(listener.accept()?.0)?;
-        ws::send(&mut socket, &json!({"hex": server_payload}))?;
-        let got: Value = ws::receive(&mut socket)?;
-        Ok(got["hex"].as_str().map_or(0, str::len))
-    });
-    let watch = Stopwatch::start();
-    let client = (|| -> anyhow::Result<usize> {
-        let mut socket = ws::connect(&endpoint)?;
-        ws::send(&mut socket, &json!({"hex": payload}))?;
-        let got: Value = ws::receive(&mut socket)?;
-        Ok(got["hex"].as_str().map_or(0, str::len))
-    })();
-    let server = server.join().unwrap();
-    let ms = watch.ms();
-    s.metric_with(
-        "duplex_ms",
-        ms,
-        "ms",
-        json!({"client": format!("{client:?}"), "server": format!("{server:?}")}),
-    );
-    s.check(
-        client.as_ref().is_ok_and(|n| *n == 32 * 1024 * 1024)
-            && server.as_ref().is_ok_and(|n| *n == 32 * 1024 * 1024),
-        "both directions completed",
-    );
+    for tls in [false, true] {
+        let (client, server, _) = session(tls, false, ConnOptions::default());
+        server.serve(service());
+        let block = seeded_bytes(21, MIB);
+        let watch = Stopwatch::start();
+        let up = {
+            let client = client.clone();
+            thread::spawn(move || upload(&client, 32, &block))
+        };
+        let down = download(&client, 32);
+        let up = up.join().unwrap();
+        let ms = watch.ms();
+        let metric = if tls { "duplex_wss_ms" } else { "duplex_ms" };
+        s.metric_with(
+            metric,
+            ms,
+            "ms",
+            json!({ "up": format!("{up:?}"), "down": format!("{down:?}") }),
+        );
+        s.check(
+            up.as_ref().is_ok_and(|n| *n == 32 * MIB as u64)
+                && down.as_ref().is_ok_and(|n| *n == 32 * MIB as u64),
+            format!("both directions completed (tls: {tls})"),
+        );
+    }
     s.finish();
 }
 
-/// Loopback throughput with 1 MiB messages.
+/// Loopback throughput with 1 MiB chunks.
 #[test]
 #[ignore = "WP1.9"]
 fn loopback_throughput() {
     let mut s = Scenario::new(FILE, "loopback_throughput");
-    let endpoint = echo_server();
-    let mut socket = ws::connect(&endpoint).unwrap();
-    let chunk = hex::encode(seeded_bytes(22, 1024 * 1024));
-    let rounds = scaled(128);
+    let mib = scaled(1024) as u64;
+    s.note(format!(
+        "session::Conn streamed response, {mib} x 1 MiB chunks (plain WS); upload and WSS recorded too"
+    ));
+    let (client, server, _) = session(false, false, ConnOptions::default());
+    server.serve(service());
+    // Warm up allocators and socket buffers.
+    let _ = download(&client, 16);
     let watch = Stopwatch::start();
-    for i in 0..rounds {
-        let reply = ws::call(&mut socket, &json!({"i": i, "hex": chunk})).unwrap();
-        assert_eq!(reply["i"], i);
-    }
-    // Payload moved in one direction (the echo doubles the wire traffic).
-    let mib = rounds as f64;
-    s.metric("mib_per_s", mib / watch.elapsed().as_secs_f64(), "MiB/s");
+    let down = download(&client, mib);
+    let secs = watch.elapsed().as_secs_f64();
+    s.check(
+        down.as_ref().is_ok_and(|n| *n == mib * MIB as u64),
+        format!("download: {down:?}"),
+    );
+    s.metric("mib_per_s", mib as f64 / secs, "MiB/s");
+    let block = seeded_bytes(22, MIB);
+    let watch = Stopwatch::start();
+    let up = upload(&client, mib, &block);
+    s.check(
+        up.as_ref().is_ok_and(|n| *n == mib * MIB as u64),
+        format!("upload: {up:?}"),
+    );
+    s.metric(
+        "upload_mib_per_s",
+        mib as f64 / watch.elapsed().as_secs_f64(),
+        "MiB/s",
+    );
+    let (client, server, _) = session(true, false, ConnOptions::default());
+    server.serve(service());
+    let _ = download(&client, 16);
+    let watch = Stopwatch::start();
+    let down = download(&client, mib);
+    s.check(
+        down.as_ref().is_ok_and(|n| *n == mib * MIB as u64),
+        format!("wss download: {down:?}"),
+    );
+    s.metric(
+        "wss_mib_per_s",
+        mib as f64 / watch.elapsed().as_secs_f64(),
+        "MiB/s",
+    );
     s.finish();
 }
