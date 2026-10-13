@@ -13,6 +13,15 @@
 //! | `blocked` | a quarantined ancestor (`blocked_on`) | `QUARANTINED_CAUSAL_ANCESTOR: <id>` |
 //! | NULL | written by an older binary (or startup evacuation); classified lazily | as written |
 //!
+//! `blocked_on` always names the root: a `quarantined` row, or a legacy row
+//! that is still to be classified as one. An older binary named the direct
+//! parent in its `QUARANTINED_CAUSAL_ANCESTOR` text; classification follows
+//! that chain to the root. Whenever a row leaves the rejected states (it
+//! becomes `ready`, `waiting` or `retry`, for example a legacy transient
+//! quarantine that is retried, or it commits), every row blocked on it
+//! becomes `waiting` on it, so it activates with it. Activation re-checks
+//! every link, so a row with another quarantined ancestor is blocked again.
+//!
 //! The legacy `error` column is non-NULL exactly for `quarantined` and
 //! `blocked`, so the legacy `incoming_quarantined` count and an older
 //! binary's drain see what they always saw. Staging never activates;
@@ -217,7 +226,9 @@ struct SliceStats {
 
 /// `inbox::ensure_schema` (`schema:inbox=1`): the state columns (named-column
 /// writers only, REVAMP_PLAN §9), `incoming_waits`, `incoming_sources`, their
-/// indexes and the cleanup trigger. Idempotent; runs in its own savepoint.
+/// indexes (plus a partial index on `blocked_on`, so releasing the rows
+/// blocked on a committed event is a point lookup) and the cleanup trigger.
+/// Idempotent; runs in its own savepoint.
 pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
     let db = &store.db;
     db.execute_batch("SAVEPOINT inbox_schema")?;
@@ -245,6 +256,7 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
             CREATE INDEX IF NOT EXISTS incoming_waits_parent ON incoming_waits(parent);
             CREATE TABLE IF NOT EXISTS incoming_sources(event TEXT NOT NULL,peer TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(event,peer));
             CREATE INDEX IF NOT EXISTS incoming_events_state ON incoming_events(state,received_ms);
+            CREATE INDEX IF NOT EXISTS incoming_events_blocked_on ON incoming_events(blocked_on) WHERE blocked_on IS NOT NULL;
             CREATE TRIGGER IF NOT EXISTS incoming_events_cleanup AFTER DELETE ON incoming_events BEGIN
                 DELETE FROM incoming_waits WHERE child=OLD.id;
                 DELETE FROM incoming_sources WHERE event=OLD.id;
@@ -754,6 +766,9 @@ impl Store {
         self.db
             .prepare_cached("DELETE FROM incoming_events WHERE id=?")?
             .execute([id])?;
+        // Rows still blocked on a committing event (written by an older
+        // build) wait on it instead and are released below with the rest.
+        self.unblock(id)?;
         let children: Vec<String> = self
             .db
             .prepare_cached("SELECT child FROM incoming_waits WHERE parent=?")?
@@ -835,6 +850,7 @@ impl Store {
             "UPDATE incoming_events SET state='retry',attempts=coalesce(attempts,0)+1,retry_at_ms=?,code=?,error_class='transient',error=NULL,blocked_on=NULL WHERE id=?",
             params![time() as i64 + delay as i64, wire.code, id],
         )?;
+        self.unblock(id)?;
         Ok(Attempt::Retried(wire))
     }
     /// Quarantine row `id` and block every staged descendant on it.
@@ -875,6 +891,44 @@ impl Store {
             "UPDATE incoming_events SET state='blocked',error=?,code=?,error_class='fatal',blocked_on=?,retry_at_ms=NULL WHERE id=?",
             params![format!("{ANCESTOR}: {root}"), ANCESTOR, root, id],
         )?;
+        self.repoint_blocked(id, root)
+    }
+    /// `id` is now blocked on `root`: rows blocked on `id` name `root` too
+    /// (`blocked_on` always names the root, so `revalidate(root)` finds them).
+    fn repoint_blocked(&self, id: &str, root: &str) -> Result<()> {
+        if id != root {
+            self.db
+                .prepare_cached(
+                    "UPDATE incoming_events SET blocked_on=?2,error=?3 WHERE blocked_on=?1 AND state='blocked' AND id<>?2",
+                )?
+                .execute(params![id, root, format!("{ANCESTOR}: {root}")])?;
+        }
+        Ok(())
+    }
+    /// Row `id` can commit (it is `ready`, `waiting` or `retry`, or it is
+    /// committing now): every row blocked on it waits on it instead, so it
+    /// activates with it. Activation re-checks every link, so a row with
+    /// another quarantined ancestor is blocked again then. Normally nothing
+    /// is blocked on such a row; this repairs rows blocked on a legacy
+    /// transient quarantine (RC11) and rows written by an older build.
+    fn unblock(&self, id: &str) -> Result<()> {
+        let rows: Vec<String> = self
+            .db
+            .prepare_cached(
+                "SELECT id FROM incoming_events WHERE blocked_on=?1 AND state='blocked' AND id<>?1",
+            )?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for row in rows {
+            self.db
+                .prepare_cached("INSERT OR IGNORE INTO incoming_waits(child,parent) VALUES(?,?)")?
+                .execute(params![row, id])?;
+            self.db
+                .prepare_cached(
+                    "UPDATE incoming_events SET state='waiting',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL,retry_at_ms=NULL WHERE id=?",
+                )?
+                .execute([&row])?;
+        }
         Ok(())
     }
     /// Write a classification to an existing row (and its waits).
@@ -887,6 +941,7 @@ impl Store {
                     "UPDATE incoming_events SET state='ready',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL WHERE id=?",
                     [id],
                 )?;
+                self.unblock(id)?;
             }
             Class::Waiting(parents) => {
                 self.db
@@ -902,6 +957,7 @@ impl Store {
                     "UPDATE incoming_events SET state='waiting',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL WHERE id=?",
                     [id],
                 )?;
+                self.unblock(id)?;
                 // A cycle closes only when this event already has waiting
                 // children; then search its staged ancestry for itself.
                 if self.closes_cycle(id, &parents)? {
@@ -1013,15 +1069,7 @@ impl Store {
         let Some((payload, state, error, blocked_on)) = staged else {
             return Ok(Parent::Missing);
         };
-        let rejected = match state.as_deref() {
-            Some(QUARANTINED) | Some(BLOCKED) => true,
-            None => error.is_some(),
-            Some(_) => false,
-        };
-        if rejected {
-            let root = blocked_on
-                .or_else(|| error.as_deref().and_then(blocked_root))
-                .unwrap_or_else(|| id.to_owned());
+        if let Some(root) = self.rejected_root_from(id, state, error, blocked_on)? {
             return Ok(Parent::Quarantined(root));
         }
         match serde_json::from_str(&payload) {
@@ -1047,26 +1095,40 @@ impl Store {
                 "UPDATE incoming_events SET received_ms=coalesce(received_ms,0),attempts=coalesce(attempts,0) WHERE id=?",
                 [id],
             )?;
+            // A legacy quarantine of a transient failure (RC11) is not a
+            // verdict: the row is re-classified on its links below.
             if let Some(text) = error.as_deref().filter(|text| !legacy_transient(text)) {
                 // Quarantined by an older binary: keep its verdict and text.
-                if let Some(root) = blocked_root(text) {
-                    let root = self.blocked_root_of(&root)?;
-                    self.db.execute(
-                        "UPDATE incoming_events SET state='blocked',code=?,error_class='fatal',blocked_on=? WHERE id=?",
-                        params![ANCESTOR, root, id],
-                    )?;
-                    self.block_descendants(id, &root)?;
-                } else {
-                    let code = code_in(text).unwrap_or(crate::model::errors::UNKNOWN_CODE);
-                    self.db.execute(
-                        "UPDATE incoming_events SET state='quarantined',code=?,error_class=? WHERE id=?",
-                        params![code, quarantine_class(code).as_str(), id],
-                    )?;
-                    self.block_descendants(id, id)?;
+                // Its ancestor text names the direct parent, which may itself
+                // be blocked: follow the chain to the root.
+                let root = match blocked_root(text) {
+                    Some(ancestor) => self.rejected_root(&ancestor)?,
+                    None => Some(id.clone()),
+                };
+                match root {
+                    Some(root) if root != *id => {
+                        self.db.execute(
+                            "UPDATE incoming_events SET state='blocked',code=?,error_class='fatal',blocked_on=? WHERE id=?",
+                            params![ANCESTOR, root, id],
+                        )?;
+                        self.repoint_blocked(id, &root)?;
+                        self.block_descendants(id, &root)?;
+                        continue;
+                    }
+                    Some(_) => {
+                        let code = code_in(text).unwrap_or(crate::model::errors::UNKNOWN_CODE);
+                        self.db.execute(
+                            "UPDATE incoming_events SET state='quarantined',code=?,error_class=? WHERE id=?",
+                            params![code, quarantine_class(code).as_str(), id],
+                        )?;
+                        self.block_descendants(id, id)?;
+                        continue;
+                    }
+                    // The ancestor it was blocked on can commit now (it is
+                    // committed, usable, or a legacy transient failure).
+                    None => {}
                 }
-                continue;
             }
-            // A legacy quarantine of a transient failure (RC11) is retried.
             let class = match serde_json::from_str::<Event>(payload) {
                 Ok(event) if event.id == *id => self.classify_links(&event)?,
                 Ok(_) => {
@@ -1080,22 +1142,89 @@ impl Store {
         }
         Ok(rows.len())
     }
-    /// The root quarantined event behind `id` (itself unless it is blocked).
-    fn blocked_root_of(&self, id: &str) -> Result<String> {
-        let blocked_on: Option<Option<String>> = self
+    /// The quarantined root that makes staged row `id` unusable as a parent,
+    /// or `None` when it can still commit (it is usable, committed or
+    /// missing). See [`rejected_root_from`](Self::rejected_root_from).
+    fn rejected_root(&self, id: &str) -> Result<Option<String>> {
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
             .db
-            .query_row(
-                "SELECT blocked_on FROM incoming_events WHERE id=? AND state='blocked'",
-                [id],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT state,error,blocked_on FROM incoming_events WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
-        Ok(blocked_on.flatten().unwrap_or_else(|| id.to_owned()))
+        match row {
+            Some((state, error, blocked_on)) => {
+                self.rejected_root_from(id, state, error, blocked_on)
+            }
+            None => Ok(None),
+        }
+    }
+    /// `rejected_root` of row `id` whose `state, error, blocked_on` are given.
+    /// A `quarantined` row is its own root and a `blocked` row names its
+    /// root. A legacy row (`state` NULL) is a root when its `error` is a
+    /// verdict, usable when it has no `error` or a transient one (RC11), and
+    /// blocked when its `error` is `QUARANTINED_CAUSAL_ANCESTOR: <ancestor>`:
+    /// an older binary named the direct parent there, so the chain is
+    /// followed to the root, and a chain that ends at a row that can commit
+    /// means the legacy row can too. A classified `blocked` row is never
+    /// usable: if its chain ends at a row that can commit (data written by
+    /// an older build), that row is named, so its children are released
+    /// with it (`unblock`). A cycle (or a blocked row without a root) makes
+    /// the row where it closes the root.
+    fn rejected_root_from(
+        &self,
+        id: &str,
+        mut state: Option<String>,
+        mut error: Option<String>,
+        mut blocked_on: Option<String>,
+    ) -> Result<Option<String>> {
+        let mut next = id.to_owned();
+        let mut seen = BTreeSet::new();
+        // Whether the chain went through a classified `blocked` row.
+        let mut blocked = false;
+        loop {
+            let usable = blocked.then(|| next.clone());
+            let ancestor = match state.as_deref() {
+                Some(QUARANTINED) => return Ok(Some(next)),
+                Some(BLOCKED) => {
+                    blocked = true;
+                    blocked_on
+                }
+                Some(_) => return Ok(usable),
+                None => match error.as_deref() {
+                    None => return Ok(usable),
+                    Some(text) if legacy_transient(text) => return Ok(usable),
+                    Some(text) => match blocked_root(text) {
+                        None => return Ok(Some(next)),
+                        ancestor => ancestor,
+                    },
+                },
+            };
+            seen.insert(next.clone());
+            let Some(ancestor) = ancestor.filter(|a| !seen.contains(a)) else {
+                return Ok(Some(next));
+            };
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = self
+                .db
+                .prepare_cached("SELECT state,error,blocked_on FROM incoming_events WHERE id=?")?
+                .query_row([&ancestor], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()?;
+            let Some(row) = row else {
+                // Committed or missing: it can commit (or has). A blocked
+                // row naming it is stale until the startup repair.
+                return Ok(blocked.then_some(next));
+            };
+            (state, error, blocked_on) = row;
+            next = ancestor;
+        }
     }
     /// Startup repairs: a restart retries every `retry` row now; waits on
     /// committed parents are dropped (an older binary may have committed
     /// them); waiting rows with no wait left become `ready`; rows whose
-    /// legacy `error` disagrees with their state are re-classified.
+    /// legacy `error` disagrees with their state are re-classified, and so
+    /// are blocked rows whose `blocked_on` is no longer a quarantined root
+    /// (it committed under an older binary, or an older build left it
+    /// pointing at an intermediate row); classification resolves their
+    /// `QUARANTINED_CAUSAL_ANCESTOR` text to the root, or releases them.
     fn reconcile_rows(&mut self) -> Result<()> {
         self.db.execute_batch(
             "UPDATE incoming_events SET state='ready',retry_at_ms=NULL WHERE state='retry';
@@ -1104,6 +1233,9 @@ impl Store {
             UPDATE incoming_events SET state=NULL WHERE (state IN ('ready','waiting','retry') AND error IS NOT NULL)
                 OR (state IN ('quarantined','blocked') AND error IS NULL)
                 OR (state IS NOT NULL AND state NOT IN ('ready','waiting','retry','quarantined','blocked'));
+            UPDATE incoming_events SET state=NULL WHERE state='blocked' AND NOT EXISTS(
+                SELECT 1 FROM incoming_events r WHERE r.id=incoming_events.blocked_on
+                AND (r.state='quarantined' OR (r.state IS NULL AND r.error IS NOT NULL)));
             UPDATE incoming_events SET state='ready' WHERE state='waiting'
                 AND NOT EXISTS(SELECT 1 FROM incoming_waits w WHERE w.child=incoming_events.id);",
         )?;
@@ -1144,6 +1276,9 @@ impl Store {
         } else {
             self.rekey_view(view);
         }
+        // Commits of this transaction count once it committed (and not at
+        // all if it rolled back); inside a caller's transaction this waits.
+        self.settle_commit_counters();
         result
     }
     /// The `data_version` under which the cached view is fresh right now, if
@@ -1278,7 +1413,9 @@ impl Store {
     }
     /// Re-queue rows for classification and activation: the given
     /// quarantined, blocked or retry rows plus every row blocked on one of
-    /// them; `None` re-queues every such row. Returns how many were reset.
+    /// them (transitively: rows written by an older build may be blocked on
+    /// an intermediate blocked row); `None` re-queues every such row.
+    /// Returns how many were reset.
     pub fn revalidate(&mut self, ids: Option<&[String]>) -> Result<usize> {
         self.with_write("inbox_revalidate", |store| {
             let targets: BTreeSet<String> = match ids {
@@ -1300,13 +1437,21 @@ impl Store {
                         if listed {
                             targets.insert(id.clone());
                         }
+                    }
+                    let mut todo = ids.to_vec();
+                    let mut seen = BTreeSet::new();
+                    while let Some(id) = todo.pop() {
+                        if !seen.insert(id.clone()) {
+                            continue;
+                        }
                         let blocked: Vec<String> = store
                             .db
                             .prepare_cached(
-                                "SELECT id FROM incoming_events WHERE state='blocked' AND blocked_on=?",
+                                "SELECT id FROM incoming_events WHERE blocked_on=? AND state='blocked'",
                             )?
-                            .query_map([id], |r| r.get(0))?
+                            .query_map([&id], |r| r.get(0))?
                             .collect::<rusqlite::Result<_>>()?;
+                        todo.extend(blocked.iter().cloned());
                         targets.extend(blocked);
                     }
                     targets
