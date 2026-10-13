@@ -433,6 +433,11 @@ struct MountCtl {
     /// Whether the worker's mount state is known (Ready line or heartbeat);
     /// an adopted worker may already be attached.
     known: bool,
+    /// The next heartbeat may predate the last mount-attach/-detach result:
+    /// its watch could already be in flight when the result arrived. The
+    /// watch loop is sequential and the mailbox FIFO, so the heartbeat after
+    /// it was requested after the result; its mount state is merged again.
+    stale_heartbeat: bool,
 }
 
 impl MountCtl {
@@ -451,6 +456,7 @@ impl MountCtl {
             retry_at: None,
             attempt: 0,
             known: false,
+            stale_heartbeat: false,
         }
     }
 
@@ -1059,6 +1065,10 @@ impl Controller {
     fn after_step(&mut self) {
         if !self.done {
             self.sync_slot();
+            if self.gate.allows_attach() {
+                // Satisfied, Overridden or cleared: the block is over.
+                self.resolve_gate_blocked();
+            }
             if self.want_attach() {
                 self.try_attach();
             }
@@ -1207,6 +1217,13 @@ impl Controller {
         let view = Arc::new(view);
         self.view.store_arc(view.clone());
         self.deps.changes.poke();
+        // After `FolderRemoved` the status hub hears nothing more of this
+        // folder: a later FolderLifecycle would register it again (WP1.11),
+        // leaving a ghost entry while the retired controller stops its worker.
+        // The local snapshot above still follows every change.
+        if self.retired {
+            return;
+        }
         let mut key = (*view).clone();
         key.generation = 0;
         key.heartbeat = None;
@@ -1348,10 +1365,15 @@ impl Controller {
             }
             return Ok(Settle::Now);
         }
-        if self.failed.is_some() {
+        // Failed → Starting on Start (§3.3), also while a Failed folder still
+        // holds a live process (PREVIOUS_WORKER_UNRESPONSIVE, or one that
+        // survived its kills): begin_start drops that untrusted handle and
+        // adopts the worker again (hello), or waits for owner.lock.
+        let was_failed = self.failed.is_some();
+        if was_failed {
             self.reset_failures();
         }
-        if self.idle() || self.failed.is_some() {
+        if self.idle() || was_failed {
             self.begin_start()?;
         }
         Ok(Settle::Now)
@@ -1376,7 +1398,11 @@ impl Controller {
             self.begin_start()?;
             return Ok(Settle::Now);
         }
-        if self.running.is_some() || self.stop.is_some() {
+        if self.running.is_some() || self.stop.is_some() || self.start.is_some() {
+            // Running, stopping or starting: the stop ladder, then a start. A
+            // spawned worker before Ready is killed directly; an adopting
+            // worker gets the graceful stop (like Stop); a lock wait or the
+            // legacy path, which own no process, start over.
             self.stop_worker(false, AfterStop::Start);
             return Ok(Settle::Stop);
         }
@@ -1389,6 +1415,13 @@ impl Controller {
     fn cmd_retry(&mut self) -> Result<Settle, ErrorWire> {
         self.mount_ctl.rearm();
         self.published.retry_at = None;
+        if !self.desired && self.failed.is_some() && self.worker.is_some() {
+            // Nothing to start (desired=0), and the live process this Failed
+            // folder holds is not ours to forget: it stays Failed (not a
+            // Stopped phase with a worker behind it). Start adopts it again;
+            // ForceStop kills it.
+            return Ok(Settle::Now);
+        }
         if self.failed.is_some() || self.backoff_state.is_some() {
             self.reset_failures();
             self.failed = None;
@@ -1536,8 +1569,9 @@ impl Controller {
                 self.deps.slots.cancel_wait(&self.state);
                 self.stop_worker(false, AfterStop::Stopped);
             }
-        } else if changed && self.desired && self.failed.is_some() && self.worker.is_none() {
-            // Failed leaves to Starting on a catalog change for this folder.
+        } else if changed && self.desired && self.failed.is_some() {
+            // Failed leaves to Starting on a catalog change for this folder
+            // (a live process it still holds is adopted again, as on Start).
             self.reset_failures();
             let _ = self.begin_start();
         }
@@ -2060,6 +2094,7 @@ impl Controller {
         self.mount_ctl.rearm();
         self.mount_ctl.user_detached = false;
         self.mount_ctl.known = !adopted;
+        self.mount_ctl.stale_heartbeat = false;
         self.published.refresh = false;
         self.published.retry_at = None;
         self.published.branches_gen = None;
@@ -2298,7 +2333,14 @@ impl Controller {
             }
         }
         if self.mount_ctl.attach.is_none() && self.mount_ctl.detach.is_none() {
-            self.mount = self.merged_mount(&heartbeat.mount);
+            if self.mount_ctl.stale_heartbeat {
+                // Possibly older than the attach/detach result: the result
+                // stands until the next heartbeat (an AttachFailed taken
+                // before a successful attach would re-arm the attach).
+                self.mount_ctl.stale_heartbeat = false;
+            } else {
+                self.mount = self.merged_mount(&heartbeat.mount);
+            }
         }
         self.mount_ctl.known = true;
         let branches = heartbeat.generations.branches;
@@ -2315,10 +2357,13 @@ impl Controller {
         }
         self.heartbeat = Some(heartbeat.clone());
         self.update_entry_from_heartbeat(&heartbeat);
-        self.deps.status.record(StatusEvent::WorkerHeartbeat {
-            state: self.state.clone(),
-            hb: heartbeat,
-        });
+        if !self.retired {
+            // Nothing follows FolderRemoved (see `publish`).
+            self.deps.status.record(StatusEvent::WorkerHeartbeat {
+                state: self.state.clone(),
+                hb: heartbeat,
+            });
+        }
     }
 
     fn on_watch_failed(&mut self, epoch: u64, _error: CallError) {
@@ -2555,10 +2600,19 @@ impl Controller {
     }
 
     fn resolve_stop_blocked(&mut self) {
+        self.resolve_error_code("STOP_BLOCKED_BY_OPEN_FILES");
+    }
+
+    fn resolve_gate_blocked(&mut self) {
+        self.resolve_error_code("GATE_BLOCKED");
+    }
+
+    /// Resolves `last_error` if it is an unresolved `code`.
+    fn resolve_error_code(&mut self, code: &str) {
         if self
             .last_error
             .as_ref()
-            .is_some_and(|record| record.error.code == "STOP_BLOCKED_BY_OPEN_FILES")
+            .is_some_and(|record| record.error.code == code && !record.is_resolved())
         {
             self.resolve_error();
         }
@@ -2951,6 +3005,7 @@ impl Controller {
 
     fn on_attach(&mut self, result: Result<Value, CallError>) {
         self.mount_ctl.attach = None;
+        self.mount_ctl.stale_heartbeat = true;
         match parse::<MountStatus>(result) {
             Ok(status) if status.state.is_attached() => {
                 self.mount = status;
@@ -3033,6 +3088,7 @@ impl Controller {
 
     fn on_detach(&mut self, result: Result<Value, CallError>) {
         self.mount_ctl.detach = None;
+        self.mount_ctl.stale_heartbeat = true;
         match parse::<MountStatus>(result) {
             Ok(status) => self.mount = status,
             Err(error) => {

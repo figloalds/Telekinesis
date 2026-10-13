@@ -210,6 +210,9 @@ enum Mode {
     Hang,
     /// Blocks while the mode stays `Hold`, then answers like `Ok`.
     Hold,
+    /// `watch` only: takes the heartbeat when called, then blocks like `Hold`
+    /// and returns that snapshot (a watch in flight across a mount change).
+    HoldStale,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,7 +307,10 @@ struct FakeWorker {
     device: String,
     version: String,
     adopted: bool,
-    sink: ProcessSink,
+    /// Where exits and startup lines go: the sink of the launch, or of the
+    /// latest `adopt` of this process (the real launcher starts a new pid
+    /// probe per adoption).
+    sink: Mutex<ProcessSink>,
     alive: AtomicBool,
     killable: AtomicBool,
     /// The exit code reported after a graceful or forced `stop`.
@@ -318,7 +324,8 @@ struct FakeWorker {
 impl FakeWorker {
     fn exit(&self, code: Option<i32>, fatal: Option<FatalLine>) {
         if self.alive.swap(false, Ordering::SeqCst) {
-            (self.sink)(ProcessEvent::Exited {
+            let sink = self.sink();
+            sink(ProcessEvent::Exited {
                 code,
                 fatal,
                 stderr_tail: "fake worker log tail".into(),
@@ -334,8 +341,13 @@ impl FakeWorker {
         change(&mut self.behavior.lock().unwrap());
     }
 
+    fn sink(&self) -> ProcessSink {
+        self.sink.lock().unwrap().clone()
+    }
+
     fn emit(&self, event: ProcessEvent) {
-        (self.sink)(event);
+        let sink = self.sink();
+        sink(event);
     }
 
     /// Sleeps until `deadline` or the worker's death; `true` if it died.
@@ -439,6 +451,20 @@ impl FakeWorker {
                     }
                     Ok(serde_json::to_value(self.heartbeat()).unwrap())
                 }
+                Mode::HoldStale => {
+                    let stale = self.heartbeat();
+                    self.log.push(format!("watch-held:{}", self.instance));
+                    let until = Instant::now() + deadline;
+                    while self.behavior.lock().unwrap().watch == Mode::HoldStale {
+                        if self.sleep(Duration::from_millis(10)) {
+                            return Err(CallError::ConnectionLost("the worker exited".into()));
+                        }
+                        if Instant::now() >= until {
+                            return Err(timeout());
+                        }
+                    }
+                    Ok(serde_json::to_value(stale).unwrap())
+                }
             },
             "hello" => match behavior.hello {
                 Mode::Ok => Ok(serde_json::to_value(HelloReply {
@@ -453,7 +479,7 @@ impl FakeWorker {
                 })
                 .unwrap()),
                 Mode::Fail => Err(timeout()),
-                Mode::Hang | Mode::Hold => {
+                Mode::Hang | Mode::Hold | Mode::HoldStale => {
                     self.sleep(deadline);
                     Err(timeout())
                 }
@@ -548,7 +574,7 @@ impl FakeWorker {
         // The real worker flushes the reply and exits; the fake stops serving
         // at once and reports the exit shortly after.
         if self.alive.swap(false, Ordering::SeqCst) {
-            let sink = self.sink.clone();
+            let sink = self.sink();
             let code = self.clean_exit;
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
@@ -666,7 +692,7 @@ impl FakeLauncher {
             device: record.device.clone(),
             version,
             adopted,
-            sink,
+            sink: Mutex::new(sink),
             alive: AtomicBool::new(true),
             killable: AtomicBool::new(true),
             clean_exit: if adopted && !self.adopted_exit_known.load(Ordering::SeqCst) {
@@ -780,9 +806,11 @@ impl WorkerLauncher for FakeLauncher {
             .find(|w| w.instance == record.instance)
             .cloned();
         if let Some(worker) = known {
-            return Ok(worker
-                .alive()
-                .then(|| Box::new(FakeProcess { worker }) as Box<dyn WorkerProcess>));
+            if !worker.alive() {
+                return Ok(None);
+            }
+            *worker.sink.lock().unwrap() = events;
+            return Ok(Some(Box::new(FakeProcess { worker })));
         }
         match self.adopt.lock().unwrap().clone() {
             AdoptPlan::None => Ok(None),
@@ -1105,6 +1133,31 @@ impl Env {
         self.clock.advance(by);
         for view in self.registry.all() {
             let _ = self.registry.send(&view.record.state, FolderCmd::Tick);
+        }
+    }
+
+    /// Advances the clock by `step` (and ticks) until `done`, one step at a
+    /// time: a timer armed by a result still in flight is not skipped.
+    fn advance_until(
+        &self,
+        state: &str,
+        what: &str,
+        step: Duration,
+        done: impl Fn(&FolderView) -> bool,
+    ) -> Arc<FolderView> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let view = self.view(state);
+            if done(&view) {
+                return view;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {state}: {what}; last view: {view:#?}; log: {:?}",
+                self.log.all()
+            );
+            self.advance(step);
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -1483,6 +1536,11 @@ fn busy_view_blocks_the_stop_with_retries_then_force_stop() {
     wait_for("second graceful stop", || {
         env.log.count("rpc:stop:graceful") == 2
     });
+    // The next retry is armed when the controller handles this refusal (2 s
+    // after the clock it reads then): wait for that before moving the clock.
+    env.wait_view("a", "second refusal handled", |v| {
+        v.last_error.as_ref().is_some_and(|e| e.count == 2)
+    });
     env.advance(Duration::from_secs(2));
     wait_for("third graceful stop", || {
         env.log.count("rpc:stop:graceful") == 3
@@ -1592,6 +1650,62 @@ fn restart_stops_then_starts_a_new_worker() {
     assert!(after.record.desired_running);
     assert_eq!(env.launcher.launches(), 2);
     assert_eq!(env.log.position("catalog:set_desired"), None);
+}
+
+#[test]
+fn restart_while_starting_kills_the_spawned_worker_and_starts_again() {
+    // Fix round 2: Restart while Starting answered OK and did nothing.
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .plan_for("a", Plan::Silent)
+        .start();
+    env.wait_view("a", "starting", |v| {
+        matches!(v.phase, FolderPhase::Starting { .. })
+    });
+    let first = env.worker("a");
+    env.registry
+        .request("a", FolderCmd::Restart, Duration::from_secs(10))
+        .unwrap();
+    let view = env.running("a");
+    assert!(!first.alive());
+    assert_ne!(view.worker.as_ref().map(|w| w.pid), Some(first.pid));
+    assert_eq!(env.kills(), 1);
+    assert_eq!(env.launcher.launches(), 2);
+    assert_eq!(env.log.count("rpc:stop"), 0, "no RPC before Ready");
+    assert!(last_error(&view).is_none(), "a restart is not a failure");
+}
+
+#[test]
+fn restart_while_adopting_stops_the_adopted_worker_then_spawns() {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .worker_record("a", 4242, "0.1.0")
+        .adopt(AdoptPlan::Alive {
+            version: "0.1.0".into(),
+            behavior: Behavior {
+                hello: Mode::Hang,
+                ..Behavior::default()
+            },
+            mount: None,
+        })
+        .start();
+    env.wait_view("a", "adopting", |v| {
+        matches!(v.phase, FolderPhase::Starting { adopting: true, .. })
+    });
+    let adopted = env.worker("a");
+    env.registry.send("a", FolderCmd::Restart).unwrap();
+    let view = env.wait_view("a", "spawned worker running", |v| {
+        matches!(v.phase, FolderPhase::Running { adopted: false, .. })
+    });
+    assert!(!adopted.alive());
+    assert!(
+        env.log.position("rpc:stop:graceful:old-a").is_some(),
+        "{:?}",
+        env.log.all()
+    );
+    assert_eq!(env.kills(), 0);
+    assert_eq!(env.launcher.launches(), 1);
+    assert!(last_error(&view).is_none(), "{view:#?}");
 }
 
 #[test]
@@ -1930,6 +2044,120 @@ fn adoption_of_a_silent_worker_fails_after_patience_without_kill_or_spawn() {
     assert_eq!(env.launcher.launches(), 0);
 }
 
+/// Folder `a` whose adopted worker never answers `hello`:
+/// `Failed{PREVIOUS_WORKER_UNRESPONSIVE}` with the process still alive and
+/// its `maximum_running` slot held.
+fn unresponsive_adopted_folder() -> Env {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .worker_record("a", 4242, "0.1.0")
+        .adopt(AdoptPlan::Alive {
+            version: "0.1.0".into(),
+            behavior: Behavior {
+                hello: Mode::Fail,
+                ..Behavior::default()
+            },
+            mount: None,
+        })
+        .start();
+    env.wait_view("a", "adopting", |v| {
+        matches!(v.phase, FolderPhase::Starting { adopting: true, .. })
+    });
+    let view = env.advance_until("a", "failed", Duration::from_secs(31), |v| {
+        error_code(&v.phase).is_some()
+    });
+    assert_eq!(
+        error_code(&view.phase),
+        Some("PREVIOUS_WORKER_UNRESPONSIVE")
+    );
+    assert!(env.worker("a").alive());
+    assert_eq!(env.registry.running_slots(), 1);
+    env
+}
+
+#[test]
+fn start_of_a_failed_folder_holding_a_live_worker_adopts_it_again() {
+    // Fix round 2: Start left such a folder Stopped (desired=1) for good.
+    let env = unresponsive_adopted_folder();
+    let hellos = env.log.count("rpc:hello");
+    env.registry.send("a", FolderCmd::Start).unwrap();
+    let view = env.wait_view("a", "adopting again", |v| {
+        matches!(v.phase, FolderPhase::Starting { adopting: true, .. })
+    });
+    assert!(view.record.desired_running);
+    wait_for("hello again", || env.log.count("rpc:hello") > hellos);
+    // The worker answers now: Running{adopted}, nothing spawned or killed.
+    env.worker("a").set(|b| b.hello = Mode::Ok);
+    let view = env.advance_until("a", "adopted", Duration::from_secs(1), |v| {
+        matches!(v.phase, FolderPhase::Running { adopted: true, .. })
+    });
+    let error = view
+        .last_error
+        .as_ref()
+        .expect("the failure stays as history");
+    assert_eq!(error.error.code, "PREVIOUS_WORKER_UNRESPONSIVE");
+    assert!(error.is_resolved(), "{view:#?}");
+    assert_eq!(env.launcher.launches(), 0);
+    assert_eq!(env.kills(), 0);
+    assert_eq!(env.registry.running_slots(), 1);
+}
+
+#[test]
+fn stop_retry_start_of_a_failed_folder_holding_a_live_worker_adopts_it_again() {
+    // Fix round 2: Retry with desired=0 cleared Failed but kept the process,
+    // and the next Start was ignored.
+    let env = unresponsive_adopted_folder();
+    let wait = Duration::from_secs(10);
+    let view = env
+        .registry
+        .request(
+            "a",
+            FolderCmd::Stop {
+                mode: StopMode::Graceful,
+            },
+            wait,
+        )
+        .unwrap();
+    assert_eq!(
+        error_code(&view.phase),
+        Some("PREVIOUS_WORKER_UNRESPONSIVE")
+    );
+    assert!(!view.record.desired_running);
+    // Nothing to start: it stays Failed, since its process is still there.
+    let view = env.registry.request("a", FolderCmd::Retry, wait).unwrap();
+    assert_eq!(
+        error_code(&view.phase),
+        Some("PREVIOUS_WORKER_UNRESPONSIVE"),
+        "{view:#?}"
+    );
+    let hellos = env.log.count("rpc:hello");
+    let view = env.registry.request("a", FolderCmd::Start, wait).unwrap();
+    assert!(
+        matches!(view.phase, FolderPhase::Starting { adopting: true, .. }),
+        "{view:#?}"
+    );
+    assert!(view.record.desired_running);
+    wait_for("hello again", || env.log.count("rpc:hello") > hellos);
+    // Still silent: Failed again after the patience. A catalog change for
+    // this folder adopts it once more (§3.3: Retry, Start or a catalog change).
+    env.advance_until("a", "failed again", Duration::from_secs(5), |v| {
+        error_code(&v.phase).is_some()
+    });
+    let hellos = env.log.count("rpc:hello");
+    env.catalog
+        .mutate(|s| s.folders[0].label = "renamed".into());
+    env.wait_view("a", "adopting after a catalog change", |v| {
+        matches!(v.phase, FolderPhase::Starting { adopting: true, .. })
+    });
+    wait_for("hello after the catalog change", || {
+        env.log.count("rpc:hello") > hellos
+    });
+    assert_eq!(env.launcher.launches(), 0);
+    assert_eq!(env.kills(), 0);
+    assert_eq!(env.registry.running_slots(), 1);
+    assert!(env.worker("a").alive());
+}
+
 #[test]
 fn adopted_worker_dying_during_adoption_is_replaced_without_backoff() {
     let env = EnvBuilder::new()
@@ -2202,6 +2430,51 @@ fn needs_user_action_attach_is_not_retried_until_attach() {
 }
 
 #[test]
+fn heartbeat_taken_before_an_attach_result_does_not_undo_it() {
+    // Found by parallel stress runs in fix round 2: a watch already in
+    // flight when the attach answered returned the earlier AttachFailed
+    // state, which re-armed the attach (a redundant mount-attach).
+    let occupied = ErrorWire::new(
+        "MOUNT_PATH_MUST_NOT_EXIST",
+        "MOUNT_PATH_MUST_NOT_EXIST: the path exists and is not empty",
+    );
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .mounted("a")
+        .behavior(|b| b.attach = VecDeque::from([AttachB::Failed(occupied)]))
+        .start();
+    env.running("a");
+    env.wait_view("a", "attach failed", |v| {
+        matches!(v.mount.state, MountState::AttachFailed { .. })
+    });
+    // The next watch takes its heartbeat (AttachFailed) now and answers late.
+    let worker = env.worker("a");
+    worker.set(|b| b.watch = Mode::HoldStale);
+    wait_for("a watch in flight", || env.log.count("watch-held:") >= 1);
+    let view = env
+        .registry
+        .request("a", FolderCmd::Attach, Duration::from_secs(10))
+        .unwrap();
+    assert!(view.mount.state.is_attached(), "{view:#?}");
+    let heartbeats = || {
+        env.status
+            .events()
+            .iter()
+            .filter(|e| matches!(e, StatusEvent::WorkerHeartbeat { state, .. } if state == "a"))
+            .count()
+    };
+    let before = heartbeats();
+    worker.set(|b| b.watch = Mode::Ok);
+    wait_for("the stale heartbeat and a fresh one", || {
+        heartbeats() >= before + 2
+    });
+    env.settle();
+    assert_eq!(env.log.count("rpc:mount-attach"), 2, "{:?}", env.log.all());
+    let view = env.view("a");
+    assert!(view.mount.state.is_attached(), "{view:#?}");
+}
+
+#[test]
 fn blocked_evidence_holds_the_gate_until_override() {
     let env = EnvBuilder::new()
         .peer("p1")
@@ -2215,16 +2488,20 @@ fn blocked_evidence_holds_the_gate_until_override() {
         matches!(v.gate, GateState::Blocked { .. })
     });
     assert_eq!(last_error(&view), Some("GATE_BLOCKED"));
+    assert!(!view.last_error.as_ref().unwrap().is_resolved());
     env.settle();
     assert_eq!(env.log.count("rpc:mount-attach"), 0);
     env.registry.send("a", FolderCmd::OverrideGate).unwrap();
-    env.wait_view("a", "attached", |v| {
+    let view = env.wait_view("a", "attached", |v| {
         v.mount.state.is_attached() && v.gate == GateState::None
     });
     let overridden = env.log.position("catalog:override_gate:a").unwrap();
     let attach = env.log.position("rpc:mount-attach").unwrap();
     let clear = env.log.position("catalog:clear_gate:a").unwrap();
     assert!(overridden < attach && attach < clear, "{:?}", env.log.all());
+    // Fix round 2: the override ends the block (history, not an active error).
+    assert_eq!(last_error(&view), Some("GATE_BLOCKED"));
+    assert!(view.last_error.as_ref().unwrap().is_resolved(), "{view:#?}");
 }
 
 #[test]
@@ -2253,11 +2530,15 @@ fn revalidate_reopens_a_blocked_gate() {
         "{view:#?}"
     );
     assert_eq!(env.log.count("rpc:revalidate"), 1);
+    // Revalidating does not end the block by itself; evidence does.
+    assert_eq!(last_error(&view), Some("GATE_BLOCKED"));
+    assert!(!view.last_error.as_ref().unwrap().is_resolved());
     // Fresh evidence after the revalidation opens the gate.
     env.registry.send("a", evidence("p1", true, false)).unwrap();
-    env.wait_view("a", "attached", |v| {
+    let view = env.wait_view("a", "attached", |v| {
         v.mount.state.is_attached() && v.gate == GateState::None
     });
+    assert!(view.last_error.as_ref().unwrap().is_resolved(), "{view:#?}");
 }
 
 #[test]
@@ -2483,6 +2764,53 @@ fn retiring_a_failed_folder_leaves_its_unresponsive_worker_and_ends_the_controll
     assert!(env.worker("a").alive());
     assert_eq!(env.kills(), 0);
     assert_eq!(env.log.count("rpc:stop"), 0);
+}
+
+#[test]
+fn retiring_a_running_folder_sends_nothing_after_folder_removed() {
+    // Fix round 2: the retired controller kept sending FolderLifecycle
+    // (Stopping, Stopped) after FolderRemoved, and the StatusHub registers a
+    // folder again on any FolderLifecycle.
+    let env = EnvBuilder::new().folder("a", true).start();
+    env.running("a");
+    wait_for("a heartbeat event", || {
+        env.status
+            .events()
+            .iter()
+            .any(|e| matches!(e, StatusEvent::WorkerHeartbeat { state, .. } if state == "a"))
+    });
+    let worker = env.worker("a");
+    env.catalog.mutate(|s| s.folders.clear());
+    wait_for("a retired", || env.registry.view("a").is_none());
+    wait_for("worker stopped", || !worker.alive());
+    // The controller ends once the exit is in (its slot is released).
+    wait_for("controller ended", || env.registry.running_slots() == 0);
+    env.settle();
+    assert_eq!(env.log.count("rpc:stop:graceful"), 1);
+    assert_eq!(env.kills(), 0);
+    assert!(env.published.entry("a").is_none());
+    let events = env.status.events();
+    let removed = events
+        .iter()
+        .position(|e| matches!(e, StatusEvent::FolderRemoved { state } if state == "a"))
+        .expect("FolderRemoved");
+    let late: Vec<&StatusEvent> = events[removed + 1..]
+        .iter()
+        .filter(|e| match e {
+            StatusEvent::FolderLifecycle(view) => view.record.state == "a",
+            StatusEvent::WorkerHeartbeat { state, .. } | StatusEvent::FolderRemoved { state } => {
+                state == "a"
+            }
+            _ => false,
+        })
+        .collect();
+    assert!(late.is_empty(), "events after FolderRemoved: {late:#?}");
+    assert!(
+        events[..removed]
+            .iter()
+            .any(|e| matches!(e, StatusEvent::FolderLifecycle(view) if view.record.state == "a")),
+        "lifecycle events before the removal"
+    );
 }
 
 #[test]
