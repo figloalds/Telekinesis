@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    net::{TcpStream, ToSocketAddrs},
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
     time::Duration,
 };
 use tungstenite::{
@@ -183,6 +183,181 @@ pub fn accept(stream: TcpStream) -> Result<Socket> {
         inner,
         negotiated.load(std::sync::atomic::Ordering::Relaxed),
     ))
+}
+
+/// A raw WebSocket over TCP or TLS, as the v3 session layer (`session`) uses
+/// it: binary frames, no JSON codec.
+pub type RawSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// Dials `endpoint` with extra upgrade `headers` (for example
+/// `X-Tkfs-Sync: 3`) and returns the raw WebSocket together with the server's
+/// upgrade response, so the caller can check what the server echoed.
+///
+/// Every resolved address is tried in turn: `timeout` bounds the TCP connect,
+/// is the socket read/write timeout of the TLS and WebSocket upgrade, and
+/// bounds that whole upgrade (a watchdog closes a socket whose server
+/// trickles its response). The first address whose upgrade succeeds wins.
+/// The returned socket keeps
+/// those socket timeouts and the default 64 MiB message bound; callers set
+/// their own. `timeout` must be non-zero. Unlike [`connect`], no
+/// `X-Tkfs-Wire` codec is offered.
+///
+/// Errors carry `WS_CONNECT_FAILED` (or `INVALID_WS_ENDPOINT` and friends for
+/// a malformed endpoint); the last address's `tungstenite::Error` stays in the
+/// chain, so a caller can tell an HTTP refusal (`Error::Http`) apart.
+pub fn connect_with(
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    connector: Option<Connector>,
+    timeout: Duration,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    let uri = endpoint_uri(endpoint)?;
+    let host = uri
+        .host()
+        .context("WS_HOST_REQUIRED")?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let mut request = endpoint.into_client_request()?;
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                .context("INVALID_REQUEST: upgrade header name")?,
+            tungstenite::http::HeaderValue::from_str(value)
+                .context("INVALID_REQUEST: upgrade header value")?,
+        );
+    }
+    let addresses: Vec<SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .with_context(|| format!("WS_CONNECT_FAILED: cannot resolve {host}"))?
+        .collect();
+    let mut connector = connector;
+    let mut last = None;
+    for (index, address) in addresses.iter().enumerate() {
+        let last_address = index + 1 == addresses.len();
+        // A connector that cannot be copied is used once (never silently
+        // replaced by the default trust store on a later address).
+        let (attempt, final_attempt) = match connector.as_ref().map(clone_connector) {
+            None => (None, last_address),
+            Some(Some(copy)) if !last_address => (Some(copy), false),
+            Some(_) => (connector.take(), true),
+        };
+        match connect_one(*address, &request, attempt, timeout) {
+            Ok(connected) => return Ok(connected),
+            Err(error) => last = Some(error.context(format!("WS_CONNECT_FAILED: {address}"))),
+        }
+        if final_attempt {
+            break;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("WS_CONNECT_FAILED: {host} resolved to no address")))
+}
+
+fn clone_connector(connector: &Connector) -> Option<Connector> {
+    match connector {
+        Connector::Plain => Some(Connector::Plain),
+        Connector::NativeTls(tls) => Some(Connector::NativeTls(tls.clone())),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+fn connect_one(
+    address: SocketAddr,
+    request: &tungstenite::handshake::client::Request,
+    connector: Option<Connector>,
+    timeout: Duration,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    let stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    // The socket timeouts bound each read; the watchdog bounds the whole TLS
+    // and WebSocket upgrade, so a server trickling its response cannot hold
+    // the dialer.
+    let watchdog = crate::session::handshake::Watchdog::for_stream(Some(&stream));
+    watchdog.arm(timeout);
+    let result =
+        tungstenite::client_tls_with_config(request.clone(), stream, Some(config()), connector);
+    watchdog.disarm();
+    result.map_err(|error| {
+        let error = handshake_failure(error);
+        if watchdog.fired() {
+            anyhow::Error::new(error).context("websocket upgrade timed out")
+        } else {
+            anyhow::Error::new(error)
+        }
+    })
+}
+
+/// A blocking handshake that stopped on `WouldBlock` timed out (Unix reports
+/// a read timeout as `WouldBlock`, Windows as `TimedOut`).
+fn handshake_failure<R: tungstenite::handshake::HandshakeRole>(
+    error: tungstenite::HandshakeError<R>,
+) -> tungstenite::Error {
+    match error {
+        tungstenite::HandshakeError::Failure(error) => error,
+        tungstenite::HandshakeError::Interrupted(_) => tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "websocket upgrade timed out",
+        )),
+    }
+}
+
+/// Accepts a WebSocket upgrade on `stream` with every incoming message (and
+/// frame) bounded by `max_message` bytes.
+///
+/// `on_request` sees the upgrade request and may add response headers (for
+/// example the `X-Tkfs-Sync` echo). Setting a status other than
+/// `101 Switching Protocols` on the response refuses the upgrade: that status
+/// is sent with no headers and an error is returned.
+///
+/// The stream is switched to blocking mode with `TCP_NODELAY`. Socket
+/// timeouts already set by the caller are kept; a stream with none gets the
+/// legacy 15 s, so a silent client cannot hold the upgrade forever.
+#[allow(clippy::result_large_err)]
+pub fn accept_with(
+    stream: TcpStream,
+    max_message: usize,
+    on_request: impl FnOnce(
+        &tungstenite::handshake::server::Request,
+        &mut tungstenite::handshake::server::Response,
+    ),
+) -> Result<RawSocket> {
+    // Windows inherits the listener's nonblocking mode on accepted sockets.
+    stream.set_nonblocking(false)?;
+    stream.set_nodelay(true)?;
+    if stream.read_timeout()?.is_none() {
+        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    }
+    if stream.write_timeout()?.is_none() {
+        stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    }
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(max_message))
+        .max_frame_size(Some(max_message));
+    tungstenite::accept_hdr_with_config(
+        MaybeTlsStream::Plain(stream),
+        move |request: &tungstenite::handshake::server::Request,
+              mut response: tungstenite::handshake::server::Response| {
+            on_request(request, &mut response);
+            if response.status() == tungstenite::http::StatusCode::SWITCHING_PROTOCOLS {
+                Ok(response)
+            } else {
+                let mut refusal = tungstenite::handshake::server::ErrorResponse::new(None);
+                *refusal.status_mut() = response.status();
+                Err(refusal)
+            }
+        },
+        Some(config),
+    )
+    .map_err(|error| anyhow::Error::new(handshake_failure(error)))
 }
 
 pub fn send<T: Serialize>(socket: &mut Socket, value: &T) -> Result<()> {
