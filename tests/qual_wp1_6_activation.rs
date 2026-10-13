@@ -3,7 +3,9 @@
 //! `tests/qualification-floors.json`.
 //!
 //! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP1.6"]`.
-//! WP1.6 un-ignores and extends them. Run in release:
+//! WP1.6 makes them pass and extends them; they stay `#[ignore]` because the
+//! release qualification runner (`scripts/qualify.ps1`) runs ignored
+//! scenarios only. Run in release:
 //! `cargo test --release --test qual_wp1_6_activation -- --ignored --test-threads=1 --nocapture`
 mod support;
 
@@ -26,15 +28,30 @@ fn remote_linear_create(name: &str, n: usize) {
     s.note(format!("authored {n} local creates in {setup_ms:.0} ms"));
     let allowed = devices([&a, &b]);
     let bundle = missing_bundle(&a, &b).unwrap();
+    let before = b.commit_path_counters();
     s.measure_from_now();
     let delivery = deliver_paced(&mut b, &bundle, &allowed, s.deadline()).unwrap();
+    let after = b.commit_path_counters();
     s.metric_with(
         "per_event_ms",
         delivery.mean_per_event_ms(),
         "ms",
         json!({"events": n, "activated": delivery.delivered,
-            "last_per_event_ms": delivery.per_event_ms.last()}),
+            "last_per_event_ms": delivery.per_event_ms.last(),
+            "fast_commits": after.fast - before.fast,
+            "slow_commits": after.slow - before.slow}),
     );
+    // WP1.6 (§5.1): a remote linear create history activates on the
+    // creation successor; only the kill switch sends it to the slow path.
+    if tkfs::core::commit::remote_fast_paths_enabled() {
+        s.check(
+            after.slow == before.slow,
+            format!(
+                "remote creates took the fast path ({} slow)",
+                after.slow - before.slow
+            ),
+        );
+    }
     if delivery.timed_out {
         s.timeout(format!("{} of {n} events activated", delivery.delivered));
     }
@@ -135,12 +152,16 @@ fn transient_retry() {
         std::env::set_var("TKFS_FAULT_ACTION", "fail");
         std::env::set_var("TKFS_FAULT_COUNT", "1");
     }
+    // `util::fault` reads the variables once per process; an earlier scenario
+    // in this binary may already have loaded them (WP1.6).
+    tkfs::util::fault::reload_from_env();
     let first = b.receive(bundle, &allowed);
     unsafe {
         std::env::remove_var("TKFS_FAULT_POINT");
         std::env::remove_var("TKFS_FAULT_ACTION");
         std::env::remove_var("TKFS_FAULT_COUNT");
     }
+    tkfs::util::fault::reload_from_env();
     s.note(format!(
         "first receive: {:?}",
         first.as_ref().map(|v| v.len())
@@ -168,6 +189,12 @@ fn transient_retry() {
         )
         .unwrap();
     s.check(quarantined == 0, "a transient error is never quarantined");
+    // WP1.6: the event waits in `retry` (1 s backoff), counted as pending.
+    let counts = b.inbox_counts().unwrap();
+    s.check(
+        counts.retry == 1 && counts.pending_active() == 1,
+        format!("one retry row, pending: {counts:?}"),
+    );
     // The retry: reopening drains, as the activator's retry would.
     let root = b.root.clone();
     drop(b);
@@ -212,6 +239,7 @@ fn local_create_after_resolved_conflict() {
             .all(|c| c.resolved_by.is_some()),
         "only resolved conflicts remain",
     );
+    let before = a.commit_path_counters();
     s.measure_from_now();
     let mut samples = vec![];
     for i in 0..20 {
@@ -223,8 +251,25 @@ fn local_create_after_resolved_conflict() {
         r.unwrap();
         samples.push(ms);
     }
+    let after = a.commit_path_counters();
     let summary = summarize(&samples);
     s.metric_with("p90_ms", summary.p90, "ms", summary.json());
     s.metric("p50_ms", summary.p50, "ms");
+    // WP1.6: resolved conflicts no longer gate the creation successor.
+    s.metric(
+        "slow_path_commits",
+        (after.slow - before.slow) as f64,
+        "count",
+    );
+    if tkfs::core::commit::remote_fast_paths_enabled() {
+        s.check(
+            after.slow == before.slow && after.fast - before.fast == samples.len() as u64,
+            format!(
+                "every create took the fast path ({} fast, {} slow)",
+                after.fast - before.fast,
+                after.slow - before.slow
+            ),
+        );
+    }
     s.finish();
 }

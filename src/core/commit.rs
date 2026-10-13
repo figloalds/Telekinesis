@@ -1,11 +1,68 @@
 //! The commit path: validation, the incremental successors (fast paths) and
 //! the full-replay slow path with its forced snapshot seal.
+//!
+//! WP1.6 (REVAMP_PLAN §5.1): the creation and namespace successors also serve
+//! remote events (kill switch `TKFS_REMOTE_FASTPATH=0`), and their conflict
+//! gate reads only the unresolved conflicts of the event's own branch.
+//!
+//! Why a successor is a restriction of full replay: it requires
+//! `dependencies == frontier` (sorted list equality), so every committed event
+//! of the branch is a causal ancestor of the new event E. The only antichain
+//! that contains E is `{E}`, whose cut is the whole history plus E: the
+//! current projection plus E's changes. The successor checks reject every way
+//! that cut could hold a new conflict (an occupied slot, a missing or dead
+//! parent directory, a directory cycle, live children of a deleted entry, a
+//! register with competing heads), and E is not a review. Location and
+//! register pairs that include E are ancestor-related, so neither the pair
+//! derivation nor `namespace_history` can add a record, and full mode's
+//! DELETE of non-rederived namespace rows is a no-op. The device that
+//! authored E plays no part in this argument; the old `device == self`
+//! restriction only kept the remote case behind the slow path. The oracle
+//! (`verify_derived_state`) is the executable check (`tests/activation_inbox.rs`).
 use super::derive::persist_projection;
 use super::*;
+use std::{cell::Cell, sync::OnceLock};
 
-/// Commit cache (owned by WP2.4, e.g. its event cache; empty in Wave 0).
+/// Commit cache: fast/slow commit counters (WP2.4 may add its event cache).
 #[derive(Default)]
-pub(crate) struct Cache {}
+pub(crate) struct Cache {
+    fast: Cell<u64>,
+    slow: Cell<u64>,
+}
+
+/// How many commits on this handle took an incremental successor (`fast`)
+/// or the full-replay slow path (`slow`) since it was opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitPathCounters {
+    pub fast: u64,
+    pub slow: u64,
+}
+
+/// `TKFS_REMOTE_FASTPATH` (read once per process): any value but `0` lets
+/// remote events use the creation and namespace successors. `0` restores the
+/// previous gate exactly: those successors serve only this device's events,
+/// and any conflict row of the branch (resolved or not) disables them.
+pub fn remote_fast_paths_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TKFS_REMOTE_FASTPATH").as_deref() != Ok("0"))
+}
+
+/// Fault point `core.commit.busy` (`util::fault`): when it fires, the commit
+/// fails with a genuine `SQLITE_BUSY` before writing anything.
+const BUSY_FAULT: &str = "core.commit.busy";
+
+/// The validated parts of an event that `commit_checked` needs.
+pub(super) struct Checked {
+    payload: String,
+    objects: BTreeSet<String>,
+}
+
+/// Result of `check_commit`.
+pub(super) enum Check {
+    /// The identical event is already in the journal (idempotent commit).
+    Committed,
+    Ready(Checked),
+}
 
 impl Store {
     pub fn commit(&mut self, event: Event, local: bool) -> Result<()> {
@@ -30,21 +87,33 @@ impl Store {
             },
             &BTreeSet::from([device]),
         )?;
-        let error: Option<String> = self
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = self
             .db
             .query_row(
-                "SELECT error FROM incoming_events WHERE id=?",
+                "SELECT error,state,code FROM incoming_events WHERE id=?",
                 [&revision],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()?
-            .flatten();
-        if let Some(error) = error {
-            bail!("{error}");
+            .optional()?;
+        match row {
+            Some((Some(error), _, _)) => bail!("{error}"),
+            // A transient failure is retried later; the event is not committed.
+            Some((None, Some(state), code)) if state == "retry" => bail!(
+                "{}: transient activation failure; retry scheduled",
+                code.as_deref().unwrap_or("SQLITE_BUSY")
+            ),
+            _ => Ok(()),
         }
-        Ok(())
     }
     pub(super) fn commit_ready(&mut self, event: Event, local: bool) -> Result<()> {
+        let Check::Ready(checked) = self.check_commit(&event, local)? else {
+            return Ok(());
+        };
+        let fast = self.fast_successor(&event, local)?;
+        self.commit_checked(event, local, checked, fast)
+    }
+    /// Every validation of the commit path that needs no projection.
+    pub(super) fn check_commit(&self, event: &Event, local: bool) -> Result<Check> {
         ensure!(event.repo == self.repo, "REPOSITORY_MISMATCH");
         ensure!(
             event.id.len() <= 128 && !event.id.is_empty() && event.device.len() <= 128,
@@ -55,7 +124,7 @@ impl Store {
             "INVALID_EVENT"
         );
         ensure!(local || event.branch.shared, "PRIVATE_EVENT_REJECTED");
-        let payload = serde_json::to_string(&event)?;
+        let payload = serde_json::to_string(event)?;
         ensure!(payload.len() <= MAX_EVENT, "EVENT_METADATA_TOO_LARGE");
         name_key(&event.branch.name)?;
         ensure!(
@@ -70,7 +139,7 @@ impl Store {
             .optional()?;
         if let Some(old) = existing {
             ensure!(old == payload, "EVENT_ID_REUSED");
-            return Ok(());
+            return Ok(Check::Committed);
         }
         let objects = event.objects();
         ensure!(
@@ -133,13 +202,30 @@ impl Store {
         if let Ok(b) = self.branch(&event.branch.id) {
             ensure!(b == event.branch, "BRANCH_DESCRIPTOR_CHANGED");
         }
-        let mut fast = self.content_successor(&event)?;
-        if fast.is_none() && local {
-            fast = self.creation_successor(&event)?;
+        Ok(Check::Ready(Checked { payload, objects }))
+    }
+    /// The incremental projection delta for `event`, if a successor proves it
+    /// equal to full replay; `None` means the slow path.
+    pub(super) fn fast_successor(&self, event: &Event, local: bool) -> Result<Option<Projection>> {
+        let mut fast = self.content_successor(event)?;
+        if fast.is_none() && (local || remote_fast_paths_enabled()) {
+            fast = self.creation_successor(event)?;
             if fast.is_none() {
-                fast = self.namespace_successor(&event)?;
+                fast = self.namespace_successor(event)?;
             }
         }
+        Ok(fast)
+    }
+    /// Writes a checked event: through `fast` (an incremental delta), or by
+    /// full replay of the branch when `fast` is `None`.
+    pub(super) fn commit_checked(
+        &mut self,
+        event: Event,
+        local: bool,
+        checked: Checked,
+        mut fast: Option<Projection>,
+    ) -> Result<()> {
+        let Checked { payload, objects } = checked;
         let incremental = fast.is_some();
         let events = if fast.is_none() {
             let mut events: Vec<_> = self
@@ -159,6 +245,9 @@ impl Store {
         };
         if !projection.pending.is_empty() {
             return Err(CausalPrerequisitesPending.into());
+        }
+        if crate::util::fault::hit(BUSY_FAULT).is_some() {
+            return Err(injected_busy().into());
         }
         fault("before_sql");
         let tx = self.db.savepoint()?;
@@ -231,8 +320,15 @@ impl Store {
             "INSERT INTO event_frontier VALUES(?,?)",
             params![event.branch.id, event.id],
         )?;
+        // The forced seal after a slow-path commit is kept (REVAMP_PLAN P4).
         snapshot::maybe_persist(&tx, &event.branch.id, !incremental)?;
         tx.commit()?;
+        let counter = if incremental {
+            &self.caches.commit.fast
+        } else {
+            &self.caches.commit.slow
+        };
+        counter.set(counter.get().saturating_add(1));
         // Patch the view only if no other connection committed since it was
         // loaded (I6); otherwise drop it. Never fail after the commit.
         let data_version = self.data_version().ok();
@@ -270,6 +366,47 @@ impl Store {
         }
         fault("sql_committed");
         Ok(())
+    }
+    /// Commits on this handle by path (see [`CommitPathCounters`]).
+    pub fn commit_path_counters(&self) -> CommitPathCounters {
+        CommitPathCounters {
+            fast: self.caches.commit.fast.get(),
+            slow: self.caches.commit.slow.get(),
+        }
+    }
+    /// Whether `branch` has a conflict row that no review resolved.
+    pub fn branch_has_unresolved_conflicts(&self, branch: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE branch=? AND resolved_by IS NULL)",
+            [branch],
+            |r| r.get(0),
+        )?)
+    }
+    /// The conflict gate of the creation and namespace successors. With
+    /// remote fast paths, only unresolved conflicts of the event's own branch
+    /// disable them; with `TKFS_REMOTE_FASTPATH=0`, any conflict row of that
+    /// branch does (the previous gate, also the oracle fallback of §5.1).
+    fn successor_conflict_gate(&self, branch: &str) -> Result<bool> {
+        if remote_fast_paths_enabled() {
+            return self.branch_has_unresolved_conflicts(branch);
+        }
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE branch=?)",
+            [branch],
+            |r| r.get(0),
+        )?)
+    }
+    /// Whether the successors may handle an event of `device`.
+    fn successor_device_allowed(&self, device: &str) -> bool {
+        device == self.device || remote_fast_paths_enabled()
+    }
+    /// The sorted causal frontier of `branch`.
+    fn frontier(&self, branch: &str) -> Result<Vec<String>> {
+        Ok(self
+            .db
+            .prepare_cached("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
+            .query_map([branch], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
     pub(super) fn content_successor(&self, event: &Event) -> Result<Option<Projection>> {
         if !event.reviewed.is_empty()
@@ -365,16 +502,7 @@ impl Store {
             .map(|c| &c.entity)
             .collect::<BTreeSet<_>>()
         {
-            let modified = ["kind", "location", "alive", "content"]
-                .iter()
-                .filter_map(|field| {
-                    p.heads
-                        .get(&register(entity, field))
-                        .and_then(|heads| heads.last())
-                })
-                .map(|v| v.created_ms)
-                .max()
-                .unwrap_or(0);
+            let modified = modified_ms(&p.heads, entity);
             p.entries.get_mut(entity).unwrap().modified_ms = modified;
         }
         // Each changed register has one head and this event parents it. All old
@@ -382,10 +510,13 @@ impl Store {
         // is possible. Existing durable records remain untouched.
         Ok(Some(p))
     }
-    /// A local fresh entry ordered after the entire accepted frontier cannot
+    /// A fresh entry ordered after the entire accepted frontier cannot
     /// introduce a concurrent namespace cut. All other placements use replay.
     pub(super) fn creation_successor(&self, event: &Event) -> Result<Option<Projection>> {
-        if event.device != self.device || !event.reviewed.is_empty() || event.changes.is_empty() {
+        if !self.successor_device_allowed(&event.device)
+            || !event.reviewed.is_empty()
+            || event.changes.is_empty()
+        {
             return Ok(None);
         }
         let entity = &event.changes[0].entity;
@@ -413,12 +544,7 @@ impl Store {
         {
             return Ok(None);
         }
-        let frontier = self
-            .db
-            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
-            .query_map([&event.branch.id], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if event.dependencies != frontier {
+        if event.dependencies != self.frontier(&event.branch.id)? {
             return Ok(None);
         }
         let Ok(view) = self.view(&event.branch.id) else {
@@ -428,7 +554,7 @@ impl Store {
         if current.entries.contains_key(entity)
             || !current.pending.is_empty()
             || !current.conflicts.is_empty()
-            || !self.conflicts()?.is_empty()
+            || self.successor_conflict_gate(&event.branch.id)?
         {
             return Ok(None);
         }
@@ -491,7 +617,7 @@ impl Store {
     /// are equally safe. Replaying every historical cut here can hold the mounted
     /// filesystem's engine and WinFsp namespace locks for minutes on IDE cleanup.
     pub(super) fn namespace_successor(&self, event: &Event) -> Result<Option<Projection>> {
-        if event.device != self.device
+        if !self.successor_device_allowed(&event.device)
             || !event.reviewed.is_empty()
             || !(1..=2).contains(&event.changes.len())
         {
@@ -515,12 +641,7 @@ impl Store {
         }) {
             return Ok(None);
         }
-        let frontier = self
-            .db
-            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
-            .query_map([&event.branch.id], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if event.dependencies != frontier {
+        if event.dependencies != self.frontier(&event.branch.id)? {
             return Ok(None);
         }
         let Ok(view) = self.view(&event.branch.id) else {
@@ -529,7 +650,7 @@ impl Store {
         let current = &view.projection;
         if !current.pending.is_empty()
             || !current.conflicts.is_empty()
-            || !self.conflicts()?.is_empty()
+            || self.successor_conflict_gate(&event.branch.id)?
         {
             return Ok(None);
         }
@@ -595,10 +716,12 @@ impl Store {
             } else {
                 // Deleting a parent with live children can suppress their
                 // namespace and create conflicts, even on a sequential event.
-                if current
-                    .entries
-                    .values()
-                    .any(|e| e.alive && e.parent == entry.id)
+                // The slot index holds exactly the live entries, keyed by parent.
+                if view
+                    .slots
+                    .range((entry.id.clone(), String::new())..)
+                    .next()
+                    .is_some_and(|((parent, _), _)| parent == &entry.id)
                 {
                     return Ok(None);
                 }
@@ -607,7 +730,6 @@ impl Store {
             entry
                 .revisions
                 .insert(change.field.clone(), event.id.clone());
-            entry.modified_ms = entry.modified_ms.max(event.created_ms);
             for field in ["kind", "location", "alive", "content", "basic"] {
                 let key = register(&entry.id, field);
                 if let Some(heads) = current.heads.get(&key) {
@@ -624,8 +746,36 @@ impl Store {
                     value: change.value.clone(),
                 }],
             );
+            // Full replay derives `modified_ms` from the current winners, so
+            // a remote event with an older clock can lower it (exactly as
+            // `project` does); `max(old, created)` would diverge.
+            entry.modified_ms = modified_ms(&delta.heads, &entry.id);
             delta.entries.insert(entry.id.clone(), entry);
         }
         Ok(Some(delta))
     }
+}
+
+/// `project`'s `modified_ms` of `entity`: the latest `created_ms` among the
+/// winners (the last head) of its non-`basic` registers.
+fn modified_ms(heads: &BTreeMap<String, Vec<Version>>, entity: &str) -> u64 {
+    ["kind", "location", "alive", "content"]
+        .iter()
+        .filter_map(|field| {
+            heads
+                .get(&register(entity, field))
+                .and_then(|heads| heads.last())
+        })
+        .map(|v| v.created_ms)
+        .max()
+        .unwrap_or(0)
+}
+
+/// The error of the `core.commit.busy` fault point: a genuine `SQLITE_BUSY`,
+/// so classification sees exactly what a contended writer would produce.
+fn injected_busy() -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+        Some(format!("database is locked (fault point {BUSY_FAULT})")),
+    )
 }
