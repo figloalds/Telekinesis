@@ -40,11 +40,11 @@ fn accept(listener: TcpListener, tls: bool) -> thread::JoinHandle<Ws> {
             )
             .unwrap();
             let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
-            MaybeTlsStream::NativeTls(acceptor.accept(stream).ok().expect("TLS accept"))
+            MaybeTlsStream::NativeTls(acceptor.accept(stream).expect("TLS accept"))
         } else {
             MaybeTlsStream::Plain(stream)
         };
-        tungstenite::accept(stream).ok().expect("WebSocket accept")
+        tungstenite::accept(stream).expect("WebSocket accept")
     })
 }
 
@@ -64,7 +64,6 @@ fn connect(port: u16, tls: bool) -> Ws {
         (format!("ws://127.0.0.1:{port}/"), None)
     };
     tungstenite::client_tls_with_config(url, stream, None, connector)
-        .ok()
         .expect("WebSocket connect")
         .0
 }

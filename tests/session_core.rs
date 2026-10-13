@@ -67,10 +67,10 @@ fn accept_ws(listener: TcpListener, transport: Transport) -> thread::JoinHandle<
                 )
                 .unwrap();
                 let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
-                MaybeTlsStream::NativeTls(acceptor.accept(stream).ok().expect("TLS accept"))
+                MaybeTlsStream::NativeTls(acceptor.accept(stream).expect("TLS accept"))
             }
         };
-        tungstenite::accept(stream).ok().expect("WebSocket accept")
+        tungstenite::accept(stream).expect("WebSocket accept")
     })
 }
 
@@ -95,7 +95,6 @@ fn connect_ws(port: u16, transport: Transport) -> Ws {
         }
     };
     tungstenite::client_tls_with_config(url, stream, None, connector)
-        .ok()
         .expect("WebSocket connect")
         .0
 }
@@ -559,6 +558,8 @@ fn timeout_cancels(transport: Transport) {
         Duration::from_secs(2),
         || server.health().inflight == 0,
     );
+    // A timed-out request never resets the connection.
+    assert!(client.closed().is_none() && server.closed().is_none());
 }
 
 #[test]
