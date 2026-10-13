@@ -13,6 +13,8 @@
   -All       every qual file and every floor (same as -Wave 4).
   -Baseline  every qual file; floors are evaluated and recorded, never enforced
              (exit 0); writes test-evidence/qualification-baseline.json.
+  -Merge     keep the other files' results from the existing evidence file and
+             replace only the files run now (floors and summary are recomputed).
 
   Exit code: 0 when every enforced floor holds and every selected scenario
   passed (or skipped); 1 otherwise. -Baseline always exits 0 unless the build fails.
@@ -34,6 +36,7 @@ param(
     [int]$FileTimeoutMin = 90,
     [string]$Evidence = "",
     [switch]$NoBuild,
+    [switch]$Merge,
     [ValidateSet("Idle", "BelowNormal", "Normal")][string]$Priority = "BelowNormal"
 )
 $ErrorActionPreference = "Stop"
@@ -182,10 +185,29 @@ function Test-Floor($floor, $value) {
     }
 }
 
+$mergedFrom = $null
+if ($Merge -and (Test-Path $Evidence)) {
+    # Carry the other files' results (and their metrics, for the floors) forward.
+    $old = Get-Content $Evidence -Raw | ConvertFrom-Json
+    $mergedFrom = [ordered]@{ generated_at = $old.generated_at; git = $old.git; run_dir = $old.run_dir }
+    $kept = @($old.files | Where-Object { -not ($selected -contains $_.file) })
+    foreach ($f in $kept) {
+        foreach ($sc in @($f.scenarios)) {
+            $records += [pscustomobject]@{ scenario = $sc.scenario; status = "started" }
+            foreach ($m in @($sc.metrics)) {
+                $records += [pscustomobject]@{ scenario = $sc.scenario; metric = $m.metric; value = $m.value }
+            }
+        }
+    }
+    $fileResults = @($kept) + @($fileResults)
+    $fileResults = @($fileResults | Sort-Object { [array]::IndexOf(@($qualFiles.Keys), $_.file) })
+}
+$evaluated = @($fileResults | ForEach-Object { $_.file })
+
 $floorResults = @()
 foreach ($floor in $floorsDoc.floors) {
     $file = $floor.scenario.Split(":")[0]
-    if (-not ($selected -contains $file)) { continue }
+    if (-not ($evaluated -contains $file)) { continue }
     $metric = $records | Where-Object { $_.scenario -eq $floor.scenario -and $_.metric -eq $floor.metric } |
         Select-Object -Last 1
     $measured = $null
@@ -256,6 +278,7 @@ $evidenceDoc = [ordered]@{
     files        = $fileResults
     floors       = $floorResults
     run_dir      = $runDir
+    merged_from  = $mergedFrom
 }
 $evidenceDoc | ConvertTo-Json -Depth 12 | Set-Content -Path $Evidence -Encoding UTF8
 Write-Host "qualify: evidence written to $Evidence"

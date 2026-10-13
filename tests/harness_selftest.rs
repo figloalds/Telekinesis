@@ -366,6 +366,19 @@ fn fixtures_are_deterministic_per_seed() {
     );
     assert_ne!(original.device, clone.device);
     assert_eq!(original.repo, clone.repo);
+    // The clone resumes from the original's snapshot re-stamped with its device
+    // (a fallback rebuild would have re-serialized it in struct field order).
+    let payload = |s: &Store| -> String {
+        s.db.query_row(
+            "SELECT payload FROM startup_snapshots WHERE branch=?",
+            [&s.active],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let mut expected: Value = serde_json::from_str(&payload(&original)).unwrap();
+    expected["device"] = json!(clone.device);
+    assert_eq!(payload(&clone), serde_json::to_string(&expected).unwrap());
 }
 
 /// Large fixtures write rows directly (`direct_creates`); the result must equal a

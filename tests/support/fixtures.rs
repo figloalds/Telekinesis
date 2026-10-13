@@ -706,10 +706,7 @@ pub fn clone_replica(store: Store, dst: &Path) -> Result<(Store, Store)> {
     for name in ["runtime.json", "worker.json", "owner.lock"] {
         let _ = fs::remove_file(dst.join(name));
     }
-    {
-        let db = rusqlite::Connection::open(dst.join("metadata.sqlite"))?;
-        db.execute("UPDATE config SET value=? WHERE key='device'", [id()])?;
-    }
+    restamp_device(dst, &id())?;
     let original = Store::open(&root, Some(&repo))?;
     let clone = Store::open(dst, Some(&repo))?;
     Ok((original, clone))
@@ -886,8 +883,30 @@ pub fn clone_into(src: &Path, dst: &Path, device: &str) -> Result<()> {
     for name in ["runtime.json", "worker.json", "owner.lock", "worker.log"] {
         let _ = fs::remove_file(dst.join(name));
     }
-    let db = rusqlite::Connection::open(dst.join("metadata.sqlite"))?;
+    restamp_device(dst, device)
+}
+
+/// Give a copied (closed) state directory the device id `device`: the `config`
+/// row and every startup snapshot, whose payload names the device and whose
+/// checksum covers the payload. Without the snapshot update the copy would fail
+/// `SNAPSHOT_VERSION_OR_IDENTITY` on every open and rebuild its whole history
+/// (O(L²) at 6298d0b: hours at 50K events).
+pub fn restamp_device(state: &Path, device: &str) -> Result<()> {
+    let db = rusqlite::Connection::open(state.join("metadata.sqlite"))?;
     db.execute("UPDATE config SET value=? WHERE key='device'", [device])?;
+    let rows: Vec<(String, String)> = db
+        .prepare("SELECT branch,payload FROM startup_snapshots")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (branch, payload) in rows {
+        let mut snapshot: Value = serde_json::from_str(&payload)?;
+        snapshot["device"] = json!(device);
+        let payload = serde_json::to_string(&snapshot)?;
+        db.execute(
+            "UPDATE startup_snapshots SET payload=?,checksum=? WHERE branch=?",
+            rusqlite::params![payload, hash(payload.as_bytes()), branch],
+        )?;
+    }
     Ok(())
 }
 

@@ -16,6 +16,21 @@ use tkfs::core::{Store, id};
 
 const FILE: &str = "qual_wp2_5_feed";
 
+/// The legacy path's error: its code when it has one, else the first line.
+fn legacy_error(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    match error_code(&text).as_str() {
+        "TEXT" => text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect(),
+        code => code.to_owned(),
+    }
+}
+
 /// Activation pause for the receiving worker (§4.4 activator; name owned by WP2.3).
 const ACTIVATOR_PAUSE: [(&str, &str); 2] = [
     ("TKFS_FAULT_POINT", "worker.activator.slice"),
@@ -133,7 +148,7 @@ fn feed_150k_events() {
                 0.0,
                 "bool",
                 json!({"legacy_path": legacy.as_ref().map(|_| "ok".to_string())
-                    .unwrap_or_else(|e| error_code(&format!("{e:#}")))}),
+                    .unwrap_or_else(legacy_error)}),
             );
             s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
         }
@@ -357,7 +372,7 @@ fn large_event_8mib() {
                 0.0,
                 "bool",
                 json!({"event_bytes": size, "legacy_path": legacy.as_ref().map(|_| "ok".to_string())
-                    .unwrap_or_else(|e| error_code(&format!("{e:#}")))}),
+                    .unwrap_or_else(legacy_error)}),
             );
             s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
         }
