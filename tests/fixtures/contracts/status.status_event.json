@@ -1,0 +1,370 @@
+[
+  {
+    "event": "folder_lifecycle",
+    "generation": 9,
+    "record": {
+      "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+      "label": "Photos",
+      "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+      "device": "3c9e7a10-1f2b-4c3d-8e9f-a0b1c2d3e4f5",
+      "directory": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+      "mount": "C:\\mounts\\photos",
+      "desired_running": true,
+      "sync_enabled": true,
+      "mount_enabled": true
+    },
+    "phase": {
+      "kind": "running",
+      "since_ms": 1790000000000,
+      "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+      "pid": 1234,
+      "address": "ws://127.0.0.1:5555",
+      "adopted": false
+    },
+    "gate": {
+      "kind": "awaiting",
+      "source": "inst-bbbb-2222",
+      "since_ms": 1790000000000,
+      "waiting_on": [
+        "412 events remaining at source"
+      ]
+    },
+    "mount": {
+      "intent": "attach",
+      "path": "C:\\mounts\\photos",
+      "state": "attached",
+      "since_ms": 1790000000900
+    },
+    "worker": {
+      "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+      "pid": 1234,
+      "address": "ws://127.0.0.1:5555",
+      "version": "0.1.0+6298d0b"
+    },
+    "heartbeat": {
+      "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+      "seq": 42,
+      "at_ms": 1790000042000,
+      "uptime_ms": 42000,
+      "mount": {
+        "intent": "attach",
+        "path": "C:\\mounts\\photos",
+        "state": "attached",
+        "since_ms": 1790000000900
+      },
+      "engine": {
+        "waiters": 1,
+        "holds": 99000,
+        "wait_p99_ms": 4,
+        "longest_hold_ms": 310,
+        "current_hold_ms": 0,
+        "stalled": false
+      },
+      "store_health": {
+        "state": "healthy"
+      },
+      "pending_saves": 0,
+      "open_handles": 3,
+      "unflushed_files": 1,
+      "generations": {
+        "sync": 0,
+        "branches": 0,
+        "content": 0,
+        "mount": 0
+      },
+      "tip": null,
+      "inbox": null,
+      "activation": null,
+      "content": null,
+      "journal": null,
+      "peers": []
+    },
+    "last_error": null,
+    "restarts": 1,
+    "degraded": false,
+    "published_error": {
+      "error": {
+        "code": "PUBLISHED_SUMMARY_FAILED",
+        "class": "transient",
+        "message": "PUBLISHED_SUMMARY_FAILED: REQUEST_TIMEOUT"
+      },
+      "scope": {
+        "kind": "folder",
+        "state": "C:\\tkfs\\data\\folders\\5b0c2f0e"
+      },
+      "first_at_ms": 1790000000100,
+      "last_at_ms": 1790000000100,
+      "count": 1,
+      "next_retry_at_ms": null,
+      "resolved_at_ms": null
+    }
+  },
+  {
+    "event": "worker_heartbeat",
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "hb": {
+      "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+      "seq": 42,
+      "at_ms": 1790000042000,
+      "uptime_ms": 42000,
+      "mount": {
+        "intent": "attach",
+        "path": "C:\\mounts\\photos",
+        "state": "attached",
+        "since_ms": 1790000000900
+      },
+      "engine": {
+        "waiters": 1,
+        "holds": 99000,
+        "wait_p99_ms": 4,
+        "longest_hold_ms": 310,
+        "current_hold_ms": 0,
+        "stalled": false
+      },
+      "store_health": {
+        "state": "healthy"
+      },
+      "pending_saves": 0,
+      "open_handles": 3,
+      "unflushed_files": 1,
+      "generations": {
+        "sync": 77,
+        "branches": 3,
+        "content": 41,
+        "mount": 2
+      },
+      "tip": {
+        "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "seq": 4096
+      },
+      "inbox": {
+        "ready": 12,
+        "waiting": 3,
+        "retry": 1,
+        "blocked": 2,
+        "quarantined": 1,
+        "unclassified": 0
+      },
+      "activation": {
+        "running": true,
+        "activated": 2048,
+        "fast": 2040,
+        "slow": 8,
+        "quarantined": 1,
+        "retried": 4,
+        "stale": 0,
+        "slices": 40,
+        "last_slice_ms": 18,
+        "last_activation_at_ms": 1790000005000,
+        "starved_since_ms": null
+      },
+      "content": {
+        "current_objects": 1200,
+        "current_available": 1100,
+        "current_missing": 100,
+        "current_missing_bytes": 734003200,
+        "shared_objects": 1500,
+        "shared_available": 1380,
+        "shared_missing_bytes": 900000000,
+        "downloading": 2,
+        "partial_bytes": 3145728,
+        "requested": 7,
+        "complete": false
+      },
+      "journal": {
+        "events": 4096,
+        "shared_events": 4090,
+        "branches": 2,
+        "tip": 4096,
+        "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "outgoing_unacknowledged": 12,
+        "unresolved_conflicts": 1
+      },
+      "peers": [
+        {
+          "replica": "8d7c6b5a-4f3e-4d2c-9b1a-0f9e8d7c6b5a",
+          "cursor_seq": 3900,
+          "remote_tip": 4312,
+          "to_receive": 412,
+          "to_send": 5,
+          "staged_pending": 3,
+          "blocked": 0,
+          "quarantined": 0,
+          "rejected": 0,
+          "caught_up": false,
+          "last_exchange_ms": 1790000004500
+        }
+      ]
+    }
+  },
+  {
+    "event": "folder_removed",
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e"
+  },
+  {
+    "event": "peer_configured",
+    "installation": "inst-bbbb-2222",
+    "endpoint": "wss://peer.example:43180"
+  },
+  {
+    "event": "peer_removed",
+    "installation": "inst-bbbb-2222"
+  },
+  {
+    "event": "lane_state",
+    "installation": "inst-bbbb-2222",
+    "lane": 1,
+    "role": "bulk",
+    "direction": "outbound",
+    "state": "backoff",
+    "error": {
+      "code": "REQUEST_TIMEOUT",
+      "class": "transient",
+      "message": "REQUEST_TIMEOUT: no reply after 30000 ms",
+      "retry_after_ms": 2000
+    },
+    "backoff_until_ms": 1790000012000,
+    "rtt_ms": null
+  },
+  {
+    "event": "exchange_started",
+    "installation": "inst-bbbb-2222",
+    "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+    "lane": 0,
+    "op": "meta.exchange",
+    "at_ms": 1790000009900
+  },
+  {
+    "event": "exchange_finished",
+    "installation": "inst-bbbb-2222",
+    "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+    "lane": 0,
+    "op": "meta.exchange",
+    "direction": "outbound",
+    "ok": true,
+    "error": null,
+    "summary": {
+      "sent_events": 3,
+      "received_events": 1,
+      "staged": 1,
+      "rejected": 1,
+      "acked": 2,
+      "local_tip": 4096,
+      "remote_tip": 130,
+      "cursor_in": 121,
+      "cursor_out": 3902,
+      "to_send": 194,
+      "to_receive": 9,
+      "local_pending": 15,
+      "remote_pending": 0,
+      "blocked": 2,
+      "quarantined": 1,
+      "caught_up": false,
+      "metadata_advanced": true,
+      "bytes_up": 18000,
+      "bytes_down": 2300
+    },
+    "bytes_up": 18000,
+    "bytes_down": 2300,
+    "objects_up": 0,
+    "objects_down": 0,
+    "duration_ms": 35
+  },
+  {
+    "event": "peer_catalog",
+    "installation": "inst-bbbb-2222",
+    "entries": [
+      {
+        "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+        "replica": "3c9e7a10-1f2b-4c3d-8e9f-a0b1c2d3e4f5",
+        "label": "Photos",
+        "branches": [
+          {
+            "id": "b0a1c2d3-e4f5-4061-8a9b-0c1d2e3f4a5b",
+            "name": "main",
+            "shared": true
+          }
+        ],
+        "state": "running",
+        "tip": {
+          "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+          "seq": 4096
+        },
+        "sync_generation": 77,
+        "content": {
+          "current_objects": 1200,
+          "current_available": 1100,
+          "current_missing": 100,
+          "current_missing_bytes": 734003200,
+          "shared_objects": 1500,
+          "shared_available": 1380,
+          "shared_missing_bytes": 900000000,
+          "downloading": 2,
+          "partial_bytes": 3145728,
+          "requested": 7,
+          "complete": false
+        },
+        "error": null,
+        "updated_at_ms": 1790000002000
+      }
+    ]
+  },
+  {
+    "event": "inbound_session",
+    "installation": "inst-bbbb-2222",
+    "lane": 0,
+    "role": "control",
+    "opened": true
+  },
+  {
+    "event": "inbound_incompatible",
+    "address": "192.0.2.10:50123",
+    "detail": "PEER_NEEDS_UPGRADE: legacy hello version 2"
+  },
+  {
+    "event": "object_error",
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "error": {
+      "code": "CORRUPT_AT_SOURCE",
+      "class": "fatal",
+      "message": "CORRUPT_AT_SOURCE: hash mismatch"
+    }
+  },
+  {
+    "event": "legacy_link",
+    "key": "wss://peer.example:43180\u001f0\u001f5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+    "value": {
+      "connected": true,
+      "exchanges": 12
+    }
+  },
+  {
+    "event": "error",
+    "scope": {
+      "kind": "peer",
+      "installation": "inst-bbbb-2222"
+    },
+    "error": {
+      "code": "INVALID_PAIRING_CODE",
+      "class": "needs_user_action",
+      "message": "INVALID_PAIRING_CODE"
+    }
+  },
+  {
+    "event": "resolved",
+    "scope": {
+      "kind": "peer",
+      "installation": "inst-bbbb-2222"
+    },
+    "code": "INVALID_PAIRING_CODE"
+  },
+  {
+    "event": "activity",
+    "at_ms": 1790000000000,
+    "kind": "lifecycle",
+    "folder": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "peer": null,
+    "message": "folder started"
+  }
+]

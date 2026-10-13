@@ -1,0 +1,13 @@
+{
+  "replica": "8d7c6b5a-4f3e-4d2c-9b1a-0f9e8d7c6b5a",
+  "cursor_seq": 3900,
+  "remote_tip": 4312,
+  "to_receive": 412,
+  "to_send": 5,
+  "staged_pending": 3,
+  "blocked": 0,
+  "quarantined": 0,
+  "rejected": 0,
+  "caught_up": false,
+  "last_exchange_ms": 1790000004500
+}

@@ -1,0 +1,16 @@
+{
+  "protocol": "tkfs-peer",
+  "versions": [
+    3
+  ],
+  "installation": "inst-aaaa-1111",
+  "role": "bulk",
+  "lane": {
+    "index": 1,
+    "count": 3
+  },
+  "pool": 4,
+  "session": "2b3c4d5e-6f70-4812-9a3b-4c5d6e7f8091",
+  "client_nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+  "features": []
+}

@@ -1,0 +1,16 @@
+[
+  {
+    "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "offset": 1048576,
+    "total": 8388608,
+    "len": 1048576,
+    "last": false
+  },
+  {
+    "hash": "a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9f",
+    "offset": 0,
+    "total": 4096,
+    "len": 4096,
+    "last": true
+  }
+]
