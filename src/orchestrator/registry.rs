@@ -24,13 +24,18 @@ use crate::{
         },
     },
     util::{
-        cancel::Cancel, lock::Tracked, log::event, notify::Notify, snapshot::Snapshot, time::Clock,
+        cancel::Cancel,
+        lock::{Tracked, lock},
+        log::event,
+        notify::Notify,
+        snapshot::Snapshot,
+        time::Clock,
     },
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
@@ -63,6 +68,10 @@ pub struct FolderRegistry {
     shutdown_started: AtomicBool,
     outcomes: Snapshot<Option<Vec<ShutdownOutcome>>>,
     watcher: Cancel,
+    /// Held by a whole `reconcile` (its controllers spawned and inserted) and
+    /// taken by `shutdown` after `stopping` is set, so a reconcile either
+    /// finishes before shutdown collects the handles or sees `stopping`.
+    reconciling: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -114,6 +123,7 @@ impl FolderRegistry {
             shutdown_started: AtomicBool::new(false),
             outcomes: Snapshot::new(None),
             watcher: Cancel::new(),
+            reconciling: Mutex::new(()),
         });
         let weak = Arc::downgrade(&registry);
         slots.set_waker(Box::new(move |states| {
@@ -156,7 +166,13 @@ impl FolderRegistry {
     }
 
     /// Spawns, retires and notifies controllers for a catalog snapshot.
+    ///
+    /// Serialized with `shutdown` (`reconciling`): every controller this
+    /// spawns is in the map before shutdown collects the handles, or none is
+    /// spawned. The lock covers channel sends and thread spawns only, never a
+    /// catalog or worker call.
     fn reconcile(&self, snapshot: &CatalogSnapshot) {
+        let _serial = lock(&self.reconciling);
         if self.stopping.load(Ordering::Acquire) {
             return;
         }
@@ -321,7 +337,7 @@ impl FolderDirectory for FolderRegistry {
 
     fn client(&self, state: &str) -> Option<Arc<dyn WorkerClient>> {
         let client = self.inner.lock().handles.get(state)?.client.clone();
-        crate::util::lock::lock(&client).clone()
+        lock(&client).clone()
     }
 
     fn generation(&self) -> u64 {
@@ -352,6 +368,9 @@ impl FolderDirectory for FolderRegistry {
         }
         self.stopping.store(true, Ordering::Release);
         self.watcher.cancel();
+        // Wait for a reconcile in progress: its controllers are inserted
+        // before the handles are collected, and any later one sees `stopping`.
+        drop(lock(&self.reconciling));
         let handles: Vec<(String, mpsc::Sender<Msg>)> = self
             .inner
             .lock()
