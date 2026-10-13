@@ -1113,10 +1113,98 @@ fn a_dead_catalog_thread_answers_unavailable_and_keeps_the_last_snapshot() {
     let waited = catalog.wait_newer(snap.generation, Duration::from_millis(50));
     assert!(started.elapsed() >= Duration::from_millis(50));
     assert!(Arc::ptr_eq(&waited, &last));
-    // The dead thread released orchestrator.lock; the data is intact.
+    // Invariant 23: the daemon keeps running on this handle, so the dead
+    // thread must not have freed the data directory for a second owner.
+    assert_owned(&env.config);
+    // Only the last handle releases orchestrator.lock; the data is intact.
+    let other = catalog.clone();
     drop(catalog);
+    assert_owned(&env.config);
+    drop(other);
+    drop(Supervisor::open(env.config.clone()).unwrap());
     let catalog = Catalog::open(&env.config).unwrap();
     assert_same_content(&catalog.snapshot(), &last);
+}
+
+/// A second `Catalog::open` and the legacy `Supervisor::open` both fail with
+/// `ALREADY_RUNNING…`: the data directory has an owner (invariant 23).
+fn assert_owned(config: &Config) {
+    let error = Catalog::open(config).unwrap_err();
+    assert!(code_of(&error).starts_with("ALREADY_RUNNING"), "{error:#}");
+    let Err(error) = Supervisor::open(config.clone()) else {
+        panic!("the legacy supervisor opened a data directory the catalog owns");
+    };
+    assert!(code_of(&error).starts_with("ALREADY_RUNNING"), "{error:#}");
+}
+
+/// Polls until another connection can no longer take the SQLite writer slot,
+/// that is, until a catalog command is inside its transaction.
+fn wait_until_writer_held(path: &Path) {
+    let db = Connection::open(path).unwrap();
+    db.busy_timeout(Duration::ZERO).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.execute_batch("BEGIN IMMEDIATE").is_ok() {
+        db.execute_batch("ROLLBACK").unwrap();
+        assert!(Instant::now() < deadline, "no command took the writer slot");
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn close_reports_a_wedged_thread_until_it_exits() {
+    let faults = exclusive();
+    let env = env();
+    let config = &env.config;
+    let catalog = Catalog::open(config).unwrap();
+    let record = folder(config, "Wedged");
+    faults.arm(
+        catalog::faults::SLOW_WRITE,
+        FaultAction::Hang,
+        Some(2500),
+        Some(1),
+    );
+    let writer = {
+        let catalog = catalog.clone();
+        let cmd = create(&record, None);
+        thread::spawn(move || catalog.apply(cmd))
+    };
+    wait_until_writer_held(&db_path(config));
+
+    // The first close gives up while the command is held, and stops new ones.
+    let started = Instant::now();
+    assert!(!catalog.close_within(Duration::from_millis(100)));
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(!catalog.is_alive());
+    let error = catalog
+        .apply(set_desired(&record.state, false))
+        .unwrap_err();
+    assert_eq!(error.code, "CATALOG_UNAVAILABLE", "{error}");
+    // A later call waits for the thread again instead of reporting it gone,
+    // and the wedged thread still owns the data directory.
+    let started = Instant::now();
+    assert!(!catalog.close_within(Duration::from_millis(50)));
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert_owned(config);
+
+    // Concurrent callers all wait for the same exit, and all see it.
+    let closers: Vec<_> = (0..3)
+        .map(|_| {
+            let catalog = catalog.clone();
+            thread::spawn(move || catalog.close())
+        })
+        .collect();
+    for closer in closers {
+        assert!(closer.join().unwrap());
+    }
+    // The command in flight when close began still committed.
+    let snap = writer.join().unwrap().unwrap();
+    assert!(snap.folder(&record.state).is_some());
+    assert!(catalog.close(), "stays true once the thread has exited");
+    // And `true` meant it: the directory is free while the handle lives on.
+    drop(Supervisor::open(config.clone()).unwrap());
+    let reopened = Catalog::open(config).unwrap();
+    assert_same_content(&reopened.snapshot(), &snap);
+    assert!(Arc::ptr_eq(&catalog.snapshot(), &snap));
 }
 
 /// Another connection holds the SQLite writer slot until released (or for
@@ -1186,12 +1274,7 @@ fn one_catalog_owns_a_data_directory() {
         env.config.data_directory.as_path()
     );
     assert!(env.config.default_mount_directory.is_dir());
-    let error = Catalog::open(&env.config).unwrap_err();
-    assert!(code_of(&error).starts_with("ALREADY_RUNNING"), "{error:#}");
-    let Err(error) = Supervisor::open(env.config.clone()) else {
-        panic!("the legacy supervisor opened a data directory the catalog owns");
-    };
-    assert!(code_of(&error).starts_with("ALREADY_RUNNING"), "{error:#}");
+    assert_owned(&env.config);
 
     // close() releases the lock; snapshot() still answers, apply does not.
     let record = folder(&env.config, "Closed");
@@ -1480,16 +1563,37 @@ fn catalog_wait_newer_wakes_within_10ms_of_the_change() {
                 tx.send((Instant::now(), snap.generation)).unwrap();
             })
         };
+        // Spins on `snapshot()` and records when the new generation became
+        // visible. It never blocks, so unlike the caller (woken by the reply)
+        // it sees the publish without needing a wake-up of its own.
+        let observer = {
+            let catalog = catalog.clone();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if catalog.snapshot().generation > generation {
+                        return Some(Instant::now());
+                    }
+                    for _ in 0..64 {
+                        std::hint::spin_loop();
+                    }
+                }
+                None
+            })
+        };
         thread::sleep(Duration::from_millis(20));
         catalog
             .apply(set_desired(&record.state, round.is_multiple_of(2)))
             .unwrap();
         let returned = Instant::now();
         let (woke, seen) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let observed = observer.join().unwrap().expect("the observer saw it");
         waiter.join().unwrap();
         assert_eq!(seen, generation + 1);
-        // Published before the reply: the waiter is never later than the caller.
-        woke.saturating_duration_since(returned)
+        // The publish (and its notify_all) precedes both the observer's sight
+        // of it and the reply, so the earlier of the two is the closest
+        // reference point to the publish a test can take.
+        woke.saturating_duration_since(observed.min(returned))
     });
     let generation = catalog.snapshot().generation;
     let started = Instant::now();

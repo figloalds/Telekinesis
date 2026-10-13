@@ -1,7 +1,7 @@
 //! Owned by WP1.1 — the catalog actor (REVAMP_PLAN §3.2, §14 WP1.1).
 //!
-//! One thread, `tkfs-catalog`, owns `orchestrator.lock` and the only
-//! connection to `folders.sqlite`. Everything else reads the immutable
+//! One thread, `tkfs-catalog`, takes `orchestrator.lock` (and shares it with
+//! the [`Catalog`] handle) and owns the only connection to `folders.sqlite`. Everything else reads the immutable
 //! [`CatalogSnapshot`] it publishes through a [`Snapshot`] cell, so a read is
 //! an `Arc` clone that never waits for a write in progress (RC8).
 //!
@@ -19,7 +19,11 @@
 //!   and returned. A command that changes nothing visible publishes nothing;
 //!   every other successful command bumps the generation by exactly one.
 //! * If the thread has died, `apply` answers `CATALOG_UNAVAILABLE` and
-//!   `snapshot()` keeps serving the last good snapshot.
+//!   `snapshot()` keeps serving the last good snapshot. The thread and the
+//!   [`Catalog`] handle share `orchestrator.lock`, so a dead thread never
+//!   frees the data directory while the daemon still runs on its handle
+//!   (invariant 23): the lock is released once the thread has exited **and**
+//!   the handle is closed or dropped.
 //! * Gate markers are written twice: the legacy `initial_sync` row (identical
 //!   positional SQL) and the `mount_gates` row. Both are deleted together by
 //!   `ClearGate`, so a downgraded binary still sees every gate. Changes a
@@ -62,9 +66,8 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
+        Arc, Condvar, Mutex, PoisonError,
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -81,7 +84,8 @@ pub const BUSY_RETRIES: u32 = 3;
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 /// Pause before retry `n` is `n * BUSY_BACKOFF`.
 pub const BUSY_BACKOFF: Duration = Duration::from_millis(50);
-/// How long [`Catalog::close`] (and `Drop`) waits for the thread to exit.
+/// How long [`Catalog::close`] (and `Drop`) waits for the thread to exit
+/// ([`Catalog::close_within`] takes another budget).
 pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// Longest folder label the catalog accepts (the legacy `create()` rule).
 pub const MAX_LABEL_BYTES: usize = 200;
@@ -171,16 +175,21 @@ struct Request {
 }
 
 /// The catalog actor's handle (implements [`CatalogApi`]). Dropping the last
-/// `Arc` closes the mailbox, lets queued commands finish, and joins the
-/// thread, which releases `orchestrator.lock` ([`Catalog::close`]).
+/// `Arc` closes the mailbox, lets queued commands finish, joins the thread
+/// and releases `orchestrator.lock` ([`Catalog::close`]). The lock is held
+/// while the thread **or** the handle is alive, so a thread that died leaves
+/// the data directory owned by the running daemon (invariant 23).
 pub struct Catalog {
     data_directory: PathBuf,
     cell: Arc<Snapshot<CatalogSnapshot>>,
-    alive: Arc<AtomicBool>,
     mailbox: Tracked<Option<Sender<Request>>>,
-    /// Disconnects when the thread has exited (its sender is a thread local).
-    exited: Mutex<Option<Receiver<()>>>,
+    /// Set by the thread's last local as it ends, normally or by a panic.
+    exit: Arc<Exit>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The handle's share of `orchestrator.lock` (the thread holds the other).
+    /// Dropped by a `close` that saw the thread exit, or with the handle, so
+    /// the data directory stays owned for as long as either is alive.
+    lock: Mutex<Option<Arc<File>>>,
 }
 
 impl Catalog {
@@ -196,21 +205,20 @@ impl Catalog {
         fs::create_dir_all(&config.default_mount_directory)?;
         let data_directory = config.data_directory.clone();
         let cell = Arc::new(Snapshot::new(CatalogSnapshot::default()));
-        let alive = Arc::new(AtomicBool::new(true));
+        let exit = Arc::new(Exit::default());
         let (mailbox, requests) = mpsc::channel::<Request>();
-        let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<()>>(1);
-        let (exit_tx, exited) = mpsc::sync_channel::<()>(1);
+        let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<Arc<File>>>(1);
         let thread = {
             let data = data_directory.clone();
             let cell = cell.clone();
-            let alive = AliveGuard(alive.clone());
+            let exit = ExitGuard(exit.clone());
             thread::Builder::new()
                 .name(THREAD_NAME.into())
                 .spawn(move || {
-                    // Dropped last (locals drop in reverse order), also when
-                    // the thread unwinds.
-                    let _exit = exit_tx;
-                    let _alive = alive;
+                    // Declared first, so dropped last (also when unwinding):
+                    // the exit is signalled after the actor, its connection
+                    // and its share of the lock are gone.
+                    let _exit = exit;
                     let actor = match Actor::open(&data, cell) {
                         Ok(actor) => actor,
                         Err(error) => {
@@ -218,20 +226,20 @@ impl Catalog {
                             return;
                         }
                     };
-                    let _ = opened_tx.send(Ok(()));
+                    let _ = opened_tx.send(Ok(actor.lock.clone()));
                     drop(opened_tx);
                     actor.run(requests);
                 })
                 .context("CATALOG_UNAVAILABLE: cannot spawn the catalog thread")?
         };
         match opened_rx.recv() {
-            Ok(Ok(())) => Ok(Arc::new(Catalog {
+            Ok(Ok(lock)) => Ok(Arc::new(Catalog {
                 data_directory,
                 cell,
-                alive,
                 mailbox: Tracked::new("catalog.mailbox", Some(mailbox)),
-                exited: Mutex::new(Some(exited)),
+                exit,
                 thread: Mutex::new(Some(thread)),
+                lock: Mutex::new(Some(lock)),
             })),
             failed => {
                 let _ = thread.join();
@@ -248,35 +256,40 @@ impl Catalog {
         &self.data_directory
     }
 
-    /// Whether the actor thread is running and accepting commands.
+    /// Whether the actor thread is running and accepting commands (false
+    /// once it has died or [`close`](Self::close) was called).
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::SeqCst) && crate::util::lock::lock(&self.exited).is_some()
+        !self.exit.has_exited() && self.mailbox.lock().is_some()
+    }
+
+    /// [`close_within`](Self::close_within) [`CLOSE_WAIT`].
+    pub fn close(&self) -> bool {
+        self.close_within(CLOSE_WAIT)
     }
 
     /// Stops accepting commands (`apply` answers `CATALOG_UNAVAILABLE`), lets
-    /// the queued ones finish, and waits up to [`CLOSE_WAIT`] for the thread
-    /// to exit, which closes the database and releases `orchestrator.lock`.
-    /// Returns whether the thread has exited. `snapshot()` keeps working.
-    pub fn close(&self) -> bool {
+    /// the queued ones finish, and waits up to `budget` for the thread to
+    /// exit, which closes the database. Returns whether the thread has
+    /// exited; only then is the handle's share of `orchestrator.lock`
+    /// released, so `true` means the data directory is free. A `false`
+    /// (a wedged command) settles nothing: every later or concurrent call
+    /// waits for the same exit again. `snapshot()` keeps working.
+    pub fn close_within(&self, budget: Duration) -> bool {
         self.mailbox.lock().take();
-        let Some(exited) = crate::util::lock::lock(&self.exited).take() else {
-            return true;
-        };
-        match exited.recv_timeout(CLOSE_WAIT) {
-            Err(RecvTimeoutError::Disconnected) | Ok(()) => {
-                if let Some(thread) = crate::util::lock::lock(&self.thread).take() {
-                    let _ = thread.join();
-                }
-                true
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                event!(warn, "CATALOG_UNAVAILABLE", {
-                    "detail": "the catalog thread did not exit within the close budget",
-                    "wait_ms": CLOSE_WAIT.as_millis() as u64,
-                });
-                false
-            }
+        if !self.exit.wait(budget) {
+            event!(warn, "CATALOG_UNAVAILABLE", {
+                "detail": "the catalog thread did not exit within the close budget",
+                "wait_ms": u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+            });
+            return false;
         }
+        if let Some(thread) = crate::util::lock::lock(&self.thread).take() {
+            let _ = thread.join();
+        }
+        // Assigned under the mutex, so the file is closed before any other
+        // caller can observe `None` and report the directory free.
+        *crate::util::lock::lock(&self.lock) = None;
+        true
     }
 }
 
@@ -286,7 +299,7 @@ impl CatalogApi for Catalog {
     }
 
     fn apply(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
-        if !self.alive.load(Ordering::SeqCst) {
+        if self.exit.has_exited() {
             return Err(unavailable("the catalog thread has exited"));
         }
         let (reply, answer) = mpsc::sync_channel(1);
@@ -321,7 +334,7 @@ impl fmt::Debug for Catalog {
         f.debug_struct("Catalog")
             .field("data_directory", &self.data_directory)
             .field("generation", &self.cell.generation())
-            .field("alive", &self.alive.load(Ordering::SeqCst))
+            .field("alive", &self.is_alive())
             .finish_non_exhaustive()
     }
 }
@@ -330,12 +343,36 @@ fn unavailable(detail: &str) -> ErrorWire {
     ErrorWire::coded("CATALOG_UNAVAILABLE", detail)
 }
 
-/// Marks the catalog dead when the thread ends, including by a panic.
-struct AliveGuard(Arc<AtomicBool>);
+/// Whether the actor thread has ended; waiters block on the condvar.
+#[derive(Default)]
+struct Exit {
+    exited: Mutex<bool>,
+    changed: Condvar,
+}
 
-impl Drop for AliveGuard {
+impl Exit {
+    fn has_exited(&self) -> bool {
+        *crate::util::lock::lock(&self.exited)
+    }
+
+    /// Waits up to `budget` for the exit; returns whether it happened.
+    fn wait(&self, budget: Duration) -> bool {
+        let exited = crate::util::lock::lock(&self.exited);
+        let (exited, _) = self
+            .changed
+            .wait_timeout_while(exited, budget, |exited| !*exited)
+            .unwrap_or_else(PoisonError::into_inner);
+        *exited
+    }
+}
+
+/// Signals [`Exit`] when the thread ends, including by a panic.
+struct ExitGuard(Arc<Exit>);
+
+impl Drop for ExitGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        *crate::util::lock::lock(&self.0.exited) = true;
+        self.0.changed.notify_all();
     }
 }
 
@@ -343,12 +380,12 @@ impl Drop for AliveGuard {
 // The actor
 
 struct Actor {
-    // Field order is drop order: the connection closes before the lock is
-    // released, so no second owner can open the file while we still do.
+    // Field order is drop order: the connection closes before the actor's
+    // share of the lock is dropped (the handle holds the other share).
     conn: Connection,
     cell: Arc<Snapshot<CatalogSnapshot>>,
     current: Arc<CatalogSnapshot>,
-    _lock: File,
+    lock: Arc<File>,
 }
 
 impl Actor {
@@ -372,7 +409,7 @@ impl Actor {
             conn,
             cell,
             current: first,
-            _lock: lock,
+            lock: Arc::new(lock),
         })
     }
 
