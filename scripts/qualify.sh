@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
+[ -n "${TKFS_QUALIFY_LF:-}" ] || exec env TKFS_QUALIFY_LF=1 bash -c "$(tr -d '
+' < "$0")" "$0" "$@" # CRLF-safe: re-run without CRs
 # Linux qualification subset (REVAMP_PLAN §14 WP0.5 task 10): the same qual
 # files and floors as scripts/qualify.ps1, run in release with
 # `--ignored --test-threads=1`. Scenarios that need Windows-only features
 # (WinFsp) skip themselves; FUSE scenarios need /dev/fuse.
+#
+# Run it with `bash scripts/qualify.sh ...`. Line 2 re-executes the script with
+# carriage returns stripped, so a Windows checkout (core.autocrlf=true, CRLF)
+# still works from WSL on /mnt/c.
 #
 # Usage:
 #   CARGO_TARGET_DIR=$HOME/tkfs-target/<pkg> scripts/qualify.sh --wave 1 [--files "a b"] [--filter NAME]
@@ -82,7 +88,8 @@ root, run_dir, evidence, kind, wave, baseline, budget, file_timeout, flt, starte
 statuses = sys.argv[11:]
 wave, baseline = int(wave), baseline == "1"
 def git(*a):
-    try: return subprocess.check_output(["git", *a], cwd=root, text=True).strip()
+    try: return subprocess.check_output(["git", *a], cwd=root, text=True,
+                                        stderr=subprocess.DEVNULL).strip()
     except Exception: return ""
 floors = json.load(open(os.path.join(root, "tests/qualification-floors.json")))["floors"]
 records, files = [], []
