@@ -1,0 +1,2500 @@
+﻿{
+    "schema":  1,
+    "kind":  "baseline",
+    "wave":  4,
+    "generated_at":  "2026-10-13T07:49:32.9445367-03:00",
+    "duration_s":  2154.8,
+    "git":  {
+                "commit":  "2e41a4047da50848294a0869764bcb5dab5c4548",
+                "branch":  "revamp/wp0-5-harness",
+                "dirty":  false
+            },
+    "toolchain":  "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "hardware":  {
+                     "cpu":  "AMD Ryzen 9 7950X3D 16-Core Processor          ",
+                     "cores":  16,
+                     "threads":  32,
+                     "memory_gb":  127.7,
+                     "os":  "Microsoft Windows 11 Pro 10.0.26300",
+                     "machine":  "FIGLOALDS"
+                 },
+    "settings":  {
+                     "budget_s":  60,
+                     "file_timeout_min":  60,
+                     "priority":  "BelowNormal",
+                     "filter":  "",
+                     "profile":  "release"
+                 },
+    "summary":  {
+                    "ok":  null,
+                    "scenarios":  77,
+                    "by_status":  {
+                                      "pass":  9,
+                                      "fail":  36,
+                                      "timeout":  31,
+                                      "skipped":  1
+                                  },
+                    "floors_evaluated":  49,
+                    "floors_passed":  1,
+                    "floors_failed":  21,
+                    "floors_missing":  2,
+                    "floors_not_run":  0,
+                    "floors_incomplete":  25,
+                    "enforced_failures":  [
+
+                                          ]
+                },
+    "files":  [
+                  {
+                      "file":  "qual_wp1_4_worker",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  31.9,
+                      "result":  "test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.18s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_4_worker.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::accept_loop_survives_faults",
+                                            "status":  "pass",
+                                            "elapsed_ms":  327,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "failed_calls",
+                                                                "value":  0.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::mount_failure_keeps_worker_serving",
+                                            "status":  "fail",
+                                            "elapsed_ms":  92,
+                                            "failures":  [
+                                                             "worker did not serve after a mount failure: WORKER_EXITED: Some(ExitStatus(ExitStatus(1)))\nMOUNT_PATH_MUST_NOT_EXIST: C:\\Users\\felyp\\AppData\\Local\\Temp\\.tmp4yet4R\\occupied\n"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::poison_exit_persists_dirty",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  30025,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: worker did not exit after engine poisoning"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::rpc_before_mount",
+                                            "status":  "fail",
+                                            "elapsed_ms":  79,
+                                            "failures":  [
+                                                             "UNSUPPORTED: supervised worker: WORKER_EXITED: Some(ExitStatus(ExitStatus(2)))\nerror: unexpected argument \u0027--supervised\u0027 found\n\n  tip: a similar argument exists: \u0027--request-id\u0027\n\nUsage: tkfs.exe daemon --state \u003cSTATE\u003e --request-id \u003cREQUEST_ID\u003e\n\nFor more information, try \u0027--help\u0027.\n"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "supervised worker: WORKER_EXITED: Some(ExitStatus(ExitStatus(2)))\nerror: unexpected argument \u0027--supervised\u0027 found\n\n  tip: a similar argument exists: \u0027--request-id\u0027\n\nUsage: tkfs.exe daemon --state \u003cSTATE\u003e --request-id \u003cREQUEST_ID\u003e\n\nFor more information, try \u0027--help\u0027.\n"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::watch_latency",
+                                            "status":  "fail",
+                                            "elapsed_ms":  81,
+                                            "failures":  [
+                                                             "UNSUPPORTED: hello: UNKNOWN_OPERATION",
+                                                             "FLOOR watch_latency: watch_ms \u003c= 1500 (measured None)"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "hello: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_5_mount",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  1.1,
+                      "result":  "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_5_mount.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_5_mount::attach_detach_attach_same_pid",
+                                            "status":  "fail",
+                                            "elapsed_ms":  76,
+                                            "failures":  [
+                                                             "UNSUPPORTED: mount-attach: Err(UNKNOWN_OPERATION)"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "mount-attach: Err(UNKNOWN_OPERATION)"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_5_mount::force_detach_persists_dirty",
+                                            "status":  "fail",
+                                            "elapsed_ms":  74,
+                                            "failures":  [
+                                                             "UNSUPPORTED: mount-attach: UNKNOWN_OPERATION"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "mount-attach: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_5_mount::foreign_mount_untouched",
+                                            "status":  "pass",
+                                            "elapsed_ms":  88,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "outcome: Err(WORKER_EXITED: Some(ExitStatus(ExitStatus(1)))\nMOUNT_PATH_MUST_NOT_EXIST: C:\\Users\\felyp\\AppData\\Local\\Temp\\.tmpdOkeXY\\foreign\n)"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_6_activation",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  315.5,
+                      "result":  "test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 314.91s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_6_activation.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::local_create_after_resolved_conflict",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  72238,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 4 of 20 creates in budget",
+                                                             "FLOOR local_create_after_resolved_conflict: p90_ms \u003c= 10 (measured Some(18223.394800000002))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "p90_ms",
+                                                                "value":  18223.394800000002,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "p50_ms",
+                                                                "value":  18150.029,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::quarantine_not_pending",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60054,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: metadata_caught_up never true with one quarantined event"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "caught_up_ms",
+                                                                "value":  59972.133499999996,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::remote_linear_create_10k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60152,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 351 of 10000 events activated",
+                                                             "FLOOR remote_linear_create_10k: per_event_ms \u003c= 5 (measured Some(171.27016239316234))"
+                                                         ],
+                                            "notes":  [
+                                                          "authored 10000 local creates in 1520 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  171.27016239316234,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::remote_linear_create_2k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60154,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 349 of 2000 events activated",
+                                                             "FLOOR remote_linear_create_2k: per_event_ms \u003c= 5 (measured Some(172.33334813753578))"
+                                                         ],
+                                            "notes":  [
+                                                          "authored 2000 local creates in 281 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  172.33334813753578,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::transient_retry",
+                                            "status":  "pass",
+                                            "elapsed_ms":  88,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "first receive: Ok(1)"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "quarantined",
+                                                                "value":  0.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_7_derive",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  241.7,
+                      "result":  "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 241.07s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_7_derive.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_7_derive::concurrent_namespace_ops_5k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  117496,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 1 of 50 operations in budget",
+                                                             "FLOOR concurrent_namespace_ops_5k: max_op_ms \u003c= 500 (measured Some(117493.99440000001))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "max_op_ms",
+                                                                "value":  117493.99440000001,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "p50_op_ms",
+                                                                "value":  117493.99440000001,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_7_derive::two_way_backlog_2k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60040,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 341 of 2000 events activated",
+                                                             "FLOOR two_way_backlog_2k: per_event_ms \u003c= 100 (measured Some(176.04683460410553))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  176.04683460410553,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_7_derive::two_way_backlog_6400",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60027,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 342 of 6400 events activated"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  175.4597549707603,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_8_objects",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  152.1,
+                      "result":  "test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 151.45s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_8_objects.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::content_status_50k",
+                                            "status":  "fail",
+                                            "elapsed_ms":  28297,
+                                            "failures":  [
+                                                             "FLOOR content_status_50k: content_status_ms \u003c 50 (measured Some(5589.5935))"
+                                                         ],
+                                            "notes":  [
+                                                          "50000 objects stored in 24482 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "content_status_ms",
+                                                                "value":  5589.5935,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::corrupt_mid_page_keeps_completed",
+                                            "status":  "fail",
+                                            "elapsed_ms":  105,
+                                            "failures":  [
+                                                             "object before the corrupt part kept",
+                                                             "object after the corrupt part kept"
+                                                         ],
+                                            "notes":  [
+                                                          "receive_parts: Err(CORRUPT_OBJECT)"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "kept",
+                                                                "value":  0.0,
+                                                                "unit":  "objects"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::restart_without_rehash_20k",
+                                            "status":  "fail",
+                                            "elapsed_ms":  3410,
+                                            "failures":  [
+                                                             "FLOOR restart_ready_20k_objects: ready_ms \u003c= 3000 (measured Some(3237.9369))"
+                                                         ],
+                                            "notes":  [
+                                                          "20000 objects stored in 9842 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "first_ready_ms",
+                                                                "value":  4619.2985,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "ready_ms",
+                                                                "value":  3237.9369,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::tiny_pending_objects_12k",
+                                            "status":  "fail",
+                                            "elapsed_ms":  3126,
+                                            "failures":  [
+                                                             "bulk error: Some(\"INVENTORY_TOO_LARGE\")",
+                                                             "FLOOR tiny_pending_objects_12k: completed == 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            },
+                                                            {
+                                                                "metric":  "objects_per_s",
+                                                                "value":  0.3198908992894519,
+                                                                "unit":  "objects/s"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_9_session",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  82.5,
+                      "result":  "test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 81.90s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_9_session.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_9_session::dead_peer_detection",
+                                            "status":  "fail",
+                                            "elapsed_ms":  15007,
+                                            "failures":  [
+                                                             "UNSUPPORTED: idle dead-peer detection needs session heartbeats (WP1.9 Conn::health)"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "idle dead-peer detection needs session heartbeats (WP1.9 Conn::health)"
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "request_detect_ms",
+                                                                "value":  15001.1334,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::duplex_32mib",
+                                            "status":  "pass",
+                                            "elapsed_ms":  363,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "duplex_ms",
+                                                                "value":  301.3177,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::idle_60s",
+                                            "status":  "fail",
+                                            "elapsed_ms":  60060,
+                                            "failures":  [
+                                                             "usable after 60 s idle: Err(IO error: Uma conexão estabelecida foi anulada pelo software no computador host. (os error 10053)\n\nCaused by:\n    Uma conexão estabelecida foi anulada pelo software no computador host. (os error 10053))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "ping_after_idle_ms",
+                                                                "value":  0.0713,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::loopback_throughput",
+                                            "status":  "fail",
+                                            "elapsed_ms":  3415,
+                                            "failures":  [
+                                                             "FLOOR session_loopback_throughput: mib_per_s \u003e= 300 (measured Some(37.540014576083784))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "mib_per_s",
+                                                                "value":  37.540014576083784,
+                                                                "unit":  "MiB/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::slow_does_not_block_fast",
+                                            "status":  "fail",
+                                            "elapsed_ms":  3004,
+                                            "failures":  [
+                                                             "FLOOR session_slow_does_not_block_fast: fast_p99_ms \u003c 50 (measured Some(2900.3219))"
+                                                         ],
+                                            "notes":  [
+                                                          "baseline transport: legacy ws (no multiplexing; one in-flight request per socket)"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "fast_p99_ms",
+                                                                "value":  2900.3219,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_12_legacy",
+                      "wave":  1,
+                      "status":  "fail",
+                      "duration_s":  188.5,
+                      "result":  "test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 187.79s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp1_12_legacy.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::crash_backoff",
+                                            "status":  "fail",
+                                            "elapsed_ms":  20019,
+                                            "failures":  [
+                                                             "FLOOR legacy_crash_backoff: restarts_20s \u003c= 5 (measured Some(11.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "restarts_20s",
+                                                                "value":  11.0,
+                                                                "unit":  "count"
+                                                            },
+                                                            {
+                                                                "metric":  "list_p99_ms",
+                                                                "value":  6.9547,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::hung_remote_repo_charged",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60039,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: healthy repository did not progress",
+                                                             "the hung repository\u0027s failure is charged to it",
+                                                             "FLOOR legacy_hung_repo_healthy_progress: healthy_delay_ms \u003c= 45000 (measured Some(NaN))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "healthy_delay_ms",
+                                                                "value":  null,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "hung_repo_charged",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::interval_20s_no_reconnects",
+                                            "status":  "fail",
+                                            "elapsed_ms":  60001,
+                                            "failures":  [
+                                                             "FLOOR legacy_interval_20s_reconnects: reconnects \u003c= 0 (measured Some(9.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "reconnects",
+                                                                "value":  9.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::worker_busy_not_counted",
+                                            "status":  "fail",
+                                            "elapsed_ms":  20104,
+                                            "failures":  [
+                                                             "WORKER_BUSY counted as a failure"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "busy_observed",
+                                                                "value":  106.0,
+                                                                "unit":  "samples"
+                                                            },
+                                                            {
+                                                                "metric":  "busy_counted",
+                                                                "value":  106.0,
+                                                                "unit":  "samples"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp2_1_lifecycle",
+                      "wave":  2,
+                      "status":  "fail",
+                      "duration_s":  244.8,
+                      "result":  "test result: FAILED. 2 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 244.13s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp2_1_lifecycle.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::adoption_after_daemon_kill",
+                                            "status":  "fail",
+                                            "elapsed_ms":  3256,
+                                            "failures":  [
+                                                             "running worker adopted, not restarted"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "adopted",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            },
+                                                            {
+                                                                "metric":  "resume_ms",
+                                                                "value":  1045.1331,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::api_latency_under_churn",
+                                            "status":  "pass",
+                                            "elapsed_ms":  6442,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "list_p99_ms",
+                                                                "value":  12.850999999999999,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::crash_loop_reaches_failed",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60056,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: no Failed{CRASH_LOOP}: status null"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "time_to_failed_ms",
+                                                                "value":  60046.2629,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::hung_worker_restarted",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60030,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: hung worker never restarted"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "restart_ms",
+                                                                "value":  60029.0524,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::mount_failure_end_to_end",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60038,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: folder never ran headless after the mount failure"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::shutdown_with_busy_folder",
+                                            "status":  "fail",
+                                            "elapsed_ms":  30035,
+                                            "failures":  [
+                                                             "daemon exits 0: None",
+                                                             "outcome left_running: Err(BUSY_VIEW: 1 open contexts, 1 unsaved files; healthy)",
+                                                             "FLOOR shutdown_busy_folder: shutdown_ms \u003c= 30000 (measured Some(NaN))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "shutdown_ms",
+                                                                "value":  null,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::sigterm_matches_shutdown",
+                                            "status":  "skipped",
+                                            "elapsed_ms":  0,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_1_lifecycle::subscribe_latency",
+                                            "status":  "fail",
+                                            "elapsed_ms":  49,
+                                            "failures":  [
+                                                             "UNSUPPORTED: status action: Err(WebSocket protocol error: Connection reset without closing handshake\n\nCaused by:\n    Connection reset without closing handshake)",
+                                                             "FLOOR subscribe_latency: subscribe_ms \u003c= 1000 (measured None)"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "status action: Err(WebSocket protocol error: Connection reset without closing handshake\n\nCaused by:\n    Connection reset without closing handshake)"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp2_3_worker",
+                      "wave":  2,
+                      "status":  "fail",
+                      "duration_s":  188.2,
+                      "result":  "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 187.53s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp2_3_worker.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp2_3_worker::fs_p99_during_catchup",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  62133,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: catch-up not finished in budget",
+                                                             "FLOOR fs_p99_during_catchup: fs_p99_ms \u003c 50 (measured Some(663.3056))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "fs_p99_ms",
+                                                                "value":  663.3056,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_3_worker::startup_with_5k_staged",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60028,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: not Ready: WORKER_READY_TIMEOUT",
+                                                             "FLOOR startup_with_5k_staged: ready_ms \u003c 3000 (measured Some(NaN))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "ready_ms",
+                                                                "value":  null,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_3_worker::status_latency_during_activation",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60099,
+                                            "failures":  [
+                                                             "29 busy/stale status replies",
+                                                             "29 replies without counts",
+                                                             "QUAL_TIMEOUT: activation not finished in budget"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "status_p99_ms",
+                                                                "value":  14.0997,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp2_4_offlock",
+                      "wave":  2,
+                      "status":  "fail",
+                      "duration_s":  95.8,
+                      "result":  "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 95.12s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp2_4_offlock.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp2_4_offlock::lock_hold_slow_event_2k",
+                                            "status":  "fail",
+                                            "elapsed_ms":  17819,
+                                            "failures":  [
+                                                             "FLOOR lock_hold_slow_event_2k: max_blocked_ms \u003c 50 (measured Some(15011.2255))"
+                                                         ],
+                                            "notes":  [
+                                                          "exchange: Err(IO error: Uma tentativa de conexão falhou porque o componente conectado não respondeu\r\ncorretamente após um período de tempo ou a conexão estabelecida falhou\r\nporque o host conectado não respondeu. (os error 10060)\n\nCaused by:\n    Uma tentativa de conexão falhou porque o componente conectado não respondeu\r\n    corretamente após um período de tempo ou a conexão estabelecida falhou\r\n    porque o host conectado não respondeu. (os error 10060))",
+                                                          "engine gauges: null"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "max_blocked_ms",
+                                                                "value":  15011.2255,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_4_offlock::stale_convergence",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  74651,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: remote events not all committed"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "converge_ms",
+                                                                "value":  74650.28080000001,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp2_5_feed",
+                      "wave":  2,
+                      "status":  "fail",
+                      "duration_s":  332.2,
+                      "result":  "test result: FAILED. 0 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 331.46s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-071336\\qual_wp2_5_feed.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp2_5_feed::feed_150k_events",
+                                            "status":  "fail",
+                                            "elapsed_ms":  15042,
+                                            "failures":  [
+                                                             "UNSUPPORTED: feed ops: UNKNOWN_OPERATION",
+                                                             "FLOOR feed_150k_events: completed == 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "feed ops: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_5_feed::idle_exchange_50k",
+                                            "status":  "fail",
+                                            "elapsed_ms":  64680,
+                                            "failures":  [
+                                                             "UNSUPPORTED: feed ops: UNKNOWN_OPERATION",
+                                                             "legacy warm-up: IO error: Uma tentativa de conexão falhou porque o componente conectado não respondeu\r\ncorretamente após um período de tempo ou a conexão estabelecida falhou\r\nporque o host conectado não respondeu. (os error 10060): Uma tentativa de conexão falhou porque o componente conectado não respondeu\r\ncorretamente após um período de tempo ou a conexão estabelecida falhou\r\nporque o host conectado não respondeu. (os error 10060)",
+                                                             "FLOOR idle_exchange_50k_cpu: cpu_ms_per_side \u003c= 10 (measured Some(8001.953125))",
+                                                             "FLOOR idle_exchange_50k_bytes: bytes \u003c= 4096 (measured Some(3901138.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "feed ops: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "cpu_ms_per_side",
+                                                                "value":  8001.953125,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "bytes",
+                                                                "value":  3901138.0,
+                                                                "unit":  "bytes"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_5_feed::large_event_8mib",
+                                            "status":  "fail",
+                                            "elapsed_ms":  194,
+                                            "failures":  [
+                                                             "UNSUPPORTED: feed ops: UNKNOWN_OPERATION",
+                                                             "FLOOR large_event_8mib: completed == 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+                                                          "event payload 1658845 bytes"
+                                                      ],
+                                            "unsupported":  [
+                                                                "feed ops: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_5_feed::peer_restore",
+                                            "status":  "fail",
+                                            "elapsed_ms":  168,
+                                            "failures":  [
+                                                             "UNSUPPORTED: feed ops: UNKNOWN_OPERATION"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "feed ops: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp2_5_feed::staged_events_not_resent",
+                                            "status":  "fail",
+                                            "elapsed_ms":  270,
+                                            "failures":  [
+                                                             "UNSUPPORTED: feed ops: UNKNOWN_OPERATION"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "feed ops: UNKNOWN_OPERATION"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp3_1_transport",
+                      "wave":  3,
+                      "status":  "fail",
+                      "duration_s":  168.2,
+                      "result":  "test result: FAILED. 1 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 167.58s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-071336\\qual_wp3_1_transport.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp3_1_transport::hung_remote_repo_extra_delay",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60036,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: healthy repository stalled",
+                                                             "FLOOR v3_hung_repo_extra_delay: extra_delay_ms \u003c 2000 (measured Some(NaN))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "extra_delay_ms",
+                                                                "value":  null,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_1_transport::inbound_status",
+                                            "status":  "fail",
+                                            "elapsed_ms":  5259,
+                                            "failures":  [
+                                                             "UNSUPPORTED: status action: WebSocket protocol error: Connection reset without closing handshake: Connection reset without closing handshake"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+                                                                "status action: WebSocket protocol error: Connection reset without closing handshake: Connection reset without closing handshake"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_1_transport::interval_20s_no_reconnects",
+                                            "status":  "fail",
+                                            "elapsed_ms":  60001,
+                                            "failures":  [
+                                                             "FLOOR v3_interval_20s_reconnects: reconnects \u003c= 0 (measured Some(9.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "reconnects",
+                                                                "value":  9.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_1_transport::rotation_unauthorized_until_repaired",
+                                            "status":  "pass",
+                                            "elapsed_ms":  10247,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "unauthorized_ms",
+                                                                "value":  78.85849999999999,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_1_transport::v2_peer_fails_closed",
+                                            "status":  "fail",
+                                            "elapsed_ms":  78,
+                                            "failures":  [
+                                                             "pairing with a v2 acceptor fails with PEER_NEEDS_UPGRADE",
+                                                             "the v2 acceptor never received a code",
+                                                             "a v2 dialer gets PEER_NEEDS_UPGRADE",
+                                                             "UNSUPPORTED: status action: WebSocket protocol error: Connection reset without closing handshake: Connection reset without closing handshake"
+                                                         ],
+                                            "notes":  [
+                                                          "v3 → v2: Ok(Object {\"configured_connections\": Number(2), \"connections\": Number(2), \"endpoint\": String(\"ws://127.0.0.1:60756\"), \"installation\": String(\"c51f71fd-28c2-4413-81c7-4a669fc1e0a6\"), \"reserved_connections\": Number(1)})",
+                                                          "v2 → v3: Ok(Object {\"bulk_lane\": Null, \"bulk_protocol\": Number(1), \"installation\": String(\"a96dabf5-b8e7-4f87-af18-b44548add419\"), \"lane\": String(\"control\"), \"version\": Number(2)})"
+                                                      ],
+                                            "unsupported":  [
+                                                                "status action: WebSocket protocol error: Connection reset without closing handshake: Connection reset without closing handshake"
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp3_2_objects",
+                      "wave":  3,
+                      "status":  "fail",
+                      "duration_s":  99.7,
+                      "result":  "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 99.01s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254\\qual_wp3_2_objects.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp3_2_objects::crash_resume",
+                                            "status":  "pass",
+                                            "elapsed_ms":  2751,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "killed with 18868221 spool bytes"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "replayed_bytes",
+                                                                "value":  0.0,
+                                                                "unit":  "bytes"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_2_objects::object_256mib_worker_to_worker",
+                                            "status":  "fail",
+                                            "elapsed_ms":  15476,
+                                            "failures":  [
+                                                             "FLOOR objects_worker_256mib: mib_per_s \u003e= 100 (measured Some(16.553095618982706))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "mib_per_s",
+                                                                "value":  16.553095618982706,
+                                                                "unit":  "MiB/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_2_objects::tiny_objects_10k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  31569,
+                                            "failures":  [
+                                                             "pump: Err(IO error: Uma tentativa de conexão falhou porque o componente conectado não respondeu\r\ncorretamente após um período de tempo ou a conexão estabelecida falhou\r\nporque o host conectado não respondeu. (os error 10060)\n\nCaused by:\n    Uma tentativa de conexão falhou porque o componente conectado não respondeu\r\n    corretamente após um período de tempo ou a conexão estabelecida falhou\r\n    porque o host conectado não respondeu. (os error 10060))",
+                                                             "QUAL_TIMEOUT: 5562 of 10000 objects in budget",
+                                                             "FLOOR objects_worker_tiny_10k: objects_per_s \u003e= 300 (measured Some(188.4867903631618))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "objects_per_s",
+                                                                "value":  188.4867903631618,
+                                                                "unit":  "objects/s"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp3_int_e2e",
+                      "wave":  3,
+                      "status":  "fail",
+                      "duration_s":  878.4,
+                      "result":  "test result: FAILED. 2 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 877.68s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-071336\\qual_wp3_int_e2e.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::catch_up_10k_events",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60005,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: catch-up incomplete",
+                                                             "FLOOR e2e_catch_up_10k: seconds \u003c= 60 (measured Some(NaN))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "seconds",
+                                                                "value":  null,
+                                                                "unit":  "s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::feed_150k_daemons",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60016,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 150K-event folder not synchronized",
+                                                             "FLOOR e2e_feed_150k: completed == 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+                                                          "lane 0 error: {\"40206584-e2a6-4a26-85f5-6b1cac19650a\":{\"caught_up\":false,\"consecutive_failures\":226,\"error\":\"REMOTE_SYNC_EXCHANGE_FAILED: WORKER_BUSY\",\"last_progress_ms\":null,\"last_success_ms\":null,\"metadata_caught_up\":false,\"metadata_progress\":null,\"object_inventory\":null,\"retry_at_ms\":1791887130657,\"total_received_object_bytes\":0,\"total_received_wire_bytes\":0,\"total_sent_object_bytes\":0,\"total_sent_wire_bytes\":0,\"transfer\":null}}"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::idle_exchange_daemons",
+                                            "status":  "fail",
+                                            "elapsed_ms":  30017,
+                                            "failures":  [
+                                                             "FLOOR e2e_idle_exchange_bytes: bytes_per_exchange \u003c= 4096 (measured Some(86038.28571428571))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "bytes_per_exchange",
+                                                                "value":  86038.28571428571,
+                                                                "unit":  "bytes"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::large_event_8mib_daemons",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60028,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: large event not synchronized",
+                                                             "FLOOR e2e_large_event_8mib: completed == 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync",
+                                            "status":  "pass",
+                                            "elapsed_ms":  3388,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "sync_ms",
+                                                                "value":  3315.9487,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::mutual_pairing_duplicate_bytes",
+                                            "status":  "fail",
+                                            "elapsed_ms":  3969,
+                                            "failures":  [
+                                                             "FLOOR e2e_mutual_pairing_bytes: wire_ratio \u003c= 1.1 (measured Some(1.3818020224571228))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "wire_ratio",
+                                                                "value":  1.3818020224571228,
+                                                                "unit":  "ratio"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::object_256mib_loopback",
+                                            "status":  "fail",
+                                            "elapsed_ms":  22355,
+                                            "failures":  [
+                                                             "FLOOR e2e_object_256mib_loopback: mib_per_s \u003e= 40 (measured Some(11.687931800881417))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "mib_per_s",
+                                                                "value":  11.687931800881417,
+                                                                "unit":  "MiB/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::objects_before_activation",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60004,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: transfer not complete in budget",
+                                                             "FLOOR e2e_objects_before_activation: objects_ahead \u003e= 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "objects_ahead",
+                                                                "value":  0.0,
+                                                                "unit":  "objects"
+                                                            },
+                                                            {
+                                                                "metric":  "complete_ms",
+                                                                "value":  60004.3577,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::one_gib_through_proxy",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60049,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: object not transferred in budget",
+                                                             "FLOOR e2e_link_utilization: link_utilization \u003e= 0.8 (measured Some(0.3855025360900718))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "link_utilization",
+                                                                "value":  0.3855025360900718,
+                                                                "unit":  "ratio"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::relay_with_objects",
+                                            "status":  "pass",
+                                            "elapsed_ms":  1405,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "relay_ms",
+                                                                "value":  1405.0672,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::tiny_files_10k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  61647,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 56 of 10000 files in budget",
+                                                             "FLOOR e2e_tiny_files_10k: files_per_s \u003e= 300 (measured Some(0.9331217370930273))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "files_per_s",
+                                                                "value":  0.9331217370930273,
+                                                                "unit":  "files/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::two_way_backlog_e2e",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60137,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: backlog not converged",
+                                                             "FLOOR e2e_two_way_backlog: seconds \u003c= 180 (measured Some(NaN))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "seconds",
+                                                                "value":  null,
+                                                                "unit":  "s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp3_int_e2e::v2_peer_fails_closed",
+                                            "status":  "fail",
+                                            "elapsed_ms":  68,
+                                            "failures":  [
+                                                             "v3 → v2 pairing: Ok(Object {\"configured_connections\": Number(2), \"connections\": Number(2), \"endpoint\": String(\"ws://127.0.0.1:63777\"), \"installation\": String(\"41e761da-8ed1-4424-937c-17da3f4449c2\"), \"reserved_connections\": Number(1)})",
+                                                             "code never sent to a v2 acceptor",
+                                                             "v2 → v3 pairing: Ok(Object {\"bulk_lane\": Null, \"bulk_protocol\": Number(1), \"installation\": String(\"55439be5-b7c0-4755-9f79-828a705b941c\"), \"lane\": String(\"control\"), \"version\": Number(2)})"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_scale",
+                      "wave":  4,
+                      "status":  "fail",
+                      "duration_s":  772.4,
+                      "result":  "test result: FAILED. 0 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 771.74s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-071336\\qual_scale.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_scale::feed_150k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60033,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: not synchronized",
+                                                             "FLOOR scale_feed_150k: completed == 1 (measured Some(0.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  0.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::idle_worker_cpu",
+                                            "status":  "fail",
+                                            "elapsed_ms":  30001,
+                                            "failures":  [
+                                                             "FLOOR scale_idle_worker_cpu: cpu_percent \u003c= 1 (measured Some(135.83333333333334))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "cpu_percent",
+                                                                "value":  135.83333333333334,
+                                                                "unit":  "%"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::management_api_p99_under_churn",
+                                            "status":  "fail",
+                                            "elapsed_ms":  60254,
+                                            "failures":  [
+                                                             "FLOOR scale_api_p99_under_churn: list_p99_ms \u003c 100 (measured Some(950.0828))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "list_p99_ms",
+                                                                "value":  950.0828,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::one_gib_object",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60063,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: object not transferred",
+                                                             "FLOOR scale_one_gib_object: mib_per_s \u003e= 40 (measured Some(13.051055307323773))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "mib_per_s",
+                                                                "value":  13.051055307323773,
+                                                                "unit":  "MiB/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::remote_linear_activation_2k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60292,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 210 of 2000 events activated",
+                                                             "FLOOR scale_remote_linear_2k: per_event_ms \u003c= 5 (measured Some(287.10162333333335))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  287.10162333333335,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::remote_linear_activation_6400",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60099,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 119 of 6400 events activated",
+                                                             "FLOOR scale_remote_linear_6400: per_event_ms \u003c= 5 (measured Some(505.03062773109247))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  505.03062773109247,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::startup_ready_50k_objects",
+                                            "status":  "fail",
+                                            "elapsed_ms":  11876,
+                                            "failures":  [
+                                                             "FLOOR scale_startup_50k_objects: ready_ms \u003c 10000 (measured Some(11875.351200000001))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "ready_ms",
+                                                                "value":  11875.351200000001,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::tiny_files_10k",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60042,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: files missing",
+                                                             "FLOOR scale_tiny_files_10k: files_per_s \u003e= 300 (measured Some(1.0326235870474052))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "files_per_s",
+                                                                "value":  1.0326235870474052,
+                                                                "unit":  "files/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_scale::two_way_backlog",
+                                            "status":  "timeout",
+                                            "elapsed_ms":  60056,
+                                            "failures":  [
+                                                             "QUAL_TIMEOUT: 215 of 2000 events activated",
+                                                             "FLOOR scale_two_way_backlog: per_event_ms \u003c= 100 (measured Some(279.32511395348837))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  279.32511395348837,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  }
+              ],
+    "floors":  [
+                   {
+                       "id":  "remote_linear_create_2k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_6_activation::remote_linear_create_2k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "ms",
+                       "measured":  172.33334813753578,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "15.9 s per event @2K"
+                   },
+                   {
+                       "id":  "remote_linear_create_10k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_6_activation::remote_linear_create_10k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "ms",
+                       "measured":  171.27016239316234,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "6.2 s @1K, 15.9 s @2K, 218 s @6.4K"
+                   },
+                   {
+                       "id":  "local_create_after_resolved_conflict",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_6_activation::local_create_after_resolved_conflict",
+                       "metric":  "p90_ms",
+                       "op":  "\u003c=",
+                       "floor":  10,
+                       "unit":  "ms",
+                       "measured":  18223.394800000002,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "4.2 s"
+                   },
+                   {
+                       "id":  "two_way_backlog_2k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_7_derive::two_way_backlog_2k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  100,
+                       "unit":  "ms",
+                       "measured":  176.04683460410553,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "slow path, 15.9 s @2K"
+                   },
+                   {
+                       "id":  "two_way_backlog_6400",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_7_derive::two_way_backlog_6400",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  300,
+                       "unit":  "ms",
+                       "measured":  175.4597549707603,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "slow path, 218 s @6.4K"
+                   },
+                   {
+                       "id":  "concurrent_namespace_ops_5k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_7_derive::concurrent_namespace_ops_5k",
+                       "metric":  "max_op_ms",
+                       "op":  "\u003c=",
+                       "floor":  500,
+                       "unit":  "ms",
+                       "measured":  117493.99440000001,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "O(N^2) seconds to minutes"
+                   },
+                   {
+                       "id":  "restart_ready_20k_objects",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_8_objects::restart_without_rehash_20k",
+                       "metric":  "ready_ms",
+                       "op":  "\u003c=",
+                       "floor":  3000,
+                       "unit":  "ms",
+                       "measured":  3237.9369,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "full re-hash"
+                   },
+                   {
+                       "id":  "content_status_50k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_8_objects::content_status_50k",
+                       "metric":  "content_status_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  5589.5935,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "about 6.5 s"
+                   },
+                   {
+                       "id":  "tiny_pending_objects_12k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_8_objects::tiny_pending_objects_12k",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  0.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "page cliff above 10,031 parts"
+                   },
+                   {
+                       "id":  "watch_latency",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_4_worker::watch_latency",
+                       "metric":  "watch_ms",
+                       "op":  "\u003c=",
+                       "floor":  1500,
+                       "unit":  "ms",
+                       "measured":  null,
+                       "verdict":  "missing",
+                       "enforced":  false,
+                       "baseline":  "no watch op"
+                   },
+                   {
+                       "id":  "session_slow_does_not_block_fast",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_9_session::slow_does_not_block_fast",
+                       "metric":  "fast_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  2900.3219,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "head-of-line blocking"
+                   },
+                   {
+                       "id":  "session_loopback_throughput",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_9_session::loopback_throughput",
+                       "metric":  "mib_per_s",
+                       "op":  "\u003e=",
+                       "floor":  300,
+                       "unit":  "MiB/s",
+                       "measured":  37.540014576083784,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "JSON+hex request/response"
+                   },
+                   {
+                       "id":  "legacy_hung_repo_healthy_progress",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_12_legacy::hung_remote_repo_charged",
+                       "metric":  "healthy_delay_ms",
+                       "op":  "\u003c=",
+                       "floor":  45000,
+                       "unit":  "ms",
+                       "measured":  null,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "lane-wide resets, 30 s backoff"
+                   },
+                   {
+                       "id":  "legacy_interval_20s_reconnects",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_12_legacy::interval_20s_no_reconnects",
+                       "metric":  "reconnects",
+                       "op":  "\u003c=",
+                       "floor":  0,
+                       "unit":  "count",
+                       "measured":  9.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "every idle cycle"
+                   },
+                   {
+                       "id":  "legacy_crash_backoff",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_12_legacy::crash_backoff",
+                       "metric":  "restarts_20s",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "count",
+                       "measured":  11.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "restart every 2 s"
+                   },
+                   {
+                       "id":  "api_p99_under_churn",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_1_lifecycle::api_latency_under_churn",
+                       "metric":  "list_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  100,
+                       "unit":  "ms",
+                       "measured":  12.850999999999999,
+                       "verdict":  "pass",
+                       "enforced":  false,
+                       "baseline":  "locks held 23-41 s"
+                   },
+                   {
+                       "id":  "subscribe_latency",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_1_lifecycle::subscribe_latency",
+                       "metric":  "subscribe_ms",
+                       "op":  "\u003c=",
+                       "floor":  1000,
+                       "unit":  "ms",
+                       "measured":  null,
+                       "verdict":  "missing",
+                       "enforced":  false,
+                       "baseline":  "5 s poll"
+                   },
+                   {
+                       "id":  "shutdown_busy_folder",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_1_lifecycle::shutdown_with_busy_folder",
+                       "metric":  "shutdown_ms",
+                       "op":  "\u003c=",
+                       "floor":  30000,
+                       "unit":  "ms",
+                       "measured":  null,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "Shutdown aborts on the first busy folder"
+                   },
+                   {
+                       "id":  "fs_p99_during_catchup",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_3_worker::fs_p99_during_catchup",
+                       "metric":  "fs_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  663.3056,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "engine held for seconds"
+                   },
+                   {
+                       "id":  "status_latency_during_activation",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_3_worker::status_latency_during_activation",
+                       "metric":  "status_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  20,
+                       "unit":  "ms",
+                       "measured":  14.0997,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "blanked (busy/stale)"
+                   },
+                   {
+                       "id":  "startup_with_5k_staged",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_3_worker::startup_with_5k_staged",
+                       "metric":  "ready_ms",
+                       "op":  "\u003c",
+                       "floor":  3000,
+                       "unit":  "ms",
+                       "measured":  null,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "unbounded startup drain"
+                   },
+                   {
+                       "id":  "lock_hold_slow_event_2k",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_4_offlock::lock_hold_slow_event_2k",
+                       "metric":  "max_blocked_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  15011.2255,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "full O(N^2) derivation under the lock"
+                   },
+                   {
+                       "id":  "feed_150k_events",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_5_feed::feed_150k_events",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  0.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "INVENTORY_TOO_LARGE"
+                   },
+                   {
+                       "id":  "idle_exchange_50k_cpu",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_5_feed::idle_exchange_50k",
+                       "metric":  "cpu_ms_per_side",
+                       "op":  "\u003c=",
+                       "floor":  10,
+                       "unit":  "ms",
+                       "measured":  8001.953125,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "1.13 s @6.4K"
+                   },
+                   {
+                       "id":  "idle_exchange_50k_bytes",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_5_feed::idle_exchange_50k",
+                       "metric":  "bytes",
+                       "op":  "\u003c=",
+                       "floor":  4096,
+                       "unit":  "bytes",
+                       "measured":  3901138.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "251 KB @6.4K"
+                   },
+                   {
+                       "id":  "large_event_8mib",
+                       "wave":  2,
+                       "scenario":  "qual_wp2_5_feed::large_event_8mib",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  0.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "permanent stall above 349,525 B"
+                   },
+                   {
+                       "id":  "v3_hung_repo_extra_delay",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_1_transport::hung_remote_repo_extra_delay",
+                       "metric":  "extra_delay_ms",
+                       "op":  "\u003c",
+                       "floor":  2000,
+                       "unit":  "ms",
+                       "measured":  null,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "lane-wide resets, 30 s backoff"
+                   },
+                   {
+                       "id":  "v3_interval_20s_reconnects",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_1_transport::interval_20s_no_reconnects",
+                       "metric":  "reconnects",
+                       "op":  "\u003c=",
+                       "floor":  0,
+                       "unit":  "count",
+                       "measured":  9.0,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "every idle cycle"
+                   },
+                   {
+                       "id":  "objects_worker_256mib",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_2_objects::object_256mib_worker_to_worker",
+                       "metric":  "mib_per_s",
+                       "op":  "\u003e=",
+                       "floor":  100,
+                       "unit":  "MiB/s",
+                       "measured":  16.553095618982706,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "about 2 MiB/s"
+                   },
+                   {
+                       "id":  "objects_worker_tiny_10k",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_2_objects::tiny_objects_10k",
+                       "metric":  "objects_per_s",
+                       "op":  "\u003e=",
+                       "floor":  300,
+                       "unit":  "objects/s",
+                       "measured":  188.4867903631618,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "stop-and-wait pages"
+                   },
+                   {
+                       "id":  "e2e_object_256mib_loopback",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::object_256mib_loopback",
+                       "metric":  "mib_per_s",
+                       "op":  "\u003e=",
+                       "floor":  40,
+                       "unit":  "MiB/s",
+                       "measured":  11.687931800881417,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "2.0 MiB/s"
+                   },
+                   {
+                       "id":  "e2e_link_utilization",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::one_gib_through_proxy",
+                       "metric":  "link_utilization",
+                       "op":  "\u003e=",
+                       "floor":  0.8,
+                       "unit":  "ratio",
+                       "measured":  0.3855025360900718,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "not measured"
+                   },
+                   {
+                       "id":  "e2e_tiny_files_10k",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::tiny_files_10k",
+                       "metric":  "files_per_s",
+                       "op":  "\u003e=",
+                       "floor":  300,
+                       "unit":  "files/s",
+                       "measured":  0.9331217370930273,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "page cliff above 10,031 parts"
+                   },
+                   {
+                       "id":  "e2e_catch_up_10k",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::catch_up_10k_events",
+                       "metric":  "seconds",
+                       "op":  "\u003c=",
+                       "floor":  60,
+                       "unit":  "s",
+                       "measured":  null,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "hours"
+                   },
+                   {
+                       "id":  "e2e_objects_before_activation",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::objects_before_activation",
+                       "metric":  "objects_ahead",
+                       "op":  "\u003e=",
+                       "floor":  1,
+                       "unit":  "objects",
+                       "measured":  0.0,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "0-byte bulk rounds"
+                   },
+                   {
+                       "id":  "e2e_mutual_pairing_bytes",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::mutual_pairing_duplicate_bytes",
+                       "metric":  "wire_ratio",
+                       "op":  "\u003c=",
+                       "floor":  1.1,
+                       "unit":  "ratio",
+                       "measured":  1.3818020224571228,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "up to 2x"
+                   },
+                   {
+                       "id":  "e2e_two_way_backlog",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::two_way_backlog_e2e",
+                       "metric":  "seconds",
+                       "op":  "\u003c=",
+                       "floor":  180,
+                       "unit":  "s",
+                       "measured":  null,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "slow path"
+                   },
+                   {
+                       "id":  "e2e_idle_exchange_bytes",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::idle_exchange_daemons",
+                       "metric":  "bytes_per_exchange",
+                       "op":  "\u003c=",
+                       "floor":  4096,
+                       "unit":  "bytes",
+                       "measured":  86038.28571428571,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "251 KB @6.4K"
+                   },
+                   {
+                       "id":  "e2e_feed_150k",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::feed_150k_daemons",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  0.0,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "INVENTORY_TOO_LARGE"
+                   },
+                   {
+                       "id":  "e2e_large_event_8mib",
+                       "wave":  3,
+                       "scenario":  "qual_wp3_int_e2e::large_event_8mib_daemons",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  0.0,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "permanent stall above 349,525 B"
+                   },
+                   {
+                       "id":  "scale_remote_linear_2k",
+                       "wave":  4,
+                       "scenario":  "qual_scale::remote_linear_activation_2k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "ms",
+                       "measured":  287.10162333333335,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "15.9 s @2K"
+                   },
+                   {
+                       "id":  "scale_remote_linear_6400",
+                       "wave":  4,
+                       "scenario":  "qual_scale::remote_linear_activation_6400",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "ms",
+                       "measured":  505.03062773109247,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "218 s @6.4K"
+                   },
+                   {
+                       "id":  "scale_two_way_backlog",
+                       "wave":  4,
+                       "scenario":  "qual_scale::two_way_backlog",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  100,
+                       "unit":  "ms",
+                       "measured":  279.32511395348837,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "slow path"
+                   },
+                   {
+                       "id":  "scale_feed_150k",
+                       "wave":  4,
+                       "scenario":  "qual_scale::feed_150k",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  0.0,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "INVENTORY_TOO_LARGE"
+                   },
+                   {
+                       "id":  "scale_tiny_files_10k",
+                       "wave":  4,
+                       "scenario":  "qual_scale::tiny_files_10k",
+                       "metric":  "files_per_s",
+                       "op":  "\u003e=",
+                       "floor":  300,
+                       "unit":  "files/s",
+                       "measured":  1.0326235870474052,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "page cliff above 10,031 parts"
+                   },
+                   {
+                       "id":  "scale_one_gib_object",
+                       "wave":  4,
+                       "scenario":  "qual_scale::one_gib_object",
+                       "metric":  "mib_per_s",
+                       "op":  "\u003e=",
+                       "floor":  40,
+                       "unit":  "MiB/s",
+                       "measured":  13.051055307323773,
+                       "verdict":  "incomplete",
+                       "enforced":  false,
+                       "baseline":  "2.0 MiB/s"
+                   },
+                   {
+                       "id":  "scale_startup_50k_objects",
+                       "wave":  4,
+                       "scenario":  "qual_scale::startup_ready_50k_objects",
+                       "metric":  "ready_ms",
+                       "op":  "\u003c",
+                       "floor":  10000,
+                       "unit":  "ms",
+                       "measured":  11875.351200000001,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "minutes"
+                   },
+                   {
+                       "id":  "scale_api_p99_under_churn",
+                       "wave":  4,
+                       "scenario":  "qual_scale::management_api_p99_under_churn",
+                       "metric":  "list_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  100,
+                       "unit":  "ms",
+                       "measured":  950.0828,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "locks held 23-41 s"
+                   },
+                   {
+                       "id":  "scale_idle_worker_cpu",
+                       "wave":  4,
+                       "scenario":  "qual_scale::idle_worker_cpu",
+                       "metric":  "cpu_percent",
+                       "op":  "\u003c=",
+                       "floor":  1,
+                       "unit":  "%",
+                       "measured":  135.83333333333334,
+                       "verdict":  "fail",
+                       "enforced":  false,
+                       "baseline":  "4 sweeps + 2 parses per 500 ms per lane x repo"
+                   }
+               ],
+    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-071336",
+    "merged_from":  {
+                        "generated_at":  "2026-10-13T07:11:55.6684021-03:00",
+                        "git":  {
+                                    "commit":  "ee9648d0f216cca56a067628e9c1193ec74d180c",
+                                    "branch":  "revamp/wp0-5-harness",
+                                    "dirty":  false
+                                },
+                        "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp0-5\\test-runs\\qualify-baseline-20261013-061254"
+                    }
+}
