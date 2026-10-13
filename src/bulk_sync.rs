@@ -1,5 +1,8 @@
 //! Independent bounded object lanes. Metadata/causal activation stays on control.
-use crate::{core::*, paired_sync::SyncRoute};
+use crate::{
+    core::{transfer::split_outcomes, *},
+    paired_sync::SyncRoute,
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -11,6 +14,9 @@ use std::{
 
 pub const PROTOCOL: u32 = 1;
 const PAGE_BUDGET: usize = 4 * 1024 * 1024;
+/// How long one page may spend installing objects. Well inside the 15 s RPC
+/// deadline of the legacy lanes; parts left over are re-sent by the peer.
+pub const RECEIVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,15 +143,14 @@ impl Page {
 fn offer(store: &Store, route: &SyncRoute, lane: Lane, inventory: Option<&Page>) -> Result<Page> {
     // One consistent committed metadata view, without the semantic engine lock.
     store.db.execute_batch("BEGIN")?;
+    let mut failures = vec![];
     let result = (|| {
         let mut parts = BTreeMap::new();
         if let Some(inventory) = inventory {
-            let known_events = store.known_by_peer(&route.remote_replica)?;
+            // Objects of shared events the peer has committed (an index join).
             let permitted = store
-                .events()?
-                .iter()
-                .filter(|event| event.branch.shared && known_events.contains(&event.id))
-                .flat_map(Event::objects)
+                .objects_of_events_known_by(&route.remote_replica)?
+                .into_iter()
                 .filter(|hash| lane.owns(hash))
                 .collect();
             let empty = Bundle {
@@ -154,13 +159,16 @@ fn offer(store: &Store, route: &SyncRoute, lane: Lane, inventory: Option<&Page>)
                 events: vec![],
                 objects: BTreeMap::new(),
             };
-            parts = store.transfer_parts(
+            // At most `MAX_PAGE_PARTS` parts with exact overhead accounting;
+            // objects in their failure backoff are skipped.
+            parts = store.transfer_parts_collect(
                 &empty,
                 &inventory.known_objects,
                 &inventory.partial_objects,
                 PAGE_BUDGET,
                 &permitted,
                 &inventory.wanted_objects,
+                &mut failures,
             )?;
         }
         Ok(Page {
@@ -190,21 +198,34 @@ fn offer(store: &Store, route: &SyncRoute, lane: Lane, inventory: Option<&Page>)
         })
     })();
     store.db.execute_batch("ROLLBACK")?; // End the read snapshot before any later write.
+    // Unreadable objects heal the index and back off (never fail the page).
+    store.note_send_failures(&failures);
     result
 }
 
+/// Receive a page's parts object by object. Completed objects are registered
+/// even when a later part fails; each failure records its object backoff.
+/// The page still answers with the first failure (wire behaviour unchanged).
 fn receive(worker: &Worker, store: &Store, page: &Page) -> Result<()> {
-    let completed = store.receive_parts_data_locked(
+    let outcomes = store.receive_parts_until(
         page.object_parts.clone(),
         &[],
         &BTreeSet::new(),
         Some(&worker.locks),
+        Some(std::time::Instant::now() + RECEIVE_BUDGET),
     )?;
-    if !completed.is_empty() {
+    let (completed, failed) = split_outcomes(&outcomes);
+    if !completed.is_empty() || !failed.is_empty() {
         // Acquire SQLite's writer slot before descriptor reads, avoiding a WAL
         // snapshot-upgrade race with concurrent causal commits/other bulk lanes.
         store.db.execute_batch("BEGIN IMMEDIATE")?;
-        let registered = store.register_received(&completed);
+        let registered = (|| {
+            store.register_received(&completed)?;
+            for (object, error) in &failed {
+                store.record_object_failure(object, error)?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })();
         match registered {
             Ok(()) => store.db.execute_batch("COMMIT")?,
             Err(error) => {
@@ -213,7 +234,10 @@ fn receive(worker: &Worker, store: &Store, page: &Page) -> Result<()> {
             }
         }
     }
-    Ok(())
+    match failed.into_iter().next() {
+        Some((_, error)) => Err(error.into_anyhow()),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn worker_control(worker: &Worker, payload: &Value) -> Result<Value> {

@@ -2,7 +2,10 @@
 //! per-object outcomes). REVAMP_PLAN §14.6; floors in §15 and
 //! `tests/qualification-floors.json`.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP1.8"]`.
+//! Created by WP0.5 against the 6298d0b baseline; enabled by WP1.8, which
+//! implements every scenario. They stay `#[ignore]` because
+//! `scripts/qualify.ps1` runs the release qualification with `--ignored`; the
+//! same behaviours run in the default suite as `tests/availability_index.rs`.
 //! `cargo test --release --test qual_wp1_8_objects -- --ignored --test-threads=1 --nocapture`
 mod support;
 
@@ -55,6 +58,16 @@ fn corrupt_mid_page_keeps_completed() {
         .collect();
     let result = b.receive_parts(parts, &[], &allowed);
     s.note(format!("receive_parts: {result:?}"));
+    s.check(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("CORRUPT_OBJECT")),
+        "the page still reports the corrupt part",
+    );
+    s.check(
+        b.object_backoff(&hashes[1]).unwrap().is_some(),
+        "the corrupt object backs off",
+    );
     let shared = b.shared_object_inventory().unwrap();
     s.check(
         shared.contains(&hashes[0]),
@@ -119,6 +132,18 @@ fn restart_without_rehash_20k() {
         Err(e) => s.timeout(format!("second start: {e:#}")),
     }
     let _ = second.stop();
+    // The same restart in-process: no object is hashed.
+    let (store, open_ms) = time_ms(|| Store::open_existing(&state).unwrap());
+    s.metric_with(
+        "open_ms",
+        open_ms,
+        "ms",
+        json!({"hashes": store.object_hashes(), "objects": scaled(20_000)}),
+    );
+    s.check(
+        store.object_hashes() == 0,
+        format!("restart hashed {} objects", store.object_hashes()),
+    );
     s.finish();
 }
 
@@ -203,6 +228,13 @@ fn content_status_50k() {
         time_ms(|| small_objects_in(&mut store, "objects", scaled(50_000), 32, 9).unwrap());
     s.note(format!("{} objects stored in {ms:.0} ms", scaled(50_000)));
     s.measure_from_now();
+    // The first call after a write burst lists `objects/` and scans the
+    // indexes; status polls then reuse both until something changes.
+    let (status, cold_ms) = time_ms(|| store.content_status().unwrap());
+    s.metric("cold_content_status_ms", cold_ms, "ms");
+    s.check(status["complete"] == true, "content complete");
+    std::thread::sleep(Duration::from_millis(150));
+    let _ = store.content_status().unwrap();
     let mut samples = vec![];
     for _ in 0..5 {
         if s.over_budget() {
