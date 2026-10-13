@@ -4,8 +4,10 @@
 //!   `PeerConnState`, and for the precedence order of each table.
 //! * The stall detector, EWMA rates and ETA, error dedupe and display policy.
 //! * The hub: event application, sharing rules (a non-sharing offline peer is
-//!   ignored, an inbound-only peer counts), stalls, rates, error history,
-//!   `record()` cost with waiters, the snapshot throttle, the legacy
+//!   ignored, an inbound-only peer counts), stalls, rates, error history and
+//!   the implicit clears of errors whose work is gone, bounded inbound
+//!   notices, `record()` cost with waiters (at 1 × 2 and at 20 folders × 5
+//!   peers with readers rebuilding), the snapshot throttle, the legacy
 //!   projection against the compatibility goldens, and redaction.
 mod support;
 
@@ -39,8 +41,8 @@ use tkfs::{
     },
     orchestrator::{
         hub::{
-            HubConfig, MAX_INBOUND_NOTICES, MAX_NOTICE_MESSAGE, ORPHAN_GRACE, StatusHub,
-            stall_after_for,
+            HubConfig, INBOUND_INCOMPATIBLE_TTL, MAX_INBOUND_NOTICES, MAX_NOTICE_MESSAGE,
+            MAX_PENDING_EVENTS, ORPHAN_GRACE, StatusHub, WORK_GONE_GRACE, stall_after_for,
         },
         hub_rules::{
             self as rules, ErrorFlags, Ewma, FolderInputs, PeerInputs, StallInput, Streak,
@@ -857,6 +859,49 @@ fn transfer_work_is_attributed_only_to_peers_that_can_supply_it() {
     assert_eq!(rules::upload_work(Some(&lacking), &complete), (0, 0));
 }
 
+/// Fix round 2: a peer without a published entry for the repo (inbound-only:
+/// no catalog, counters unknown) gets download work only while it
+/// demonstrably supplies; a publishing peer always may (its counters, when
+/// known, then decide through `download_work`).
+#[test]
+fn download_attribution_needs_a_published_entry_or_recent_supply() {
+    const WINDOW: Duration = Duration::from_secs(60);
+    let now = T0 + 1_000_000;
+    // (published, last supplied, may supply)
+    let rows = [
+        (true, None, true),
+        (true, Some(now - 3_600_000), true),
+        (false, None, false),
+        (false, Some(now), true),
+        (false, Some(now - 59_999), true),
+        (false, Some(now - 60_000), false),
+        (false, Some(now - 3_600_000), false),
+        // A supply stamped after `now` (clock skew between readings) counts.
+        (false, Some(now + 5), true),
+    ];
+    for (published, supplied, expected) in rows {
+        assert_eq!(
+            rules::may_supply(published, supplied, now, WINDOW),
+            expected,
+            "published {published}, supplied {supplied:?}"
+        );
+    }
+    // Remote-folder answers versus op failures.
+    assert!(rules::remote_waiting_code(rules::REMOTE_STARTING_CODE));
+    assert!(rules::remote_waiting_code(rules::PAUSED_CODE));
+    assert!(!rules::remote_waiting_code("OBJECT_IO_ERROR"));
+    assert!(!rules::remote_waiting_code("WORKER_NOT_RUNNING"));
+    // Work directions.
+    let work = |down_bytes, up_objects| Work {
+        down_bytes,
+        up_objects,
+        ..Work::default()
+    };
+    assert!(work(1, 0).has_down_work() && !work(1, 0).has_up_work());
+    assert!(!work(0, 1).has_down_work() && work(0, 1).has_up_work());
+    assert!(!Work::default().has_down_work() && !Work::default().has_up_work());
+}
+
 // ===========================================================================
 // Pure rules: rates and ETA
 
@@ -1551,6 +1596,135 @@ fn inbound_only_peer_counts() {
     });
     assert_eq!(fx.snap().peers[0].state, PeerConnState::Offline);
     assert_eq!(fx.folder().sync.state, FolderSyncState::Offline);
+}
+
+/// Fix round 2 (review, minor): an inbound-only peer has no catalog, so its
+/// content counters are unknown. Content it lacks too must not read as a
+/// download from it and then as a false stall: download work is attributed
+/// to it only while it demonstrably pushes objects to us (within the stall
+/// threshold of its last push), as a catalog peer missing the same bytes
+/// reads up to date.
+#[test]
+fn an_inbound_only_peer_is_credited_only_with_what_it_pushes() {
+    let stall = STALL.as_secs();
+    let fx = Fx::new();
+    fx.running_folder();
+    for (lane, role) in [(0, LaneRole::Control), (1, LaneRole::Bulk)] {
+        fx.rec(StatusEvent::InboundSession {
+            installation: PEER_B.into(),
+            lane,
+            role,
+            opened: true,
+        });
+    }
+    fx.rec(finished(
+        PEER_B,
+        0,
+        "meta.exchange",
+        Direction::Inbound,
+        None,
+        Some(summary(0, 0)),
+        100,
+        0,
+    ));
+    // The review's probe: we miss 1000 bytes that the dialer lacks too.
+    fx.rec(heartbeat(1, Some(missing_bytes(1000))));
+    fx.hub.tick();
+    for second in 0..stall + 10 {
+        fx.run(1);
+        assert_ne!(
+            fx.pair(PEER_B).state,
+            FolderPeerState::Stalled,
+            "second {second}"
+        );
+    }
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::UpToDate);
+    let pair = &folder.sync.peers[0];
+    assert_eq!(pair.state, FolderPeerState::UpToDate);
+    assert_eq!(pair.objects_down.bytes_remaining, 0);
+    assert_eq!(pair.stalled_since_ms, None);
+    assert!(!folder.content.complete, "completeness stays its own claim");
+    // The dialer pushes an object: what we miss is a download from it while
+    // it pushes.
+    fx.rec(heartbeat(2, Some(missing_bytes(4 << 20))));
+    fx.rec(finished(
+        PEER_B,
+        1,
+        "objects.push",
+        Direction::Inbound,
+        None,
+        None,
+        1 << 20,
+        1,
+    ));
+    fx.rec(heartbeat(3, Some(missing_bytes(3 << 20))));
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::Downloading);
+    assert_eq!(folder.sync.peers[0].state, FolderPeerState::Downloading);
+    assert_eq!(folder.sync.peers[0].objects_down.bytes_remaining, 3 << 20);
+    // It stops (it lacks the rest): the attribution lapses with the stall
+    // threshold, so it never shows a false stall, and the lapse is not
+    // progress.
+    let progress = fx.pair(PEER_B).last_progress_ms;
+    for second in 0..stall + 10 {
+        fx.run(1);
+        assert_ne!(
+            fx.pair(PEER_B).state,
+            FolderPeerState::Stalled,
+            "second {second}"
+        );
+    }
+    let pair = fx.pair(PEER_B);
+    assert_eq!(pair.state, FolderPeerState::UpToDate);
+    assert_eq!(pair.objects_down.bytes_remaining, 0);
+    assert_eq!(pair.last_progress_ms, progress);
+}
+
+/// Fix round 2: an exchange the peer initiated (inbound) is its own error
+/// key, seen from here: its `objects.push` is our download, its
+/// `objects.pull` our upload. Each clears on its own success, or once the
+/// pair has no work left in that direction.
+#[test]
+fn inbound_exchange_errors_are_their_own_keys_seen_from_here() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    // We have everything; the peer lacks 1 MiB (upload work).
+    let mut lacking = entry(REPO, EntryState::Running);
+    lacking.content = Some(missing_bytes(1 << 20));
+    fx.rec(catalog(PEER_A, &[lacking]));
+    fx.rec(heartbeat(1, Some(missing_bytes(0))));
+    let inbound = |op: &str, error: Option<ErrorWire>| {
+        finished(PEER_A, 1, op, Direction::Inbound, error, None, 0, 0)
+    };
+    for _ in 0..3 {
+        fx.rec(inbound("objects.pull", Some(wire("OBJECT_IO_ERROR"))));
+        fx.rec(inbound("objects.push", Some(wire("REQUEST_TIMEOUT"))));
+    }
+    let mut codes = open_codes(&fx);
+    codes.sort();
+    assert_eq!(codes, ["OBJECT_IO_ERROR", "REQUEST_TIMEOUT"]);
+    // Our outbound pull succeeding is another key: both stay.
+    fx.rec(finished(
+        PEER_A,
+        1,
+        "objects.pull",
+        Direction::Outbound,
+        None,
+        None,
+        0,
+        0,
+    ));
+    assert_eq!(open_codes(&fx).len(), 2);
+    // Its push is our download, and we miss nothing: that one resolves after
+    // the grace; its pull is our upload, still due: that one stays.
+    fx.run(WORK_GONE_GRACE.as_secs());
+    assert_eq!(open_codes(&fx), ["OBJECT_IO_ERROR"]);
+    // Its own success clears it.
+    fx.rec(inbound("objects.pull", None));
+    assert!(open_codes(&fx).is_empty());
 }
 
 #[test]
@@ -2296,6 +2470,264 @@ fn errors_clear_per_op_and_hidden_errors_never_reach_history() {
     );
 }
 
+/// The codes of the folder's open (unresolved) errors.
+fn open_codes(fx: &Fx) -> Vec<String> {
+    fx.folder()
+        .errors
+        .iter()
+        .filter(|e| e.resolved_at_ms.is_none())
+        .map(|e| e.error.code.clone())
+        .collect()
+}
+
+/// Fix round 2 (review, major): an objects-op error is kept per (peer, repo,
+/// op) key and clears on that key's next success. When the op's work goes
+/// away without one (the object became unreferenced, arrived from another
+/// peer, or the peer got it elsewhere), the op never runs again; its error
+/// then resolves once the pair has no work left in the op's direction, after
+/// `WORK_GONE_GRACE` without a new report, and not while the op is in flight.
+#[test]
+fn objects_op_errors_resolve_when_their_work_is_gone() {
+    let grace = WORK_GONE_GRACE.as_secs();
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    let failed = |op: &str| {
+        finished(
+            PEER_A,
+            1,
+            op,
+            Direction::Outbound,
+            Some(wire("OBJECT_IO_ERROR")),
+            None,
+            0,
+            0,
+        )
+    };
+    let meta_ok_for = |fx: &Fx, seconds: u64| {
+        for _ in 0..seconds {
+            fx.rec(meta(PEER_A, summary(0, 0)));
+            fx.run(1);
+        }
+    };
+    // The review's probe: 1000 bytes missing, the pull fails three times.
+    fx.rec(heartbeat(1, Some(missing_bytes(1000))));
+    for _ in 0..3 {
+        fx.rec(failed("objects.pull"));
+    }
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Backoff);
+    // While the work remains, neither time nor metadata successes clear it.
+    meta_ok_for(&fx, 30);
+    assert_eq!(open_codes(&fx), ["OBJECT_IO_ERROR"]);
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Backoff);
+    // One more failure, then the worker misses nothing any more: resolved
+    // after the grace (the heartbeat may lag the worker), not before.
+    fx.rec(failed("objects.pull"));
+    fx.rec(heartbeat(2, Some(missing_bytes(0))));
+    meta_ok_for(&fx, grace - 1);
+    assert_eq!(open_codes(&fx), ["OBJECT_IO_ERROR"], "not before the grace");
+    meta_ok_for(&fx, 1);
+    let folder = fx.folder();
+    assert!(open_codes(&fx).is_empty(), "{:?}", folder.errors);
+    let resolved = folder
+        .errors
+        .iter()
+        .find(|e| e.error.code == "OBJECT_IO_ERROR")
+        .expect("shown, so kept in the history");
+    assert_eq!(resolved.count, 4);
+    assert_eq!(resolved.resolved_at_ms, Some(fx.now()));
+    assert!(
+        fx.snap()
+            .activity
+            .iter()
+            .any(|a| a.kind == "resolved" && a.message == "OBJECT_IO_ERROR resolved")
+    );
+    // …and the rest of the probe: 120 s of metadata successes, all up to date.
+    meta_ok_for(&fx, 120);
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::UpToDate);
+    assert_eq!(folder.sync.summary, "Up to date · 1 of 1 peer");
+    assert_eq!(folder.sync.peers[0].state, FolderPeerState::UpToDate);
+    assert!(folder.sync.peers[0].error.is_none());
+    // Not while that op is in flight: the pull of the last object runs on.
+    fx.rec(heartbeat(3, Some(missing_bytes(1000))));
+    for _ in 0..3 {
+        fx.rec(failed("objects.pull"));
+    }
+    fx.rec(StatusEvent::ExchangeStarted {
+        installation: PEER_A.into(),
+        repo: REPO.into(),
+        lane: 1,
+        op: "objects.pull".into(),
+        at_ms: fx.now(),
+    });
+    fx.rec(heartbeat(4, Some(missing_bytes(0))));
+    fx.run(grace + 5);
+    assert_eq!(open_codes(&fx), ["OBJECT_IO_ERROR"], "in flight");
+    fx.rec(failed("objects.pull"));
+    fx.run(grace - 1);
+    assert_eq!(open_codes(&fx), ["OBJECT_IO_ERROR"]);
+    fx.run(1);
+    assert!(open_codes(&fx).is_empty());
+    // Uploads: a push error resolves once the peer lacks nothing we have,
+    // and a download that is still due keeps its pull error meanwhile.
+    let lacking = |bytes: u64| {
+        let mut published = entry(REPO, EntryState::Running);
+        published.content = Some(missing_bytes(bytes));
+        catalog(PEER_A, &[published])
+    };
+    fx.rec(lacking(1 << 20));
+    fx.rec(heartbeat(5, Some(missing_bytes(2000))));
+    for _ in 0..3 {
+        fx.rec(failed("objects.push"));
+        fx.rec(failed("objects.pull"));
+    }
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Backoff);
+    fx.rec(lacking(0));
+    fx.run(grace);
+    assert_eq!(open_codes(&fx), ["OBJECT_IO_ERROR"]);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.objects_up.bytes_remaining, 0);
+    assert_eq!(pair.objects_down.bytes_remaining, 2000);
+    assert_eq!(pair.state, FolderPeerState::Backoff, "the pull still fails");
+}
+
+/// Fix round 2 (review, major): `REMOTE_WORKER_STARTING` and
+/// `FOLDER_SYNC_PAUSED` describe the remote folder, not one op. Any success
+/// with the peer for the repo resolves them whatever op failed, and so does
+/// the remote's catalog entry turning Running (an unchanged Running entry
+/// may predate the answer and proves nothing).
+#[test]
+fn remote_folder_answers_resolve_on_any_success_or_a_running_catalog() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    let starting = || wire(rules::REMOTE_STARTING_CODE);
+    // The review's probe: a bulk-lane op got REMOTE_WORKER_STARTING three
+    // times while the catalog lists the remote folder as Running.
+    for _ in 0..3 {
+        fx.rec(finished(
+            PEER_A,
+            1,
+            "objects.pull",
+            Direction::Outbound,
+            Some(starting()),
+            None,
+            0,
+            0,
+        ));
+    }
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::WaitingForRemote);
+    assert_eq!(fx.folder().sync.state, FolderSyncState::Offline);
+    // A metadata success proves the remote folder serves.
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::UpToDate);
+    assert_eq!(fx.folder().sync.state, FolderSyncState::UpToDate);
+    assert!(open_codes(&fx).is_empty());
+    fx.run(120);
+    assert_eq!(fx.folder().sync.state, FolderSyncState::UpToDate);
+    // An unchanged Running catalog proves nothing…
+    fx.rec(meta_failed(PEER_A, starting()));
+    fx.rec(catalog(PEER_A, &[entry(REPO, EntryState::Running)]));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::WaitingForRemote);
+    // …the remote folder turning Running does.
+    fx.rec(catalog(PEER_A, &[entry(REPO, EntryState::Starting)]));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::WaitingForRemote);
+    fx.rec(catalog(PEER_A, &[entry(REPO, EntryState::Running)]));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::UpToDate);
+    assert!(open_codes(&fx).is_empty());
+    // FOLDER_SYNC_PAUSED on the metadata op, cleared by an objects success.
+    fx.rec(meta_failed(PEER_A, wire(rules::PAUSED_CODE)));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::WaitingForRemote);
+    fx.rec(finished(
+        PEER_A,
+        1,
+        "objects.pull",
+        Direction::Outbound,
+        None,
+        None,
+        0,
+        0,
+    ));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::UpToDate);
+    // An op failure is not a remote answer: another op's success keeps it.
+    for _ in 0..3 {
+        fx.rec(meta_failed(PEER_A, wire("REQUEST_TIMEOUT")));
+    }
+    fx.rec(finished(
+        PEER_A,
+        1,
+        "objects.pull",
+        Direction::Outbound,
+        None,
+        None,
+        0,
+        0,
+    ));
+    assert_eq!(open_codes(&fx), ["REQUEST_TIMEOUT"]);
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Backoff);
+}
+
+/// Fix round 2: nothing is exchanged with a peer that does not share the
+/// folder (any more), so its (folder, peer) errors resolve after
+/// `WORK_GONE_GRACE` without a new report; so do those of a peer the hub
+/// does not know.
+#[test]
+fn errors_of_a_peer_that_stops_sharing_resolve() {
+    let grace = WORK_GONE_GRACE.as_secs();
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    for _ in 0..3 {
+        fx.rec(meta_failed(PEER_A, wire("REQUEST_TIMEOUT")));
+    }
+    fx.rec(StatusEvent::Error {
+        scope: Scope::FolderPeer {
+            state: STATE.into(),
+            installation: "inst-gone".into(),
+        },
+        error: wire("REMOTE_REPLICA_BINDING_MISMATCH"),
+    });
+    // Still shared: the metadata error waits for the next metadata success.
+    fx.run(grace + 5);
+    assert_eq!(
+        open_codes(&fx),
+        ["REQUEST_TIMEOUT"],
+        "the unknown peer's error resolved"
+    );
+    // The peer stops publishing the folder: its error, quiet for longer than
+    // the grace already, resolves at the next tick.
+    fx.rec(catalog(PEER_A, &[entry("repo-other", EntryState::Running)]));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::NotShared);
+    assert_eq!(open_codes(&fx), ["REQUEST_TIMEOUT"]);
+    fx.run(1);
+    assert!(open_codes(&fx).is_empty());
+    // The grace counts from the last report.
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    for _ in 0..3 {
+        fx.rec(meta_failed(PEER_A, wire("REQUEST_TIMEOUT")));
+    }
+    fx.rec(catalog(PEER_A, &[entry("repo-other", EntryState::Running)]));
+    fx.run(grace - 1);
+    assert_eq!(open_codes(&fx), ["REQUEST_TIMEOUT"]);
+    fx.run(1);
+    let folder = fx.folder();
+    assert!(open_codes(&fx).is_empty(), "{:?}", folder.errors);
+    assert_eq!(folder.sync.state, FolderSyncState::NotShared);
+    assert!(
+        folder
+            .errors
+            .iter()
+            .any(|e| e.error.code == "REQUEST_TIMEOUT")
+    );
+}
+
 #[test]
 fn contention_is_hidden_until_it_lasts_30_seconds() {
     let fx = Fx::new();
@@ -2579,6 +3011,108 @@ fn inbound_incompatible_notices_are_one_per_host_and_bounded() {
         .find(|e| e.error.message.contains("203.0.113.5"))
         .expect("the newest host is kept");
     assert!(notice.error.message.len() <= MAX_NOTICE_MESSAGE);
+}
+
+/// Fix round 2 (review, minor): unauthenticated attempts from many source
+/// addresses cannot flood the activity ring or the error history. An IPv6
+/// host is keyed by its /64; a notice adds no generic `error` entry and at
+/// most one `inbound_incompatible` entry a minute, which counts the hosts
+/// seen meanwhile; expired notices keep one history entry between them, and
+/// their expiry is not logged as a resolution.
+#[test]
+fn inbound_incompatible_floods_cannot_flood_activity_or_history() {
+    let fx = Fx::new();
+    fx.running_folder();
+    // A real error, resolved into the daemon history.
+    fx.rec(lane(
+        PEER_A,
+        0,
+        LaneState::Unauthorized,
+        Some(wire("INVALID_PAIRING_CODE")),
+    ));
+    fx.rec(lane(PEER_A, 0, LaneState::Ready, None));
+    let real_error_kept = |fx: &Fx| {
+        fx.snap()
+            .daemon
+            .errors
+            .iter()
+            .any(|e| e.error.code == "INVALID_PAIRING_CODE" && e.resolved_at_ms.is_some())
+    };
+    assert!(real_error_kept(&fx));
+    let count = |fx: &Fx, kind: &str| fx.snap().activity.iter().filter(|a| a.kind == kind).count();
+    let lifecycle_kept = |fx: &Fx| fx.snap().activity.iter().any(|a| a.kind == "lifecycle");
+    let (errors, resolved) = (count(&fx, "error"), count(&fx, "resolved"));
+    assert_eq!((errors, resolved), (1, 1));
+    let notice = |address: String| StatusEvent::InboundIncompatible {
+        address,
+        detail: "PEER_NEEDS_UPGRADE: legacy hello version 2".into(),
+    };
+    let notices = |fx: &Fx| -> Vec<ErrorRecord> {
+        fx.snap()
+            .daemon
+            .errors
+            .iter()
+            .filter(|e| e.error.code == "PEER_NEEDS_UPGRADE")
+            .cloned()
+            .collect()
+    };
+    // The review's probe: 300 addresses of one IPv6 /64 are one host.
+    for n in 0..300u64 {
+        fx.rec(notice(format!("[2001:db8::{n:x}]:5000")));
+    }
+    let open = notices(&fx);
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].count, 300);
+    assert_eq!(count(&fx, "inbound_incompatible"), 1);
+    // 300 IPv4 hosts within half a minute: 16 notices, no new entry.
+    for n in 0..300u64 {
+        fx.advance(100);
+        fx.rec(notice(format!("10.0.{}.{}:4000", n / 256, n % 256)));
+    }
+    assert_eq!(notices(&fx).len(), MAX_INBOUND_NOTICES);
+    assert_eq!(count(&fx, "inbound_incompatible"), 1);
+    assert_eq!(count(&fx, "error"), errors, "no generic error entries");
+    // A minute after the first entry, the next new host is logged with a
+    // count of those seen meanwhile.
+    fx.advance(30_000);
+    fx.rec(notice("203.0.113.9:1".into()));
+    let snap = fx.snap();
+    let last = snap
+        .activity
+        .iter()
+        .rev()
+        .find(|a| a.kind == "inbound_incompatible")
+        .unwrap();
+    assert!(
+        last.message.contains("203.0.113.9:1")
+            && last
+                .message
+                .ends_with("(and 300 more hosts since the last notice)"),
+        "{}",
+        last.message
+    );
+    // A new host every second for an hour: at most one entry a minute, and
+    // the folder's own entries are never evicted.
+    for n in 0..3_600u64 {
+        fx.rec(notice(format!("10.1.{}.{}:4000", n / 256, n % 256)));
+        fx.run(1);
+    }
+    assert!(count(&fx, "inbound_incompatible") <= 2 + 61);
+    assert_eq!(count(&fx, "error"), errors);
+    assert!(lifecycle_kept(&fx));
+    // Expiry after 10 min of quiet is not a resolution, and the history
+    // keeps one notice: the real error keeps its entry.
+    fx.run(INBOUND_INCOMPATIBLE_TTL.as_secs() + 1);
+    let kept = notices(&fx);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].resolved_at_ms.is_some());
+    assert!(
+        kept[0].error.message.contains("10.1.14.15:4000"),
+        "the newest"
+    );
+    assert_eq!(count(&fx, "resolved"), resolved);
+    assert!(real_error_kept(&fx));
+    assert!(lifecycle_kept(&fx));
 }
 
 #[test]
@@ -2970,6 +3504,71 @@ fn wait_newer_returns_on_record_and_on_timeout() {
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 
+/// Fix round 2: `record` wakes a single subscriber when the hub turns dirty
+/// (waking them all cost the producer one wake-up per subscriber). That one
+/// rebuilds and the publish wakes the rest; and one that returns before it
+/// could rebuild (its deadline came first) passes the wake-up on, so the
+/// others are not left asleep until their own deadlines.
+#[test]
+fn every_subscriber_is_served_when_one_is_woken() {
+    let hub = StatusHub::new(HubConfig::default(), Arc::new(SystemClock));
+    hub.record(StatusEvent::FolderLifecycle(Box::new(view(running()))));
+    let generation = hub.snapshot().generation;
+    // Ten subscribers blocked on a clean hub; one event serves them all.
+    let waiters: Vec<_> = (0..10)
+        .map(|_| {
+            let hub = hub.clone();
+            thread::spawn(move || {
+                let snap = hub.wait_newer(generation, Duration::from_secs(10));
+                (Instant::now(), snap.generation)
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(50));
+    let recorded = Instant::now();
+    hub.record(heartbeat(1, None));
+    for waiter in waiters {
+        let (woke, newer) = waiter.join().unwrap();
+        assert!(newer > generation);
+        let latency = woke.saturating_duration_since(recorded);
+        assert!(latency < Duration::from_millis(500), "{latency:?}");
+    }
+    // Empty the throttle with two rebuilds back to back (after a pause that
+    // refills it), leaving the hub clean.
+    thread::sleep(Duration::from_millis(1100));
+    for seq in 2..4 {
+        hub.record(heartbeat(seq, None));
+        let before = hub.rebuilds();
+        let _ = hub.snapshot();
+        assert_eq!(hub.rebuilds(), before + 1, "published at once");
+    }
+    let generation = hub.snapshot().generation;
+    assert_eq!(hub.pending(), 0);
+    // `first` blocks first, with a short deadline; `second` blocks after it,
+    // with a long one. The event wakes one of them (`first`, in arrival
+    // order); the throttle keeps it from rebuilding before its deadline, so
+    // it must hand the wake-up to `second`, which rebuilds once the throttle
+    // allows (≤ 250 ms).
+    let spawn = |timeout: Duration| {
+        let hub = hub.clone();
+        thread::spawn(move || {
+            let snap = hub.wait_newer(generation, timeout);
+            (Instant::now(), snap.generation)
+        })
+    };
+    let first = spawn(Duration::from_millis(120));
+    thread::sleep(Duration::from_millis(20));
+    let second = spawn(Duration::from_secs(10));
+    thread::sleep(Duration::from_millis(20));
+    let recorded = Instant::now();
+    hub.record(heartbeat(4, None));
+    let _ = first.join().unwrap();
+    let (woke, newer) = second.join().unwrap();
+    assert!(newer > generation, "served, not timed out");
+    let latency = woke.saturating_duration_since(recorded);
+    assert!(latency < Duration::from_secs(2), "{latency:?}");
+}
+
 #[test]
 fn snapshot_rebuilds_are_throttled_to_four_per_second() {
     let hub = StatusHub::new(HubConfig::default(), Arc::new(SystemClock));
@@ -3138,6 +3737,272 @@ fn record_p99_under_50us_with_10_waiters() {
         let (p50, p99, seen) = measure_record_latency();
         println!("run {run}: record() p50 {p50:?}, p99 {p99:?}, waiters saw {seen} snapshots");
         assert!(seen > 0, "waiters were served");
+        best = best.min(p99);
+        if best < Duration::from_micros(50) {
+            break;
+        }
+    }
+    assert!(best < Duration::from_micros(50), "best p99 {best:?}");
+}
+
+/// Fix round 2: `record` only queues the event with the time it was
+/// recorded; whoever next needs the state applies the queue in record order,
+/// each event at its recorded time, and a hub that nobody reads or ticks
+/// still keeps the queue bounded.
+#[test]
+fn recorded_events_apply_in_order_at_their_recorded_time() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    let first = fx.now();
+    for _ in 0..3 {
+        fx.rec(meta_failed(PEER_A, wire("REQUEST_TIMEOUT")));
+        fx.advance(1000);
+    }
+    assert!(fx.hub.pending() > 0, "queued, not applied yet");
+    // Applied a minute later, at their recorded times.
+    fx.advance(60_000);
+    let error = fx.pair(PEER_A).error.expect("shown at the 3rd attempt");
+    assert_eq!(
+        (error.first_at_ms, error.last_at_ms, error.count),
+        (first, first + 2000, 3)
+    );
+    assert_eq!(fx.hub.pending(), 0);
+    // In record order, and bounded without any reader or tick.
+    let total = 3 * MAX_PENDING_EVENTS as u64;
+    for index in 0..total {
+        fx.rec(StatusEvent::Activity(ActivityEntry {
+            at_ms: T0 + index,
+            kind: "custom".into(),
+            folder: None,
+            peer: None,
+            message: format!("entry {index}"),
+        }));
+        assert!(fx.hub.pending() < MAX_PENDING_EVENTS);
+    }
+    let snap = fx.snap();
+    let tail: Vec<&str> = snap.activity[snap.activity.len() - 3..]
+        .iter()
+        .map(|entry| entry.message.as_str())
+        .collect();
+    let expected: Vec<String> = (total - 3..total).map(|i| format!("entry {i}")).collect();
+    assert_eq!(tail, expected);
+}
+
+/// Fix round 2: a hub at a realistic scale for the rebuild and tick costs:
+/// 20 folders × 5 peers, visible pair and object errors on every folder, and
+/// a full activity ring.
+fn large_hub(folders: usize, peers: usize) -> Arc<StatusHub> {
+    let hub = StatusHub::new(HubConfig::default(), Arc::new(SystemClock));
+    let state_of = |f: usize| format!("state-{f}");
+    let repo_of = |f: usize| format!("repo-{f}");
+    let peer_of = |p: usize| format!("inst-{p}");
+    for f in 0..folders {
+        hub.record(StatusEvent::FolderLifecycle(Box::new(FolderView {
+            generation: 1,
+            record: record(&state_of(f), &repo_of(f)),
+            phase: running(),
+            ..FolderView::default()
+        })));
+        hub.record(StatusEvent::WorkerHeartbeat {
+            state: state_of(f),
+            hb: Arc::new(WorkerHeartbeat {
+                instance: "instance-1".into(),
+                seq: 1,
+                content: Some(missing_bytes(1 << 30)),
+                ..WorkerHeartbeat::default()
+            }),
+        });
+        for index in 0..8u64 {
+            hub.record(StatusEvent::ObjectError {
+                state: state_of(f),
+                hash: format!("{index:064x}"),
+                error: ErrorWire::new("SIZE_MISMATCH", "SIZE_MISMATCH: 3 != 4"),
+            });
+        }
+    }
+    let published: Vec<PublishedEntry> = (0..folders)
+        .map(|f| {
+            let mut published = entry(&repo_of(f), EntryState::Running);
+            published.content = Some(missing_bytes(0));
+            published
+        })
+        .collect();
+    for p in 0..peers {
+        hub.record(StatusEvent::PeerConfigured {
+            installation: peer_of(p),
+            endpoint: format!("ws://127.0.0.1:{}", 44_000 + p),
+        });
+        for lane_index in 0..3 {
+            hub.record(lane(&peer_of(p), lane_index, LaneState::Ready, None));
+        }
+        hub.record(catalog(&peer_of(p), &published));
+        for f in 0..folders {
+            for _ in 0..3 {
+                hub.record(StatusEvent::ExchangeFinished {
+                    installation: peer_of(p),
+                    repo: repo_of(f),
+                    lane: 1,
+                    op: "objects.pull".into(),
+                    direction: Direction::Outbound,
+                    ok: false,
+                    error: Some(wire("OBJECT_IO_ERROR")),
+                    summary: None,
+                    bytes_up: 100,
+                    bytes_down: 0,
+                    objects_up: 0,
+                    objects_down: 0,
+                    duration_ms: 3,
+                });
+            }
+        }
+    }
+    for index in 0..policy::ACTIVITY_RING {
+        hub.record(StatusEvent::Activity(ActivityEntry {
+            at_ms: T0 + index as u64,
+            kind: "custom".into(),
+            folder: Some(state_of(index % folders)),
+            peer: None,
+            message: format!("entry {index}"),
+        }));
+    }
+    let _ = hub.snapshot_now();
+    hub
+}
+
+/// One measurement on [`large_hub`]: `record()` latencies over 20,000 mixed
+/// events, one every 25 µs (so the samples span about half a second of
+/// rebuilds and ticks, as a daemon's events do), while 10 subscribers
+/// long-poll, 2 status readers force a rebuild every millisecond
+/// (`snapshot_now` bypasses the throttle: the worst case of readers holding
+/// the hub) and a ticker ticks every 20 ms. Returns (p50, p99, snapshots
+/// built during the measurement).
+fn measure_record_latency_at_scale() -> (Duration, Duration, u64) {
+    const PACE: Duration = Duration::from_micros(25);
+    const FOLDERS: usize = 20;
+    const PEERS: usize = 5;
+    let hub = large_hub(FOLDERS, PEERS);
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for _ in 0..10 {
+        let (hub, stop) = (hub.clone(), stop.clone());
+        threads.push(thread::spawn(move || {
+            let mut generation = 0;
+            while !stop.load(Ordering::Relaxed) {
+                generation = hub
+                    .wait_newer(generation, Duration::from_millis(50))
+                    .generation;
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let (hub, stop) = (hub.clone(), stop.clone());
+        threads.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = hub.snapshot_now();
+                thread::sleep(Duration::from_millis(1));
+            }
+        }));
+    }
+    {
+        let (hub, stop) = (hub.clone(), stop.clone());
+        threads.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                hub.tick();
+                thread::sleep(Duration::from_millis(20));
+            }
+        }));
+    }
+    let event = |index: u64| -> StatusEvent {
+        let f = (index as usize / 4) % FOLDERS;
+        let installation = format!("inst-{}", index as usize % PEERS);
+        let repo = format!("repo-{f}");
+        match index % 4 {
+            0 | 1 => StatusEvent::ExchangeFinished {
+                installation,
+                repo,
+                lane: 0,
+                op: "meta.exchange".into(),
+                direction: Direction::Outbound,
+                ok: true,
+                error: None,
+                summary: Some(summary(0, index % 7)),
+                bytes_up: 200,
+                bytes_down: 300,
+                objects_up: 0,
+                objects_down: 0,
+                duration_ms: 35,
+            },
+            2 => StatusEvent::ExchangeFinished {
+                installation,
+                repo,
+                lane: 1,
+                op: "objects.pull".into(),
+                direction: Direction::Outbound,
+                ok: true,
+                error: None,
+                summary: None,
+                bytes_up: 200,
+                bytes_down: 65_536,
+                objects_up: 0,
+                objects_down: 1,
+                duration_ms: 35,
+            },
+            _ => StatusEvent::WorkerHeartbeat {
+                state: format!("state-{f}"),
+                hb: Arc::new(WorkerHeartbeat {
+                    instance: "instance-1".into(),
+                    seq: index,
+                    content: Some(missing_bytes(1 << 30)),
+                    ..WorkerHeartbeat::default()
+                }),
+            },
+        }
+    };
+    let before = hub.rebuilds();
+    let mut samples = Vec::with_capacity(20_000);
+    let mut next = Instant::now();
+    for index in 0..22_000u64 {
+        let event = event(index);
+        while Instant::now() < next {
+            std::hint::spin_loop();
+        }
+        next += PACE;
+        let started = Instant::now();
+        hub.record(event);
+        if index >= 2_000 {
+            samples.push(started.elapsed());
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    let built = hub.rebuilds() - before;
+    samples.sort();
+    (
+        samples[samples.len() / 2],
+        samples[samples.len() * 99 / 100],
+        built,
+    )
+}
+
+/// Fix round 2 (review finding: the p99 test used 1 folder and 2 peers, so
+/// it could not see a rebuild or tick holding the lock that `record()`
+/// takes). At 20 folders × 5 peers, with readers rebuilding as often as they
+/// can and a fast ticker, `record()` p99 stays under 50 µs: it never waits
+/// for a rebuild or a tick. Best of three runs, like the small variant.
+#[test]
+fn record_p99_stays_under_50us_while_a_large_hub_rebuilds() {
+    let mut best = Duration::MAX;
+    for run in 1..=3 {
+        let (p50, p99, built) = measure_record_latency_at_scale();
+        println!("run {run}: record() p50 {p50:?}, p99 {p99:?}, {built} snapshots built");
+        assert!(
+            built >= 50,
+            "the samples overlapped many rebuilds ({built})"
+        );
         best = best.min(p99);
         if best < Duration::from_micros(50) {
             break;

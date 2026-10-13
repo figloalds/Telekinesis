@@ -33,6 +33,14 @@ pub const REMOTE_STARTING_CODE: &str = "REMOTE_WORKER_STARTING";
 /// even if no object completed (a large object streams over many exchanges).
 pub const PROGRESS_MIN_BYTES: u64 = 64 * 1024;
 
+/// Whether `code` says the remote *folder* is not serving
+/// (`REMOTE_WORKER_STARTING`, `FOLDER_SYNC_PAUSED`) rather than that one op
+/// failed: the pair waits for the remote, and any success with that peer for
+/// that repo, whatever the op, proves the remote folder serves again.
+pub fn remote_waiting_code(code: &str) -> bool {
+    code == REMOTE_STARTING_CODE || code == PAUSED_CODE
+}
+
 // ---------------------------------------------------------------------------
 // Errors: dedupe and display policy
 
@@ -151,7 +159,7 @@ pub struct ErrorFlags {
 impl ErrorFlags {
     /// Folds one open error into the flags.
     pub fn with(mut self, class: ErrorClass, code: &str, visible: bool) -> Self {
-        if code == REMOTE_STARTING_CODE || code == PAUSED_CODE {
+        if remote_waiting_code(code) {
             self.remote_waiting = true;
             return self;
         }
@@ -670,6 +678,16 @@ impl Work {
     pub fn is_zero(&self) -> bool {
         *self == Work::default()
     }
+
+    /// Objects or bytes left to download.
+    pub fn has_down_work(&self) -> bool {
+        self.down_bytes > 0 || self.down_objects > 0
+    }
+
+    /// Objects or bytes left to upload.
+    pub fn has_up_work(&self) -> bool {
+        self.up_bytes > 0 || self.up_objects > 0
+    }
 }
 
 /// Whether remaining work went down between two observations (any component
@@ -700,11 +718,36 @@ pub fn missing(content: &ContentCounters) -> (u64, u64) {
 }
 
 /// Whether `source` can likely supply some of what `target` misses: its
-/// counters are unknown, it is complete, or it misses strictly fewer bytes.
+/// counters are unknown (for a download, only a peer that [`may_supply`]
+/// gets this far), it is complete, or it misses strictly fewer bytes.
 /// Two replicas missing the same objects (lost everywhere) therefore owe each
 /// other nothing, so that case never shows as a transfer or a stall.
 fn can_supply(source: Option<&ContentCounters>, target: &ContentCounters) -> bool {
     source.is_none_or(|source| source.complete || missing(source).1 < missing(target).1)
+}
+
+/// Whether our missing content may be attributed to a peer as download work
+/// at all (before [`download_work`] weighs its counters):
+///
+/// * a peer that publishes the repo (its catalog lists it) is one we pull
+///   from on our own initiative, so it may supply;
+/// * a peer without a published entry for the repo (an inbound-only peer has
+///   no catalog) only sends what it chooses to push, and its counters are
+///   unknown. It supplies only while it demonstrably does: within `window`
+///   (the stall threshold) of the last exchange in which it moved objects to
+///   us (`last_supplied_ms`).
+///
+/// Without the second rule, content that such a peer lacks too would read as
+/// a download from it and then as a false stall. That pair can never stall on
+/// download work alone (its evidence expires as the threshold passes); the
+/// dialer, which has our catalog and counters, reports that pair's stalls.
+pub fn may_supply(
+    published: bool,
+    last_supplied_ms: Option<u64>,
+    now_ms: u64,
+    window: Duration,
+) -> bool {
+    published || last_supplied_ms.is_some_and(|at| now_ms.saturating_sub(at) < ms(window))
 }
 
 /// What we may still download from a peer: our missing objects and bytes,
