@@ -145,6 +145,21 @@ fn transient_retry() {
         "first receive: {:?}",
         first.as_ref().map(|v| v.len())
     ));
+    // Evidence that the fault fired: the first receive reported the busy
+    // error, or left the event uncommitted (WP1.6 moves it to `retry`).
+    // Without it (no fault hook, wrong point name) the scenario proves nothing.
+    let committed_first = b.shared_event_inventory().unwrap();
+    let deferred = !ids.iter().all(|id| committed_first.contains(id));
+    let busy_error = first.as_ref().err().is_some_and(|e| {
+        let text = format!("{e:#}");
+        ["BUSY", "LOCKED", "locked"]
+            .iter()
+            .any(|code| text.contains(code))
+    });
+    s.check(
+        deferred || busy_error,
+        "core.commit.busy fired (the first receive reported BUSY or left the event uncommitted)",
+    );
     let quarantined: i64 =
         b.db.query_row(
             "SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",

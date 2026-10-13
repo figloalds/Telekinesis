@@ -16,11 +16,22 @@
   -Merge     keep the other files' results from the existing evidence file and
              replace only the files run now (floors and summary are recomputed).
 
+  -SelfTest  check the process runner only (no build, no qual file): commands
+             with known exit codes and `test result:` lines must get the
+             expected file status. Exit 0 when every case holds, 1 otherwise.
+             tests/harness_selftest.rs runs it under `powershell` (5.1).
+
+  File status: pass only when cargo exited 0 AND the last `test result:` line
+  of its output says `ok.`; timeout when the per-file limit killed it; fail
+  otherwise (including an unknown exit code). The exit code and the result
+  line are recorded per file.
+
   Floor verdicts: pass, fail, missing (no metric), incomplete (the scenario
   timed out, so its metric covers a partial run), not_run.
 
-  Exit code: 0 when every enforced floor holds and every selected scenario
-  passed (or skipped); 1 otherwise. -Baseline always exits 0 unless the build fails.
+  Exit code: 0 when every enforced floor holds and every selected file and
+  scenario passed (or skipped); 1 otherwise. -Baseline always exits 0 unless
+  the build fails.
 
   Encoding: every file is read as UTF-8 and the evidence is written as UTF-8
   without a BOM and with LF line endings (strict JSON readers such as
@@ -33,6 +44,9 @@
 
 .EXAMPLE
   powershell -NoProfile -File scripts\qualify.ps1 -Baseline -BudgetS 60
+
+.EXAMPLE
+  powershell -NoProfile -File scripts\qualify.ps1 -SelfTest
 #>
 param(
     [int]$Wave = 0,
@@ -45,11 +59,79 @@ param(
     [string]$Evidence = "",
     [switch]$NoBuild,
     [switch]$Merge,
+    [switch]$SelfTest,
     [ValidateSet("Idle", "BelowNormal", "Normal")][string]$Priority = "BelowNormal"
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+
+# File status from the exit code and the last `test result:` line. A pass
+# needs both: exit code 0 and `test result: ok.`. An unknown ($null) exit code
+# is never a pass.
+function Get-QualStatus($ExitCode, $Result) {
+    if ($null -eq $ExitCode -or $ExitCode -ne 0) { return "fail" }
+    if ($Result -and $Result -match '^test result: ok\.') { return "pass" }
+    return "fail"
+}
+
+# Run one command line with stdout in $Log and stderr in "$Log.err", at
+# $ProcessPriority, for at most $TimeoutMs (then the process tree is killed).
+# Returns status (pass|fail|timeout), exit_code and result (the last
+# `test result:` line, or $null).
+function Invoke-QualProcess([string]$FilePath, [string]$Arguments, [string]$Log, [int]$TimeoutMs,
+    [string]$ProcessPriority) {
+    $p = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru `
+        -RedirectStandardOutput $Log -RedirectStandardError "$Log.err"
+    # Windows PowerShell 5.1: the Process object Start-Process returns holds no
+    # handle, so ExitCode reads $null after the process exits (every file would
+    # be recorded as failed). Reading Handle while the process runs caches it.
+    $null = $p.Handle
+    try { $p.PriorityClass = $ProcessPriority } catch { }
+    $exitCode = $null
+    $timedOut = -not $p.WaitForExit($TimeoutMs)
+    if ($timedOut) {
+        & taskkill /PID $p.Id /T /F | Out-Null
+        $null = $p.WaitForExit(30000)
+    } else {
+        $p.WaitForExit()
+        $exitCode = $p.ExitCode
+    }
+    $summary = Select-String -Path $Log -Pattern "^test result:" -ErrorAction SilentlyContinue |
+        Select-Object -Last 1
+    $result = if ($summary) { $summary.Line.Trim() } else { $null }
+    if ($timedOut) { $status = "timeout" } else { $status = Get-QualStatus $exitCode $result }
+    return [ordered]@{ status = $status; exit_code = $exitCode; result = $result }
+}
+
+if ($SelfTest) {
+    # Commands with known outcomes through the same runner as the qual files.
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("tkfs-qualify-selftest-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $cases = @(
+        @{ name = "pass"; args = '/c "echo test result: ok. 1 passed; 0 failed& exit 0"'; status = "pass"; exit = "0"; ms = 60000 },
+        @{ name = "failed"; args = '/c "echo test result: FAILED. 0 passed; 1 failed& exit 101"'; status = "fail"; exit = "101"; ms = 60000 },
+        @{ name = "exit3"; args = '/c exit 3'; status = "fail"; exit = "3"; ms = 60000 },
+        @{ name = "exit0-no-result"; args = '/c exit 0'; status = "fail"; exit = "0"; ms = 60000 },
+        @{ name = "exit0-failed-result"; args = '/c "echo test result: FAILED. 0 passed; 1 failed& exit 0"'; status = "fail"; exit = "0"; ms = 60000 },
+        @{ name = "timeout"; args = '/c "ping -n 30 127.0.0.1 >nul"'; status = "timeout"; exit = ""; ms = 1000 }
+    )
+    $bad = 0
+    foreach ($c in $cases) {
+        $r = Invoke-QualProcess "cmd.exe" $c.args (Join-Path $dir "$($c.name).log") $c.ms $Priority
+        $got = "status=$($r.status) exit=$($r.exit_code)"
+        $want = "status=$($c.status) exit=$($c.exit)"
+        if ($got -eq $want) { Write-Host "qualify selftest: $($c.name): $got" }
+        else { $bad += 1; Write-Host "qualify selftest: $($c.name): got $got, want $want (result: $($r.result))" }
+    }
+    Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    if ($bad -gt 0) {
+        Write-Host "qualify selftest: FAILED ($bad of $($cases.Count) cases, PowerShell $($PSVersionTable.PSVersion))"
+        exit 1
+    }
+    Write-Host "qualify selftest: ok ($($cases.Count) cases, PowerShell $($PSVersionTable.PSVersion))"
+    exit 0
+}
 
 # Owner wave of each qualification file (REVAMP_PLAN §14 WP0.5).
 $qualFiles = [ordered]@{
@@ -133,19 +215,8 @@ foreach ($file in $selected) {
     $cargoArgs = "test --release --test $file -- --ignored --test-threads=1 --nocapture $Filter"
     Write-Host "qualify: running $file (budget $BudgetS s per scenario)"
     $t0 = Get-Date
-    $p = Start-Process -FilePath "cargo" -ArgumentList $cargoArgs -NoNewWindow -PassThru `
-        -RedirectStandardOutput $log -RedirectStandardError "$log.err"
-    try { $p.PriorityClass = $Priority } catch { }
-    $done = $p.WaitForExit($FileTimeoutMin * 60 * 1000)
-    if (-not $done) {
-        & taskkill /PID $p.Id /T /F | Out-Null
-        $fileStatus = "timeout"
-    } else {
-        $p.WaitForExit()
-        if ($p.ExitCode -eq 0) { $fileStatus = "pass" } else { $fileStatus = "fail" }
-    }
-    $summary = Select-String -Path $log -Pattern "^test result:" -ErrorAction SilentlyContinue |
-        Select-Object -Last 1
+    $run = Invoke-QualProcess "cargo" $cargoArgs $log ($FileTimeoutMin * 60 * 1000) $Priority
+    $fileStatus = $run.status
     $fileRecords = @()
     if (Test-Path $qualOut) {
         foreach ($line in Get-Content $qualOut -Encoding UTF8) {
@@ -182,12 +253,13 @@ foreach ($file in $selected) {
         file       = $file
         wave       = $qualFiles[$file]
         status     = $fileStatus
+        exit_code  = $run.exit_code
         duration_s = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-        result     = if ($summary) { $summary.Line } else { $null }
+        result     = $run.result
         log        = $log
         scenarios  = $scenarios
     }
-    Write-Host "qualify: $file -> $fileStatus ($([math]::Round(((Get-Date) - $t0).TotalSeconds)) s)"
+    Write-Host "qualify: $file -> $fileStatus (exit $($run.exit_code), $([math]::Round(((Get-Date) - $t0).TotalSeconds)) s)"
 }
 Remove-Item Env:TKFS_QUAL_OUT -ErrorAction SilentlyContinue
 Remove-Item Env:TKFS_QUAL_BUDGET_S -ErrorAction SilentlyContinue

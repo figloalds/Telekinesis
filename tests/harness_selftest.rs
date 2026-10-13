@@ -583,6 +583,20 @@ fn metrics_percentiles_cpu_and_pids() {
     let s = summarize(&samples);
     assert_eq!((s.count, s.min, s.max, s.p90), (100, 1.0, 100.0, 90.0));
     assert!(percentile(&[], 50.0).is_nan());
+    // No samples: NaN statistics (never 0.0, which would pass every `<` floor),
+    // emitted as null, failing every floor.
+    let empty = summarize(&[]);
+    assert_eq!(empty.count, 0);
+    for v in [
+        empty.min, empty.mean, empty.p50, empty.p90, empty.p99, empty.max,
+    ] {
+        assert!(v.is_nan(), "{empty:?}");
+    }
+    for op in ["<", "<=", ">", ">=", "=="] {
+        assert!(!meets(&json!({"op":op,"value":50}), empty.p99), "{op}");
+    }
+    assert_eq!(empty.json()["p99"], Value::Null);
+    assert_eq!(empty.json()["count"], 0);
 
     let pid = std::process::id();
     let before = process_cpu_ms(pid).expect("own cpu time");
@@ -691,6 +705,47 @@ fn normalization_and_shape_rules() {
 }
 
 // ---------------------------------------------------------------- legacy fixtures
+
+/// Fixture copies hold only committed files: SQLite side files left next to a
+/// fixture database (ignored by git) are not copied.
+#[test]
+fn legacy_copies_skip_sqlite_side_files() {
+    let src = tempfile::tempdir().unwrap();
+    fs::create_dir_all(src.path().join("nested")).unwrap();
+    for name in [
+        "metadata.sqlite",
+        "metadata.sqlite-wal",
+        "metadata.sqlite-shm",
+        "nested/folders.sqlite",
+        "nested/folders.sqlite-journal",
+        "nested/keep.txt",
+    ] {
+        fs::write(src.path().join(name), name).unwrap();
+    }
+    let dst = tempfile::tempdir().unwrap();
+    legacy::copy_fixture(src.path(), &dst.path().join("copy")).unwrap();
+    let copy = dst.path().join("copy");
+    for kept in [
+        "metadata.sqlite",
+        "nested/folders.sqlite",
+        "nested/keep.txt",
+    ] {
+        assert!(copy.join(kept).is_file(), "{kept} copied");
+    }
+    assert_eq!(legacy::sqlite_side_files(&copy), Vec::<PathBuf>::new());
+    assert_eq!(legacy::sqlite_side_files(src.path()).len(), 3);
+    // The real copies, before anything opens them.
+    let worker = copy_legacy_worker();
+    assert_eq!(
+        legacy::sqlite_side_files(&worker.state),
+        Vec::<PathBuf>::new()
+    );
+    let datadir = copy_legacy_datadir();
+    assert_eq!(
+        legacy::sqlite_side_files(&datadir.data),
+        Vec::<PathBuf>::new()
+    );
+}
 
 #[test]
 fn legacy_worker_fixture_opens_with_current_build() {
@@ -1462,6 +1517,47 @@ fn qualify_sh_runs_with_lf_and_crlf() {
     }
 }
 
+/// `scripts/qualify.ps1 -SelfTest` under Windows PowerShell 5.1 (the host the
+/// script documents) and, when installed, PowerShell 7: the process runner
+/// must report pass only for exit 0 with an `ok.` result line, fail for any
+/// other exit code or result, and timeout when killed. Regression: under 5.1
+/// `Start-Process -PassThru` left ExitCode `$null`, so every file was "fail".
+#[cfg(windows)]
+#[test]
+fn qualify_ps1_runner_reports_exit_codes() {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/qualify.ps1");
+    let mut hosts = 0;
+    for host in ["powershell", "pwsh"] {
+        let out = match std::process::Command::new(host)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+            ])
+            .arg("-File")
+            .arg(&script)
+            .arg("-SelfTest")
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) if host == "pwsh" && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("{host}: {e}"),
+        };
+        hosts += 1;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("qualify selftest: ok"),
+            "{host}: {:?}
+{stdout}
+{stderr}",
+            out.status
+        );
+    }
+    assert!(hosts >= 1);
+}
+
 #[test]
 fn floors_reference_existing_scenarios() {
     let doc: Value = serde_json::from_slice(&fs::read(floors_path()).unwrap()).unwrap();
@@ -1509,5 +1605,17 @@ fn baseline_evidence_is_strict_json() {
         .collect();
     for (file, _) in QUAL_FILES {
         assert!(files.contains(*file), "baseline evidence lacks {file}");
+    }
+    // File statuses agree with the recorded exit code and result line (the
+    // PowerShell 5.1 runner bug recorded "fail" with no exit code).
+    for f in doc["files"].as_array().unwrap() {
+        let result = f["result"].as_str().unwrap_or("");
+        let expected = match (f["status"].as_str().unwrap(), f["exit_code"].as_i64()) {
+            ("timeout", None) => continue,
+            (_, Some(0)) if result.starts_with("test result: ok.") => "pass",
+            (_, Some(_)) => "fail",
+            (_, None) => panic!("{} has no exit code: {f}", f["file"]),
+        };
+        assert_eq!(f["status"], expected, "{}", f["file"]);
     }
 }
