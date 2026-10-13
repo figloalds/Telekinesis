@@ -161,6 +161,21 @@ pub fn error_code(s: &str) -> String {
         .to_owned()
 }
 
+/// An error's §8 code when it has one, else its first line (for reports).
+pub fn describe_error(e: &anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    match error_code(&text).as_str() {
+        "TEXT" => text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(200)
+            .collect(),
+        code => code.to_owned(),
+    }
+}
+
 pub fn is_uuid(s: &str) -> bool {
     s.len() == 36 && uuid::Uuid::parse_str(s).is_ok()
 }

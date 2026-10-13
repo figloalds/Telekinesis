@@ -401,7 +401,8 @@ impl Scenario {
                 .rev()
                 .find(|(m, _)| m == metric)
                 .map(|(_, v)| *v);
-            let ok = measured.is_some_and(|v| meets(&floor, v));
+            // A metric from a run cut short by its budget is not comparable.
+            let ok = !self.timed_out && measured.is_some_and(|v| meets(&floor, v));
             floor_results.push(json!({"id":floor["id"],"metric":metric,"op":floor["op"],
                 "floor":floor["value"],"measured":measured.map(finite),"ok":ok}));
             if !ok {

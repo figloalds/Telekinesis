@@ -16,21 +16,6 @@ use tkfs::core::{Store, id};
 
 const FILE: &str = "qual_wp2_5_feed";
 
-/// The legacy path's error: its code when it has one, else the first line.
-fn legacy_error(e: &anyhow::Error) -> String {
-    let text = format!("{e:#}");
-    match error_code(&text).as_str() {
-        "TEXT" => text
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(200)
-            .collect(),
-        code => code.to_owned(),
-    }
-}
-
 /// Activation pause for the receiving worker (§4.4 activator; name owned by WP2.3).
 const ACTIVATOR_PAUSE: [(&str, &str); 2] = [
     ("TKFS_FAULT_POINT", "worker.activator.slice"),
@@ -148,9 +133,9 @@ fn feed_150k_events() {
                 0.0,
                 "bool",
                 json!({"legacy_path": legacy.as_ref().map(|_| "ok".to_string())
-                    .unwrap_or_else(legacy_error)}),
+                    .unwrap_or_else(describe_error)}),
             );
-            s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
+            s.unsupported(format!("feed ops: {}", describe_error(&e)));
         }
         Err(e) => {
             s.metric("completed", 0.0, "bool");
@@ -172,7 +157,7 @@ fn idle_exchange_50k() {
     let feed = match feed_until_caught_up(&link, &s) {
         Ok(_) => true,
         Err(e) if is_unsupported(&e) => {
-            s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
+            s.unsupported(format!("feed ops: {}", describe_error(&e)));
             // Baseline record: the legacy idle round (§15 baseline 1.13 s, 251 KB @6.4K).
             for _ in 0..3 {
                 if let Err(e) = link.metadata_round() {
@@ -236,7 +221,7 @@ fn staged_events_not_resent() {
     let first = link.feed_round();
     let Ok((first, _, _)) = first else {
         let e = first.err().unwrap();
-        s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
+        s.unsupported(format!("feed ops: {}", describe_error(&e)));
         return s.finish();
     };
     s.note(format!("first round: {}", first["summary"]));
@@ -280,7 +265,7 @@ fn peer_restore() {
     {
         let link = WorkerLink::new(&wb, &wa, &repo, &b_device, &a_device);
         if let Err(e) = feed_until_caught_up(&link, &s) {
-            s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
+            s.unsupported(format!("feed ops: {}", describe_error(&e)));
             return s.finish();
         }
     }
@@ -372,9 +357,9 @@ fn large_event_8mib() {
                 0.0,
                 "bool",
                 json!({"event_bytes": size, "legacy_path": legacy.as_ref().map(|_| "ok".to_string())
-                    .unwrap_or_else(legacy_error)}),
+                    .unwrap_or_else(describe_error)}),
             );
-            s.unsupported(format!("feed ops: {}", error_code(&format!("{e:#}"))));
+            s.unsupported(format!("feed ops: {}", describe_error(&e)));
         }
         Err(e) => {
             s.metric("completed", 0.0, "bool");

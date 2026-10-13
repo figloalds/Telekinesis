@@ -123,8 +123,11 @@ for fl in floors:
     ran = any(r.get("scenario") == fl["scenario"] and r.get("status") == "started" for r in records)
     metric = [r for r in records if r.get("scenario") == fl["scenario"] and r.get("metric") == fl["metric"]]
     measured = metric[-1]["value"] if metric else None
+    status = next((sc["status"] for f in files for sc in f["scenarios"]
+                   if sc["scenario"] == fl["scenario"]), None)
     if not ran: verdict = "not_run"
     elif not metric: verdict = "missing"
+    elif status in ("timeout", "killed", "incomplete"): verdict = "incomplete"
     elif measured is not None and ops[fl["op"]](measured, fl["value"]): verdict = "pass"
     else: verdict = "fail"
     enforced = (not baseline) and fl["wave"] <= wave and (ran or not flt)
@@ -156,6 +159,7 @@ doc = {
                 "floors_failed": sum(r["verdict"] == "fail" for r in results),
                 "floors_missing": sum(r["verdict"] == "missing" for r in results),
                 "floors_not_run": sum(r["verdict"] == "not_run" for r in results),
+                "floors_incomplete": sum(r["verdict"] == "incomplete" for r in results),
                 "enforced_failures": enforced_failures},
     "files": files, "floors": results, "run_dir": run_dir,
 }

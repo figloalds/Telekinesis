@@ -75,9 +75,10 @@ fn hung_remote_repo_extra_delay() {
             a.try_inspect(&state).is_ok_and(|p| p["running"] == true)
         });
     }
+    // Queue work for X before its worker becomes unreachable.
+    write_file(&px, "x-trigger.txt", b"x-trigger");
     let hung = HungServer::start();
     let redirect = redirect_runtime_json(&state_dir(&px), &hung.endpoint()).ok();
-    write_file(&px, "x-trigger.txt", b"x-trigger");
     s.measure_from_now();
     let mut after = vec![];
     for i in 0..3 {
@@ -201,7 +202,7 @@ fn v2_peer_fails_closed() {
             "status shows PEER_NEEDS_UPGRADE",
         ),
         Err(e) => {
-            s.unsupported(format!("status action: {}", error_code(&format!("{e:#}"))));
+            s.unsupported(format!("status action: {}", describe_error(&e)));
             false
         }
     };
@@ -225,7 +226,7 @@ fn inbound_status() {
     let status = match a.raw_call(json!({"op":"status"})) {
         Ok(status) => status,
         Err(e) => {
-            s.unsupported(format!("status action: {}", error_code(&format!("{e:#}"))));
+            s.unsupported(format!("status action: {}", describe_error(&e)));
             return s.finish();
         }
     };

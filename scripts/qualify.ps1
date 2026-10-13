@@ -16,6 +16,9 @@
   -Merge     keep the other files' results from the existing evidence file and
              replace only the files run now (floors and summary are recomputed).
 
+  Floor verdicts: pass, fail, missing (no metric), incomplete (the scenario
+  timed out, so its metric covers a partial run), not_run.
+
   Exit code: 0 when every enforced floor holds and every selected scenario
   passed (or skipped); 1 otherwise. -Baseline always exits 0 unless the build fails.
 
@@ -213,9 +216,12 @@ foreach ($floor in $floorsDoc.floors) {
     $measured = $null
     if ($metric) { $measured = $metric.value }
     $ran = [bool]($records | Where-Object { $_.scenario -eq $floor.scenario -and $_.status -eq "started" })
+    $scenarioStatus = ($fileResults | ForEach-Object { $_.scenarios } |
+        Where-Object { $_.scenario -eq $floor.scenario } | Select-Object -First 1).status
     $enforced = (-not $Baseline) -and ($floor.wave -le $Wave) -and ($ran -or -not $Filter)
     if (-not $ran) { $verdict = "not_run" }
     elseif ($null -eq $metric) { $verdict = "missing" }
+    elseif ($scenarioStatus -in @("timeout", "killed", "incomplete")) { $verdict = "incomplete" }
     elseif (Test-Floor $floor $measured) { $verdict = "pass" }
     else { $verdict = "fail" }
     $floorResults += [ordered]@{
@@ -273,6 +279,7 @@ $evidenceDoc = [ordered]@{
         floors_failed     = @($floorResults | Where-Object { $_.verdict -eq "fail" }).Count
         floors_missing    = @($floorResults | Where-Object { $_.verdict -eq "missing" }).Count
         floors_not_run    = @($floorResults | Where-Object { $_.verdict -eq "not_run" }).Count
+        floors_incomplete = @($floorResults | Where-Object { $_.verdict -eq "incomplete" }).Count
         enforced_failures = @($enforcedFailures | ForEach-Object { $_.id })
     }
     files        = $fileResults

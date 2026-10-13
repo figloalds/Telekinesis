@@ -521,6 +521,15 @@ pub fn content_status(folder: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// Whether the folder's worker holds every object referenced by its committed
+/// shared events, and those events reference at least `objects` objects.
+/// (`content.complete` alone is vacuously true before any event is committed,
+/// and `has_file`/`has_hash` only prove the metadata arrived.)
+pub fn content_complete(folder: &Value, objects: u64) -> bool {
+    let c = content_status(folder);
+    c["complete"] == true && c["shared_objects"].as_u64().is_some_and(|n| n >= objects)
+}
+
 /// Whether mounts can work on this machine (WinFsp on Windows, `/dev/fuse` on Linux).
 pub fn mount_supported() -> bool {
     #[cfg(windows)]

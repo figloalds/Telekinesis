@@ -40,8 +40,8 @@ fn cas_files(folder: &Value) -> usize {
         .count()
 }
 
-fn complete(folder: &Value) -> bool {
-    content_status(folder)["complete"] == true
+fn complete(folder: &Value, objects: u64) -> bool {
+    content_complete(folder, objects)
 }
 
 /// Transfer one object of `size` bytes A → B on loopback. Returns (seconds, done).
@@ -55,7 +55,9 @@ fn transfer_one(s: &mut Scenario, size: u64) -> (f64, bool) {
     b.pair(&a, &a.code());
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
-    let done = wait_until(s.remaining(), || has_hash(&pb, "big.bin", &hash));
+    let done = wait_until(s.remaining(), || {
+        has_hash(&pb, "big.bin", &hash) && complete(&pb, 1)
+    });
     (s.started.elapsed().as_secs_f64(), done)
 }
 
@@ -101,7 +103,9 @@ fn one_gib_through_proxy() {
     b.pair_endpoint(&proxy.endpoint(), &a.code(), Some(3));
     s.measure_from_now();
     let pb = b.receive_from(&proxy.endpoint(), &pa);
-    let done = wait_until(s.remaining(), || has_hash(&pb, "gib.bin", &hash));
+    let done = wait_until(s.remaining(), || {
+        has_hash(&pb, "gib.bin", &hash) && complete(&pb, 1)
+    });
     let secs = s.started.elapsed().as_secs_f64();
     let moved = if done {
         size as f64
@@ -131,7 +135,7 @@ fn tiny_files(s: &mut Scenario, count: usize) {
     b.pair(&a, &a.code());
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
-    let done = wait_until(s.remaining(), || complete(&pb));
+    let done = wait_until(s.remaining(), || complete(&pb, count as u64));
     let secs = s.started.elapsed().as_secs_f64();
     let available = content_status(&pb)["shared_available"]
         .as_f64()
@@ -189,14 +193,21 @@ fn objects_before_activation() {
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let mut ahead = 0usize;
+    let mut previous = 0usize;
     let done = wait_until(s.remaining(), || {
-        let committed = content_status(&pb)["shared_available"]
-            .as_u64()
-            .unwrap_or(0) as usize;
-        // The empty file's object is always present; ignore it.
+        // Count files first, so every counted file was installed before the
+        // status snapshot (the empty file's object is always present).
         let present = cas_files(&pb).saturating_sub(1);
-        ahead = ahead.max(present.saturating_sub(committed));
-        complete(&pb) && content_status(&pb)["shared_objects"].as_u64() == Some(count as u64 + 1)
+        let status = content_status(&pb);
+        // A busy reply carries no counts: skip the sample.
+        let Some(committed) = status["shared_available"].as_u64() else {
+            return false;
+        };
+        let now = present.saturating_sub(committed as usize);
+        // Only a surplus seen in two consecutive samples counts (no install race).
+        ahead = ahead.max(now.min(previous));
+        previous = now;
+        status["complete"] == true && status["shared_objects"].as_u64() == Some(count as u64 + 1)
     });
     s.metric("objects_ahead", ahead as f64, "objects");
     s.metric(
@@ -229,7 +240,10 @@ fn relay_with_objects() {
     write_file(&pa, "from-a.bin", &from_a);
     write_file(&pc, "from-c.bin", &from_c);
     let done = wait_until(s.remaining(), || {
-        has_file(&pc, "from-a.bin", &from_a) && has_file(&pa, "from-c.bin", &from_c)
+        has_file(&pc, "from-a.bin", &from_a)
+            && has_file(&pa, "from-c.bin", &from_c)
+            && complete(&pc, 2)
+            && complete(&pa, 2)
     });
     s.metric("relay_ms", s.started.elapsed().as_secs_f64() * 1000.0, "ms");
     if !done {
@@ -261,7 +275,7 @@ fn mutual_pairing_duplicate_bytes() {
     a.pair_endpoint(&to_b.endpoint(), &b.code(), Some(3));
     s.measure_from_now();
     let pb = b.receive_from(&to_a.endpoint(), &pa);
-    let done = wait_until(s.remaining(), || complete(&pb));
+    let done = wait_until(s.remaining(), || complete(&pb, files as u64));
     let wire = to_a.bytes_up() + to_a.bytes_down() + to_b.bytes_up() + to_b.bytes_down();
     let object_bytes = (files * size) as f64;
     s.metric_with(
@@ -444,7 +458,9 @@ fn legacy_fixture_upgrade_then_sync() {
     let received = fresh.receive(&legacy, &source);
     let name = folder["file"].as_str().unwrap();
     let content = folder["content"].as_str().unwrap();
-    let synced = wait_until(s.remaining(), || has_hash(&received, name, content));
+    let synced = wait_until(s.remaining(), || {
+        has_hash(&received, name, content) && complete(&received, 1)
+    });
     s.metric("sync_ms", s.started.elapsed().as_secs_f64() * 1000.0, "ms");
     s.check(synced, "legacy content reaches the new node");
     write_file(&received, "back.txt", b"back to the upgraded node");

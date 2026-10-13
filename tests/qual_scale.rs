@@ -163,7 +163,7 @@ fn tiny_files_10k() {
     b.pair(&a, &a.code());
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
-    let done = wait_until(s.remaining(), || content_status(&pb)["complete"] == true);
+    let done = wait_until(s.remaining(), || content_complete(&pb, count as u64));
     let available = content_status(&pb)["shared_available"]
         .as_f64()
         .unwrap_or(0.0);
@@ -194,7 +194,9 @@ fn one_gib_object() {
     b.pair(&a, &a.code());
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
-    let done = wait_until(s.remaining(), || has_hash(&pb, "gib.bin", &hash));
+    let done = wait_until(s.remaining(), || {
+        has_hash(&pb, "gib.bin", &hash) && content_complete(&pb, 1)
+    });
     let secs = s.started.elapsed().as_secs_f64();
     let moved = if done {
         size as f64
@@ -307,8 +309,9 @@ fn management_api_p99_under_churn() {
 #[ignore = "WP4.2"]
 fn idle_worker_cpu() {
     let mut s = Scenario::new(FILE, "idle_worker_cpu");
-    let a = Node::new();
-    let b = Node::new();
+    // The production default anti-entropy interval (the harness default is 50 ms).
+    let a = Node::start(NodeConfig::default().interval(500));
+    let b = Node::start(NodeConfig::default().interval(500));
     let (pa, pb) = synced_replicas(&a, &b, &a.endpoint(), "Idle", |st| {
         linear_history(st, scaled(5000))?;
         small_objects_in(st, "objects", scaled(10_000), 256, 74).map(|_| ())
