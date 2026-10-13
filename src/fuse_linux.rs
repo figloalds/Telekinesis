@@ -12,8 +12,15 @@
 //! Managed mounts are named `tkfs-<instance>` (subtype `tkfs`) so a stale one
 //! can later be proven ours by the previous `worker.json` ([`recover_managed`],
 //! invariant 27). Mount failures never write `Engine.health`: a dispatch
-//! thread death or a failed checkout remount reports `Lost` to the controller,
-//! and callback failures go to the mount-scoped error counter and log.
+//! thread death (an error, or the connection ending because the mount was
+//! unmounted outside the worker) or a failed checkout remount reports `Lost`
+//! to the controller, and callback failures go to the mount-scoped error
+//! counter and log.
+//!
+//! `MOUNT` is the transition lock: [`bind`], [`attach`], [`detach`] and
+//! [`checkout`] hold it across their mount I/O (so they wait for each other);
+//! a callback, [`attached`], [`serves`] and [`inflight`] never take it, so
+//! readers never wait for a transition.
 use crate::{
     core::*,
     model::ipc::timing::DETACH_DRAIN,
@@ -33,7 +40,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::JoinHandle,
 };
@@ -46,12 +53,34 @@ static MOUNT: Mutex<Option<Mount>> = Mutex::new(None);
 const MAX_IO: usize = 1024 * 1024;
 struct Mount {
     path: PathBuf,
+    /// `path` as `/proc/self/mountinfo` names it (canonicalized at attach).
+    canonical: PathBuf,
     source: String,
     /// The `/dev/fuse` dispatch thread.
     worker: Option<JoinHandle<()>>,
     /// Writing to (or dropping) this end stops the dispatch thread.
     wake: Option<UnixStream>,
+    /// Set before a detach or checkout ends the connection: the dispatch
+    /// thread's exit is then deliberate, not `Lost`.
+    stopping: Arc<AtomicBool>,
 }
+impl Mount {
+    /// Whether the dispatch thread still serves the connection.
+    fn serving(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| !w.is_finished())
+    }
+    /// Whether our mount is still at its path (`false` once it was unmounted
+    /// outside the worker). An unreadable mount table counts as present.
+    fn present(&self) -> bool {
+        mounts_at(&self.canonical).map_or(true, |mounts| {
+            mounts
+                .iter()
+                .any(|(fstype, source)| fstype == "fuse.tkfs" && *source == self.source)
+        })
+    }
+}
+/// A launched connection: the dispatch thread, its wake end, its stop flag.
+type Launched = (JoinHandle<()>, UnixStream, Arc<AtomicBool>);
 
 fn helper_mount(path: &Path, source: &str) -> Result<File> {
     let (parent, child) = UnixStream::pair()?;
@@ -126,7 +155,10 @@ fn unmount(path: &Path, lazy: bool) -> Result<()> {
     );
     Ok(())
 }
-fn launch(engine: Shared, path: &Path, source: &str) -> Result<(JoinHandle<()>, UnixStream)> {
+/// Mounts `path` and starts its dispatch thread. The engine is marked attached
+/// (`adapter::attached`) before the thread starts, so a dispatch death always
+/// has the last word on `Engine.mounted`.
+fn launch(engine: Shared, path: &Path, source: &str) -> Result<Launched> {
     let device = helper_mount(path, source)?;
     let (wake, woken) = match UnixStream::pair() {
         Ok(pair) => pair,
@@ -136,24 +168,44 @@ fn launch(engine: Shared, path: &Path, source: &str) -> Result<(JoinHandle<()>, 
             return Err(error.into());
         }
     };
-    let spawned = std::thread::Builder::new()
-        .name("fuse-dispatch".into())
-        .spawn(move || {
-            if let Err(error) = serve(device, engine.clone(), woken) {
-                {
-                    let mut e = lock_engine(&engine);
-                    e.mounted = false;
-                    e.publish_observation();
+    let stopping = Arc::new(AtomicBool::new(false));
+    adapter::attached(&engine);
+    let spawned = {
+        let engine = engine.clone();
+        let stopping = stopping.clone();
+        let path = path.to_owned();
+        std::thread::Builder::new()
+            .name("fuse-dispatch".into())
+            .spawn(move || {
+                let outcome = serve(device, engine.clone(), woken);
+                if stopping.load(Ordering::SeqCst) {
+                    return; // A detach or checkout ended the connection.
                 }
-                // Mount-scoped: `Lost`, never `Engine.health`.
-                adapter::report_lost(&anyhow::anyhow!("FUSE_DISPATCH_FAILED: {error:#}"));
-            }
-        });
+                let error = match outcome {
+                    Ok(Exit::Woken) => return,
+                    Ok(Exit::DeviceGone) => anyhow::anyhow!(
+                        "MOUNT_NOT_RUNNING: the FUSE mount at {} was unmounted outside the worker",
+                        path.display()
+                    ),
+                    Err(error) => anyhow::anyhow!("FUSE_DISPATCH_FAILED: {error:#}"),
+                };
+                // Mount-scoped: `Lost`, never `Engine.health`. Dirty sessions
+                // go to `pending_saves` now (invariant 8): the dead
+                // connection's handles keep them referenced until a detach.
+                adapter::lost(&engine);
+                adapter::report_lost(&error);
+            })
+    };
     match spawned {
-        Ok(worker) => Ok((worker, wake)),
+        Ok(worker) => Ok((worker, wake, stopping)),
         Err(error) => {
             // The device closed with the closure: the mount is stale.
             let _ = unmount(path, false);
+            {
+                let mut e = lock_engine(&engine);
+                e.mounted = false;
+                e.publish_observation();
+            }
             Err(error.into())
         }
     }
@@ -203,9 +255,21 @@ pub fn serves(engine: &Shared) -> bool {
         .as_ref()
         .is_some_and(|bound| Arc::ptr_eq(bound, engine))
 }
-/// The path of the attached instance, if any (also while it is lost).
+/// The path of the attached instance, if any (also while it is lost). Never
+/// waits for a transition in progress.
 pub fn attached() -> Option<PathBuf> {
-    lock(&MOUNT).as_ref().map(|m| m.path.clone())
+    adapter::attached_path()
+}
+/// Whether the attached instance is no longer in the mount table: unmounted
+/// outside the worker, possibly lazily with files still open (the connection
+/// then lives on and the dispatch thread has not noticed). `false` while a
+/// transition runs. Never waits.
+pub fn vanished() -> bool {
+    MOUNT
+        .try_lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|mount| !mount.present()))
+        .unwrap_or(false)
 }
 /// Callbacks currently running.
 pub fn inflight() -> usize {
@@ -244,7 +308,8 @@ fn attach_source(path: &Path, source: &str) -> Result<()> {
     let engine = bound()?;
     vacant(path)?;
     std::fs::create_dir(path)?;
-    let (worker, wake) = match launch(engine.clone(), path, source) {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let (worker, wake, stopping) = match launch(engine, path, source) {
         Ok(launched) => launched,
         Err(error) => {
             let _ = std::fs::remove_dir(path);
@@ -253,15 +318,18 @@ fn attach_source(path: &Path, source: &str) -> Result<()> {
     };
     *guard = Some(Mount {
         path: path.into(),
+        canonical,
         source: source.into(),
         worker: Some(worker),
         wake: Some(wake),
+        stopping,
     });
-    adapter::attached(&engine);
+    adapter::set_attached_path(Some(path.to_owned()));
     Ok(())
 }
 /// Stops the dispatch thread (after the unmount) and waits for it.
 fn stop_dispatch(mount: &mut Mount) {
+    mount.stopping.store(true, Ordering::SeqCst);
     if let Some(mut wake) = mount.wake.take() {
         let _ = wake.write_all(&[1]);
     }
@@ -276,15 +344,18 @@ fn stop_dispatch(mount: &mut Mount) {
 /// unfenced) while handles are open, a session is dirty, callbacks do not
 /// drain, or the kernel refuses the unmount. A force detach unmounts lazily
 /// when the kernel still has files open; stopping the dispatch thread then
-/// aborts the connection, so those files fail instead of hanging. A mount
-/// whose dispatch thread died is always detached like a force detach.
+/// aborts the connection, so those files fail instead of hanging. A lost
+/// mount (its dispatch thread ended, or it was unmounted outside the worker)
+/// is always detached like a force detach, and one that is no longer in the
+/// mount table is not unmounted again.
 pub fn detach(force: bool) -> Result<()> {
     let mut guard = lock(&MOUNT);
     let Some(mount) = guard.as_mut() else {
         return Ok(());
     };
     let engine = bound()?;
-    let force = force || mount.worker.as_ref().is_none_or(JoinHandle::is_finished);
+    let present = mount.present();
+    let force = force || !present || !mount.serving();
     adapter::fence(&engine, force)?;
     if !adapter::drain(DETACH_DRAIN) && !force {
         adapter::unfence(&engine);
@@ -296,20 +367,32 @@ pub fn detach(force: bool) -> Result<()> {
     if force {
         adapter::persist_dirty(&engine);
     }
-    if let Err(refused) = unmount(&mount.path, false) {
-        if !force {
-            adapter::unfence(&engine);
-            return Err(refused);
-        }
-        if let Err(error) = unmount(&mount.path, true) {
-            adapter::unfence(&engine);
-            return Err(error.context(format!("{refused:#}")));
+    if present {
+        // The connection ends with the unmount: deliberately, not `Lost`.
+        mount.stopping.store(true, Ordering::SeqCst);
+        if let Err(refused) = unmount(&mount.path, false) {
+            // A dispatch thread that died meanwhile makes the mount lost.
+            if !force && mount.serving() {
+                mount.stopping.store(false, Ordering::SeqCst);
+                adapter::unfence(&engine);
+                return Err(refused);
+            }
+            // The lazy unmount fails only if the mount is gone meanwhile.
+            if let Err(error) = unmount(&mount.path, true)
+                && mount.present()
+            {
+                mount.stopping.store(false, Ordering::SeqCst);
+                adapter::unfence(&engine);
+                return Err(error.context(format!("{refused:#}")));
+            }
         }
     }
     stop_dispatch(mount);
-    // Our own mount point (created by attach); never removes content.
+    // Our own mount point (created by attach); never removes content, and
+    // never a mount point (whatever was mounted there since is not ours).
     let _ = std::fs::remove_dir(&mount.path);
     *guard = None;
+    adapter::set_attached_path(None);
     adapter::release(&engine);
     Ok(())
 }
@@ -417,9 +500,16 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         e.switching = true;
     }
     adapter::drain(DETACH_DRAIN);
-    if let Err(error) = unmount(&mount.path, false) {
-        adapter::unfence(engine);
-        return Err(error);
+    // Unmounted outside the worker: the checkout still runs, then the mount is
+    // reported lost instead of mounting again at a path that is no longer ours.
+    let present = mount.present();
+    if present {
+        mount.stopping.store(true, Ordering::SeqCst);
+        if let Err(error) = unmount(&mount.path, false) {
+            mount.stopping.store(false, Ordering::SeqCst);
+            adapter::unfence(engine);
+            return Err(error);
+        }
     }
     stop_dispatch(mount);
     let result = {
@@ -427,22 +517,30 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         e.mounted = false;
         e.control(request, payload)
     };
-    let relaunch = crate::util::fault::fail("fs.remount")
-        .and_then(|()| launch(engine.clone(), &mount.path, &mount.source));
+    let relaunch = if present {
+        crate::util::fault::fail("fs.remount")
+            .and_then(|()| launch(engine.clone(), &mount.path, &mount.source))
+            .map_err(|error| anyhow::anyhow!("REMOUNT_FAILED: {error:#}"))
+    } else {
+        Err(anyhow::anyhow!(
+            "MOUNT_NOT_RUNNING: the FUSE mount at {} was unmounted outside the worker",
+            mount.path.display()
+        ))
+    };
     match relaunch {
-        Ok((worker, wake)) => {
+        Ok((worker, wake, stopping)) => {
             mount.worker = Some(worker);
             mount.wake = Some(wake);
-            adapter::attached(engine);
+            mount.stopping = stopping;
             result
         }
         Err(error) => {
             // The mount is gone: Lost (never `Engine.health`).
             let path = mount.path.clone();
             *guard = None;
+            adapter::set_attached_path(None);
             let _ = std::fs::remove_dir(&path);
             adapter::release(engine);
-            let error = anyhow::anyhow!("REMOUNT_FAILED: {error:#}");
             adapter::report_lost(&error);
             Err(error)
         }
@@ -1001,7 +1099,15 @@ impl Filesystem {
 fn counted(op: u32, error: &anyhow::Error) -> bool {
     [18, 25, 29].contains(&op) || errno(error) == libc::EIO
 }
-fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<()> {
+/// Why the dispatch loop stopped.
+enum Exit {
+    /// The wake end was written or closed (a detach or checkout).
+    Woken,
+    /// The connection ended (`ENODEV` or end of file): the mount was
+    /// unmounted, by a detach or checkout or outside the worker.
+    DeviceGone,
+}
+fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
     // Non-blocking reads after `poll`: a withdrawn request never blocks the
     // loop, so a stop request is always seen.
     let flags = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFL) };
@@ -1038,14 +1144,14 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<()> {
         }
         if fds[1].revents != 0 {
             // Detach: the connection aborts once the device closes.
-            return Ok(());
+            return Ok(Exit::Woken);
         }
         // Qualification hook: the dispatch thread dies (`Lost`).
         crate::util::fault::fail("fs.dispatch")?;
         let count = match device.read(&mut bytes) {
-            Ok(0) => break,
+            Ok(0) => return Ok(Exit::DeviceGone),
             Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => break,
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => return Ok(Exit::DeviceGone),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1124,7 +1230,6 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<()> {
         write_reply(&writer, unique, result)?;
         drop(callback);
     }
-    Ok(())
 }
 fn write_reply(
     writer: &std::sync::Mutex<File>,

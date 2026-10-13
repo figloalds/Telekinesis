@@ -553,6 +553,39 @@ fn status_never_waits_for_a_transition() {
 }
 
 #[test]
+fn a_transition_slower_than_the_reply_wait_answers_worker_busy() {
+    let _serial = serial();
+    if !mount_supported() {
+        return;
+    }
+    let f = Fixture::new(None);
+    if !f.attach() {
+        return;
+    }
+    f.controller
+        .set_reply_wait(Some(Duration::from_millis(300)));
+    // The detach cannot fence while the engine is held.
+    let held = f.engine.lock().unwrap();
+    let started = Instant::now();
+    let error = f.controller.detach(false).unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(error.code, "WORKER_BUSY", "{error}");
+    assert_eq!(error.class, ErrorClass::Contention);
+    assert_eq!(f.controller.status().state, MountState::Detaching);
+    drop(held);
+    // The transition goes on and finishes on its own.
+    assert!(wait_until(Duration::from_secs(15), || f
+        .controller
+        .status()
+        .state
+        == MountState::Detached));
+    f.controller.set_reply_wait(None);
+    f.assert_unfenced();
+    assert!(f.attach());
+    f.detach();
+}
+
+#[test]
 fn legacy_start_and_stop_lift_the_fence_and_restart_in_process() {
     let _serial = serial();
     if !mount_supported() {
@@ -629,6 +662,182 @@ fn dispatch_death_is_lost_not_engine_health() {
     assert!(f.attach());
     fs::write(f.mount.join("again.txt"), b"again").unwrap();
     f.detach();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dispatch_death_retains_dirty_sessions() {
+    let _serial = serial();
+    if !mount_supported() {
+        return;
+    }
+    let f = Fixture::new(None);
+    if !f.attach() {
+        return;
+    }
+    let bytes = b"unsaved when the dispatch thread died";
+    let mut file = fs::File::create(f.mount.join("dirty.txt")).unwrap();
+    file.write_all(bytes).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        f.engine.lock().unwrap().sessions.values().any(|s| s.dirty)
+    }));
+    assert_eq!(f.pending_saves(), 0);
+    let _disarm = Disarm;
+    arm("fs.dispatch");
+    let _ = fs::metadata(f.mount.join("probe"));
+    assert!(wait_until(Duration::from_secs(10), || matches!(
+        f.controller.status().state,
+        MountState::Lost { .. }
+    )));
+    fault::configure(None);
+    // In `pending_saves` before any detach (invariant 8).
+    assert!(f.pending_saves() >= 1, "the dirty session is retained");
+    assert!(!f.engine.lock().unwrap().mounted);
+    drop(file);
+    f.detach();
+    assert!(f.attach());
+    assert_eq!(fs::read(f.mount.join("dirty.txt")).unwrap(), bytes);
+    f.engine.lock().unwrap().retry_pending().unwrap();
+    assert!(wait_until(Duration::from_secs(10), || f.pending_saves() == 0));
+    f.detach();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_lost_mount_during_a_refused_detach_stays_lost() {
+    let _serial = serial();
+    if !mount_supported() {
+        return;
+    }
+    let f = Fixture::new(None);
+    if !f.attach() {
+        return;
+    }
+    // An open handle makes the graceful detach wait (up to 1 s) for quiet,
+    // then refuse.
+    let mut file = fs::File::create(f.mount.join("open.txt")).unwrap();
+    file.write_all(b"open").unwrap();
+    let controller = f.controller.clone();
+    let detaching = std::thread::spawn(move || controller.detach(false));
+    assert!(wait_until(Duration::from_secs(5), || {
+        f.controller.status().state == MountState::Detaching
+    }));
+    let _disarm = Disarm;
+    arm("fs.dispatch");
+    let _ = fs::metadata(f.mount.join("probe"));
+    let error = detaching.join().unwrap().unwrap_err();
+    fault::configure(None);
+    assert_eq!(error.code, "BUSY_VIEW", "{error}");
+    // Lost, whichever came first: never the `Attached` the detach started from.
+    assert!(wait_until(Duration::from_secs(5), || matches!(
+        f.controller.status().state,
+        MountState::Lost { .. }
+    )));
+    std::thread::sleep(Duration::from_millis(200));
+    match f.controller.status().state {
+        MountState::Lost { error } => assert_eq!(error.code, "FUSE_DISPATCH_FAILED"),
+        other => panic!("expected Lost, got {other:?}"),
+    }
+    drop(file);
+    f.detach();
+    assert!(linux::mounts_at(&f.mount).is_empty());
+    assert!(f.attach());
+    assert_eq!(fs::read(f.mount.join("open.txt")).unwrap(), b"open");
+    f.detach();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_unmount_is_lost_and_recovers() {
+    let _serial = serial();
+    if !mount_supported() {
+        return;
+    }
+    let f = Fixture::new(None);
+    if !f.attach() {
+        return;
+    }
+    fs::write(f.mount.join("x.txt"), b"before the external unmount").unwrap();
+    let lost = |f: &Fixture| {
+        assert!(
+            wait_until(Duration::from_secs(5), || matches!(
+                f.controller.status().state,
+                MountState::Lost { .. }
+            )),
+            "{:?}",
+            f.controller.status()
+        );
+        match f.controller.status().state {
+            MountState::Lost { error } => assert_eq!(error.code, "MOUNT_NOT_RUNNING", "{error}"),
+            other => panic!("expected Lost, got {other:?}"),
+        }
+        assert!(wait_until(Duration::from_secs(5), || !f
+            .engine
+            .lock()
+            .unwrap()
+            .mounted));
+        assert_eq!(f.health(), None, "a lost mount never writes engine health");
+    };
+    // `fusermount3 -u` outside the worker: the connection ends (ENODEV).
+    linux::external_unmount(&f.mount);
+    lost(&f);
+    // A detach of the vanished mount does not unmount again; it cleans up.
+    f.detach();
+    assert!(!f.mount.exists(), "our empty mount point is removed");
+    assert!(f.attach());
+    assert_eq!(
+        fs::read(f.mount.join("x.txt")).unwrap(),
+        b"before the external unmount"
+    );
+    // Again, then attach the same path directly: a real mount, not the
+    // stale `Attached`.
+    linux::external_unmount(&f.mount);
+    lost(&f);
+    assert!(f.attach());
+    assert_eq!(linux::mounts_at(&f.mount).len(), 1);
+    fs::write(f.mount.join("y.txt"), b"in the store").unwrap();
+    assert!(f.engine.lock().unwrap().store.lookup("y.txt").is_ok());
+    f.detach();
+    assert!(linux::mounts_at(&f.mount).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn lazy_external_unmount_with_an_open_file_is_not_reported_attached() {
+    let _serial = serial();
+    if !mount_supported() {
+        return;
+    }
+    let f = Fixture::new(None);
+    if !f.attach() {
+        return;
+    }
+    let bytes = b"written before a lazy external unmount";
+    let mut held = fs::File::create(f.mount.join("held.txt")).unwrap();
+    held.write_all(bytes).unwrap();
+    // `fusermount3 -u -z` outside the worker: the mount leaves the table, but
+    // the open file keeps the connection (and the dispatch thread) alive.
+    assert!(
+        std::process::Command::new("fusermount3")
+            .args(["-u", "-z", "--"])
+            .arg(&f.mount)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(linux::mounts_at(&f.mount).is_empty());
+    assert!(f.controller.status().state.is_attached());
+    // Attaching the same path cleans the vanished mount up and mounts afresh,
+    // instead of answering the old `Attached`. The bytes survive (the kernel
+    // flushes the file at the lazy unmount; a dirty session would be retained).
+    assert!(f.attach());
+    assert_eq!(linux::mounts_at(&f.mount).len(), 1);
+    assert_eq!(fs::read(f.mount.join("held.txt")).unwrap(), bytes);
+    drop(held);
+    fs::write(f.mount.join("after.txt"), b"in the store").unwrap();
+    assert!(f.engine.lock().unwrap().store.lookup("after.txt").is_ok());
+    f.detach();
+    assert!(linux::mounts_at(&f.mount).is_empty());
 }
 
 #[cfg(target_os = "linux")]
@@ -721,6 +930,23 @@ mod linux {
             .arg(path)
             .status();
         let _ = fs::remove_dir(path);
+    }
+
+    /// `fusermount3 -u` by someone else than the worker (the kernel may still
+    /// be releasing a just-closed file for a moment).
+    pub fn external_unmount(path: &Path) {
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                Command::new("fusermount3")
+                    .args(["-u", "--"])
+                    .arg(path)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            }),
+            "fusermount3 -u {}",
+            path.display()
+        );
+        assert!(mounts_at(path).is_empty());
     }
 
     /// A stale `tkfs` mount is left alone unless the previous `worker.json`

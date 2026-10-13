@@ -7,6 +7,11 @@
 //! `worker::mount_ctl`). Mount failures never write `Engine.health`: callback
 //! failures go to the mount-scoped error counter and a rate-limited log, and a
 //! failed checkout remount reports `Lost` to the controller.
+//!
+//! `MOUNT` is the transition lock: [`bind`], [`attach`], [`detach`] and
+//! [`checkout`] hold it across their mount I/O (so they wait for each other);
+//! a callback, [`attached`], [`serves`] and [`inflight`] never take it, and
+//! [`notify`] only tries it, so readers never wait for a transition.
 use crate::{
     core::*,
     model::ipc::timing::DETACH_DRAIN,
@@ -134,9 +139,16 @@ pub fn serves(engine: &Shared) -> bool {
         .as_ref()
         .is_some_and(|bound| Arc::ptr_eq(bound, engine))
 }
-/// The path of the attached native instance, if any.
+/// The path of the attached native instance, if any. Never waits for a
+/// transition in progress.
 pub fn attached() -> Option<PathBuf> {
-    lock(&MOUNT).as_ref().map(|m| m.path.clone())
+    adapter::attached_path()
+}
+/// Whether the attached instance was unmounted outside this process. Always
+/// `false` for WinFsp: the mount point lives as long as the native instance,
+/// which only `tk_mount_stop` ends (FUSE has a real probe).
+pub fn vanished() -> bool {
+    false
 }
 /// Callbacks currently running.
 pub fn inflight() -> usize {
@@ -166,6 +178,7 @@ pub fn attach(path: &Path) -> Result<()> {
         native,
         path: path.to_owned(),
     });
+    adapter::set_attached_path(Some(path.to_owned()));
     adapter::attached(&engine);
     Ok(())
 }
@@ -196,6 +209,7 @@ pub fn detach(force: bool) -> Result<()> {
         unsafe { tk_mount_stop(mount.native) };
     }
     *guard = None;
+    adapter::set_attached_path(None);
     adapter::release(&engine);
     Ok(())
 }
@@ -253,6 +267,7 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         Err(error) => {
             // The mount is gone: Lost (never `Engine.health`).
             *mount_guard = None;
+            adapter::set_attached_path(None);
             adapter::release(engine);
             let error = anyhow::anyhow!("REMOUNT_FAILED: {error:#}");
             adapter::report_lost(&error);
