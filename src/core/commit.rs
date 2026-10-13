@@ -19,19 +19,44 @@
 //! authored E plays no part in this argument; the old `device == self`
 //! restriction only kept the remote case behind the slow path. The oracle
 //! (`verify_derived_state`) is the executable check (`tests/activation_inbox.rs`).
+//!
+//! What the argument does not cover: the `NAMESPACE_HISTORY_LIMIT` count
+//! (`MAX_NAMESPACE_CUTS` competing cuts per dependency cone). A successor
+//! never runs `persist_projection`, so nothing is counted. No record changes,
+//! but the count over *old* events can grow: a location change to a parent
+//! or a `(parent, name)` slot the entity never used joins cones
+//! (`NamespaceCones` unions historical parents and slot sharers), and a
+//! delete makes the entity's `alive = true` versions eligible for the
+//! TRUE-presence extrema. Full replay would refuse such an event before its
+//! ACK once the joined cone exceeds the limit; through a successor it
+//! commits, and the next slow commit or rebuild of that cone is refused
+//! instead. Local renames, moves and deletes have had this gap since
+//! before WP1.6; remote ones share it now. An exact guard has to count the
+//! touched cones, which is the derivation the successor avoids;
+//! CCR-WP1.6-5 asks WP1.7 (append-mode counting, §5.2 (d)) for it.
 use super::derive::persist_projection;
 use super::*;
-use std::{cell::Cell, sync::OnceLock};
+use std::{
+    cell::{Cell, RefCell},
+    sync::OnceLock,
+};
 
 /// Commit cache: fast/slow commit counters (WP2.4 may add its event cache).
 #[derive(Default)]
 pub(crate) struct Cache {
     fast: Cell<u64>,
     slow: Cell<u64>,
+    /// Commits made inside an enclosing transaction (event id → fast), not
+    /// counted until that transaction is known to have committed them.
+    pending: RefCell<BTreeMap<String, bool>>,
 }
 
 /// How many commits on this handle took an incremental successor (`fast`)
-/// or the full-replay slow path (`slow`) since it was opened.
+/// or the full-replay slow path (`slow`) since it was opened. Only durable
+/// commits count: a commit made inside an enclosing transaction (an
+/// activation slice, a control request) counts once the connection is back
+/// in autocommit with the event in the journal, so a commit whose enclosing
+/// transaction rolled back is never counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitPathCounters {
     pub fast: u64,
@@ -323,12 +348,7 @@ impl Store {
         // The forced seal after a slow-path commit is kept (REVAMP_PLAN P4).
         snapshot::maybe_persist(&tx, &event.branch.id, !incremental)?;
         tx.commit()?;
-        let counter = if incremental {
-            &self.caches.commit.fast
-        } else {
-            &self.caches.commit.slow
-        };
-        counter.set(counter.get().saturating_add(1));
+        self.count_commit(&event.id, incremental);
         // Patch the view only if no other connection committed since it was
         // loaded (I6); otherwise drop it. Never fail after the commit.
         let data_version = self.data_version().ok();
@@ -369,10 +389,57 @@ impl Store {
     }
     /// Commits on this handle by path (see [`CommitPathCounters`]).
     pub fn commit_path_counters(&self) -> CommitPathCounters {
+        self.settle_commit_counters();
         CommitPathCounters {
             fast: self.caches.commit.fast.get(),
             slow: self.caches.commit.slow.get(),
         }
+    }
+    /// Count the commit of `id` once it is durable: now when its savepoint
+    /// was the outermost transaction, else when it settles.
+    fn count_commit(&self, id: &str, fast: bool) {
+        let cache = &self.caches.commit;
+        // An entry for the same event is an attempt whose enclosing
+        // transaction rolled back: `check_commit` found it absent from the
+        // journal before this commit.
+        cache.pending.borrow_mut().remove(id);
+        if self.db.is_autocommit() {
+            self.settle_commit_counters();
+            self.bump_commit_counter(fast);
+        } else {
+            cache.pending.borrow_mut().insert(id.to_owned(), fast);
+        }
+    }
+    /// Count the pending commits that became durable; drop the rolled-back
+    /// ones. Only in autocommit, when no enclosing transaction is open (any
+    /// pending commit's transaction has then ended). A lookup failure keeps
+    /// the entry for a later settle.
+    pub(super) fn settle_commit_counters(&self) {
+        if !self.db.is_autocommit() {
+            return;
+        }
+        let pending = std::mem::take(&mut *self.caches.commit.pending.borrow_mut());
+        for (id, fast) in pending {
+            let durable = self
+                .db
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM events WHERE id=?)")
+                .and_then(|mut statement| statement.query_row([&id], |r| r.get::<_, bool>(0)));
+            match durable {
+                Ok(true) => self.bump_commit_counter(fast),
+                Ok(false) => {}
+                Err(_) => {
+                    self.caches.commit.pending.borrow_mut().insert(id, fast);
+                }
+            }
+        }
+    }
+    fn bump_commit_counter(&self, fast: bool) {
+        let counter = if fast {
+            &self.caches.commit.fast
+        } else {
+            &self.caches.commit.slow
+        };
+        counter.set(counter.get().saturating_add(1));
     }
     /// Whether `branch` has a conflict row that no review resolved.
     pub fn branch_has_unresolved_conflicts(&self, branch: &str) -> Result<bool> {

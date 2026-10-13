@@ -753,6 +753,273 @@ fn legacy_rows_are_classified_and_drained() {
     assert_oracle_empty(&mut s, "after legacy drain");
 }
 
+/// A receiver `b` and the causally sorted remote creates of the nested
+/// directories `d`, `d/x`, `d/x/y`, … (`depth` of them), each depending on
+/// the previous one.
+fn nested_chain(depth: usize) -> (tempfile::TempDir, Store, Vec<Event>) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = store(&dir.path().join("a"), &repo);
+    let b = store(&dir.path().join("b"), &repo);
+    let mut path = String::from("d");
+    for _ in 0..depth {
+        a.create(&path, "directory").unwrap();
+        path.push_str("/x");
+    }
+    let bundle = missing(&a, &b);
+    assert_eq!(bundle.events.len(), depth);
+    for pair in bundle.events.windows(2) {
+        assert!(pair[1].dependencies.contains(&pair[0].id));
+    }
+    (dir, b, bundle.events)
+}
+
+/// Insert an inbox row as an older binary or build left it.
+fn insert_row(
+    s: &Store,
+    event: &Event,
+    state: Option<&str>,
+    error: Option<&str>,
+    blocked_on: Option<&str>,
+) {
+    s.db.execute(
+        "INSERT INTO incoming_events(id,payload,error,state,blocked_on) VALUES(?,?,?,?,?)",
+        rusqlite::params![
+            event.id,
+            serde_json::to_string(event).unwrap(),
+            error,
+            state,
+            blocked_on
+        ],
+    )
+    .unwrap();
+}
+
+/// Activate until no row is ready.
+fn drain(s: &mut Store) {
+    while s.activate_slice(SliceBudget::UNBOUNDED).unwrap().more {}
+}
+
+fn ancestor(id: &str) -> String {
+    format!("QUARANTINED_CAUSAL_ANCESTOR: {id}")
+}
+
+/// Fix round 1 (blocker): a legacy quarantine of a transient failure (RC11)
+/// is retried on open, and its descendants follow it in every rowid order,
+/// whether the old binary marked them `QUARANTINED_CAUSAL_ANCESTOR: <root>`
+/// or never tried them (`error` NULL).
+#[test]
+fn legacy_transient_roots_release_their_descendants_in_any_order() {
+    let blocked = |root: &Event| Some(ancestor(&root.id));
+    for (case, child_first, child_error) in [
+        ("root first, blocked child", false, true),
+        ("child first, blocked child", true, true),
+        ("root first, untried child", false, false),
+        ("child first, untried child", true, false),
+    ] {
+        let (_dir, b, events) = nested_chain(2);
+        let (root, child) = (&events[0], &events[1]);
+        let child_error = if child_error { blocked(root) } else { None };
+        let insert_root = || insert_row(&b, root, None, Some("database is locked"), None);
+        let insert_child = || insert_row(&b, child, None, child_error.as_deref(), None);
+        if child_first {
+            insert_child();
+            insert_root();
+        } else {
+            insert_root();
+            insert_child();
+        }
+        let path = b.root.clone();
+        drop(b);
+        let mut b = Store::open_existing(&path).unwrap();
+        assert!(b.lookup("d").is_ok(), "{case}: root");
+        assert!(
+            b.lookup("d/x").is_ok(),
+            "{case}: child stays {:?}",
+            state_of(&b, &child.id)
+        );
+        assert_eq!(b.inbox_counts().unwrap().total(), 0, "{case}");
+        assert_oracle_empty(&mut b, case);
+    }
+}
+
+/// Fix round 1 (blocker): an older binary named the *direct* parent in
+/// `QUARANTINED_CAUSAL_ANCESTOR`. Classification resolves every row to the
+/// root whatever the rowid order, so `revalidate(root)` re-queues the whole
+/// chain and it activates once the root commits.
+#[test]
+fn legacy_ancestor_chains_resolve_to_the_root() {
+    let (_dir, b, events) = nested_chain(3);
+    let (r, c, g) = (&events[0], &events[1], &events[2]);
+    insert_row(&b, g, None, Some(&ancestor(&c.id)), None);
+    insert_row(&b, c, None, Some(&ancestor(&r.id)), None);
+    insert_row(&b, r, None, Some("INVALID_KIND: legacy verdict"), None);
+    let path = b.root.clone();
+    drop(b);
+    let mut b = Store::open_existing(&path).unwrap();
+    assert_eq!(state_of(&b, &r.id).0.as_deref(), Some("quarantined"));
+    for row in [c, g] {
+        let (state, error, blocked_on) = state_of(&b, &row.id);
+        assert_eq!(state.as_deref(), Some("blocked"));
+        assert!(error.unwrap().starts_with("QUARANTINED_CAUSAL_ANCESTOR"));
+        assert_eq!(blocked_on.as_deref(), Some(r.id.as_str()), "the root");
+    }
+    let counts = b.inbox_counts().unwrap();
+    assert_eq!(
+        (counts.quarantined, counts.blocked, counts.pending_active()),
+        (1, 2, 0)
+    );
+    assert_eq!(b.quarantined(10).unwrap().len(), 1);
+    assert_eq!(b.revalidate(Some(std::slice::from_ref(&r.id))).unwrap(), 3);
+    drain(&mut b);
+    for path in ["d", "d/x", "d/x/x"] {
+        assert!(b.lookup(path).is_ok(), "{path}");
+    }
+    assert_eq!(b.inbox_counts().unwrap().total(), 0);
+    assert_oracle_empty(&mut b, "after the legacy chain");
+}
+
+/// Fix round 1 (blocker): rows that an older build left blocked on a row that
+/// can commit, or on an intermediate blocked row, are not stuck. At runtime
+/// the commit of the row they name releases them; `revalidate(root)` follows
+/// `blocked_on` transitively; on open, a blocked row whose `blocked_on` is no
+/// longer a quarantined root is re-classified.
+#[test]
+fn rows_blocked_on_a_row_that_can_commit_are_released() {
+    // Runtime: the root is `ready`, its descendants are blocked on it.
+    let (_dir, mut b, events) = nested_chain(3);
+    let (r, c, g) = (&events[0], &events[1], &events[2]);
+    insert_row(&b, g, Some("blocked"), Some(&ancestor(&r.id)), Some(&r.id));
+    insert_row(&b, c, Some("blocked"), Some(&ancestor(&r.id)), Some(&r.id));
+    insert_row(&b, r, Some("ready"), None, None);
+    let slice = b.activate_slice(SliceBudget::UNBOUNDED).unwrap();
+    assert!(slice.activated.contains(&r.id));
+    drain(&mut b);
+    assert!(b.lookup("d/x/x").is_ok(), "{:?}", state_of(&b, &g.id));
+    assert_eq!(b.inbox_counts().unwrap().total(), 0);
+    assert_oracle_empty(&mut b, "released at runtime");
+
+    // `revalidate` follows `blocked_on` through an intermediate blocked row.
+    let (_dir, mut b, events) = nested_chain(3);
+    let (r, c, g) = (&events[0], &events[1], &events[2]);
+    insert_row(&b, g, Some("blocked"), Some(&ancestor(&c.id)), Some(&c.id));
+    insert_row(&b, c, Some("blocked"), Some(&ancestor(&r.id)), Some(&r.id));
+    insert_row(&b, r, Some("quarantined"), Some("INVALID_KIND: x"), None);
+    assert_eq!(b.revalidate(Some(std::slice::from_ref(&r.id))).unwrap(), 3);
+    drain(&mut b);
+    assert!(b.lookup("d/x/x").is_ok(), "{:?}", state_of(&b, &g.id));
+    assert_oracle_empty(&mut b, "revalidated transitively");
+
+    // On open: blocked on a committed event, and blocked on an intermediate
+    // row whose root is quarantined (re-pointed to the root).
+    let (_dir, mut b, events) = nested_chain(3);
+    let (r, c, g) = (&events[0], &events[1], &events[2]);
+    let allowed: BTreeSet<String> = events.iter().map(|e| e.device.clone()).collect();
+    b.receive(page(&b, vec![r.clone()], &BTreeMap::new()), &allowed)
+        .unwrap();
+    insert_row(&b, c, Some("blocked"), Some(&ancestor(&r.id)), Some(&r.id));
+    insert_row(&b, g, Some("blocked"), Some(&ancestor(&c.id)), Some(&c.id));
+    let path = b.root.clone();
+    drop(b);
+    let mut b = Store::open_existing(&path).unwrap();
+    assert!(b.lookup("d/x/x").is_ok(), "{:?}", state_of(&b, &g.id));
+    assert_eq!(b.inbox_counts().unwrap().total(), 0);
+    assert_oracle_empty(&mut b, "released on open");
+
+    let (_dir, b, events) = nested_chain(3);
+    let (r, c, g) = (&events[0], &events[1], &events[2]);
+    insert_row(&b, r, Some("quarantined"), Some("INVALID_KIND: x"), None);
+    insert_row(&b, c, Some("blocked"), Some(&ancestor(&r.id)), Some(&r.id));
+    insert_row(&b, g, Some("blocked"), Some(&ancestor(&c.id)), Some(&c.id));
+    let path = b.root.clone();
+    drop(b);
+    let b = Store::open_existing(&path).unwrap();
+    assert_eq!(state_of(&b, &g.id).2.as_deref(), Some(r.id.as_str()));
+    let counts = b.inbox_counts().unwrap();
+    assert_eq!((counts.quarantined, counts.blocked), (1, 2));
+
+    // A child staged under a stale blocked row is blocked with it (never
+    // waiting on it): when the row they name is quarantined, nothing of the
+    // chain is left pending.
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let a = store(&dir.path().join("a"), &repo);
+    let mut b = store(&dir.path().join("b"), &repo);
+    let branch = a.branch(&a.active).unwrap();
+    let bad = a.event(&branch, invalid_kind_changes("bad.txt"));
+    let mut child = a.event(&branch, invalid_kind_changes("child.txt"));
+    child.dependencies = vec![bad.id.clone()];
+    let mut grandchild = a.event(&branch, invalid_kind_changes("grandchild.txt"));
+    grandchild.dependencies = vec![child.id.clone()];
+    insert_row(&b, &bad, Some("ready"), None, None);
+    insert_row(
+        &b,
+        &child,
+        Some("blocked"),
+        Some(&ancestor(&bad.id)),
+        Some(&bad.id),
+    );
+    let staged = b
+        .stage_incoming(
+            vec![StagedEvent {
+                event: grandchild.clone(),
+                source: None,
+            }],
+            &devices([&a, &b]),
+        )
+        .unwrap();
+    assert_eq!(staged.staged, vec![grandchild.id.clone()]);
+    assert_eq!(
+        state_of(&b, &grandchild.id).2.as_deref(),
+        Some(bad.id.as_str())
+    );
+    drain(&mut b);
+    let counts = b.inbox_counts().unwrap();
+    assert_eq!(
+        (counts.quarantined, counts.blocked, counts.pending_active()),
+        (1, 2, 0)
+    );
+    for row in [&child, &grandchild] {
+        assert_eq!(state_of(&b, &row.id).2.as_deref(), Some(bad.id.as_str()));
+    }
+}
+
+/// Fix round 1: the commit path counters count durable commits only. A
+/// commit inside a caller's transaction counts once that transaction
+/// commits, and never if it rolls back.
+#[test]
+fn commit_path_counters_count_only_durable_commits() {
+    let (_dir, mut b, events) = nested_chain(2);
+    let allowed: BTreeSet<String> = events.iter().map(|e| e.device.clone()).collect();
+    let total = |b: &Store| {
+        let counters = b.commit_path_counters();
+        counters.fast + counters.slow
+    };
+    let before = total(&b);
+    let first = page(&b, vec![events[0].clone()], &BTreeMap::new());
+    b.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(b.receive(first.clone(), &allowed).unwrap().len(), 1);
+    assert_eq!(total(&b), before, "not durable inside the transaction");
+    b.db.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(total(&b), before, "rolled back: never counted");
+    assert!(b.lookup("d").is_err());
+    b.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    b.receive(first, &allowed).unwrap();
+    b.db.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        total(&b),
+        before + 1,
+        "counted once its transaction committed"
+    );
+    b.receive(
+        page(&b, vec![events[1].clone()], &BTreeMap::new()),
+        &allowed,
+    )
+    .unwrap();
+    assert_eq!(total(&b), before + 2, "an outermost commit counts at once");
+    assert!(b.lookup("d/x").is_ok());
+}
+
 /// CCR-WP0.INT-5 item 2: activation takes the writer slot before it reads
 /// (`BEGIN IMMEDIATE`), so another writer makes it wait, not fail.
 #[test]
