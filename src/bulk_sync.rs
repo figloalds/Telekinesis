@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::{Arc, Mutex, Weak},
+    sync::Arc,
 };
 
 pub const PROTOCOL: u32 = 1;
@@ -32,20 +32,7 @@ impl Lane {
     }
 }
 
-#[derive(Default)]
-pub struct ObjectLocks(Mutex<BTreeMap<String, Weak<Mutex<()>>>>);
-impl ObjectLocks {
-    pub fn for_object(&self, object: &str) -> Arc<Mutex<()>> {
-        let mut locks = self.0.lock().unwrap();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
-            return lock;
-        }
-        let lock = Arc::new(Mutex::new(()));
-        locks.insert(object.to_owned(), Arc::downgrade(&lock));
-        lock
-    }
-}
+pub use crate::core::objects::ObjectLocks;
 
 #[derive(Clone)]
 pub(crate) struct Worker {
