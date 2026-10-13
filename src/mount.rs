@@ -47,8 +47,17 @@ unsafe extern "C" {
     fn tk_mount_notify(native: usize, path: *const u16, action: u32) -> u32;
 }
 /// Called outside the engine mutex, using paths in their WinFsp-normalized form.
+/// Never waits for a mount transition (a detach can hold the adapter for its
+/// quiet wait and drain): `BUSY_VIEW`, and the caller keeps the notification
+/// for its next delivery.
 pub fn notify(path: &str, action: u32) -> Result<()> {
-    let guard = lock(&MOUNT);
+    let guard = match MOUNT.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            bail!("BUSY_VIEW: mount transition in progress")
+        }
+    };
     let Some(m) = guard.as_ref().filter(|m| m.native != 0) else {
         return Ok(());
     };
