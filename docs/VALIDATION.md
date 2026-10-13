@@ -1,5 +1,100 @@
 # Validation
 
+## Live mount failure and sync visibility (2026-10-12)
+
+The remote Docker worker repeatedly exited with `MOUNT_PATH_MUST_NOT_EXIST` while
+all four outbound lanes remained connected with no repository exchanges. Read-only
+SQLite snapshots found 1,593 local shared events versus 920 remote events, no
+quarantines or missing prerequisites absent from both peers, and 102 missing
+objects referenced by the remote's already accepted metadata. This was a different
+failure from the earlier replica's missing history.
+
+Stopped the failed worker's retry loop, verified that `/app/mounts/Projetos` was an
+empty ordinary directory and not a mount or symlink, removed it with nonrecursive
+`rmdir`, then started the same worker state. No backing objects or metadata were
+removed. The mount succeeded and all three bulk lanes resumed. A later snapshot
+contained 1,027 accepted events, 367 pending events and all 239 objects referenced
+by accepted shared history. Metadata was still catching up; full convergence was
+not claimed. Reports are under `test-evidence/live-sync-*.json` (local, ignored).
+
+The desktop now separates synchronization details from conflict review, displays
+current and shared-history availability, metadata backlogs, per-lane object
+inventories, transfer totals/timings and observation ages. Folder rows distinguish
+remote unavailability from network connection health. The API includes the last
+advertised remote-folder availability and per-repository lane observations.
+Four Windows GUI unit tests and all 15 orchestrator integration tests passed,
+including a connected peer whose worker stops and disappears from discovery.
+All-target checking, strict Clippy and formatting passed. These UI/API source
+changes have not been deployed; physical desktop interaction was not validated.
+The independent-mount design in `ARCHITECTURE.md` is a study, not an implemented
+lifecycle refactor.
+
+## Parallel object lanes and binary gzip transport (2026-10-12)
+
+The full Windows Cargo suite passed 128 tests, with one opt-in codec benchmark
+ignored by the normal suite. That benchmark was run separately in release mode
+and passed. The Ubuntu/WSL release run passed 53 tests across the library,
+`bulk_lanes`, `runtime_lanes`, `paired_sync`, `partial_content` and `orchestrator`
+targets, with the same benchmark ignored. `/dev/fuse` was available for the real
+mount cases. All-target checking, strict Clippy, formatting and diff whitespace
+checks passed on Windows. Windows and Linux release binaries were built.
+
+The new regressions verify concurrent transfer of different objects from one
+repository, progress while another object's lock and the engine lock are held,
+control-only metadata acknowledgements, bounded activation with durable pending
+events, lane-pool changes and overlapping partial-file recovery. Codec tests cover
+binary/gzip round trips, malformed and oversized frames, truncated streams, legacy
+JSON fallback, and negotiated binary messages over WSS.
+
+An isolated Windows release comparison transferred three 4 MiB objects through
+two daemons and independently verified their bytes. The installed baseline took
+10.311 seconds; the new build took 4.352 seconds (about 2.37 times faster). Each
+of the three bulk lanes received exactly 4 MiB; the control lane received zero
+object bytes. This is one local loopback comparison, not a WAN bandwidth or
+sustained throughput qualification. Objects are partitioned across lanes; a
+single large object is not striped across connections.
+
+The release codec fixture reduced 1,110,000 bytes of repetitive text to a
+7,843-byte binary/gzip message. A 1,048,576-byte seeded random fixture used a raw
+binary message of 1,048,719 bytes, avoiding gzip expansion and hex wire overhead.
+Full envelope encode/decode timings were respectively 5.69/3.76 ms for the text
+fixture and 9.01/3.12 ms for random data. These include JSON/hex conversion and
+allocation, not just gzip. Compression is adaptive and has measurable CPU cost;
+the repetitive fixture does not predict compression ratios for project files.
+
+Local ignored evidence is in `test-evidence/parallel-gzip-windows-tests.log`,
+`parallel-gzip-linux-tests.log`, `parallel-gzip-codec-benchmark.log` and
+`parallel-gzip-transport-benchmark.json`. Release artifacts are
+`target/release/tkfs.exe` and `target/runnables/linux-x86_64/tkfs`. Neither the
+installed local application nor the remote Docker service was replaced or
+restarted by this validation. The missing-history findings below describe an
+earlier replica; the user subsequently recreated the repositories, so those
+counts must not be used to diagnose the current live state.
+
+## Worker transport pacing (2026-10-12)
+
+The full Windows suite passed 118 tests. After final connection/validation cleanup,
+the 14 orchestrator tests and 19 paired-sync, partial-content and worker-lane tests
+passed again. Coverage includes control delivery during a blocked bulk transfer,
+persistent worker requests after application errors, no automatic replay after
+an uncertain disconnect, and a multi-page transfer with a five-second idle poll
+interval. Strict Clippy and release builds pass.
+
+An isolated two-daemon release benchmark transferred and independently verified
+an 8 MiB object at the default 500 ms polling interval: 8.08 seconds using the
+previously installed Windows binary, 3.99 seconds with persistent worker lanes,
+reduced repeated availability scans, and a 10 ms yield during active content.
+This single loopback comparison is not a WAN throughput qualification. Evidence:
+`test-evidence/transport-benchmark.json` (local, ignored).
+
+Read-only inspection of the live Projetos peers found matching 844-event accepted
+journals and projections, but 1,273 pending remote events requiring 1,018 event IDs
+absent from both samples. Both replicas lacked the same 51 content objects.
+Remote ping median was 11.86 ms; no object download was active. The receiving mount
+remained unpublished because its initial metadata readiness condition was not met.
+Increasing connections cannot recover missing history or content. Live binaries
+were not replaced by this validation.
+
 The folder-first rewrite was checked on Windows and Ubuntu/WSL on 2026-10-11.
 The reboot results below describe commit `26ab12d`; the outbound WSS follow-up
 has separate results at the end.

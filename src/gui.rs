@@ -30,6 +30,7 @@ fn folder_rows(value: &Value) -> Vec<FolderRow> {
             running: p["running"] == true,
             starting: p["starting"] == true,
             error: p["error"].as_str().unwrap_or_default().into(),
+            sync: sync_label(p).into(),
         })
         .collect()
 }
@@ -82,8 +83,11 @@ fn folder_action(state: &str, payload: Value) -> Action {
 }
 fn folder_summary(value: &Value) -> String {
     let s = &value["status"];
-    if s["stale"] == true {
-        return "Worker busy; displaying an older observation. Fresh status will resume automatically.".into();
+    if s["stale"] == true && !s["content"].is_object() {
+        return format!(
+            "Worker busy; content counts are unavailable in this observation ({}). Peer and lane status continues below.",
+            age(&s["sampled_at_ms"])
+        );
     }
     let c = &s["content"];
     let peers = s["peers"]
@@ -130,7 +134,12 @@ fn folder_summary(value: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Metadata: {} | Content: {} / {} current objects available | {} downloading\nPending metadata: {} | Unflushed files: {} | Health: {}\n{}\n{}",
+        "{}Metadata: {} | Current objects: {} / {} available | {} downloading\nShared history: {} / {} objects available | Partial data: {} | Requested: {}\nMetadata queued locally: {} | Quarantined: {} | Awaiting acknowledgement: {}\nUnflushed files: {} | Health: {}\n{}\n{}",
+        if s["stale"] == true {
+            "STALE: worker busy; showing the last observation.\n"
+        } else {
+            ""
+        },
         if s["metadata_caught_up"] == true {
             "up to date"
         } else {
@@ -139,12 +148,169 @@ fn folder_summary(value: &Value) -> String {
         c["current_available"],
         c["current_objects"],
         c["downloading"],
+        c["shared_available"],
+        c["shared_objects"],
+        bytes(c["partial_bytes"].as_u64().unwrap_or(0)),
+        c["requested"],
         s["incoming_pending"],
+        s["incoming_quarantined"],
+        s["outgoing_unacknowledged"],
         s["unflushed_files"],
         s["health"].as_str().unwrap_or("healthy"),
         peers,
         pending
     )
+}
+
+fn bytes(n: u64) -> String {
+    if n >= 1024 * 1024 {
+        format!("{:.1} MiB", n as f64 / 1048576.0)
+    } else if n >= 1024 {
+        format!("{:.1} KiB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+fn age(at: &Value) -> String {
+    at.as_u64()
+        .map(|at| format!("{}s ago", tkfs::core::time().saturating_sub(at) / 1000))
+        .unwrap_or_else(|| "not observed".into())
+}
+
+fn sync_label(project: &Value) -> &'static str {
+    if project["error"].is_string() || project["publication_error"].is_string() {
+        return "Sync blocked";
+    }
+    if project["starting"] == true {
+        return "Waiting for worker";
+    }
+    if project["running"] != true {
+        return "Sync stopped";
+    }
+    let peers: Vec<_> = project["sync"].as_array().into_iter().flatten().collect();
+    if peers.is_empty() {
+        return "No outbound peers";
+    }
+    if peers.iter().any(|p| p["connected"] != true) {
+        return "Peer disconnected";
+    }
+    if peers.iter().any(|p| p["remote_available"] == false) {
+        return "Remote unavailable";
+    }
+    if peers.iter().any(|p| {
+        p["error"].is_string()
+            || p["lanes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|l| l["error"].is_string() || l["repository"]["error"].is_string())
+    }) {
+        return "Sync retrying";
+    }
+    if peers.iter().any(|p| p["metadata"].is_null()) {
+        return "Awaiting sync status";
+    }
+    if peers.iter().any(|p| {
+        p["metadata"]["last_success_ms"]
+            .as_u64()
+            .is_none_or(|at| tkfs::core::time().saturating_sub(at) >= 15000)
+    }) {
+        return "Sync status stale";
+    }
+    if peers
+        .iter()
+        .any(|p| p["metadata"]["metadata_caught_up"] != true)
+    {
+        return "Syncing metadata";
+    }
+    if peers.iter().any(|p| {
+        p["lanes"].as_array().into_iter().flatten().any(|l| {
+            let i = &l["repository"]["object_inventory"];
+            i["local_only"].as_u64().unwrap_or(0) > 0 || i["remote_only"].as_u64().unwrap_or(0) > 0
+        })
+    }) {
+        return "Syncing objects";
+    }
+    // Equal inventories cannot prove availability of bytes missing on both peers.
+    "Metadata up to date"
+}
+
+fn network_summary(project: &Value) -> String {
+    let mut lines = vec![sync_label(project).to_owned()];
+    for key in ["error", "publication_error", "startup_phase"] {
+        if let Some(message) = project[key].as_str() {
+            lines.push(message.into());
+        }
+    }
+    for peer in project["sync"].as_array().into_iter().flatten() {
+        lines.push(format!(
+            "\n{}",
+            peer["endpoint"].as_str().unwrap_or("Remote")
+        ));
+        if peer["connected"] != true {
+            lines.push("Control connection offline; retrying automatically.".into());
+        } else if peer["remote_available"] == false {
+            lines.push("Connected, but this folder is not advertised by the remote. Its worker may be stopped, starting, or unable to publish.".into());
+        }
+        if let Some(error) = peer["error"].as_str() {
+            lines.push(error.into());
+        }
+        let metadata = &peer["metadata"];
+        let progress = &metadata["metadata_progress"];
+        if progress.is_object() {
+            lines.push(format!("Metadata events: local {} / remote {} · Waiting to commit: local {} / remote {}\nEvents absent from remote: {} · Absent locally: {} · Observation {}",
+                progress["local_events"], progress["remote_events"], progress["local_pending"], progress["remote_pending"],
+                progress["local_only_events"], progress["remote_only_events"], age(&metadata["last_success_ms"])));
+        }
+        for lane in peer["lanes"].as_array().into_iter().flatten() {
+            let s = &lane["repository"];
+            let codec = match lane["transport"].as_str() {
+                Some("tkfs-binary-gzip-v1") => "binary + adaptive gzip",
+                Some(_) => "legacy JSON",
+                None => "negotiating transport",
+            };
+            lines.push(format!(
+                "Lane {} · {} · {} · {}",
+                lane["lane"],
+                if lane["role"] == "control" {
+                    "reserved control"
+                } else {
+                    "objects"
+                },
+                if lane["connected"] == true {
+                    "connected"
+                } else {
+                    "offline"
+                },
+                codec
+            ));
+            if s.is_object() {
+                lines.push(format!(
+                    "  Objects sent {} / received {} · Last progress {} · Last success {}",
+                    bytes(s["total_sent_object_bytes"].as_u64().unwrap_or(0)),
+                    bytes(s["total_received_object_bytes"].as_u64().unwrap_or(0)),
+                    age(&s["last_progress_ms"]),
+                    age(&s["last_success_ms"])
+                ));
+                if s["object_inventory"].is_object() {
+                    let i = &s["object_inventory"];
+                    lines.push(format!("  Available objects: local {} / remote {} · Only local {} / only remote {} · Partial local {} / remote {}",
+                        i["local_available"], i["remote_available"], i["local_only"], i["remote_only"], i["local_partial"], i["remote_partial"]));
+                }
+                if let Some(ms) = s["transfer"]["total_ms"].as_u64() {
+                    lines.push(format!("  Last exchange {} ms (prepare {} / remote {} / apply {}) · Wire sent {} / received {}",
+                        ms, s["transfer"]["offer_ms"], s["transfer"]["remote_exchange_ms"], s["transfer"]["apply_ms"],
+                        bytes(s["total_sent_wire_bytes"].as_u64().unwrap_or(0)), bytes(s["total_received_wire_bytes"].as_u64().unwrap_or(0))));
+                }
+            }
+            if let Some(error) = s["error"].as_str().or_else(|| lane["error"].as_str()) {
+                lines.push(format!("  Retry: {error}"));
+            }
+        }
+    }
+    lines.push("\nCounters cover successful exchanges since the daemon started or this folder was rediscovered. Object inventories are sampled per lane and can lag receipt by one exchange. Shared history includes older revisions; raw directory file counts can differ from current content.".into());
+    lines.join("\n")
 }
 
 fn clear_remote(ui: &AppWindow) {
@@ -319,6 +485,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     });
 
     let rows = Rc::new(RefCell::new(Vec::<FolderRow>::new()));
+    let projects = Rc::new(RefCell::new(Value::Null));
     let cached = rows.clone();
     let weak = ui.as_weak();
     ui.on_search_folders(move |query| {
@@ -392,9 +559,28 @@ pub fn run(config_path: &Path) -> Result<()> {
     {
         let weak = ui.as_weak();
         let tx = tx.clone();
+        let projects = projects.clone();
         ui.on_folder_details(move |state| {
             if let Some(ui) = weak.upgrade() {
                 ui.set_folder_summary("Loading folder state…".into());
+                let snapshot = projects.borrow();
+                if let Some(project) = snapshot["folders"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|p| p["state"] == state.as_str())
+                {
+                    ui.set_network_summary(network_summary(project).into());
+                    if project["running"] != true {
+                        ui.set_folder_summary(
+                            "Worker unavailable. Connection and startup status are shown below."
+                                .into(),
+                        );
+                        ui.set_conflict_count(0);
+                        ui.set_conflicts(ModelRc::default());
+                        return;
+                    }
+                }
             }
             submit(
                 &weak,
@@ -536,7 +722,9 @@ pub fn run(config_path: &Path) -> Result<()> {
     let mut previous_peers = Vec::new();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(100), move || {
         let Some(ui) = weak.upgrade() else { return; };
-        *watched.lock().unwrap() = (ui.get_dialog() == "folder").then(|| ui.get_selected_state().to_string());
+        *watched.lock().unwrap() = (ui.get_dialog() == "folder" && rows.borrow().iter()
+            .any(|p| p.state == ui.get_selected_state() && p.running))
+            .then(|| ui.get_selected_state().to_string());
         while let Ok((action, interactive, result)) = out.try_recv() {
             if interactive { ui.set_busy(false); }
             match result {
@@ -580,6 +768,11 @@ pub fn run(config_path: &Path) -> Result<()> {
                         }
                         Action::List => {
                             ui.set_connected(true);
+                            if let Some(project) = value["folders"].as_array().into_iter().flatten()
+                                .find(|p| p["state"] == ui.get_selected_state().as_str()) {
+                                ui.set_network_summary(network_summary(project).into());
+                            }
+                            *projects.borrow_mut() = value.clone();
                             let next_rows = folder_rows(&value);
                             if *rows.borrow() != next_rows {
                                 *rows.borrow_mut() = next_rows;
@@ -656,6 +849,31 @@ pub fn run(config_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn connected_peer_does_not_hide_an_unavailable_folder_or_stale_sync() {
+        let mut project =
+            json!({"running":true,"sync":[{"connected":true,"remote_available":false}]});
+        assert_eq!(sync_label(&project), "Remote unavailable");
+        assert!(network_summary(&project).contains("not advertised"));
+        project["sync"][0]["remote_available"] = json!(true);
+        project["sync"][0]["metadata"] = json!({"metadata_caught_up":true,"last_success_ms":0});
+        assert_eq!(sync_label(&project), "Sync status stale");
+        project["sync"][0]["metadata"]["last_success_ms"] = json!(tkfs::core::time());
+        assert_eq!(sync_label(&project), "Metadata up to date");
+        project["sync"][0]["lanes"] = json!([{"repository":{"object_inventory":{"local_only":3}}}]);
+        assert_eq!(sync_label(&project), "Syncing objects");
+    }
+
+    #[test]
+    fn summary_distinguishes_current_content_from_history_and_pending_metadata() {
+        let summary = folder_summary(&json!({"status":{"content":{
+            "current_available":100,"current_objects":108,"shared_available":108,"shared_objects":291,
+            "partial_bytes":2048,"requested":1,"downloading":2},
+            "incoming_pending":673,"incoming_quarantined":0,"outgoing_unacknowledged":4}}));
+        assert!(summary.contains("Current objects: 100 / 108"));
+        assert!(summary.contains("Shared history: 108 / 291"));
+        assert!(summary.contains("Metadata queued locally: 673"));
+    }
     #[test]
     fn folder_snapshot_preserves_headless_and_failure_states() {
         let rows = folder_rows(&json!({"folders": [

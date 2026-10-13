@@ -50,7 +50,7 @@ pub struct Engine {
     pub switching: bool,
     pub mounted: bool,
     pub last_sync: Option<Value>,
-    pub transfers: Arc<Mutex<()>>,
+    pub transfers: Arc<crate::bulk_sync::ObjectLocks>,
     pub sync_peers: BTreeSet<String>,
     pub peer_sync: BTreeMap<String, Value>,
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
@@ -71,7 +71,7 @@ impl Engine {
             switching: false,
             mounted: false,
             last_sync: None,
-            transfers: Arc::new(Mutex::new(())),
+            transfers: Arc::new(crate::bulk_sync::ObjectLocks::default()),
             sync_peers: BTreeSet::new(),
             peer_sync: BTreeMap::new(),
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -510,8 +510,16 @@ impl Engine {
         bundle: Bundle,
         allowed: &BTreeSet<String>,
     ) -> Result<Vec<String>> {
+        self.receive_peer_budget(bundle, allowed, None)
+    }
+    pub(crate) fn receive_peer_budget(
+        &mut self,
+        bundle: Bundle,
+        allowed: &BTreeSet<String>,
+        budget: Option<usize>,
+    ) -> Result<Vec<String>> {
         let before = self.store.projection(&self.store.active)?;
-        let accepted = self.store.receive(bundle, allowed)?;
+        let accepted = self.store.receive_with_budget(bundle, allowed, budget)?;
         let after = self.store.projection(&self.store.active)?;
         self.notifications
             .extend(namespace_notifications(&before, &after));
@@ -800,10 +808,44 @@ pub fn rpc(info: &Discovery, request: &str, payload: Value) -> Result<Value> {
     let mut socket = crate::ws::connect(&info.address)?;
     crate::ws::call(&mut socket, &json!({"request":request,"payload":payload}))
 }
+/// One worker connection per peer lane. Never share a socket between bulk and
+/// control work, and never replay a request after an uncertain transport error.
+#[derive(Default)]
+pub struct RpcLane {
+    connection: Option<(String, crate::ws::Socket)>,
+    last_used: Option<std::time::Instant>,
+}
+impl RpcLane {
+    pub fn call(&mut self, info: &Discovery, request: &str, payload: Value) -> Result<Value> {
+        if self
+            .connection
+            .as_ref()
+            .is_none_or(|(address, _)| address != &info.address)
+            || self
+                .last_used
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(10))
+        {
+            self.connection = None;
+            self.connection = Some((info.address.clone(), crate::ws::connect(&info.address)?));
+        }
+        let result = crate::ws::call(
+            &mut self.connection.as_mut().unwrap().1,
+            &json!({"request":request,"payload":payload}),
+        );
+        self.last_used = Some(std::time::Instant::now());
+        if result
+            .as_ref()
+            .is_err_and(|error| error.downcast_ref::<crate::ws::RemoteError>().is_none())
+        {
+            self.connection = None;
+        }
+        result
+    }
+}
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
-    let (info, stopping, observation) = {
+    let (info, stopping, observation, bulk) = {
         let e = engine.lock().unwrap();
         (
             Discovery {
@@ -816,6 +858,12 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
             },
             e.stopping.clone(),
             e.observation.clone(),
+            crate::bulk_sync::Worker {
+                root: e.store.root.clone(),
+                repo: e.store.repo.clone(),
+                device: e.store.device.clone(),
+                locks: e.transfers.clone(),
+            },
         )
     };
     engine.lock().unwrap().discovery = serde_json::to_vec(&info)?;
@@ -841,13 +889,20 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
                 Ok((stream, _)) => {
                     let engine = engine.clone();
                     let observation = observation.clone();
+                    let stopping = stopping.clone();
+                    let bulk = bulk.clone();
                     std::thread::spawn(move || {
                         let _ = (|| -> Result<()> {
                             let mut socket = crate::ws::accept(stream)?;
-                            let request: Value = crate::ws::receive(&mut socket)?;
-                            let result = dispatch_rpc(&engine, &observation, &request);
-                            deliver_notifications(&engine);
-                            crate::ws::reply(&mut socket, result)
+                            loop {
+                                let request: Value = crate::ws::receive(&mut socket)?;
+                                let result = dispatch_rpc(&engine, &observation, &bulk, &request);
+                                deliver_notifications(&engine);
+                                crate::ws::reply(&mut socket, result)?;
+                                if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return Ok(());
+                                }
+                            }
                         })();
                     });
                 }
@@ -860,9 +915,33 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
     });
     Ok(info)
 }
-fn dispatch_rpc(engine: &Shared, observation: &Arc<Mutex<Value>>, r: &Value) -> Result<Value> {
+fn dispatch_rpc(
+    engine: &Shared,
+    observation: &Arc<Mutex<Value>>,
+    bulk: &crate::bulk_sync::Worker,
+    r: &Value,
+) -> Result<Value> {
     let request = r["request"].as_str().context("INVALID_REQUEST_ID")?;
     let payload = &r["payload"];
+    if payload["op"]
+        .as_str()
+        .is_some_and(|op| op.starts_with("published-bulk-"))
+    {
+        return crate::bulk_sync::worker_control(bulk, payload);
+    }
+    if payload["op"] == "published-summary" {
+        let store = bulk.store()?;
+        return Ok(json!(crate::paired_sync::PublishedState {
+            repo: store.repo.clone(),
+            replica: store.device.clone(),
+            label: store.repo.clone(),
+            branches: store
+                .branches()?
+                .into_iter()
+                .filter(|branch| branch.shared)
+                .collect(),
+        }));
+    }
     if payload["op"]
         .as_str()
         .is_some_and(|op| op.starts_with("published-"))
@@ -928,6 +1007,9 @@ fn dispatch_rpc(engine: &Shared, observation: &Arc<Mutex<Value>>, r: &Value) -> 
 /// and control-lane calls remain able to acquire the semantic engine.
 fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
     let mut metadata = payload.clone();
+    // Bound semantic work per control exchange; queued events remain durable
+    // and unacknowledged until later slices activate them.
+    metadata["bounded_metadata"] = json!(payload["metadata_only"] == true);
     let mut parts = BTreeMap::new();
     if let Some(page) = metadata.get_mut("page") {
         let originals: crate::paired_sync::SyncPage = serde_json::from_value(page.clone())?;
@@ -953,17 +1035,23 @@ fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
         page["bundle"]["objects"] = json!({});
     }
     if parts.is_empty() {
-        return crate::paired_sync::worker_control(&mut engine.lock().unwrap(), &metadata);
+        let mut e = engine
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("WORKER_BUSY"))?;
+        return crate::paired_sync::worker_control(&mut e, &metadata);
     }
     let (mut result, transfer, lock) = {
-        let mut e = engine.lock().unwrap();
+        let mut e = engine
+            .try_lock()
+            .map_err(|_| anyhow::anyhow!("WORKER_BUSY"))?;
         let result = crate::paired_sync::worker_control(&mut e, &metadata)?;
         (result, e.store.transfer_view()?, e.transfers.clone())
     };
     if !parts.is_empty() {
-        let _guard = lock.lock().unwrap();
         let objects: Vec<_> = parts.keys().cloned().collect();
-        let completed = match transfer.receive_parts_data(parts, &[], &BTreeSet::new()) {
+        let received =
+            transfer.receive_parts_data_locked(parts, &[], &BTreeSet::new(), Some(&lock));
+        let completed = match received {
             Ok(completed) => completed,
             Err(error) => {
                 let e = engine.lock().unwrap();
@@ -1043,7 +1131,8 @@ fn fetch_verified(
                 return Ok(file);
             }
             drop(file);
-            let _guard = lock.lock().unwrap();
+            let object_lock = lock.for_object(object);
+            let _guard = object_lock.lock().unwrap();
             if path.is_file() {
                 // Recheck after acquiring the install lock: another request may
                 // have repaired the path while this reader verified old bytes.

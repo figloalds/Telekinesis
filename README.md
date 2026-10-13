@@ -18,10 +18,30 @@ its folder catalog, and proxies replication between matching repositories.
 Networking runs inside the orchestrator daemon. WebSocket is the only transport,
 with four persistent connections per configured peer by default. Lane 0 is
 reserved for discovery, events, and replication state; file content uses the
-other three lanes. Repositories are distributed across the bulk lanes, while
+other three lanes. Objects within each repository are distributed across the bulk lanes, while
 the reserved lane visits all repositories. Requests carry local changes and
 responses carry remote changes, so an outbound-only orchestrator can both send
 and receive. Multiple peers and relayed replica origins are supported.
+
+Each peer lane also has its own persistent connection to the local worker;
+control requests do not queue behind a bulk socket. Active content pages yield
+for 10 ms between rounds; advancing metadata also continues without an idle pause.
+`sync_interval_ms` controls idle polling. Each object has one serial lane owner,
+while different objects in the same repository transfer concurrently. Bulk I/O
+uses separate database connections and per-object locks outside the metadata
+engine. Control activation yields after at most 32 event commits or a 50 ms
+target (an individual atomic event can take longer). Peer status includes
+per-exchange object/wire byte counts, cumulative transferred bytes, and
+local offer, remote exchange, and local apply timings to distinguish worker cost
+from remote round-trip cost (which includes remote processing).
+
+New endpoints negotiate `tkfs-binary-gzip-v1` on both worker IPC and peer
+WebSockets. Object payloads cross as raw binary attachments; metadata stays JSON.
+Messages use gzip level 1 when a compression probe and final size comparison
+show savings, otherwise raw binary. Compressed and expanded sizes are bounded,
+and SHA-256 verification still applies to the original file bytes. Older
+endpoints retain JSON and the previous single-bulk-lane-per-repository behavior;
+upgrade both ends to use parallel bulk protocol 1 and compression together.
 
 Pairing uses one randomly generated code. The receiving orchestrator stores a
 salted SHA-256 verifier in its catalog, not the code. A dialing orchestrator
@@ -133,12 +153,47 @@ tkfs -f B.toml manage receive ws://A_HOST:43180 REPO_ID MyProject
 tkfs -f B.toml manage peers
 ```
 
-The daemon creates a new local replica, mounts it, and syncs it automatically.
+The daemon creates a new local replica and starts its worker headlessly. For a
+mounted `receive`, it waits for a successful metadata round trip with the selected
+peer: accepted event inventories must match and both incoming queues must be
+empty. It then restarts the worker with the requested mount. `manage inspect`
+reports `initial_sync_pending`, `startup_phase`, `mounted`, and per-peer `sync`
+progress/errors while it waits. The wait survives daemon restarts; an unavailable
+peer or incomplete causal history leaves the mount unpublished. File bytes may
+still download after mounting. Later remounts use the durable local journal and
+remain available offline.
 Use `--headless` on `receive` when no mount is needed. Existing matching
 repositories sync automatically; B needs no inbound listener and A needs no
 outbound pairing entry. Only running workers appear in the remote folder list.
 A paired orchestrator can discover all running folders and sync shared branches.
 Private branches and checkpoint history remain local.
+
+To investigate a folder that is not converging, first run `manage peers` and
+`manage inspect STATE_ID`. A connected socket does not mean replication is
+healthy: inspect each lane's **repository** error, failure count, and
+`metadata_progress` (local/remote event counts, differences and pending counts).
+Use `tkfs --runtime BACKING_STATE/runtime.json status` for worker health and
+content availability. Objects are content hashes, not directory entries; counts
+can differ because of duplicate content, old revisions, and partial downloads.
+
+For a deeper comparison, the read-only diagnostic script reads a consistent
+SQLite transaction, including its WAL, without opening or rebuilding the store:
+
+```sh
+python scripts/inspect_metadata.py --state BACKING_STATE --output local.json
+# Run the same command on the other machine and retrieve its remote.json.
+python scripts/inspect_metadata.py --compare local.json remote.json
+```
+
+Compare accepted shared events, payload hashes, pending prerequisites, active
+branch and projection hashes. `missing_parents_absent_on_both` means neither
+sampled replica has those required events, even in its inbox; locate an older
+replica or backup to recover them. Local startup snapshots are disposable journal
+caches, not an authoritative substitute for missing remote history. Do not clear
+queues or fabricate acknowledgements to make the counts match. Legacy references
+with missing bytes and size descriptors replicate as metadata with unknown size;
+status reports `size: null` until a descriptor or verified content is recovered.
+Unknown-size files cannot provide accurate filesystem attributes until then.
 
 `manage pair ... --connections 6` selects a total pool size, including one
 reserved connection. A setting of 1 is promoted to 2 so file transfers never

@@ -24,7 +24,7 @@
    shares that catalog with the bulk lanes, and exchanges event manifests,
    branches, inventories and durable acknowledgements for every matching folder.
    File objects and resumable chunks use the remaining persistent lanes, with
-   each repository assigned to one bulk lane. Each lane proxies bounded
+   object hashes within each repository assigned across all bulk lanes. Each lane proxies bounded
    offer/exchange/apply pages to its local worker. Server
    responses include changes in the opposite direction. Reconnect resumes from
    durable inventories and object offsets, including after worker restart.
@@ -40,14 +40,115 @@ in published pages. Checkpoints remain local. There are no per-device grants,
 certificate pins, enrollment approval records, protected credential backends or
 application-managed OS permissions.
 
+## Independent synchronization and mounting: lifecycle study
+
+This is a proposed lifecycle change, not the current implementation. Inspection
+on 2026-10-12 confirmed that replication itself supports unmounted workers:
+`paired_sync` operates on `Engine`/`Store`, and `bulk_sync` opens independent store
+connections. Neither needs a filesystem adapter. Existing headless integration
+tests exercise real metadata and object exchange through orchestrator processes.
+
+The coupling is in startup and management. `main::worker` starts the mount before
+`runtime::start_rpc`; a mount error exits the worker before it can advertise a
+repository. The supervisor equates worker readiness with the requested mount,
+and `Action::Stop` stops the worker. Initial receipt already uses a headless worker,
+but replaces that process once metadata is ready to mount. Mount path changes
+also require stopping the worker. This explains how an empty leftover Docker mount
+directory can block every sync lane while the orchestrators remain connected.
+
+Keep one durable state owner and make the filesystem adapter optional throughout
+that worker's lifetime. Persist separate `sync_enabled` and `mount_enabled` intent,
+with the assigned path independent of whether it is currently attached. Recover
+the store and establish RPC first; report `worker_ready` before attempting any
+mount. A serialized mount controller then attaches/detaches the adapter without
+holding the engine or supervisor lock during OS calls. Mount errors and retries
+must update mount status only, leaving discovery, metadata commits and object
+transfers available. Store integrity/recovery failures remain worker health errors.
+
+| Sync intent | Mount intent | Expected operation |
+| --- | --- | --- |
+| Enabled | Detached or failed | Headless replication continues; mount can retry independently. |
+| Enabled | Attached | Filesystem operations and replication share the recovered state. |
+| Paused | Attached | Local filesystem remains usable; missing remote content reports unavailable. |
+| Paused | Detached | Worker can stop once pending saves and management operations are settled. |
+
+Explicit mount/unmount and pause/resume-sync actions should coexist with the
+existing stop-folder action, whose full-stop semantics must remain clear. Sync
+pause must gate both outbound scheduling and inbound exchange, including active
+bulk requests at bounded page boundaries; suppressing only the local dialer would
+still allow peers to send changes. Current saves remain durable and queued for
+resume. Initial metadata readiness gates automatic mounting only, with no worker
+restart, identity change or transfer-cursor reset.
+
+There are adapter details to address before implementing dynamic mounting:
+
+- WinFsp's `ENGINE: OnceLock` is assigned by `mount::start` and rejects a second
+  attempt, even after some failed first attempts. Bind it once to the state owner
+  and permit adapter recreation only for that same engine.
+- Both adapter stop paths fence filesystem opens using `switching`; shutdown
+  assumes process exit. Ordinary detach/retry must restore a well-defined fence
+  state, clear stale handles only after callbacks drain, and preserve dirty saves.
+- FUSE dispatch/remount and WinFsp remount failures currently enter the common
+  `Engine::health` field. Separate mount health from storage/recovery health so
+  a mount error cannot falsely mark replication unhealthy or prevent safe detach.
+- Keep discovery's mount information current on attach/detach, and discard or
+  coalesce filesystem notifications while detached. Reattaching reads the current
+  projection, so replaying every headless change as an OS notification is unnecessary.
+- Linux has `start_managed`/`recover_managed` helpers, but the current worker calls
+  plain `start`. Persistent mount ownership and mount-namespace checks must precede
+  recovery; do not automatically remove arbitrary existing directories or mounts.
+  Container mount propagation remains a separate deployment concern.
+
+Qualify the change with failed-mount-but-successful-sync tests, repeated attach /
+detach on the same PID and RPC endpoint, ongoing content transfer during detach,
+busy-file refusal without stopping sync, initial sync without worker replacement,
+pause behavior in both directions, and daemon restart preserving both intents.
+Run adapter cases on WinFsp and real Linux FUSE. This gives lifecycle independence;
+a native adapter crash can still kill its host process. Full crash isolation would
+require a separate adapter process and a filesystem RPC boundary, a larger follow-up.
+
 Pool lanes reconnect independently with exponential backoff after errors. Lane 0
 is always reserved, including when bulk lanes fail; bulk work never borrows it.
 The default four connections provide one control lane and three bulk lanes.
-Configured totals of one are promoted to two. Stable repository sharding across
-bulk lanes preserves serial object transfers while several folders can transfer
-concurrently. Only bulk exchanges update object resume cursors, so delayed
-metadata replies cannot rewind an in-flight transfer. Bulk pages retain event
-manifests for object authorization and recovery; duplicate events are idempotent.
+Configured totals of one are promoted to two. Bulk protocol 1 shards object hashes
+across the pool, keeping each object sequential while different objects transfer
+concurrently. Bulk pages carry object inventory, demand, offsets and bytes only;
+they never activate or acknowledge causal metadata. A sender offers only shared
+objects referenced by metadata already advertised by the receiver. Resume state
+comes from durable receiver spools, so reconnection and changes to pool size do
+not lose progress. Overlapping retries verify the existing prefix before append.
+Per-object locks also coordinate duplicate deliveries through different peers.
+
+Worker RPC sockets are persistent and owned separately by each peer lane, on
+both dialing and serving orchestrators. Application errors preserve the socket;
+transport errors discard it without replaying an uncertain request. Changed
+worker addresses and idle sockets reconnect before the next call. Content-bearing
+rounds and advancing metadata yield for 10 ms instead of waiting for the idle sync interval. This retains
+serial object cursors and the reserved control lane while avoiding a fixed pause
+after every content page. Repository status exposes the last successful exchange's
+object byte counts and offer/exchange/apply times; remote exchange time includes
+network and remote worker processing, not just wire latency.
+
+Bulk workers use independent SQLite connections and perform disk I/O outside
+the semantic engine mutex. Object registration uses a short immediate transaction
+after durable installation; SQLite still serializes writers. Discovery also reads
+committed state independently. Metadata activation commits at most 32 events or
+a 50 ms target per exchange, checked between atomic events. Remaining events stay
+in the durable inbox without acknowledgement. Incoming rows are staged together;
+already accepted duplicate events are checked without replaying them. Contended
+metadata requests return `WORKER_BUSY` for a short retry instead of accumulating
+threads waiting for the engine. Individual atomic event validation is not preempted.
+
+The HTTP upgrade request/response negotiates `X-Tkfs-Wire: tkfs-binary-gzip-v1`.
+Its versioned binary envelope contains JSON metadata and raw object attachments.
+Each message independently uses gzip level 1 only when beneficial, without shared
+compression dictionaries. Receivers bound wire bytes, declared/inflated bytes and
+the reconstructed JSON size; invalid lengths, CRCs, duplicate attachment paths and
+trailing members are rejected. Content hashes continue to cover original bytes.
+Without the echoed capability, the connection uses ordinary JSON. Pairing separately
+negotiates bulk protocol 1 and each socket's object shard. Older peers retain the
+serial repository bulk path and dedicated control lane; compression and parallel
+bulk require support on both ends. Authentication and TLS validation are unchanged.
 
 Roles are negotiated during the pairing handshake. A control session rejects
 object payloads and emits metadata-only replies. A peer that does not acknowledge
@@ -73,7 +174,8 @@ all shared history; selective retention and garbage collection are not added.
 
 Bulk receipt writes resumable spools, verifies the completed file once and moves
 it into CAS. Hashing, file flushes and installation run outside the engine mutex;
-the engine registers completed objects on its serialized SQLite connection.
+parallel bulk lanes register completed objects through short SQLite writer
+transactions; the legacy path registers through the engine connection.
 Registration is distinct from metadata activation. Interrupted registration can
 be recovered by retransmission, and stale/complete partial cursors are repairable.
 

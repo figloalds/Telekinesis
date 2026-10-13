@@ -55,6 +55,23 @@ continue syncing. Failed folders retry with exponential delays from 1 to 30
 seconds; a successful exchange clears the error and retry state. These status
 fields describe the last exchange, not a distributed synchronization barrier.
 
+`transfer` reports `sent_object_bytes`, `received_object_bytes`, `offer_ms`,
+`remote_exchange_ms`, `apply_ms`, and `total_ms` for the last successful exchange.
+Byte counts are unencoded object payload sizes, not total JSON/TLS traffic.
+Remote time includes remote processing. These measurements help separate local
+worker overhead from peer round-trip cost; they are not a link-capacity test.
+
+Each lane reports `transport` (`tkfs-binary-gzip-v1` or `json`) and `parallel_bulk`.
+With parallel bulk enabled, every bulk lane can serve every repository, partitioned
+by object hash; `transfer.object_lane` identifies that partition. Metadata
+`caught_up` observations belong to the control lane. Bulk success does not certify
+metadata convergence. `total_sent_object_bytes` and `total_received_object_bytes`
+accumulate successful payload transfers for each repository/lane (including
+retries, reset when the lane is recreated). `transfer.sent_wire_bytes` and
+`received_wire_bytes` count encoded WebSocket message payloads for the last peer
+exchange, including metadata but excluding WS/TLS/TCP overhead. Comparing them
+with object bytes shows the effect of binary encoding and optional gzip.
+
 Remote discovery omits workers whose summaries cannot be read. Their local
 `manage inspect` / `manage list` results expose `publication_error`, which clears
 after a successful discovery pass.

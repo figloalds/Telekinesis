@@ -269,7 +269,7 @@ fn bulk_install_wait_does_not_block_control_rpc() {
     let info = runtime::start_rpc(b.clone(), &dir.path().join("b"), None).unwrap();
     let page = paired_sync::offer(&a, &ab, None).unwrap();
     let remote = info.clone();
-    let transfer_lock = b.lock().unwrap().transfers.clone();
+    let transfer_lock = b.lock().unwrap().transfers.for_object(&hash(b"bytes"));
     let guard = transfer_lock.lock().unwrap();
     let install = std::thread::spawn(move || {
         runtime::rpc(

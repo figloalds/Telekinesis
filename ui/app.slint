@@ -1,5 +1,5 @@
 import { ScrollView, TextEdit, AboutSlint, Palette } from "std-widgets.slint";
-export struct FolderRow { state: string, label: string, mount: string, running: bool, starting: bool, error: string }
+export struct FolderRow { state: string, label: string, mount: string, running: bool, starting: bool, error: string, sync: string }
 export struct ConflictRow { id: string, description: string, field: string, entity: string }
 export struct RevisionRow { id: string, description: string }
 export struct RemoteRow { repo: string, label: string }
@@ -101,6 +101,8 @@ export component AppWindow inherits Window {
     in property <int> online-count;
     in property <[FolderRow]> folders;
     in property <string> folder-summary;
+    in property <string> network-summary;
+    in-out property <bool> show-conflicts: false;
     in property <int> conflict-count;
     in property <int> conflict-offset;
     callback conflict-page(int);
@@ -227,7 +229,10 @@ export component AppWindow inherits Window {
                                     HorizontalLayout { padding-left: 16px; padding-right: 16px; padding-top: 12px; padding-bottom: 12px; spacing: 14px;
                                         HorizontalLayout { width: root.name-column; spacing: 10px; alignment: start;
                                             FolderIcon {}
-                                            Label { text: folder.label; font-weight: 600; horizontal-stretch: 1; }
+                                            VerticalLayout { spacing: 1px;
+                                                Label { text: folder.label; font-weight: 600; horizontal-stretch: 1; }
+                                                Muted { text: folder.sync; font-size: 10px; }
+                                            }
                                         }
                                         Label { text: folder.mount == "" ? "No mount point" : folder.mount; font-family: "Consolas"; font-size: 12px; horizontal-stretch: 1.2; }
                                         Rectangle { width: 118px;
@@ -240,8 +245,8 @@ export component AppWindow inherits Window {
                                             ActionButton { text: folder.starting ? "Cancel" : folder.running ? (folder.mount == "" ? "Stop" : "Unmount") : (folder.mount == "" ? "Start" : "Mount"); enabled: root.interactive;
                                                 clicked => { if folder.running || folder.starting { root.stop-folder(folder.state); } else { root.start-folder(folder.state); } }
                                             }
-                                            ActionButton { text: "Sync / conflicts"; enabled: root.interactive && folder.running;
-                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.selected-conflict = ""; root.selected-revision = ""; root.dialog = "folder"; root.folder-details(folder.state); }
+                                            ActionButton { text: "Sync / conflicts"; enabled: root.interactive;
+                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.selected-conflict = ""; root.selected-revision = ""; root.show-conflicts = false; root.dialog = "folder"; root.folder-details(folder.state); }
                                             }
                                             ActionButton { text: "Change path"; enabled: root.interactive;
                                                 clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.mount-path = folder.mount; root.dialog = (folder.running || folder.starting) ? "stop-first" : "mount"; }
@@ -342,6 +347,19 @@ export component AppWindow inherits Window {
                     ActionButton { text: "Shut down daemon"; enabled: !root.busy; clicked => { root.shutdown(); } }
                 }
                 if root.dialog == "folder": VerticalLayout { spacing: 10px;
+                    HorizontalLayout { spacing: 8px;
+                        ActionButton { text: "Synchronization"; primary: !root.show-conflicts; clicked => { root.show-conflicts = false; } }
+                        ActionButton { text: "Conflicts (" + root.conflict-count + ")"; primary: root.show-conflicts; clicked => { root.show-conflicts = true; } }
+                        Rectangle { horizontal-stretch: 1; }
+                        Muted { text: "Refreshes every 5 seconds"; }
+                    }
+                    if !root.show-conflicts: VerticalLayout { spacing: 8px;
+                        Label { text: "Local content and metadata"; font-weight: 600; }
+                        TextEdit { text: root.folder-summary; read-only: true; height: 140px; }
+                        Label { text: "Peers and transfer lanes"; font-weight: 600; }
+                        TextEdit { text: root.network-summary; read-only: true; height: 260px; }
+                    }
+                    if root.show-conflicts: VerticalLayout { spacing: 10px;
                     TextEdit { text: root.folder-summary; read-only: true; height: 100px; }
                     HorizontalLayout { spacing: 8px;
                         Label { text: "Unresolved conflicts (" + root.conflict-count + ")"; font-weight: 600; horizontal-stretch: 1; }
@@ -379,6 +397,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     Muted { text: "Choosing a revision records an explicit resolution. Close open files before resolving. Missing previews download on demand."; wrap: word-wrap; }
+                    }
                 }
                 if root.dialog == "details": TextEdit { text: root.status; read-only: true; height: 180px; }
                 if root.dialog != "details": Label { text: root.busy ? "Working…" : root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; wrap: word-wrap; }

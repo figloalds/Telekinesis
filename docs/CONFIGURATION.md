@@ -24,7 +24,14 @@ sync_interval_ms = 500
 | `maximum_running` | Maximum supervised workers, 1–64; default 8. |
 | `network.listen` | Plain WS bind address. Default `127.0.0.1:43180`. Use `""` to disable inbound networking, or `"0.0.0.0:43180"` to bind all IPv4 interfaces. |
 | `network.connections` | Requested total persistent connections per peer, 1–16; default 4. Effective minimum 2: one reserved control/event lane plus at least one bulk lane. |
-| `network.sync_interval_ms` | Delay between sync passes, 50–60000 ms; default 500. |
+| `network.sync_interval_ms` | Idle polling delay, 50–60000 ms; default 500. Rounds carrying content or advancing metadata yield for 10 ms. |
+
+With bulk protocol 1, object hashes within each repository share all bulk lanes.
+An individual object stays sequential; increasing the pool helps concurrent
+objects, not striping a single file. Binary framing and beneficial gzip level 1
+are negotiated automatically on peer and worker sockets. `manage peers` reports
+the selected transport and parallel-bulk capability; older endpoints fall back
+to JSON and one bulk lane per repository while preserving the control reserve.
 
 Restart the daemon after editing TOML. Folder mount changes and pairing changes
 use the management API and persist immediately. A stopped folder can be assigned

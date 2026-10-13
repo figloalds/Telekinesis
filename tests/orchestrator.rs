@@ -20,6 +20,9 @@ struct Node {
 }
 impl Node {
     fn new() -> Self {
+        Self::with_interval(50)
+    }
+    fn with_interval(interval: u64) -> Self {
         let root = tempfile::tempdir().unwrap();
         #[cfg(target_os = "linux")]
         {
@@ -27,7 +30,7 @@ impl Node {
             fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
         }
         let path = root.path().join("orchestrator.toml");
-        fs::write(&path,"format_version=2\ndata_directory='data'\ndefault_mount_directory='mounts'\nmaximum_running=8\n[network]\nlisten='127.0.0.1:0'\nconnections=3\nsync_interval_ms=50\n").unwrap();
+        fs::write(&path,format!("format_version=2\ndata_directory='data'\ndefault_mount_directory='mounts'\nmaximum_running=8\n[network]\nlisten='127.0.0.1:0'\nconnections=3\nsync_interval_ms={interval}\n")).unwrap();
         let config = Config::load(&path).unwrap();
         let mut node = Self {
             root,
@@ -169,6 +172,111 @@ fn write(p: &Value, name: &str, bytes: &[u8]) {
         p,
         json!({"op":"import","path":name,"hex":hex::encode(bytes)}),
     );
+}
+
+#[test]
+fn active_bulk_pages_do_not_wait_for_the_idle_poll_interval() {
+    let a = Node::with_interval(5000);
+    let b = Node::with_interval(5000);
+    let pa = a.create("Bulk source", true);
+    let bytes = vec![37; 6 * 1024 * 1024];
+    write(&pa, "large.bin", &bytes);
+    b.pair(&a, &a.code());
+    let pb = b.receive(&a, &pa);
+    // Wait for discovery/metadata authorization and the first data page. Those
+    // may legitimately use the idle interval; subsequent pages must not.
+    wait_for(|| {
+        let content = rpc(&pb, json!({"op":"status"}))["content"].clone();
+        content["partial_bytes"].as_u64().unwrap_or(0) > 0
+            || content["current_objects"] == 1 && content["complete"] == true
+    });
+    let started = Instant::now();
+    loop {
+        let content = rpc(&pb, json!({"op":"status"}))["content"].clone();
+        if content["current_objects"] == 1 && content["complete"] == true {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "active content transfer was throttled by idle polling: {}",
+            b.call(Action::Peers)
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(has(&pb, "large.bin", &bytes));
+    let peers = b.call(Action::Peers);
+    assert_eq!(peers[0]["lanes"][0]["role"], "control");
+    assert!(peers[0]["lanes"].as_array().unwrap().iter().any(|lane| {
+        lane["repositories"][pa["repo"].as_str().unwrap()]["transfer"]["received_object_bytes"]
+            .is_number()
+    }));
+}
+
+#[test]
+fn one_repository_uses_all_bulk_lanes_and_keeps_control_free_of_objects() {
+    let a = Node::new();
+    let b = Node::new();
+    let pa = a.create("Parallel source", true);
+    let mut contents = Vec::new();
+    for index in 0..3 {
+        let lane = tkfs::bulk_sync::Lane { index, count: 3 };
+        let bytes = (0u64..)
+            .map(|seed| seed.to_le_bytes().repeat(8192))
+            .find(|bytes| lane.owns(&hash(bytes)))
+            .unwrap();
+        let name = format!("lane-{index}.bin");
+        write(&pa, &name, &bytes);
+        contents.push((name, bytes));
+    }
+    b.call(Action::Pair {
+        endpoint: a.endpoint(),
+        code: a.code(),
+        connections: Some(4),
+    });
+    let pb = b.receive(&a, &pa);
+    wait_for(|| contents.iter().all(|(name, bytes)| has(&pb, name, bytes)));
+    wait_for(|| {
+        let peers = b.call(Action::Peers);
+        (1..4).all(|index| peers[0]["lanes"][index]["repositories"][pa["repo"].as_str().unwrap()]["total_received_object_bytes"].as_u64().unwrap_or(0) >= 65536)
+    });
+    let peers = b.call(Action::Peers);
+    for lane in peers[0]["lanes"].as_array().unwrap() {
+        assert_eq!(lane["parallel_bulk"], true);
+        assert_eq!(lane["transport"], "tkfs-binary-gzip-v1");
+    }
+    let control = &peers[0]["lanes"][0]["repositories"][pa["repo"].as_str().unwrap()];
+    assert_eq!(control["total_received_object_bytes"], 0);
+    assert_eq!(control["total_sent_object_bytes"], 0);
+    let inspect = || {
+        b.call(Action::Inspect {
+            state: pb["state"].as_str().unwrap().into(),
+        })
+    };
+    wait_for(|| {
+        let status = inspect();
+        let lanes = status["sync"][0]["lanes"].as_array().unwrap();
+        status["sync"][0]["remote_available"] == true
+            && lanes.len() == 4
+            && lanes[1..].iter().all(|l| {
+                let s = &l["repository"];
+                s["object_inventory"]["local_available"]
+                    == s["object_inventory"]["remote_available"]
+                    && s["object_inventory"]["local_available"]
+                        .as_u64()
+                        .unwrap_or(0)
+                        > 0
+                    && s["last_progress_ms"].is_u64()
+                    && s["total_received_wire_bytes"].as_u64().unwrap_or(0) > 0
+            })
+    });
+    // A connected orchestrator is not evidence of an available folder worker.
+    a.call(Action::Stop {
+        state: pa["state"].as_str().unwrap().into(),
+    });
+    wait_for(|| {
+        let status = inspect();
+        status["sync"][0]["connected"] == true && status["sync"][0]["remote_available"] == false
+    });
 }
 fn wait_for(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -351,7 +459,7 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     assert!(lane["repositories"][repo]["retry_at_ms"].is_u64());
     fs::write(&object, bytes).unwrap();
     wait_for(|| has(&broken_b, "repair.txt", bytes));
-    wait_for(|| b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["caught_up"] == true);
+    wait_for(|| b.call(Action::Peers)[0]["lanes"][0]["repositories"][repo]["caught_up"] == true);
 
     // Corrupt outbound content must also leave the other folder and socket usable.
     let state = broken["state"].as_str().unwrap().to_owned();
@@ -377,7 +485,7 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     wait_for(|| {
         let peers = b.call(Action::Peers);
         let status = &peers[0]["lanes"][1]["repositories"][repo];
-        status["caught_up"] == true
+        peers[0]["lanes"][0]["repositories"][repo]["caught_up"] == true
             && status["error"].is_null()
             && status["retry_at_ms"].is_null()
             && status["consecutive_failures"] == 0
@@ -832,4 +940,97 @@ fn real_partial_mount_fetches_on_read_without_blocking_unrelated_metadata() {
         bytes
     );
     reader.join().unwrap();
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn received_mount_waits_for_complete_metadata_across_daemon_restart() {
+    #[cfg(target_os = "linux")]
+    if !Path::new("/dev/fuse").exists() {
+        return;
+    }
+    use tkfs::{
+        core::Store,
+        paired_sync::{self, SyncRoute},
+        runtime::Engine,
+    };
+    let a = Node::new();
+    let mut b = Node::new();
+    let pa = a.create("Bootstrap source", true);
+    let original = tempfile::tempdir().unwrap();
+    let mut author = Engine::new(
+        Store::initialize(original.path(), pa["repo"].as_str().unwrap(), &id()).unwrap(),
+    );
+    author.store.create("parent", "directory").unwrap();
+    author.store.create("parent/child", "directory").unwrap();
+    let route = SyncRoute {
+        peer: id(),
+        repo: author.store.repo.clone(),
+        local_replica: author.store.device.clone(),
+        remote_replica: pa["device"].as_str().unwrap().into(),
+    };
+    let reverse = SyncRoute {
+        local_replica: route.remote_replica.clone(),
+        remote_replica: route.local_replica.clone(),
+        ..route.clone()
+    };
+    let full = paired_sync::offer(&author, &route, None).unwrap();
+    let mut incomplete = full.clone();
+    incomplete
+        .bundle
+        .events
+        .retain(|e| !e.dependencies.is_empty());
+    assert_eq!(incomplete.bundle.events.len(), 1);
+    rpc(
+        &pa,
+        json!({"op":"published-exchange","route":reverse,"page":incomplete,"metadata_only":true}),
+    );
+    assert_eq!(rpc(&pa, json!({"op":"status"}))["incoming_pending"], 1);
+    b.pair(&a, &a.code());
+    let mount = b.root.path().join("received");
+    let pb = b
+        .try_call(Action::Receive {
+            endpoint: a.endpoint(),
+            repo: pa["repo"].as_str().unwrap().into(),
+            label: "Received".into(),
+            mount: Some(mount.clone()),
+            headless: false,
+        })
+        .unwrap();
+    let state = pb["state"].as_str().unwrap().to_owned();
+    let inspect = |node: &Node| {
+        node.try_call(Action::Inspect {
+            state: state.clone(),
+        })
+        .unwrap()
+    };
+    wait_for(|| inspect(&b)["startup_phase"] == "synchronizing remote metadata");
+    wait_for(|| inspect(&b)["sync"][0]["metadata"]["last_success_ms"].is_number());
+    assert_eq!(inspect(&b)["running"], false);
+    assert_eq!(inspect(&b)["mounted"], false);
+    assert!(!mount.exists());
+    // Waiting for remote prerequisites is not a worker-start timeout, and its
+    // durable marker must survive a supervisor restart.
+    b.stop();
+    b.start();
+    wait_for(|| inspect(&b)["startup_phase"] == "synchronizing remote metadata");
+    assert_eq!(inspect(&b)["initial_sync_pending"], true);
+    assert!(!mount.exists());
+    rpc(
+        &pa,
+        json!({"op":"published-exchange","route":reverse,"page":full,"metadata_only":true}),
+    );
+    wait_for(|| inspect(&b)["running"] == true);
+    assert_eq!(inspect(&b)["initial_sync_pending"], false);
+    assert_eq!(inspect(&b)["mounted"], true);
+    assert!(mount.join("parent/child").is_dir());
+    // Once initialized, remounting remains possible with the source stopped.
+    a.call(Action::Stop {
+        state: pa["state"].as_str().unwrap().into(),
+    });
+    b.call(Action::Stop {
+        state: state.clone(),
+    });
+    b.call(Action::Start { state });
+    assert!(mount.join("parent/child").is_dir());
 }

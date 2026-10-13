@@ -482,6 +482,12 @@ impl Store {
         Ok(bytes)
     }
     pub fn object_size(&self, object: &str) -> Result<u64> {
+        self.object_size_if_known(object)?
+            .with_context(|| format!("CONTENT_SIZE_UNKNOWN: {object}"))
+    }
+    /// Legacy journals may reference unavailable bytes without a size descriptor.
+    /// Preserve that distinction rather than blocking metadata or inventing a size.
+    pub fn object_size_if_known(&self, object: &str) -> Result<Option<u64>> {
         valid_object(object)?;
         if let Some(size) = self
             .db
@@ -492,11 +498,13 @@ impl Store {
             )
             .optional()?
         {
-            return Ok(size);
+            return Ok(Some(size));
         }
-        Ok(fs::metadata(self.root.join("objects").join(object))
-            .map_err(object_error)?
-            .len())
+        match fs::metadata(self.root.join("objects").join(object)) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(object_error(error)),
+        }
     }
     pub fn remember_object_size(&self, object: &str, size: u64) -> Result<()> {
         valid_object(object)?;
@@ -544,7 +552,7 @@ impl Store {
     }
     pub fn object_state(&self, object: &str) -> Result<Value> {
         let available = self.object_available(object);
-        let size = self.object_size(object)?;
+        let size = self.object_size_if_known(object)?;
         let partial = fs::metadata(self.root.join("incoming-objects").join(object))
             .ok()
             .map(|m| m.len());
@@ -565,7 +573,7 @@ impl Store {
             "available"
         } else if error.is_some() {
             "retrying"
-        } else if partial == Some(size) {
+        } else if size.is_some() && partial == size {
             "verifying"
         } else if partial.is_some() {
             "downloading"
@@ -575,22 +583,28 @@ impl Store {
             "missing"
         };
         Ok(
-            json!({"object":object,"size":size,"state":state,"downloaded":partial.unwrap_or(0),"error":if available { None } else { error }}),
+            json!({"object":object,"size":size,"size_known":size.is_some(),"state":state,"downloaded":partial.unwrap_or(0),"error":if available { None } else { error }}),
         )
     }
     /// Separate connection for bulk I/O. No replay, projection rebuild or engine
     /// mutex; accepted metadata remains owned by the worker's semantic engine.
     pub fn transfer_view(&self) -> Result<Self> {
-        let db = Connection::open(self.root.join("metadata.sqlite"))?;
+        Self::open_transfer(&self.root, &self.repo, &self.device)
+    }
+    pub(crate) fn open_transfer(root: &Path, repo: &str, device: &str) -> Result<Self> {
+        let db = Connection::open(root.join("metadata.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA synchronous=FULL;")?;
+        let active = db.query_row("SELECT value FROM config WHERE key='active'", [], |row| {
+            row.get(0)
+        })?;
         Ok(Self {
             db,
-            root: self.root.clone(),
-            repo: self.repo.clone(),
-            device: self.device.clone(),
-            active: self.active.clone(),
-            generation: self.generation,
+            root: root.to_owned(),
+            repo: repo.to_owned(),
+            device: device.to_owned(),
+            active,
+            generation: 0,
             view_cache: RefCell::new(None),
         })
     }
@@ -2211,6 +2225,14 @@ impl Store {
         bundle: Bundle,
         allowed_devices: &BTreeSet<String>,
     ) -> Result<Vec<String>> {
+        self.receive_with_budget(bundle, allowed_devices, None)
+    }
+    pub(crate) fn receive_with_budget(
+        &mut self,
+        bundle: Bundle,
+        allowed_devices: &BTreeSet<String>,
+        budget: Option<usize>,
+    ) -> Result<Vec<String>> {
         ensure!(bundle.repo == self.repo, "REPOSITORY_MISMATCH");
         for b in &bundle.branches {
             ensure!(b.shared, "PRIVATE_BRANCH_REJECTED");
@@ -2234,10 +2256,24 @@ impl Store {
                 [h],
             )?;
         }
+        let mut accepted = Vec::new();
+        let tx = self.db.savepoint()?;
         for e in bundle.events {
             let payload = serde_json::to_string(&e)?;
-            let old: Option<String> = self
-                .db
+            let committed: Option<String> = tx
+                .query_row("SELECT payload FROM events WHERE id=?", [&e.id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            if let Some(committed) = committed {
+                ensure!(
+                    serde_json::from_str::<Event>(&committed)? == e,
+                    "EVENT_ID_REUSED"
+                );
+                accepted.push(e.id);
+                continue;
+            }
+            let old: Option<String> = tx
                 .query_row(
                     "SELECT payload FROM incoming_events WHERE id=?",
                     [&e.id],
@@ -2247,13 +2283,14 @@ impl Store {
             if let Some(old) = old {
                 ensure!(old == payload, "EVENT_ID_REUSED");
             } else {
-                self.db.execute(
+                tx.execute(
                     "INSERT INTO incoming_events(id,payload) VALUES(?,?)",
                     params![e.id, payload],
                 )?;
             }
         }
-        let accepted = self.drain_incoming()?;
+        tx.commit()?;
+        accepted.extend(self.drain_incoming_budget(budget)?);
         for b in bundle.branches {
             if let Ok(existing) = self.branch(&b.id) {
                 ensure!(existing == b, "BRANCH_DESCRIPTOR_CHANGED");
@@ -2276,6 +2313,9 @@ impl Store {
         Ok(accepted)
     }
     fn drain_incoming(&mut self) -> Result<Vec<String>> {
+        self.drain_incoming_budget(None)
+    }
+    fn drain_incoming_budget(&mut self, budget: Option<usize>) -> Result<Vec<String>> {
         if !self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM incoming_events WHERE error IS NULL)",
             [],
@@ -2289,7 +2329,7 @@ impl Store {
         // All referenced objects were installed durably before entering here.
         let name = format!("incoming_{}", id().replace('-', ""));
         self.db.execute_batch(&format!("SAVEPOINT {name}"))?;
-        let result = self.drain_incoming_inner();
+        let result = self.drain_incoming_inner(budget);
         match result {
             Ok(accepted) => {
                 if let Err(error) = self.db.execute_batch(&format!("RELEASE {name}")) {
@@ -2307,8 +2347,10 @@ impl Store {
             }
         }
     }
-    fn drain_incoming_inner(&mut self) -> Result<Vec<String>> {
+    fn drain_incoming_inner(&mut self, budget: Option<usize>) -> Result<Vec<String>> {
         let mut accepted = vec![];
+        let started = std::time::Instant::now();
+        let mut attempts = 0;
         loop {
             let staged: Vec<(String, Option<String>)> = self
                 .db
@@ -2335,6 +2377,12 @@ impl Store {
                 .collect();
             let mut progress = false;
             for (e, error) in &staged {
+                if budget.is_some_and(|maximum| {
+                    attempts >= maximum
+                        || attempts > 0 && started.elapsed() >= std::time::Duration::from_millis(50)
+                }) {
+                    return Ok(accepted);
+                }
                 crate::startup::progress("recovering incoming events");
                 if error.is_some() {
                     continue;
@@ -2351,7 +2399,10 @@ impl Store {
                     {
                         continue;
                     }
-                    Ok(()) => self.commit_ready(e.clone(), false),
+                    Ok(()) => {
+                        attempts += 1;
+                        self.commit_ready(e.clone(), false)
+                    }
                 };
                 match result {
                     Ok(()) => {
@@ -2431,8 +2482,11 @@ impl Store {
         let branches: Vec<_> = self.branches()?.into_iter().filter(|b| b.shared).collect();
         let mut used = serde_json::to_vec(&branches)?.len() + 1024;
         let mut events = vec![];
-        for e in self
-            .events()?
+        // Inventory acknowledges committed events only. Sending a UUID-sorted
+        // prefix can fill every page with children whose parents never fit, so
+        // the receiver cannot ACK and the same prefix repeats forever.
+        let journal = self.events()?;
+        for e in causal_order(&journal)
             .into_iter()
             .filter(|e| e.branch.shared && !known.contains(&e.id))
         {
@@ -2442,9 +2496,13 @@ impl Store {
                 break;
             }
             used += size;
-            events.push(e);
+            events.push(e.clone());
         }
-        let available = self.shared_object_inventory()?;
+        let available = if include_objects {
+            self.shared_object_inventory()?
+        } else {
+            BTreeSet::new()
+        };
         let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
         let mut objects = BTreeMap::new();
         for h in hashes
@@ -2478,7 +2536,7 @@ impl Store {
     pub fn acknowledge(&self, events: &[String]) -> Result<()> {
         for rev in events {
             self.db.execute(
-                "UPDATE outbox SET acknowledged=1 WHERE event=? AND event IN
+                "UPDATE outbox SET acknowledged=1 WHERE event=? AND acknowledged=0 AND event IN
                     (SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1)",
                 [rev],
             )?;
@@ -2684,6 +2742,15 @@ impl Store {
         events: &[Event],
         allowed: &BTreeSet<String>,
     ) -> Result<Vec<(String, u64)>> {
+        self.receive_parts_data_locked(parts, events, allowed, None)
+    }
+    pub(crate) fn receive_parts_data_locked(
+        &self,
+        parts: BTreeMap<String, ObjectPart>,
+        events: &[Event],
+        allowed: &BTreeSet<String>,
+        locks: Option<&crate::bulk_sync::ObjectLocks>,
+    ) -> Result<Vec<(String, u64)>> {
         let mut completed = vec![];
         ensure!(
             events
@@ -2691,6 +2758,9 @@ impl Store {
                 .all(|e| e.repo == self.repo && e.branch.shared && allowed.contains(&e.device)),
             "UNAUTHORIZED_EVENT"
         );
+        if parts.is_empty() {
+            return Ok(completed);
+        }
         let authorized: BTreeSet<_> = self
             .events()?
             .iter()
@@ -2698,10 +2768,15 @@ impl Store {
             .chain(events.iter())
             .flat_map(Event::objects)
             .collect();
+        // One availability snapshot per page, not one full CAS scan per object.
+        // Part keys are unique; completed objects are registered by the caller.
+        let available = self.shared_object_inventory()?;
         for (object, part) in parts {
             valid_object(&object)?;
             ensure!(authorized.contains(&object), "UNAUTHORIZED_OBJECT");
-            if self.shared_object_inventory()?.contains(&object) {
+            let lock = locks.map(|locks| locks.for_object(&object));
+            let _guard = lock.as_ref().map(|lock| lock.lock().unwrap());
+            if available.contains(&object) {
                 self.verify_object(&object)?;
                 continue;
             }
@@ -2742,17 +2817,21 @@ impl Store {
                 continue;
             }
             if part.offset < length {
-                ensure!(
-                    part.offset + bytes.len() as u64 <= length,
-                    "OBJECT_PART_OVERLAP"
-                );
+                // Concurrent peers or a changed pool may use different chunk
+                // boundaries. Verify the durable overlap, then append its suffix.
+                let overlap = bytes.len().min((length - part.offset) as usize);
                 file.seek(SeekFrom::Start(part.offset))?;
-                let mut old = vec![0; bytes.len()];
+                let mut old = vec![0; overlap];
                 file.read_exact(&mut old)?;
-                if old != bytes {
+                if old != bytes[..overlap] {
                     file.set_len(0)?;
                     file.sync_all()?;
                     bail!("OBJECT_PART_CHANGED");
+                }
+                if overlap < bytes.len() {
+                    file.seek(SeekFrom::Start(length))?;
+                    file.write_all(&bytes[overlap..])?;
+                    file.sync_all()?;
                 }
             } else {
                 file.seek(SeekFrom::Start(length))?;
@@ -3179,6 +3258,13 @@ fn validate_direct_links(
     Ok(())
 }
 fn activated_ids(events: &[Event]) -> BTreeSet<String> {
+    causal_order(events)
+        .into_iter()
+        .map(|e| e.id.clone())
+        .collect()
+}
+fn causal_order(events: &[Event]) -> Vec<&Event> {
+    let by_id: BTreeMap<_, _> = events.iter().map(|e| (e.id.as_str(), e)).collect();
     let mut degrees = BTreeMap::new();
     let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     let mut ready = BTreeSet::new();
@@ -3199,10 +3285,10 @@ fn activated_ids(events: &[Event]) -> BTreeSet<String> {
                 .push(e.id.as_str());
         }
     }
-    let mut active = BTreeSet::new();
+    let mut active = Vec::new();
     while let Some(id) = ready.pop_first() {
         crate::startup::progress("validating causal history");
-        active.insert(id.to_owned());
+        active.push(by_id[id]);
         if let Some(children) = children.get(id) {
             for child in children {
                 let degree = degrees.get_mut(child).unwrap();

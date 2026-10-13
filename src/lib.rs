@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod bulk_sync;
 pub mod core;
 #[cfg(windows)]
 pub mod mount;
@@ -11,4 +12,5 @@ pub mod pairing_code;
 pub mod runtime;
 pub mod staging;
 pub mod startup;
+mod wire;
 pub mod ws;

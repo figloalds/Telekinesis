@@ -200,12 +200,23 @@ struct LinkStatus {
     exchanges: u64,
     last_success_ms: Option<u64>,
     error: Option<String>,
+    transport: Option<String>,
+    parallel_bulk: bool,
     repositories: BTreeMap<String, RepositoryStatus>,
 }
 #[derive(Default, Clone, Serialize)]
 struct RepositoryStatus {
     last_success_ms: Option<u64>,
     caught_up: bool,
+    metadata_caught_up: bool,
+    metadata_progress: Option<Value>,
+    transfer: Option<Value>,
+    object_inventory: Option<Value>,
+    last_progress_ms: Option<u64>,
+    total_sent_object_bytes: u64,
+    total_received_object_bytes: u64,
+    total_sent_wire_bytes: u64,
+    total_received_wire_bytes: u64,
     error: Option<String>,
     consecutive_failures: u32,
     retry_at_ms: Option<u64>,
@@ -215,8 +226,13 @@ struct RepositoryStatus {
 impl RepositoryStatus {
     fn failed(&mut self, error: &anyhow::Error) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let delay = retry_delay(self.consecutive_failures);
+        let delay = if format!("{error:#}").contains("WORKER_BUSY") {
+            Duration::from_millis(50)
+        } else {
+            retry_delay(self.consecutive_failures)
+        };
         self.caught_up = false;
+        self.metadata_caught_up = false;
         self.error = Some(format!("{error:#}"));
         self.retry_at_ms = Some(crate::core::time() + delay.as_millis() as u64);
         self.retry_at = Some(Instant::now() + delay);
@@ -225,6 +241,40 @@ impl RepositoryStatus {
     fn succeeded(&mut self, result: &Value) {
         self.last_success_ms = Some(crate::core::time());
         self.caught_up = result["caught_up"] == true;
+        self.metadata_caught_up = result["metadata_caught_up"] == true;
+        self.metadata_progress = result.get("metadata_progress").cloned();
+        self.transfer = result.get("transfer").cloned();
+        self.object_inventory = result.get("object_inventory").cloned();
+        if result["metadata_advanced"] == true
+            || result["transfer"]["sent_object_bytes"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+            || result["transfer"]["received_object_bytes"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        {
+            self.last_progress_ms = self.last_success_ms;
+        }
+        self.total_sent_wire_bytes = self
+            .total_sent_wire_bytes
+            .saturating_add(result["transfer"]["sent_wire_bytes"].as_u64().unwrap_or(0));
+        self.total_received_wire_bytes = self.total_received_wire_bytes.saturating_add(
+            result["transfer"]["received_wire_bytes"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+        self.total_sent_object_bytes = self.total_sent_object_bytes.saturating_add(
+            result["transfer"]["sent_object_bytes"]
+                .as_u64()
+                .unwrap_or(0),
+        );
+        self.total_received_object_bytes = self.total_received_object_bytes.saturating_add(
+            result["transfer"]["received_object_bytes"]
+                .as_u64()
+                .unwrap_or(0),
+        );
         self.error = None;
         self.consecutive_failures = 0;
         self.retry_at_ms = None;
@@ -239,6 +289,7 @@ struct Worker {
     child: Child,
     messages: Receiver<Value>,
     startup: Option<crate::startup::Watchdog>,
+    mounted: bool,
 }
 pub struct Supervisor {
     pub config: Config,
@@ -290,6 +341,7 @@ impl Supervisor {
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS projects(state TEXT PRIMARY KEY,label TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,device TEXT NOT NULL,directory TEXT NOT NULL,mount TEXT,desired INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS peers(endpoint TEXT PRIMARY KEY,code TEXT NOT NULL,installation TEXT NOT NULL,connections INTEGER NOT NULL,revision TEXT NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS initial_sync(state TEXT PRIMARY KEY,endpoint TEXT NOT NULL);")?;
         db.execute(
             "INSERT OR IGNORE INTO settings VALUES('installation',?)",
             [id()],
@@ -344,6 +396,7 @@ impl Supervisor {
         repo: Option<String>,
         mount: Option<PathBuf>,
         headless: bool,
+        initial_peer: Option<&str>,
     ) -> Result<Value> {
         ensure!(
             !label.trim().is_empty() && label.len() <= 200,
@@ -373,7 +426,8 @@ impl Supervisor {
         let device = id();
         let _store = Store::initialize(&directory, &repo, &device)?;
         drop(_store);
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO projects VALUES(?,?,?,?,?,?,1)",
             params![
                 state,
@@ -384,6 +438,13 @@ impl Supervisor {
                 mount.as_ref().map(|p| p.to_string_lossy().into_owned())
             ],
         )?;
+        if let Some(endpoint) = initial_peer.filter(|_| mount.is_some()) {
+            tx.execute(
+                "INSERT INTO initial_sync VALUES(?,?)",
+                params![state, endpoint],
+            )?;
+        }
+        tx.commit()?;
         // Keep the durable record if the mount fails; list/inspect reports the error
         // and configure-mount/start can repair it without losing the state.
         if let Err(error) = self.start(&state) {
@@ -461,7 +522,8 @@ impl Supervisor {
             .open(p.directory.join("worker.log"))?;
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("daemon").arg("--state").arg(&p.directory);
-        if let Some(mount) = &p.mount {
+        let mounted = p.mount.is_some() && self.initial_peer(state)?.is_none();
+        if let Some(mount) = &p.mount.filter(|_| mounted) {
             command.arg("--mount").arg(mount);
         }
         command
@@ -492,6 +554,7 @@ impl Supervisor {
                 child,
                 messages,
                 startup: Some(crate::startup::Watchdog::new(Instant::now())),
+                mounted,
             },
         );
         Ok(())
@@ -520,7 +583,7 @@ impl Supervisor {
                     ensure!(
                         message["repo"] == p.repo
                             && message["device"] == p.device
-                            && message["mounted"] == p.mount.is_some(),
+                            && message["mounted"] == worker.mounted,
                         "WORKER_STATE_MISMATCH"
                     );
                     worker.startup = None;
@@ -573,14 +636,53 @@ impl Supervisor {
         Ok(())
     }
     fn inspect(&self, state: &str) -> Result<Value> {
-        let mut value = json!(self.project(state)?);
+        let project = self.project(state)?;
+        let mut value = json!(project);
         let worker = self.workers.get(state);
-        value["running"] = json!(worker.is_some_and(|w| w.startup.is_none()));
-        value["starting"] = json!(worker.is_some_and(|w| w.startup.is_some()));
+        let initial_peer = self.initial_peer(state)?;
+        value["running"] =
+            json!(worker.is_some_and(|w| w.startup.is_none()) && initial_peer.is_none());
+        value["starting"] =
+            json!(worker.is_some_and(|w| w.startup.is_some() || initial_peer.is_some()));
+        value["mounted"] = json!(worker.is_some_and(|w| w.startup.is_none() && w.mounted));
+        value["initial_sync_pending"] = json!(initial_peer.is_some());
         value["startup_phase"] = json!(worker.and_then(|w| w.startup.as_ref()).map(|s| &s.phase));
+        if worker.is_some_and(|w| w.startup.is_none()) && initial_peer.is_some() {
+            value["startup_phase"] = json!("synchronizing remote metadata");
+        }
+        value["sync"] =
+            json!(self.peers()?.iter().map(|peer| {
+            let link = self.links.get(&link_key(peer, 0));
+            let remote_available = link.filter(|l| l.connected).and_then(|_|
+                self.remote_catalogs.get(&link_key(peer, 0)))
+                .map(|catalog| catalog.iter().any(|p| p.repo == project.repo));
+            json!({"endpoint":peer.endpoint,"connected":link.is_some_and(|l| l.connected),
+                "remote_available":remote_available,
+                "error":link.and_then(|l| l.error.as_ref()),
+                "metadata":link.and_then(|l| l.repositories.get(&project.repo)),
+                "lanes":(0..peer.pool_size()).map(|lane| {
+                    let status = self.links.get(&link_key(peer, lane));
+                    json!({"lane":lane,"role":lane_role(lane),
+                        "connected":status.is_some_and(|s| s.connected),
+                        "transport":status.and_then(|s| s.transport.as_ref()),
+                        "parallel_bulk":status.is_some_and(|s| s.parallel_bulk),
+                        "error":status.and_then(|s| s.error.as_ref()),
+                        "repository":status.and_then(|s| s.repositories.get(&project.repo))})
+                }).collect::<Vec<_>>()})
+        }).collect::<Vec<_>>());
         value["error"] = json!(self.failures.get(state));
         value["publication_error"] = json!(self.publication_errors.get(state));
         Ok(value)
+    }
+    fn initial_peer(&self, state: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT endpoint FROM initial_sync WHERE state=?",
+                [state],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
     fn reconcile(&mut self) -> Result<()> {
         let states: Vec<_> = self.workers.keys().cloned().collect();
@@ -593,6 +695,40 @@ impl Supervisor {
             }
         }
         for p in self.projects()? {
+            if p.desired_running
+                && self
+                    .workers
+                    .get(&p.state)
+                    .is_some_and(|w| w.startup.is_none())
+                && let Some(endpoint) = self.initial_peer(&p.state)?
+                && let Some(peer) = self
+                    .peers()?
+                    .into_iter()
+                    .find(|peer| peer.endpoint == endpoint)
+                && self.links.get(&link_key(&peer, 0)).is_some_and(|link| {
+                    link.connected
+                        && link.repositories.get(&p.repo).is_some_and(|status| {
+                            status.metadata_caught_up
+                                && status.error.is_none()
+                                && status.last_success_ms.is_some_and(|at| {
+                                    crate::core::time().saturating_sub(at) < 15000
+                                })
+                        })
+                })
+            {
+                // The headless worker has durably accepted the remote journal.
+                // Stop it before enabling the mount; the marker survives failures
+                // and daemon restarts, and normal later remounts remain offline-capable.
+                match self.stop(&p.state) {
+                    Ok(()) => {
+                        self.db
+                            .execute("DELETE FROM initial_sync WHERE state=?", [&p.state])?;
+                    }
+                    Err(error) => {
+                        self.failures.insert(p.state.clone(), format!("{error:#}"));
+                    }
+                }
+            }
             if p.desired_running
                 && !self.workers.contains_key(&p.state)
                 && let Err(error) = self.start(&p.state)
@@ -695,10 +831,13 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
                     .any(|p| p.repo == repo),
                 "REMOTE_FOLDER_NOT_FOUND"
             );
-            return shared
-                .lock()
-                .unwrap()
-                .create(label, Some(repo), mount, headless);
+            return shared.lock().unwrap().create(
+                label,
+                Some(repo),
+                mount,
+                headless,
+                Some(&endpoint),
+            );
         }
         _ => {}
     }
@@ -707,7 +846,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
     match action {
         Action::List => Ok(json!({"installation":s.installation,"folders":s.projects()?.iter().map(|p|s.inspect(&p.state)).collect::<Result<Vec<_>>>()?})),
         Action::Inspect { state } => s.inspect(&state),
-        Action::Create { label, mount, headless } => s.create(label, None, mount, headless),
+        Action::Create { label, mount, headless } => s.create(label, None, mount, headless, None),
         Action::ConfigureMount { state, mount } => {
             ensure!(!s.workers.contains_key(&state), "STOP_FOLDER_BEFORE_CONFIGURING");
             let p = s.project(&state)?;
@@ -752,23 +891,32 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
 }
 
 fn dial(endpoint: &str, code: &str, installation: &str) -> Result<(ws::Socket, String)> {
-    dial_role(endpoint, code, installation, Some("control"))
+    let (socket, installation, _) = dial_role(endpoint, code, installation, Some("control"), None)?;
+    Ok((socket, installation))
 }
 fn dial_role(
     endpoint: &str,
     code: &str,
     installation: &str,
     role: Option<&str>,
-) -> Result<(ws::Socket, String)> {
+    bulk_lane: Option<crate::bulk_sync::Lane>,
+) -> Result<(ws::Socket, String, bool)> {
     let mut socket = ws::connect(endpoint)?;
     let hello = ws::call(
         &mut socket,
-        &json!({"op":"pair","version":2,"code":code,"installation":installation,"lane":role}),
+        &json!({"op":"pair","version":2,"code":code,"installation":installation,"lane":role,"bulk_protocol":crate::bulk_sync::PROTOCOL,"bulk_lane":bulk_lane}),
     )?;
     if let Some(role) = role {
         ensure!(
             hello["lane"] == role,
             "RESERVED_LANES_UNSUPPORTED: upgrade the remote orchestrator"
+        );
+    }
+    let parallel = hello["bulk_protocol"] == crate::bulk_sync::PROTOCOL;
+    if parallel {
+        ensure!(
+            hello["bulk_lane"] == json!(bulk_lane),
+            "BULK_LANE_NEGOTIATION_FAILED"
         );
     }
     Ok((
@@ -777,6 +925,7 @@ fn dial_role(
             .as_str()
             .context("INVALID_PAIR_REPLY")?
             .into(),
+        parallel,
     ))
 }
 fn remote_list(shared: &Shared, endpoint: &str) -> Result<Vec<PublishedState>> {
@@ -797,7 +946,10 @@ fn remote_list(shared: &Shared, endpoint: &str) -> Result<Vec<PublishedState>> {
         &json!({"op":"list"}),
     )?)?)
 }
-fn published(shared: &Shared) -> Result<Vec<PublishedState>> {
+fn published(
+    shared: &Shared,
+    clients: &mut BTreeMap<String, runtime::RpcLane>,
+) -> Result<Vec<PublishedState>> {
     let workers = {
         let s = shared.lock().unwrap();
         s.projects()?
@@ -813,11 +965,13 @@ fn published(shared: &Shared) -> Result<Vec<PublishedState>> {
     let mut errors = BTreeMap::new();
     for (p, info) in workers {
         let result = (|| -> Result<PublishedState> {
-            let state: PublishedState = serde_json::from_value(runtime::rpc(
-                &info?,
-                &id(),
-                json!({"op":"published-summary"}),
-            )?)?;
+            let info = info?;
+            let state: PublishedState =
+                serde_json::from_value(clients.entry(info.state.clone()).or_default().call(
+                    &info,
+                    &id(),
+                    json!({"op":"published-summary"}),
+                )?)?;
             ensure!(
                 state.repo == p.repo && state.replica == p.device,
                 "WORKER_STATE_MISMATCH"
@@ -849,6 +1003,9 @@ fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<()> {
     let mut socket = ws::accept(stream)?;
     let hello: Value = ws::receive(&mut socket)?;
     let role = hello["lane"].as_str();
+    let parallel = hello["bulk_protocol"] == crate::bulk_sync::PROTOCOL;
+    let bulk_lane: Option<crate::bulk_sync::Lane> =
+        serde_json::from_value(hello["bulk_lane"].clone())?;
     let verified = (|| -> Result<(Verifier, String, String)> {
         ensure!(
             hello["op"] == "pair" && hello["version"] == 2,
@@ -858,6 +1015,9 @@ fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<()> {
             hello["lane"].is_null() || matches!(role, Some("control" | "bulk")),
             "INVALID_LANE_ROLE"
         );
+        if parallel && role == Some("bulk") {
+            bulk_lane.context("BULK_LANE_REQUIRED")?.validate()?;
+        }
         let peer = hello["installation"]
             .as_str()
             .context("INSTALLATION_REQUIRED")?
@@ -880,8 +1040,11 @@ fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<()> {
     };
     ws::reply(
         &mut socket,
-        Ok(json!({"installation":installation,"version":2,"lane":role})),
+        Ok(
+            json!({"installation":installation,"version":2,"lane":role,"bulk_protocol":if parallel { crate::bulk_sync::PROTOCOL } else { 0 },"bulk_lane":bulk_lane}),
+        ),
     )?;
+    let mut workers = BTreeMap::<String, runtime::RpcLane>::new();
     loop {
         let request: Value = ws::receive(&mut socket)?;
         let result = (|| -> Result<Value> {
@@ -892,8 +1055,9 @@ fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<()> {
             }
             match request["op"].as_str() {
                 Some("ping") => Ok(json!({"alive":true})),
-                Some("list") => Ok(json!(published(&shared)?)),
+                Some("list") => Ok(json!(published(&shared, &mut workers)?)),
                 Some("exchange") => {
+                    ensure!(!parallel || role != Some("bulk"), "METADATA_ON_BULK_LANE");
                     let page: SyncPage = serde_json::from_value(request["page"].clone())?;
                     let info = {
                         let s = shared.lock().unwrap();
@@ -905,11 +1069,29 @@ fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<()> {
                         s.discovery(&p.state)?
                     };
                     let binding = route(&info, &peer, &page.sender);
-                    runtime::rpc(
+                    workers.entry(info.state.clone()).or_default().call(
                         &info,
                         &id(),
                         json!({"op":"published-exchange","route":binding,"page":page,"max_frame":4*1024*1024,"metadata_only":role == Some("control")}),
                     )
+                }
+                Some("objects") => {
+                    ensure!(parallel && role == Some("bulk"), "BULK_ON_CONTROL_LANE");
+                    let page: crate::bulk_sync::Page =
+                        serde_json::from_value(request["page"].clone())?;
+                    ensure!(Some(page.lane) == bulk_lane, "BULK_LANE_MISMATCH");
+                    let info = {
+                        let s = shared.lock().unwrap();
+                        let project = s
+                            .projects()?
+                            .into_iter()
+                            .find(|p| p.repo == page.repo)
+                            .context("REPOSITORY_NOT_MANAGED")?;
+                        s.discovery(&project.state)?
+                    };
+                    let binding = route(&info, &peer, &page.sender);
+                    workers.entry(info.state.clone()).or_default().call(&info, &id(),
+                        json!({"op":"published-bulk-exchange","route":binding,"lane":page.lane,"page":page}))
                 }
                 _ => bail!("UNKNOWN_PEER_OPERATION"),
             }
@@ -933,8 +1115,56 @@ fn lane_active(shared: &Shared, peer: &Peer) -> bool {
 fn lane_wait(shared: &Shared, peer: &Peer, delay: Duration) {
     let until = Instant::now() + delay;
     while Instant::now() < until && lane_active(shared, peer) {
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(
+            Duration::from_millis(50).min(until.saturating_duration_since(Instant::now())),
+        );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exchange_bulk(
+    worker: &mut runtime::RpcLane,
+    info: &Discovery,
+    binding: &SyncRoute,
+    lane: crate::bulk_sync::Lane,
+    socket: &mut ws::Socket,
+    inventories: &mut BTreeMap<String, crate::bulk_sync::Page>,
+    connection_failed: &mut bool,
+) -> Result<Value> {
+    let started = Instant::now();
+    let page: crate::bulk_sync::Page = serde_json::from_value(worker.call(info, &id(),
+        json!({"op":"published-bulk-offer","route":binding,"lane":lane,"inventory":inventories.get(&binding.repo)}))
+        .context("LOCAL_BULK_OFFER_FAILED")?)?;
+    let offer_ms = started.elapsed().as_millis();
+    let sent_bytes = page.object_bytes();
+    let exchange_started = Instant::now();
+    let wire_before = (socket.sent_bytes, socket.received_bytes);
+    let response: crate::bulk_sync::Page = serde_json::from_value(
+        ws::call(socket, &json!({"op":"objects","page":page})).map_err(|error| {
+            *connection_failed = error.downcast_ref::<ws::RemoteError>().is_none();
+            error.context("REMOTE_BULK_EXCHANGE_FAILED")
+        })?,
+    )?;
+    let remote_ms = exchange_started.elapsed().as_millis();
+    let received_bytes = response.object_bytes();
+    let apply_started = Instant::now();
+    let mut result = worker.call(info, &id(),
+        json!({"op":"published-bulk-apply","route":binding,"lane":lane,"page":response,"request":page.request}))
+        .context("LOCAL_BULK_APPLY_FAILED")?;
+    result["transfer"] = json!({"offer_ms":offer_ms,"remote_exchange_ms":remote_ms,
+        "apply_ms":apply_started.elapsed().as_millis(),"total_ms":started.elapsed().as_millis(),
+        "sent_object_bytes":sent_bytes,"received_object_bytes":received_bytes,
+        "sent_wire_bytes":socket.sent_bytes-wire_before.0,"received_wire_bytes":socket.received_bytes-wire_before.1,
+        "transport":socket.codec(),"object_lane":lane});
+    // Both inventories describe verified objects when the corresponding page
+    // was produced. Receipt of this page can advance them on the next exchange.
+    result["object_inventory"] = json!({"local_available":page.known_objects.len(),
+        "remote_available":response.known_objects.len(),
+        "local_only":page.known_objects.difference(&response.known_objects).count(),
+        "remote_only":response.known_objects.difference(&page.known_objects).count(),
+        "local_partial":page.partial_objects.len(),"remote_partial":response.partial_objects.len()});
+    inventories.insert(binding.repo.clone(), response.inventory());
+    Ok(result)
 }
 
 fn run_lane(shared: Shared, peer: Peer, lane: usize) {
@@ -942,16 +1172,30 @@ fn run_lane(shared: Shared, peer: Peer, lane: usize) {
     let catalog_key = link_key(&peer, 0);
     let metadata_only = lane == 0;
     let mut connection_failures = 0u32;
+    let mut workers = BTreeMap::<String, runtime::RpcLane>::new();
+    let mut inventories = BTreeMap::<String, crate::bulk_sync::Page>::new();
     while lane_active(&shared, &peer) {
         let result = (|| -> Result<()> {
             let installation = shared.lock().unwrap().installation.clone();
-            let (mut socket, remote) = dial_role(
+            let bulk_lane = (!metadata_only).then_some(crate::bulk_sync::Lane {
+                index: lane.saturating_sub(1),
+                count: peer.pool_size() - 1,
+            });
+            let (mut socket, remote, parallel) = dial_role(
                 &peer.endpoint,
                 &peer.code,
                 &installation,
                 Some(lane_role(lane)),
+                bulk_lane,
             )?;
             ensure!(remote == peer.installation, "PEER_INSTALLATION_CHANGED");
+            inventories.clear();
+            {
+                let mut s = shared.lock().unwrap();
+                let status = s.links.entry(key.clone()).or_default();
+                status.transport = Some(socket.codec().to_owned());
+                status.parallel_bulk = parallel;
+            }
             shared
                 .lock()
                 .unwrap()
@@ -986,10 +1230,11 @@ fn run_lane(shared: Shared, peer: Peer, lane: usize) {
                     (s.projects()?, s.config.network.sync_interval_ms)
                 };
                 let mut active_repositories = BTreeSet::new();
+                let mut transferred_content = false;
                 for remote in remote {
                     // Events visit every repository on the reserved lane;
                     // object cursors have exactly one serial bulk owner.
-                    if !metadata_only && peer.bulk_lane(&remote.repo) != lane {
+                    if !metadata_only && !parallel && peer.bulk_lane(&remote.repo) != lane {
                         continue;
                     }
                     let Some(local) = local
@@ -1023,24 +1268,84 @@ fn run_lane(shared: Shared, peer: Peer, lane: usize) {
                             .discovery(&local.state)
                             .context("LOCAL_WORKER_UNAVAILABLE")?;
                         let binding = route(&info, &peer.installation, &remote.replica);
-                        let page: SyncPage = serde_json::from_value(runtime::rpc(
+                        let worker = workers.entry(local.state.clone()).or_default();
+                        if parallel && !metadata_only {
+                            let result = exchange_bulk(
+                                worker,
+                                &info,
+                                &binding,
+                                bulk_lane.unwrap(),
+                                &mut socket,
+                                &mut inventories,
+                                &mut connection_failed,
+                            )?;
+                            transferred_content |= result["transfer"]["sent_object_bytes"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                > 0
+                                || result["transfer"]["received_object_bytes"]
+                                    .as_u64()
+                                    .unwrap_or(0)
+                                    > 0;
+                            return Ok(result);
+                        }
+                        let started = Instant::now();
+                        let page: SyncPage = serde_json::from_value(worker.call(
                             &info,
                             &id(),
                             json!({"op":"published-offer","route":binding,"max_frame":4*1024*1024,"metadata_only":metadata_only}),
                         ).context("LOCAL_SYNC_OFFER_FAILED")?)?;
+                        let offer_ms = started.elapsed().as_millis();
+                        let sent_bytes = page
+                            .bundle
+                            .objects
+                            .values()
+                            .map(|hex| hex.len() / 2)
+                            .sum::<usize>()
+                            + page
+                                .object_parts
+                                .values()
+                                .map(|part| part.hex.len() / 2)
+                                .sum::<usize>();
                         let sent: BTreeSet<_> =
                             page.bundle.events.iter().map(|e| e.id.clone()).collect();
+                        let exchange_started = Instant::now();
+                        let wire_before = (socket.sent_bytes, socket.received_bytes);
                         let response = ws::call(&mut socket, &json!({"op":"exchange","page":page}))
                             .map_err(|error| {
                                 connection_failed =
                                     error.downcast_ref::<ws::RemoteError>().is_none();
                                 error.context("REMOTE_SYNC_EXCHANGE_FAILED")
                             })?;
-                        runtime::rpc(
+                        let remote_ms = exchange_started.elapsed().as_millis();
+                        let received_bytes = response["bundle"]["objects"]
+                            .as_object()
+                            .into_iter()
+                            .flat_map(|objects| objects.values())
+                            .filter_map(Value::as_str)
+                            .map(|hex| hex.len() / 2)
+                            .sum::<usize>()
+                            + response["object_parts"]
+                                .as_object()
+                                .into_iter()
+                                .flat_map(|parts| parts.values())
+                                .filter_map(|part| part["hex"].as_str())
+                                .map(|hex| hex.len() / 2)
+                                .sum::<usize>();
+                        let apply_started = Instant::now();
+                        let mut result = worker.call(
                             &info,
                             &id(),
                             json!({"op":"published-apply","route":binding,"page":response,"request":page.request,"sent":sent,"max_frame":4*1024*1024,"metadata_only":metadata_only}),
-                        ).context("LOCAL_SYNC_APPLY_FAILED")
+                        ).context("LOCAL_SYNC_APPLY_FAILED")?;
+                        transferred_content |= sent_bytes > 0
+                            || received_bytes > 0
+                            || result["metadata_advanced"] == true;
+                        result["transfer"] = json!({"offer_ms":offer_ms,"remote_exchange_ms":remote_ms,
+                            "apply_ms":apply_started.elapsed().as_millis(),"total_ms":started.elapsed().as_millis(),
+                            "sent_object_bytes":sent_bytes,"received_object_bytes":received_bytes,
+                            "sent_wire_bytes":socket.sent_bytes-wire_before.0,"received_wire_bytes":socket.received_bytes-wire_before.1,"transport":socket.codec()});
+                        Ok(result)
                     })();
                     if connection_failed {
                         return exchange.map(|_| ());
@@ -1066,7 +1371,17 @@ fn run_lane(shared: Shared, peer: Peer, lane: usize) {
                         .retain(|repo, _| active_repositories.contains(repo));
                 }
                 connection_failures = 0;
-                lane_wait(&shared, &peer, Duration::from_millis(interval));
+                // The configured interval is idle polling, not a bandwidth cap.
+                // Keep a small yield between active pages for fairness/recovery.
+                lane_wait(
+                    &shared,
+                    &peer,
+                    Duration::from_millis(if transferred_content {
+                        interval.min(10)
+                    } else {
+                        interval
+                    }),
+                );
             }
             let _ = socket.close(None);
             Ok(())
@@ -1078,6 +1393,7 @@ fn run_lane(shared: Shared, peer: Peer, lane: usize) {
             status.error = result.err().map(|e| format!("{e:#}"));
             for repository in status.repositories.values_mut() {
                 repository.caught_up = false;
+                repository.metadata_caught_up = false;
             }
         }
         if lane_active(&shared, &peer) {

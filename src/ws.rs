@@ -7,10 +7,44 @@ use std::{
     time::Duration,
 };
 use tungstenite::{
-    Connector, Message, WebSocket, protocol::WebSocketConfig, stream::MaybeTlsStream,
+    Connector, Message, WebSocket, client::IntoClientRequest, protocol::WebSocketConfig,
+    stream::MaybeTlsStream,
 };
 
-pub type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
+pub struct Socket {
+    inner: WebSocket<MaybeTlsStream<TcpStream>>,
+    binary: bool,
+    pub sent_bytes: u64,
+    pub received_bytes: u64,
+}
+impl Socket {
+    fn new(inner: WebSocket<MaybeTlsStream<TcpStream>>, binary: bool) -> Self {
+        Self {
+            inner,
+            binary,
+            sent_bytes: 0,
+            received_bytes: 0,
+        }
+    }
+    pub fn codec(&self) -> &'static str {
+        if self.binary {
+            crate::wire::PROTOCOL
+        } else {
+            "json"
+        }
+    }
+}
+impl std::ops::Deref for Socket {
+    type Target = WebSocket<MaybeTlsStream<TcpStream>>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl std::ops::DerefMut for Socket {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
 pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 
 /// A complete error reply leaves the connection usable. Transport and malformed
@@ -83,13 +117,21 @@ fn connect_with_connector(endpoint: &str, connector: Option<Connector>) -> Resul
         match TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
             Ok(stream) => {
                 timeouts(&stream)?;
-                return Ok(tungstenite::client_tls_with_config(
-                    endpoint,
+                let mut request = endpoint.into_client_request()?;
+                request
+                    .headers_mut()
+                    .insert("X-Tkfs-Wire", crate::wire::PROTOCOL.parse()?);
+                let (socket, response) = tungstenite::client_tls_with_config(
+                    request,
                     stream,
                     Some(config()),
                     connector,
-                )?
-                .0);
+                )?;
+                let binary = response
+                    .headers()
+                    .get("X-Tkfs-Wire")
+                    .is_some_and(|value| value == crate::wire::PROTOCOL);
+                return Ok(Socket::new(socket, binary));
             }
             Err(error) => last = Some(error),
         }
@@ -109,17 +151,50 @@ pub fn timeouts(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 pub fn accept(stream: TcpStream) -> Result<Socket> {
     timeouts(&stream)?;
-    Ok(tungstenite::accept_with_config(
+    let negotiated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let selected = negotiated.clone();
+    let inner = tungstenite::accept_hdr_with_config(
         MaybeTlsStream::Plain(stream),
+        move |request: &tungstenite::handshake::server::Request,
+              mut response: tungstenite::handshake::server::Response| {
+            let binary = request
+                .headers()
+                .get("X-Tkfs-Wire")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(',')
+                        .any(|item| item.trim() == crate::wire::PROTOCOL)
+                });
+            if binary {
+                response
+                    .headers_mut()
+                    .insert("X-Tkfs-Wire", crate::wire::PROTOCOL.parse().unwrap());
+            }
+            selected.store(binary, std::sync::atomic::Ordering::Relaxed);
+            Ok(response)
+        },
         Some(config()),
-    )?)
+    )?;
+    Ok(Socket::new(
+        inner,
+        negotiated.load(std::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
 pub fn send<T: Serialize>(socket: &mut Socket, value: &T) -> Result<()> {
+    if socket.binary {
+        let bytes = crate::wire::encode(serde_json::to_value(value)?, MAX_MESSAGE)?;
+        socket.sent_bytes += bytes.len() as u64;
+        socket.send(Message::Binary(bytes.into()))?;
+        return Ok(());
+    }
     let bytes = serde_json::to_string(value)?;
     ensure!(bytes.len() <= MAX_MESSAGE, "WS_MESSAGE_TOO_LARGE");
+    socket.sent_bytes += bytes.len() as u64;
     socket.send(Message::Text(bytes.into()))?;
     Ok(())
 }
@@ -127,8 +202,21 @@ pub fn send<T: Serialize>(socket: &mut Socket, value: &T) -> Result<()> {
 pub fn receive<T: DeserializeOwned>(socket: &mut Socket) -> Result<T> {
     loop {
         match socket.read()? {
-            Message::Text(bytes) => return Ok(serde_json::from_str(&bytes)?),
-            Message::Binary(bytes) => return Ok(serde_json::from_slice(&bytes)?),
+            Message::Text(bytes) => {
+                socket.received_bytes += bytes.len() as u64;
+                return Ok(serde_json::from_str(&bytes)?);
+            }
+            Message::Binary(bytes) => {
+                socket.received_bytes += bytes.len() as u64;
+                return if socket.binary {
+                    Ok(serde_json::from_value(crate::wire::decode(
+                        &bytes,
+                        MAX_MESSAGE,
+                    )?)?)
+                } else {
+                    Ok(serde_json::from_slice(&bytes)?)
+                };
+            }
             Message::Ping(_) => socket.flush()?,
             Message::Pong(_) => {}
             Message::Close(_) => bail!("WS_CLOSED"),
@@ -256,7 +344,7 @@ mod tests {
 
     // Tungstenite requires the header callback to return its unboxed HTTP error response.
     #[allow(clippy::result_large_err)]
-    fn tls_server() -> (u16, thread::JoinHandle<()>) {
+    fn tls_server(binary: bool) -> (u16, thread::JoinHandle<()>) {
         let identity = native_tls::Identity::from_pkcs12(
             include_bytes!("../tests/fixtures/tls/localhost.p12"),
             "telekinesis-test",
@@ -274,15 +362,23 @@ mod tests {
             };
             let handshake = tungstenite::accept_hdr_with_config(
                 MaybeTlsStream::NativeTls(tls),
-                |request: &tungstenite::handshake::server::Request, response| {
+                move |request: &tungstenite::handshake::server::Request,
+                      mut response: tungstenite::handshake::server::Response| {
                     assert_eq!(request.uri(), "/sync?lane=1");
+                    if binary {
+                        assert_eq!(request.headers()["X-Tkfs-Wire"], crate::wire::PROTOCOL);
+                        response
+                            .headers_mut()
+                            .insert("X-Tkfs-Wire", crate::wire::PROTOCOL.parse().unwrap());
+                    }
                     Ok(response)
                 },
                 Some(config()),
             );
-            let Ok(mut socket) = handshake else {
+            let Ok(socket) = handshake else {
                 return;
             };
+            let mut socket = Socket::new(socket, binary);
             for _ in 0..2 {
                 let request: Value = receive(&mut socket).unwrap();
                 reply(&mut socket, Ok(request)).unwrap();
@@ -293,7 +389,7 @@ mod tests {
 
     #[test]
     fn wss_exchanges_persistent_messages_and_preserves_route() {
-        let (port, server) = tls_server();
+        let (port, server) = tls_server(false);
         let mut socket = connect_with_connector(
             &format!("wss://localhost:{port}/sync?lane=1"),
             Some(trusted_connector()),
@@ -308,14 +404,14 @@ mod tests {
 
     #[test]
     fn wss_rejects_untrusted_certificates() {
-        let (port, server) = tls_server();
+        let (port, server) = tls_server(false);
         assert!(connect(&format!("wss://localhost:{port}/sync?lane=1")).is_err());
         server.join().unwrap();
     }
 
     #[test]
     fn wss_rejects_hostname_mismatch_even_with_trusted_ca() {
-        let (port, server) = tls_server();
+        let (port, server) = tls_server(false);
         assert!(
             connect_with_connector(
                 &format!("wss://127.0.0.1:{port}/sync?lane=1"),
@@ -323,6 +419,23 @@ mod tests {
             )
             .is_err()
         );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn wss_negotiates_binary_gzip_and_reports_compressed_payload_bytes() {
+        let (port, server) = tls_server(true);
+        let mut socket = connect_with_connector(
+            &format!("wss://localhost:{port}/sync?lane=1"),
+            Some(trusted_connector()),
+        )
+        .unwrap();
+        assert_eq!(socket.codec(), crate::wire::PROTOCOL);
+        for _ in 0..2 {
+            let value = json!({"hex":"0a".repeat(128*1024)});
+            assert_eq!(call(&mut socket, &value).unwrap(), value);
+        }
+        assert!(socket.sent_bytes < 16 * 1024 && socket.received_bytes < 16 * 1024);
         server.join().unwrap();
     }
 }
