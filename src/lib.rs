@@ -13,4 +13,5 @@ pub mod runtime;
 pub mod staging;
 pub mod startup;
 mod wire;
+pub mod worker;
 pub mod ws;
