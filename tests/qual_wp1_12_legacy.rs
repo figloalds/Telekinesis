@@ -157,19 +157,24 @@ fn worker_busy_not_counted() {
     s.measure_from_now();
     let mut busy_seen = 0;
     let mut busy_counted = 0;
+    let mut busy_retries_max = 0;
     let window = Duration::from_secs(20).min(s.budget);
     let watch = Stopwatch::start();
     while watch.elapsed() < window {
         if let Ok(peers) = b.raw_call(json!({"op":"peers"})) {
             for r in repo_statuses(&peers, &repo) {
-                if r["error"]
+                // WP1.12: Contention is counted in `busy_retries` and never
+                // reaches `error`; a legacy daemon reports it as the error.
+                let busy_retries = r["busy_retries"].as_u64().unwrap_or(0);
+                busy_retries_max = busy_retries_max.max(busy_retries);
+                let busy_error = r["error"]
                     .as_str()
-                    .is_some_and(|e| e.contains("WORKER_BUSY"))
-                {
+                    .is_some_and(|e| e.contains("WORKER_BUSY"));
+                if busy_error || busy_retries > 0 {
                     busy_seen += 1;
-                    if r["consecutive_failures"].as_u64().unwrap_or(0) > 0 {
-                        busy_counted += 1;
-                    }
+                }
+                if busy_error && r["consecutive_failures"].as_u64().unwrap_or(0) > 0 {
+                    busy_counted += 1;
                 }
             }
         }
@@ -179,6 +184,7 @@ fn worker_busy_not_counted() {
     writer.join().unwrap();
     s.metric("busy_observed", busy_seen as f64, "samples");
     s.metric("busy_counted", busy_counted as f64, "samples");
+    s.metric("busy_retries_max", busy_retries_max as f64, "count");
     if busy_seen == 0 {
         s.note("no WORKER_BUSY observed in the window; nothing to judge");
     }
