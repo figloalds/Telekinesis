@@ -11,8 +11,13 @@
 //!   mount goes away underneath us (FUSE dispatch death, failed checkout
 //!   remount). A refused graceful detach restores the previous state.
 //! - **Mailbox:** attach and detach run one at a time on the `mount-ctl`
-//!   thread (§2.5). Callers enqueue a transition and wait for its reply; no
-//!   lock is held across mount I/O, and nothing else waits on a transition.
+//!   thread (§2.5). Callers enqueue a transition and wait for its reply, at
+//!   most [`ATTACH_WAIT`]/[`DETACH_WAIT`] (then `WORKER_BUSY`, Contention; the
+//!   transition goes on and `status()` shows it); no lock is held across
+//!   mount I/O, and nothing else waits on a transition.
+//! - **Lost** (`Attached`/`Attaching` → `Lost`) is signalled by the adapter.
+//!   One that arrives while a detach runs is remembered: a detach refused
+//!   afterwards publishes `Lost`, never the `Attached` it started from.
 //! - **`status()`** reads a published snapshot. It never takes the engine lock
 //!   and never waits for a transition in progress; the snapshot generation
 //!   ([`MountController::generation`]) bumps on every state change. A mount
@@ -68,7 +73,16 @@ use std::{
         atomic::{AtomicU32, Ordering},
         mpsc,
     },
+    time::Duration,
 };
+
+/// How long an attach caller waits for its reply (queue included) before
+/// `WORKER_BUSY`; below the orchestrator's `deadlines::MOUNT_ATTACH` (60 s).
+pub const ATTACH_WAIT: Duration = Duration::from_secs(50);
+/// How long a detach caller waits for its reply (queue included) before
+/// `WORKER_BUSY`: the quiet wait (1 s), the drain (10 s) and the native stop
+/// fit, and it stays below `deadlines::MOUNT_DETACH` (15 s).
+pub const DETACH_WAIT: Duration = Duration::from_secs(14);
 
 /// Attach failures that need the user (§4.3 preflight); every other attach
 /// failure is Transient.
@@ -115,6 +129,10 @@ struct Inner {
     generated: String,
     /// Consecutive failed attaches.
     attempts: AtomicU32,
+    /// A `Lost` signalled while a detach ran (taken by that detach).
+    lost_while_detaching: Mutex<Option<ErrorWire>>,
+    /// Overrides [`ATTACH_WAIT`] and [`DETACH_WAIT`] ([`MountController::set_reply_wait`]).
+    reply_wait: Mutex<Option<Duration>>,
     /// The store root and identity, read once from the engine.
     identity: OnceLock<Identity>,
     me: Weak<Inner>,
@@ -143,6 +161,8 @@ impl MountController {
             instance: Mutex::new(None),
             generated: uuid::Uuid::new_v4().to_string(),
             attempts: AtomicU32::new(0),
+            lost_while_detaching: Mutex::new(None),
+            reply_wait: Mutex::new(None),
             identity: OnceLock::new(),
             me: me.clone(),
         });
@@ -188,23 +208,49 @@ impl MountController {
         adapter::mount_errors()
     }
 
-    fn call(&self, command: impl FnOnce(Reply) -> Command) -> Result<MountStatus, ErrorWire> {
+    /// Bounds how long `attach`/`detach` callers wait for their reply
+    /// (`None`: [`ATTACH_WAIT`] and [`DETACH_WAIT`]).
+    pub fn set_reply_wait(&self, wait: Option<Duration>) {
+        *lock(&self.inner.reply_wait) = wait;
+    }
+
+    /// Enqueues a transition and waits for its reply, at most `wait`: a
+    /// transition that takes longer (a hung native stop or `fusermount3`)
+    /// answers `WORKER_BUSY` and goes on; `status()` shows where it is.
+    fn call(
+        &self,
+        wait: Duration,
+        command: impl FnOnce(Reply) -> Command,
+    ) -> Result<MountStatus, ErrorWire> {
         let unavailable =
             || ErrorWire::coded("MOUNT_NOT_RUNNING", "the mount-ctl thread is not running");
         let mailbox = self.mailbox.as_ref().ok_or_else(unavailable)?;
         let (reply, answer) = mpsc::channel();
         mailbox.send(command(reply)).map_err(|_| unavailable())?;
-        answer.recv().map_err(|_| unavailable())?
+        let wait = lock(&self.inner.reply_wait).unwrap_or(wait);
+        match answer.recv_timeout(wait) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ErrorWire::coded(
+                "WORKER_BUSY",
+                format!(
+                    "a mount transition is still running after {} ms (state {:?})",
+                    wait.as_millis(),
+                    self.inner.current().state
+                ),
+            )
+            .with_retry_after(1000)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(unavailable()),
+        }
     }
 }
 
 impl MountControl for MountController {
     fn attach(&self, path: &Path) -> Result<MountStatus, ErrorWire> {
-        self.call(|reply| Command::Attach(path.to_owned(), reply))
+        self.call(ATTACH_WAIT, |reply| Command::Attach(path.to_owned(), reply))
     }
 
     fn detach(&self, force: bool) -> Result<MountStatus, ErrorWire> {
-        self.call(|reply| Command::Detach(force, reply))
+        self.call(DETACH_WAIT, |reply| Command::Detach(force, reply))
     }
 
     fn status(&self) -> MountStatus {
@@ -302,6 +348,24 @@ impl Inner {
         if current.state.is_attached() && self.native().is_none() {
             // Detached outside the controller (legacy `mount::stop`).
             current = self.publish(MountIntent::Detach, current.path, MountState::Detached);
+        }
+        if self.native().is_some()
+            && !matches!(current.state, MountState::Lost { .. })
+            && crate::mount::vanished()
+        {
+            // Unmounted outside the worker before the adapter noticed (a lazy
+            // unmount keeps the connection while files are open): lost, so it
+            // is cleaned up and attached afresh below, never reported attached.
+            current = self.publish(
+                current.intent,
+                current.path,
+                MountState::Lost {
+                    error: ErrorWire::coded(
+                        "MOUNT_NOT_RUNNING",
+                        "the mount was unmounted outside the worker",
+                    ),
+                },
+            );
         }
         if current.state.is_attached() {
             if current.path.as_deref() == Some(path) {
@@ -461,14 +525,21 @@ impl Inner {
         })));
     }
 
-    /// `Attached`/`Attaching` → `Lost` (signalled by the adapter).
+    /// `Attached`/`Attaching` → `Lost` (signalled by the adapter). While a
+    /// detach runs, the signal is remembered for that detach. Both run under
+    /// the snapshot's write lock, so a detach that ends afterwards sees it,
+    /// and one that ended before leaves a state this signal then changes.
     fn lost(&self, error: ErrorWire) {
-        self.status.update(move |status| match status.state {
+        self.status.update(|status| match status.state {
             MountState::Attached { .. } | MountState::Attaching => MountStatus {
                 intent: status.intent,
                 path: status.path.clone(),
                 state: MountState::Lost { error },
             },
+            MountState::Detaching => {
+                *lock(&self.lost_while_detaching) = Some(error);
+                status.clone()
+            }
             _ => status.clone(),
         });
     }
@@ -481,23 +552,35 @@ impl Inner {
         };
         let lost = matches!(current.state, MountState::Lost { .. });
         let path = current.path.clone().or(Some(native));
+        lock(&self.lost_while_detaching).take();
         self.publish(MountIntent::Detach, path.clone(), MountState::Detaching);
         match crate::mount::detach(force || lost) {
-            Ok(()) => Ok(self.publish(MountIntent::Detach, path, MountState::Detached)),
+            Ok(()) => {
+                lock(&self.lost_while_detaching).take();
+                Ok(self.publish(MountIntent::Detach, path, MountState::Detached))
+            }
             Err(error) => {
                 let wire = ErrorWire::from_error(&error);
                 if self.native().is_some() {
-                    // Refused or failed before the native stop: unchanged.
-                    let restored = if current.state.is_attached() || lost {
-                        current
-                    } else {
-                        MountStatus {
-                            intent: MountIntent::Attach,
-                            path,
-                            state: MountState::Attached { since_ms: now_ms() },
+                    // Refused or failed before the native stop: unchanged,
+                    // unless the mount was lost meanwhile.
+                    self.status.update(|_| {
+                        if let Some(error) = lock(&self.lost_while_detaching).take() {
+                            MountStatus {
+                                intent: current.intent,
+                                path,
+                                state: MountState::Lost { error },
+                            }
+                        } else if current.state.is_attached() || lost {
+                            current
+                        } else {
+                            MountStatus {
+                                intent: MountIntent::Attach,
+                                path,
+                                state: MountState::Attached { since_ms: now_ms() },
+                            }
                         }
-                    };
-                    self.status.store(restored);
+                    });
                 } else {
                     self.publish(
                         MountIntent::Detach,
@@ -545,7 +628,7 @@ pub mod adapter {
     };
     use anyhow::{Result, ensure};
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
         sync::{
             Arc, Condvar, Mutex,
             atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -559,6 +642,21 @@ pub mod adapter {
     static MOUNT_ERRORS: AtomicU64 = AtomicU64::new(0);
     type LostHook = Arc<dyn Fn(ErrorWire) + Send + Sync>;
     static LOST: Mutex<Option<LostHook>> = Mutex::new(None);
+    /// The attached instance's path, published by the adapter whenever its
+    /// transition lock changes the instance; only ever locked for a copy.
+    static ATTACHED: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// The path of the adapter's attached instance (also while it is lost).
+    /// Never waits for a transition in progress.
+    pub fn attached_path() -> Option<PathBuf> {
+        lock(&ATTACHED).clone()
+    }
+
+    /// Called by the adapter, under its transition lock, whenever it starts
+    /// or forgets an instance.
+    pub fn set_attached_path(path: Option<PathBuf>) {
+        *lock(&ATTACHED) = path;
+    }
 
     /// Counts one native callback until dropped.
     pub struct Callback(());
@@ -680,7 +778,18 @@ pub mod adapter {
         e.publish_observation();
     }
 
-    /// Engine bookkeeping after a native instance started.
+    /// The native instance died underneath us (FUSE dispatch end): every
+    /// dirty session into `pending_saves` (invariant 8; the dead connection's
+    /// handles keep them referenced, so the pending-save retry skips them
+    /// until the detach that cleans the instance up), then `mounted = false`.
+    pub fn lost(engine: &Shared) {
+        let mut e = lock_engine(engine);
+        retain(&mut e);
+        e.mounted = false;
+        e.publish_observation();
+    }
+
+    /// Engine bookkeeping when a native instance starts.
     pub fn attached(engine: &Shared) {
         let mut e = lock_engine(engine);
         e.mounted = true;
