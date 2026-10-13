@@ -3,10 +3,20 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Verifier {
     pub salt: String,
     pub hash: String,
+}
+/// `hash` is HMAC-key-equivalent to the pairing code (REVAMP_PLAN §11.15,
+/// invariant 21), so `Debug` never prints it (CCR-WP0.4-2, applied by WP0.INT).
+impl std::fmt::Debug for Verifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Verifier")
+            .field("salt", &self.salt)
+            .field("hash", &"<redacted>")
+            .finish()
+    }
 }
 impl Verifier {
     pub fn generate() -> (String, Self) {
@@ -46,5 +56,16 @@ mod tests {
         let restored: Verifier = serde_json::from_str(&stored).unwrap();
         assert!(restored.verify(&code));
         assert!(!restored.verify(&other));
+    }
+    #[test]
+    fn verifier_debug_redacts_the_hash() {
+        let (code, verifier) = Verifier::generate();
+        let printed = format!("{verifier:?} {verifier:#?}");
+        assert!(!printed.contains(&verifier.hash));
+        assert!(!printed.contains(&code));
+        assert!(printed.contains(&verifier.salt));
+        assert!(printed.contains("<redacted>"));
+        assert_eq!(verifier.clone(), verifier);
+        assert_ne!(verifier, Verifier::generate().1);
     }
 }

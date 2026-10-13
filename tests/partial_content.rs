@@ -272,13 +272,24 @@ fn bulk_install_wait_does_not_block_control_rpc() {
     let transfer_lock = b.lock().unwrap().transfers.for_object(&hash(b"bytes"));
     let guard = transfer_lock.lock().unwrap();
     let install = std::thread::spawn(move || {
-        runtime::rpc(
-            &remote,
-            &id(),
-            json!({"op":"published-exchange","route":ba,"page":page}),
-        )
+        // `published_rpc` takes the engine with `try_lock` and answers
+        // WORKER_BUSY, before applying anything, when it collides with the
+        // polling loop below; retry it (CCR-WP0.INT-1).
+        loop {
+            match runtime::rpc(
+                &remote,
+                &id(),
+                json!({"op":"published-exchange","route":ba,"page":page}),
+            ) {
+                Err(error) if error.to_string().contains("WORKER_BUSY") => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                result => break result,
+            }
+        }
     });
-    for _ in 0..100 {
+    // Up to 10 s (was 0.5 s): the metadata apply can be retried above.
+    for _ in 0..2000 {
         if b.lock().unwrap().store.lookup("bulk").is_ok() {
             break;
         }
