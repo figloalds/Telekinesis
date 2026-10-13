@@ -1,0 +1,94 @@
+{
+  "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+  "seq": 42,
+  "at_ms": 1790000042000,
+  "uptime_ms": 42000,
+  "mount": {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attached",
+    "since_ms": 1790000000900
+  },
+  "engine": {
+    "waiters": 1,
+    "holds": 99000,
+    "wait_p99_ms": 4,
+    "longest_hold_ms": 310,
+    "current_hold_ms": 0,
+    "stalled": false
+  },
+  "store_health": {
+    "state": "healthy"
+  },
+  "pending_saves": 0,
+  "open_handles": 3,
+  "unflushed_files": 1,
+  "generations": {
+    "sync": 77,
+    "branches": 3,
+    "content": 41,
+    "mount": 2
+  },
+  "tip": {
+    "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "seq": 4096
+  },
+  "inbox": {
+    "ready": 12,
+    "waiting": 3,
+    "retry": 1,
+    "blocked": 2,
+    "quarantined": 1,
+    "unclassified": 0
+  },
+  "activation": {
+    "running": true,
+    "activated": 2048,
+    "fast": 2040,
+    "slow": 8,
+    "quarantined": 1,
+    "retried": 4,
+    "stale": 0,
+    "slices": 40,
+    "last_slice_ms": 18,
+    "last_activation_at_ms": 1790000005000,
+    "starved_since_ms": null
+  },
+  "content": {
+    "current_objects": 1200,
+    "current_available": 1100,
+    "current_missing": 100,
+    "current_missing_bytes": 734003200,
+    "shared_objects": 1500,
+    "shared_available": 1380,
+    "shared_missing_bytes": 900000000,
+    "downloading": 2,
+    "partial_bytes": 3145728,
+    "requested": 7,
+    "complete": false
+  },
+  "journal": {
+    "events": 4096,
+    "shared_events": 4090,
+    "branches": 2,
+    "tip": 4096,
+    "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "outgoing_unacknowledged": 12,
+    "unresolved_conflicts": 1
+  },
+  "peers": [
+    {
+      "replica": "8d7c6b5a-4f3e-4d2c-9b1a-0f9e8d7c6b5a",
+      "cursor_seq": 3900,
+      "remote_tip": 4312,
+      "to_receive": 412,
+      "to_send": 5,
+      "staged_pending": 3,
+      "blocked": 0,
+      "quarantined": 0,
+      "rejected": 0,
+      "caught_up": false,
+      "last_exchange_ms": 1790000004500
+    }
+  ]
+}

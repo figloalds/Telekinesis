@@ -1,0 +1,13 @@
+{
+  "current_objects": 1200,
+  "current_available": 1100,
+  "current_missing": 100,
+  "current_missing_bytes": 734003200,
+  "shared_objects": 1500,
+  "shared_available": 1380,
+  "shared_missing_bytes": 900000000,
+  "downloading": 2,
+  "partial_bytes": 3145728,
+  "requested": 7,
+  "complete": false
+}

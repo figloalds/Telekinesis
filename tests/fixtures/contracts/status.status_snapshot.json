@@ -1,0 +1,292 @@
+{
+  "schema": 2,
+  "generation": 314,
+  "at_ms": 1790000010000,
+  "daemon": {
+    "installation": "inst-aaaa-1111",
+    "version": "0.1.0+6298d0b",
+    "pid": 4321,
+    "started_at_ms": 1789999940000,
+    "stopping": false,
+    "control": "ws://127.0.0.1:43181",
+    "network": "ws://0.0.0.0:43180",
+    "log_path": "C:\\tkfs\\data\\logs\\orchestrator.log",
+    "errors": []
+  },
+  "folders": [
+    {
+      "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+      "label": "Photos",
+      "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+      "device": "3c9e7a10-1f2b-4c3d-8e9f-a0b1c2d3e4f5",
+      "lifecycle": {
+        "phase": "running",
+        "detail": null,
+        "since_ms": 1790000000000,
+        "pid": 1234,
+        "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+        "adopted": true,
+        "restarts": 1,
+        "next_retry_at_ms": null,
+        "last_exit": {
+          "code": 73,
+          "fatal": {
+            "fatal": true,
+            "code": "STORE_IDENTITY_MISMATCH",
+            "class": "fatal",
+            "message": "STORE_IDENTITY_MISMATCH: metadata.sqlite belongs to another repository",
+            "exit_code": 73
+          },
+          "stderr_tail": "store open failed\n",
+          "at_ms": 1790000001500
+        },
+        "degraded": false,
+        "startup": {
+          "phase": "verifying objects",
+          "seq": 37
+        }
+      },
+      "intents": {
+        "desired_running": true,
+        "sync_enabled": true,
+        "mount_enabled": true
+      },
+      "mount": {
+        "intent": "attach",
+        "path": "C:\\mounts\\photos",
+        "state": "attached",
+        "since_ms": 1790000000900
+      },
+      "gate": {
+        "state": "awaiting",
+        "source": "inst-bbbb-2222",
+        "since_ms": 1790000000000,
+        "waiting_on": [
+          "412 events remaining at source"
+        ]
+      },
+      "store": {
+        "health": {
+          "state": "healthy"
+        },
+        "pending_saves": 0,
+        "unflushed_files": 1,
+        "open_handles": 3
+      },
+      "activation": {
+        "inbox": {
+          "ready": 12,
+          "waiting": 3,
+          "retry": 1,
+          "blocked": 2,
+          "quarantined": 1,
+          "unclassified": 0
+        },
+        "counters": {
+          "running": true,
+          "activated": 2048,
+          "fast": 2040,
+          "slow": 8,
+          "quarantined": 1,
+          "retried": 4,
+          "stale": 0,
+          "slices": 40,
+          "last_slice_ms": 18,
+          "last_activation_at_ms": 1790000005000,
+          "starved_since_ms": null
+        }
+      },
+      "content": {
+        "current_objects": 1200,
+        "current_available": 1100,
+        "current_missing": 100,
+        "current_missing_bytes": 734003200,
+        "shared_objects": 1500,
+        "shared_available": 1380,
+        "shared_missing_bytes": 900000000,
+        "downloading": 2,
+        "partial_bytes": 3145728,
+        "requested": 7,
+        "complete": false
+      },
+      "journal": {
+        "events": 4096,
+        "shared_events": 4090,
+        "branches": 2,
+        "tip": 4096,
+        "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+        "outgoing_unacknowledged": 12,
+        "unresolved_conflicts": 1
+      },
+      "sync": {
+        "state": "downloading",
+        "summary": "1 of 1 peers",
+        "peers": [
+          {
+            "installation": "inst-bbbb-2222",
+            "endpoint": "wss://peer.example:43180",
+            "label": "laptop",
+            "direction": "outbound",
+            "state": "downloading",
+            "metadata": {
+              "to_send": 5,
+              "to_receive": 412,
+              "local_pending": 15,
+              "remote_pending": 0,
+              "blocked": 2,
+              "quarantined": 1,
+              "rejected": 1,
+              "caught_up": false,
+              "cursor_seq": 3900,
+              "remote_tip": 4312,
+              "last_exchange_ms": 1790000004500
+            },
+            "objects_down": {
+              "objects_remaining": 100,
+              "bytes_remaining": 838860800,
+              "in_flight": 2,
+              "rate_bps": 3400000,
+              "eta_s": 360,
+              "total_bytes": 3221225472,
+              "last_progress_ms": 1790000009000
+            },
+            "objects_up": {
+              "objects_remaining": 0,
+              "bytes_remaining": 0,
+              "in_flight": 0,
+              "rate_bps": 0,
+              "eta_s": null,
+              "total_bytes": 0,
+              "last_progress_ms": null
+            },
+            "last_progress_ms": 1790000009000,
+            "stalled_since_ms": null,
+            "backoff_until_ms": null,
+            "error": {
+              "error": {
+                "code": "REQUEST_TIMEOUT",
+                "class": "transient",
+                "message": "REQUEST_TIMEOUT: no reply after 30000 ms",
+                "retry_after_ms": 2000
+              },
+              "scope": {
+                "kind": "folder_peer",
+                "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+                "installation": "inst-bbbb-2222"
+              },
+              "first_at_ms": 1790000000000,
+              "last_at_ms": 1790000004000,
+              "count": 2,
+              "next_retry_at_ms": 1790000006000,
+              "resolved_at_ms": null
+            }
+          }
+        ]
+      },
+      "errors": [
+        {
+          "error": {
+            "code": "REQUEST_TIMEOUT",
+            "class": "transient",
+            "message": "REQUEST_TIMEOUT: no reply after 30000 ms",
+            "retry_after_ms": 2000
+          },
+          "scope": {
+            "kind": "folder_peer",
+            "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+            "installation": "inst-bbbb-2222"
+          },
+          "first_at_ms": 1790000000000,
+          "last_at_ms": 1790000004000,
+          "count": 2,
+          "next_retry_at_ms": 1790000006000,
+          "resolved_at_ms": null
+        }
+      ]
+    }
+  ],
+  "peers": [
+    {
+      "installation": "inst-bbbb-2222",
+      "endpoint": "wss://peer.example:43180",
+      "label": "laptop",
+      "direction": "both",
+      "state": "online",
+      "protocol": "tkfs-peer/3",
+      "since_ms": 1789999970000,
+      "rtt_ms": 42,
+      "rate_up_bps": 12000,
+      "rate_down_bps": 3400000,
+      "lanes": [
+        {
+          "lane": 0,
+          "role": "control",
+          "direction": "outbound",
+          "state": "ready",
+          "since_ms": 1789999970000,
+          "inflight": [
+            {
+              "op": "meta.exchange",
+              "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+              "since_ms": 1790000009900,
+              "bytes": 0
+            }
+          ],
+          "bytes_up": 1000000,
+          "bytes_down": 2000000,
+          "rate_up_bps": 1000,
+          "rate_down_bps": 2000,
+          "reconnects": 0,
+          "backoff_until_ms": null,
+          "error": null
+        },
+        {
+          "lane": 1,
+          "role": "bulk",
+          "direction": "outbound",
+          "state": "backoff",
+          "since_ms": 1790000008000,
+          "inflight": [],
+          "bytes_up": 0,
+          "bytes_down": 900000000,
+          "rate_up_bps": 0,
+          "rate_down_bps": 0,
+          "reconnects": 3,
+          "backoff_until_ms": 1790000012000,
+          "error": {
+            "error": {
+              "code": "REQUEST_TIMEOUT",
+              "class": "transient",
+              "message": "REQUEST_TIMEOUT: no reply after 30000 ms",
+              "retry_after_ms": 2000
+            },
+            "scope": {
+              "kind": "folder_peer",
+              "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+              "installation": "inst-bbbb-2222"
+            },
+            "first_at_ms": 1790000000000,
+            "last_at_ms": 1790000004000,
+            "count": 2,
+            "next_retry_at_ms": 1790000006000,
+            "resolved_at_ms": null
+          }
+        }
+      ],
+      "inbound_sessions": 2,
+      "shared_folders": [
+        "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a"
+      ],
+      "error": null
+    }
+  ],
+  "activity": [
+    {
+      "at_ms": 1790000009500,
+      "kind": "exchange",
+      "folder": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+      "peer": "inst-bbbb-2222",
+      "message": "received 1 event, staged 1"
+    }
+  ]
+}

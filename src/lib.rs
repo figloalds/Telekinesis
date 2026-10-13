@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod bulk_sync;
 pub mod core;
+pub mod model;
 #[cfg(windows)]
 pub mod mount;
 #[cfg(target_os = "linux")]
@@ -10,8 +11,10 @@ pub mod orchestrator;
 pub mod paired_sync;
 pub mod pairing_code;
 pub mod runtime;
+pub mod session;
 pub mod staging;
 pub mod startup;
+pub mod util;
 mod wire;
 pub mod worker;
 pub mod ws;

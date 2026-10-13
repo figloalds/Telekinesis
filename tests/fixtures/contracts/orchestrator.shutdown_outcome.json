@@ -1,0 +1,16 @@
+[
+  {
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "outcome": "stopped",
+    "error": null
+  },
+  {
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "outcome": "left_running",
+    "error": {
+      "code": "BUSY_VIEW",
+      "class": "contention",
+      "message": "BUSY_VIEW: 1 open handle"
+    }
+  }
+]

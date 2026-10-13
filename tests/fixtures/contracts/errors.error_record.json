@@ -1,0 +1,18 @@
+{
+  "error": {
+    "code": "REQUEST_TIMEOUT",
+    "class": "transient",
+    "message": "REQUEST_TIMEOUT: no reply after 30000 ms",
+    "retry_after_ms": 2000
+  },
+  "scope": {
+    "kind": "folder_peer",
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "installation": "inst-bbbb-2222"
+  },
+  "first_at_ms": 1790000000000,
+  "last_at_ms": 1790000004000,
+  "count": 2,
+  "next_retry_at_ms": 1790000006000,
+  "resolved_at_ms": null
+}

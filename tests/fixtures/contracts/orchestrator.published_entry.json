@@ -1,0 +1,33 @@
+{
+  "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+  "replica": "3c9e7a10-1f2b-4c3d-8e9f-a0b1c2d3e4f5",
+  "label": "Photos",
+  "branches": [
+    {
+      "id": "b0a1c2d3-e4f5-4061-8a9b-0c1d2e3f4a5b",
+      "name": "main",
+      "shared": true
+    }
+  ],
+  "state": "running",
+  "tip": {
+    "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "seq": 4096
+  },
+  "sync_generation": 77,
+  "content": {
+    "current_objects": 1200,
+    "current_available": 1100,
+    "current_missing": 100,
+    "current_missing_bytes": 734003200,
+    "shared_objects": 1500,
+    "shared_available": 1380,
+    "shared_missing_bytes": 900000000,
+    "downloading": 2,
+    "partial_bytes": 3145728,
+    "requested": 7,
+    "complete": false
+  },
+  "error": null,
+  "updated_at_ms": 1790000002000
+}

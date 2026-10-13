@@ -1,0 +1,18 @@
+[
+  "not_shared",
+  "offline",
+  "connecting",
+  "incompatible",
+  "unauthorized",
+  "waiting_for_worker",
+  "waiting_for_remote",
+  "paused",
+  "metadata",
+  "downloading",
+  "uploading",
+  "syncing",
+  "blocked",
+  "backoff",
+  "stalled",
+  "up_to_date"
+]

@@ -1,0 +1,64 @@
+{
+  "results": [
+    {
+      "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "outcome": "completed",
+      "bytes": 0
+    },
+    {
+      "hash": "a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9f",
+      "outcome": {
+        "progressed": {
+          "durable_offset": 2097152
+        }
+      },
+      "bytes": 1048576
+    },
+    {
+      "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "outcome": "skipped",
+      "bytes": 2097152
+    },
+    {
+      "hash": "a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9f",
+      "outcome": "in_flight_elsewhere",
+      "bytes": 3145728
+    },
+    {
+      "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "outcome": "not_available",
+      "bytes": 4194304
+    },
+    {
+      "hash": "a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9f",
+      "outcome": "not_permitted",
+      "bytes": 5242880
+    },
+    {
+      "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "outcome": "corrupt_at_source",
+      "bytes": 6291456
+    },
+    {
+      "hash": "a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9f",
+      "outcome": "size_mismatch",
+      "bytes": 7340032
+    },
+    {
+      "hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+      "outcome": "unsolicited",
+      "bytes": 8388608
+    },
+    {
+      "hash": "a0b1c2d3e4f5061728394a5b6c7d8e9fa0b1c2d3e4f5061728394a5b6c7d8e9f",
+      "outcome": {
+        "failed": {
+          "code": "OBJECT_IO_ERROR",
+          "class": "transient",
+          "message": "OBJECT_IO_ERROR: disk full"
+        }
+      },
+      "bytes": 9437184
+    }
+  ]
+}
