@@ -160,12 +160,14 @@ mod os {
 
 /// Process ids whose command line contains `needle` (for example a worker's
 /// state directory). Windows queries CIM through PowerShell; Linux scans `/proc`.
+/// Neither the caller nor the querying PowerShell (whose own command line
+/// contains `needle`) is listed.
 pub fn find_pids(needle: &str) -> Vec<u32> {
     #[cfg(windows)]
     {
         let filter = needle.replace('\'', "''");
         let script = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -and $_.CommandLine.Contains('{filter}') }} | ForEach-Object {{ $_.ProcessId }}"
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains('{filter}') }} | ForEach-Object {{ $_.ProcessId }}"
         );
         let Ok(out) = std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])

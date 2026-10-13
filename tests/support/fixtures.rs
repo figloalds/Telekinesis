@@ -346,6 +346,14 @@ pub fn journal_order(store: &Store, skip: &BTreeSet<String>) -> Result<Vec<Strin
 }
 
 /// Summary of `concurrent_histories`.
+///
+/// Determinism contract (same `(stores.len(), ops, seed)` → equal values):
+/// `log`, `syncs` and `history`. `history` is read back from the stores, so it
+/// also proves the stores committed the same operations. The projected
+/// outcome (which concurrent rename or write wins, conflict counts, visible
+/// names) is **not** part of the contract: the core breaks those ties by event
+/// and entity ids, which are random UUIDs, so it differs between runs of the
+/// same seed (measured: 29 of 30 seeds; equal across replicas of one run).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConcurrentSummary {
     /// The intended operation sequence: `replica:op:target[:content]` (deterministic per seed).
@@ -354,6 +362,73 @@ pub struct ConcurrentSummary {
     pub refused: usize,
     /// Pairwise one-way syncs performed.
     pub syncs: usize,
+    /// `canonical_history` of the converged replicas (identical on every replica).
+    pub history: Vec<String>,
+}
+
+/// The committed shared events of `store` without ids, sorted: each event as
+/// `author|entity.field=value,...`, where `author` is the index of its device in
+/// `devices`, entities are named by the name they were created with, a location
+/// is `parent-name/name` (`/` for the root) and `basic` values (timestamps) are
+/// omitted. Equal for two runs of a seeded fixture that committed the same
+/// operations in the same causal structure, whatever ids they drew.
+pub fn canonical_history(store: &Store, devices: &[String]) -> Result<Vec<String>> {
+    let events: Vec<Event> = store
+        .events()?
+        .into_iter()
+        .filter(|e| e.branch.shared)
+        .collect();
+    let mut created: BTreeMap<String, String> = BTreeMap::new();
+    for e in &events {
+        let new: BTreeSet<&str> = e
+            .changes
+            .iter()
+            .filter(|c| c.field == "kind")
+            .map(|c| c.entity.as_str())
+            .collect();
+        for c in &e.changes {
+            if c.field == "location" && new.contains(c.entity.as_str()) {
+                let name = c.value["name"].as_str().unwrap_or_default();
+                created.insert(c.entity.clone(), name.to_owned());
+            }
+        }
+    }
+    let name = |entity: &str| -> String {
+        if entity == ROOT {
+            "/".into()
+        } else {
+            created.get(entity).cloned().unwrap_or_else(|| "?".into())
+        }
+    };
+    let mut out: Vec<String> = events
+        .iter()
+        .map(|e| {
+            let author = devices
+                .iter()
+                .position(|d| *d == e.device)
+                .map_or_else(|| "?".to_owned(), |i| i.to_string());
+            let mut changes: Vec<String> = e
+                .changes
+                .iter()
+                .map(|c| {
+                    let value = match c.field.as_str() {
+                        "location" => format!(
+                            "{}/{}",
+                            name(c.value["parent"].as_str().unwrap_or_default()),
+                            c.value["name"].as_str().unwrap_or_default()
+                        ),
+                        "basic" => "-".into(),
+                        _ => c.value.to_string(),
+                    };
+                    format!("{}.{}={value}", name(&c.entity), c.field)
+                })
+                .collect();
+            changes.sort();
+            format!("{author}|{}", changes.join(","))
+        })
+        .collect();
+    out.sort();
+    Ok(out)
 }
 
 /// `ops` random namespace and content operations spread over `stores` (all of the
@@ -475,6 +550,14 @@ pub fn concurrent_histories(
         }
     }
     converge(stores, &allowed)?;
+    let replica_devices: Vec<String> = stores.iter().map(|s| s.device.clone()).collect();
+    summary.history = canonical_history(&stores[0], &replica_devices)?;
+    for other in &stores[1..] {
+        ensure!(
+            canonical_history(other, &replica_devices)? == summary.history,
+            "FIXTURE_HISTORIES_DIFFER"
+        );
+    }
     Ok(summary)
 }
 
@@ -694,12 +777,15 @@ pub fn large_object_in(store: &mut Store, path: &str, bytes: u64, seed: u64) -> 
 }
 
 /// Close `store`, copy its directory to `dst` and give the copy a fresh device
-/// id: a second replica that has already activated the same history (avoids
-/// replaying a large remote history through the slow path during setup).
-/// Returns `(original reopened, clone)`.
+/// id: a second replica that has already received and activated the same
+/// history (avoids replaying a large remote history through the slow path
+/// during setup). The copy's per-replica rows are those of a receiver after its
+/// first round trip with the author (`as_receiver`). Returns
+/// `(original reopened, clone)`.
 pub fn clone_replica(store: Store, dst: &Path) -> Result<(Store, Store)> {
     let root = store.root.clone();
     let repo = store.repo.clone();
+    let author = store.device.clone();
     store.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     drop(store);
     copy_dir(&root, dst)?;
@@ -707,15 +793,17 @@ pub fn clone_replica(store: Store, dst: &Path) -> Result<(Store, Store)> {
         let _ = fs::remove_file(dst.join(name));
     }
     restamp_device(dst, &id())?;
+    as_receiver(dst, &author)?;
     let original = Store::open(&root, Some(&repo))?;
     let clone = Store::open(dst, Some(&repo))?;
     Ok((original, clone))
 }
 
 /// `clone_replica`, then remove the clone's object bytes (except the empty
-/// object): a replica that has committed the whole history but holds none of
-/// its content, as if it had received the metadata only. Avoids activating a
-/// large remote history through the slow path during setup.
+/// object) and its availability rows for them: a replica that has committed
+/// the whole history but holds none of its content, as if it had received the
+/// metadata only. Avoids activating a large remote history through the slow
+/// path during setup.
 pub fn metadata_replica(store: Store, dst: &Path) -> Result<(Store, Store)> {
     let (original, clone) = clone_replica(store, dst)?;
     let repo = clone.repo.clone();
@@ -727,8 +815,49 @@ pub fn metadata_replica(store: Store, dst: &Path) -> Result<(Store, Store)> {
             fs::remove_file(entry.path())?;
         }
     }
+    // Only verified inbound bytes are recorded as received; object references
+    // and sizes come from the events and stay.
+    let db = rusqlite::Connection::open(dst.join("metadata.sqlite"))?;
+    db.execute(
+        "DELETE FROM received_shared_objects WHERE hash<>?",
+        [&empty],
+    )?;
+    db.execute("DELETE FROM published_objects WHERE hash<>?", [&empty])?;
+    drop(db);
     let clone = Store::open(dst, Some(&repo))?;
     Ok((original, clone))
+}
+
+/// Turn a copied (closed) state of `author` into what a receiver of that whole
+/// history holds after its first round trip with `author` (core.rs `commit`,
+/// `receive`, `remember_peer_inventory`):
+/// - the author's publication grants (`published_objects`, written only for
+///   local authorship) become `received_shared_objects` (verified inbound bytes);
+/// - every shared event stays in the `outbox` (a receiver queues received
+///   shared events too) and is acknowledged, because the author holds them all;
+/// - the author's knowledge of its own peers (`peer_known`, `peer_objects`,
+///   `peer_requests`), its object requests and request receipts are dropped;
+///   `peer_known` records that `author` holds every shared event.
+pub fn as_receiver(state: &Path, author: &str) -> Result<()> {
+    let mut db = rusqlite::Connection::open(state.join("metadata.sqlite"))?;
+    let tx = db.transaction()?;
+    tx.execute_batch(
+        "INSERT OR IGNORE INTO received_shared_objects SELECT hash FROM published_objects;
+         DELETE FROM published_objects;
+         UPDATE outbox SET acknowledged=1;
+         DELETE FROM peer_known;
+         DELETE FROM peer_objects;
+         DELETE FROM peer_requests;
+         DELETE FROM object_requests;
+         DELETE FROM receipts;",
+    )?;
+    tx.execute(
+        "INSERT INTO peer_known SELECT ?, e.id FROM events e JOIN branches b ON b.id=e.branch \
+         WHERE b.shared=1",
+        [author],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Recursive directory copy (files and directories only).
@@ -874,8 +1003,15 @@ pub fn deliver_paced(
 }
 
 /// Copy a closed state directory `src` over `dst` and stamp `device` as the
-/// copy's device id (turns `dst` into an already-synchronized replica).
+/// copy's device id (turns `dst` into an already-synchronized replica, with
+/// receiver-side rows, see `as_receiver`). Both directories must belong to
+/// stopped folders whose workers have exited (`Node::stop_folder_exited`).
 pub fn clone_into(src: &Path, dst: &Path, device: &str) -> Result<()> {
+    let author: String = rusqlite::Connection::open(src.join("metadata.sqlite"))?.query_row(
+        "SELECT value FROM config WHERE key='device'",
+        [],
+        |r| r.get(0),
+    )?;
     if dst.exists() {
         fs::remove_dir_all(dst)?;
     }
@@ -883,7 +1019,8 @@ pub fn clone_into(src: &Path, dst: &Path, device: &str) -> Result<()> {
     for name in ["runtime.json", "worker.json", "owner.lock", "worker.log"] {
         let _ = fs::remove_file(dst.join(name));
     }
-    restamp_device(dst, device)
+    restamp_device(dst, device)?;
+    as_receiver(dst, &author)
 }
 
 /// Give a copied (closed) state directory the device id `device`: the `config`

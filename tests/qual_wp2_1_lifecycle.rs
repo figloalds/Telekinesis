@@ -23,9 +23,10 @@ use support::*;
 const FILE: &str = "qual_wp2_1_lifecycle";
 
 /// Turn `folder` into a crash loop: remove its store so every start fails.
+/// The store is deleted only after the worker has exited.
 fn make_crasher(node: &Node, folder: &Value) {
     let state = state_id(folder);
-    node.stop_folder(&state);
+    node.stop_folder_exited(folder, STOP_EXIT_TIMEOUT).unwrap();
     for name in [
         "metadata.sqlite",
         "metadata.sqlite-wal",
@@ -63,20 +64,15 @@ fn api_latency_under_churn() {
         let _ = a.raw_call(json!({"op":"stop","state":state_id(&busy),"wait":false}));
     }
     let stop = Arc::new(AtomicBool::new(false));
+    let counts = Arc::new(CallCounts::default());
     let churner = {
-        let stop = stop.clone();
-        let control = a.discovery().unwrap();
+        let (stop, counts, control) = (stop.clone(), counts.clone(), a.control());
         let churn_state = state_id(&churn);
         thread::spawn(move || {
-            let call = |action: Value| {
-                let Ok(mut socket) = tkfs::ws::connect(control["control"].as_str().unwrap()) else {
-                    return;
-                };
-                let _ = tkfs::ws::call(&mut socket, &action);
-            };
             while !stop.load(Ordering::Relaxed) {
-                call(json!({"op":"stop","state":churn_state}));
-                call(json!({"op":"start","state":churn_state}));
+                for op in ["stop", "start"] {
+                    counts.record(&control.call(&json!({"op":op,"state":churn_state})));
+                }
             }
         })
     };
@@ -94,8 +90,14 @@ fn api_latency_under_churn() {
     }
     stop.store(true, Ordering::Relaxed);
     churner.join().unwrap();
+    // A churner whose calls never reach the daemon (for example rejected
+    // upgrades) would let the floor pass without any churn.
+    let (ok, _, _) = counts.get();
+    s.check(ok >= 2, format!("churner made progress: {}", counts.json()));
     let summary = summarize(&samples);
-    s.metric_with("list_p99_ms", summary.p99, "ms", summary.json());
+    let mut extra = summary.json();
+    extra["churn"] = counts.json();
+    s.metric_with("list_p99_ms", summary.p99, "ms", extra);
     s.finish();
 }
 
@@ -353,16 +355,9 @@ fn subscribe_latency() {
         return s.finish();
     };
     let generation = status["generation"].as_u64().unwrap_or(0);
-    let control = a.discovery().unwrap()["control"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let control = a.control();
     let waiter = thread::spawn(move || {
-        let mut socket = tkfs::ws::connect(&control)?;
-        let reply = tkfs::ws::call(
-            &mut socket,
-            &json!({"op":"subscribe","since":generation,"wait_ms":10000}),
-        );
+        let reply = control.call(&json!({"op":"subscribe","since":generation,"wait_ms":10000}));
         Ok::<_, anyhow::Error>((reply?, std::time::Instant::now()))
     });
     thread::sleep(Duration::from_millis(300));

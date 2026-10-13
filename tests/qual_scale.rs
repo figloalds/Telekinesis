@@ -23,12 +23,29 @@ fn empty() -> String {
     tkfs::core::hash(b"")
 }
 
-/// Committed event count on a folder's worker (`events` op).
-fn event_count(folder: &Value) -> usize {
-    try_rpc(folder, json!({"op":"events"}))
-        .ok()
-        .and_then(|e| e.as_array().map(Vec::len))
-        .unwrap_or(0)
+/// Committed event count on a folder's worker (`events` op), retried while the
+/// worker answers busy. An unreadable count is an error, never 0: a 0 would
+/// skew the activation base (and wrap the unsigned arithmetic).
+fn event_count(folder: &Value) -> anyhow::Result<usize> {
+    retry_busy(Duration::from_secs(60), || {
+        try_rpc(folder, json!({"op":"events"}))?
+            .as_array()
+            .map(Vec::len)
+            .ok_or_else(|| anyhow::anyhow!("INVALID_EVENTS_REPLY"))
+    })
+}
+
+/// Events activated on the receiver since `base`, for `per_event_ms`. A count
+/// that cannot be read fails the scenario (and reports 1, so the metric stays
+/// an upper bound instead of a fabricated rate).
+fn activated_since(s: &mut Scenario, folder: &Value, base: usize) -> usize {
+    match event_count(folder) {
+        Ok(count) => count.saturating_sub(base).max(1),
+        Err(e) => {
+            s.check(false, format!("receiver event count unreadable: {e:#}"));
+            1
+        }
+    }
 }
 
 /// Remote linear activation between daemons: A's folder holds `n` creates; B receives.
@@ -40,13 +57,18 @@ fn remote_linear(name: &str, n: usize) {
     let pa = a.create("Linear", true);
     a.with_stopped_folder(&pa, SETUP, |st| linear_history(st, n).map(|_| ()))
         .unwrap();
-    let base = event_count(&pa) - n;
+    // Events of the folder before the history (its own setup), which the
+    // receiver also activates; `checked_sub` guards the unsigned arithmetic.
+    let total = event_count(&pa).expect("source event count");
+    let Some(base) = total.checked_sub(n) else {
+        panic!("source holds {total} events, fewer than the {n} written");
+    };
     b.pair(&a, &a.code());
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let last = format!("lin-{:06}.txt", n - 1);
     let done = wait_until(s.remaining(), || has_hash(&pb, &last, &empty()));
-    let activated = event_count(&pb).saturating_sub(base).max(1);
+    let activated = activated_since(&mut s, &pb, base);
     s.metric_with(
         "per_event_ms",
         s.started.elapsed().as_secs_f64() * 1000.0 / activated as f64,
@@ -92,7 +114,7 @@ fn two_way_backlog() {
         Ok(())
     })
     .unwrap();
-    let base = event_count(&pb);
+    let base = event_count(&pb).expect("receiver event count before the backlog");
     a.with_stopped_folder(&pa, SETUP, |st| {
         linear_history_named(st, "backlog", n).map(|_| ())
     })
@@ -100,7 +122,7 @@ fn two_way_backlog() {
     s.measure_from_now();
     let last = format!("backlog-{:06}.txt", n - 1);
     let done = wait_until(s.remaining(), || has_hash(&pb, &last, &empty()));
-    let activated = event_count(&pb).saturating_sub(base).max(1);
+    let activated = activated_since(&mut s, &pb, base);
     s.metric_with(
         "per_event_ms",
         s.started.elapsed().as_secs_f64() * 1000.0 / activated as f64,
@@ -227,7 +249,7 @@ fn startup_ready_50k_objects() {
     })
     .unwrap();
     let state = state_id(&pa);
-    a.stop_folder(&state);
+    a.stop_folder_exited(&pa, STOP_EXIT_TIMEOUT).unwrap();
     s.measure_from_now();
     let _ = a.raw_call(json!({"op":"start","state":state}));
     let ready = wait_until(s.remaining(), || {
@@ -257,26 +279,21 @@ fn management_api_p99_under_churn() {
     let folders: Vec<String> = (0..6)
         .map(|i| state_id(&a.create(&format!("Churn {i}"), true)))
         .collect();
-    let control = a.discovery().unwrap()["control"]
-        .as_str()
-        .unwrap()
-        .to_owned();
     let stop = Arc::new(AtomicBool::new(false));
     let churners: Vec<_> = folders
         .into_iter()
         .map(|state| {
-            let (stop, control) = (stop.clone(), control.clone());
-            thread::spawn(move || {
-                let call = |action: Value| {
-                    if let Ok(mut socket) = tkfs::ws::connect(&control) {
-                        let _ = tkfs::ws::call(&mut socket, &action);
-                    }
-                };
+            let (stop, control) = (stop.clone(), a.control());
+            let counts = Arc::new(CallCounts::default());
+            let thread_counts = counts.clone();
+            let handle = thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    call(json!({"op":"stop","state":state}));
-                    call(json!({"op":"start","state":state}));
+                    for op in ["stop", "start"] {
+                        thread_counts.record(&control.call(&json!({"op":op,"state":state})));
+                    }
                 }
-            })
+            });
+            (handle, counts)
         })
         .collect();
     s.measure_from_now();
@@ -296,11 +313,22 @@ fn management_api_p99_under_churn() {
         thread::sleep(Duration::from_millis(20));
     }
     stop.store(true, Ordering::Relaxed);
-    for churner in churners {
-        churner.join().unwrap();
+    let mut churn = vec![];
+    for (i, (handle, counts)) in churners.into_iter().enumerate() {
+        handle.join().unwrap();
+        // A churner whose calls never reach the daemon (for example rejected
+        // upgrades) would let the floor pass without any churn.
+        let (ok, _, _) = counts.get();
+        s.check(
+            ok >= 2,
+            format!("churner {i} made progress: {}", counts.json()),
+        );
+        churn.push(counts.json());
     }
     let summary = summarize(&samples);
-    s.metric_with("list_p99_ms", summary.p99, "ms", summary.json());
+    let mut extra = summary.json();
+    extra["churn"] = json!(churn);
+    s.metric_with("list_p99_ms", summary.p99, "ms", extra);
     s.finish();
 }
 
@@ -331,21 +359,29 @@ fn idle_worker_cpu() {
         .collect();
     s.check(pids.len() >= 2, format!("worker pids: {pids:?}"));
     s.measure_from_now();
-    let before: Vec<f64> = pids
-        .iter()
-        .map(|p| process_cpu_ms(*p).unwrap_or(f64::NAN))
-        .collect();
+    let before: Vec<Option<f64>> = pids.iter().map(|p| process_cpu_ms(*p)).collect();
     let window = Duration::from_secs(30).min(s.budget);
     thread::sleep(window);
-    let after: Vec<f64> = pids
-        .iter()
-        .map(|p| process_cpu_ms(*p).unwrap_or(f64::NAN))
-        .collect();
-    let percent = before
-        .iter()
-        .zip(&after)
-        .map(|(b, a)| (a - b) / (window.as_secs_f64() * 1000.0) * 100.0)
-        .fold(0.0, f64::max);
+    let after: Vec<Option<f64>> = pids.iter().map(|p| process_cpu_ms(*p)).collect();
+    // Every worker must be measured at both ends: a pid that exited, restarted
+    // or denied access is a failed measurement (NaN fails the floor), never a
+    // silently dropped sample (f64::max ignores NaN).
+    let mut percent = if pids.is_empty() { f64::NAN } else { 0.0 };
+    for (pid, (b, a)) in pids.iter().zip(before.iter().zip(&after)) {
+        match (b, a) {
+            (Some(b), Some(a)) => {
+                percent = percent.max((a - b) / (window.as_secs_f64() * 1000.0) * 100.0);
+            }
+            _ => {
+                s.check(
+                    false,
+                    format!("worker {pid} CPU unreadable: {b:?} -> {a:?}"),
+                );
+                percent = f64::NAN;
+                break;
+            }
+        }
+    }
     s.metric_with(
         "cpu_percent",
         percent,
