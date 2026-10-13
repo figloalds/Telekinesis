@@ -197,7 +197,7 @@ fn management(action: ManagementCommand) -> Result<Action> {
             Action::ConfigureMount { state, mount }
         }
         ManagementCommand::Start { state } => Action::Start { state },
-        ManagementCommand::Stop { state } => Action::Stop { state },
+        ManagementCommand::Stop { state } => Action::Stop { state, wait: None },
         ManagementCommand::Shutdown => Action::Shutdown,
         ManagementCommand::ResetPairingCode => Action::ResetPairingCode,
         ManagementCommand::Pair {

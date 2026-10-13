@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod session;
 pub mod staging;
 pub mod startup;
+pub mod ui_model;
 pub mod util;
 mod wire;
 pub mod worker;

@@ -1,5 +1,12 @@
 //! Worker process entry: one folder state, its engine, the loopback RPC
 //! listener and an optional mount. `tkfs daemon --state S [--mount M]` runs it.
+pub mod activator;
+pub mod heartbeat;
+pub mod maintenance;
+pub mod mount_ctl;
+pub mod record;
+pub mod status_cell;
+
 use crate::{
     core::Store,
     orchestrator,

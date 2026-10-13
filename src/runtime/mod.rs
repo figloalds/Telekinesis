@@ -9,11 +9,14 @@ use std::{
 
 pub mod content;
 pub mod control;
+pub mod ctx;
 pub mod engine;
 pub mod export;
 pub mod notify;
+pub mod objects_rpc;
 pub mod published;
 pub mod server;
+pub mod sync_rpc;
 
 pub use content::prepare_content;
 pub use engine::{Engine, Handle, Session};

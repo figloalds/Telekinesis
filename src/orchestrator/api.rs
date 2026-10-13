@@ -5,7 +5,7 @@ use super::{
     supervisor::Shared,
 };
 use crate::{pairing_code::Verifier, runtime, ws};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::atomic::Ordering};
@@ -37,6 +37,10 @@ pub enum Action {
     },
     Stop {
         state: String,
+        /// `false` returns at once instead of waiting for `Stopped|StopBlocked`
+        /// (§3.5). The legacy supervisor always stops synchronously.
+        #[serde(default)]
+        wait: Option<bool>,
     },
     Shutdown,
     ResetPairingCode,
@@ -60,6 +64,43 @@ pub enum Action {
         #[serde(default)]
         headless: bool,
     },
+    // Management API v2 (§3.5, §14 WP2.2). Frozen by WP0.INT; the legacy
+    // `manage` answers each of them with NOT_IMPLEMENTED.
+    Status,
+    Subscribe {
+        since: u64,
+        #[serde(default)]
+        wait_ms: Option<u32>,
+    },
+    Attach {
+        state: String,
+    },
+    Detach {
+        state: String,
+        #[serde(default)]
+        force: bool,
+    },
+    PauseSync {
+        state: String,
+    },
+    ResumeSync {
+        state: String,
+    },
+    OverrideGate {
+        state: String,
+    },
+    ForceStop {
+        state: String,
+    },
+    Retry {
+        state: String,
+    },
+    Revalidate {
+        state: String,
+        #[serde(default)]
+        ids: Option<Vec<String>>,
+    },
+    Diagnostics,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -150,6 +191,25 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
             );
         }
         Action::RemoteList { endpoint } => return Ok(json!(remote_list(shared, &endpoint)?)),
+        // Management API v2 (WP2.1/WP2.2) is not served by the legacy
+        // supervisor; answer without taking the lifecycle lock.
+        v2 @ (Action::Status
+        | Action::Subscribe { .. }
+        | Action::Attach { .. }
+        | Action::Detach { .. }
+        | Action::PauseSync { .. }
+        | Action::ResumeSync { .. }
+        | Action::OverrideGate { .. }
+        | Action::ForceStop { .. }
+        | Action::Retry { .. }
+        | Action::Revalidate { .. }
+        | Action::Diagnostics) => {
+            let op = serde_json::to_value(&v2)?["op"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            bail!("NOT_IMPLEMENTED: {op} is not served by the legacy orchestrator");
+        }
         Action::Receive {
             endpoint,
             repo,
@@ -192,7 +252,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
             s.start(&state)?;
             s.inspect(&state)
         }
-        Action::Stop { state } => {
+        Action::Stop { state, wait: _ } => {
             s.project(&state)?;
             s.stop(&state)?;
             s.set_desired(&state, false)?;
@@ -218,6 +278,22 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
             status["role"] = json!(lane_role(lane));
             status
         }).collect::<Vec<_>>()})).collect::<Vec<_>>())),
-        _ => unreachable!(),
+        // Answered above, before the lifecycle lock is taken. Explicit arms
+        // (no `unreachable!`): a request can never panic the control thread.
+        Action::Folder { .. }
+        | Action::Pair { .. }
+        | Action::RemoteList { .. }
+        | Action::Receive { .. }
+        | Action::Status
+        | Action::Subscribe { .. }
+        | Action::Attach { .. }
+        | Action::Detach { .. }
+        | Action::PauseSync { .. }
+        | Action::ResumeSync { .. }
+        | Action::OverrideGate { .. }
+        | Action::ForceStop { .. }
+        | Action::Retry { .. }
+        | Action::Revalidate { .. }
+        | Action::Diagnostics => bail!("UNSUPPORTED_OPERATION: action already dispatched"),
     }
 }
