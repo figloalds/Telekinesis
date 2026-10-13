@@ -3,20 +3,28 @@
 //! The `StatusHub` behind [`StatusSink`] and [`StatusSource`] (REVAMP_PLAN
 //! §3.4, §7): one cheap, versioned owner of everything the UI shows.
 //!
-//! * **Passive.** All state lives in one `Mutex<HubState>`. [`record`] applies
-//!   an event in memory (map updates only: no I/O, no waiting, no durable
-//!   write; p99 < 50 µs) and never blocks on a producer (invariant 30: status
-//!   never blocks or writes).
+//! * **Passive, two locks.** The derived state lives in a `Mutex<HubState>`
+//!   (the *state* lock). [`record`] never takes it: it appends the event,
+//!   stamped with the time it was recorded, to a small queue under a second
+//!   lock (the *inbox*) that is never held across any real work. So a
+//!   producer never waits for a snapshot rebuild or a tick, whatever the
+//!   number of folders and peers (p99 < 50 µs; no I/O, no waiting, no durable
+//!   write: invariant 30, status never blocks or writes). Whoever next needs
+//!   the state (a reader, the tick, a setter, or `record` itself once
+//!   [`MAX_PENDING_EVENTS`] are queued) applies the queued events in order,
+//!   each at its recorded time, under the state lock.
 //! * **Lazy snapshots.** [`snapshot`] returns an `Arc<StatusSnapshot>` that is
 //!   rebuilt only when something changed, at most 4 times in any 1 s window
 //!   (`policy::SNAPSHOT_MIN_INTERVAL` on average) and at most 2 back to back,
 //!   so an isolated event is published at once while an event storm costs at
-//!   most 4 rebuilds a second. [`wait_newer`] serves `subscribe` long polls.
+//!   most 4 rebuilds a second. [`wait_newer`] serves `subscribe` long polls;
+//!   an unchanged hub serves the published snapshot from the inbox lock alone.
 //! * **Tick.** [`tick`] (the caller runs it at `HubConfig::interval`, 1 Hz,
 //!   see [`StatusHub::spawn_ticker`]) folds the EWMA rates (10 s and 60 s),
 //!   runs the stall detector, applies the time-based error display policy
-//!   (Contention after 30 s), expires stale inbound-incompatible notices and
-//!   prunes state of folders that were removed or never registered.
+//!   (Contention after 30 s), resolves pair errors whose work is gone,
+//!   expires stale inbound-incompatible notices and prunes state of folders
+//!   that were removed or never registered.
 //! * **Two clocks.** Reported `*_ms` fields are wall-clock time; every
 //!   duration the hub measures (stall, Contention visibility, notice expiry,
 //!   orphan grace) runs on a monotonic timeline (`Clock::instant`), so a
@@ -69,8 +77,8 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
-    net::{IpAddr, SocketAddr},
-    sync::{Arc, Condvar, Mutex},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -108,6 +116,23 @@ pub const ORPHAN_GRACE: Duration = Duration::from_secs(10);
 /// Removed folder states remembered so that late events for them are
 /// dropped instead of re-creating the folder.
 pub const MAX_TOMBSTONES: usize = 64;
+/// Recorded events queued before `record` applies them itself. Readers and
+/// the 1 Hz tick normally apply them long before; this only bounds the queue
+/// of a hub that nobody reads or ticks.
+pub const MAX_PENDING_EVENTS: usize = 4096;
+/// Initial capacity of the two event queues that alternate between the inbox
+/// and the state (they keep what they grow to).
+const QUEUE_CAPACITY: usize = 256;
+/// A (folder, peer) error whose work is gone is resolved once it has not
+/// been reported for this long (an implicit success, see `clear_idle_errors`):
+/// an objects op with no work left in its direction, or any error of a peer
+/// that no longer shares the folder. The wait covers the heartbeat's lag
+/// behind the worker (content counters are refreshed at 1 Hz).
+pub const WORK_GONE_GRACE: Duration = Duration::from_secs(10);
+/// At most one `inbound_incompatible` activity entry per this period; the
+/// next one says how many more hosts were seen meanwhile. The notices come
+/// from unauthenticated traffic and must not flood the activity ring.
+pub const NOTICE_ACTIVITY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Hub settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,14 +180,37 @@ pub fn stall_after_for(sync_interval: Duration, override_ms: Option<&str>) -> Du
 
 /// The status owner (§3.4). Create it with [`StatusHub::new`], give it to
 /// producers as `Arc<dyn StatusSink>` and to readers as `Arc<dyn StatusSource>`.
+///
+/// Lock order: `state`, then `inbox`; `inbox` is never held across a build, a
+/// tick or an event application.
 pub struct StatusHub {
     cfg: HubConfig,
     clock: Arc<dyn Clock>,
     /// The wall-clock time and the instant at construction: the origin of
     /// the monotonic timeline (`Now::mono`).
     origin: (u64, Instant),
+    /// The derived state (the slow lock).
     state: Mutex<HubState>,
+    /// Queued events, the dirty flag and the published snapshot (the fast
+    /// lock).
+    inbox: Mutex<Inbox>,
+    /// Paired with `inbox`. When the hub turns dirty, one waiter is woken
+    /// (it applies the events and rebuilds); a publish wakes them all.
     changed: Condvar,
+}
+
+/// What `record` and the readers share without the state lock.
+#[derive(Debug)]
+struct Inbox {
+    /// Recorded events not applied yet, in record order, each with the time
+    /// it was recorded.
+    events: Vec<(Now, StatusEvent)>,
+    /// Something changed since `published` was built (queued events count).
+    dirty: bool,
+    published: Arc<StatusSnapshot>,
+    /// `wait_newer` callers blocked on `changed` (or woken and not yet back
+    /// under the lock).
+    waiting: usize,
 }
 
 /// One reading of the hub's two clocks.
@@ -197,10 +245,15 @@ impl Now {
 impl std::fmt::Debug for StatusHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let state = lock(&self.state);
+        let (pending, dirty) = {
+            let inbox = lock(&self.inbox);
+            (inbox.events.len(), inbox.dirty)
+        };
         f.debug_struct("StatusHub")
             .field("cfg", &self.cfg)
-            .field("version", &state.version)
-            .field("generation", &state.cached.generation)
+            .field("generation", &state.generation)
+            .field("dirty", &dirty)
+            .field("pending", &pending)
             .field("folders", &state.folders.len())
             .field("peers", &state.peers.len())
             .finish_non_exhaustive()
@@ -214,13 +267,19 @@ impl StatusHub {
             ms: origin.0,
             mono: origin.0,
         };
-        let mut state = HubState::new(&cfg, now);
-        state.cached = Arc::new(state.build(now, &cfg, 0));
+        let state = HubState::new(&cfg, now);
+        let published = Arc::new(state.build(now, &cfg, 0));
         Arc::new(StatusHub {
             cfg,
             clock,
             origin,
             state: Mutex::new(state),
+            inbox: Mutex::new(Inbox {
+                events: Vec::with_capacity(QUEUE_CAPACITY),
+                dirty: false,
+                published,
+                waiting: 0,
+            }),
             changed: Condvar::new(),
         })
     }
@@ -295,10 +354,12 @@ impl StatusHub {
     /// that must observe their own writes (and for tests).
     pub fn snapshot_now(&self) -> Arc<StatusSnapshot> {
         let mut state = lock(&self.state);
-        if state.version != state.built_version {
+        let dirty = lock(&self.inbox).dirty;
+        if dirty {
             self.rebuild(&mut state);
         }
-        state.cached.clone()
+        drop(state);
+        self.published()
     }
 
     /// Sets (or clears) a peer's display name, the catalog's
@@ -317,12 +378,19 @@ impl StatusHub {
     /// The `LegacyLink` passthrough values recorded so far (pre-cutover
     /// legacy `LinkStatus` JSON, keyed as the producer keyed it).
     pub fn legacy_links(&self) -> BTreeMap<String, Value> {
-        lock(&self.state).legacy_links.clone()
+        let mut state = lock(&self.state);
+        self.drain(&mut state);
+        state.legacy_links.clone()
     }
 
     /// How many snapshots have been built (diagnostics and tests).
     pub fn rebuilds(&self) -> u64 {
         lock(&self.state).rebuilds
+    }
+
+    /// Recorded events not applied yet (diagnostics and tests).
+    pub fn pending(&self) -> usize {
+        lock(&self.inbox).events.len()
     }
 
     /// The §7.3 `sync` member of List/Inspect for `folder` after the cutover:
@@ -332,7 +400,8 @@ impl StatusHub {
     /// repository}]`, where `metadata` and `repository` carry every legacy
     /// `RepositoryStatus` key.
     pub fn legacy_folder_sync(&self, folder: &FolderRecord, peers: &[PeerRecord]) -> Value {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
+        self.drain(&mut state);
         let mut out = Vec::with_capacity(peers.len());
         for record in peers {
             let peer = state.find_peer(record);
@@ -390,7 +459,8 @@ impl StatusHub {
     /// reserved_connections: 1, lanes: [{role, connected, exchanges,
     /// last_success_ms, error, transport, parallel_bulk, repositories}]}`.
     pub fn legacy_peers(&self, peers: &[PeerRecord]) -> Value {
-        let state = lock(&self.state);
+        let mut state = lock(&self.state);
+        self.drain(&mut state);
         let mut out = Vec::with_capacity(peers.len());
         for record in peers {
             let peer = state.find_peer(record);
@@ -435,26 +505,72 @@ impl StatusHub {
         value
     }
 
-    /// Applies `change` under the state lock; when it reports a change, the
-    /// state version moves and waiters are woken if the hub was clean.
+    /// Applies the queued events, then `change`, under the state lock; when
+    /// `change` reports a change, the hub turns dirty.
     fn mutate(&self, change: impl FnOnce(&mut HubState, Now, &HubConfig) -> bool) {
-        let now = self.now();
         let mut state = lock(&self.state);
-        let was_clean = state.version == state.built_version;
+        self.drain(&mut state);
+        let now = self.now();
         if change(&mut state, now, &self.cfg) {
-            state.version = state.version.wrapping_add(1);
-            drop(state);
-            if was_clean {
-                self.changed.notify_all();
-            }
+            self.mark_dirty();
         }
     }
 
-    /// Rebuilds the cached snapshot if the state changed and the bucket has a
-    /// token; otherwise returns how long until the next token (`None` when
-    /// nothing changed or the rebuild happened).
+    /// Marks the published snapshot stale; wakes a waiter if it was current.
+    fn mark_dirty(&self) {
+        let wake = {
+            let mut inbox = lock(&self.inbox);
+            !std::mem::replace(&mut inbox.dirty, true) && inbox.waiting > 0
+        };
+        if wake {
+            self.changed.notify_one();
+        }
+    }
+
+    /// The published snapshot, for a `wait_newer` caller that returns. The
+    /// hub wakes a single waiter when it turns dirty; if it is still dirty,
+    /// that wake-up may have been this caller's, so it is passed on.
+    fn leave(&self, inbox: MutexGuard<'_, Inbox>) -> Arc<StatusSnapshot> {
+        let snapshot = inbox.published.clone();
+        let pass = inbox.dirty && inbox.waiting > 0;
+        drop(inbox);
+        if pass {
+            self.changed.notify_one();
+        }
+        snapshot
+    }
+
+    /// The published snapshot.
+    fn published(&self) -> Arc<StatusSnapshot> {
+        lock(&self.inbox).published.clone()
+    }
+
+    /// Applies the queued events in record order, each at its recorded time.
+    /// The caller holds the state lock, so only one thread drains at a time.
+    fn drain(&self, state: &mut HubState) {
+        self.take_events(state, false);
+        state.apply_pending();
+    }
+
+    /// Moves the queued events into `state.pending` (an empty buffer that
+    /// keeps its capacity, so `record` does not reallocate in steady state);
+    /// with `clean`, also clears `dirty` in the same critical section.
+    fn take_events(&self, state: &mut HubState, clean: bool) {
+        let mut inbox = lock(&self.inbox);
+        if clean {
+            inbox.dirty = false;
+        }
+        std::mem::swap(&mut inbox.events, &mut state.pending);
+    }
+
+    /// Applies the queued events; then, if the hub is dirty and the throttle
+    /// has a slot, rebuilds and publishes the snapshot. Returns how long
+    /// until the next slot when it had none (`None` when the hub was clean or
+    /// the rebuild happened).
     fn refresh(&self, state: &mut HubState) -> Option<Duration> {
-        if state.version == state.built_version {
+        self.drain(state);
+        let dirty = lock(&self.inbox).dirty;
+        if !dirty {
             return None;
         }
         match state.throttle.take(self.clock.instant()) {
@@ -466,60 +582,118 @@ impl StatusHub {
         }
     }
 
+    /// Builds and publishes a snapshot. Only the state lock is held while
+    /// building, so `record` never waits for it.
     fn rebuild(&self, state: &mut HubState) {
+        // Taking the queued events and clearing `dirty` together: anything
+        // recorded from here on makes the hub dirty again.
+        self.take_events(state, true);
+        state.apply_pending();
         let now = self.now();
-        let generation = state.cached.generation.wrapping_add(1);
-        let snapshot = state.build(now, &self.cfg, generation);
-        state.cached = Arc::new(snapshot);
-        state.built_version = state.version;
+        let generation = state.generation.wrapping_add(1);
+        state.generation = generation;
+        let snapshot = Arc::new(state.build(now, &self.cfg, generation));
         state.rebuilds = state.rebuilds.wrapping_add(1);
+        let previous = std::mem::replace(&mut lock(&self.inbox).published, snapshot);
+        self.changed.notify_all();
+        // The previous snapshot may be the last reference: free it outside
+        // the inbox lock.
+        drop(previous);
     }
 }
 
 impl StatusSink for StatusHub {
+    /// Queues the event with the time it was recorded: only the inbox lock is
+    /// taken, so this never waits for a rebuild, a tick or another reader.
     fn record(&self, event: StatusEvent) {
-        self.mutate(|state, now, _| {
-            state.apply(event, now);
-            true
-        });
+        let mut inbox = lock(&self.inbox);
+        // Read under the lock, so queued events are in time order.
+        let now = self.now();
+        inbox.events.push((now, event));
+        let wake = !std::mem::replace(&mut inbox.dirty, true) && inbox.waiting > 0;
+        let full = inbox.events.len() >= MAX_PENDING_EVENTS;
+        drop(inbox);
+        if wake {
+            // One waiter is enough: it applies the events and rebuilds, and
+            // the publish wakes the others. Waking every subscriber here
+            // would cost the producer one wake-up per subscriber.
+            self.changed.notify_one();
+        }
+        if full {
+            // Nobody applied the queue for a while (no reader, no tick):
+            // apply it here so that it stays bounded.
+            let mut state = lock(&self.state);
+            self.drain(&mut state);
+        }
     }
 }
 
 impl StatusSource for StatusHub {
     fn snapshot(&self) -> Arc<StatusSnapshot> {
+        {
+            let inbox = lock(&self.inbox);
+            if !inbox.dirty {
+                return inbox.published.clone();
+            }
+        }
         let mut state = lock(&self.state);
         self.refresh(&mut state);
-        state.cached.clone()
+        drop(state);
+        self.published()
     }
 
     /// Returns as soon as a snapshot newer than `generation` exists, or the
     /// current one when `timeout` elapses. A `generation` ahead of the hub
     /// (from a previous daemon run) returns the current snapshot at once.
+    ///
+    /// No wake-up is lost:
+    ///
+    /// * the dirty flag and the published generation are checked under the
+    ///   inbox lock right before waiting on `changed` (paired with it), and
+    ///   whoever changes them does so under that lock and signals after;
+    /// * when the hub turns dirty, one waiter is woken (if any waits). It
+    ///   applies the events and rebuilds, or waits for the throttle's slot
+    ///   on a timer and rebuilds then, and the publish wakes everyone. A
+    ///   waiter that returns while the hub is still dirty passes the wake-up
+    ///   on (`leave`), so some waiter always owns a dirty spell.
     fn wait_newer(&self, generation: u64, timeout: Duration) -> Arc<StatusSnapshot> {
         let deadline = Instant::now().checked_add(timeout);
-        let mut state = lock(&self.state);
+        let mut throttled: Option<Duration> = None;
         loop {
-            let throttled = self.refresh(&mut state);
-            let current = state.cached.generation;
+            let mut inbox = lock(&self.inbox);
             // Newer, or a generation from a previous daemon run (ahead of us).
-            if current != generation {
-                return state.cached.clone();
+            if inbox.published.generation != generation {
+                return self.leave(inbox);
+            }
+            if inbox.dirty && throttled.is_none() {
+                // Something changed: apply it and rebuild, or learn how long
+                // the throttle wants us to wait.
+                drop(inbox);
+                let mut state = lock(&self.state);
+                throttled = self.refresh(&mut state);
+                continue;
             }
             let remaining = match deadline {
                 Some(deadline) => deadline.saturating_duration_since(Instant::now()),
                 None => Duration::from_secs(3600),
             };
             if remaining.is_zero() {
-                return state.cached.clone();
+                return self.leave(inbox);
             }
-            let wait = throttled
-                .map_or(remaining, |wait| wait.min(remaining))
-                .max(Duration::from_millis(1));
-            state = self
+            // While dirty, the throttle's slot is the deadline (`record` does
+            // not signal a hub that is already dirty); otherwise wait for a
+            // change or a publish.
+            let wait = match throttled.take() {
+                Some(wait) if inbox.dirty => wait.min(remaining),
+                _ => remaining,
+            }
+            .max(Duration::from_millis(1));
+            inbox.waiting += 1;
+            let (mut inbox, _) = self
                 .changed
-                .wait_timeout(state, wait)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
+                .wait_timeout(inbox, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inbox.waiting -= 1;
         }
     }
 }
@@ -660,7 +834,8 @@ impl OpenError {
 }
 
 /// `(scope, slot)`: one open error per slot. Generic `Error` events use the
-/// empty slot; exchanges use their op; mirrored records use a fixed name.
+/// empty slot; exchanges use their op (`in:op` when the peer initiated it,
+/// see `exchange_slot`); mirrored records use a fixed name.
 type SlotKey = (Scope, String);
 
 /// Slot-name prefix of the inbound-incompatible notices (Daemon scope).
@@ -671,7 +846,16 @@ const INBOUND_SLOT: &str = "inbound:";
 #[derive(Debug, Default)]
 struct ErrorBook {
     open: BTreeMap<SlotKey, OpenError>,
-    history: VecDeque<ErrorRecord>,
+    history: VecDeque<Past>,
+}
+
+/// A history entry.
+#[derive(Debug)]
+struct Past {
+    record: ErrorRecord,
+    /// An expired inbound-incompatible notice: at most one is kept (see
+    /// `ErrorBook::expire_notices`).
+    notice: bool,
 }
 
 impl ErrorBook {
@@ -856,11 +1040,51 @@ impl ErrorBook {
         }
     }
 
+    /// Drops the inbound notices whose host has not tried again for `ttl`
+    /// (monotonic). This is not a resolution: no `resolved` activity entry,
+    /// and only the newest shown one is kept in the history, replacing the
+    /// notice kept there before, so unauthenticated traffic holds at most
+    /// one history entry.
+    fn expire_notices(&mut self, now: Now, ttl: u64) -> bool {
+        let expired: Vec<SlotKey> = self
+            .inbound_notices()
+            .filter(|(_, open)| now.mono.saturating_sub(open.seen) >= ttl)
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut newest: Option<ErrorRecord> = None;
+        for key in &expired {
+            if let Some(open) = self.open.remove(key)
+                && open.shown
+                && newest
+                    .as_ref()
+                    .is_none_or(|kept| open.record.last_at_ms >= kept.last_at_ms)
+            {
+                newest = Some(open.record);
+            }
+        }
+        if let Some(mut record) = newest {
+            record.resolve(now.ms);
+            self.history.retain(|past| !past.notice);
+            self.push_past(Past {
+                record,
+                notice: true,
+            });
+        }
+        !expired.is_empty()
+    }
+
     fn push_history(&mut self, record: ErrorRecord) {
+        self.push_past(Past {
+            record,
+            notice: false,
+        });
+    }
+
+    fn push_past(&mut self, past: Past) {
         while self.history.len() >= policy::ERROR_HISTORY {
             self.history.pop_front();
         }
-        self.history.push_back(record);
+        self.history.push_back(past);
     }
 
     /// Visible open errors (newest first), then the history (newest first).
@@ -878,6 +1102,7 @@ impl ErrorBook {
                 self.history
                     .iter()
                     .rev()
+                    .map(|past| &past.record)
                     .filter(|record| filter(&record.scope))
                     .cloned(),
             )
@@ -1167,14 +1392,23 @@ struct PairEntry {
     /// The pair's last exchange event (monotonic): a pair whose repo has no
     /// registered folder is pruned [`ORPHAN_GRACE`] later.
     touched: u64,
+    /// The last exchange in which the peer moved objects to us (monotonic):
+    /// the evidence that a peer without a published entry supplies
+    /// (`rules::may_supply`).
+    supplied: Option<u64>,
+    /// Download work was attributed to the peer at the last tick (a change
+    /// of attribution is not progress).
+    supplying: bool,
 }
 
 type PairKey = (String, String);
 
 struct HubState {
-    version: u64,
-    built_version: u64,
-    cached: Arc<StatusSnapshot>,
+    /// The generation of the last snapshot built.
+    generation: u64,
+    /// Events taken from the inbox, being applied; empty otherwise. It swaps
+    /// with the inbox queue, so both keep their capacity.
+    pending: Vec<(Now, StatusEvent)>,
     throttle: Throttle,
     rebuilds: u64,
     last_tick: Option<Instant>,
@@ -1192,12 +1426,18 @@ struct HubState {
     /// Recently removed folder states (oldest first): late events for them
     /// are dropped instead of re-creating the folder.
     removed: VecDeque<String>,
+    /// When the last `inbound_incompatible` activity entry was added
+    /// (monotonic), and how many new notices were not logged since.
+    notice_logged: Option<u64>,
+    notices_unlogged: u64,
 }
 
 /// Everything derived for one (folder, peer) pair at one instant.
 struct PairFacts {
     inputs: PeerInputs,
     work: Work,
+    /// Download work may be attributed to the peer (`rules::may_supply`).
+    supplies: bool,
     meta: MetaProgress,
     direction: Direction,
     /// When the stall began (monotonic).
@@ -1210,9 +1450,8 @@ struct PairFacts {
 impl HubState {
     fn new(cfg: &HubConfig, now: Now) -> Self {
         Self {
-            version: 0,
-            built_version: 0,
-            cached: Arc::new(StatusSnapshot::default()),
+            generation: 0,
+            pending: Vec::with_capacity(QUEUE_CAPACITY),
             throttle: Throttle::new(),
             rebuilds: 0,
             last_tick: None,
@@ -1235,7 +1474,19 @@ impl HubState {
             legacy_links: BTreeMap::new(),
             labels: BTreeMap::new(),
             removed: VecDeque::new(),
+            notice_logged: None,
+            notices_unlogged: 0,
         }
+    }
+
+    /// Applies the events taken from the inbox, in order, keeping the
+    /// buffer's capacity.
+    fn apply_pending(&mut self) {
+        let mut pending = std::mem::take(&mut self.pending);
+        for (now, event) in pending.drain(..) {
+            self.apply(event, now);
+        }
+        self.pending = pending;
     }
 
     /// The (repo, peer) pair, marked as touched now.
@@ -1385,11 +1636,7 @@ impl HubState {
             StatusEvent::PeerCatalog {
                 installation,
                 entries,
-            } => {
-                let peer = self.peer_mut(&installation);
-                peer.outbound = true;
-                peer.catalog = Some(entries);
-            }
+            } => self.on_catalog(&installation, entries, now),
             StatusEvent::InboundSession {
                 installation,
                 lane,
@@ -1702,10 +1949,18 @@ impl HubState {
         );
     }
 
-    /// A legacy (v2) peer dialed us (§6.2). One notice per remote host: its
-    /// count rises with every attempt (each reconnect uses a new ephemeral
-    /// port), and at most [`MAX_INBOUND_NOTICES`] hosts are kept, so
-    /// unauthenticated traffic cannot grow the daemon's errors (invariant 22).
+    /// A legacy (v2) peer dialed us (§6.2). This is unauthenticated pre-auth
+    /// traffic, so everything it can grow is bounded (invariant 22):
+    ///
+    /// * one notice per remote host (an IPv6 host by its /64): its count
+    ///   rises with every attempt, each reconnect using a new ephemeral port;
+    /// * at most [`MAX_INBOUND_NOTICES`] hosts are kept (the least recently
+    ///   seen is dropped, not moved to the history);
+    /// * a notice adds no generic `error` activity entry, and at most one
+    ///   `inbound_incompatible` entry per [`NOTICE_ACTIVITY_INTERVAL`], which
+    ///   counts the hosts seen since the previous one;
+    /// * an expired notice is not a resolution: the history keeps only the
+    ///   newest one (`ErrorBook::expire_notices`).
     fn on_inbound_incompatible(&mut self, address: &str, detail: &str, now: Now) {
         let code = code_in(detail).unwrap_or("PEER_NEEDS_UPGRADE").to_owned();
         let message = truncate(
@@ -1717,16 +1972,74 @@ impl HubState {
             format!("{INBOUND_SLOT}{}", remote_host(address)),
         );
         let new = !self.daemon_errors.open.contains_key(&key);
+        // A ring with no capacity records nothing: the notice's own entry
+        // below replaces the generic `error` one.
         self.daemon_errors.observe(
             key,
             ErrorWire::new(code, message.clone()),
             now,
-            &mut self.ring,
+            &mut Ring::default(),
         );
         self.daemon_errors.cap_inbound_notices();
-        if new {
-            self.ring
-                .push(now.ms, "inbound_incompatible", None, None, message);
+        if !new {
+            return;
+        }
+        let due = self
+            .notice_logged
+            .is_none_or(|at| now.mono.saturating_sub(at) >= rules::ms(NOTICE_ACTIVITY_INTERVAL));
+        if !due {
+            self.notices_unlogged = self.notices_unlogged.saturating_add(1);
+            return;
+        }
+        let message = match self.notices_unlogged {
+            0 => message,
+            1 => format!("{message} (and 1 more host since the last notice)"),
+            more => format!("{message} (and {more} more hosts since the last notice)"),
+        };
+        self.ring
+            .push(now.ms, "inbound_incompatible", None, None, message);
+        self.notice_logged = Some(now.mono);
+        self.notices_unlogged = 0;
+    }
+
+    /// A peer's published catalog. A remote folder that turned Running (it
+    /// was not Running, or not listed, in the previous catalog) serves
+    /// again: what the remote answered while it did not
+    /// (`REMOTE_WORKER_STARTING`, `FOLDER_SYNC_PAUSED`) is resolved. An
+    /// unchanged Running entry proves nothing (the catalog may predate the
+    /// answer), so only the transition counts.
+    fn on_catalog(&mut self, installation: &str, entries: Vec<PublishedEntry>, now: Now) {
+        let peer = self.peer_mut(installation);
+        peer.outbound = true;
+        let started: Vec<String> = entries
+            .iter()
+            .filter(|entry| {
+                entry.state == EntryState::Running
+                    && peer
+                        .catalog_entry(&entry.repo)
+                        .is_none_or(|before| before.state != EntryState::Running)
+            })
+            .map(|entry| entry.repo.clone())
+            .collect();
+        peer.catalog = Some(entries);
+        for repo in started {
+            let Some(state) = self.repos.get(&repo) else {
+                continue;
+            };
+            let Some(folder) = self.folders.get_mut(state) else {
+                continue;
+            };
+            let scope = Scope::FolderPeer {
+                state: state.clone(),
+                installation: installation.to_owned(),
+            };
+            folder.errors.resolve(
+                |(slot_scope, _), open| {
+                    *slot_scope == scope && rules::remote_waiting_code(&open.record.error.code)
+                },
+                now,
+                &mut self.ring,
+            );
         }
     }
 
@@ -1893,6 +2206,8 @@ impl HubState {
             pair.up_episode = pair.up_episode.saturating_add(x.bytes_up);
             if x.bytes_down >= rules::PROGRESS_MIN_BYTES || x.objects_down > 0 {
                 pair.last_down_ms = Some(now.ms);
+                // Evidence that the peer supplies objects (`rules::may_supply`).
+                pair.supplied = Some(now.mono);
                 progress = true;
             }
             if x.bytes_up >= rules::PROGRESS_MIN_BYTES || x.objects_up > 0 {
@@ -1935,7 +2250,7 @@ impl HubState {
                 );
             }
         }
-        // Errors: per (peer, repo, op) slot of the folder book.
+        // Errors: per (peer, repo, op, direction) slot of the folder book.
         if let Some(state) = &folder_state
             && let Some(folder) = self.folders.get_mut(state)
         {
@@ -1943,23 +2258,27 @@ impl HubState {
                 state: state.clone(),
                 installation: x.installation.clone(),
             };
+            let slot = exchange_slot(&x.op, x.direction);
             match (&x.error, x.ok) {
                 (_, true) => {
+                    // A success clears its own key and the generic slot; and
+                    // any success proves that the remote folder serves, so
+                    // what it answered while it did not no longer holds.
                     folder.errors.resolve(
-                        |(slot_scope, slot), _| {
-                            *slot_scope == scope && (slot.is_empty() || *slot == x.op)
+                        |(slot_scope, name), open| {
+                            *slot_scope == scope
+                                && (name.is_empty()
+                                    || *name == slot
+                                    || rules::remote_waiting_code(&open.record.error.code))
                         },
                         now,
                         &mut self.ring,
                     );
                 }
                 (Some(error), false) => {
-                    folder.errors.observe(
-                        (scope, x.op.clone()),
-                        error.clone(),
-                        now,
-                        &mut self.ring,
-                    );
+                    folder
+                        .errors
+                        .observe((scope, slot), error.clone(), now, &mut self.ring);
                 }
                 (None, false) => {}
             }
@@ -2107,28 +2426,39 @@ impl HubState {
         // Stall detection and remaining-work tracking per (folder, peer), on
         // the monotonic timeline.
         let mut updates = Vec::new();
+        // (sharing, remaining work) of every (repo, peer) of a registered
+        // folder, for the implicit clears below.
+        let mut pair_work: BTreeMap<PairKey, (bool, Work)> = BTreeMap::new();
         for (state, folder) in &self.folders {
             let Some(view) = &folder.view else { continue };
             for (installation, peer) in &self.peers {
                 let key = (view.record.repo.clone(), installation.clone());
                 let pair = self.pairs.get(&key);
                 let facts = self.pair_facts(state, folder, view, peer, pair, now, cfg);
-                updates.push((key, facts.inputs, facts.work));
+                pair_work.insert(key.clone(), (facts.inputs.shared, facts.work));
+                updates.push((key, facts.inputs, facts.work, facts.supplies));
             }
         }
-        for (key, inputs, work) in updates {
+        for (key, inputs, work, supplies) in updates {
             let eligible = inputs.can_progress() && inputs.work_remaining();
             if !eligible && !self.pairs.contains_key(&key) {
                 continue;
             }
             let pair = self.pairs.entry(key.clone()).or_default();
-            if let Some(before) = pair.work
-                && rules::progressed(&before, &work)
-            {
-                // Shown as the pair's `last_progress_ms`.
-                pair.last_progress = Some(now.mono);
-                changed = true;
+            if let Some(mut before) = pair.work {
+                if pair.supplying && !supplies {
+                    // The download work left with its attribution, not
+                    // because anything was downloaded.
+                    before.down_bytes = 0;
+                    before.down_objects = 0;
+                }
+                if rules::progressed(&before, &work) {
+                    // Shown as the pair's `last_progress_ms`.
+                    pair.last_progress = Some(now.mono);
+                    changed = true;
+                }
             }
+            pair.supplying = supplies;
             pair.work = Some(work);
             if work.down_bytes == 0 && work.down_objects == 0 && pair.down_episode != 0 {
                 pair.down_episode = 0;
@@ -2166,22 +2496,82 @@ impl HubState {
             }
             pair.stalled_since = stalled;
         }
+        changed |= self.clear_idle_errors(&pair_work, now);
         // Time-based error visibility; expiry of inbound-incompatible notices.
         changed |= self.daemon_errors.refresh(now, &mut self.ring);
         for folder in self.folders.values_mut() {
             changed |= folder.errors.refresh(now, &mut self.ring);
         }
-        let ttl = rules::ms(INBOUND_INCOMPATIBLE_TTL);
-        changed |= self.daemon_errors.resolve(
-            |(scope, slot), open| {
-                *scope == Scope::Daemon
-                    && slot.starts_with(INBOUND_SLOT)
-                    && now.mono.saturating_sub(open.seen) >= ttl
-            },
-            now,
-            &mut self.ring,
-        );
+        changed |= self
+            .daemon_errors
+            .expire_notices(now, rules::ms(INBOUND_INCOMPATIBLE_TTL));
         self.prune_orphans(now);
+        changed
+    }
+
+    /// Implicit successes for (folder, peer) errors whose work is gone. An
+    /// error clears on the next success of its own key (its op and
+    /// direction); these cover the keys that will never run again to clear
+    /// it. Once an error has not been reported for [`WORK_GONE_GRACE`]:
+    ///
+    /// * every error of a peer that does not share the folder (any more), or
+    ///   that the hub does not know, resolves: nothing is exchanged with it
+    ///   for this folder;
+    /// * an objects-op error resolves when the pair has no work left in the
+    ///   op's direction(s) and no exchange of that op is in flight: the
+    ///   object became unreferenced, arrived from another peer, or the peer
+    ///   got it elsewhere, so the op does not run again (the worker only
+    ///   pulls or pushes what is wanted).
+    ///
+    /// Errors of other ops wait for their op's next success: the metadata
+    /// exchange runs again on its own (anti-entropy every sync interval) as
+    /// long as the pair shares the folder and both folders serve. Remote
+    /// folder answers (`REMOTE_WORKER_STARTING`, `FOLDER_SYNC_PAUSED`) are
+    /// resolved by any success with the peer for the repo, or by its catalog
+    /// entry turning Running (see `on_exchange_finished`, `on_catalog`).
+    fn clear_idle_errors(&mut self, pair_work: &BTreeMap<PairKey, (bool, Work)>, now: Now) -> bool {
+        let grace = rules::ms(WORK_GONE_GRACE);
+        let HubState {
+            folders,
+            peers,
+            ring,
+            ..
+        } = self;
+        let mut changed = false;
+        for folder in folders.values_mut() {
+            let Some(repo) = folder.repo().map(str::to_owned) else {
+                continue;
+            };
+            changed |= folder.errors.resolve(
+                |(scope, slot), open| {
+                    let Scope::FolderPeer { installation, .. } = scope else {
+                        return false;
+                    };
+                    if now.mono.saturating_sub(open.seen) < grace {
+                        return false;
+                    }
+                    let Some((shared, work)) = pair_work.get(&(repo.clone(), installation.clone()))
+                    else {
+                        return true;
+                    };
+                    if !*shared {
+                        return true;
+                    }
+                    let (down, up) = slot_directions(slot);
+                    if !down && !up {
+                        return false;
+                    }
+                    let work_left = (down && work.has_down_work()) || (up && work.has_up_work());
+                    let in_flight = !slot.starts_with(INBOUND_OP)
+                        && peers
+                            .get(installation)
+                            .is_some_and(|peer| op_in_flight(peer, &repo, slot));
+                    !work_left && !in_flight
+                },
+                now,
+                ring,
+            );
+        }
         changed
     }
 
@@ -2296,8 +2686,16 @@ impl HubState {
         {
             meta.remote_tip = tip.seq;
         }
-        // Object work exists only with a peer that shares the repo.
-        let local_content = folder.content().filter(|_| shared);
+        // Object work exists only with a peer that shares the repo. Download
+        // work goes to a peer that publishes the repo, or to one that
+        // demonstrably pushes objects to us (inbound-only peers).
+        let supplies = rules::may_supply(
+            entry.is_some(),
+            pair.and_then(|pair| pair.supplied),
+            now.mono,
+            cfg.stall_after,
+        );
+        let local_content = folder.content().filter(|_| shared && supplies);
         let remote_content = entry.and_then(|entry| entry.content.as_ref());
         let (down_objects, down_bytes) = local_content
             .map(|local| rules::download_work(local, remote_content))
@@ -2394,6 +2792,7 @@ impl HubState {
         PairFacts {
             inputs,
             work,
+            supplies,
             meta,
             direction,
             stalled_since,
@@ -2821,7 +3220,43 @@ fn objects_in_flight(peer: &PeerEntry, repo: &str) -> (u32, u32) {
         })
 }
 
-/// `(down, up)`: which directions an objects op moves bytes in.
+/// Slot-name prefix of an exchange the peer initiated (inbound).
+const INBOUND_OP: &str = "in:";
+
+/// The error slot of an exchange: its op, or `in:op` for an exchange the
+/// peer initiated, so the two directions of one op are separate keys (an
+/// inbound `objects.push` is a download for us, an outbound one an upload).
+fn exchange_slot(op: &str, direction: Direction) -> String {
+    match direction {
+        Direction::Inbound => format!("{INBOUND_OP}{op}"),
+        Direction::Outbound | Direction::Both => op.to_owned(),
+    }
+}
+
+/// `(down, up)` seen from here: which directions the objects op of an
+/// exchange slot moves bytes in (`(false, false)` for any other op).
+fn slot_directions(slot: &str) -> (bool, bool) {
+    match slot.strip_prefix(INBOUND_OP) {
+        // The peer pulls from us (an upload) or pushes to us (a download).
+        Some(op) => {
+            let (down, up) = object_directions(op);
+            (up, down)
+        }
+        None => object_directions(slot),
+    }
+}
+
+/// Whether an outbound exchange of `op` for `repo` is in flight with `peer`.
+fn op_in_flight(peer: &PeerEntry, repo: &str, op: &str) -> bool {
+    peer.lanes
+        .iter()
+        .filter(|(key, _)| !key.inbound)
+        .flat_map(|(_, lane)| lane.inflight.iter())
+        .any(|inflight| inflight.op == op && inflight.repo == repo)
+}
+
+/// `(down, up)`: which directions an objects op moves bytes in, seen from the
+/// side that initiated it.
 fn object_directions(op: &str) -> (bool, bool) {
     if !is_objects_op(op) {
         return (false, false);
@@ -2957,14 +3392,14 @@ fn legacy_repo_value(repo: &LegacyRepo, lane: u32, pool: u32) -> Value {
 fn remote_host(address: &str) -> String {
     let address = address.trim();
     if let Ok(socket) = address.parse::<SocketAddr>() {
-        return socket.ip().to_canonical().to_string();
+        return notice_host(socket.ip());
     }
     if let Ok(ip) = address
         .trim_start_matches('[')
         .trim_end_matches(']')
         .parse::<IpAddr>()
     {
-        return ip.to_canonical().to_string();
+        return notice_host(ip);
     }
     let host = match address.rsplit_once(':') {
         Some((host, port))
@@ -2975,6 +3410,21 @@ fn remote_host(address: &str) -> String {
         _ => address,
     };
     truncate(host.to_owned(), MAX_NOTICE_HOST)
+}
+
+/// The notice key of an IP address: an IPv4 address (IPv4-mapped IPv6
+/// included) as is, an IPv6 address by its /64. One IPv6 host can source
+/// from any address of its /64 (privacy addresses, or trivially when it
+/// wants to rotate notices), so the /64 is the host.
+fn notice_host(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            format!("{}/64", Ipv6Addr::from(segments))
+        }
+    }
 }
 
 /// `text` cut to at most `max` bytes, on a character boundary.
