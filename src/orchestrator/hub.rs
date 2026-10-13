@@ -8,22 +8,29 @@
 //!   write; p99 < 50 µs) and never blocks on a producer (invariant 30: status
 //!   never blocks or writes).
 //! * **Lazy snapshots.** [`snapshot`] returns an `Arc<StatusSnapshot>` that is
-//!   rebuilt only when something changed, through a token bucket that allows
-//!   4 rebuilds per second sustained (`policy::SNAPSHOT_MIN_INTERVAL`) and a
-//!   burst of 2, so an isolated event is published at once while an event
-//!   storm costs at most 4 rebuilds a second. [`wait_newer`] serves
-//!   `subscribe` long polls.
+//!   rebuilt only when something changed, at most 4 times in any 1 s window
+//!   (`policy::SNAPSHOT_MIN_INTERVAL` on average) and at most 2 back to back,
+//!   so an isolated event is published at once while an event storm costs at
+//!   most 4 rebuilds a second. [`wait_newer`] serves `subscribe` long polls.
 //! * **Tick.** [`tick`] (the caller runs it at `HubConfig::interval`, 1 Hz,
 //!   see [`StatusHub::spawn_ticker`]) folds the EWMA rates (10 s and 60 s),
 //!   runs the stall detector, applies the time-based error display policy
-//!   (Contention after 30 s) and expires stale inbound-incompatible notices.
+//!   (Contention after 30 s), expires stale inbound-incompatible notices and
+//!   prunes state of folders that were removed or never registered.
+//! * **Two clocks.** Reported `*_ms` fields are wall-clock time; every
+//!   duration the hub measures (stall, Contention visibility, notice expiry,
+//!   orphan grace) runs on a monotonic timeline (`Clock::instant`), so a
+//!   system clock jump neither fires nor suppresses one (see `Now`).
 //! * **Pure rules** live in [`super::hub_rules`].
 //! * **Legacy projection.** [`legacy_folder_sync`] and [`legacy_peers`] build
 //!   the §7.3 List/Inspect `sync` member and the Peers reply from the typed
 //!   events, for use after the cutover (WP3.1).
-//! * **Redaction.** No event carries a pairing code, and the legacy
-//!   projection, which receives `PeerRecord`s, never serializes their `code`
-//!   and scrubs it from any string it emits (invariant 21).
+//! * **Redaction** (invariant 21). No pairing code reaches the hub: no
+//!   `StatusEvent` field carries one, and the typed snapshot is built from
+//!   events only, so keeping codes out of error messages is the producers'
+//!   duty. The legacy projection, which receives `PeerRecord`s, never
+//!   serializes their `code`, never keeps them, and scrubs every code from
+//!   any string it emits (defence in depth).
 //!
 //! State maps are keyed by folder state, by (repo, peer installation) pair,
 //! by (peer, lane direction, lane) and by inbound session (peer, lane).
@@ -44,7 +51,7 @@ use crate::{
         health::{ContentCounters, MountIntent, MountState, MountStatus, StoreHealth},
         ipc::WorkerHeartbeat,
         orchestrator::{
-            ExitRecord, FolderPhase, FolderRecord, FolderView, GateState, PeerRecord,
+            EntryState, ExitRecord, FolderPhase, FolderRecord, FolderView, GateState, PeerRecord,
             PublishedEntry, StatusSink, StatusSource, StopStage, limits,
         },
         protocol::{LaneRole, PROTOCOL_NAME, PROTOCOL_VERSION, feed::ExchangeSummary},
@@ -62,6 +69,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Condvar, Mutex},
     time::{Duration, Instant},
 };
@@ -78,9 +86,28 @@ pub const MAX_LEGACY_LINKS: usize = 4096;
 pub const MAX_INFLIGHT: usize = 64;
 /// Snapshot rebuild burst (see the module docs).
 pub const SNAPSHOT_BURST: f64 = 2.0;
+/// Snapshot rebuilds allowed in any window of [`SNAPSHOT_WINDOW`].
+pub const SNAPSHOT_MAX_PER_WINDOW: usize = 4;
+/// The sliding window of [`SNAPSHOT_MAX_PER_WINDOW`] (§3.4: at most 4 a second).
+pub const SNAPSHOT_WINDOW: Duration = Duration::from_secs(1);
 /// An inbound-incompatible notice is dropped after this long without a new
-/// attempt from that address (the §8 Incompatible recheck period).
+/// attempt from that host (the §8 Incompatible recheck period).
 pub const INBOUND_INCOMPATIBLE_TTL: Duration = limits::INCOMPATIBLE_RECHECK;
+/// Open inbound-incompatible notices kept (one per remote host); the least
+/// recently seen is dropped beyond this. The notices come from
+/// unauthenticated pre-auth traffic, so they must stay bounded (invariant 22).
+pub const MAX_INBOUND_NOTICES: usize = 16;
+/// Longest remote host name kept in an inbound notice slot.
+pub const MAX_NOTICE_HOST: usize = 128;
+/// Longest inbound-incompatible message kept.
+pub const MAX_NOTICE_MESSAGE: usize = 512;
+/// State of a folder the hub never saw registered (no `FolderLifecycle`), or
+/// pair data of a repo without a registered folder, is dropped after this
+/// long without news (it can only be shown once its folder is registered).
+pub const ORPHAN_GRACE: Duration = Duration::from_secs(10);
+/// Removed folder states remembered so that late events for them are
+/// dropped instead of re-creating the folder.
+pub const MAX_TOMBSTONES: usize = 64;
 
 /// Hub settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,8 +158,40 @@ pub fn stall_after_for(sync_interval: Duration, override_ms: Option<&str>) -> Du
 pub struct StatusHub {
     cfg: HubConfig,
     clock: Arc<dyn Clock>,
+    /// The wall-clock time and the instant at construction: the origin of
+    /// the monotonic timeline (`Now::mono`).
+    origin: (u64, Instant),
     state: Mutex<HubState>,
     changed: Condvar,
+}
+
+/// One reading of the hub's two clocks.
+///
+/// * `ms` is wall-clock time. Every reported `*_ms` field uses it.
+/// * `mono` is a monotonic millisecond timeline: the wall-clock time at hub
+///   start plus the `Clock::instant` time elapsed since. Every duration the
+///   hub measures uses it (stall, Contention visibility, notice expiry,
+///   orphan grace), so a forward system clock jump (NTP, resume) cannot fire
+///   a stall and a backward one cannot suppress it.
+///
+/// A timer kept on the monotonic timeline is reported as wall-clock time by
+/// its age (`Now::wall_of`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Now {
+    ms: u64,
+    mono: u64,
+}
+
+impl Now {
+    /// The wall-clock time of the monotonic instant `mono`: now minus its age.
+    fn wall_of(self, mono: u64) -> u64 {
+        self.ms.saturating_sub(self.mono.saturating_sub(mono))
+    }
+
+    /// The monotonic instant of the wall-clock time `ms`: now minus its age.
+    fn mono_of(self, ms: u64) -> u64 {
+        self.mono.saturating_sub(self.ms.saturating_sub(ms))
+    }
 }
 
 impl std::fmt::Debug for StatusHub {
@@ -150,12 +209,17 @@ impl std::fmt::Debug for StatusHub {
 
 impl StatusHub {
     pub fn new(cfg: HubConfig, clock: Arc<dyn Clock>) -> Arc<StatusHub> {
-        let now = clock.now_ms();
+        let origin = (clock.now_ms(), clock.instant());
+        let now = Now {
+            ms: origin.0,
+            mono: origin.0,
+        };
         let mut state = HubState::new(&cfg, now);
         state.cached = Arc::new(state.build(now, &cfg, 0));
         Arc::new(StatusHub {
             cfg,
             clock,
+            origin,
             state: Mutex::new(state),
             changed: Condvar::new(),
         })
@@ -163,6 +227,18 @@ impl StatusHub {
 
     pub fn config(&self) -> &HubConfig {
         &self.cfg
+    }
+
+    /// Reads both clocks (see [`Now`]).
+    fn now(&self) -> Now {
+        let elapsed = self
+            .clock
+            .instant()
+            .saturating_duration_since(self.origin.1);
+        Now {
+            ms: self.clock.now_ms(),
+            mono: self.origin.0.saturating_add(rules::ms(elapsed)),
+        }
     }
 
     /// Sets the daemon identity shown in `StatusSnapshot.daemon` (its
@@ -263,9 +339,14 @@ impl StatusHub {
             let pool = record.connections.max(limits::MIN_POOL);
             let lane0 = peer.and_then(|peer| peer.lanes.get(&LaneKey::outbound(0)));
             let connected = lane0.is_some_and(|lane| lane.state == LaneState::Ready);
+            // Legacy published lists held only Running workers, so a remote
+            // folder that is starting, paused or unavailable reads `false`.
             let remote_available = if connected {
-                peer.and_then(|peer| peer.catalog.as_ref())
-                    .map(|catalog| catalog.iter().any(|entry| entry.repo == folder.repo))
+                peer.and_then(|peer| peer.catalog.as_ref()).map(|catalog| {
+                    catalog.iter().any(|entry| {
+                        entry.repo == folder.repo && entry.state == EntryState::Running
+                    })
+                })
             } else {
                 None
             };
@@ -356,8 +437,8 @@ impl StatusHub {
 
     /// Applies `change` under the state lock; when it reports a change, the
     /// state version moves and waiters are woken if the hub was clean.
-    fn mutate(&self, change: impl FnOnce(&mut HubState, u64, &HubConfig) -> bool) {
-        let now = self.clock.now_ms();
+    fn mutate(&self, change: impl FnOnce(&mut HubState, Now, &HubConfig) -> bool) {
+        let now = self.now();
         let mut state = lock(&self.state);
         let was_clean = state.version == state.built_version;
         if change(&mut state, now, &self.cfg) {
@@ -386,7 +467,7 @@ impl StatusHub {
     }
 
     fn rebuild(&self, state: &mut HubState) {
-        let now = self.clock.now_ms();
+        let now = self.now();
         let generation = state.cached.generation.wrapping_add(1);
         let snapshot = state.build(now, &self.cfg, generation);
         state.cached = Arc::new(snapshot);
@@ -446,11 +527,16 @@ impl StatusSource for StatusHub {
 // ---------------------------------------------------------------------------
 // State
 
-/// Token bucket for snapshot rebuilds.
+/// Snapshot rebuild limiter: a token bucket (one token per
+/// `policy::SNAPSHOT_MIN_INTERVAL`, burst [`SNAPSHOT_BURST`]) under a sliding
+/// window that allows at most [`SNAPSHOT_MAX_PER_WINDOW`] rebuilds in any
+/// [`SNAPSHOT_WINDOW`] (§3.4: at most 4 a second).
 #[derive(Debug)]
 struct Throttle {
     tokens: f64,
     at: Option<Instant>,
+    /// The latest rebuilds, oldest first (at most `SNAPSHOT_MAX_PER_WINDOW`).
+    recent: VecDeque<Instant>,
 }
 
 impl Throttle {
@@ -458,9 +544,11 @@ impl Throttle {
         Self {
             tokens: SNAPSHOT_BURST,
             at: None,
+            recent: VecDeque::with_capacity(SNAPSHOT_MAX_PER_WINDOW + 1),
         }
     }
 
+    /// Takes a rebuild slot, or says how long until the next one.
     fn take(&mut self, now: Instant) -> Result<(), Duration> {
         let period = policy::SNAPSHOT_MIN_INTERVAL.as_secs_f64();
         if let Some(at) = self.at {
@@ -468,12 +556,23 @@ impl Throttle {
             self.tokens = (self.tokens + refill).min(SNAPSHOT_BURST);
         }
         self.at = Some(now);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            Ok(())
-        } else {
-            Err(Duration::from_secs_f64((1.0 - self.tokens) * period))
+        if self.tokens < 1.0 {
+            return Err(Duration::from_secs_f64((1.0 - self.tokens) * period));
         }
+        if self.recent.len() >= SNAPSHOT_MAX_PER_WINDOW
+            && let Some(oldest) = self.recent.front()
+        {
+            let age = now.saturating_duration_since(*oldest);
+            if age < SNAPSHOT_WINDOW {
+                return Err(SNAPSHOT_WINDOW - age);
+            }
+        }
+        self.tokens -= 1.0;
+        self.recent.push_back(now);
+        while self.recent.len() > SNAPSHOT_MAX_PER_WINDOW {
+            self.recent.pop_front();
+        }
+        Ok(())
     }
 }
 
@@ -539,20 +638,23 @@ impl Ring {
 #[derive(Clone, Debug)]
 struct OpenError {
     record: ErrorRecord,
+    /// The display streak, on the monotonic timeline (`Now::mono`).
     streak: Streak,
     /// Shown at least once (sticky until resolved); only shown errors reach
     /// the history.
     shown: bool,
+    /// When this slot was last reported, on the monotonic timeline.
+    seen: u64,
 }
 
 impl OpenError {
-    fn visible(&self, now: u64) -> bool {
+    fn visible(&self, now: Now) -> bool {
         self.shown
             || rules::error_visible(
                 self.record.error.class,
                 &self.record.error.code,
                 self.streak,
-                now,
+                now.mono,
             )
     }
 }
@@ -560,6 +662,9 @@ impl OpenError {
 /// `(scope, slot)`: one open error per slot. Generic `Error` events use the
 /// empty slot; exchanges use their op; mirrored records use a fixed name.
 type SlotKey = (Scope, String);
+
+/// Slot-name prefix of the inbound-incompatible notices (Daemon scope).
+const INBOUND_SLOT: &str = "inbound:";
 
 /// Open errors and the resolved history of one owner (the daemon, or one
 /// folder).
@@ -571,14 +676,18 @@ struct ErrorBook {
 
 impl ErrorBook {
     /// Records one occurrence (deduplicated per slot).
-    fn observe(&mut self, key: SlotKey, error: ErrorWire, now: u64, ring: &mut Ring) {
+    fn observe(&mut self, key: SlotKey, error: ErrorWire, now: Now, ring: &mut Ring) {
         let previous = self.open.remove(&key);
         let streak = previous
             .as_ref()
-            .map_or(Streak::start(now), |open| open.streak.bump());
+            .map_or(Streak::start(now.mono), |open| open.streak.bump());
         let was_shown = previous.as_ref().is_some_and(|open| open.shown);
-        let (record, superseded) =
-            rules::dedupe(previous.map(|open| open.record), error, key.0.clone(), now);
+        let (record, superseded) = rules::dedupe(
+            previous.map(|open| open.record),
+            error,
+            key.0.clone(),
+            now.ms,
+        );
         if let Some(old) = superseded
             && was_shown
         {
@@ -589,14 +698,31 @@ impl ErrorBook {
             record,
             streak,
             shown: same_code_shown,
+            seen: now.mono,
         };
         show_if_visible(&mut open, now, ring);
         self.open.insert(key, open);
     }
 
+    /// The record of a persistent condition its owner re-reports as a state
+    /// rather than as counted attempts (store health, a lost mount): the same
+    /// open code is one deduplicated record whose `count` rises with every
+    /// report, so the display policy counts reports like attempts (a
+    /// Transient condition shows from its 3rd report on).
+    fn condition(&self, key: &SlotKey, error: &ErrorWire, now: Now) -> ErrorRecord {
+        match self.open.get(key) {
+            Some(open) if open.record.error.code == error.code => {
+                let mut record = open.record.clone();
+                record.observe(error.clone(), now.ms);
+                record
+            }
+            _ => ErrorRecord::new(error.clone(), key.0.clone(), now.ms),
+        }
+    }
+
     /// Mirrors a record owned by someone else (a FolderView error, a mount or
     /// store-health error): `None` resolves the slot.
-    fn mirror(&mut self, key: SlotKey, record: Option<ErrorRecord>, now: u64, ring: &mut Ring) {
+    fn mirror(&mut self, key: SlotKey, record: Option<ErrorRecord>, now: Now, ring: &mut Ring) {
         let Some(record) = record else {
             self.resolve(|slot, _| *slot == key, now, ring);
             return;
@@ -607,23 +733,28 @@ impl ErrorBook {
         }
         let previous = self.open.remove(&key);
         let mut shown = false;
+        let mut since = None;
         if let Some(previous) = previous {
             if previous.record.error.code == record.error.code {
                 shown = previous.shown;
+                since = Some(previous.streak.since_ms);
             } else if previous.shown {
                 let mut old = previous.record;
-                old.resolve(now);
+                old.resolve(now.ms);
                 self.push_history(old);
             }
         }
+        // The owner's wall-clock `first_at_ms` enters the monotonic timeline
+        // by its age.
         let streak = Streak {
             failures: record.count.max(1),
-            since_ms: record.first_at_ms,
+            since_ms: since.unwrap_or_else(|| now.mono_of(record.first_at_ms)),
         };
         let mut open = OpenError {
             record,
             streak,
             shown,
+            seen: now.mono,
         };
         show_if_visible(&mut open, now, ring);
         self.open.insert(key, open);
@@ -633,7 +764,7 @@ impl ErrorBook {
     fn resolve(
         &mut self,
         pred: impl Fn(&SlotKey, &OpenError) -> bool,
-        now: u64,
+        now: Now,
         ring: &mut Ring,
     ) -> bool {
         let keys: Vec<SlotKey> = self
@@ -647,9 +778,9 @@ impl ErrorBook {
                 && open.shown
             {
                 let mut record = open.record;
-                record.resolve(now);
+                record.resolve(now.ms);
                 ring.push(
-                    now,
+                    now.ms,
                     "resolved",
                     scope_folder(&record.scope),
                     scope_peer(&record.scope),
@@ -662,7 +793,7 @@ impl ErrorBook {
     }
 
     /// Marks errors that became visible with time; true if any did.
-    fn refresh(&mut self, now: u64, ring: &mut Ring) -> bool {
+    fn refresh(&mut self, now: Now, ring: &mut Ring) -> bool {
         let mut changed = false;
         for open in self.open.values_mut() {
             if !open.shown && open.visible(now) {
@@ -692,6 +823,39 @@ impl ErrorBook {
         }
     }
 
+    /// The open inbound-incompatible notice slots (a key range, so this
+    /// never walks the other daemon errors).
+    fn inbound_notices(&self) -> impl Iterator<Item = (&SlotKey, &OpenError)> {
+        self.open
+            .range((Scope::Daemon, INBOUND_SLOT.to_owned())..)
+            .take_while(|((scope, slot), _)| {
+                *scope == Scope::Daemon && slot.starts_with(INBOUND_SLOT)
+            })
+    }
+
+    /// Drops the least recently seen inbound notices beyond
+    /// [`MAX_INBOUND_NOTICES`] (not into the history: they are noise from
+    /// unauthenticated traffic, and the history is for real errors).
+    fn cap_inbound_notices(&mut self) {
+        loop {
+            let mut count = 0;
+            let mut oldest: Option<(u64, &SlotKey)> = None;
+            for (key, open) in self.inbound_notices() {
+                count += 1;
+                if oldest.is_none_or(|(seen, _)| open.seen < seen) {
+                    oldest = Some((open.seen, key));
+                }
+            }
+            match oldest {
+                Some((_, key)) if count > MAX_INBOUND_NOTICES => {
+                    let key = key.clone();
+                    self.open.remove(&key);
+                }
+                _ => return,
+            }
+        }
+    }
+
     fn push_history(&mut self, record: ErrorRecord) {
         while self.history.len() >= policy::ERROR_HISTORY {
             self.history.pop_front();
@@ -700,7 +864,7 @@ impl ErrorBook {
     }
 
     /// Visible open errors (newest first), then the history (newest first).
-    fn list(&self, now: u64, filter: impl Fn(&Scope) -> bool) -> Vec<ErrorRecord> {
+    fn list(&self, now: Now, filter: impl Fn(&Scope) -> bool) -> Vec<ErrorRecord> {
         let mut open: Vec<&ErrorRecord> = self
             .open
             .iter()
@@ -732,17 +896,17 @@ impl ErrorBook {
     }
 }
 
-fn show_if_visible(open: &mut OpenError, now: u64, ring: &mut Ring) {
+fn show_if_visible(open: &mut OpenError, now: Now, ring: &mut Ring) {
     if !open.shown && open.visible(now) {
         announce(open, now, ring);
     }
 }
 
-fn announce(open: &mut OpenError, now: u64, ring: &mut Ring) {
+fn announce(open: &mut OpenError, now: Now, ring: &mut Ring) {
     open.shown = true;
     let record = &open.record;
     ring.push(
-        now,
+        now.ms,
         "error",
         scope_folder(&record.scope),
         scope_peer(&record.scope),
@@ -788,9 +952,19 @@ struct FolderEntry {
     mount: MountStatus,
     last_exit: Option<ExitRecord>,
     errors: ErrorBook,
+    /// When the entry was created (monotonic): a folder that is never
+    /// registered (no view) is pruned [`ORPHAN_GRACE`] later.
+    created: u64,
 }
 
 impl FolderEntry {
+    fn new(now: Now) -> Self {
+        Self {
+            created: now.mono,
+            ..Self::default()
+        }
+    }
+
     fn repo(&self) -> Option<&str> {
         self.view.as_ref().map(|view| view.record.repo.as_str())
     }
@@ -976,17 +1150,23 @@ struct PairEntry {
     last_meta_exchange_ms: Option<u64>,
     up: Ewma,
     down: Ewma,
-    last_progress_ms: Option<u64>,
+    /// Last progress (monotonic; reported by its age).
+    last_progress: Option<u64>,
     last_down_ms: Option<u64>,
     last_up_ms: Option<u64>,
     /// Remaining work at the last observation (progress = a decrease).
     work: Option<Work>,
-    eligible_since_ms: Option<u64>,
-    stalled_since_ms: Option<u64>,
+    /// Since when the pair can progress and has work (monotonic).
+    eligible_since: Option<u64>,
+    /// When the current stall began (monotonic).
+    stalled_since: Option<u64>,
     /// Object bytes moved in the current transfer episode (reset when the
     /// remaining work reaches zero); `total_bytes = episode + remaining`.
     down_episode: u64,
     up_episode: u64,
+    /// The pair's last exchange event (monotonic): a pair whose repo has no
+    /// registered folder is pruned [`ORPHAN_GRACE`] later.
+    touched: u64,
 }
 
 type PairKey = (String, String);
@@ -1009,6 +1189,9 @@ struct HubState {
     legacy_links: BTreeMap<String, Value>,
     /// Peer display names (catalog `peer_meta.display_name`), by installation.
     labels: BTreeMap<String, String>,
+    /// Recently removed folder states (oldest first): late events for them
+    /// are dropped instead of re-creating the folder.
+    removed: VecDeque<String>,
 }
 
 /// Everything derived for one (folder, peer) pair at one instant.
@@ -1017,14 +1200,15 @@ struct PairFacts {
     work: Work,
     meta: MetaProgress,
     direction: Direction,
-    stalled_since_ms: Option<u64>,
+    /// When the stall began (monotonic).
+    stalled_since: Option<u64>,
     backoff_until_ms: Option<u64>,
     error: Option<ErrorRecord>,
     culprit: Option<ErrorRecord>,
 }
 
 impl HubState {
-    fn new(cfg: &HubConfig, now: u64) -> Self {
+    fn new(cfg: &HubConfig, now: Now) -> Self {
         Self {
             version: 0,
             built_version: 0,
@@ -1036,7 +1220,7 @@ impl HubState {
             // through `StatusHub::set_daemon`.
             daemon: DaemonStatus {
                 pid: std::process::id(),
-                started_at_ms: now,
+                started_at_ms: now.ms,
                 ..DaemonStatus::default()
             },
             daemon_errors: ErrorBook::default(),
@@ -1050,7 +1234,15 @@ impl HubState {
             },
             legacy_links: BTreeMap::new(),
             labels: BTreeMap::new(),
+            removed: VecDeque::new(),
         }
+    }
+
+    /// The (repo, peer) pair, marked as touched now.
+    fn pair_mut(&mut self, repo: String, installation: String, now: Now) -> &mut PairEntry {
+        let pair = self.pairs.entry((repo, installation)).or_default();
+        pair.touched = now.mono;
+        pair
     }
 
     fn find_peer(&self, record: &PeerRecord) -> Option<&PeerEntry> {
@@ -1088,10 +1280,12 @@ impl HubState {
 
     // -- event application --------------------------------------------------
 
-    fn apply(&mut self, event: StatusEvent, now: u64) {
+    fn apply(&mut self, event: StatusEvent, now: Now) {
         match event {
             StatusEvent::FolderLifecycle(view) => self.on_view(*view, now),
-            StatusEvent::WorkerHeartbeat { state, hb } => self.on_heartbeat(&state, hb, now, true),
+            StatusEvent::WorkerHeartbeat { state, hb } => {
+                self.on_heartbeat(&state, hb, now, true);
+            }
             StatusEvent::FolderRemoved { state } => self.on_folder_removed(&state, now),
             StatusEvent::PeerConfigured {
                 installation,
@@ -1103,7 +1297,7 @@ impl HubState {
                 peer.endpoint = Some(endpoint.clone());
                 if new {
                     self.ring.push(
-                        now,
+                        now.ms,
                         "peer",
                         None,
                         Some(&installation),
@@ -1154,8 +1348,7 @@ impl HubState {
                     since_ms: at_ms,
                     bytes: 0,
                 });
-                let pair = self.pairs.entry((repo, installation)).or_default();
-                pair.outbound_seen = true;
+                self.pair_mut(repo, installation, now).outbound_seen = true;
             }
             StatusEvent::ExchangeFinished {
                 installation,
@@ -1220,27 +1413,20 @@ impl HubState {
                 } else {
                     LaneState::Closed
                 };
-                entry.set_state(state, now);
+                entry.set_state(state, now.ms);
                 self.update_conn(&installation, now);
             }
             StatusEvent::InboundIncompatible { address, detail } => {
-                let code = code_in(&detail).unwrap_or("PEER_NEEDS_UPGRADE").to_owned();
-                let message = format!("inbound connection from {address}: {detail}");
-                let key = (Scope::Daemon, format!("inbound:{address}"));
-                self.daemon_errors.observe(
-                    key,
-                    ErrorWire::new(code, message.clone()),
-                    now,
-                    &mut self.ring,
-                );
-                self.ring
-                    .push(now, "inbound_incompatible", None, None, message);
+                self.on_inbound_incompatible(&address, &detail, now);
             }
             StatusEvent::ObjectError { state, hash, error } => {
-                let folder = self.folders.entry(state.clone()).or_default();
-                let key = (Scope::Object { state, hash }, String::new());
-                folder.errors.observe(key, error, now, &mut self.ring);
-                folder.errors.cap_items();
+                if let Some(folder) =
+                    folder_for_event(&mut self.folders, &self.removed, &state, now)
+                {
+                    let key = (Scope::Object { state, hash }, String::new());
+                    folder.errors.observe(key, error, now, &mut self.ring);
+                    folder.errors.cap_items();
+                }
             }
             StatusEvent::LegacyLink { key, value } => {
                 if !self.legacy_links.contains_key(&key)
@@ -1256,11 +1442,16 @@ impl HubState {
         }
     }
 
-    fn on_view(&mut self, view: FolderView, now: u64) {
+    fn on_view(&mut self, view: FolderView, now: Now) {
         let state = view.record.state.clone();
         let repo = view.record.repo.clone();
         let phase = view.phase.lifecycle();
-        let entry = self.folders.entry(state.clone()).or_default();
+        // A FolderLifecycle registers the folder (again, after a removal).
+        self.removed.retain(|removed| *removed != state);
+        let entry = self
+            .folders
+            .entry(state.clone())
+            .or_insert_with(|| FolderEntry::new(now));
         if let Some(old) = entry.repo()
             && old != repo
         {
@@ -1272,10 +1463,10 @@ impl HubState {
         let first = entry.view.is_none();
         let phase_changed = first || entry.phase != phase;
         if phase_changed {
-            entry.phase_since_ms = phase_since(&view.phase).unwrap_or(now);
+            entry.phase_since_ms = phase_since(&view.phase).unwrap_or(now.ms);
             entry.phase = phase;
             self.ring.push(
-                now,
+                now.ms,
                 "lifecycle",
                 Some(&state),
                 None,
@@ -1302,7 +1493,7 @@ impl HubState {
             .is_none_or(|old| old.gate.kind() != view.gate.kind());
         if gate_changed && !(first && view.gate == GateState::None) {
             self.ring
-                .push(now, "gate", Some(&state), None, gate_message(&view.gate));
+                .push(now.ms, "gate", Some(&state), None, gate_message(&view.gate));
         }
         // Mirrored records owned by the controller.
         let lifecycle_error = match &view.phase {
@@ -1327,60 +1518,51 @@ impl HubState {
         let heartbeat = view.heartbeat.clone();
         entry.mount = view.mount.clone();
         entry.view = Some(Box::new(view));
-        self.mirror_mount(&state, now);
-        if let Some(hb) = heartbeat {
-            self.on_heartbeat(&state, hb, now, false);
+        // A newer heartbeat mirrors the mount itself; either way the mount is
+        // mirrored once per event (a lost mount's report count rises by one).
+        let applied = heartbeat.is_some_and(|hb| self.on_heartbeat(&state, hb, now, false));
+        if !applied {
+            self.mirror_mount(&state, now);
         }
     }
 
     /// A heartbeat, from a `WorkerHeartbeat` event (`take_mount`: its mount
     /// state is the freshest) or carried by a FolderView (whose own mount
-    /// state, set by the controller, wins).
-    fn on_heartbeat(&mut self, state: &str, hb: Arc<WorkerHeartbeat>, now: u64, take_mount: bool) {
-        let entry = self.folders.entry(state.to_owned()).or_default();
+    /// state, set by the controller, wins). Returns whether it was applied
+    /// (it was newer than the last one, and the folder was not removed).
+    fn on_heartbeat(
+        &mut self,
+        state: &str,
+        hb: Arc<WorkerHeartbeat>,
+        now: Now,
+        take_mount: bool,
+    ) -> bool {
+        let Some(entry) = folder_for_event(&mut self.folders, &self.removed, state, now) else {
+            return false;
+        };
         if let Some(old) = &entry.heartbeat
             && (Arc::ptr_eq(old, &hb) || (old.instance == hb.instance && old.seq >= hb.seq))
         {
-            return;
+            return false;
         }
         let previous = entry.heartbeat.replace(Arc::clone(&hb));
         if take_mount {
             entry.mount = hb.mount.clone();
         }
-        // Store health: a mirrored Folder-scope record.
-        let store_error = hb.store_health.error().map(|error| {
-            let first = entry
-                .errors
-                .open
-                .get(&(
-                    Scope::Folder {
-                        state: state.into(),
-                    },
-                    SLOT_STORE.to_owned(),
-                ))
-                .filter(|open| open.record.error.code == error.code)
-                .map_or(now, |open| open.record.first_at_ms);
-            let mut record = ErrorRecord::new(
-                error.clone(),
-                Scope::Folder {
-                    state: state.into(),
-                },
-                first,
-            );
-            record.last_at_ms = now;
-            record
-        });
-        entry.errors.mirror(
-            (
-                Scope::Folder {
-                    state: state.into(),
-                },
-                SLOT_STORE.into(),
-            ),
-            store_error,
-            now,
-            &mut self.ring,
+        // Store health: a persistent condition, mirrored into a Folder slot.
+        let store_key = (
+            Scope::Folder {
+                state: state.into(),
+            },
+            SLOT_STORE.to_owned(),
         );
+        let store_error = hb
+            .store_health
+            .error()
+            .map(|error| entry.errors.condition(&store_key, error, now));
+        entry
+            .errors
+            .mirror(store_key, store_error, now, &mut self.ring);
         // Implicit successes for item scopes.
         if hb
             .content
@@ -1433,17 +1615,18 @@ impl HubState {
                 if (downloaded && (work.down_bytes > 0 || work.down_objects > 0))
                     || (activated && work.meta > 0)
                 {
-                    pair.last_progress_ms = Some(now);
+                    pair.last_progress = Some(now.mono);
                     if downloaded {
-                        pair.last_down_ms = Some(now);
+                        pair.last_down_ms = Some(now.ms);
                     }
                 }
             }
         }
+        true
     }
 
     /// Mirrors the folder's current mount state into the Mount scope.
-    fn mirror_mount(&mut self, state: &str, now: u64) {
+    fn mirror_mount(&mut self, state: &str, now: Now) {
         let Some(entry) = self.folders.get_mut(state) else {
             return;
         };
@@ -1458,27 +1641,15 @@ impl HubState {
                 attempt,
                 next_retry_at_ms,
             } => {
-                let first = entry
-                    .errors
-                    .open
-                    .get(&key)
-                    .filter(|open| open.record.error.code == error.code)
-                    .map_or(now, |open| open.record.first_at_ms);
-                let mut record = ErrorRecord::new(error.clone(), scope, first);
-                record.last_at_ms = now;
+                // The mount supervisor owns the attempt count.
+                let mut record = entry.errors.condition(&key, error, now);
                 record.count = u64::from((*attempt).max(1));
                 record.next_retry_at_ms = *next_retry_at_ms;
                 entry.errors.mirror(key, Some(record), now, &mut self.ring);
             }
             MountState::Lost { error } => {
-                let first = entry
-                    .errors
-                    .open
-                    .get(&key)
-                    .filter(|open| open.record.error.code == error.code)
-                    .map_or(now, |open| open.record.first_at_ms);
-                let mut record = ErrorRecord::new(error.clone(), scope, first);
-                record.last_at_ms = now;
+                // A state, not an attempt: every report counts.
+                let record = entry.errors.condition(&key, error, now);
                 entry.errors.mirror(key, Some(record), now, &mut self.ring);
             }
             MountState::Attached { .. } => {
@@ -1501,7 +1672,14 @@ impl HubState {
         }
     }
 
-    fn on_folder_removed(&mut self, state: &str, now: u64) {
+    fn on_folder_removed(&mut self, state: &str, now: Now) {
+        // Late events for the state are dropped from now on.
+        if !self.removed.iter().any(|removed| removed == state) {
+            if self.removed.len() >= MAX_TOMBSTONES {
+                self.removed.pop_front();
+            }
+            self.removed.push_back(state.to_owned());
+        }
         let Some(entry) = self.folders.remove(state) else {
             return;
         };
@@ -1515,11 +1693,44 @@ impl HubState {
                 }
             }
         }
-        self.ring
-            .push(now, "lifecycle", Some(state), None, "folder removed".into());
+        self.ring.push(
+            now.ms,
+            "lifecycle",
+            Some(state),
+            None,
+            "folder removed".into(),
+        );
     }
 
-    fn on_peer_removed(&mut self, installation: &str, now: u64) {
+    /// A legacy (v2) peer dialed us (§6.2). One notice per remote host: its
+    /// count rises with every attempt (each reconnect uses a new ephemeral
+    /// port), and at most [`MAX_INBOUND_NOTICES`] hosts are kept, so
+    /// unauthenticated traffic cannot grow the daemon's errors (invariant 22).
+    fn on_inbound_incompatible(&mut self, address: &str, detail: &str, now: Now) {
+        let code = code_in(detail).unwrap_or("PEER_NEEDS_UPGRADE").to_owned();
+        let message = truncate(
+            format!("inbound connection from {address}: {detail}"),
+            MAX_NOTICE_MESSAGE,
+        );
+        let key = (
+            Scope::Daemon,
+            format!("{INBOUND_SLOT}{}", remote_host(address)),
+        );
+        let new = !self.daemon_errors.open.contains_key(&key);
+        self.daemon_errors.observe(
+            key,
+            ErrorWire::new(code, message.clone()),
+            now,
+            &mut self.ring,
+        );
+        self.daemon_errors.cap_inbound_notices();
+        if new {
+            self.ring
+                .push(now.ms, "inbound_incompatible", None, None, message);
+        }
+    }
+
+    fn on_peer_removed(&mut self, installation: &str, now: Now) {
         let Some(peer) = self.peers.get_mut(installation) else {
             return;
         };
@@ -1543,8 +1754,13 @@ impl HubState {
                 .errors
                 .resolve(|(scope, _), _| of_peer(scope), now, &mut self.ring);
         }
-        self.ring
-            .push(now, "peer", None, Some(installation), "peer removed".into());
+        self.ring.push(
+            now.ms,
+            "peer",
+            None,
+            Some(installation),
+            "peer removed".into(),
+        );
         if keep {
             self.update_conn(installation, now);
         }
@@ -1561,7 +1777,7 @@ impl HubState {
         error: Option<ErrorWire>,
         backoff_until_ms: Option<u64>,
         rtt_ms: Option<u64>,
-        now: u64,
+        now: Now,
     ) {
         let peer = self.peer_mut(installation);
         if direction == Direction::Inbound {
@@ -1576,7 +1792,7 @@ impl HubState {
             .or_insert_with(|| LaneEntry::new(lane, role, direction));
         entry.role = role;
         entry.direction = direction;
-        entry.set_state(state, now);
+        entry.set_state(state, now.ms);
         entry.backoff_until_ms = backoff_until_ms;
         if rtt_ms.is_some() {
             entry.rtt_ms = rtt_ms;
@@ -1591,7 +1807,7 @@ impl HubState {
                 if error.retry_after_ms.is_none()
                     && let Some(until) = backoff_until_ms
                 {
-                    error.retry_after_ms = Some(until.saturating_sub(now));
+                    error.retry_after_ms = Some(until.saturating_sub(now.ms));
                 }
                 self.daemon_errors
                     .observe((lane_scope, slot.into()), error, now, &mut self.ring);
@@ -1614,7 +1830,7 @@ impl HubState {
         self.update_conn(installation, now);
     }
 
-    fn on_exchange_finished(&mut self, x: Exchange, now: u64) {
+    fn on_exchange_finished(&mut self, x: Exchange, now: Now) {
         let objects_op = is_objects_op(&x.op);
         let folder_state = self.repos.get(&x.repo).cloned();
         let content = folder_state
@@ -1653,13 +1869,14 @@ impl HubState {
         lane.down.add(x.bytes_down);
         lane.exchanges = lane.exchanges.saturating_add(1);
         if x.ok {
-            lane.last_success_ms = Some(now);
+            lane.last_success_ms = Some(now.ms);
         }
         // Pair accounting.
         let pair = self
             .pairs
             .entry((x.repo.clone(), x.installation.clone()))
             .or_default();
+        pair.touched = now.mono;
         match x.direction {
             Direction::Inbound => pair.inbound_seen = true,
             Direction::Outbound => pair.outbound_seen = true,
@@ -1675,11 +1892,11 @@ impl HubState {
             pair.down_episode = pair.down_episode.saturating_add(x.bytes_down);
             pair.up_episode = pair.up_episode.saturating_add(x.bytes_up);
             if x.bytes_down >= rules::PROGRESS_MIN_BYTES || x.objects_down > 0 {
-                pair.last_down_ms = Some(now);
+                pair.last_down_ms = Some(now.ms);
                 progress = true;
             }
             if x.bytes_up >= rules::PROGRESS_MIN_BYTES || x.objects_up > 0 {
-                pair.last_up_ms = Some(now);
+                pair.last_up_ms = Some(now.ms);
                 progress = true;
             }
         }
@@ -1693,7 +1910,7 @@ impl HubState {
             let after = meta_work(summary);
             progress |= moved || before.is_some_and(|before| after < before);
             pair.summary = Some(summary.clone());
-            pair.last_meta_exchange_ms = Some(now);
+            pair.last_meta_exchange_ms = Some(now.ms);
         }
         // A failed metadata exchange withdraws the caught-up claim until the
         // next success, except under Contention, which never resets it (§8).
@@ -1707,10 +1924,10 @@ impl HubState {
             summary.caught_up = false;
         }
         if progress {
-            pair.last_progress_ms = Some(now);
-            if pair.stalled_since_ms.take().is_some() {
+            pair.last_progress = Some(now.mono);
+            if pair.stalled_since.take().is_some() {
                 self.ring.push(
-                    now,
+                    now.ms,
                     "stall",
                     folder_state.as_deref(),
                     Some(&x.installation),
@@ -1749,7 +1966,7 @@ impl HubState {
         }
         if progress && let Some(state) = &folder_state {
             self.ring.coalesce(
-                now,
+                now.ms,
                 "exchange",
                 Some(state),
                 Some(&x.installation),
@@ -1764,11 +1981,19 @@ impl HubState {
                 .get_mut(&LaneKey::outbound(x.lane))
                 .expect("created above");
             let repo = lane.repos.entry(x.repo.clone()).or_default();
-            update_legacy_repo(repo, &x, objects_op, progress, content, remote_content, now);
+            update_legacy_repo(
+                repo,
+                &x,
+                objects_op,
+                progress,
+                content,
+                remote_content,
+                now.ms,
+            );
         }
     }
 
-    fn on_error(&mut self, scope: Scope, error: ErrorWire, now: u64) {
+    fn on_error(&mut self, scope: Scope, error: ErrorWire, now: Now) {
         match &scope {
             Scope::Daemon => {
                 self.daemon_errors
@@ -1791,16 +2016,20 @@ impl HubState {
             | Scope::Object { state, .. }
             | Scope::Event { state, .. }
             | Scope::FolderPeer { state, .. } => {
-                let folder = self.folders.entry(state.clone()).or_default();
-                folder
-                    .errors
-                    .observe((scope, String::new()), error, now, &mut self.ring);
-                folder.errors.cap_items();
+                let state = state.clone();
+                if let Some(folder) =
+                    folder_for_event(&mut self.folders, &self.removed, &state, now)
+                {
+                    folder
+                        .errors
+                        .observe((scope, String::new()), error, now, &mut self.ring);
+                    folder.errors.cap_items();
+                }
             }
         }
     }
 
-    fn on_resolved(&mut self, scope: &Scope, code: &str, now: u64) {
+    fn on_resolved(&mut self, scope: &Scope, code: &str, now: Now) {
         let matches = |(slot_scope, _): &SlotKey, open: &OpenError| {
             slot_scope == scope && (code.is_empty() || open.record.error.code == code)
         };
@@ -1823,7 +2052,7 @@ impl HubState {
     }
 
     /// Recomputes a peer's connection badge; records transitions.
-    fn update_conn(&mut self, installation: &str, now: u64) {
+    fn update_conn(&mut self, installation: &str, now: Now) {
         let revoked = self
             .daemon_errors
             .open_matching(|(scope, _)| scope_peer(scope) == Some(installation))
@@ -1841,10 +2070,10 @@ impl HubState {
         if conn != peer.conn || peer.conn_since_ms.is_none() {
             let changed = conn != peer.conn;
             peer.conn = conn;
-            peer.conn_since_ms = Some(now);
+            peer.conn_since_ms = Some(now.ms);
             if changed {
                 self.ring.push(
-                    now,
+                    now.ms,
                     "peer",
                     None,
                     Some(installation),
@@ -1856,7 +2085,7 @@ impl HubState {
 
     // -- tick -----------------------------------------------------------------
 
-    fn tick(&mut self, now: u64, elapsed: Duration, cfg: &HubConfig) -> bool {
+    fn tick(&mut self, now: Now, elapsed: Duration, cfg: &HubConfig) -> bool {
         let mut changed = false;
         let mut fold = |ewma: &mut Ewma| {
             let before = (ewma.short_bps(), ewma.long_bps());
@@ -1875,7 +2104,8 @@ impl HubState {
             fold(&mut pair.up);
             fold(&mut pair.down);
         }
-        // Stall detection and remaining-work tracking per (folder, peer).
+        // Stall detection and remaining-work tracking per (folder, peer), on
+        // the monotonic timeline.
         let mut updates = Vec::new();
         for (state, folder) in &self.folders {
             let Some(view) = &folder.view else { continue };
@@ -1895,29 +2125,33 @@ impl HubState {
             if let Some(before) = pair.work
                 && rules::progressed(&before, &work)
             {
-                pair.last_progress_ms = Some(now);
+                // Shown as the pair's `last_progress_ms`.
+                pair.last_progress = Some(now.mono);
+                changed = true;
             }
             pair.work = Some(work);
-            if work.down_bytes == 0 && work.down_objects == 0 {
+            if work.down_bytes == 0 && work.down_objects == 0 && pair.down_episode != 0 {
                 pair.down_episode = 0;
+                changed = true;
             }
-            if work.up_bytes == 0 && work.up_objects == 0 {
+            if work.up_bytes == 0 && work.up_objects == 0 && pair.up_episode != 0 {
                 pair.up_episode = 0;
+                changed = true;
             }
-            pair.eligible_since_ms = if eligible {
-                Some(pair.eligible_since_ms.unwrap_or(now))
+            pair.eligible_since = if eligible {
+                Some(pair.eligible_since.unwrap_or(now.mono))
             } else {
                 None
             };
             let stalled = rules::stall(&StallInput {
                 work_remaining: inputs.work_remaining(),
                 connected: inputs.can_progress(),
-                eligible_since_ms: pair.eligible_since_ms,
-                last_progress_ms: pair.last_progress_ms,
-                now_ms: now,
+                eligible_since_ms: pair.eligible_since,
+                last_progress_ms: pair.last_progress,
+                now_ms: now.mono,
                 stall_after: cfg.stall_after,
             });
-            if stalled.is_some() != pair.stalled_since_ms.is_some() {
+            if stalled.is_some() != pair.stalled_since.is_some() {
                 changed = true;
                 let state = self.repos.get(&key.0).cloned();
                 let message = match stalled {
@@ -1928,9 +2162,9 @@ impl HubState {
                     None => "stall cleared".to_owned(),
                 };
                 self.ring
-                    .push(now, "stall", state.as_deref(), Some(&key.1), message);
+                    .push(now.ms, "stall", state.as_deref(), Some(&key.1), message);
             }
-            pair.stalled_since_ms = stalled;
+            pair.stalled_since = stalled;
         }
         // Time-based error visibility; expiry of inbound-incompatible notices.
         changed |= self.daemon_errors.refresh(now, &mut self.ring);
@@ -1941,13 +2175,38 @@ impl HubState {
         changed |= self.daemon_errors.resolve(
             |(scope, slot), open| {
                 *scope == Scope::Daemon
-                    && slot.starts_with("inbound:")
-                    && now.saturating_sub(open.record.last_at_ms) >= ttl
+                    && slot.starts_with(INBOUND_SLOT)
+                    && now.mono.saturating_sub(open.seen) >= ttl
             },
             now,
             &mut self.ring,
         );
+        self.prune_orphans(now);
         changed
+    }
+
+    /// Drops what can never be shown once [`ORPHAN_GRACE`] has passed without
+    /// news: the entry of a folder that was never registered (an event raced
+    /// a registration that never came) and the pair data of a repo without a
+    /// registered folder (with its legacy lane repos). None of it is in a
+    /// snapshot, so this is not a change.
+    fn prune_orphans(&mut self, now: Now) {
+        let grace = rules::ms(ORPHAN_GRACE);
+        let fresh = |since: u64| now.mono.saturating_sub(since) < grace;
+        self.folders
+            .retain(|_, folder| folder.view.is_some() || fresh(folder.created));
+        let repos = &self.repos;
+        self.pairs
+            .retain(|(repo, _), pair| repos.contains_key(repo) || fresh(pair.touched));
+        let pairs = &self.pairs;
+        for (installation, peer) in self.peers.iter_mut() {
+            for lane in peer.lanes.values_mut() {
+                lane.repos.retain(|repo, _| {
+                    repos.contains_key(repo)
+                        || pairs.contains_key(&(repo.clone(), installation.clone()))
+                });
+            }
+        }
     }
 
     // -- derivation -----------------------------------------------------------
@@ -1960,7 +2219,7 @@ impl HubState {
         view: &FolderView,
         peer: &PeerEntry,
         pair: Option<&PairEntry>,
-        now: u64,
+        now: Now,
         cfg: &HubConfig,
     ) -> PairFacts {
         let repo = &view.record.repo;
@@ -2073,21 +2332,17 @@ impl HubState {
                 .saturating_add(meta.rejected),
         };
         let eligible = inputs.can_progress() && inputs.work_remaining();
-        let stalled_since_ms = pair.and_then(|pair| {
+        let stalled_since = pair.and_then(|pair| {
             rules::stall(&StallInput {
                 work_remaining: inputs.work_remaining(),
                 connected: inputs.can_progress(),
-                eligible_since_ms: if eligible {
-                    pair.eligible_since_ms
-                } else {
-                    None
-                },
-                last_progress_ms: pair.last_progress_ms,
-                now_ms: now,
+                eligible_since_ms: if eligible { pair.eligible_since } else { None },
+                last_progress_ms: pair.last_progress,
+                now_ms: now.mono,
                 stall_after: cfg.stall_after,
             })
         });
-        inputs.stalled = stalled_since_ms.is_some();
+        inputs.stalled = stalled_since.is_some();
         let backoff_until_ms = pair_errors
             .iter()
             .filter(|open| open.record.error.class.retries_automatically())
@@ -2141,14 +2396,14 @@ impl HubState {
             work,
             meta,
             direction,
-            stalled_since_ms,
+            stalled_since,
             backoff_until_ms,
             error,
             culprit,
         }
     }
 
-    fn build(&self, now: u64, cfg: &HubConfig, generation: u64) -> StatusSnapshot {
+    fn build(&self, now: Now, cfg: &HubConfig, generation: u64) -> StatusSnapshot {
         let mut folders = Vec::with_capacity(self.folders.len());
         for (state, folder) in &self.folders {
             if let Some(view) = &folder.view {
@@ -2163,7 +2418,7 @@ impl HubState {
         StatusSnapshot {
             schema: STATUS_SCHEMA,
             generation,
-            at_ms: now,
+            at_ms: now.ms,
             daemon: DaemonStatus {
                 errors: self.daemon_errors.list(now, |_| true),
                 ..self.daemon.clone()
@@ -2179,7 +2434,7 @@ impl HubState {
         state: &str,
         folder: &FolderEntry,
         view: &FolderView,
-        now: u64,
+        now: Now,
         cfg: &HubConfig,
     ) -> FolderStatus {
         let record = &view.record;
@@ -2216,8 +2471,9 @@ impl HubState {
                 summary.blocked = summary.blocked.max(facts.meta.blocked);
                 summary.quarantined = summary.quarantined.max(facts.meta.quarantined);
                 summary.rejected = summary.rejected.max(facts.meta.rejected);
-                if let Some(since) = facts.stalled_since_ms {
+                if let Some(since) = facts.stalled_since {
                     let stalled_for = now
+                        .mono
                         .saturating_sub(since)
                         .saturating_add(rules::ms(cfg.stall_after));
                     summary.stalled_for_ms =
@@ -2261,8 +2517,10 @@ impl HubState {
                         .saturating_add(facts.work.up_bytes),
                     last_progress_ms: pair.and_then(|pair| pair.last_up_ms),
                 },
-                last_progress_ms: pair.and_then(|pair| pair.last_progress_ms),
-                stalled_since_ms: facts.stalled_since_ms,
+                last_progress_ms: pair
+                    .and_then(|pair| pair.last_progress)
+                    .map(|mono| now.wall_of(mono)),
+                stalled_since_ms: facts.stalled_since.map(|mono| now.wall_of(mono)),
                 backoff_until_ms: facts.backoff_until_ms,
                 error,
             });
@@ -2358,7 +2616,7 @@ impl HubState {
         }
     }
 
-    fn build_peer(&self, peer: &PeerEntry, now: u64) -> PeerStatus {
+    fn build_peer(&self, peer: &PeerEntry, now: Now) -> PeerStatus {
         let lanes: Vec<LaneStatus> = peer
             .lanes
             .iter()
@@ -2488,6 +2746,26 @@ fn lifecycle_status(
             _ => None,
         },
     }
+}
+
+/// The folder entry a folder-scoped event (heartbeat, error) applies to:
+/// `None` for a recently removed folder, whose late events are dropped. An
+/// unknown folder gets an entry, which is pruned if it is never registered
+/// (events can race the first `FolderLifecycle`).
+fn folder_for_event<'a>(
+    folders: &'a mut BTreeMap<String, FolderEntry>,
+    removed: &VecDeque<String>,
+    state: &str,
+    now: Now,
+) -> Option<&'a mut FolderEntry> {
+    if removed.iter().any(|removed| removed == state) {
+        return None;
+    }
+    Some(
+        folders
+            .entry(state.to_owned())
+            .or_insert_with(|| FolderEntry::new(now)),
+    )
 }
 
 /// `ExchangeFinished` fields.
@@ -2671,6 +2949,44 @@ fn legacy_repo_value(repo: &LegacyRepo, lane: u32, pool: u32) -> Value {
         );
     }
     value
+}
+
+/// The remote host of a socket address without its port (`ip:port`,
+/// `[v6]:port` or `name:port`), so every connection from one host shares
+/// one notice slot; at most [`MAX_NOTICE_HOST`] bytes.
+fn remote_host(address: &str) -> String {
+    let address = address.trim();
+    if let Ok(socket) = address.parse::<SocketAddr>() {
+        return socket.ip().to_canonical().to_string();
+    }
+    if let Ok(ip) = address
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+    {
+        return ip.to_canonical().to_string();
+    }
+    let host = match address.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty() && !host.contains(':') && port.parse::<u16>().is_ok() =>
+        {
+            host
+        }
+        _ => address,
+    };
+    truncate(host.to_owned(), MAX_NOTICE_HOST)
+}
+
+/// `text` cut to at most `max` bytes, on a character boundary.
+fn truncate(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 /// Replaces every occurrence of a peer's pairing code in any string of

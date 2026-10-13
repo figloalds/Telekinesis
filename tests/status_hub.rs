@@ -12,7 +12,7 @@ mod support;
 use serde_json::Value;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -23,6 +23,7 @@ use tkfs::{
         errors::{ErrorClass, ErrorRecord, ErrorWire, Scope, classify},
         health::{
             ContentCounters, InboxCounts, JournalCounters, MountIntent, MountState, MountStatus,
+            StoreHealth,
         },
         ipc::WorkerHeartbeat,
         orchestrator::{
@@ -37,13 +38,16 @@ use tkfs::{
         },
     },
     orchestrator::{
-        hub::{HubConfig, StatusHub, stall_after_for},
+        hub::{
+            HubConfig, MAX_INBOUND_NOTICES, MAX_NOTICE_MESSAGE, ORPHAN_GRACE, StatusHub,
+            stall_after_for,
+        },
         hub_rules::{
             self as rules, ErrorFlags, Ewma, FolderInputs, PeerInputs, StallInput, Streak,
             SummaryFacts, Work,
         },
     },
-    util::time::{ManualClock, SystemClock},
+    util::time::{Clock, ManualClock, SystemClock},
 };
 
 const T0: u64 = 1_790_000_000_000;
@@ -1107,8 +1111,27 @@ fn error_flags_fold_classes() {
 // ===========================================================================
 // Hub fixtures
 
+/// A `ManualClock` whose wall-clock reading can also jump on its own (an NTP
+/// correction, a resume from sleep) while its monotonic instant does not.
+#[derive(Debug)]
+struct JumpClock {
+    inner: ManualClock,
+    jump_ms: Mutex<i64>,
+}
+
+impl Clock for JumpClock {
+    fn now_ms(&self) -> u64 {
+        self.inner
+            .now_ms()
+            .saturating_add_signed(*self.jump_ms.lock().unwrap())
+    }
+    fn instant(&self) -> Instant {
+        self.inner.instant()
+    }
+}
+
 struct Fx {
-    clock: Arc<ManualClock>,
+    clock: Arc<JumpClock>,
     hub: Arc<StatusHub>,
 }
 
@@ -1122,7 +1145,10 @@ impl Fx {
     }
 
     fn with_config(cfg: HubConfig) -> Self {
-        let clock = Arc::new(ManualClock::new(T0));
+        let clock = Arc::new(JumpClock {
+            inner: ManualClock::new(T0),
+            jump_ms: Mutex::new(0),
+        });
         let hub = StatusHub::new(cfg, clock.clone());
         Self { clock, hub }
     }
@@ -1135,12 +1161,19 @@ impl Fx {
         self.hub.snapshot_now()
     }
 
+    /// The wall-clock time.
     fn now(&self) -> u64 {
-        T0 + self.clock.elapsed().as_millis() as u64
+        self.clock.now_ms()
     }
 
+    /// Time passes (both clocks).
     fn advance(&self, ms: u64) {
-        self.clock.advance(Duration::from_millis(ms));
+        self.clock.inner.advance(Duration::from_millis(ms));
+    }
+
+    /// The wall clock alone jumps by `ms` (no time passes).
+    fn jump(&self, ms: i64) {
+        *self.clock.jump_ms.lock().unwrap() += ms;
     }
 
     /// `seconds` ticks, one second apart.
@@ -1653,6 +1686,101 @@ fn failed_lifecycle_and_mount_errors_need_attention() {
     assert_eq!(mount_error.resolved_at_ms, Some(T0 + 20));
 }
 
+/// Fix round 1: store health and a lost mount are states the worker
+/// re-reports in every heartbeat, not counted attempts. A Transient one is one
+/// deduplicated record whose count rises per report, so it shows from its 3rd
+/// report on like any Transient error.
+#[test]
+fn persistent_store_and_mount_conditions_show_from_their_third_report() {
+    let fx = Fx::new();
+    fx.running_folder();
+    let recovery = ErrorWire::new(
+        "RECOVERY_REQUIRED",
+        "RECOVERY_REQUIRED: a pending save could not be restored",
+    );
+    let lost = ErrorWire::new("REMOUNT_FAILED", "REMOUNT_FAILED: dispatcher exited");
+    assert_eq!(recovery.class, ErrorClass::Transient);
+    assert_eq!(lost.class, ErrorClass::Transient);
+    let report =
+        |seq: u64, store_health: StoreHealth, state: MountState| StatusEvent::WorkerHeartbeat {
+            state: STATE.into(),
+            hb: Arc::new(WorkerHeartbeat {
+                instance: "instance-1".into(),
+                seq,
+                at_ms: T0,
+                store_health,
+                mount: MountStatus {
+                    intent: MountIntent::Attach,
+                    path: None,
+                    state,
+                },
+                ..WorkerHeartbeat::default()
+            }),
+        };
+    let failing = |seq: u64| {
+        report(
+            seq,
+            StoreHealth::Failed {
+                error: recovery.clone(),
+            },
+            MountState::Lost {
+                error: lost.clone(),
+            },
+        )
+    };
+    for seq in 1..=2 {
+        fx.advance(1000);
+        fx.rec(failing(seq));
+        // A replay of the same heartbeat is not a new report.
+        fx.rec(failing(seq));
+        assert!(fx.folder().errors.is_empty(), "report {seq} hidden");
+    }
+    fx.advance(1000);
+    fx.rec(failing(3));
+    let folder = fx.folder();
+    let store = folder
+        .errors
+        .iter()
+        .find(|e| e.error.code == "RECOVERY_REQUIRED")
+        .expect("store health shown at the 3rd report");
+    assert_eq!(store.count, 3);
+    assert_eq!(store.first_at_ms, T0 + 1000);
+    assert_eq!(store.last_at_ms, fx.now());
+    assert_eq!(
+        store.scope,
+        Scope::Folder {
+            state: STATE.into()
+        }
+    );
+    let mount = folder
+        .errors
+        .iter()
+        .find(|e| e.error.code == "REMOUNT_FAILED")
+        .expect("lost mount shown at the 3rd report");
+    assert_eq!(mount.count, 3);
+    assert!(
+        fx.snap()
+            .activity
+            .iter()
+            .any(|a| a.kind == "error" && a.message.starts_with("RECOVERY_REQUIRED"))
+    );
+    // Healthy and attached again: both resolve into the history.
+    fx.advance(1000);
+    fx.rec(report(
+        4,
+        StoreHealth::Healthy,
+        MountState::Attached { since_ms: fx.now() },
+    ));
+    let folder = fx.folder();
+    assert_eq!(folder.errors.len(), 2);
+    assert!(
+        folder
+            .errors
+            .iter()
+            .all(|e| e.resolved_at_ms == Some(fx.now()))
+    );
+}
+
 #[test]
 fn gate_paused_blocked_and_remote_waiting() {
     let fx = Fx::new();
@@ -1867,6 +1995,108 @@ fn up_to_date_pairs_never_stall() {
     fx.run(600);
     assert_eq!(fx.pair(PEER_A).state, FolderPeerState::UpToDate);
     assert_eq!(fx.folder().sync.state, FolderSyncState::UpToDate);
+}
+
+/// Fix round 1: durations run on the monotonic clock. A wall-clock jump
+/// (NTP, resume from sleep) neither fires nor suppresses a stall, Contention
+/// visibility or a notice expiry; reported times still follow the wall clock.
+#[test]
+fn wall_clock_jumps_neither_fire_nor_suppress_timers() {
+    const HOUR: i64 = 3_600_000;
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 412)));
+    fx.hub.tick();
+    fx.run(10);
+    fx.rec(StatusEvent::Error {
+        scope: Scope::Daemon,
+        error: wire("WORKER_BUSY"),
+    });
+    fx.rec(StatusEvent::InboundIncompatible {
+        address: "192.0.2.10:50123".into(),
+        detail: "PEER_NEEDS_UPGRADE: legacy hello version 2".into(),
+    });
+    let shown = |fx: &Fx, code: &str| {
+        fx.snap()
+            .daemon
+            .errors
+            .iter()
+            .any(|e| e.error.code == code && e.resolved_at_ms.is_none())
+    };
+    // The wall clock leaps 2 h ahead at t = 10 s.
+    fx.jump(2 * HOUR);
+    fx.run(2);
+    assert_eq!(fx.snap().at_ms, T0 + 12_000 + 2 * HOUR as u64);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(
+        pair.state,
+        FolderPeerState::Metadata,
+        "no stall at t = 12 s"
+    );
+    assert_eq!(pair.stalled_since_ms, None);
+    assert!(!shown(&fx, "WORKER_BUSY"), "Contention hidden at 2 s");
+    assert!(shown(&fx, "PEER_NEEDS_UPGRADE"), "notice not expired");
+    // Real time still drives them: Contention shows 30 s after it began…
+    fx.run(27);
+    assert!(!shown(&fx, "WORKER_BUSY"));
+    fx.run(1);
+    assert!(shown(&fx, "WORKER_BUSY"));
+    // …and the stall fires 60 s after the pair became eligible, reported in
+    // wall-clock time.
+    fx.run(19);
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Metadata);
+    fx.run(1);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.state, FolderPeerState::Stalled);
+    assert_eq!(pair.stalled_since_ms, Some(fx.now()));
+    assert_eq!(pair.stalled_since_ms, Some(T0 + 60_000 + 2 * HOUR as u64));
+    // Progress at t = 60 s (the tick at t = 61 s sees the decrease too),
+    // then the wall clock falls 3 h back: the stall still fires 60 s of real
+    // time later.
+    fx.rec(meta(PEER_A, summary(0, 200)));
+    assert_eq!(fx.pair(PEER_A).last_progress_ms, Some(fx.now()));
+    fx.jump(-3 * HOUR);
+    fx.run(60);
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Metadata);
+    fx.run(1);
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Stalled);
+    // The notice expires 10 min of real time after its last attempt (t = 10 s).
+    fx.run(488);
+    assert!(shown(&fx, "PEER_NEEDS_UPGRADE"));
+    fx.run(1);
+    assert!(!shown(&fx, "PEER_NEEDS_UPGRADE"));
+}
+
+/// Fix round 1: a decrease of remaining work that only the tick sees (here,
+/// the peer's published counters) moves `last_progress_ms` and publishes a
+/// new snapshot.
+#[test]
+fn progress_seen_by_the_tick_is_published() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    let lacking = |bytes: u64| {
+        let mut published = entry(REPO, EntryState::Running);
+        published.content = Some(missing_bytes(bytes));
+        catalog(PEER_A, &[published])
+    };
+    fx.rec(lacking(2 << 20));
+    fx.hub.tick();
+    fx.run(2);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.objects_up.bytes_remaining, 2 << 20);
+    assert_eq!(pair.last_progress_ms, None);
+    // The peer got half of it elsewhere; a snapshot is taken before the tick.
+    fx.advance(1000);
+    fx.rec(lacking(1 << 20));
+    let before = fx.snap().generation;
+    assert_eq!(fx.pair(PEER_A).last_progress_ms, None);
+    fx.advance(1000);
+    fx.hub.tick();
+    let snap = fx.snap();
+    assert!(snap.generation > before, "the tick published its progress");
+    assert_eq!(fx.pair(PEER_A).last_progress_ms, Some(fx.now()));
 }
 
 #[test]
@@ -2268,6 +2498,89 @@ fn inbound_incompatible_is_shown_then_expires() {
     assert!(fx.snap().daemon.errors[0].resolved_at_ms.is_some());
 }
 
+/// Fix round 1: the notices come from unauthenticated pre-auth traffic
+/// (invariant 22). One host is one notice whatever its source port, and the
+/// number of hosts kept is capped.
+#[test]
+fn inbound_incompatible_notices_are_one_per_host_and_bounded() {
+    let fx = Fx::new();
+    let notice = |address: String| StatusEvent::InboundIncompatible {
+        address,
+        detail: "PEER_NEEDS_UPGRADE: legacy hello version 2".into(),
+    };
+    let open = |fx: &Fx| -> Vec<ErrorRecord> {
+        fx.snap()
+            .daemon
+            .errors
+            .iter()
+            .filter(|e| e.resolved_at_ms.is_none())
+            .cloned()
+            .collect()
+    };
+    // A legacy peer reconnecting its lanes, each time from a new ephemeral
+    // port: one notice whose count rises.
+    for port in 0..40u64 {
+        fx.advance(10);
+        fx.rec(notice(format!("192.0.2.10:{}", 50_000 + port)));
+    }
+    let notices = open(&fx);
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].count, 40);
+    assert_eq!(notices[0].error.code, "PEER_NEEDS_UPGRADE");
+    assert!(
+        notices[0].error.message.contains("192.0.2.10:50039"),
+        "the latest attempt: {}",
+        notices[0].error.message
+    );
+    let entries = |fx: &Fx| {
+        fx.snap()
+            .activity
+            .iter()
+            .filter(|a| a.kind == "inbound_incompatible")
+            .count()
+    };
+    assert_eq!(entries(&fx), 1, "one activity entry per host");
+    // IPv6 hosts and the IPv4-mapped form of a known host share slots too.
+    fx.rec(notice("[2001:db8::7]:4000".into()));
+    fx.rec(notice("[2001:db8::7]:4001".into()));
+    fx.rec(notice("[::ffff:192.0.2.10]:4002".into()));
+    let notices = open(&fx);
+    assert_eq!(notices.len(), 2);
+    assert_eq!(notices.iter().map(|e| e.count).sum::<u64>(), 43);
+    // A flood from many hosts keeps the most recently seen ones only.
+    for host in 0..1_000u64 {
+        fx.advance(1);
+        fx.rec(notice(format!(
+            "10.{}.{}.{}:{}",
+            (host >> 16) & 255,
+            (host >> 8) & 255,
+            host & 255,
+            40_000 + host
+        )));
+    }
+    let notices = open(&fx);
+    assert_eq!(notices.len(), MAX_INBOUND_NOTICES);
+    assert!(notices[0].error.message.contains("10.0.3.231:40999"));
+    assert!(
+        notices
+            .iter()
+            .all(|e| !e.error.message.contains("192.0.2.10"))
+    );
+    let snap = fx.snap();
+    assert!(snap.daemon.errors.len() <= MAX_INBOUND_NOTICES + policy::ERROR_HISTORY);
+    assert!(snap.activity.len() <= policy::ACTIVITY_RING);
+    // A huge detail is cut.
+    fx.rec(StatusEvent::InboundIncompatible {
+        address: "203.0.113.5:1".into(),
+        detail: format!("PEER_NEEDS_UPGRADE: {}", "x".repeat(100_000)),
+    });
+    let notice = open(&fx)
+        .into_iter()
+        .find(|e| e.error.message.contains("203.0.113.5"))
+        .expect("the newest host is kept");
+    assert!(notice.error.message.len() <= MAX_NOTICE_MESSAGE);
+}
+
 #[test]
 fn folder_removed_and_activity_ring_is_bounded() {
     let fx = Fx::with_config(HubConfig {
@@ -2305,6 +2618,114 @@ fn folder_removed_and_activity_ring_is_bounded() {
     });
     silent.running_folder();
     assert!(silent.snap().activity.is_empty());
+}
+
+/// Fix round 1: events that arrive after `FolderRemoved` (a late heartbeat,
+/// object error or exchange) must not re-create the folder; when the state is
+/// registered again, even at once, it starts clean.
+#[test]
+fn late_events_of_a_removed_folder_are_dropped() {
+    let fx = Fx::new();
+    let revoked = || ErrorWire::new("PEER_REVOKED", "PEER_REVOKED: detail");
+    let late_events = |fx: &Fx| {
+        fx.rec(heartbeat(9, Some(missing_bytes(1000))));
+        fx.rec(StatusEvent::ObjectError {
+            state: STATE.into(),
+            hash: "0123abcd".into(),
+            error: revoked(),
+        });
+        fx.rec(StatusEvent::Error {
+            scope: Scope::FolderPeer {
+                state: STATE.into(),
+                installation: PEER_A.into(),
+            },
+            error: revoked(),
+        });
+    };
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 3)));
+    fx.rec(StatusEvent::FolderRemoved {
+        state: STATE.into(),
+    });
+    late_events(&fx);
+    assert!(fx.snap().folders.is_empty());
+    // Registered again at once: no stale heartbeat or errors.
+    fx.running_folder();
+    let folder = fx.folder();
+    assert!(folder.errors.is_empty(), "{:?}", folder.errors);
+    assert_eq!(folder.content, ContentCounters::default());
+    assert_eq!(fx.pair(PEER_A).metadata.last_exchange_ms, None);
+    // Events of the registered state apply again.
+    late_events(&fx);
+    assert_eq!(fx.folder().errors.len(), 2);
+    assert_eq!(fx.folder().content, missing_bytes(1000));
+    // A late exchange of a removed repo: its pair data (and legacy lane
+    // repos) is pruned once the grace period passes without a registered
+    // folder.
+    fx.rec(StatusEvent::FolderRemoved {
+        state: STATE.into(),
+    });
+    fx.rec(meta(PEER_A, summary(0, 3)));
+    let legacy = |fx: &Fx| fx.hub.legacy_peers(&[peer_record("ABCD-EFGH-IJKL")]);
+    assert_eq!(
+        legacy(&fx)[0]["lanes"][0]["repositories"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    fx.run(ORPHAN_GRACE.as_secs() + 1);
+    assert_eq!(
+        legacy(&fx)[0]["lanes"][0]["repositories"],
+        serde_json::json!({})
+    );
+    fx.running_folder();
+    let folder = fx.folder();
+    assert!(folder.errors.is_empty(), "{:?}", folder.errors);
+    assert_eq!(fx.pair(PEER_A).metadata.last_exchange_ms, None);
+}
+
+/// Fix round 1: an event may race the first `FolderLifecycle` of its state
+/// (kept), but the entry of a state that is never registered is pruned.
+#[test]
+fn unregistered_folder_state_is_pruned_after_the_grace() {
+    let fx = Fx::new();
+    let ghost = |state: &str| StatusEvent::ObjectError {
+        state: state.into(),
+        hash: "0123abcd".into(),
+        error: ErrorWire::new("PEER_REVOKED", "PEER_REVOKED: detail"),
+    };
+    let register = |state: &str, repo: &str| {
+        StatusEvent::FolderLifecycle(Box::new(FolderView {
+            generation: 1,
+            record: record(state, repo),
+            phase: running(),
+            ..FolderView::default()
+        }))
+    };
+    // Racing the registration: kept.
+    fx.rec(ghost("state-race"));
+    fx.rec(register("state-race", "repo-race"));
+    let snap = fx.snap();
+    let race = snap
+        .folders
+        .iter()
+        .find(|f| f.state == "state-race")
+        .unwrap();
+    assert_eq!(race.errors.len(), 1);
+    // Never registered within the grace: pruned, so a late registration
+    // starts clean.
+    fx.rec(ghost("state-ghost"));
+    fx.run(ORPHAN_GRACE.as_secs() + 1);
+    fx.rec(register("state-ghost", "repo-ghost"));
+    let snap = fx.snap();
+    let ghost = snap
+        .folders
+        .iter()
+        .find(|f| f.state == "state-ghost")
+        .unwrap();
+    assert!(ghost.errors.is_empty());
 }
 
 #[test]
@@ -2577,19 +2998,57 @@ fn snapshot_rebuilds_are_throttled_to_four_per_second() {
         hub.record(heartbeat(seq, None));
         thread::sleep(Duration::from_millis(1));
     }
-    let elapsed = started.elapsed().as_secs_f64();
     stop.store(true, Ordering::Relaxed);
     for reader in readers {
         reader.join().unwrap();
     }
+    // Every counted rebuild happened within `elapsed`, and no 1 s window
+    // holds more than 4.
+    let elapsed = started.elapsed().as_secs_f64();
     let rebuilds = hub.rebuilds() - before;
-    let bound = (2.0 + 4.0 * elapsed).ceil() as u64 + 1;
+    let bound = 4 * elapsed.ceil() as u64;
     assert!(seq > 200, "the event stream ran ({seq})");
     assert!(
         rebuilds <= bound,
         "{rebuilds} rebuilds in {elapsed:.2} s (bound {bound})"
     );
     assert!(rebuilds >= 3, "readers saw updates ({rebuilds})");
+}
+
+/// Fix round 1, deterministic: under an event storm no 1 s window holds more
+/// than 4 rebuilds (§3.4), readers still get 4 a second, and an isolated
+/// event after a quiet spell is published at once (up to 2 back to back).
+#[test]
+fn snapshot_rebuilds_never_exceed_four_in_any_second() {
+    let fx = Fx::new();
+    fx.running_folder();
+    let mut seq = 0;
+    let mut event = |fx: &Fx| {
+        seq += 1;
+        fx.rec(heartbeat(seq, None));
+    };
+    let mut rebuilt_at = Vec::new();
+    for step in 0..500u64 {
+        event(&fx);
+        let before = fx.hub.rebuilds();
+        let _ = fx.hub.snapshot();
+        if fx.hub.rebuilds() != before {
+            rebuilt_at.push(step * 10);
+        }
+        fx.advance(10);
+    }
+    for window in rebuilt_at.windows(5) {
+        assert!(window[4] - window[0] >= 1000, "{rebuilt_at:?}");
+    }
+    assert!(rebuilt_at.len() >= 16, "{rebuilt_at:?}");
+    fx.advance(5000);
+    for published in [true, true, false] {
+        event(&fx);
+        let before = fx.hub.rebuilds();
+        let _ = fx.hub.snapshot();
+        assert_eq!(fx.hub.rebuilds() != before, published);
+        fx.advance(10);
+    }
 }
 
 /// One measurement: `record()` latencies over 20,000 mixed events while 10
@@ -2834,13 +3293,66 @@ fn legacy_projection_reports_failures_like_the_legacy_lanes() {
     assert_eq!(peers_reply[0]["configured_connections"], 1);
 }
 
+/// Fix round 1: legacy published lists held only Running workers, so a
+/// remote folder that is starting, paused or unavailable reads
+/// `remote_available: false` (the legacy GUI's "worker may be stopped,
+/// starting" hint); no catalog yet, or a lane down, reads `null`.
+#[test]
+fn legacy_remote_available_means_a_running_remote_worker() {
+    let record = record(STATE, REPO);
+    let peers = [peer_record("ABCD-EFGH-IJKL")];
+    let fx = legacy_fixture(true);
+    let available =
+        |fx: &Fx| fx.hub.legacy_folder_sync(&record, &peers)[0]["remote_available"].clone();
+    assert_eq!(available(&fx), true);
+    for state in [
+        EntryState::Starting,
+        EntryState::Paused,
+        EntryState::Unavailable,
+    ] {
+        fx.rec(catalog(PEER_A, &[entry(REPO, state)]));
+        assert_eq!(available(&fx), false, "{state:?}");
+    }
+    fx.rec(catalog(PEER_A, &[entry("repo-other", EntryState::Running)]));
+    assert_eq!(available(&fx), false);
+    fx.rec(catalog(PEER_A, &[entry(REPO, EntryState::Running)]));
+    assert_eq!(available(&fx), true);
+    // Connected, but no catalog received yet.
+    let fresh = Fx::new();
+    fresh.running_folder();
+    fresh.rec(lane(PEER_A, 0, LaneState::Ready, None));
+    assert_eq!(available(&fresh), Value::Null);
+}
+
 #[test]
 fn status_redacts_pairing_code() {
     const CODE: &str = "SECRET-PAIRING-CODE-7731";
-    let fx = legacy_fixture(true);
     let peers = [peer_record(CODE)];
-    // A producer bug that leaks the code into an error message is scrubbed
-    // from the legacy projection (defence in depth).
+    let record = record(STATE, REPO);
+    // The catalog's PeerRecord never serializes or prints its code.
+    assert!(!serde_json::to_string(&peers[0]).unwrap().contains(CODE));
+    assert!(!format!("{:?} {:#?}", peers[0], peers[0]).contains(CODE));
+    // The legacy projection receives the records but never emits a code by
+    // itself (nothing needed scrubbing) and never keeps them: the typed
+    // snapshot built after it has no trace of the code.
+    let fx = legacy_fixture(true);
+    let legacy = |fx: &Fx| {
+        [
+            fx.hub.legacy_folder_sync(&record, &peers).to_string(),
+            fx.hub.legacy_peers(&peers).to_string(),
+        ]
+    };
+    for output in legacy(&fx) {
+        assert!(!output.contains(CODE), "{output}");
+        assert!(!output.contains("<redacted>"), "nothing to scrub: {output}");
+    }
+    let typed = serde_json::to_string(&*fx.snap()).unwrap();
+    assert!(!typed.contains(CODE));
+    assert!(!format!("{:?}", fx.hub).contains(CODE));
+    // Defence in depth: a producer bug that leaks the code into an error
+    // message is scrubbed from the legacy projection. (The typed snapshot is
+    // built from events only and no event field carries a code, so keeping
+    // codes out of messages is the producers' duty; see the hub docs.)
     fx.rec(lane(
         PEER_A,
         0,
@@ -2850,23 +3362,8 @@ fn status_redacts_pairing_code() {
             format!("INVALID_PAIRING_CODE: {CODE}"),
         )),
     ));
-    let record = record(STATE, REPO);
-    let outputs = [
-        fx.hub.legacy_folder_sync(&record, &peers).to_string(),
-        fx.hub.legacy_peers(&peers).to_string(),
-    ];
-    for output in &outputs {
+    for output in legacy(&fx) {
         assert!(!output.contains(CODE), "{output}");
         assert!(output.contains("<redacted>"), "{output}");
     }
-    // The catalog's PeerRecord never serializes its code, and no status event
-    // carries one, so the typed snapshot never contains it.
-    let serialized = serde_json::to_string(&peers[0]).unwrap();
-    assert!(!serialized.contains(CODE));
-    let good = legacy_fixture(true);
-    let snapshot = serde_json::to_string(&*good.snap()).unwrap();
-    assert!(!snapshot.contains(CODE));
-    let legacy = good.hub.legacy_peers(&peers).to_string();
-    assert!(!legacy.contains(CODE));
-    assert!(!format!("{:?}", peers[0]).contains(CODE));
 }
