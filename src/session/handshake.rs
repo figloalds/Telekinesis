@@ -29,6 +29,17 @@
 //!    session limits, switch to non-blocking and hand the socket to
 //!    [`Conn::from_established`].
 //!
+//! **Who is blamed.** A peer's close frame during the handshake is a closed
+//! connection (`WS_CLOSED`), whatever reason it carries: only the client reads
+//! a server's protocol-error close (code 1002, what this server sends on a
+//! violation) as [`DialError::Protocol`]. A server whose own installation id
+//! is invalid refuses every handshake as its own failure
+//! (`INSTALLATION_REQUIRED`, close code 1011), never as the dialer's
+//! `PROTOCOL_VIOLATION`.
+//!
+//! The step watchdog is the transport's (`ws::watchdog`), shared with the
+//! dialer's upgrade in [`ws::connect_with`].
+//!
 //! The pre-auth frames use the §6.2 frame layout (8-byte prefix, JSON header,
 //! no body). They are encoded here rather than by `session::frame` (WP1.9) so
 //! this package has no intra-wave dependency; the layout is the same.
@@ -51,15 +62,14 @@ use crate::{
         conn::{AcceptedPeer, Conn, ConnOptions, PeerInfo, Side},
     },
     util::hmac::ct_eq,
-    ws::{self, RawSocket},
+    ws::{self, RawSocket, watchdog::Watchdog},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
     fmt, io,
-    net::{Shutdown, SocketAddr, TcpStream},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
-    thread::{self, JoinHandle},
+    net::{SocketAddr, TcpStream},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tungstenite::{
@@ -139,7 +149,9 @@ pub trait ClientAuth: Send + Sync {
 /// The accepting side's view of the catalog (WP2.8 implements it over
 /// `CatalogSnapshot`).
 pub trait AcceptPolicy: Send + Sync {
-    /// This daemon's installation id (self-pair refusal).
+    /// This daemon's installation id (self-pair refusal). It must be a valid
+    /// id (1..=128 bytes, no control characters); otherwise every handshake is
+    /// refused as this server's failure (`INSTALLATION_REQUIRED`).
     fn installation(&self) -> String;
     /// The current verifier and its generation; `None` → `PAIRING_CODE_NOT_SET`.
     fn verifier(&self) -> Option<(Verifier, u64)>;
@@ -698,6 +710,13 @@ fn server_steps(
             }));
             Err(error)
         }
+        Err(Failure::Local { error, reason }) => {
+            guarded.close_gracefully(Some(CloseFrame {
+                code: CloseCode::Error,
+                reason: reason.into(),
+            }));
+            Err(error)
+        }
         Err(Failure::Step(step)) => {
             guarded.abandon();
             Err(step.into_wire())
@@ -711,6 +730,13 @@ enum Failure {
     Goaway(ErrorWire),
     /// A protocol violation: close frame, no GOAWAY.
     Violation(String),
+    /// This server cannot run the handshake (its own configuration is
+    /// invalid): an internal-error close frame (1011) with a short `reason`,
+    /// and `error` for the caller. The dialer is not blamed.
+    Local {
+        error: ErrorWire,
+        reason: &'static str,
+    },
     /// The socket timed out or closed: nothing more is sent.
     Step(StepError),
 }
@@ -758,6 +784,18 @@ fn server_auth(
         ));
     }
     let installation = policy.installation();
+    // Our own id goes into `ServerHello` and `T`: an invalid one is this
+    // server's misconfiguration, not the dialer's violation.
+    if !valid_id(&installation) {
+        return Err(Failure::Local {
+            error: ErrorWire::coded(
+                "INSTALLATION_REQUIRED",
+                "this orchestrator's installation id is not valid (1..=128 bytes without \
+                 control characters); handshake refused",
+            ),
+            reason: "the server's installation id is invalid",
+        });
+    }
     if hello.installation == installation {
         return Err(Failure::Goaway(ErrorWire::coded(
             "CANNOT_PAIR_WITH_SELF",
@@ -985,6 +1023,30 @@ fn truncate(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
+/// A peer-chosen close reason made safe for an error message: at most 123
+/// bytes (the WebSocket limit) with control characters escaped.
+fn close_reason(reason: &str) -> String {
+    let mut safe = String::new();
+    for c in truncate(reason, 123).chars() {
+        if c.is_control() {
+            safe.extend(c.escape_default());
+        } else {
+            safe.push(c);
+        }
+    }
+    safe
+}
+
+/// ` (close code N: "reason")`, or ` (close code N)` without a reason.
+fn close_detail(code: CloseCode, reason: &str) -> String {
+    let code = u16::from(code);
+    if reason.is_empty() {
+        format!(" (close code {code})")
+    } else {
+        format!(" (close code {code}: {:?})", truncate(reason, 123))
+    }
+}
+
 /// Encodes one pre-auth frame: kind, no flags, reserved zero, header length
 /// (u32 LE), JSON header, no body.
 fn encode_frame(kind: FrameKind, header: &impl Serialize) -> Result<Vec<u8>, String> {
@@ -1046,6 +1108,9 @@ enum StepError {
     Timeout,
     /// The peer closed or reset the connection.
     Closed(String),
+    /// The peer sent a close frame. Its reason is peer-chosen text, kept only
+    /// as escaped diagnostic detail.
+    PeerClosed { code: CloseCode, reason: String },
     /// The peer broke the protocol (bad frame, oversize message, text…).
     Violation(String),
 }
@@ -1086,6 +1151,13 @@ impl StepError {
                 format!("handshake step exceeded {} s", HANDSHAKE_TIMEOUT.as_secs()),
             ),
             StepError::Closed(detail) => ErrorWire::coded("WS_CLOSED", detail),
+            StepError::PeerClosed { code, reason } => ErrorWire::coded(
+                "WS_CLOSED",
+                format!(
+                    "the peer closed the connection{}",
+                    close_detail(code, &reason)
+                ),
+            ),
             StepError::Violation(detail) => ErrorWire::coded("PROTOCOL_VIOLATION", detail),
         }
     }
@@ -1096,6 +1168,26 @@ impl StepError {
             StepError::Closed(detail) => {
                 DialError::Connect(format!("connection closed during the handshake: {detail}"))
             }
+            // What this server sends on a violation: the server says the
+            // dialer broke the protocol.
+            StepError::PeerClosed {
+                code: CloseCode::Protocol,
+                reason,
+            } => {
+                let reason = close_reason(&reason);
+                let reason = reason
+                    .strip_prefix("PROTOCOL_VIOLATION: ")
+                    .unwrap_or(&reason);
+                DialError::Protocol(if reason.is_empty() {
+                    "the server closed the handshake with a protocol error".into()
+                } else {
+                    format!("the server closed the handshake: {reason}")
+                })
+            }
+            StepError::PeerClosed { code, reason } => DialError::Connect(format!(
+                "connection closed during the handshake: the server closed it{}",
+                close_detail(code, &reason)
+            )),
             StepError::Violation(detail) => DialError::Protocol(detail),
         }
     }
@@ -1152,12 +1244,15 @@ impl Guarded {
                         break Err(StepError::Timeout);
                     }
                 }
+                // A close is a closed connection on either side, whatever
+                // its reason; only `into_dial` reads a protocol close.
                 Ok(Message::Close(frame)) => {
                     break Err(match frame {
-                        Some(frame) if !frame.reason.is_empty() => {
-                            StepError::Violation(frame.reason.as_str().to_owned())
-                        }
-                        _ => StepError::Closed("the peer closed the connection".into()),
+                        Some(frame) => StepError::PeerClosed {
+                            code: frame.code,
+                            reason: frame.reason.as_str().to_owned(),
+                        },
+                        None => StepError::Closed("the peer closed the connection".into()),
                     });
                 }
                 Ok(message) => break Ok(message),
@@ -1251,161 +1346,30 @@ impl Guarded {
     }
 }
 
-/// Shuts the socket down when a handshake step overruns its budget. Socket
-/// timeouts bound each `read`/`write` call; this bounds the whole step, so a
-/// peer that trickles one byte at a time cannot hold the handshake open.
-pub(crate) struct Watchdog {
-    shared: Arc<(Mutex<Watch>, Condvar)>,
-    thread: Option<JoinHandle<()>>,
-}
-
-#[derive(Default)]
-struct Watch {
-    deadline: Option<Instant>,
-    fired: bool,
-    done: bool,
-}
-
-fn lock_watch(mutex: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Test hook: makes [`Watchdog::start`] fail on this thread, as a failed
-    /// thread spawn would.
-    pub(crate) static REFUSE_WATCHDOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-impl Watchdog {
-    /// Starts a watchdog that shuts `stream` down (through a duplicate
-    /// handle; see [`watchdog_handle`]) when an armed budget runs out.
-    ///
-    /// Fails when no duplicate handle can be made or the thread cannot be
-    /// spawned. Callers then refuse the connection: without a watchdog only
-    /// the per-call socket timeouts apply, and a peer trickling bytes (or
-    /// fragments) would be bounded by nothing (fail closed, invariant 22).
-    pub(crate) fn start(stream: &TcpStream) -> io::Result<Watchdog> {
-        let handle = watchdog_handle(stream)?;
-        #[cfg(test)]
-        if REFUSE_WATCHDOG.with(std::cell::Cell::get) {
-            return Err(io::Error::other("watchdog thread refused (test hook)"));
-        }
-        let shared = Arc::new((Mutex::new(Watch::default()), Condvar::new()));
-        let watched = shared.clone();
-        let thread = thread::Builder::new()
-            .name("tkfs-handshake-watchdog".into())
-            .spawn(move || watch(&watched, &handle))?;
-        Ok(Watchdog {
-            shared,
-            thread: Some(thread),
-        })
-    }
-
-    /// A watchdog with no thread, which never fires (tests of the bounds that
-    /// must hold without one).
-    #[cfg(test)]
-    fn inert() -> Watchdog {
-        Watchdog {
-            shared: Arc::new((Mutex::new(Watch::default()), Condvar::new())),
-            thread: None,
-        }
-    }
-
-    pub(crate) fn arm(&self, budget: Duration) {
-        lock_watch(&self.shared.0).deadline = Some(Instant::now() + budget);
-        self.shared.1.notify_all();
-    }
-
-    /// Once `disarm` returns, [`Watchdog::fired`] no longer changes for the
-    /// budget just disarmed.
-    pub(crate) fn disarm(&self) {
-        lock_watch(&self.shared.0).deadline = None;
-        self.shared.1.notify_all();
-    }
-
-    pub(crate) fn fired(&self) -> bool {
-        lock_watch(&self.shared.0).fired
-    }
-}
-
-impl Drop for Watchdog {
-    fn drop(&mut self) {
-        lock_watch(&self.shared.0).done = true;
-        self.shared.1.notify_all();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// A duplicate handle the watchdog can shut the socket down with.
-///
-/// On Windows, a duplicate taken right after a non-blocking connect (what
-/// `TcpStream::connect_timeout` does) can carry a stale "not connected" state,
-/// and `shutdown` on it then fails with `WSAENOTCONN`, so an overrunning step
-/// would not be interrupted. A `getpeername` on the original refreshes the
-/// state the duplicate is created from (checked over thousands of connects);
-/// the duplicate is verified the same way. Elsewhere this is a plain clone.
-fn watchdog_handle(stream: &TcpStream) -> io::Result<TcpStream> {
-    for _ in 0..3 {
-        let _ = stream.peer_addr();
-        let duplicate = stream.try_clone()?;
-        if duplicate.peer_addr().is_ok() {
-            return Ok(duplicate);
-        }
-    }
-    stream.try_clone()
-}
-
-fn watch(shared: &(Mutex<Watch>, Condvar), stream: &TcpStream) {
-    let (mutex, condvar) = shared;
-    let mut state = lock_watch(mutex);
-    loop {
-        if state.done {
-            return;
-        }
-        match state.deadline {
-            None => {
-                state = condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
-            }
-            Some(deadline) => {
-                let now = Instant::now();
-                if now >= deadline {
-                    state.fired = true;
-                    state.deadline = None;
-                    drop(state);
-                    let _ = stream.shutdown(Shutdown::Both);
-                    return;
-                }
-                state = condvar
-                    .wait_timeout(state, deadline - now)
-                    .map(|(state, _)| state)
-                    .unwrap_or_else(|error| error.into_inner().0);
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::auth::CodeAuth;
-    use std::{io::Read, net::TcpListener};
+    use crate::{session::auth::CodeAuth, ws::watchdog::REFUSE_WATCHDOG};
+    use std::{
+        cell::Cell,
+        io::Read,
+        net::TcpListener,
+        thread::{self, LocalKey},
+    };
 
-    /// Sets [`REFUSE_WATCHDOG`] on this thread until dropped.
-    struct RefuseWatchdog;
+    /// Sets a watchdog test hook on this thread until dropped.
+    struct Hook(&'static LocalKey<Cell<bool>>);
 
-    impl RefuseWatchdog {
-        fn set() -> RefuseWatchdog {
-            REFUSE_WATCHDOG.with(|refuse| refuse.set(true));
-            RefuseWatchdog
+    impl Hook {
+        fn set(hook: &'static LocalKey<Cell<bool>>) -> Hook {
+            hook.with(|hook| hook.set(true));
+            Hook(hook)
         }
     }
 
-    impl Drop for RefuseWatchdog {
+    impl Drop for Hook {
         fn drop(&mut self) {
-            REFUSE_WATCHDOG.with(|refuse| refuse.set(false));
+            self.0.with(|hook| hook.set(false));
         }
     }
 
@@ -1459,7 +1423,7 @@ mod tests {
     fn a_watchdog_that_cannot_start_refuses_the_connection() {
         // Upgraded sockets for the handshake functions, made before the hook.
         let (client_ws, server_ws) = pair();
-        let _hook = RefuseWatchdog::set();
+        let _hook = Hook::set(&REFUSE_WATCHDOG);
         let started = Instant::now();
 
         let (client, server) = accepted_pair();
@@ -1565,5 +1529,108 @@ mod tests {
             "drain ended after {elapsed:?}"
         );
         pinger.join().unwrap();
+    }
+
+    /// Unix only: there the socket timeouts the watchdog shrinks belong to
+    /// the socket. On Windows they belong to the handle, and the bound rests
+    /// on `shutdown` through a verified duplicate (see
+    /// `ws::watchdog::watchdog_handle`).
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_watchdog_shutdown_still_ends_a_trickled_step() {
+        use crate::ws::watchdog::FAIL_SHUTDOWN;
+        use std::{io::Write, net::Shutdown};
+        // The watchdog fires but its `shutdown` fails. A peer trickling one
+        // data frame a byte at a time keeps every read short, so the 5 s
+        // per-call timeout never trips; the timeouts the watchdog shrank end
+        // the step.
+        let (client, server) = pair();
+        let mut guarded = {
+            let _hook = Hook::set(&FAIL_SHUTDOWN);
+            Guarded::new(client, None).unwrap()
+        };
+        guarded.budget = Duration::from_millis(600);
+        let mut raw = tcp_of(&server).unwrap().try_clone().unwrap();
+        let control = raw.try_clone().unwrap();
+        let trickler = thread::spawn(move || {
+            // An unmasked (server to client) binary frame of 60 bytes, one
+            // byte every 100 ms: 6 s for the whole frame.
+            if raw.write_all(&[0x82, 60]).is_err() {
+                return;
+            }
+            for _ in 0..60 {
+                thread::sleep(Duration::from_millis(100));
+                if raw.write_all(&[0]).is_err() {
+                    return;
+                }
+            }
+        });
+        let started = Instant::now();
+        let result = guarded.read_message();
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(StepError::Timeout)), "{result:?}");
+        assert!(guarded.watchdog.fired());
+        assert!(
+            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_secs(3),
+            "step ended after {elapsed:?}"
+        );
+        let _ = control.shutdown(Shutdown::Both);
+        trickler.join().unwrap();
+    }
+
+    #[test]
+    fn a_peer_close_is_a_closed_connection_not_a_violation() {
+        let close = |code, reason: &str| StepError::PeerClosed {
+            code,
+            reason: reason.into(),
+        };
+        // Server side: whatever the dialer's close says, it is WS_CLOSED, and
+        // its reason is escaped detail only.
+        for (code, reason) in [
+            (CloseCode::Away, "going away"),
+            (CloseCode::Protocol, "PROTOCOL_VIOLATION: forged"),
+            (CloseCode::Normal, ""),
+        ] {
+            assert!(matches!(
+                Failure::from(close(code, reason)),
+                Failure::Step(StepError::PeerClosed { .. })
+            ));
+            let error = close(code, reason).into_wire();
+            assert_eq!(error.code, "WS_CLOSED", "{error}");
+            assert!(error.message.contains(reason), "{error}");
+        }
+        let error = close(CloseCode::Away, "line\nbreak\u{7}").into_wire();
+        assert!(error.message.contains(r"line\nbreak\u{7}"), "{error}");
+        assert!(!error.message.contains('\n'), "{error}");
+        // Client side: a protocol close from the server is a violation it
+        // reports; any other close is a closed connection.
+        match close(
+            CloseCode::Protocol,
+            "PROTOCOL_VIOLATION: invalid client hello",
+        )
+        .into_dial()
+        {
+            DialError::Protocol(detail) => assert_eq!(
+                detail,
+                "the server closed the handshake: invalid client hello"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            close(CloseCode::Protocol, "").into_dial(),
+            DialError::Protocol(_)
+        ));
+        match close(CloseCode::Protocol, "bad\u{1b}[2J").into_dial() {
+            DialError::Protocol(detail) => assert!(!detail.contains('\u{1b}'), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+        match close(CloseCode::Away, "going away").into_dial() {
+            DialError::Connect(detail) => assert!(detail.contains("1001"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            close(CloseCode::Error, "the server's installation id is invalid").into_dial(),
+            DialError::Connect(_)
+        ));
     }
 }

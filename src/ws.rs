@@ -301,8 +301,8 @@ fn connect_one(
     // The socket timeouts bound each read; the watchdog bounds the whole TLS
     // and WebSocket upgrade, so a server trickling its response cannot hold
     // the dialer. No watchdog, no attempt.
-    let watchdog = crate::session::handshake::Watchdog::start(&stream)
-        .context("websocket upgrade watchdog could not start")?;
+    let watchdog =
+        watchdog::Watchdog::start(&stream).context("websocket upgrade watchdog could not start")?;
     watchdog.arm(remaining);
     let result =
         tungstenite::client_tls_with_config(request.clone(), stream, Some(config()), connector);
@@ -450,6 +450,219 @@ pub fn call<T: Serialize>(socket: &mut Socket, request: &T) -> Result<Value> {
             Err(RemoteError(error.to_owned()).into())
         }
         None => bail!("INVALID_WS_REPLY: missing boolean ok"),
+    }
+}
+
+/// A deadline on a whole blocking exchange over one TCP socket (a WebSocket
+/// upgrade, a handshake step). Socket timeouts bound each `read`/`write`
+/// call; a watchdog bounds the whole exchange, so a peer that trickles one
+/// byte at a time cannot hold it open. [`connect_with`] uses it for the
+/// upgrade, and the v3 handshake (`session::handshake`) for every step. It
+/// lives here, in the transport, so the transport never depends on the
+/// session layer.
+pub(crate) mod watchdog {
+    use std::{
+        io,
+        net::{Shutdown, TcpStream},
+        sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
+    /// The socket timeouts an expired watchdog leaves: the next blocking call
+    /// on the socket returns at once.
+    const EXPIRED_TIMEOUT: Duration = Duration::from_millis(1);
+
+    /// Ends a blocking exchange that overruns its armed budget: it shrinks
+    /// the socket timeouts and shuts the socket down (through a duplicate
+    /// handle; see [`watchdog_handle`]).
+    pub(crate) struct Watchdog {
+        shared: Arc<(Mutex<Watch>, Condvar)>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    #[derive(Default)]
+    struct Watch {
+        deadline: Option<Instant>,
+        fired: bool,
+        done: bool,
+    }
+
+    fn lock_watch(mutex: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Test hook: makes [`Watchdog::start`] fail on this thread, as a
+        /// failed thread spawn would.
+        pub(crate) static REFUSE_WATCHDOG: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Test hook: a watchdog started on this thread finds its `shutdown`
+        /// failing when it fires (as a stale Windows duplicate would).
+        pub(crate) static FAIL_SHUTDOWN: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    impl Watchdog {
+        /// Starts a watchdog for `stream`, initially disarmed.
+        ///
+        /// Fails when no verified duplicate handle can be made or the thread
+        /// cannot be spawned. Callers then refuse the connection: without a
+        /// watchdog only the per-call socket timeouts apply, and a peer
+        /// trickling bytes (or fragments) would be bounded by nothing (fail
+        /// closed, invariant 22).
+        pub(crate) fn start(stream: &TcpStream) -> io::Result<Watchdog> {
+            let handle = watchdog_handle(stream)?;
+            #[cfg(test)]
+            if REFUSE_WATCHDOG.with(std::cell::Cell::get) {
+                return Err(io::Error::other("watchdog thread refused (test hook)"));
+            }
+            #[cfg(test)]
+            let shutdown_fails = FAIL_SHUTDOWN.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let shutdown_fails = false;
+            let shared = Arc::new((Mutex::new(Watch::default()), Condvar::new()));
+            let watched = shared.clone();
+            let thread = thread::Builder::new()
+                .name("tkfs-handshake-watchdog".into())
+                .spawn(move || watch(&watched, &handle, shutdown_fails))?;
+            Ok(Watchdog {
+                shared,
+                thread: Some(thread),
+            })
+        }
+
+        /// A watchdog with no thread, which never fires (tests of the bounds
+        /// that must hold without one).
+        #[cfg(test)]
+        pub(crate) fn inert() -> Watchdog {
+            Watchdog {
+                shared: Arc::new((Mutex::new(Watch::default()), Condvar::new())),
+                thread: None,
+            }
+        }
+
+        pub(crate) fn arm(&self, budget: Duration) {
+            lock_watch(&self.shared.0).deadline = Some(Instant::now() + budget);
+            self.shared.1.notify_all();
+        }
+
+        /// Once `disarm` returns, [`Watchdog::fired`] no longer changes for
+        /// the budget just disarmed.
+        pub(crate) fn disarm(&self) {
+            lock_watch(&self.shared.0).deadline = None;
+            self.shared.1.notify_all();
+        }
+
+        pub(crate) fn fired(&self) -> bool {
+            lock_watch(&self.shared.0).fired
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            lock_watch(&self.shared.0).done = true;
+            self.shared.1.notify_all();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A duplicate handle the watchdog can shut the socket down with, or an
+    /// error when none can be verified (the caller then refuses the
+    /// connection: fail closed).
+    ///
+    /// On Windows, a duplicate taken right after a non-blocking connect
+    /// (what `TcpStream::connect_timeout` does) can carry a stale "not
+    /// connected" state, and `shutdown` on it then fails with `WSAENOTCONN`,
+    /// so an overrunning exchange would not be interrupted. A stale duplicate
+    /// stays stale (measured: 23 of 3,000 connects gave one, and none of them
+    /// recovered on a second `getpeername` or `shutdown`), but a `getpeername`
+    /// on the original refreshes the state a new duplicate is created from
+    /// (each of those 23 re-duplicated cleanly). So the original is refreshed
+    /// before each clone and the duplicate verified the same way. A duplicate
+    /// that fails verification three times is never used: its `shutdown`
+    /// would fail when it matters. Elsewhere the first clone verifies, unless
+    /// the connection is already gone.
+    fn watchdog_handle(stream: &TcpStream) -> io::Result<TcpStream> {
+        let mut last = None;
+        for _ in 0..3 {
+            let _ = stream.peer_addr();
+            let duplicate = stream.try_clone()?;
+            match duplicate.peer_addr() {
+                Ok(_) => return Ok(duplicate),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "no verified socket handle for the watchdog: {}",
+                last.map(|error| error.to_string()).unwrap_or_default()
+            ),
+        ))
+    }
+
+    fn watch(shared: &(Mutex<Watch>, Condvar), stream: &TcpStream, shutdown_fails: bool) {
+        let (mutex, condvar) = shared;
+        let mut state = lock_watch(mutex);
+        loop {
+            if state.done {
+                return;
+            }
+            match state.deadline {
+                None => {
+                    state = condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        state.fired = true;
+                        state.deadline = None;
+                        drop(state);
+                        expire(stream, shutdown_fails);
+                        return;
+                    }
+                    state = condvar
+                        .wait_timeout(state, deadline - now)
+                        .map(|(state, _)| state)
+                        .unwrap_or_else(|error| error.into_inner().0);
+                }
+            }
+        }
+    }
+
+    /// Ends the exchange: `shutdown` ends the call in progress and every
+    /// later one.
+    ///
+    /// The socket timeouts are shrunk first, as a second line should
+    /// `shutdown` fail (it is then logged as `WATCHDOG_SHUTDOWN_FAILED`). On
+    /// Unix they belong to the socket, so every later blocking call on the
+    /// owner's handle returns at once and a trickling peer is cut off at its
+    /// next pause. On Windows they belong to the handle (measured: a timeout
+    /// set through a duplicate leaves the original's unchanged), so there the
+    /// bound rests on `shutdown` through the duplicate [`watchdog_handle`]
+    /// verified. The one failure known there is a connection already gone,
+    /// which ends the owner's call by itself.
+    fn expire(stream: &TcpStream, shutdown_fails: bool) {
+        let read = stream.set_read_timeout(Some(EXPIRED_TIMEOUT));
+        let write = stream.set_write_timeout(Some(EXPIRED_TIMEOUT));
+        let shutdown = if shutdown_fails {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "shutdown refused (test hook)",
+            ))
+        } else {
+            stream.shutdown(Shutdown::Both)
+        };
+        if let Err(error) = shutdown {
+            crate::util::log::event!(warn, WATCHDOG_SHUTDOWN_FAILED, {
+                "error": error.to_string(),
+                "timeouts_shrunk": read.is_ok() && write.is_ok(),
+            });
+        }
     }
 }
 
@@ -689,5 +902,33 @@ mod tests {
         let error =
             connect_any("fallback", &[], &request, None, budget).expect_err("nothing to dial");
         assert!(format!("{error:#}").contains("WS_CONNECT_FAILED"));
+    }
+
+    /// Unix only: Windows still answers `getpeername` on a socket whose
+    /// connection is closed, so this state cannot be built there.
+    #[cfg(unix)]
+    #[test]
+    fn a_watchdog_never_runs_on_an_unverified_handle() {
+        use std::{io::Read, net::Shutdown};
+        // A socket whose connection is fully closed: no duplicate of it
+        // verifies, so no watchdog starts (fail closed) rather than one
+        // whose `shutdown` would fail.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        drop(listener.accept().unwrap().0);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!((&client).read(&mut [0u8; 4]).unwrap(), 0);
+        client.shutdown(Shutdown::Both).unwrap();
+        let started = Instant::now();
+        while client.peer_addr().is_ok() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never closed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let error = watchdog::Watchdog::start(&client)
+            .err()
+            .expect("no watchdog on a closed socket");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected, "{error}");
     }
 }
