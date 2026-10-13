@@ -12,10 +12,13 @@
 //! 4. `Engine::new` (recovers pending saves);
 //! 5. build the `WorkerCtx`;
 //! 6. start the RPC listener: recovery is complete before any RPC (invariant 24);
-//! 7. write `runtime.json` and `worker.json`;
+//! 7. write `runtime.json` and `worker.json` (`runtime.json.mount` is the
+//!    absolute, normalized legacy `--mount` once prepared, or the path of a
+//!    successful `mount-attach`; `None` before);
 //! 8. legacy/standalone `--mount` without `--supervised`: attach now, and
-//!    report a failure in Ready (never fatal); `--supervised`: the
-//!    orchestrator attaches later through `mount-attach`;
+//!    report a failure in Ready (never fatal; a stop accepted since step 6
+//!    skips it); `--supervised`: the orchestrator attaches later through
+//!    `mount-attach`;
 //! 9. print the `ReadyLine`;
 //! 10. start the heartbeat;
 //! 11. wait for `stopping`, let the stop reply flush (≤ 2 s), remove
@@ -45,7 +48,7 @@ use crate::{
     runtime::{
         Engine, RpcServer, Shared,
         ctx::{EngineGaugeCell, SyncStorePool, WorkerCtx},
-        server::{publish_discovery, start_rpc_server},
+        server::start_rpc_server,
     },
     util::{
         fault,
@@ -160,10 +163,12 @@ pub fn build_ctx(
     })
 }
 
-/// Resolves a requested mount path the way the legacy worker did: absolute,
+/// Resolves a requested mount path the way the legacy worker did: absolute
+/// (against this process's working directory) and lexically normalized,
 /// never overlapping the state directory (invariant 27; checked before
 /// anything is created), parent created. The mount controller checks the
-/// rest (the path must not exist, …).
+/// rest (the path must not exist, …). The result is also what
+/// `runtime.json` advertises as `mount` (`bucket-export` resolves it).
 pub fn prepare_mount_path(state: &Path, path: &Path) -> Result<PathBuf, ErrorWire> {
     let io = |error: std::io::Error| ErrorWire::from_error(&error.into());
     let path = normalize(&std::path::absolute(path).map_err(io)?);
@@ -296,13 +301,20 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     // 6. RPC
     crate::startup::progress("starting RPC listener");
     let server = start_rpc_server(ctx.clone()).map_err(internal)?;
-    // 7. runtime.json and worker.json
-    let mut discovery = server.discovery().clone();
-    discovery.mount = args
-        .mount
+    // 7. runtime.json and worker.json. The legacy `--mount` is prepared first
+    // (absolute, normalized, parent created; a failure is the mount error of
+    // step 8), so `runtime.json.mount` is the absolute path step 8 attaches,
+    // as the legacy worker published it; `bucket-export` resolves it. A
+    // supervised worker publishes `None` until a `mount-attach` succeeds.
+    let legacy_mount = match (&args.mount, args.supervised) {
+        (Some(path), false) => Some(prepare_mount_path(&state, path)),
+        _ => None,
+    };
+    let published = legacy_mount
         .as_ref()
+        .and_then(|prepared| prepared.as_ref().ok())
         .map(|path| path.to_string_lossy().into_owned());
-    publish_discovery(&ctx.engine, &state, &discovery).map_err(internal)?;
+    let discovery = server.publish(published).map_err(internal)?;
     let worker_record = WorkerRecord {
         format: WORKER_RECORD_FORMAT,
         pid: std::process::id(),
@@ -319,11 +331,14 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
         token: None,
     };
     record::write_atomic(&state, &worker_record).map_err(internal)?;
-    // 8. legacy synchronous mount; never fatal
+    // 8. legacy synchronous mount; never fatal. RPC is up since step 6: a
+    // stop accepted meanwhile wins (`WORKER_STOPPING`, nothing attached), and
+    // a stop that arrives during the attach waits for it, then detaches.
     let mut mount_error = None;
-    if let (Some(path), false) = (&args.mount, args.supervised) {
+    if let (Some(prepared), Some(path)) = (legacy_mount, &args.mount) {
         crate::startup::progress("mounting filesystem");
-        if let Err(error) = prepare_mount_path(&state, path).and_then(|p| ctx.mount.attach(&p)) {
+        fault::hang("worker.legacy_attach");
+        if let Err(error) = prepared.and_then(|prepared| server.attach(&prepared)) {
             crate::util::log::event!(warn, (error.code.as_str()), {
                 "site": "worker.mount",
                 "path": path,
@@ -335,6 +350,9 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     let mount: MountStatus = ctx.mount.status();
     heartbeat::beat(&ctx, &vitals);
     drop(reporting);
+    // The supervised idle clock starts at Ready: a supervisor contacts the
+    // worker only after reading it, however long startup took.
+    ctx.last_contact_ms.store(now_ms(), Ordering::Relaxed);
     // 9. Ready
     crate::startup::print_line(&ReadyLine {
         ready: true,
@@ -403,25 +421,36 @@ fn idle_limit() -> Option<Duration> {
 }
 
 impl Running {
-    /// §4.1 step 11.
+    /// §4.1 step 11. The main thread never blocks on the engine here: its
+    /// stops (idle exit, signals) refuse with `WORKER_BUSY` while the engine
+    /// or a mount attach is busy, and are retried.
     fn wait(self) -> Result<()> {
         let ctx = self.server.ctx().clone();
         let mut next_idle_check = Instant::now();
+        // A signal whose stop met a busy engine: retried every tick.
+        #[cfg(target_os = "linux")]
+        let mut signal_pending = false;
         loop {
             let seen = self.server.stop_count();
             if ctx.stopping.load(Ordering::SeqCst) {
                 break;
             }
             #[cfg(target_os = "linux")]
-            if SIGNALLED.swap(false, Ordering::Relaxed) {
+            if SIGNALLED.swap(false, Ordering::Relaxed) || signal_pending {
+                let retry = signal_pending;
                 match self.server.stop(StopMode::Graceful) {
                     Ok(_) => break,
                     Err(error) => {
                         let wire = ErrorWire::from_error(&error);
-                        crate::util::log::event!(warn, (wire.code.as_str()), {
-                            "site": "worker.signal",
-                            "message": wire.message,
-                        });
+                        // Open files refuse a signal, as before (BUSY_VIEW;
+                        // send it again later). A busy engine is retried.
+                        signal_pending = wire.code == "WORKER_BUSY";
+                        if !retry {
+                            crate::util::log::event!(warn, (wire.code.as_str()), {
+                                "site": "worker.signal",
+                                "message": wire.message,
+                            });
+                        }
                     }
                 }
             }

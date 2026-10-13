@@ -12,17 +12,23 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    io::{BufRead, BufReader, Write},
+    path::{Component, Path, PathBuf},
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::Ordering,
+        mpsc::{self, RecvTimeoutError},
+    },
     thread,
     time::{Duration, Instant},
 };
 use support::*;
 use tkfs::{
     core::{Store, id},
-    model::ipc::{HelloReply, ReadyLine, WorkerHeartbeat, WorkerRecord},
+    model::ipc::{HelloReply, ReadyLine, StopMode, StopReply, WorkerHeartbeat, WorkerRecord},
     runtime::{self, Engine, Shared},
+    util::fault::{self, FaultAction, FaultConfig},
     worker::{self, record},
     ws,
 };
@@ -101,6 +107,162 @@ fn fuse_may_flush() -> bool {
     cfg!(target_os = "linux")
 }
 
+/// A worker spawned directly, for what `WorkerProc` cannot do: a chosen
+/// working directory, and the arrival time of every stdout line. Killed on
+/// drop if still running.
+struct TimedWorker {
+    child: Child,
+    lines: mpsc::Receiver<(Instant, Value)>,
+}
+
+impl TimedWorker {
+    fn spawn(cwd: &Path, state: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.join("worker.log"))
+            .unwrap();
+        let mut command = Command::new(bin());
+        command
+            .current_dir(cwd)
+            .arg("daemon")
+            .arg("--state")
+            .arg(state)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(log);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, lines) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(value) = serde_json::from_str::<Value>(&line)
+                    && sender.send((Instant::now(), value)).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { child, lines }
+    }
+
+    /// Every stdout line up to and including Ready, with its arrival time.
+    fn until_ready(&mut self, state: &Path) -> Vec<(Instant, Value)> {
+        let deadline = Instant::now() + READY;
+        let mut seen = Vec::new();
+        loop {
+            match self.lines.recv_timeout(Duration::from_millis(100)) {
+                Ok((at, line)) => {
+                    assert!(line["fatal"] != true, "{line}");
+                    let ready = line["ready"] == true;
+                    seen.push((at, line));
+                    if ready {
+                        return seen;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => assert!(
+                    Instant::now() < deadline,
+                    "no Ready: {seen:?}\n{}",
+                    tail(&state.join("worker.log"), 8 * 1024)
+                ),
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "the worker exited before Ready: {seen:?}\n{}",
+                    tail(&state.join("worker.log"), 8 * 1024)
+                ),
+            }
+        }
+    }
+
+    fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().ok().flatten() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for TimedWorker {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Whether process `pid` owns a listening TCP socket; `None` where this test
+/// cannot tell (yet). Windows: `netstat -ano -p TCP` rows of `pid` whose
+/// foreign address is the unspecified `0.0.0.0:0` (listening rows; the state
+/// column is localized, the addresses are not). Linux: a `LISTEN` (`0A`) row
+/// of `/proc/<pid>/net/tcp{,6}` whose inode is one of the process's sockets,
+/// once the worker holds `owner.lock` (step 1 of `worker::run`): until `exec`
+/// has closed them, the forked child still holds the test process's
+/// descriptors, other tests' listeners included (and `/proc/<pid>/exe`
+/// already names the new image before they are closed).
+#[cfg(windows)]
+fn listening(pid: u32) -> Option<bool> {
+    let output = Command::new("netstat")
+        .args(["-ano", "-p", "TCP"])
+        .output()
+        .ok()?;
+    let pid = pid.to_string();
+    Some(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let columns: Vec<_> = line.split_whitespace().collect();
+        columns.len() == 5 && columns[0] == "TCP" && columns[2] == "0.0.0.0:0" && columns[4] == pid
+    }))
+}
+#[cfg(target_os = "linux")]
+fn listening(pid: u32) -> Option<bool> {
+    let descriptors: Vec<PathBuf> = fs::read_dir(format!("/proc/{pid}/fd"))
+        .ok()?
+        .filter_map(|entry| fs::read_link(entry.ok()?.path()).ok())
+        .collect();
+    if !descriptors
+        .iter()
+        .any(|target| target.ends_with("owner.lock"))
+    {
+        return None;
+    }
+    let sockets: std::collections::HashSet<String> = descriptors
+        .iter()
+        .filter_map(|target| {
+            let target = target.to_str()?;
+            Some(
+                target
+                    .strip_prefix("socket:[")?
+                    .strip_suffix(']')?
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let mut listening = false;
+    for table in ["tcp", "tcp6"] {
+        let Ok(text) = fs::read_to_string(format!("/proc/{pid}/net/{table}")) else {
+            continue;
+        };
+        listening |= text.lines().skip(1).any(|line| {
+            let columns: Vec<_> = line.split_whitespace().collect();
+            columns.len() > 9 && columns[3] == "0A" && sockets.contains(columns[9])
+        });
+    }
+    Some(listening)
+}
+#[cfg(not(any(windows, target_os = "linux")))]
+fn listening(_pid: u32) -> Option<bool> {
+    None
+}
+
 /// After a test left a FUSE mount behind (a force stop or an exit with the
 /// mount up), unmount it so the temporary directory can be removed.
 fn release_mount(_path: &Path) {
@@ -147,6 +309,12 @@ fn mount_failure_is_reported_in_ready_and_rpc_keeps_serving() {
     assert_eq!(typed.ipc, 3);
     assert_eq!(Some(typed.pid), worker.pid());
 
+    // runtime.json advertises the absolute path it tried to attach, as the
+    // legacy worker did (bucket-export keeps refusing to write there).
+    assert_eq!(
+        discovery_at(&state).unwrap().mount.map(PathBuf::from),
+        Some(mount.clone())
+    );
     let status = worker.rpc(json!({"op":"status"})).unwrap();
     assert_eq!(status["mounted"], false);
     assert_eq!(status["mount"]["state"], "attach_failed", "{status}");
@@ -257,8 +425,8 @@ fn ready_worker_record_and_hello_describe_the_same_process() {
 
 /// Invariant 24: store recovery (including pending saves) completes before
 /// the listener exists. `worker.startup` holds the worker between recovery
-/// and the listener: nothing is published, and only after Ready does the
-/// recovered save commit.
+/// and the listener: nothing is published, the process owns no listening
+/// socket, and only after Ready does the recovered save commit.
 #[test]
 fn rpc_after_recovery() {
     let dir = tempfile::tempdir().unwrap();
@@ -277,28 +445,46 @@ fn rpc_after_recovery() {
         &[
             ("TKFS_FAULT_POINT", "worker.startup"),
             ("TKFS_FAULT_ACTION", "hang"),
-            ("TKFS_FAULT_MS", "1500"),
+            ("TKFS_FAULT_MS", "2500"),
         ],
     )
     .unwrap();
+    let pid = worker.pid().unwrap();
+    // The hold starts after spawn, so it lasts at least until here.
+    let held_until = worker.spawned_at + Duration::from_millis(2400);
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(1000) {
+    let mut sampled = 0;
+    while started.elapsed() < Duration::from_millis(1500) {
         assert!(
             !state.join("runtime.json").exists(),
-            "listener before recovery"
+            "runtime.json before recovery"
         );
         assert!(
             !record::path(&state).exists(),
             "worker.json before recovery"
         );
+        // A listener opened early (before the fault point) shows up here
+        // even if the files were still published after it.
+        if let Some(listening) = listening(pid)
+            && Instant::now() < held_until
+        {
+            assert!(!listening, "a listening socket before recovery");
+            sampled += 1;
+        }
         assert!(worker.try_exit().is_none());
         thread::sleep(Duration::from_millis(50));
     }
+    if cfg!(any(windows, target_os = "linux")) {
+        assert!(sampled >= 1, "no listener sample inside the hold");
+    }
     let ready = worker.wait_ready(READY).unwrap();
     assert!(
-        started.elapsed() >= Duration::from_millis(1400),
+        started.elapsed() >= Duration::from_millis(2400),
         "the fault held startup"
     );
+    if let Some(listening) = listening(pid) {
+        assert!(listening, "the probe sees the listener once Ready");
+    }
     let ready_at = worker.seen.iter().position(|l| l["ready"] == true).unwrap();
     assert!(
         worker.seen[..ready_at]
@@ -480,6 +666,11 @@ fn supervised_worker_is_ready_before_mount_and_attaches_on_request() {
     assert_eq!(ready["mounted"], false);
     assert!(ready["mount_error"].is_null(), "{ready}");
     assert!(!mount.exists(), "nothing attached before mount-attach");
+    assert_eq!(
+        discovery_at(&state).unwrap().mount,
+        None,
+        "nothing advertised before mount-attach"
+    );
     assert!(record::read(&state).unwrap().unwrap().supervised);
     let status = worker.rpc(json!({"op":"mount-status"})).unwrap();
     assert_eq!(status["state"], "detached", "{status}");
@@ -494,6 +685,11 @@ fn supervised_worker_is_ready_before_mount_and_attaches_on_request() {
             .rpc(json!({"op":"mount-attach","path":mount_arg}))
             .unwrap();
         assert_eq!(attached["state"], "attached", "{attached}");
+        assert_eq!(
+            discovery_at(&state).unwrap().mount.map(PathBuf::from),
+            Some(mount.clone()),
+            "runtime.json advertises the attached path"
+        );
         fs::write(mount.join("through-mount.txt"), b"mounted bytes").unwrap();
         let status = worker.rpc(json!({"op":"status"})).unwrap();
         assert_eq!(status["mounted"], true, "{status}");
@@ -520,6 +716,7 @@ fn supervised_worker_is_ready_before_mount_and_attaches_on_request() {
         assert_eq!(exit.code(), Some(0));
         assert_eq!(committed(&state, "through-mount.txt"), b"mounted bytes");
     } else {
+        assert_eq!(discovery_at(&state).unwrap().mount, None);
         worker.stop().unwrap();
     }
 }
@@ -655,10 +852,11 @@ fn mounted_stop_ladder_refuses_then_persists_dirty_files() {
     assert_eq!(committed(&state, "dirty.txt"), bytes);
 }
 
-/// `engine.poison` (panic under the engine lock): the worker persists the
-/// dirty session and exits 70; a restart commits the bytes.
+/// Invariant 8 guard (§10): `engine.poison` (panic under the engine lock):
+/// the worker persists the dirty session and exits 70; a restart commits the
+/// bytes.
 #[test]
-fn engine_poison_exits_70_and_persists_dirty_sessions() {
+fn poison_exit_persists_dirty() {
     if !mount_supported() {
         eprintln!("skipped: no mount support");
         return;
@@ -725,8 +923,12 @@ fn wait_released(engine: &Shared) {
     );
 }
 
+/// Invariant 8 guard (§10), in process and without a mount: a graceful stop
+/// with an open dirty session is refused (`BUSY_VIEW`, the worker stays up);
+/// a force stop fences new opens, writes the `pending_saves` row and stops;
+/// after a "crash" the recovered engine commits the bytes.
 #[test]
-fn graceful_stop_refuses_an_open_session_and_force_stop_retains_it() {
+fn force_stop_persists_dirty() {
     let dir = tempfile::tempdir().unwrap();
     let engine = shared(dir.path());
     let info = runtime::start_rpc(engine.clone(), dir.path(), None).unwrap();
@@ -784,8 +986,13 @@ fn graceful_stop_refuses_an_open_session_and_force_stop_retains_it() {
     );
 }
 
+/// The poison hook never commits what the panicked request left half done:
+/// it rolls the open transaction back, or, when that `ROLLBACK` fails
+/// (`engine.poison_rollback`), replaces the connection (closing it discards
+/// the transaction); then it retains every dirty session. One test, because
+/// it is the only user of that process-wide fault point.
 #[test]
-fn poison_hook_rolls_back_the_open_transaction_then_retains_dirty_sessions() {
+fn poison_hook_never_commits_the_open_transaction_and_retains_dirty_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path(), Some("worker-lifecycle")).unwrap());
     let (h, entry) = engine.open("dirty.txt", Some("file"), true).unwrap();
@@ -824,6 +1031,62 @@ fn poison_hook_rolls_back_the_open_transaction_then_retains_dirty_sessions() {
     assert_eq!(probe, 0);
     // From autocommit the hook is just `retain_all_dirty`.
     assert_eq!(engine.persist_after_poison().unwrap(), 1);
+
+    // The ROLLBACK fails: the connection is replaced, never committed.
+    let (h2, second) = engine.open("second.txt", Some("file"), true).unwrap();
+    engine.write(h2, 0, b"second", false, false).unwrap();
+    engine
+        .store
+        .db
+        .execute_batch(
+            "PRAGMA cache_size=1234; BEGIN IMMEDIATE; SAVEPOINT control_request; \
+             CREATE TABLE wp1_4_half_done(x INTEGER); INSERT INTO wp1_4_half_done VALUES(1);",
+        )
+        .unwrap();
+    fault::configure(Some(FaultConfig {
+        count: Some(1),
+        ..FaultConfig::new("engine.poison_rollback", FaultAction::Fail)
+    }));
+    let retained = engine.persist_after_poison();
+    fault::configure(None);
+    assert_eq!(retained.unwrap(), 2);
+    let cache_size: i64 = engine
+        .store
+        .db
+        .query_row("PRAGMA cache_size", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(cache_size, 1234, "the connection was replaced");
+    assert!(engine.store.db.is_autocommit());
+    let mut rows: Vec<String> = other
+        .prepare("SELECT entity FROM pending_saves")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    rows.sort();
+    let mut expected = vec![entry.id.clone(), second.id.clone()];
+    expected.sort();
+    assert_eq!(rows, expected);
+    let half_done: i64 = other
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='wp1_4_half_done'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(half_done, 0, "the half-done transaction was discarded");
+    // The fresh connection serves the engine: both sessions commit.
+    engine.close(h).unwrap();
+    engine.close(h2).unwrap();
+    engine.retry_pending().unwrap();
+    engine.quiet().unwrap();
+    assert_eq!(engine.vitals.pending_saves(), 0);
+    let entry = engine.store.lookup("second.txt").unwrap();
+    assert_eq!(
+        engine.store.read_object(&entry.content.unwrap()).unwrap(),
+        b"second"
+    );
 }
 
 #[test]
@@ -1002,4 +1265,273 @@ fn failed_retained_save_commit_rolls_back_and_keeps_the_row() {
     engine.flush(h).unwrap();
     engine.close(h).unwrap();
     engine.quiet().unwrap();
+}
+
+/// The `pending_saves` gauge is counted once the save's transaction is
+/// resolved. Here the commit fails (a deferred foreign key violation leaves
+/// the transaction open, without the row) and re-retaining the session fails
+/// too: the gauge still shows the row the rollback kept.
+#[test]
+fn failed_commit_then_failed_retain_keeps_the_pending_saves_gauge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path(), Some("worker-lifecycle")).unwrap());
+    let (h, entry) = engine.open("gauged.txt", Some("file"), true).unwrap();
+    engine.write(h, 0, b"retained", false, false).unwrap();
+    assert_eq!(engine.retain_all_dirty().unwrap(), 1);
+    assert_eq!(engine.vitals.pending_saves(), 1);
+    engine
+        .store
+        .db
+        .execute_batch(
+            "CREATE TABLE wp1_4_parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE wp1_4_child(parent INTEGER REFERENCES wp1_4_parent(id)
+                 DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER wp1_4_orphan AFTER DELETE ON pending_saves
+                 BEGIN INSERT INTO wp1_4_child VALUES(42); END;
+             CREATE TRIGGER wp1_4_refuse_insert BEFORE INSERT ON pending_saves
+                 BEGIN SELECT RAISE(ABORT, 'retain refused by test'); END;
+             CREATE TRIGGER wp1_4_refuse_update BEFORE UPDATE ON pending_saves
+                 BEGIN SELECT RAISE(ABORT, 'retain refused by test'); END;",
+        )
+        .unwrap();
+    let error = format!("{:#}", engine.flush(h).unwrap_err());
+    assert!(error.contains("PENDING_SAVE_PERSIST_FAILED"), "{error}");
+    assert!(error.contains("retain refused by test"), "{error}");
+    assert!(engine.store.db.is_autocommit());
+    let rows: i64 = engine
+        .store
+        .db
+        .query_row("SELECT count(*) FROM pending_saves", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 1, "the rollback kept the row");
+    assert_eq!(
+        engine.vitals.pending_saves(),
+        1,
+        "counted after the rollback"
+    );
+    assert!(engine.sessions[&entry.id].dirty);
+    engine
+        .store
+        .db
+        .execute_batch(
+            "DROP TRIGGER wp1_4_orphan; DROP TRIGGER wp1_4_refuse_insert; \
+             DROP TRIGGER wp1_4_refuse_update;",
+        )
+        .unwrap();
+    engine.flush(h).unwrap();
+    assert_eq!(engine.vitals.pending_saves(), 0);
+    engine.close(h).unwrap();
+    engine.quiet().unwrap();
+}
+
+/// The main thread's stops (idle exit, signals) never wait for the engine: a
+/// held engine refuses them at once with `WORKER_BUSY` (they retry), and the
+/// next attempt stops.
+#[test]
+fn reply_less_stop_refuses_a_busy_engine_instead_of_waiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    let ctx = worker::build_ctx(engine.clone(), dir.path(), false, None);
+    let server = runtime::server::start_rpc_server(ctx.clone()).unwrap();
+    let held = runtime::lock_engine(&engine);
+    let started = Instant::now();
+    let refused = format!("{:#}", server.stop(StopMode::Graceful).unwrap_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "it did not wait"
+    );
+    assert!(refused.starts_with("WORKER_BUSY"), "{refused}");
+    assert!(!ctx.stopping.load(Ordering::SeqCst));
+    drop(held);
+    assert_eq!(
+        server.stop(StopMode::Graceful).unwrap(),
+        StopReply {
+            stopped: true,
+            persisted_dirty: 0,
+            detached: false,
+        }
+    );
+    assert!(ctx.stopping.load(Ordering::SeqCst));
+    // A stopping worker attaches nothing.
+    let refused = server.attach(&dir.path().join("late-mount")).unwrap_err();
+    assert_eq!(refused.code, "WORKER_STOPPING", "{refused}");
+    drop(server);
+    drop(ctx);
+    wait_released(&engine);
+}
+
+/// A stop accepted after RPC started (step 6) but before the legacy
+/// synchronous attach (step 8, held by `worker.legacy_attach`) wins: nothing
+/// is attached, Ready reports `WORKER_STOPPING`, the worker exits 0.
+#[test]
+fn stop_before_the_legacy_attach_skips_the_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    let mount = dir.path().join("mnt");
+    let mount_arg = mount.to_string_lossy().into_owned();
+    let mut worker = WorkerProc::spawn(
+        &state,
+        &["--mount", &mount_arg],
+        &[
+            ("TKFS_FAULT_POINT", "worker.legacy_attach"),
+            ("TKFS_FAULT_ACTION", "hang"),
+            ("TKFS_FAULT_MS", "3000"),
+        ],
+    )
+    .unwrap();
+    wait_for("runtime.json", READY, || record::path(&state).exists());
+    let stopped = worker.rpc(json!({"op":"stop"})).unwrap();
+    assert_eq!(
+        stopped,
+        json!({"stopped":true,"persisted_dirty":0,"detached":false})
+    );
+    let ready = worker.wait_ready(READY).unwrap();
+    assert_eq!(ready["mounted"], false, "{ready}");
+    assert_eq!(ready["mount_error"]["code"], "WORKER_STOPPING", "{ready}");
+    let exit = worker.wait_exit(Duration::from_secs(10)).expect("exit");
+    assert_eq!(exit.code(), Some(0));
+    assert!(!mount.exists(), "never attached");
+    assert!(!state.join("runtime.json").exists());
+    assert!(!record::path(&state).exists());
+}
+
+/// `runtime.json.mount` is the absolute, normalized mount path even when
+/// `--mount` is relative to the worker's working directory (the legacy worker
+/// published `absolute(--mount)`), so `bucket-export` resolves it: an export
+/// outside the mount works, one inside it is refused.
+#[test]
+fn relative_mount_argument_is_published_absolute() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    // Occupied: the attach fails (reported in Ready) and nothing is mounted.
+    let occupied = dir.path().join("occupied");
+    fs::create_dir_all(&occupied).unwrap();
+    fs::write(occupied.join("keep.txt"), b"user data").unwrap();
+    let relative = Path::new(".").join("sub").join("..").join("occupied");
+    let mut worker = TimedWorker::spawn(
+        dir.path(),
+        &state,
+        &["--mount", relative.to_str().unwrap()],
+        &[],
+    );
+    let (_, ready) = worker.until_ready(&state).pop().unwrap();
+    assert_eq!(ready["mounted"], false, "{ready}");
+    let published = PathBuf::from(discovery_at(&state).unwrap().mount.expect("published"));
+    assert!(published.is_absolute(), "{}", published.display());
+    assert!(
+        published
+            .components()
+            .all(|c| !matches!(c, Component::CurDir | Component::ParentDir)),
+        "normalized: {}",
+        published.display()
+    );
+    assert_eq!(
+        fs::canonicalize(&published).unwrap(),
+        fs::canonicalize(&occupied).unwrap()
+    );
+    rpc_at(
+        &state,
+        json!({"op":"import","path":"a.txt","hex":hex::encode(b"a")}),
+    )
+    .unwrap();
+    let exported = rpc_at(
+        &state,
+        json!({"op":"bucket-export","directory":dir.path().join("bucket")}),
+    )
+    .unwrap();
+    assert_eq!(
+        exported["backend"], "local-directory-test-bucket",
+        "{exported}"
+    );
+    let inside = remote_error(rpc_at(
+        &state,
+        json!({"op":"bucket-export","directory":occupied.join("bucket")}),
+    ));
+    assert!(
+        inside.starts_with("BUCKET_MUST_BE_OUTSIDE_MOUNT"),
+        "{inside}"
+    );
+    rpc_at(&state, json!({"op":"stop"})).unwrap();
+    let exit = worker.wait_exit(Duration::from_secs(10)).expect("exit");
+    assert_eq!(exit.code(), Some(0));
+    assert_eq!(fs::read(occupied.join("keep.txt")).unwrap(), b"user data");
+}
+
+/// Invariant 28 guard (§10): long recovery work reports startup progress from
+/// the recovering thread. Pending-save recovery is slowed down by
+/// `engine.recover_pending` (600 ms per save): a `recovering pending saves`
+/// line arrives while recovery still runs (well before Ready), every line
+/// before Ready is startup progress with increasing sequence numbers, and
+/// nothing prints progress after Ready (the heartbeat is not progress).
+#[test]
+fn backfill_reports_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    let saves = 4;
+    {
+        let mut engine = Engine::new(Store::open_existing(&state).unwrap());
+        for index in 0..saves {
+            let (h, _) = engine
+                .open(&format!("backfill-{index}.txt"), Some("file"), true)
+                .unwrap();
+            engine
+                .write(h, 0, format!("bytes {index}").as_bytes(), false, false)
+                .unwrap();
+        }
+        assert_eq!(engine.retain_all_dirty().unwrap(), saves);
+    }
+    let mut worker = TimedWorker::spawn(
+        dir.path(),
+        &state,
+        &[],
+        &[
+            ("TKFS_FAULT_POINT", "engine.recover_pending"),
+            ("TKFS_FAULT_ACTION", "hang"),
+            ("TKFS_FAULT_MS", "600"),
+        ],
+    );
+    let mut lines = worker.until_ready(&state);
+    let (ready_at, _) = lines.pop().unwrap();
+    let mut sequence = 0;
+    for (_, line) in &lines {
+        let next = line["startup_progress"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("not startup progress: {line}"));
+        assert!(next > sequence, "{lines:?}");
+        sequence = next;
+    }
+    let (recovering_at, recovering) = lines
+        .iter()
+        .find(|(_, line)| {
+            line["phase"] == "recovering pending saves"
+                && line["startup_progress"].as_u64() >= Some(2)
+        })
+        .unwrap_or_else(|| panic!("no progress during recovery: {lines:?}"));
+    assert!(
+        ready_at.duration_since(*recovering_at) >= Duration::from_millis(500),
+        "{recovering} arrived {:?} before Ready",
+        ready_at.duration_since(*recovering_at)
+    );
+    thread::sleep(Duration::from_millis(1500));
+    let after: Vec<_> = worker.lines.try_iter().map(|(_, line)| line).collect();
+    assert!(
+        after
+            .iter()
+            .all(|line| line.get("startup_progress").is_none()),
+        "progress after Ready: {after:?}"
+    );
+    wait_for("pending saves committed", Duration::from_secs(20), || {
+        rpc_at(&state, json!({"op":"status"}))
+            .is_ok_and(|status| status["unflushed_files"] == 0 && status["health"].is_null())
+    });
+    rpc_at(&state, json!({"op":"stop"})).unwrap();
+    let exit = worker.wait_exit(Duration::from_secs(10)).expect("exit");
+    assert_eq!(exit.code(), Some(0));
+    assert_eq!(pending_saves(&state), 0);
+    for index in 0..saves {
+        assert_eq!(
+            committed(&state, &format!("backfill-{index}.txt")),
+            format!("bytes {index}").as_bytes()
+        );
+    }
 }
