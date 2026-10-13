@@ -554,6 +554,144 @@ fn client_verifies_the_server_proof() {
     assert!(impostor.join().unwrap().is_empty());
 }
 
+/// A scripted v3 server: echoes the upgrade, reads HELLO and answers an
+/// honest `ServerHello` after `lie` edits it, then returns every data message
+/// the client sends next (until it closes).
+fn lying_server(
+    lie: impl FnOnce(&ClientHello, &mut ServerHello) + Send + 'static,
+) -> (String, JoinHandle<Vec<Message>>) {
+    let (_, verifier) = Verifier::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut ws = ws::accept_with(stream, 64 * 1024, |_, response| {
+            response
+                .headers_mut()
+                .insert("X-Tkfs-Sync", "3".parse().unwrap());
+        })
+        .unwrap();
+        let (kind, hello) = read_frame(&mut ws);
+        assert_eq!(kind, 1);
+        let hello: ClientHello = serde_json::from_value(hello).unwrap();
+        let mut server = ServerHello {
+            protocol: PROTOCOL_NAME.into(),
+            version: 3,
+            installation: SERVER.into(),
+            role: hello.role,
+            lane: hello.lane,
+            salt: verifier.salt,
+            server_nonce: session::auth::new_nonce(),
+            verifier_generation: GENERATION,
+            features: vec![],
+            limits: Limits::default(),
+        };
+        lie(&hello, &mut server);
+        send_frame(&mut ws, 2, &server);
+        drain_until_closed(&mut ws)
+    });
+    (endpoint, server)
+}
+
+#[test]
+fn client_checks_the_server_hello_before_proving() {
+    type Lie = Box<dyn FnOnce(&ClientHello, &mut ServerHello) + Send>;
+    let bulk = Some(LaneSpec::new(1, 3));
+    // (case, requested role and lane, the lie, expected code)
+    let cases: Vec<(&str, LaneRole, Option<LaneSpec>, Lie, &str)> = vec![
+        (
+            "echoes another role",
+            LaneRole::Control,
+            None,
+            Box::new(|_, server| server.role = LaneRole::Probe),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "echoes another lane",
+            LaneRole::Bulk,
+            bulk,
+            Box::new(|_, server| server.lane = Some(LaneSpec::new(2, 3))),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "drops the lane",
+            LaneRole::Bulk,
+            bulk,
+            Box::new(|_, server| server.lane = None),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "claims the client's installation",
+            LaneRole::Control,
+            None,
+            Box::new(|_, server| server.installation = CLIENT.into()),
+            "CANNOT_PAIR_WITH_SELF",
+        ),
+        (
+            "has no installation",
+            LaneRole::Control,
+            None,
+            Box::new(|_, server| server.installation = String::new()),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "echoes the client nonce",
+            LaneRole::Control,
+            None,
+            Box::new(|hello, server| server.server_nonce = hello.client_nonce.clone()),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "sends a short nonce",
+            LaneRole::Control,
+            None,
+            Box::new(|_, server| server.server_nonce = "00".into()),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "speaks another protocol",
+            LaneRole::Control,
+            None,
+            Box::new(|_, server| server.protocol = "other".into()),
+            "PROTOCOL_VIOLATION",
+        ),
+        (
+            "answers another version",
+            LaneRole::Control,
+            None,
+            Box::new(|_, server| server.version = 4),
+            "PEER_PROTOCOL_UNSUPPORTED",
+        ),
+    ];
+    let (code, _) = Verifier::generate();
+    for (case, role, lane, lie, expected) in cases {
+        let (endpoint, server) = lying_server(lie);
+        let error = handshake::connect_v3(
+            &endpoint,
+            hello(role, lane),
+            &CodeAuth { code: code.clone() },
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_wire().code, expected, "{case}: {error:?}");
+        if expected == "CANNOT_PAIR_WITH_SELF" {
+            assert!(matches!(error, DialError::Rejected(_)), "{case}: {error:?}");
+            assert_eq!(error.class(), ErrorClass::NeedsUserAction, "{case}");
+        }
+        // The client refused before proving anything to that server.
+        let received = server.join().unwrap();
+        assert!(
+            received.is_empty(),
+            "{case}: the client sent {} message(s) after HELLO_ACK",
+            received.len()
+        );
+    }
+}
+
 #[test]
 fn self_pair_is_refused_before_auth() {
     let (code, verifier) = Verifier::generate();
@@ -1037,6 +1175,38 @@ fn oversize_preauth_messages_are_rejected() {
     let error = server.join().unwrap().unwrap_err();
     assert_eq!(error.code, "PROTOCOL_VIOLATION", "{error}");
     assert!(policy.legacy.lock().unwrap().is_empty());
+
+    // The legacy hello bound is 16 KiB of JSON exactly (it has no frame
+    // prefix): 16,384 bytes is a legacy attempt, 16,385 a violation.
+    let padded = |total: usize| {
+        let empty = json!({"op":"pair","version":2,"padding":""});
+        let base = serde_json::to_string(&empty).unwrap().len();
+        let padded = json!({"op":"pair","version":2,"padding":"x".repeat(total - base)});
+        assert_eq!(serde_json::to_string(&padded).unwrap().len(), total);
+        padded
+    };
+    let (endpoint, _, server) = serve_once(policy.clone());
+    let mut socket = ws::connect(&endpoint).unwrap();
+    let error = ws::call(&mut socket, &padded(16 * 1024)).unwrap_err();
+    assert!(
+        error.downcast_ref::<ws::RemoteError>().is_some(),
+        "{error:#}"
+    );
+    assert_eq!(
+        server.join().unwrap().unwrap_err().code,
+        "PEER_NEEDS_UPGRADE"
+    );
+    assert_eq!(policy.legacy.lock().unwrap().len(), 1);
+    let (endpoint, _, server) = serve_once(policy.clone());
+    let mut socket = ws::connect(&endpoint).unwrap();
+    ws::send(&mut socket, &padded(16 * 1024 + 1)).unwrap();
+    let error = server.join().unwrap().unwrap_err();
+    assert_eq!(error.code, "PROTOCOL_VIOLATION", "{error}");
+    assert_eq!(
+        policy.legacy.lock().unwrap().len(),
+        1,
+        "an oversize legacy hello is not reported"
+    );
 }
 
 #[test]
@@ -1137,6 +1307,26 @@ fn silent_and_trickling_peers_are_closed_at_5s() {
             assert_eq!(error.code, "REQUEST_TIMEOUT", "{error}");
             assert_closed_at_handshake_timeout(started, "silent v3 client");
             drop(ws);
+        }),
+        // A v3 client that pings every second instead of sending HELLO:
+        // control messages are not progress.
+        thread::spawn(|| {
+            let (_, _, policy) = paired();
+            let (endpoint, _, server) = serve_once(policy.clone());
+            let mut ws = raw_v3(&endpoint);
+            let started = Instant::now();
+            let pinger = thread::spawn(move || {
+                while started.elapsed() < Duration::from_secs(30)
+                    && ws.send(Message::Ping(Vec::new().into())).is_ok()
+                {
+                    thread::sleep(Duration::from_secs(1));
+                }
+            });
+            let error = server.join().unwrap().unwrap_err();
+            assert_eq!(error.code, "REQUEST_TIMEOUT", "{error}");
+            assert_closed_at_handshake_timeout(started, "pinging v3 client");
+            assert!(policy.admitted.lock().unwrap().is_empty());
+            pinger.join().unwrap();
         }),
         // A legacy client that upgrades and never sends its hello.
         thread::spawn(|| {
@@ -1257,7 +1447,9 @@ fn dial_tries_every_resolved_address() {
     let listener = TcpListener::bind(SocketAddr::new(last.ip(), 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     if addresses.len() < 2 {
-        eprintln!("localhost resolves to one address; fallback not exercised");
+        // `ws::tests::connect_with_tries_every_address_in_turn` covers the
+        // fallback without the resolver.
+        eprintln!("localhost resolves to one address here; fallback not exercised end to end");
     }
     let (code, _, policy) = paired();
     let server = thread::spawn(move || {

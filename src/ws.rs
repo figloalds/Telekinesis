@@ -4,7 +4,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     net::{SocketAddr, TcpStream, ToSocketAddrs},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tungstenite::{
     Connector, Message, WebSocket, client::IntoClientRequest, protocol::WebSocketConfig,
@@ -193,14 +193,16 @@ pub type RawSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 /// `X-Tkfs-Sync: 3`) and returns the raw WebSocket together with the server's
 /// upgrade response, so the caller can check what the server echoed.
 ///
-/// Every resolved address is tried in turn: `timeout` bounds the TCP connect,
-/// is the socket read/write timeout of the TLS and WebSocket upgrade, and
-/// bounds that whole upgrade (a watchdog closes a socket whose server
-/// trickles its response). The first address whose upgrade succeeds wins.
-/// The returned socket keeps
-/// those socket timeouts and the default 64 MiB message bound; callers set
-/// their own. `timeout` must be non-zero. Unlike [`connect`], no
-/// `X-Tkfs-Wire` codec is offered.
+/// Every resolved address is tried in turn, and `timeout` is the budget of
+/// one address's whole attempt: the TCP connect plus the TLS and WebSocket
+/// upgrade share it (the upgrade gets what the connect left, as its socket
+/// read/write timeouts and as a watchdog deadline that shuts down the socket
+/// of a server trickling its response). The first address whose upgrade
+/// succeeds wins. The returned socket keeps those socket timeouts (at most
+/// `timeout`) and the default 64 MiB message bound; callers set their own.
+/// `timeout` must be non-zero. Unlike [`connect`], no `X-Tkfs-Wire` codec is
+/// offered. An attempt whose watchdog cannot be started fails rather than
+/// run unbounded.
 ///
 /// Errors carry `WS_CONNECT_FAILED` (or `INVALID_WS_ENDPOINT` and friends for
 /// a malformed endpoint); the last address's `tungstenite::Error` stays in the
@@ -237,6 +239,17 @@ pub fn connect_with(
         .to_socket_addrs()
         .with_context(|| format!("WS_CONNECT_FAILED: cannot resolve {host}"))?
         .collect();
+    connect_any(&host, &addresses, &request, connector, timeout)
+}
+
+/// [`connect_with`] over already-resolved `addresses`, in order.
+fn connect_any(
+    host: &str,
+    addresses: &[SocketAddr],
+    request: &tungstenite::handshake::client::Request,
+    connector: Option<Connector>,
+    timeout: Duration,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
     let mut connector = connector;
     let mut last = None;
     for (index, address) in addresses.iter().enumerate() {
@@ -248,7 +261,7 @@ pub fn connect_with(
             Some(Some(copy)) if !last_address => (Some(copy), false),
             Some(_) => (connector.take(), true),
         };
-        match connect_one(*address, &request, attempt, timeout) {
+        match connect_one(*address, request, attempt, timeout) {
             Ok(connected) => return Ok(connected),
             Err(error) => last = Some(error.context(format!("WS_CONNECT_FAILED: {address}"))),
         }
@@ -274,26 +287,41 @@ fn connect_one(
     connector: Option<Connector>,
     timeout: Duration,
 ) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    // One deadline for the whole attempt: the upgrade gets what the TCP
+    // connect left of `timeout`.
+    let deadline = Instant::now() + timeout;
     let stream = TcpStream::connect_timeout(&address, timeout)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(upgrade_timed_out().into());
+    }
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
     // The socket timeouts bound each read; the watchdog bounds the whole TLS
     // and WebSocket upgrade, so a server trickling its response cannot hold
-    // the dialer.
-    let watchdog = crate::session::handshake::Watchdog::for_stream(Some(&stream));
-    watchdog.arm(timeout);
+    // the dialer. No watchdog, no attempt.
+    let watchdog = crate::session::handshake::Watchdog::start(&stream)
+        .context("websocket upgrade watchdog could not start")?;
+    watchdog.arm(remaining);
     let result =
         tungstenite::client_tls_with_config(request.clone(), stream, Some(config()), connector);
     watchdog.disarm();
-    result.map_err(|error| {
-        let error = handshake_failure(error);
-        if watchdog.fired() {
-            anyhow::Error::new(error).context("websocket upgrade timed out")
-        } else {
-            anyhow::Error::new(error)
+    let fired = watchdog.fired();
+    match result {
+        // The watchdog shut the socket down: even a completed upgrade is
+        // unusable.
+        Ok(_) if fired => Err(upgrade_timed_out().into()),
+        Ok(connected) => Ok(connected),
+        Err(error) if fired => {
+            Err(anyhow::Error::new(handshake_failure(error)).context("websocket upgrade timed out"))
         }
-    })
+        Err(error) => Err(anyhow::Error::new(handshake_failure(error))),
+    }
+}
+
+fn upgrade_timed_out() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "websocket upgrade timed out")
 }
 
 /// A blocking handshake that stopped on `WouldBlock` timed out (Unix reports
@@ -303,10 +331,7 @@ fn handshake_failure<R: tungstenite::handshake::HandshakeRole>(
 ) -> tungstenite::Error {
     match error {
         tungstenite::HandshakeError::Failure(error) => error,
-        tungstenite::HandshakeError::Interrupted(_) => tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "websocket upgrade timed out",
-        )),
+        tungstenite::HandshakeError::Interrupted(_) => tungstenite::Error::Io(upgrade_timed_out()),
     }
 }
 
@@ -612,5 +637,57 @@ mod tests {
         }
         assert!(socket.sent_bytes < 16 * 1024 && socket.received_bytes < 16 * 1024);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_with_tries_every_address_in_turn() {
+        // Hosts-independent fallback: a refused address, then a silent one
+        // (it accepts TCP, never answers the upgrade), then a listening one.
+        let refused = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let silent_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = silent_listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accept_with(stream, 1024, |_, response| {
+                response.headers_mut().insert(
+                    "X-Fallback",
+                    tungstenite::http::HeaderValue::from_static("reached"),
+                );
+            })
+            .map(|_| ())
+        });
+        let request = format!("ws://{open}").into_client_request().unwrap();
+        let budget = Duration::from_millis(800);
+        let started = Instant::now();
+        let (_socket, response) =
+            connect_any("fallback", &[refused, silent, open], &request, None, budget).unwrap();
+        assert_eq!(response.headers()["X-Fallback"], "reached");
+        // The silent address was abandoned once its budget ran out (the
+        // refused one costs at most its own budget).
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= budget - Duration::from_millis(100) && elapsed < Duration::from_secs(10),
+            "connected after {elapsed:?}"
+        );
+        server.join().unwrap().unwrap();
+        drop(silent_listener);
+
+        // Every address refused: WS_CONNECT_FAILED naming the last one tried.
+        let error = connect_any("fallback", &[silent, refused], &request, None, budget)
+            .expect_err("no address accepts");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("WS_CONNECT_FAILED: {refused}")),
+            "{text}"
+        );
+        // No address at all.
+        let error =
+            connect_any("fallback", &[], &request, None, budget).expect_err("nothing to dial");
+        assert!(format!("{error:#}").contains("WS_CONNECT_FAILED"));
     }
 }
