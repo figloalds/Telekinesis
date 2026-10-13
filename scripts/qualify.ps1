@@ -196,6 +196,18 @@ try {
 } catch { $hardware = [ordered]@{ error = "$_" } }
 
 $started = Get-Date
+# Git state when the run starts (the build and the binaries under test), not
+# when the evidence is written: edits made while a long run is in progress do
+# not belong to it.
+try {
+    $porcelain = @(& git status --porcelain 2>$null | ForEach-Object { "$_".TrimEnd() } | Where-Object { $_ })
+} catch { $porcelain = @() }
+$gitState = [ordered]@{
+    commit      = Get-Git @("rev-parse", "HEAD")
+    branch      = Get-Git @("rev-parse", "--abbrev-ref", "HEAD")
+    dirty       = $porcelain.Count -gt 0
+    dirty_paths = @($porcelain | Select-Object -First 50)
+}
 Write-Host "qualify: $kind, files: $($selected -join ', ')"
 if (-not $NoBuild) {
     $buildArgs = @("test", "--release", "--no-run")
@@ -345,11 +357,7 @@ $evidenceDoc = [ordered]@{
     wave         = $Wave
     generated_at = (Get-Date).ToString("o")
     duration_s   = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
-    git          = [ordered]@{
-        commit = Get-Git @("rev-parse", "HEAD")
-        branch = Get-Git @("rev-parse", "--abbrev-ref", "HEAD")
-        dirty  = [bool](Get-Git @("status", "--porcelain"))
-    }
+    git          = $gitState
     toolchain    = (& rustc -V 2>$null | Out-String).Trim()
     hardware     = $hardware
     settings     = [ordered]@{
