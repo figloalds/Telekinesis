@@ -12,7 +12,7 @@
 //! **Handshake** (blocking, pre-auth bounds: every message ≤ 16 KiB of header
 //! and every step ≤ 5 s, enforced by socket timeouts plus a watchdog that
 //! shuts the socket down when a step overruns, so a trickling peer cannot
-//! hold a slot either):
+//! hold a slot either; a connection whose watchdog cannot start is refused):
 //! 1. → `HELLO{ClientHello}` with a fresh client nonce;
 //! 2. ← `HELLO_ACK{ServerHello}` with the verifier salt, a fresh server nonce
 //!    and the verifier generation, or `GOAWAY{CANNOT_PAIR_WITH_SELF |
@@ -293,9 +293,9 @@ pub fn client_handshake(
         .map_err(|error| DialError::Connect(format!("handshake socket setup failed: {error}")))?;
     match client_steps(&mut guarded, &hello, auth) {
         Ok(server) => {
-            let ws = guarded.finish(MAX_HEADER, MAX_CHUNK).map_err(|error| {
-                DialError::Connect(format!("handshake socket setup failed: {error}"))
-            })?;
+            let ws = guarded
+                .finish(MAX_HEADER, MAX_CHUNK)
+                .map_err(StepError::into_dial)?;
             Ok((ws, server))
         }
         Err(error) => {
@@ -340,7 +340,7 @@ pub fn accept_v3(
         .peer_addr()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
     set_timeouts(&stream, Some(HANDSHAKE_TIMEOUT)).map_err(closed_wire)?;
-    let watchdog = Watchdog::for_stream(Some(&stream));
+    let watchdog = Watchdog::start(&stream).map_err(watchdog_wire)?;
     watchdog.arm(HANDSHAKE_TIMEOUT);
     let mut kind = UpgradeKind::Legacy;
     let upgraded = ws::accept_with(stream, PRE_AUTH_MESSAGE, |request, response| {
@@ -360,6 +360,10 @@ pub fn accept_v3(
         }
     });
     watchdog.disarm();
+    if watchdog.fired() {
+        // The socket was shut down: even a completed upgrade is unusable.
+        return Err(StepError::Timeout.into_wire());
+    }
     let ws = upgraded.map_err(|error| {
         if kind == UpgradeKind::Loopback {
             ErrorWire::coded(
@@ -367,7 +371,7 @@ pub fn accept_v3(
                 "loopback session upgrade refused on the peer endpoint",
             )
         } else {
-            upgrade_wire(&error, watchdog.fired())
+            upgrade_wire(&error)
         }
     })?;
     let mut guarded = Guarded::new(ws, Some(watchdog)).map_err(closed_wire)?;
@@ -429,7 +433,7 @@ pub fn accept_loopback(
     o: ConnOptions,
 ) -> Result<Conn, ErrorWire> {
     set_timeouts(&stream, Some(HANDSHAKE_TIMEOUT)).map_err(closed_wire)?;
-    let watchdog = Watchdog::for_stream(Some(&stream));
+    let watchdog = Watchdog::start(&stream).map_err(watchdog_wire)?;
     watchdog.arm(HANDSHAKE_TIMEOUT);
     let mut kind = None;
     let mut authorized = false;
@@ -460,6 +464,9 @@ pub fn accept_loopback(
         },
     );
     watchdog.disarm();
+    if watchdog.fired() {
+        return Err(StepError::Timeout.into_wire());
+    }
     let ws = upgraded.map_err(|error| match (kind, authorized) {
         (Some(UpgradeKind::Loopback), false) => {
             ErrorWire::coded("ACCESS_DENIED", "loopback session token refused")
@@ -468,7 +475,7 @@ pub fn accept_loopback(
             "PROTOCOL_VIOLATION",
             "not a loopback session upgrade (X-Tkfs-Sync: 3-loopback)",
         ),
-        _ => upgrade_wire(&error, watchdog.fired()),
+        _ => upgrade_wire(&error),
     })?;
     drop(watchdog);
     into_conn(ws, Side::Server, loopback_peer(), o).map_err(|error| {
@@ -668,7 +675,7 @@ fn server_steps(
         Ok(peer) => {
             let ws = guarded
                 .finish(limits.max_header as usize, limits.max_chunk as usize)
-                .map_err(closed_wire)?;
+                .map_err(StepError::into_wire)?;
             Ok((ws, peer))
         }
         Err(Failure::Goaway(error)) => {
@@ -823,6 +830,11 @@ fn server_auth(
 /// Reads the legacy client's first message, reports it with the pairing code
 /// redacted, and answers the legacy-format `PEER_NEEDS_UPGRADE`.
 fn refuse_legacy(guarded: &mut Guarded, addr: SocketAddr, policy: &dyn AcceptPolicy) -> ErrorWire {
+    // The legacy hello is one JSON message (no frame prefix): ≤ 16 KiB.
+    guarded.ws.set_config(|config| {
+        config.max_message_size = Some(MAX_HEADER_PRE_AUTH);
+        config.max_frame_size = Some(MAX_HEADER_PRE_AUTH);
+    });
     let hello = match guarded.read_message() {
         Ok(Message::Text(text)) => serde_json::from_str(text.as_str()).unwrap_or(Value::Null),
         Ok(Message::Binary(bytes)) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
@@ -925,13 +937,21 @@ fn closed_wire(error: io::Error) -> ErrorWire {
     ErrorWire::coded("WS_CLOSED", error)
 }
 
-fn upgrade_wire(error: &anyhow::Error, fired: bool) -> ErrorWire {
+/// No watchdog, no handshake: without one a trickling peer is unbounded, so
+/// the connection is refused (fail closed, invariant 22).
+fn watchdog_wire(error: io::Error) -> ErrorWire {
+    ErrorWire::coded(
+        "WS_CLOSED",
+        format!("handshake watchdog could not start, connection refused: {error}"),
+    )
+}
+
+fn upgrade_wire(error: &anyhow::Error) -> ErrorWire {
     match error
         .chain()
         .find_map(|cause| cause.downcast_ref::<tungstenite::Error>())
     {
-        Some(error) => StepError::from_ws(error, fired).into_wire(),
-        None if fired => StepError::Timeout.into_wire(),
+        Some(error) => StepError::from_ws(error).into_wire(),
         None => ErrorWire::coded("WS_CLOSED", format!("{error:#}")),
     }
 }
@@ -1031,11 +1051,11 @@ enum StepError {
 }
 
 impl StepError {
-    fn from_ws(error: &tungstenite::Error, fired: bool) -> StepError {
+    /// A socket-level failure. A step whose watchdog fired is a
+    /// [`StepError::Timeout`] whatever the socket reported; callers check that
+    /// first.
+    fn from_ws(error: &tungstenite::Error) -> StepError {
         use tungstenite::error::{Error, ProtocolError};
-        if fired {
-            return StepError::Timeout;
-        }
         match error {
             Error::Io(error)
                 if matches!(
@@ -1052,9 +1072,9 @@ impl StepError {
             Error::Protocol(
                 ProtocolError::ResetWithoutClosingHandshake | ProtocolError::HandshakeIncomplete,
             ) => StepError::Closed(error.to_string()),
-            Error::Capacity(detail) => StepError::Violation(format!(
-                "message exceeds the {PRE_AUTH_MESSAGE}-byte pre-auth bound: {detail}"
-            )),
+            Error::Capacity(detail) => {
+                StepError::Violation(format!("message exceeds the pre-auth bound: {detail}"))
+            }
             other => StepError::Violation(other.to_string()),
         }
     }
@@ -1082,35 +1102,56 @@ impl StepError {
 }
 
 /// An upgraded socket during the handshake: pre-auth bounds, 5 s socket
-/// timeouts and a step watchdog.
+/// timeouts and a step watchdog. A step whose watchdog fired fails with
+/// [`StepError::Timeout`], whatever the socket reported, because the socket
+/// has been shut down.
 struct Guarded {
     ws: RawSocket,
     watchdog: Watchdog,
+    /// The budget of one step ([`HANDSHAKE_TIMEOUT`]).
+    budget: Duration,
 }
 
 impl Guarded {
+    /// Fails (and drops `ws`) when the socket is not TCP or no watchdog can
+    /// be started for it: the handshake is never run unbounded.
     fn new(mut ws: RawSocket, watchdog: Option<Watchdog>) -> io::Result<Guarded> {
         ws.set_config(|config| {
             config.max_message_size = Some(PRE_AUTH_MESSAGE);
             config.max_frame_size = Some(PRE_AUTH_MESSAGE);
         });
-        let stream = tcp_of(&ws);
-        if let Some(stream) = stream {
-            set_timeouts(stream, Some(HANDSHAKE_TIMEOUT))?;
-        }
+        let stream = tcp_of(&ws).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the handshake needs a TCP socket",
+            )
+        })?;
+        set_timeouts(stream, Some(HANDSHAKE_TIMEOUT))?;
         let watchdog = match watchdog {
             Some(watchdog) => watchdog,
-            None => Watchdog::for_stream(stream),
+            None => Watchdog::start(stream)?,
         };
-        Ok(Guarded { ws, watchdog })
+        Ok(Guarded {
+            ws,
+            watchdog,
+            budget: HANDSHAKE_TIMEOUT,
+        })
     }
 
-    /// One message within the step budget, skipping Ping/Pong.
+    /// One message within the step budget, skipping Ping/Pong. Control
+    /// messages are not progress: the step deadline is also checked here, so
+    /// a peer that keeps pinging cannot extend the step even if the watchdog
+    /// failed to shut the socket down.
     fn read_message(&mut self) -> Result<Message, StepError> {
-        self.watchdog.arm(HANDSHAKE_TIMEOUT);
+        let deadline = Instant::now() + self.budget;
+        self.watchdog.arm(self.budget);
         let result = loop {
             match self.ws.read() {
-                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                Ok(Message::Ping(_) | Message::Pong(_)) => {
+                    if self.watchdog.fired() || Instant::now() >= deadline {
+                        break Err(StepError::Timeout);
+                    }
+                }
                 Ok(Message::Close(frame)) => {
                     break Err(match frame {
                         Some(frame) if !frame.reason.is_empty() => {
@@ -1120,10 +1161,13 @@ impl Guarded {
                     });
                 }
                 Ok(message) => break Ok(message),
-                Err(error) => break Err(StepError::from_ws(&error, self.watchdog.fired())),
+                Err(error) => break Err(StepError::from_ws(&error)),
             }
         };
         self.watchdog.disarm();
+        if self.watchdog.fired() {
+            return Err(StepError::Timeout);
+        }
         result
     }
 
@@ -1138,13 +1182,13 @@ impl Guarded {
     }
 
     fn send(&mut self, message: Message) -> Result<(), StepError> {
-        self.watchdog.arm(HANDSHAKE_TIMEOUT);
-        let result = self
-            .ws
-            .send(message)
-            .map_err(|error| StepError::from_ws(&error, self.watchdog.fired()));
+        self.watchdog.arm(self.budget);
+        let result = self.ws.send(message);
         self.watchdog.disarm();
-        result
+        if self.watchdog.fired() {
+            return Err(StepError::Timeout);
+        }
+        result.map_err(|error| StepError::from_ws(&error))
     }
 
     fn write_frame(&mut self, kind: FrameKind, header: &impl Serialize) -> Result<(), StepError> {
@@ -1152,32 +1196,45 @@ impl Guarded {
         self.send(Message::Binary(frame.into()))
     }
 
-    /// Success: no socket timeouts, session-sized bounds, blocking mode.
-    fn finish(self, max_header: usize, max_chunk: usize) -> io::Result<RawSocket> {
-        let Guarded { mut ws, watchdog } = self;
+    /// Success: no socket timeouts, session-sized bounds, blocking mode. A
+    /// watchdog that fired as the last step completed has shut the socket
+    /// down, so that is a [`StepError::Timeout`], not a dead socket handed
+    /// to the session.
+    fn finish(self, max_header: usize, max_chunk: usize) -> Result<RawSocket, StepError> {
+        let Guarded {
+            mut ws, watchdog, ..
+        } = self;
+        let fired = watchdog.fired();
         drop(watchdog);
+        if fired {
+            return Err(StepError::Timeout);
+        }
         let bound = session_message_bound(max_header, max_chunk);
         ws.set_config(|config| {
             config.max_message_size = Some(bound);
             config.max_frame_size = Some(bound);
         });
         if let Some(stream) = tcp_of(&ws) {
-            set_timeouts(stream, None)?;
+            set_timeouts(stream, None)
+                .map_err(|error| StepError::Closed(format!("socket setup failed: {error}")))?;
         }
         Ok(ws)
     }
 
     /// Sends a close frame and waits (≤ 1 s) for the peer to close, so the
     /// frames already sent (a `GOAWAY`, the legacy reply) are read before the
-    /// socket goes away (closing with unread input would reset it).
+    /// socket goes away (closing with unread input would reset it). The wait
+    /// is bounded by the watchdog and by its own deadline, so a peer that
+    /// keeps sending cannot hold it.
     fn close_gracefully(mut self, frame: Option<CloseFrame>) {
         if let Some(stream) = tcp_of(&self.ws) {
             let _ = stream.set_read_timeout(Some(CLOSE_DRAIN));
             let _ = stream.set_write_timeout(Some(CLOSE_DRAIN));
         }
+        let deadline = Instant::now() + CLOSE_DRAIN;
         self.watchdog.arm(CLOSE_DRAIN);
         if self.ws.close(frame).is_ok() {
-            while !self.watchdog.fired() {
+            while !self.watchdog.fired() && Instant::now() < deadline {
                 if self.ws.read().is_err() {
                     break;
                 }
@@ -1213,26 +1270,46 @@ fn lock_watch(mutex: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test hook: makes [`Watchdog::start`] fail on this thread, as a failed
+    /// thread spawn would.
+    pub(crate) static REFUSE_WATCHDOG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Watchdog {
-    /// A watchdog over `stream` (through a duplicate handle; see
-    /// [`watchdog_handle`]).
-    pub(crate) fn for_stream(stream: Option<&TcpStream>) -> Watchdog {
-        Watchdog::new(stream.and_then(watchdog_handle))
+    /// Starts a watchdog that shuts `stream` down (through a duplicate
+    /// handle; see [`watchdog_handle`]) when an armed budget runs out.
+    ///
+    /// Fails when no duplicate handle can be made or the thread cannot be
+    /// spawned. Callers then refuse the connection: without a watchdog only
+    /// the per-call socket timeouts apply, and a peer trickling bytes (or
+    /// fragments) would be bounded by nothing (fail closed, invariant 22).
+    pub(crate) fn start(stream: &TcpStream) -> io::Result<Watchdog> {
+        let handle = watchdog_handle(stream)?;
+        #[cfg(test)]
+        if REFUSE_WATCHDOG.with(std::cell::Cell::get) {
+            return Err(io::Error::other("watchdog thread refused (test hook)"));
+        }
+        let shared = Arc::new((Mutex::new(Watch::default()), Condvar::new()));
+        let watched = shared.clone();
+        let thread = thread::Builder::new()
+            .name("tkfs-handshake-watchdog".into())
+            .spawn(move || watch(&watched, &handle))?;
+        Ok(Watchdog {
+            shared,
+            thread: Some(thread),
+        })
     }
 
-    /// A watchdog that shuts `stream` (a handle of the guarded socket) down.
-    /// Without a stream (or if the thread cannot start) only the socket
-    /// timeouts apply.
-    pub(crate) fn new(stream: Option<TcpStream>) -> Watchdog {
-        let shared = Arc::new((Mutex::new(Watch::default()), Condvar::new()));
-        let thread = stream.and_then(|stream| {
-            let shared = shared.clone();
-            thread::Builder::new()
-                .name("tkfs-handshake-watchdog".into())
-                .spawn(move || watch(&shared, &stream))
-                .ok()
-        });
-        Watchdog { shared, thread }
+    /// A watchdog with no thread, which never fires (tests of the bounds that
+    /// must hold without one).
+    #[cfg(test)]
+    fn inert() -> Watchdog {
+        Watchdog {
+            shared: Arc::new((Mutex::new(Watch::default()), Condvar::new())),
+            thread: None,
+        }
     }
 
     pub(crate) fn arm(&self, budget: Duration) {
@@ -1240,6 +1317,8 @@ impl Watchdog {
         self.shared.1.notify_all();
     }
 
+    /// Once `disarm` returns, [`Watchdog::fired`] no longer changes for the
+    /// budget just disarmed.
     pub(crate) fn disarm(&self) {
         lock_watch(&self.shared.0).deadline = None;
         self.shared.1.notify_all();
@@ -1268,15 +1347,15 @@ impl Drop for Watchdog {
 /// would not be interrupted. A `getpeername` on the original refreshes the
 /// state the duplicate is created from (checked over thousands of connects);
 /// the duplicate is verified the same way. Elsewhere this is a plain clone.
-fn watchdog_handle(stream: &TcpStream) -> Option<TcpStream> {
+fn watchdog_handle(stream: &TcpStream) -> io::Result<TcpStream> {
     for _ in 0..3 {
         let _ = stream.peer_addr();
-        let duplicate = stream.try_clone().ok()?;
+        let duplicate = stream.try_clone()?;
         if duplicate.peer_addr().is_ok() {
-            return Some(duplicate);
+            return Ok(duplicate);
         }
     }
-    stream.try_clone().ok()
+    stream.try_clone()
 }
 
 fn watch(shared: &(Mutex<Watch>, Condvar), stream: &TcpStream) {
@@ -1305,5 +1384,186 @@ fn watch(shared: &(Mutex<Watch>, Condvar), stream: &TcpStream) {
                     .unwrap_or_else(|error| error.into_inner().0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::auth::CodeAuth;
+    use std::{io::Read, net::TcpListener};
+
+    /// Sets [`REFUSE_WATCHDOG`] on this thread until dropped.
+    struct RefuseWatchdog;
+
+    impl RefuseWatchdog {
+        fn set() -> RefuseWatchdog {
+            REFUSE_WATCHDOG.with(|refuse| refuse.set(true));
+            RefuseWatchdog
+        }
+    }
+
+    impl Drop for RefuseWatchdog {
+        fn drop(&mut self) {
+            REFUSE_WATCHDOG.with(|refuse| refuse.set(false));
+        }
+    }
+
+    /// A policy the tested paths must never consult.
+    struct Unreachable;
+
+    impl AcceptPolicy for Unreachable {
+        fn installation(&self) -> String {
+            unreachable!("installation")
+        }
+        fn verifier(&self) -> Option<(Verifier, u64)> {
+            unreachable!("verifier")
+        }
+        fn admit(&self, _: &ClientHello) -> Result<(), ErrorWire> {
+            unreachable!("admit")
+        }
+        fn legacy_attempt(&self, _: SocketAddr, _: &Value) {
+            unreachable!("legacy_attempt")
+        }
+    }
+
+    /// An upgraded (client, server) WebSocket pair over loopback TCP.
+    fn pair() -> (RawSocket, RawSocket) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            ws::accept_with(stream, 64 * 1024, |_, _| {}).unwrap()
+        });
+        let (client, _) = ws::connect_with(&endpoint, &[], None, DIAL_ATTEMPT).unwrap();
+        (client, server.join().unwrap())
+    }
+
+    /// The peer of a refused connection sees it closed, without data.
+    fn assert_closed(mut stream: TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut buffer = [0u8; 64];
+        assert!(matches!(stream.read(&mut buffer), Ok(0) | Err(_)));
+    }
+
+    fn accepted_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn a_watchdog_that_cannot_start_refuses_the_connection() {
+        // Upgraded sockets for the handshake functions, made before the hook.
+        let (client_ws, server_ws) = pair();
+        let _hook = RefuseWatchdog::set();
+        let started = Instant::now();
+
+        let (client, server) = accepted_pair();
+        let error =
+            accept_v3(server, &Unreachable, Limits::default()).expect_err("accept_v3 refuses");
+        assert_eq!(error.code, "WS_CLOSED", "{error}");
+        assert!(error.message.contains("watchdog"), "{error}");
+        assert_closed(client);
+
+        let (client, server) = accepted_pair();
+        let error = accept_loopback(server, None, ConnOptions::default())
+            .expect_err("accept_loopback refuses");
+        assert_eq!(error.code, "WS_CLOSED", "{error}");
+        assert_closed(client);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let error =
+            ws::connect_with(&endpoint, &[], None, DIAL_ATTEMPT).expect_err("connect_with refuses");
+        let text = format!("{error:#}");
+        assert!(text.contains("WS_CONNECT_FAILED"), "{text}");
+        assert!(text.contains("watchdog"), "{text}");
+
+        let error = client_handshake(
+            client_ws,
+            client_hello("client", LaneRole::Control, None, 1),
+            &CodeAuth { code: "c".into() },
+        )
+        .expect_err("client_handshake refuses");
+        assert!(
+            matches!(&error, DialError::Connect(detail) if detail.contains("watchdog")),
+            "{error:?}"
+        );
+        let error =
+            server_handshake(server_ws, &Unreachable).expect_err("server_handshake refuses");
+        assert_eq!(error.code, "WS_CLOSED", "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    fn wait_fired(watchdog: &Watchdog) {
+        let started = Instant::now();
+        while !watchdog.fired() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never fired");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_fired_watchdog_fails_the_step_and_the_finish() {
+        // The budget ran out as the last step completed: no dead socket is
+        // handed to the session.
+        let (client, _server) = pair();
+        let guarded = Guarded::new(client, None).unwrap();
+        guarded.watchdog.arm(Duration::ZERO);
+        wait_fired(&guarded.watchdog);
+        assert!(matches!(
+            guarded.finish(MAX_HEADER, MAX_CHUNK),
+            Err(StepError::Timeout)
+        ));
+
+        let (client, _server) = pair();
+        let mut guarded = Guarded::new(client, None).unwrap();
+        guarded.watchdog.arm(Duration::ZERO);
+        wait_fired(&guarded.watchdog);
+        assert!(matches!(guarded.read_message(), Err(StepError::Timeout)));
+        assert!(matches!(
+            guarded.send(Message::Binary(vec![0; 8].into())),
+            Err(StepError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn pings_cannot_extend_a_step_or_the_close_drain() {
+        // Without a watchdog to shut the socket down, a peer pinging every
+        // 100 ms keeps every read short; the step and drain deadlines still
+        // end both loops.
+        let (client, mut server) = pair();
+        let pinger = thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(20)
+                && server.send(Message::Ping(Vec::new().into())).is_ok()
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let mut guarded = Guarded {
+            ws: client,
+            watchdog: Watchdog::inert(),
+            budget: Duration::from_millis(600),
+        };
+        let started = Instant::now();
+        assert!(matches!(guarded.read_message(), Err(StepError::Timeout)));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(600) && elapsed < Duration::from_secs(3),
+            "step ended after {elapsed:?}"
+        );
+        let started = Instant::now();
+        guarded.close_gracefully(None);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < CLOSE_DRAIN + Duration::from_millis(1_500),
+            "drain ended after {elapsed:?}"
+        );
+        pinger.join().unwrap();
     }
 }
