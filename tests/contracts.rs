@@ -2521,10 +2521,14 @@ fn session_stubs_fail_closed_with_not_implemented() {
     let frame =
         session::frame::Frame::new(FrameKind::Cancel, 0, &CancelHeader { id: 1 }, vec![]).unwrap();
     assert_eq!(frame.header_as::<CancelHeader>().unwrap().id, 1);
-    assert!(
-        session::frame::encode(&frame, session::frame::FrameLimits::SESSION).is_err()
-            && session::frame::decode(&[], session::frame::FrameLimits::PRE_AUTH).is_err()
+    // WP1.9 (CCR-WP1.9-1): the frame codec is real now. It round-trips, and it
+    // still fails closed on malformed input.
+    let bytes = session::frame::encode(&frame, session::frame::FrameLimits::SESSION).unwrap();
+    assert_eq!(
+        session::frame::decode(&bytes, session::frame::FrameLimits::SESSION).unwrap(),
+        frame
     );
+    assert!(session::frame::decode(&[], session::frame::FrameLimits::PRE_AUTH).is_err());
     let dial_errors = [
         (session::DialError::Connect("x".into()), "WS_CONNECT_FAILED"),
         (

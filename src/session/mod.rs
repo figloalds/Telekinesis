@@ -1,8 +1,12 @@
 //! Peer and loopback v3 sessions (§6.2).
 //!
-//! Stub landed by WP0.4 with the final public signatures; WP1.9 implements
-//! `frame`, `io` and `conn`, WP1.10 implements `handshake` and `auth`. Until
-//! then every fallible entry point returns a `NOT_IMPLEMENTED` error.
+//! * [`frame`]: the frame codec and its bounds (WP1.9);
+//! * [`conn`]: multiplexed request/response connections with deadlines,
+//!   cancellation, streaming, backpressure and a server handler pool (WP1.9);
+//! * `io`: the per-connection I/O thread, the only code that touches a
+//!   session socket (WP1.9);
+//! * [`handshake`] and [`auth`]: session establishment (WP1.10). Until that
+//!   package lands, its fallible entry points return `NOT_IMPLEMENTED`.
 pub mod auth;
 pub mod conn;
 pub mod frame;
