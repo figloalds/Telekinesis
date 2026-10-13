@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-[ -n "${TKFS_QUALIFY_LF:-}" ] || exec env TKFS_QUALIFY_LF=1 bash -c "$(tr -d '
-' < "$0")" "$0" "$@" # CRLF-safe: re-run without CRs
+[ -n "${TKFS_QUALIFY_LF:-}" ] || exec env TKFS_QUALIFY_LF=1 bash -c "$(tr -d '\r' < "$0")" "$0" "$@" # CRLF-safe: re-run without CRs
 # Linux qualification subset (REVAMP_PLAN §14 WP0.5 task 10): the same qual
 # files and floors as scripts/qualify.ps1, run in release with
 # `--ignored --test-threads=1`. Scenarios that need Windows-only features
 # (WinFsp) skip themselves; FUSE scenarios need /dev/fuse.
 #
 # Run it with `bash scripts/qualify.sh ...`. Line 2 re-executes the script with
-# carriage returns stripped, so a Windows checkout (core.autocrlf=true, CRLF)
-# still works from WSL on /mnt/c.
+# carriage returns stripped (`tr -d '\r'`, written as an escape: never put a
+# literal CR or LF between those quotes), so a Windows checkout
+# (core.autocrlf=true, CRLF) still works from WSL on /mnt/c.
+# tests/harness_selftest.rs::qualify_sh_runs_with_lf_and_crlf guards this.
 #
 # Usage:
 #   CARGO_TARGET_DIR=$HOME/tkfs-target/<pkg> scripts/qualify.sh --wave 1 [--files "a b"] [--filter NAME]

@@ -254,17 +254,14 @@ impl Node {
     /// Send arbitrary action JSON (`{"op": "...", ...}`) to the control endpoint
     /// over `ws::connect` + `ws::call`. A remote error is returned as `Err`.
     pub fn raw_call(&self, action: Value) -> Result<Value> {
-        let discovery = self.discovery()?;
-        let control = discovery["control"]
-            .as_str()
-            .context("INVALID_ORCHESTRATOR_DISCOVERY")?;
-        let token = self.data_dir().join("orchestrator.token");
-        if token.is_file() {
-            // WP4.1 local tokens: the same JSON wire with an X-Tkfs-Token upgrade header.
-            return token_call(control, fs::read_to_string(token)?.trim(), &action);
+        self.control().call(&action)
+    }
+    /// A cloneable handle on this daemon's control endpoint for other threads
+    /// (churners, waiters). It uses the same token-aware path as `raw_call`.
+    pub fn control(&self) -> Control {
+        Control {
+            data_dir: self.data_dir(),
         }
-        let mut socket = ws::connect(control)?;
-        ws::call(&mut socket, &action)
     }
     /// `raw_call` that panics with the daemon and worker logs on error.
     #[track_caller]
@@ -433,6 +430,69 @@ pub fn kill_pid(pid: u32) {
     }
 }
 
+/// A daemon's control endpoint, resolved per call from `DATA/orchestrator.json`
+/// (so it follows restarts). When `DATA/orchestrator.token` exists (WP4.1) the
+/// call carries it as `X-Tkfs-Token`; otherwise it is plain `ws::connect` +
+/// `ws::call`. `Clone + Send`: move one into a thread instead of calling
+/// `ws::connect` directly, which a token-protected daemon would reject.
+#[derive(Clone, Debug)]
+pub struct Control {
+    pub data_dir: PathBuf,
+}
+impl Control {
+    pub fn call(&self, action: &Value) -> Result<Value> {
+        let bytes = fs::read(self.data_dir.join("orchestrator.json"))
+            .context("ORCHESTRATOR_NOT_RUNNING")?;
+        let discovery: Value = serde_json::from_slice(&bytes)?;
+        let control = discovery["control"]
+            .as_str()
+            .context("INVALID_ORCHESTRATOR_DISCOVERY")?;
+        let token = self.data_dir.join("orchestrator.token");
+        if token.is_file() {
+            // WP4.1 local tokens: the same JSON wire with an X-Tkfs-Token upgrade header.
+            return token_call(control, fs::read_to_string(token)?.trim(), action);
+        }
+        let mut socket = ws::connect(control)?;
+        ws::call(&mut socket, action)
+    }
+}
+
+/// Outcome counts of a background thread's control calls (for example a
+/// Start/Stop churner), so a scenario can fail when the thread did nothing.
+#[derive(Debug, Default)]
+pub struct CallCounts {
+    pub ok: std::sync::atomic::AtomicU64,
+    /// The daemon answered with an error (`ok:false`).
+    pub remote_errors: std::sync::atomic::AtomicU64,
+    /// No answer: connect, handshake (for example an unauthorized upgrade) or socket error.
+    pub transport_errors: std::sync::atomic::AtomicU64,
+}
+impl CallCounts {
+    pub fn record(&self, result: &Result<Value>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match result {
+            Ok(_) => self.ok.fetch_add(1, Relaxed),
+            Err(e) if e.downcast_ref::<ws::RemoteError>().is_some() => {
+                self.remote_errors.fetch_add(1, Relaxed)
+            }
+            Err(_) => self.transport_errors.fetch_add(1, Relaxed),
+        };
+    }
+    /// `(ok, remote_errors, transport_errors)`.
+    pub fn get(&self) -> (u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.ok.load(Relaxed),
+            self.remote_errors.load(Relaxed),
+            self.transport_errors.load(Relaxed),
+        )
+    }
+    pub fn json(&self) -> Value {
+        let (ok, remote, transport) = self.get();
+        json!({"ok": ok, "remote_errors": remote, "transport_errors": transport})
+    }
+}
+
 fn token_call(control: &str, token: &str, action: &Value) -> Result<Value> {
     use tungstenite::{Message, client::IntoClientRequest};
     let mut request = control.into_client_request()?;
@@ -454,6 +514,27 @@ fn token_call(control: &str, token: &str, action: &Value) -> Result<Value> {
             None => bail!("INVALID_WS_REPLY"),
         };
     }
+}
+
+/// Whether `STATE/runtime.json` exists and something accepts TCP connections at
+/// its address. A clean worker exit removes the file; a stale file left by a
+/// killed worker points at a closed port. (TCP only, so a future token check on
+/// the worker endpoint cannot make a live worker look gone.)
+pub fn worker_listening(state_dir: &Path) -> bool {
+    let Ok(discovery) = discovery_at(state_dir) else {
+        return state_dir.join("runtime.json").exists();
+    };
+    let host = discovery
+        .address
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    use std::net::ToSocketAddrs;
+    host.to_socket_addrs().ok().is_some_and(|mut addrs| {
+        addrs.any(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_ok())
+    })
 }
 
 /// The `runtime.json` discovery of a folder state directory.
@@ -707,8 +788,42 @@ impl Node {
             thread::sleep(Duration::from_millis(25));
         }
     }
-    /// Stop `folder`, run `f` on its store in-process, then start it again and
-    /// wait (`timeout`) until it runs. Returns `f`'s result.
+    /// `Stop` `folder`, then wait (`timeout`) until its worker process is gone:
+    /// `inspect` reports neither `running` nor `starting`, no process has the
+    /// state directory on its command line, and `runtime.json` is removed (or
+    /// its port refuses TCP connections, see `worker_listening`). Only then may
+    /// a caller open, edit or delete the
+    /// folder's store. §7.3 lets Stop return `{…, stopping:true,
+    /// waiting_for:"BUSY_VIEW…"}` while the worker keeps running; this waits for
+    /// that worker too and errors (never returns early) if it is still alive.
+    /// Returns the Stop reply.
+    pub fn stop_folder_exited(&self, folder: &Value, timeout: Duration) -> Result<Value> {
+        let state = state_id(folder);
+        let dir = state_dir(folder);
+        let reply = self.raw_call(json!({"op":"stop","state":state}))?;
+        let deadline = Instant::now() + timeout;
+        let stopped = wait_until(timeout, || {
+            self.raw_call(json!({"op":"inspect","state":state}))
+                .is_ok_and(|p| p["running"] != true && p["starting"] != true)
+        });
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let gone = stopped
+            && wait_until(remaining.max(Duration::from_secs(1)), || {
+                !worker_listening(&dir) && self.worker_pids(folder).is_empty()
+            });
+        if !gone {
+            bail!(
+                "WORKER_STILL_RUNNING: folder {state} did not exit within {timeout:?} after Stop \
+                 (reply {reply}, pids {:?}); its store must not be touched\n{}",
+                self.worker_pids(folder),
+                self.logs()
+            );
+        }
+        Ok(reply)
+    }
+    /// Stop `folder` (waiting until its worker has exited, see
+    /// `stop_folder_exited`), run `f` on its store in-process, then start it
+    /// again and wait (`timeout`) until it runs. Returns `f`'s result.
     pub fn with_stopped_folder<T>(
         &self,
         folder: &Value,
@@ -716,7 +831,7 @@ impl Node {
         f: impl FnOnce(&mut tkfs::core::Store) -> Result<T>,
     ) -> Result<T> {
         let state = state_id(folder);
-        self.raw_call(json!({"op":"stop","state":state}))?;
+        self.stop_folder_exited(folder, STOP_EXIT_TIMEOUT)?;
         let value = {
             let mut store = tkfs::core::Store::open_existing(&state_dir(folder))?;
             let value = f(&mut store)?;
@@ -738,10 +853,15 @@ impl Node {
     }
 }
 
+/// How long harness helpers wait for a stopped folder's worker to exit before
+/// touching its store (Stop itself may answer after ≤ 15 s, §7.3).
+pub const STOP_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Two already-synchronized replicas of a large history without replaying it:
 /// `a` creates a folder (empty), `b` pairs through `endpoint` and receives it,
-/// both folders stop, `build` writes the history into A's store in-process, B's
-/// state becomes a copy of A's (keeping B's device id), and both start again.
+/// both folders stop (and their workers exit), `build` writes the history into
+/// A's store in-process, B's state becomes a receiver-side copy of A's
+/// (`fixtures::clone_into`, keeping B's device id), and both start again.
 /// Returns the (A, B) folder replies.
 pub fn synced_replicas(
     a: &Node,
@@ -753,8 +873,8 @@ pub fn synced_replicas(
     let pa = a.create(label, true);
     b.pair_endpoint(endpoint, &a.code(), Some(b.cfg.connections));
     let pb = b.receive_from(endpoint, &pa);
-    b.stop_folder(&state_id(&pb));
-    a.stop_folder(&state_id(&pa));
+    b.stop_folder_exited(&pb, STOP_EXIT_TIMEOUT)?;
+    a.stop_folder_exited(&pa, STOP_EXIT_TIMEOUT)?;
     {
         let mut store = tkfs::core::Store::open_existing(&state_dir(&pa))?;
         build(&mut store)?;

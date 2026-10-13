@@ -256,6 +256,11 @@ fn visible(store: &Store) -> BTreeSet<(String, Option<String>)> {
         .collect()
 }
 
+/// Seeded fixtures are deterministic. For `concurrent_histories` the contract
+/// is the intent log, the sync schedule and the committed history read back
+/// from the stores (`ConcurrentSummary::history`, ids replaced by names); the
+/// projected tie-breaks between concurrent operations depend on random ids and
+/// are compared across the replicas of one run only.
 #[test]
 fn fixtures_are_deterministic_per_seed() {
     let run = |seed| {
@@ -277,6 +282,14 @@ fn fixtures_are_deterministic_per_seed() {
     assert_eq!(a.syncs, b.syncs);
     assert_ne!(a.log, c.log, "different seed, different operations");
     assert_eq!(a.log.len(), 60);
+    // Store state, not just the RNG: the same committed events for the same seed.
+    assert_eq!(a.history, b.history, "same seed, same committed history");
+    assert_ne!(a.history, c.history, "different seed, different history");
+    assert_eq!(
+        a.history.len() + a.refused,
+        a.log.len(),
+        "one committed event per accepted operation"
+    );
 
     assert_eq!(seeded_bytes(5, 64), seeded_bytes(5, 64));
     assert_ne!(seeded_bytes(5, 64), seeded_bytes(6, 64));
@@ -379,6 +392,76 @@ fn fixtures_are_deterministic_per_seed() {
     let mut expected: Value = serde_json::from_str(&payload(&original)).unwrap();
     expected["device"] = json!(clone.device);
     assert_eq!(payload(&clone), serde_json::to_string(&expected).unwrap());
+
+    replicas_have_receiver_rows();
+}
+
+fn hashes_in(store: &Store, table: &str) -> BTreeSet<String> {
+    store
+        .db
+        .prepare(&format!("SELECT hash FROM {table}"))
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// `clone_replica` and `metadata_replica` hold the rows a real receiver holds:
+/// no author-only publication grants, acknowledged outbox, knowledge that the
+/// author holds every event, and (metadata only) no availability for objects
+/// whose bytes were not received.
+fn replicas_have_receiver_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut author = Store::open(&dir.path().join("author"), Some("fixture-clone")).unwrap();
+    let hashes = small_objects_in(&mut author, "objs", 5, 100, 3).unwrap();
+    let published = hashes_in(&author, "published_objects");
+    assert!(
+        hashes.iter().all(|h| published.contains(h)),
+        "author grants"
+    );
+    assert!(author.outgoing_unacknowledged().unwrap() > 0);
+
+    let (author, clone) = clone_replica(author, &dir.path().join("clone")).unwrap();
+    assert_eq!(
+        hashes_in(&author, "published_objects"),
+        published,
+        "original untouched"
+    );
+    assert!(hashes_in(&clone, "published_objects").is_empty());
+    assert_eq!(hashes_in(&clone, "received_shared_objects"), published);
+    assert_eq!(clone.outgoing_unacknowledged().unwrap(), 0);
+    assert_eq!(
+        clone.known_by_peer(&author.device).unwrap(),
+        author.shared_event_inventory().unwrap()
+    );
+    assert_eq!(
+        clone.shared_object_inventory().unwrap(),
+        author.shared_object_inventory().unwrap()
+    );
+    assert_eq!(clone.content_status().unwrap()["complete"], true);
+
+    let (author, meta) = metadata_replica(author, &dir.path().join("meta")).unwrap();
+    let empty = hash(b"");
+    assert_eq!(
+        meta.shared_event_inventory().unwrap(),
+        author.shared_event_inventory().unwrap()
+    );
+    assert!(hashes_in(&meta, "published_objects").is_empty());
+    assert!(
+        hashes_in(&meta, "received_shared_objects")
+            .iter()
+            .all(|h| *h == empty)
+    );
+    assert!(hashes.iter().all(|h| !meta.object_available(h)));
+    assert!(
+        meta.shared_object_inventory()
+            .unwrap()
+            .iter()
+            .all(|h| *h == empty)
+    );
+    assert_eq!(meta.outgoing_unacknowledged().unwrap(), 0);
+    assert_eq!(meta.content_status().unwrap()["complete"], false);
 }
 
 /// Large fixtures write rows directly (`direct_creates`); the result must equal a
@@ -422,6 +505,67 @@ fn direct_rows_match_full_projection() {
     let (reopened, ms) = time_ms(|| Store::open_existing(&dir.path().join("a")).unwrap());
     check(&reopened);
     assert!(ms < 30_000.0, "reopen took {ms} ms");
+}
+
+// ---------------------------------------------------------------- node helpers
+
+/// `Node::control()` works from another thread (also with a WP4.1 token file,
+/// which the baseline daemon ignores), `CallCounts` tells answered, refused and
+/// unreachable calls apart, and `with_stopped_folder` edits the store only
+/// after the worker has exited.
+#[test]
+fn node_control_and_stopped_folder_edit() {
+    let node = Node::new();
+    let folder = node.create("Edit", true);
+    fs::write(
+        node.data_dir().join("orchestrator.token"),
+        "selftest-token\n",
+    )
+    .unwrap();
+    let counts = std::sync::Arc::new(CallCounts::default());
+    let (control, thread_counts) = (node.control(), counts.clone());
+    thread::spawn(move || {
+        thread_counts.record(&control.call(&json!({"op":"list"})));
+        thread_counts.record(&control.call(&json!({"op":"inspect","state":"no-such-folder"})));
+    })
+    .join()
+    .unwrap();
+    let unreachable = Control {
+        data_dir: node.path().join("missing"),
+    };
+    counts.record(&unreachable.call(&json!({"op":"list"})));
+    assert_eq!(counts.get(), (1, 1, 1), "{}", counts.json());
+    fs::remove_file(node.data_dir().join("orchestrator.token")).unwrap();
+
+    let dir = state_dir(&folder);
+    let before = node.worker_pids(&folder);
+    assert!(!before.is_empty(), "worker running");
+    let edited = node
+        .with_stopped_folder(&folder, Duration::from_secs(60), |store| {
+            assert!(
+                !worker_listening(&dir),
+                "worker still listening during the edit"
+            );
+            Ok(store.create("edited-offline.txt", "file")?.id)
+        })
+        .unwrap();
+    assert!(!edited.is_empty());
+    let after = node.inspect(&state_id(&folder));
+    assert_eq!(after["running"], true);
+    assert!(
+        wait_until(Duration::from_secs(10), || has_hash(
+            &after,
+            "edited-offline.txt",
+            &hash(b"")
+        )),
+        "offline edit visible after restart"
+    );
+    assert!(
+        node.worker_pids(&folder)
+            .iter()
+            .all(|p| !before.contains(p)),
+        "a new worker process"
+    );
 }
 
 // ---------------------------------------------------------------- metrics
@@ -649,7 +793,8 @@ fn legacy_datadir_fixture_opens_with_current_build() {
     assert_eq!(labels, expected);
     let peers = node.peers();
     assert_eq!(peers.as_array().unwrap().len(), 1);
-    assert_eq!(peers[0]["endpoint"], m["peers"][0]["endpoint"]);
+    // The copy's peer is moved to a closed port (no dials into parallel tests).
+    assert_eq!(peers[0]["endpoint"], legacy::DEAD_PEER_ENDPOINT);
     assert_eq!(peers[0]["installation"], m["peers"][0]["installation"]);
     for folder in m["folders"].as_array().unwrap() {
         let state = folder["state"].as_str().unwrap();
@@ -1275,6 +1420,45 @@ fn qual_files_exist_and_ignores_name_their_owner() {
     }
 }
 
+/// `scripts/qualify.sh` really runs (argument parsing and file selection) from
+/// an LF and from a CRLF copy, as `bash scripts/qualify.sh …` does from WSL on
+/// a Windows checkout (core.autocrlf=true). Regression: a CR-stripping
+/// prologue that deleted newlines instead made every run a silent exit 0.
+#[cfg(unix)]
+#[test]
+fn qualify_sh_runs_with_lf_and_crlf() {
+    let source =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/qualify.sh"))
+            .unwrap()
+            .replace("\r\n", "\n");
+    for (kind, text) in [
+        ("lf", source.clone()),
+        ("crlf", source.replace('\n', "\r\n")),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("scripts")).unwrap();
+        let script = root.path().join("scripts/qualify.sh");
+        fs::write(&script, text).unwrap();
+        for (args, message) in [
+            (&["--bogus-arg"][..], "unknown argument --bogus-arg"),
+            (&["--wave", "9"][..], "use --wave 1..4"),
+            (
+                &["--wave", "1", "--files", "qual_none", "--no-build"][..],
+                "no qualification files selected",
+            ),
+        ] {
+            let out = std::process::Command::new("bash")
+                .arg(&script)
+                .args(args)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{kind} {args:?}: {stderr}");
+            assert!(stderr.contains(message), "{kind} {args:?}: {stderr}");
+        }
+    }
+}
+
 #[test]
 fn floors_reference_existing_scenarios() {
     let doc: Value = serde_json::from_slice(&fs::read(floors_path()).unwrap()).unwrap();
@@ -1301,5 +1485,26 @@ fn floors_reference_existing_scenarios() {
             "{id}"
         );
         assert!((1..=4).contains(&floor["wave"].as_u64().unwrap()), "{id}");
+    }
+}
+
+/// The committed baseline evidence is strict JSON (no UTF-8 BOM, which
+/// serde_json rejects) and records every qualification file.
+#[test]
+fn baseline_evidence_is_strict_json() {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-evidence/qualification-baseline.json");
+    let bytes = fs::read(&path).unwrap();
+    assert!(!bytes.starts_with(&[0xef, 0xbb, 0xbf]), "UTF-8 BOM");
+    let doc: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(doc["kind"], "baseline");
+    let files: BTreeSet<_> = doc["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["file"].as_str().unwrap().to_owned())
+        .collect();
+    for (file, _) in QUAL_FILES {
+        assert!(files.contains(*file), "baseline evidence lacks {file}");
     }
 }

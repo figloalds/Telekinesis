@@ -195,7 +195,8 @@ fn crash_backoff() {
     let a = Node::new();
     let p = a.create("Crasher", true);
     let state = state_id(&p);
-    a.stop_folder(&state);
+    // Delete the store only after the worker has exited.
+    a.stop_folder_exited(&p, STOP_EXIT_TIMEOUT).unwrap();
     let dir = state_dir(&p);
     for name in [
         "metadata.sqlite",

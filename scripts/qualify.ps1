@@ -22,6 +22,11 @@
   Exit code: 0 when every enforced floor holds and every selected scenario
   passed (or skipped); 1 otherwise. -Baseline always exits 0 unless the build fails.
 
+  Encoding: every file is read as UTF-8 and the evidence is written as UTF-8
+  without a BOM and with LF line endings (strict JSON readers such as
+  serde_json reject a BOM; Windows PowerShell 5.1 `Set-Content -Encoding UTF8`
+  would add one, and its default read encoding is the ANSI code page).
+
 .EXAMPLE
   $env:CARGO_TARGET_DIR = "C:\tkfs-target\wp1-6"
   powershell -NoProfile -File scripts\qualify.ps1 -Wave 1 -Files qual_wp1_6_activation
@@ -79,10 +84,16 @@ if ($selected.Count -eq 0) { throw "no qualification files selected" }
 
 if ($Baseline) { $kind = "baseline" } elseif ($All) { $kind = "all" } else { $kind = "wave-$Wave" }
 if (-not $Evidence) { $Evidence = Join-Path $root "test-evidence/qualification-$kind.json" }
+# Absolute (relative to the repository root, as before): .NET file APIs below
+# resolve relative paths against the process directory, not Set-Location.
+$Evidence = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Evidence)
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $runDir = Join-Path $root "test-runs/qualify-$kind-$stamp"
 New-Item -ItemType Directory -Force $runDir | Out-Null
 New-Item -ItemType Directory -Force (Split-Path -Parent $Evidence) | Out-Null
+
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+function Read-Utf8([string]$Path) { [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) }
 
 function Get-Git([string[]]$GitArgs) {
     try { (& git @GitArgs 2>$null | Out-String).Trim() } catch { "" }
@@ -111,7 +122,7 @@ if (-not $NoBuild) {
     if ($LASTEXITCODE -ne 0) { throw "release build failed" }
 }
 
-$floorsDoc = Get-Content (Join-Path $root "tests/qualification-floors.json") -Raw | ConvertFrom-Json
+$floorsDoc = Read-Utf8 (Join-Path $root "tests/qualification-floors.json") | ConvertFrom-Json
 $fileResults = @()
 $records = @()
 foreach ($file in $selected) {
@@ -137,7 +148,7 @@ foreach ($file in $selected) {
         Select-Object -Last 1
     $fileRecords = @()
     if (Test-Path $qualOut) {
-        foreach ($line in Get-Content $qualOut) {
+        foreach ($line in Get-Content $qualOut -Encoding UTF8) {
             if ($line.Trim()) { $fileRecords += ($line | ConvertFrom-Json) }
         }
     }
@@ -197,7 +208,7 @@ function Test-Floor($floor, $value) {
 $mergedFrom = $null
 if ($Merge -and (Test-Path $Evidence)) {
     # Carry the other files' results (and their metrics, for the floors) forward.
-    $old = Get-Content $Evidence -Raw | ConvertFrom-Json
+    $old = Read-Utf8 $Evidence | ConvertFrom-Json
     $mergedFrom = [ordered]@{ generated_at = $old.generated_at; git = $old.git; run_dir = $old.run_dir }
     $kept = @($old.files | Where-Object { -not ($selected -contains $_.file) })
     foreach ($f in $kept) {
@@ -293,7 +304,8 @@ $evidenceDoc = [ordered]@{
     run_dir      = $runDir
     merged_from  = $mergedFrom
 }
-$evidenceDoc | ConvertTo-Json -Depth 12 | Set-Content -Path $Evidence -Encoding UTF8
+$json = ($evidenceDoc | ConvertTo-Json -Depth 12) -replace "`r`n", "`n"
+[System.IO.File]::WriteAllText($Evidence, $json + "`n", $utf8NoBom)
 Write-Host "qualify: evidence written to $Evidence"
 Write-Host ("qualify: scenarios {0}; floors pass {1}, fail {2}, missing {3}" -f `
         $allScenarios.Count, $evidenceDoc.summary.floors_passed, $evidenceDoc.summary.floors_failed, `

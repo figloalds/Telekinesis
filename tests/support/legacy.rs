@@ -60,7 +60,10 @@ pub struct LegacyDataDir {
 /// Copy `tests/fixtures/legacy/datadir/data` to `ROOT/data` and relocate the
 /// absolute paths stored in `folders.sqlite` (`projects.directory`,
 /// `projects.mount`) from the capture root to `ROOT`, the way a user moving a
-/// data directory would. Everything else is byte-for-byte the baseline output.
+/// data directory would. The captured peer endpoint (an ephemeral port of the
+/// capture run) becomes `DEAD_PEER_ENDPOINT`, so a daemon on the copy never
+/// dials a listener of a parallel test. Everything else is byte-for-byte the
+/// baseline output.
 ///
 /// Contents: `projects` (a received running folder, a received folder gated by
 /// `initial_sync`, a stopped local folder), one outbound `peers` row, the
@@ -90,7 +93,12 @@ pub fn copy_legacy_datadir_with(cfg: &NodeConfig) -> Result<LegacyDataDir> {
     })
 }
 
-/// Rewrite the capture-time absolute prefixes in `projects` to `new_root`.
+/// Where the legacy data dir's outbound peer points in a temp copy: a closed,
+/// privileged port (TCP discard), never handed out as an ephemeral port.
+pub const DEAD_PEER_ENDPOINT: &str = "ws://127.0.0.1:9";
+
+/// Rewrite the capture-time absolute prefixes in `projects` to `new_root`, and
+/// every captured peer endpoint (`peers`, `initial_sync`) to `DEAD_PEER_ENDPOINT`.
 pub fn relocate(data: &Path, manifest: &Value, new_root: &Path) -> Result<()> {
     let old_root = manifest["root"].as_str().context("manifest root")?;
     // The daemon stores paths derived from the canonical configuration path.
@@ -106,6 +114,17 @@ pub fn relocate(data: &Path, manifest: &Value, new_root: &Path) -> Result<()> {
         db.execute(
             "UPDATE projects SET directory=?,mount=? WHERE state=?",
             rusqlite::params![directory, mount, state],
+        )?;
+    }
+    for peer in manifest["peers"].as_array().context("manifest peers")? {
+        let endpoint = peer["endpoint"].as_str().context("peer endpoint")?;
+        db.execute(
+            "UPDATE peers SET endpoint=? WHERE endpoint=?",
+            [DEAD_PEER_ENDPOINT, endpoint],
+        )?;
+        db.execute(
+            "UPDATE initial_sync SET endpoint=? WHERE endpoint=?",
+            [DEAD_PEER_ENDPOINT, endpoint],
         )?;
     }
     Ok(())
