@@ -1,7 +1,8 @@
 //! Legacy fixtures captured with the baseline binary (6298d0b) by WP0.5
 //! (`tests/fixtures/legacy`, see its README). Tests never touch the committed
-//! files: `copy_legacy_worker()` and `copy_legacy_datadir()` return temp copies.
-use super::fixtures::copy_dir;
+//! files: `copy_legacy_worker()` and `copy_legacy_datadir()` return temp copies
+//! of the committed files only (SQLite `-wal`/`-shm`/`-journal` side files,
+//! which `.gitignore` hides, are never copied).
 use super::node::NodeConfig;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -39,7 +40,7 @@ pub struct LegacyWorker {
 pub fn copy_legacy_worker() -> LegacyWorker {
     let temp = tempfile::tempdir().unwrap();
     let state = temp.path().join("state");
-    copy_dir(&legacy_dir().join("worker/state"), &state).unwrap();
+    copy_fixture(&legacy_dir().join("worker/state"), &state).unwrap();
     LegacyWorker {
         temp,
         state,
@@ -80,7 +81,7 @@ pub fn copy_legacy_datadir_with(cfg: &NodeConfig) -> Result<LegacyDataDir> {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777))?;
     }
     let data = root.path().join("data");
-    copy_dir(&legacy_dir().join("datadir/data"), &data)?;
+    copy_fixture(&legacy_dir().join("datadir/data"), &data)?;
     let config = root.path().join("orchestrator.toml");
     fs::write(&config, cfg.toml())?;
     let manifest = manifest("datadir");
@@ -91,6 +92,45 @@ pub fn copy_legacy_datadir_with(cfg: &NodeConfig) -> Result<LegacyDataDir> {
         config,
         manifest,
     })
+}
+
+/// Whether `name` is a SQLite side file (`-wal`, `-shm`, `-journal`). The
+/// committed fixtures have none (their WALs were checkpointed); one next to a
+/// fixture database was left by a tool that opened the fixture in place and
+/// is ignored by git, so it must not reach a test's copy.
+pub fn is_sqlite_side_file(name: &str) -> bool {
+    ["-wal", "-shm", "-journal"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+}
+
+/// Copy a fixture tree without SQLite side files.
+pub fn copy_fixture(src: &Path, dst: &Path) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_fixture(&entry.path(), &target)?;
+        } else if !is_sqlite_side_file(&entry.file_name().to_string_lossy()) {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// SQLite side files anywhere under `root` (none in a fresh fixture copy).
+pub fn sqlite_side_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = vec![];
+    for entry in fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(sqlite_side_files(&path));
+        } else if is_sqlite_side_file(&entry.file_name().to_string_lossy()) {
+            found.push(path);
+        }
+    }
+    found
 }
 
 /// Where the legacy data dir's outbound peer points in a temp copy: a closed,

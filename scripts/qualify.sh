@@ -15,8 +15,10 @@
 #   CARGO_TARGET_DIR=$HOME/tkfs-target/<pkg> scripts/qualify.sh --wave 1 [--files "a b"] [--filter NAME]
 #   scripts/qualify.sh --all | --baseline [--budget-s 120] [--file-timeout-min 90] [--evidence PATH] [--no-build]
 #
-# Evidence: test-evidence/qualification-<kind>-linux.json. Exit 0 when every
-# enforced floor holds and every selected file passed (--baseline: always 0).
+# Evidence: test-evidence/qualification-<kind>-linux.json. A file passes only
+# when cargo exits 0 and its last `test result:` line says `ok.`; exit code and
+# result line are recorded. Exit 0 when every enforced floor holds and every
+# selected file passed (--baseline: always 0).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(pwd)
@@ -79,8 +81,8 @@ for f in "${selected[@]}"; do
   code=$?
   set -e
   if [ $code -eq 0 ]; then st=pass; elif [ $code -eq 124 ] || [ $code -eq 137 ]; then st=timeout; else st=fail; fi
-  statuses+=("$f=$st=$(( $(date +%s) - t0 ))")
-  echo "qualify: $f -> $st"
+  statuses+=("$f=$st=$(( $(date +%s) - t0 ))=$code")
+  echo "qualify: $f -> $st (exit $code)"
 done
 
 python3 - "$root" "$run_dir" "$evidence" "$kind" "$wave" "$baseline" "$budget" "$file_timeout" "$filter" "$started" "${statuses[@]}" <<'PY'
@@ -95,7 +97,7 @@ def git(*a):
 floors = json.load(open(os.path.join(root, "tests/qualification-floors.json")))["floors"]
 records, files = [], []
 for entry in statuses:
-    name, st, secs = entry.split("=")
+    name, st, secs, code = entry.split("=")
     recs = []
     path = os.path.join(run_dir, name + ".qual.jsonl")
     if os.path.exists(path):
@@ -120,7 +122,10 @@ for entry in statuses:
     if os.path.exists(log):
         lines = [l.strip() for l in open(log, errors="replace") if l.startswith("test result:")]
         result = lines[-1] if lines else None
-    files.append({"file": name, "status": st, "duration_s": int(secs), "result": result,
+    # Cross-check: a pass needs exit 0 and an `ok.` result line (as qualify.ps1).
+    if st == "pass" and not (result or "").startswith("test result: ok."): st = "fail"
+    files.append({"file": name, "status": st, "exit_code": int(code), "duration_s": int(secs),
+                  "result": result,
                   "log": log, "scenarios": scenarios})
 selected = {f["file"] for f in files}
 ops = {"<": lambda v, l: v < l, "<=": lambda v, l: v <= l, ">": lambda v, l: v > l,

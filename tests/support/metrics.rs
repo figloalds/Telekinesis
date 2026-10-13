@@ -1,6 +1,7 @@
 //! Measurements for qualification scenarios.
 //!
-//! - `Stopwatch`, `summarize` (percentiles), `process_cpu_ms` (Windows
+//! - `Stopwatch`, `summarize` (percentiles; NaN statistics for no samples, so
+//!   an empty measurement fails its floor), `process_cpu_ms` (Windows
 //!   `GetProcessTimes` FFI, Linux `/proc/<pid>/stat`), `find_pids`.
 //! - `qual(..)` prints one `QUAL {json}` line per metric on stdout and, when
 //!   `TKFS_QUAL_OUT` names a file, appends the same JSON line there
@@ -60,7 +61,9 @@ pub fn percentile(samples: &[f64], p: f64) -> f64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Statistics of a sample set. No `Default`: an all-zero summary would satisfy
+/// every `<`/`<=` floor without measuring anything.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Summary {
     pub count: usize,
     pub min: f64,
@@ -71,15 +74,32 @@ pub struct Summary {
     pub max: f64,
 }
 impl Summary {
+    /// The summary of no samples: count 0, every statistic NaN.
+    pub fn empty() -> Self {
+        Self {
+            count: 0,
+            min: f64::NAN,
+            mean: f64::NAN,
+            p50: f64::NAN,
+            p90: f64::NAN,
+            p99: f64::NAN,
+            max: f64::NAN,
+        }
+    }
+    /// JSON with NaN statistics as `null` (serde_json maps non-finite to null).
     pub fn json(&self) -> Value {
-        json!({"count":self.count,"min":self.min,"mean":self.mean,"p50":self.p50,
-            "p90":self.p90,"p99":self.p99,"max":self.max})
+        json!({"count":self.count,"min":finite(self.min),"mean":finite(self.mean),
+            "p50":finite(self.p50),"p90":finite(self.p90),"p99":finite(self.p99),
+            "max":finite(self.max)})
     }
 }
 
+/// Count, min, mean, p50/p90/p99 and max of `samples`. With no samples every
+/// statistic is NaN (`Summary::empty`), so a metric taken from it is emitted as
+/// `null` and fails every floor ("measured NaN") instead of passing as 0.
 pub fn summarize(samples: &[f64]) -> Summary {
     if samples.is_empty() {
-        return Summary::default();
+        return Summary::empty();
     }
     Summary {
         count: samples.len(),

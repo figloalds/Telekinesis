@@ -88,7 +88,24 @@ fn accept_loop_survives_faults() {
             last_ten_ok += 1;
         }
     }
-    s.metric("failed_calls", failures as f64, "count");
+    // Evidence that the fault point fired: a call that hit an injected accept
+    // error, or a worker.log line naming the point. Without it (no fault hook,
+    // a misspelled point, env not reaching the worker) "still serving" proves
+    // nothing. If the owner's accept fault is invisible to clients and not
+    // logged, replace this with the evidence the implementation exposes.
+    let logged = fs::read_to_string(state.join("worker.log"))
+        .unwrap_or_default()
+        .contains("worker.accept_error");
+    s.metric_with(
+        "failed_calls",
+        failures as f64,
+        "count",
+        json!({"fault_logged": logged}),
+    );
+    s.check(
+        failures >= 1 || logged,
+        "worker.accept_error fired (a failed call or a worker.log line naming it)",
+    );
     s.check(failures <= 3, format!("{failures} failed calls"));
     s.check(last_ten_ok == 10, "still serving after the faults");
     s.check(worker.try_exit().is_none(), "worker alive");

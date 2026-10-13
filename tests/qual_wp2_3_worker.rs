@@ -13,7 +13,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -65,23 +65,55 @@ fn catch_up(n: usize) -> CatchUp {
     }
 }
 
+/// Progress of `deliver`: events in pages the worker accepted, and pages it
+/// refused (after retrying `BUSY` for 120 s) with the last error.
+#[derive(Default)]
+struct Delivery {
+    delivered: AtomicUsize,
+    failed_pages: AtomicUsize,
+    last_error: Mutex<Option<String>>,
+}
+impl Delivery {
+    fn delivered(&self) -> usize {
+        self.delivered.load(Ordering::Relaxed)
+    }
+    /// Every page accepted; otherwise the failure count and last error. A
+    /// refused page means the measured phase had less (or nothing) to activate.
+    fn check(&self, s: &mut Scenario) {
+        let failed = self.failed_pages.load(Ordering::Relaxed);
+        let last = self.last_error.lock().unwrap().clone();
+        s.check(
+            failed == 0,
+            format!("{failed} pages refused by published-exchange, last: {last:?}"),
+        );
+    }
+}
+
 /// Deliver `events` to the worker at `state` in pages of 64 through
 /// `published-exchange` (metadata only, bounded activation), then keep
 /// exchanging empty pages until nothing is pending. Stops when `stop` is set.
-fn deliver(state: &Path, c: &CatchUp, stop: &AtomicBool, delivered: &AtomicUsize) {
+fn deliver(state: &Path, c: &CatchUp, stop: &AtomicBool, progress: &Delivery) {
     let route = legacy_route(&id(), &c.repo, &c.b_device, &c.a_device);
     for page in c.events.chunks(64) {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         let body = legacy_page(&c.repo, &c.a_device, &c.b_device, page, &BTreeSet::new());
-        let _ = retry_busy(Duration::from_secs(120), || {
+        let reply = retry_busy(Duration::from_secs(120), || {
             rpc_at(
                 state,
                 json!({"op":"published-exchange","route":route,"page":body,"metadata_only":true}),
             )
         });
-        delivered.fetch_add(page.len(), Ordering::Relaxed);
+        match reply {
+            Ok(_) => {
+                progress.delivered.fetch_add(page.len(), Ordering::Relaxed);
+            }
+            Err(e) => {
+                progress.failed_pages.fetch_add(1, Ordering::Relaxed);
+                *progress.last_error.lock().unwrap() = Some(format!("{e:#}"));
+            }
+        }
     }
     while !stop.load(Ordering::Relaxed) {
         let pending = rpc_at(state, json!({"op":"status"}))
@@ -118,40 +150,59 @@ fn fs_p99_during_catchup() {
         let _ = worker.rpc(json!({"op":"mount-attach","path":mount_arg}));
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let delivered = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(Delivery::default());
     s.measure_from_now();
     let feeder = {
-        let (stop, delivered, c) = (stop.clone(), delivered.clone(), c.clone());
-        thread::spawn(move || deliver(&c.state.clone(), &c, &stop, &delivered))
+        let (stop, progress, c) = (stop.clone(), progress.clone(), c.clone());
+        thread::spawn(move || deliver(&c.state.clone(), &c, &stop, &progress))
     };
     let mut samples = vec![];
-    while !feeder.is_finished() && !s.over_budget() {
+    let mut fs_errors = 0usize;
+    let mut last_fs_error = None;
+    // At least one round of FS operations, even if the feeder finishes first.
+    while samples.len() + fs_errors == 0 || (!feeder.is_finished() && !s.over_budget()) {
         for i in 0..20 {
             let (r, ms) = time_ms(|| {
                 fs::metadata(mount.join(format!("base/f{i:02}.txt")))?;
                 fs::read(mount.join(format!("base/f{i:02}.txt")))
             });
-            if r.is_ok() {
-                samples.push(ms);
+            match r {
+                Ok(_) => samples.push(ms),
+                Err(e) => {
+                    fs_errors += 1;
+                    last_fs_error = Some(e.to_string());
+                }
             }
             thread::sleep(Duration::from_millis(10));
         }
         let (r, ms) = time_ms(|| fs::read_dir(mount.join("base")).map(|d| d.count()));
-        if r.is_ok() {
-            samples.push(ms);
+        match r {
+            Ok(_) => samples.push(ms),
+            Err(e) => {
+                fs_errors += 1;
+                last_fs_error = Some(e.to_string());
+            }
         }
     }
     let timed_out = !feeder.is_finished();
     stop.store(true, Ordering::Relaxed);
     let _ = feeder.join();
+    // Only successful operations are timed: with none (mount not attached,
+    // files unreadable) the p99 is NaN and fails its floor; errors fail too.
     let summary = summarize(&samples);
     s.metric_with(
         "fs_p99_ms",
         summary.p99,
         "ms",
-        json!({"fs": summary.json(), "delivered": delivered.load(Ordering::Relaxed),
+        json!({"fs": summary.json(), "fs_errors": fs_errors, "delivered": progress.delivered(),
             "events": c.events.len()}),
     );
+    s.check(!samples.is_empty(), "at least one FS operation measured");
+    s.check(
+        fs_errors == 0,
+        format!("{fs_errors} FS operations failed during catch-up, last: {last_fs_error:?}"),
+    );
+    progress.check(&mut s);
     if timed_out {
         s.timeout("catch-up not finished in budget");
     }
@@ -168,24 +219,33 @@ fn status_latency_during_activation() {
     let mut worker = WorkerProc::spawn(&c.state, &[], &[]).unwrap();
     worker.wait_ready(Duration::from_secs(120)).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
-    let delivered = Arc::new(AtomicUsize::new(0));
+    let progress = Arc::new(Delivery::default());
     s.measure_from_now();
     let feeder = {
-        let (stop, delivered, c) = (stop.clone(), delivered.clone(), c.clone());
-        thread::spawn(move || deliver(&c.state.clone(), &c, &stop, &delivered))
+        let (stop, progress, c) = (stop.clone(), progress.clone(), c.clone());
+        thread::spawn(move || deliver(&c.state.clone(), &c, &stop, &progress))
     };
     let mut samples = vec![];
     let mut busy = 0;
     let mut missing_counts = 0;
-    while !feeder.is_finished() && !s.over_budget() {
+    let mut status_errors = 0usize;
+    let mut last_status_error = None;
+    // At least one status call, even if the feeder finishes first.
+    while samples.len() + status_errors == 0 || (!feeder.is_finished() && !s.over_budget()) {
         let (r, ms) = time_ms(|| worker.rpc(json!({"op":"status"})));
-        if let Ok(status) = r {
-            samples.push(ms);
-            if status["busy"] == true || status["stale"] == true {
-                busy += 1;
+        match r {
+            Ok(status) => {
+                samples.push(ms);
+                if status["busy"] == true || status["stale"] == true {
+                    busy += 1;
+                }
+                if status["incoming_pending"].is_null() || status["content"].is_null() {
+                    missing_counts += 1;
+                }
             }
-            if status["incoming_pending"].is_null() || status["content"].is_null() {
-                missing_counts += 1;
+            Err(e) => {
+                status_errors += 1;
+                last_status_error = Some(format!("{e:#}"));
             }
         }
         thread::sleep(Duration::from_millis(50));
@@ -193,14 +253,22 @@ fn status_latency_during_activation() {
     let timed_out = !feeder.is_finished();
     stop.store(true, Ordering::Relaxed);
     let _ = feeder.join();
+    // Only answered calls are timed: with none the p99 is NaN and fails its
+    // floor; errors fail too.
     let summary = summarize(&samples);
     s.metric_with(
         "status_p99_ms",
         summary.p99,
         "ms",
         json!({"status": summary.json(), "busy_replies": busy, "missing_counts": missing_counts,
-            "delivered": delivered.load(Ordering::Relaxed)}),
+            "status_errors": status_errors, "delivered": progress.delivered()}),
     );
+    s.check(!samples.is_empty(), "at least one status reply measured");
+    s.check(
+        status_errors == 0,
+        format!("{status_errors} status calls failed, last: {last_status_error:?}"),
+    );
+    progress.check(&mut s);
     s.check(busy == 0, format!("{busy} busy/stale status replies"));
     s.check(
         missing_counts == 0,

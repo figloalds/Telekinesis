@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use support::*;
 
@@ -343,10 +343,23 @@ fn sigterm_matches_shutdown() {
     }
 }
 
+/// Whether a status snapshot (§7.1) lists a folder labelled `label`.
+fn lists_folder(snapshot: &Value, label: &str) -> bool {
+    snapshot["folders"]
+        .as_array()
+        .is_some_and(|folders| folders.iter().any(|f| f["label"] == label))
+}
+
 /// `subscribe{since}` returns within 1 s of a lifecycle change.
+///
+/// Only a reply that reflects the Create counts (its snapshot lists the new
+/// folder, which cannot exist before the Create is sent). A reply caused by an
+/// unrelated generation bump is followed by a new `subscribe` from its
+/// generation, so it can neither end the measurement early nor record ~0 ms.
 #[test]
 #[ignore = "WP2.1"]
 fn subscribe_latency() {
+    const LABEL: &str = "Subscribe";
     let mut s = Scenario::new(FILE, "subscribe_latency");
     let a = Node::new();
     let status = a.raw_call(json!({"op":"status"}));
@@ -354,25 +367,63 @@ fn subscribe_latency() {
         s.unsupported(format!("status action: {status:?}"));
         return s.finish();
     };
+    s.check(
+        status["generation"].is_u64(),
+        format!("status has a generation: {status}"),
+    );
+    s.check(
+        !lists_folder(&status, LABEL),
+        "no Subscribe folder before the Create",
+    );
     let generation = status["generation"].as_u64().unwrap_or(0);
     let control = a.control();
-    let waiter = thread::spawn(move || {
-        let reply = control.call(&json!({"op":"subscribe","since":generation,"wait_ms":10000}));
-        Ok::<_, anyhow::Error>((reply?, std::time::Instant::now()))
+    let waiter = thread::spawn(move || -> anyhow::Result<(Value, Instant, u32)> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut since = generation;
+        let mut unrelated = 0;
+        loop {
+            let asked = Instant::now();
+            let reply = control.call(&json!({"op":"subscribe","since":since,"wait_ms":10000}))?;
+            let at = Instant::now();
+            if lists_folder(&reply, LABEL) {
+                return Ok((reply, at, unrelated));
+            }
+            unrelated += 1;
+            if at >= deadline {
+                anyhow::bail!(
+                    "SUBSCRIBE_NEVER_SHOWED_CREATE after {unrelated} replies, last: {reply}"
+                );
+            }
+            let next = reply["generation"].as_u64().unwrap_or(since);
+            if next <= since && at.duration_since(asked) < Duration::from_millis(50) {
+                // Neither a newer generation nor a long poll: do not spin.
+                thread::sleep(Duration::from_millis(20));
+            }
+            since = since.max(next);
+        }
     });
     thread::sleep(Duration::from_millis(300));
-    let changed = std::time::Instant::now();
-    let _ = a.raw_call(json!({"op":"create","label":"Subscribe","mount":null,"headless":true}));
+    let changed = Instant::now();
+    let created = a.raw_call(json!({"op":"create","label":LABEL,"mount":null,"headless":true}));
+    s.check(created.is_ok(), format!("create: {created:?}"));
     match waiter.join().unwrap() {
-        Ok((reply, at)) => {
+        Ok((reply, at, unrelated)) => {
             let ms = at.saturating_duration_since(changed).as_secs_f64() * 1000.0;
-            s.metric("subscribe_ms", ms, "ms");
+            s.metric_with(
+                "subscribe_ms",
+                ms,
+                "ms",
+                json!({"unrelated_replies": unrelated}),
+            );
             s.check(
                 reply["generation"].as_u64().unwrap_or(0) > generation,
                 "newer generation",
             );
         }
-        Err(e) => s.unsupported(format!("subscribe: {e:#}")),
+        Err(e) if is_unsupported(&e) => s.unsupported(format!("subscribe: {e:#}")),
+        Err(e) => {
+            s.check(false, format!("subscribe: {e:#}"));
+        }
     }
     s.finish();
 }
