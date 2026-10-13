@@ -10,7 +10,8 @@
 //! Crash-only internals: a request that panics while holding the engine
 //! poisons it, and the poison policy (`runtime::lock_engine`) then persists
 //! every dirty session and exits 70 (`PoisonPolicy::Exit`, the worker); 50
-//! consecutive accept errors exit 70 too. The supervisor restarts the worker.
+//! consecutive accept errors persist them too (best effort: the engine must
+//! be free within 2 s) and exit 70. The supervisor restarts the worker.
 //!
 //! Mount attaches and stops are serialized by one gate: an attach (the
 //! legacy startup attach or `mount-attach`) never starts once a stop was
@@ -50,6 +51,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long the accept-error exit waits for the engine before it exits
+/// without retaining ([`Core::exit_after_accept_errors`]).
+const EXIT_RETAIN_WAIT: Duration = Duration::from_secs(2);
+
 /// Legacy entry point (in-process tests and tools): builds a minimal
 /// `WorkerCtx` (unsupervised, no previous record, no activator), starts the
 /// RPC server and the heartbeat, and publishes `runtime.json` with `mount`
@@ -57,9 +62,10 @@ use std::{
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
     let ctx = crate::worker::build_ctx(engine, state, false, None);
     let server = start_rpc_server(ctx.clone())?;
-    let info = server.publish(mount)?;
+    // The heartbeat first, as in `worker::run`: nothing is published by a
+    // call that then fails.
     crate::worker::heartbeat::spawn(ctx, server.vitals().clone())?;
-    Ok(info)
+    server.publish(mount)
 }
 
 /// Starts the RPC listener for `ctx` (§4.1 step 6) and returns its
@@ -246,8 +252,9 @@ impl Core {
     }
 
     /// Blocking accept, one thread per connection. Never exits on an error:
-    /// log, pause 100 ms, and exit 70 after 50 consecutive errors. Returns
-    /// only once the worker is stopping (the stop path wakes it).
+    /// log, pause 100 ms, and after 50 consecutive errors retain the dirty
+    /// sessions and exit 70 ([`Core::exit_after_accept_errors`]). Returns only
+    /// once the worker is stopping (the stop path wakes it).
     fn accept_loop(self: Arc<Self>, listener: TcpListener) {
         let mut consecutive = 0u32;
         loop {
@@ -287,15 +294,57 @@ impl Core {
                 "consecutive": consecutive,
             });
             if consecutive >= timing::ACCEPT_ERROR_LIMIT {
-                crate::util::log::event!(fatal, WORKER_EXITED, {
-                    "reason": "consecutive accept errors",
-                    "consecutive": consecutive,
-                    "exit_code": crate::model::ipc::EXIT_INTERNAL,
-                });
-                std::process::exit(crate::model::ipc::EXIT_INTERNAL);
+                self.exit_after_accept_errors(consecutive);
             }
             thread::sleep(timing::ACCEPT_ERROR_PAUSE);
         }
+    }
+
+    /// The exit after [`timing::ACCEPT_ERROR_LIMIT`] consecutive accept errors
+    /// (exit 70; the supervisor restarts the worker). Like the poison exit, it
+    /// first retains every dirty session (invariant 8): a realistic cause is
+    /// descriptor exhaustion, with a mount up and files unsaved.
+    ///
+    /// The engine is taken without waiting on a wedged holder
+    /// (`try_lock_engine`, retried for at most [`EXIT_RETAIN_WAIT`]), then
+    /// `retain_all_dirty` runs with a panic contained, and the fatal
+    /// `WORKER_EXITED` line logs the outcome (`retained_dirty`, `error`,
+    /// `retain_panicked`, `engine_busy`). The process exits while still holding
+    /// the engine, so nothing changes after the retain. An engine still busy at
+    /// the deadline is logged and the exit proceeds: nobody can retain from a
+    /// wedged engine. A poisoned engine takes the poison exit instead (its
+    /// policy runs inside `try_lock_engine`). `runtime.json` and `worker.json`
+    /// stay, as after the poison exit: the next worker's FUSE recovery reads
+    /// this worker's record.
+    fn exit_after_accept_errors(&self, consecutive: u32) -> ! {
+        let deadline = Instant::now() + EXIT_RETAIN_WAIT;
+        let mut engine = loop {
+            match try_lock_engine(&self.ctx.engine) {
+                Some(engine) => break Some(engine),
+                None if Instant::now() >= deadline => break None,
+                None => thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let outcome = engine
+            .as_mut()
+            .map(|engine| catch_unwind(AssertUnwindSafe(|| engine.retain_all_dirty())));
+        let (retained, error, panicked) = match &outcome {
+            Some(Ok(Ok(retained))) => (Some(*retained), None, false),
+            Some(Ok(Err(error))) => (None, Some(format!("{error:#}")), false),
+            Some(Err(_)) => (None, None, true),
+            None => (None, None, false),
+        };
+        crate::util::log::event!(fatal, WORKER_EXITED, {
+            "reason": "consecutive accept errors",
+            "consecutive": consecutive,
+            "retained_dirty": retained,
+            "error": error,
+            "retain_panicked": panicked,
+            "engine_busy": engine.is_none(),
+            "exit_code": crate::model::ipc::EXIT_INTERNAL,
+        });
+        // Exit while still holding the engine (if taken).
+        std::process::exit(crate::model::ipc::EXIT_INTERNAL)
     }
 
     /// One connection: a persistent request loop. Notifications are delivered

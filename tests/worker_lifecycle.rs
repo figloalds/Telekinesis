@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
+    net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -421,6 +422,78 @@ fn ready_worker_record_and_hello_describe_the_same_process() {
     assert!(!state.join("runtime.json").exists());
     assert!(!record::path(&state).exists());
     assert_eq!(record::read(&state).unwrap(), None);
+}
+
+/// `process_start_of` is a liveness check as well as an identity one: a
+/// worker that has exited but is not reaped yet (a zombie on Linux; on
+/// Windows, a process object kept by this test's `Child` handle) reads as
+/// absent, so adoption never takes a dead worker for its live record.
+#[test]
+fn process_start_of_treats_an_exited_unreaped_worker_as_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    assert!(record::process_start_of(std::process::id()).is_some());
+    let mut worker = TimedWorker::spawn(dir.path(), &state, &[], &[]);
+    worker.until_ready(&state);
+    let pid = worker.child.id();
+    let written = record::read(&state).unwrap().unwrap();
+    assert_eq!(written.pid, pid);
+    assert_eq!(record::process_start_of(pid), Some(written.process_start));
+    rpc_at(&state, json!({"op":"stop"})).unwrap();
+    // The child is neither waited for nor polled until the check passes.
+    wait_for(
+        "the exited, unreaped worker reads as absent",
+        Duration::from_secs(20),
+        || record::process_start_of(pid).is_none(),
+    );
+    let exit = worker.child.wait().unwrap();
+    assert_eq!(exit.code(), Some(0));
+    assert_eq!(record::process_start_of(pid), None);
+}
+
+/// A fatal failure once `runtime.json` is published (§4.1 step 7; here the
+/// `worker.json` write, failed by `worker.write_record`) withdraws
+/// `runtime.json` before the `FatalLine` (exit 70), so nobody finds a
+/// listener that dies with the process; a previous worker's `worker.json`
+/// (what a crash leaves) is kept for the next worker's recovery.
+#[test]
+fn fatal_after_publish_withdraws_runtime_json_and_keeps_the_previous_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    let mut previous = WorkerProc::spawn(&state, &[], &[]).unwrap();
+    previous.wait_ready(READY).unwrap();
+    let previous_record = fs::read(record::path(&state)).unwrap();
+    previous.stop().unwrap();
+    fs::write(record::path(&state), &previous_record).unwrap();
+
+    let mut worker = WorkerProc::spawn(
+        &state,
+        &[],
+        &[
+            ("TKFS_FAULT_POINT", "worker.write_record"),
+            ("TKFS_FAULT_ACTION", "fail"),
+        ],
+    )
+    .unwrap();
+    let fatal = fatal_line(&mut worker);
+    assert_eq!(fatal["code"], "FAULT_INJECTED", "{fatal}");
+    assert_eq!(fatal["exit_code"], 70, "{fatal}");
+    let exit = worker.wait_exit(Duration::from_secs(10)).expect("exit");
+    assert_eq!(exit.code(), Some(70));
+    assert!(
+        worker.seen.iter().all(|line| line["ready"] != true),
+        "{:?}",
+        worker.seen
+    );
+    assert!(
+        !state.join("runtime.json").exists(),
+        "runtime.json withdrawn"
+    );
+    assert_eq!(
+        fs::read(record::path(&state)).unwrap(),
+        previous_record,
+        "the previous worker's record is kept"
+    );
 }
 
 /// Invariant 24: store recovery (including pending saves) completes before
@@ -892,6 +965,99 @@ fn poison_exit_persists_dirty() {
     assert!(pending_saves(&state) >= 1 || fuse_may_flush());
     let log = fs::read_to_string(state.join("worker.log")).unwrap();
     assert!(log.contains("ENGINE_POISONED"), "{log}");
+    release_mount(&mount);
+
+    let mut restarted = WorkerProc::spawn(&state, &[], &[]).unwrap();
+    restarted.wait_ready(READY).unwrap();
+    wait_saved(&restarted);
+    restarted.stop().unwrap();
+    assert_eq!(committed(&state, "dirty.txt"), bytes);
+}
+
+/// Invariant 8 on the other planned exit: after 50 consecutive accept errors
+/// (`worker.accept_error` on every accept) the worker retains the dirty
+/// session before it exits 70, logs the outcome in the fatal `WORKER_EXITED`
+/// line, and a restart commits the bytes. Without mount support it still
+/// exits 70, with nothing to retain.
+#[test]
+fn accept_error_exit_persists_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    let mount = dir.path().join("mnt");
+    let mount_arg = mount.to_string_lossy().into_owned();
+    let mounted = mount_supported();
+    let mount_args = ["--mount", mount_arg.as_str()];
+    let args: &[&str] = if mounted { &mount_args } else { &[] };
+    let mut worker = WorkerProc::spawn(
+        &state,
+        args,
+        &[
+            ("TKFS_FAULT_POINT", "worker.accept_error"),
+            ("TKFS_FAULT_ACTION", "fail"),
+        ],
+    )
+    .unwrap();
+    let ready = worker.wait_ready(READY).unwrap();
+    assert_eq!(ready["mounted"], mounted, "{ready}");
+    let bytes = b"dirty bytes that must survive the accept-error exit".to_vec();
+    let file = mounted.then(|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(mount.join("dirty.txt"))
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file
+    });
+    // Every accept fails: connect until the worker gives up (50 errors,
+    // 100 ms apart).
+    let address: SocketAddr = ready["address"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("ws://")
+        .parse()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let exit = loop {
+        if let Some(exit) = worker.try_exit() {
+            break exit;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no exit after accept errors\n{}",
+            worker.log_tail()
+        );
+        let _ = TcpStream::connect_timeout(&address, Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(50));
+    };
+    drop(file);
+    assert_eq!(exit.code(), Some(70));
+    let log = fs::read_to_string(state.join("worker.log")).unwrap();
+    let exited = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["code"] == "WORKER_EXITED")
+        .unwrap_or_else(|| panic!("no WORKER_EXITED line: {log}"));
+    if mounted {
+        assert!(
+            pending_saves(&state) >= 1 || fuse_may_flush(),
+            "the dirty session was not retained: {exited}"
+        );
+    }
+    assert_eq!(exited["level"], "fatal", "{exited}");
+    assert_eq!(exited["consecutive"], 50, "{exited}");
+    assert_eq!(exited["engine_busy"], false, "{exited}");
+    assert_eq!(exited["retain_panicked"], false, "{exited}");
+    assert!(exited["error"].is_null(), "{exited}");
+    let retained = exited["retained_dirty"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no retained_dirty: {exited}"));
+    if !mounted {
+        assert_eq!(retained, 0, "{exited}");
+        return;
+    }
+    assert!(retained >= 1 || fuse_may_flush(), "{exited}");
     release_mount(&mount);
 
     let mut restarted = WorkerProc::spawn(&state, &[], &[]).unwrap();

@@ -11,21 +11,26 @@
 //!    thread (invariant 28);
 //! 4. `Engine::new` (recovers pending saves);
 //! 5. build the `WorkerCtx`;
-//! 6. start the RPC listener: recovery is complete before any RPC (invariant 24);
+//! 6. start the RPC listener: recovery is complete before any RPC (invariant
+//!    24); then the heartbeat thread (§4.1 step 10, moved here so that
+//!    nothing fallible remains after Ready);
 //! 7. write `runtime.json` and `worker.json` (`runtime.json.mount` is the
 //!    absolute, normalized legacy `--mount` once prepared, or the path of a
-//!    successful `mount-attach`; `None` before);
+//!    successful `mount-attach`; `None` before); a failure withdraws them
+//!    (`runtime.json`, and `worker.json` if it is this process's) before the
+//!    `FatalLine`;
 //! 8. legacy/standalone `--mount` without `--supervised`: attach now, and
 //!    report a failure in Ready (never fatal; a stop accepted since step 6
 //!    skips it); `--supervised`: the orchestrator attaches later through
 //!    `mount-attach`;
 //! 9. print the `ReadyLine`;
-//! 10. start the heartbeat;
+//! 10. install the Linux signal handlers;
 //! 11. wait for `stopping`, let the stop reply flush (≤ 2 s), remove
 //!     `runtime.json` and `worker.json`.
 //!
 //! Failures before Ready print a `FatalLine` and exit 73 (store), 75
-//! (locked), 78 (configuration) or 70 (internal).
+//! (locked), 78 (configuration) or 70 (internal). Nothing after Ready prints
+//! a `FatalLine`.
 pub mod activator;
 pub mod heartbeat;
 pub mod maintenance;
@@ -298,9 +303,12 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     fault::trigger("worker.startup").map_err(internal)?;
     // 5. context
     let ctx = build_ctx(engine, &state, args.supervised, previous);
-    // 6. RPC
+    // 6. RPC, then the heartbeat thread (moved up from step 10: started
+    // before anything is published, its failure is a FatalLine with nothing
+    // to withdraw, and nothing fallible remains after Ready)
     crate::startup::progress("starting RPC listener");
     let server = start_rpc_server(ctx.clone()).map_err(internal)?;
+    heartbeat::spawn(ctx.clone(), vitals.clone()).map_err(|error| internal(error.into()))?;
     // 7. runtime.json and worker.json. The legacy `--mount` is prepared first
     // (absolute, normalized, parent created; a failure is the mount error of
     // step 8), so `runtime.json.mount` is the absolute path step 8 attaches,
@@ -314,23 +322,34 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
         .as_ref()
         .and_then(|prepared| prepared.as_ref().ok())
         .map(|path| path.to_string_lossy().into_owned());
-    let discovery = server.publish(published).map_err(internal)?;
-    let worker_record = WorkerRecord {
-        format: WORKER_RECORD_FORMAT,
-        pid: std::process::id(),
-        instance: ctx.instance.clone(),
-        address: discovery.address.clone(),
-        version: ctx.version.clone(),
-        ipc: IPC_VERSION,
-        repo: ctx.repo.clone(),
-        device: ctx.device.clone(),
-        started_at_ms: ctx.started_at_ms,
-        process_start: record::process_start(),
-        executable: record::executable().map_err(internal)?,
-        supervised: args.supervised,
-        token: None,
-    };
-    record::write_atomic(&state, &worker_record).map_err(internal)?;
+    let executable = record::executable().map_err(internal)?;
+    let records = (|| -> Result<crate::runtime::Discovery> {
+        let discovery = server.publish(published)?;
+        fault::fail("worker.write_record")?;
+        record::write_atomic(
+            &state,
+            &WorkerRecord {
+                format: WORKER_RECORD_FORMAT,
+                pid: std::process::id(),
+                instance: ctx.instance.clone(),
+                address: discovery.address.clone(),
+                version: ctx.version.clone(),
+                ipc: IPC_VERSION,
+                repo: ctx.repo.clone(),
+                device: ctx.device.clone(),
+                started_at_ms: ctx.started_at_ms,
+                process_start: record::process_start(),
+                executable,
+                supervised: args.supervised,
+                token: None,
+            },
+        )?;
+        Ok(discovery)
+    })();
+    let discovery = records.map_err(|error| {
+        withdraw_records(&state, &ctx.instance);
+        internal(error)
+    })?;
     // 8. legacy synchronous mount; never fatal. RPC is up since step 6: a
     // stop accepted meanwhile wins (`WORKER_STOPPING`, nothing attached), and
     // a stop that arrives during the attach waits for it, then detaches.
@@ -368,8 +387,9 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
         ipc: IPC_VERSION,
         token: None,
     });
-    // 10. background threads
-    heartbeat::spawn(ctx.clone(), vitals).map_err(|error| internal(error.into()))?;
+    // 10. signal handlers. Nothing after Ready is fatal: a thread started
+    // here (WP2.3's maintenance and activator) must log a failure to start,
+    // not print a FatalLine after the ReadyLine.
     #[cfg(target_os = "linux")]
     unsafe {
         libc::signal(libc::SIGINT, signal_stop as libc::sighandler_t);
@@ -381,6 +401,23 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
         idle_limit: args.supervised.then(idle_limit).flatten(),
         _lock: lock,
     })
+}
+
+/// A fatal failure once step 7 began (before Ready): remove `runtime.json`
+/// (with `owner.lock` held no live worker owns it; it may advertise this
+/// process's listener, which dies with the exit) and `worker.json` if it is
+/// this process's record. A previous worker's record is kept: it describes a
+/// dead process (adoption checks `process_start_of`), and its instance is what
+/// the next worker's FUSE recovery matches a stale mount against.
+fn withdraw_records(state: &Path, instance: &str) {
+    let _ = fs::remove_file(state.join("runtime.json"));
+    if record::read(state)
+        .ok()
+        .flatten()
+        .is_some_and(|record| record.instance == instance)
+    {
+        let _ = record::remove(state);
+    }
 }
 
 /// `owner.lock` is held by another process: `ALREADY_RUNNING` (exit 75).

@@ -98,10 +98,19 @@ pub fn executable() -> Result<PathBuf> {
     Ok(std::env::current_exe()?)
 }
 
-/// The `process_start` of a live process: the Windows creation FILETIME
+/// The `process_start` of a running process: the Windows creation FILETIME
 /// (`GetProcessTimes`), or Linux `/proc/<pid>/stat` field 22 (start time in
-/// clock ticks since boot). `None` if the process does not exist or cannot be
-/// queried.
+/// clock ticks since boot). `None` if the process does not exist, cannot be
+/// queried, or **has exited**: this is a liveness check as well as an
+/// identity one. An exited process can still be queried while it is not
+/// reaped (a zombie, `/proc/<pid>/stat` state `Z`, on Linux) or while any
+/// handle keeps its process object (for example the parent's
+/// `std::process::Child`, on Windows); both read as absent.
+///
+/// Windows tells a running process by `GetExitCodeProcess` returning
+/// `STILL_ACTIVE` (259), so a process that exited *with* code 259 reads as
+/// running; tkfs never exits with 259 (its codes are 0, 70, 73, 75, 78 and
+/// the fault exit).
 #[cfg(windows)]
 pub fn process_start_of(pid: u32) -> Option<u64> {
     use std::ffi::c_void;
@@ -114,6 +123,7 @@ pub fn process_start_of(pid: u32) -> Option<u64> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+        fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
         fn GetProcessTimes(
             process: *mut c_void,
             creation: *mut FileTime,
@@ -124,10 +134,13 @@ pub fn process_start_of(pid: u32) -> Option<u64> {
         fn CloseHandle(handle: *mut c_void) -> i32;
     }
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         return None;
     }
+    let mut code = 0u32;
+    let running = unsafe { GetExitCodeProcess(handle, &mut code) } != 0 && code == STILL_ACTIVE;
     let mut creation = FileTime::default();
     let (mut exit, mut kernel, mut user) = (
         FileTime::default(),
@@ -136,7 +149,7 @@ pub fn process_start_of(pid: u32) -> Option<u64> {
     );
     let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     unsafe { CloseHandle(handle) };
-    (ok != 0).then(|| (u64::from(creation.high) << 32) | u64::from(creation.low))
+    (running && ok != 0).then(|| (u64::from(creation.high) << 32) | u64::from(creation.low))
 }
 
 /// See the Windows variant.
@@ -145,11 +158,17 @@ pub fn process_start_of(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // Field 2 (comm) is parenthesized and may contain spaces and parentheses;
     // the fields after the last ')' start at field 3.
-    let rest = &stat[stat.rfind(')')? + 1..];
-    rest.split_whitespace().nth(22 - 3)?.parse().ok()
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    // Field 3, the state: a zombie (`Z`) or dead (`X`; `x` on 2.6.33–3.13
+    // kernels) process has exited.
+    if matches!(fields.next()?, "Z" | "X" | "x") {
+        return None;
+    }
+    fields.nth(22 - 4)?.parse().ok()
 }
 
-/// See the Windows variant (no process start time on this platform).
+/// See the Windows variant (no process start time on this platform, so
+/// adoption fails closed).
 #[cfg(not(any(windows, target_os = "linux")))]
 pub fn process_start_of(_pid: u32) -> Option<u64> {
     None
