@@ -597,8 +597,9 @@ fn owner_lock_free(directory: &Path) -> bool {
     crate::orchestrator::lock_state(directory).is_ok()
 }
 
-/// The error an unexpected worker exit stands for.
-fn classify_exit(exit: &ExitRecord, log: &Path) -> ErrorWire {
+/// The error an unexpected worker exit stands for. `adopted`: the worker is
+/// not our child, so a missing exit code means "unknown", not a signal.
+fn classify_exit(exit: &ExitRecord, adopted: bool, log: &Path) -> ErrorWire {
     if let Some(fatal) = &exit.fatal {
         return fatal.to_wire();
     }
@@ -615,10 +616,39 @@ fn classify_exit(exit: &ExitRecord, log: &Path) -> ErrorWire {
             "WORKER_EXITED",
             format!("WORKER_EXITED: exit code {code}; see {}", log.display()),
         ),
+        None if adopted => ErrorWire::new(
+            "WORKER_EXITED",
+            format!(
+                "WORKER_EXITED: the adopted worker exited (its exit code cannot be read); see {}",
+                log.display()
+            ),
+        ),
         None => ErrorWire::new(
             "WORKER_EXITED",
             format!("WORKER_EXITED: terminated; see {}", log.display()),
         ),
+    }
+}
+
+/// Whether a worker that exited during a stop that would restart it crashed
+/// (§3.3 "Stopping → Backoff (crashed while stopping)"). A kill of ours is
+/// never a crash, and a known exit code is the answer: 0 is the clean end of
+/// the stop. Without a code:
+///
+/// * an adopted worker is not our child, so the launcher cannot read its exit
+///   code (WP1.3 reports `None` from its pid probe on Unix). Its exit is the
+///   stop it was asked for (acknowledged, in flight, or lost with the
+///   connection), unless it had refused that stop (StopBlocked) and no retry
+///   was in flight;
+/// * a spawned worker was terminated by a signal: a crash.
+fn crashed_while_stopping(plan: &StopPlan, killed: bool, adopted: bool, code: Option<i32>) -> bool {
+    if killed {
+        return false;
+    }
+    match code {
+        Some(code) => code != ipc::EXIT_OK,
+        None if adopted => plan.blocked.is_some() && plan.rpc.is_none(),
+        None => true,
     }
 }
 
@@ -737,6 +767,7 @@ impl Controller {
             if !self.done {
                 self.on_timers();
             }
+            self.end_if_retired();
             self.after_step();
         }
         self.finish();
@@ -1528,9 +1559,21 @@ impl Controller {
         for waiter in self.waiters.drain(..) {
             let _ = waiter.reply.send(Err(error.clone()));
         }
-        if self.worker.is_some() {
-            self.stop_worker(false, AfterStop::Retire);
+        if self.worker.is_none() || self.failed.is_some() {
+            // No process, or one a graceful stop does not touch (an
+            // unresponsive adopted worker, or one that survived its kills):
+            // it is left running, like a busy worker at retire.
+            self.done = true;
         } else {
+            self.stop_worker(false, AfterStop::Retire);
+        }
+    }
+
+    /// A retired controller ends once it owns no process, or once the process
+    /// it still has is one it gives up on (Failed). Whatever the stop plan
+    /// would have done afterwards (Backoff, Fail) no longer applies.
+    fn end_if_retired(&mut self) {
+        if self.retired && (self.worker.is_none() || self.failed.is_some()) {
             self.done = true;
         }
     }
@@ -2062,6 +2105,13 @@ impl Controller {
             at_ms: self.now_ms(),
         };
         let killed = worker.killed;
+        let adopted = worker.record.is_some() || worker.process.adopted();
+        // The stop plan's RPC state decides the exit's meaning (below); it is
+        // read before the worker's RPCs are forgotten.
+        let crashed = self
+            .stop
+            .as_ref()
+            .is_some_and(|plan| crashed_while_stopping(plan, killed, adopted, exit.code));
         self.drop_worker_rpcs();
         self.running = None;
         self.heartbeat = None;
@@ -2080,10 +2130,9 @@ impl Controller {
             return;
         }
         if let Some(plan) = self.stop.take() {
-            let crashed = !killed && exit.code != Some(ipc::EXIT_OK);
             if crashed && matches!(plan.after, AfterStop::Start) {
                 // Crashed while stopping for a restart: back off (§3.3).
-                let error = classify_exit(&exit, &self.worker_log());
+                let error = classify_exit(&exit, adopted, &self.worker_log());
                 self.fail(error, exit);
                 return;
             }
@@ -2107,7 +2156,7 @@ impl Controller {
             return;
         }
         self.start = None;
-        let error = classify_exit(&exit, &self.worker_log());
+        let error = classify_exit(&exit, adopted, &self.worker_log());
         event!(warn, WORKER_EXITED, {
             "folder": self.state,
             "exit_code": exit.code,
@@ -2255,8 +2304,12 @@ impl Controller {
         let branches = heartbeat.generations.branches;
         match self.published.branches_gen {
             Some(seen) if seen != branches => self.published.refresh = true,
+            // The entry was taken before any heartbeat (the summary on Ready),
+            // so the branches generation it reflects is unknown and a change
+            // since then would be missed: one more summary, requested with
+            // this heartbeat's generation (one extra call per start).
             None if self.published.entry.is_some() && self.published.rpc.is_none() => {
-                self.published.branches_gen = Some(branches)
+                self.published.refresh = true
             }
             _ => {}
         }
@@ -2332,7 +2385,10 @@ impl Controller {
     /// Stops the worker (or cancels a start without one) and then does `after`.
     fn stop_worker(&mut self, force: bool, after: AfterStop) {
         if let Some(plan) = self.stop.as_mut() {
-            if matches!(plan.after, AfterStop::Stopped | AfterStop::Start) {
+            // Retire overrides any plan (a kill bound for Backoff or Fail too).
+            if matches!(after, AfterStop::Retire)
+                || matches!(plan.after, AfterStop::Stopped | AfterStop::Start)
+            {
                 plan.after = after;
             }
             let upgrade = force && !plan.force && plan.stage == StopStage::Requested;
@@ -2534,7 +2590,8 @@ impl Controller {
                     let error = ErrorWire::new(
                         "WORKER_STOP_TIMEOUT",
                         format!(
-                            "WORKER_STOP_TIMEOUT: worker pid {pid} did not exit after                              {KILL_ATTEMPTS} kill attempts"
+                            "WORKER_STOP_TIMEOUT: worker pid {pid} did not exit after {KILL_ATTEMPTS} \
+                             kill attempts"
                         ),
                     );
                     event!(error, WORKER_STOP_TIMEOUT, { "folder": self.state, "pid": pid });

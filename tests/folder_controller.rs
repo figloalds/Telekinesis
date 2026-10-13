@@ -10,7 +10,7 @@
 //! checked directly.
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -208,6 +208,8 @@ enum Mode {
     Ok,
     Fail,
     Hang,
+    /// Blocks while the mode stays `Hold`, then answers like `Ok`.
+    Hold,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -305,6 +307,8 @@ struct FakeWorker {
     sink: ProcessSink,
     alive: AtomicBool,
     killable: AtomicBool,
+    /// The exit code reported after a graceful or forced `stop`.
+    clean_exit: Option<i32>,
     behavior: Mutex<Behavior>,
     seq: AtomicU64,
     hb: Mutex<HbTemplate>,
@@ -423,6 +427,18 @@ impl FakeWorker {
                     self.sleep(deadline);
                     Err(timeout())
                 }
+                Mode::Hold => {
+                    let until = Instant::now() + deadline;
+                    while self.behavior.lock().unwrap().watch == Mode::Hold {
+                        if self.sleep(Duration::from_millis(10)) {
+                            return Err(CallError::ConnectionLost("the worker exited".into()));
+                        }
+                        if Instant::now() >= until {
+                            return Err(timeout());
+                        }
+                    }
+                    Ok(serde_json::to_value(self.heartbeat()).unwrap())
+                }
             },
             "hello" => match behavior.hello {
                 Mode::Ok => Ok(serde_json::to_value(HelloReply {
@@ -437,7 +453,7 @@ impl FakeWorker {
                 })
                 .unwrap()),
                 Mode::Fail => Err(timeout()),
-                Mode::Hang => {
+                Mode::Hang | Mode::Hold => {
                     self.sleep(deadline);
                     Err(timeout())
                 }
@@ -507,7 +523,8 @@ impl FakeWorker {
                 Mode::Ok => Ok(serde_json::to_value(PublishedSummary {
                     repo: self.repo.clone(),
                     replica: self.device.clone(),
-                    label: "fake".into(),
+                    // The label names the branches generation the summary saw.
+                    label: format!("fake-b{}", self.hb.lock().unwrap().branches),
                     branches: Vec::new(),
                     tip: FeedTip::default(),
                     sync_generation: 1,
@@ -532,10 +549,11 @@ impl FakeWorker {
         // at once and reports the exit shortly after.
         if self.alive.swap(false, Ordering::SeqCst) {
             let sink = self.sink.clone();
+            let code = self.clean_exit;
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
                 sink(ProcessEvent::Exited {
-                    code: Some(0),
+                    code,
                     fatal: None,
                     stderr_tail: String::new(),
                 });
@@ -619,6 +637,9 @@ struct FakeLauncher {
     default_behavior: Mutex<Behavior>,
     behavior_for: Mutex<BTreeMap<String, Behavior>>,
     adopt: Mutex<AdoptPlan>,
+    /// Whether the exit code of an adopted worker can be read. WP1.3 reads it
+    /// on Windows (a process handle); on Unix a pid probe reports `None`.
+    adopted_exit_known: AtomicBool,
     next_pid: AtomicU32,
 }
 
@@ -648,6 +669,11 @@ impl FakeLauncher {
             sink,
             alive: AtomicBool::new(true),
             killable: AtomicBool::new(true),
+            clean_exit: if adopted && !self.adopted_exit_known.load(Ordering::SeqCst) {
+                None
+            } else {
+                Some(0)
+            },
             behavior: Mutex::new(behavior),
             seq: AtomicU64::new(0),
             hb: Mutex::new(HbTemplate {
@@ -814,6 +840,7 @@ struct EnvBuilder {
     behavior: Behavior,
     behavior_for: BTreeMap<String, Behavior>,
     adopt: AdoptPlan,
+    adopted_exit_known: bool,
 }
 
 impl EnvBuilder {
@@ -831,6 +858,7 @@ impl EnvBuilder {
             behavior: Behavior::default(),
             behavior_for: BTreeMap::new(),
             adopt: AdoptPlan::None,
+            adopted_exit_known: false,
         }
     }
 
@@ -923,6 +951,13 @@ impl EnvBuilder {
         self
     }
 
+    /// Adopted workers report their real exit code (Windows) instead of
+    /// `None` (Unix, the default).
+    fn adopted_exit_known(mut self, known: bool) -> Self {
+        self.adopted_exit_known = known;
+        self
+    }
+
     /// Writes `STATE/worker.json` naming a previous worker.
     fn worker_record(self, state: &str, pid: u32, version: &str) -> Self {
         let folder = self.folders.iter().find(|f| f.state == state).unwrap();
@@ -975,6 +1010,7 @@ impl EnvBuilder {
             default_behavior: Mutex::new(self.behavior),
             behavior_for: Mutex::new(self.behavior_for),
             adopt: Mutex::new(self.adopt),
+            adopted_exit_known: AtomicBool::new(self.adopted_exit_known),
             next_pid: AtomicU32::new(1000),
         });
         let registry = FolderRegistry::start(RegistryDeps {
@@ -1587,6 +1623,32 @@ fn restart_whose_worker_crashes_while_stopping_backs_off() {
 }
 
 #[test]
+fn restart_whose_spawned_worker_is_signalled_while_stopping_backs_off() {
+    // A spawned worker is our child: no exit code means a signal, a crash.
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .behavior(|b| b.stop = StopB::AckNoExit)
+        .start();
+    env.running("a");
+    env.registry.send("a", FolderCmd::Restart).unwrap();
+    env.wait_view("a", "await exit", |v| {
+        matches!(
+            v.phase,
+            FolderPhase::Stopping {
+                stage: StopStage::AwaitExit,
+                ..
+            }
+        )
+    });
+    env.worker("a").exit(None, None);
+    let view = env.wait_view("a", "backoff", |v| {
+        matches!(v.phase, FolderPhase::Backoff { attempt: 1, .. })
+    });
+    assert_eq!(last_error(&view), Some("WORKER_EXITED"));
+    assert_eq!(env.launcher.launches(), 1);
+}
+
+#[test]
 fn default_limits_follow_the_plan_constants() {
     let limits = LifecycleLimits::default();
     assert_eq!(limits.worker_version, env!("CARGO_PKG_VERSION"));
@@ -1734,20 +1796,88 @@ fn adoption_match_runs_adopted_without_spawn() {
 
 #[test]
 fn adoption_version_mismatch_stops_then_spawns() {
+    // The old worker exits after its stop with an unknown exit code (Unix: a
+    // pid probe cannot read it) or with 0 (Windows): a replacement either way.
+    for known in [false, true] {
+        let env = EnvBuilder::new()
+            .folder("a", true)
+            .worker_record("a", 4242, "0.0.9")
+            .adopt(alive("0.0.9"))
+            .adopted_exit_known(known)
+            .start();
+        let view = env.wait_view("a", "spawned worker running", |v| {
+            matches!(v.phase, FolderPhase::Running { adopted: false, .. })
+        });
+        let stop = env.log.position("rpc:stop:graceful:old-a").unwrap();
+        let launch = env.log.position("launch:a").unwrap();
+        assert!(stop < launch, "{:?}", env.log.all());
+        assert_eq!(env.kills(), 0);
+        assert_ne!(view.worker.as_ref().unwrap().pid, 4242);
+        assert_eq!(env.log.count("catalog:set_desired"), 0);
+        assert_eq!(env.launcher.launches(), 1, "exit code known: {known}");
+        assert!(last_error(&view).is_none(), "not a failure: {view:#?}");
+    }
+}
+
+#[test]
+fn restart_of_an_adopted_worker_spawns_at_once_whatever_its_exit_code() {
+    for known in [false, true] {
+        let env = EnvBuilder::new()
+            .folder("a", true)
+            .worker_record("a", 4242, "0.1.0")
+            .adopt(alive("0.1.0"))
+            .adopted_exit_known(known)
+            .start();
+        env.wait_view("a", "adopted", |v| {
+            matches!(v.phase, FolderPhase::Running { adopted: true, .. })
+        });
+        env.registry.send("a", FolderCmd::Restart).unwrap();
+        let view = env.wait_view("a", "spawned worker running", |v| {
+            matches!(v.phase, FolderPhase::Running { adopted: false, .. })
+        });
+        assert!(env.log.position("rpc:stop:graceful:old-a").is_some());
+        assert_eq!(env.launcher.launches(), 1, "exit code known: {known}");
+        assert_eq!(env.kills(), 0);
+        assert!(last_error(&view).is_none(), "not a failure: {view:#?}");
+        assert!(!env.status.events().iter().any(|e| matches!(
+            e,
+            StatusEvent::FolderLifecycle(v) if matches!(v.phase, FolderPhase::Backoff { .. })
+        )));
+    }
+}
+
+#[test]
+fn adopted_worker_that_refused_a_restart_and_died_counts_as_a_crash() {
+    // The stop was refused (StopBlocked) and no retry was in flight: an exit
+    // with an unknown code is not the stop, so it is a counted failure.
     let env = EnvBuilder::new()
         .folder("a", true)
-        .worker_record("a", 4242, "0.0.9")
-        .adopt(alive("0.0.9"))
+        .worker_record("a", 4242, "0.1.0")
+        .adopt(AdoptPlan::Alive {
+            version: "0.1.0".into(),
+            behavior: Behavior {
+                stop: StopB::Busy,
+                ..Behavior::default()
+            },
+            mount: None,
+        })
         .start();
-    let view = env.wait_view("a", "spawned worker running", |v| {
-        matches!(v.phase, FolderPhase::Running { adopted: false, .. })
+    env.wait_view("a", "adopted", |v| {
+        matches!(v.phase, FolderPhase::Running { adopted: true, .. })
     });
-    let stop = env.log.position("rpc:stop:graceful:old-a").unwrap();
-    let launch = env.log.position("launch:a").unwrap();
-    assert!(stop < launch, "{:?}", env.log.all());
-    assert_eq!(env.kills(), 0);
-    assert_ne!(view.worker.as_ref().unwrap().pid, 4242);
-    assert_eq!(env.log.count("catalog:set_desired"), 0);
+    env.registry.send("a", FolderCmd::Restart).unwrap();
+    env.wait_view("a", "stop blocked", |v| {
+        matches!(v.phase, FolderPhase::StopBlocked { .. })
+    });
+    env.worker("a").exit(None, None);
+    let view = env.wait_view("a", "backoff", |v| {
+        matches!(v.phase, FolderPhase::Backoff { attempt: 1, .. })
+    });
+    assert_eq!(last_error(&view), Some("WORKER_EXITED"));
+    assert_eq!(env.launcher.launches(), 0);
+    env.advance(Duration::from_secs(2));
+    env.running("a");
+    assert_eq!(env.launcher.launches(), 1);
 }
 
 #[test]
@@ -1901,6 +2031,7 @@ fn legacy_orphan_is_stopped_before_the_spawn() {
         default_behavior: Mutex::new(Behavior::default()),
         behavior_for: Mutex::new(BTreeMap::new()),
         adopt: Mutex::new(AdoptPlan::None),
+        adopted_exit_known: AtomicBool::new(false),
         next_pid: AtomicU32::new(1000),
     });
     let sink: ProcessSink = Arc::new(|_| {});
@@ -2322,6 +2453,157 @@ fn catalog_changes_spawn_start_and_stop_controllers() {
 }
 
 #[test]
+fn retiring_a_failed_folder_leaves_its_unresponsive_worker_and_ends_the_controller() {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .worker_record("a", 4242, "0.1.0")
+        .adopt(AdoptPlan::Alive {
+            version: "0.1.0".into(),
+            behavior: Behavior {
+                hello: Mode::Fail,
+                ..Behavior::default()
+            },
+            mount: None,
+        })
+        .start();
+    env.wait_view("a", "adopting", |v| {
+        matches!(v.phase, FolderPhase::Starting { adopting: true, .. })
+    });
+    env.advance(Duration::from_secs(31));
+    let view = env.wait_view("a", "failed", |v| error_code(&v.phase).is_some());
+    assert_eq!(
+        error_code(&view.phase),
+        Some("PREVIOUS_WORKER_UNRESPONSIVE")
+    );
+    assert_eq!(env.registry.running_slots(), 1);
+    env.catalog.mutate(|s| s.folders.clear());
+    wait_for("a retired", || env.registry.view("a").is_none());
+    // The controller ends (its slot is released); the worker is left running.
+    wait_for("controller ended", || env.registry.running_slots() == 0);
+    assert!(env.worker("a").alive());
+    assert_eq!(env.kills(), 0);
+    assert_eq!(env.log.count("rpc:stop"), 0);
+}
+
+#[test]
+fn retiring_during_a_kill_ends_the_controller_even_if_the_worker_never_exits() {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .plan(Plan::Silent)
+        .start();
+    env.wait_view("a", "starting", |v| {
+        matches!(v.phase, FolderPhase::Starting { .. })
+    });
+    let worker = env.worker("a");
+    worker.killable.store(false, Ordering::SeqCst);
+    // Watchdog expiry: kill, then Backoff once the worker is gone.
+    env.advance(Duration::from_secs(31));
+    wait_for("first kill", || env.kills() == 1);
+    env.advance(Duration::from_secs(11));
+    wait_for("second kill", || env.kills() == 2);
+    env.catalog.mutate(|s| s.folders.clear());
+    wait_for("a retired", || env.registry.view("a").is_none());
+    assert_eq!(env.registry.running_slots(), 1);
+    // The kills are exhausted (WORKER_STOP_TIMEOUT): the retired controller
+    // ends instead of waiting forever. No Tick reaches a retired folder, so
+    // its own timer (at most 2 s) fires.
+    env.clock.advance(Duration::from_secs(11));
+    wait_for("controller ended", || env.registry.running_slots() == 0);
+    assert!(worker.alive());
+    assert_eq!(env.kills(), 2);
+}
+
+#[test]
+fn shutdown_racing_catalog_additions_reaches_every_controller() {
+    // Folders keep appearing while shutdown runs. Every controller that exists
+    // afterwards answered the shutdown (none was added after its handles were
+    // collected), and every launched worker belongs to one of them.
+    for round in 0..12u64 {
+        let env = EnvBuilder::new().folder("a", true).start();
+        env.running("a");
+        let stop = Arc::new(AtomicBool::new(false));
+        let adder = {
+            let catalog = env.catalog.clone();
+            let stop = stop.clone();
+            let base = env.dir.path().join("states");
+            thread::spawn(move || {
+                let mut next = 0;
+                while !stop.load(Ordering::SeqCst) && next < 400 {
+                    let state = format!("n{next}");
+                    next += 1;
+                    catalog.mutate(|s| {
+                        s.folders.push(FolderRecord {
+                            state: state.clone(),
+                            label: state.clone(),
+                            repo: format!("repo-{state}"),
+                            device: format!("dev-{state}"),
+                            directory: base.join(&state),
+                            mount: None,
+                            desired_running: next % 2 == 0,
+                            sync_enabled: true,
+                            mount_enabled: false,
+                        })
+                    });
+                    thread::yield_now();
+                }
+            })
+        };
+        thread::sleep(Duration::from_millis(2 + round % 5));
+        let outcomes = env.registry.shutdown(Duration::from_secs(2));
+        stop.store(true, Ordering::SeqCst);
+        adder.join().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let answered: BTreeSet<String> = outcomes.iter().map(|o| o.state.clone()).collect();
+        for view in env.registry.all() {
+            assert!(
+                answered.contains(&view.record.state),
+                "round {round}: {} has a controller but no shutdown outcome",
+                view.record.state
+            );
+        }
+        for entry in env.log.all() {
+            if let Some(state) = entry.strip_prefix("launch:") {
+                assert!(
+                    answered.contains(state),
+                    "round {round}: {state} launched a worker outside the shutdown"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn published_entry_taken_before_the_first_heartbeat_is_refreshed_once() {
+    // The summary on Ready precedes every heartbeat, so its branches
+    // generation is unknown; a branch change before the first heartbeat must
+    // still reach the entry.
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .behavior(|b| b.watch = Mode::Hold)
+        .start();
+    env.running("a");
+    wait_for("entry", || env.published.entry("a").is_some());
+    assert_eq!(env.published.entry("a").unwrap().label, "fake-b0");
+    assert_eq!(env.log.count("rpc:published-summary"), 1);
+    let worker = env.worker("a");
+    worker.hb.lock().unwrap().branches = 5;
+    worker.set(|b| b.watch = Mode::Ok);
+    wait_for("refreshed entry", || {
+        env.published
+            .entry("a")
+            .is_some_and(|e| e.label == "fake-b5")
+    });
+    env.wait_view("a", "heartbeats", |v| {
+        v.heartbeat.as_ref().is_some_and(|hb| hb.seq >= 4)
+    });
+    assert_eq!(
+        env.log.count("rpc:published-summary"),
+        2,
+        "one extra summary per start, not one per heartbeat"
+    );
+}
+
+#[test]
 fn published_summary_failure_marks_the_entry_unavailable_and_branch_changes_refresh() {
     let env = EnvBuilder::new()
         .folder("a", true)
@@ -2345,6 +2627,10 @@ fn published_summary_failure_marks_the_entry_unavailable_and_branch_changes_refr
         matches!(view.phase, FolderPhase::Running { .. }),
         "only the entry is affected"
     );
+    // The retry below then carries a known branches generation (a summary
+    // taken before the first heartbeat is followed by one more, see
+    // `published_entry_taken_before_the_first_heartbeat_is_refreshed_once`).
+    env.wait_view("a", "heartbeat", |v| v.heartbeat.is_some());
     env.worker("a").set(|b| b.summary = Mode::Ok);
     env.advance(Duration::from_secs(61));
     wait_for("running entry", || {
@@ -2361,7 +2647,12 @@ fn published_summary_failure_marks_the_entry_unavailable_and_branch_changes_refr
     let calls = env.log.count("rpc:published-summary");
     let tip = env.published.entry("a").unwrap().tip;
     wait_for("tip moves", || env.published.entry("a").unwrap().tip != tip);
-    assert_eq!(env.log.count("rpc:published-summary"), calls);
+    assert_eq!(
+        env.log.count("rpc:published-summary"),
+        calls,
+        "{:?}",
+        env.log.all()
+    );
     // A branch change triggers another summary.
     env.worker("a").hb.lock().unwrap().branches = 9;
     wait_for("summary after branch change", || {
