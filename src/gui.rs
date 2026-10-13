@@ -525,7 +525,8 @@ pub fn run(config_path: &Path) -> Result<()> {
         state: state.into()
     });
     handler!(on_stop_folder, |state| Action::Stop {
-        state: state.into()
+        state: state.into(),
+        wait: None
     });
     handler!(on_configure_mount, |state, mount| Action::ConfigureMount {
         state: state.into(),

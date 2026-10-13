@@ -272,6 +272,7 @@ fn one_repository_uses_all_bulk_lanes_and_keeps_control_free_of_objects() {
     // A connected orchestrator is not evidence of an available folder worker.
     a.call(Action::Stop {
         state: pa["state"].as_str().unwrap().into(),
+        wait: None,
     });
     wait_for(|| {
         let status = inspect();
@@ -346,6 +347,7 @@ fn folder_lifecycle_persistent_pool_bidirectional_sync_and_restart() {
     let state = first_b["state"].as_str().unwrap().to_owned();
     b.call(Action::Stop {
         state: state.clone(),
+        wait: None,
     });
     let inspect = b.call(Action::Inspect {
         state: state.clone(),
@@ -465,6 +467,7 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     let state = broken["state"].as_str().unwrap().to_owned();
     a.call(Action::Stop {
         state: state.clone(),
+        wait: None,
     });
     let local_bytes = b"local unsent object";
     write(&broken_b, "local-repair.txt", local_bytes);
@@ -593,6 +596,7 @@ fn real_mount_can_write_stop_reconfigure_and_remount() {
     );
     a.call(Action::Stop {
         state: state.clone(),
+        wait: None,
     });
     let new_mount = a.root.path().join("relocated");
     a.call(Action::ConfigureMount {
@@ -623,6 +627,7 @@ fn startup_returns_observable_state_and_can_be_cancelled() {
     let stopped = node
         .try_call(Action::Stop {
             state: state.clone(),
+            wait: None,
         })
         .unwrap();
     assert_eq!(stopped["starting"], false);
@@ -883,16 +888,23 @@ fn real_partial_mount_fetches_on_read_without_blocking_unrelated_metadata() {
     write(&pa, "remote.txt", bytes);
     b.pair(&a, &a.code());
     let pb = b.receive(&a, &pa);
+    // `content.complete` is vacuously true before the event commits, so also
+    // require the object to be installed before it is deleted below
+    // (CCR-WP0.5-3, applied by WP0.INT).
     wait_for(|| {
-        rpc(&pb, json!({"op":"status"}))["content"]["complete"] == true
+        let content = rpc(&pb, json!({"op":"status"}))["content"].clone();
+        content["complete"] == true
+            && content["current_available"].as_u64().unwrap_or(0) >= 1
             && has(&pb, "remote.txt", bytes)
     });
     a.call(Action::Stop {
         state: pa["state"].as_str().unwrap().into(),
+        wait: None,
     });
     let state = pb["state"].as_str().unwrap().to_owned();
     b.call(Action::Stop {
         state: state.clone(),
+        wait: None,
     });
     fs::remove_file(
         Path::new(pb["directory"].as_str().unwrap())
@@ -1027,9 +1039,11 @@ fn received_mount_waits_for_complete_metadata_across_daemon_restart() {
     // Once initialized, remounting remains possible with the source stopped.
     a.call(Action::Stop {
         state: pa["state"].as_str().unwrap().into(),
+        wait: None,
     });
     b.call(Action::Stop {
         state: state.clone(),
+        wait: None,
     });
     b.call(Action::Start { state });
     assert!(mount.join("parent/child").is_dir());
