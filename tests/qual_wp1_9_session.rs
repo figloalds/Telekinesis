@@ -11,7 +11,11 @@ mod support;
 use serde_json::json;
 use std::{
     net::{TcpListener, TcpStream},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -173,7 +177,8 @@ fn upload(conn: &Conn, count: u64, block: &[u8]) -> Result<u64, CallError> {
 }
 
 /// A slow request on one stream must not delay fast requests on another
-/// stream of the same connection.
+/// stream of the same connection, and bulk data queued ahead must not delay a
+/// control call (`control_queued_30mib_p99_ms`).
 #[test]
 #[ignore = "WP1.9"]
 fn slow_does_not_block_fast() {
@@ -233,7 +238,89 @@ fn slow_does_not_block_fast() {
     s.check(slow.is_ok(), format!("slow call: {slow:?}"));
     let summary = summarize(&samples);
     s.metric_with("fast_p99_ms", summary.p99, "ms", summary.json());
+    control_under_queued_data(&mut s);
     s.finish();
+}
+
+/// §14 WP1.9: a control call is answered < 50 ms while 30 MiB of data is
+/// queued. A producer keeps the client's data queue (32 MiB) full; each of 200
+/// calls starts with at least 30 MiB queued. The metric is the p99, as for
+/// `fast_p99_ms`; the max is recorded with it. (On Windows loopback, data
+/// already in the kernel moves in steps of the 15.6 ms timer tick while the
+/// sender's socket is full, so samples cluster at 1, 2 or 3 ticks; on Linux
+/// the max is about 2 ms.)
+fn control_under_queued_data(s: &mut Scenario) {
+    const QUEUED: u64 = 30 * MIB as u64;
+    let (client, server, _) = session(false, false, ConnOptions::default());
+    server.serve(service());
+    let stop = Arc::new(AtomicBool::new(false));
+    let producer = {
+        let client = client.clone();
+        let stop = stop.clone();
+        thread::spawn(move || -> Result<u64, CallError> {
+            let block = seeded_bytes(23, MIB);
+            let mut upload =
+                client.upload("upload", json!({}), Priority::Data, Duration::from_secs(30))?;
+            let mut parts = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                let header = ChunkHeader {
+                    id: 0,
+                    hash: None,
+                    offset: parts * MIB as u64,
+                    total: 0,
+                    last: false,
+                };
+                upload.chunk(header, &block)?;
+                parts += 1;
+            }
+            let reply = upload.finish()?;
+            Ok(reply.header["bytes"].as_u64().unwrap_or(0))
+        })
+    };
+    let mut samples = vec![];
+    let mut least_queued = u64::MAX;
+    for i in 0..200 {
+        let waiting = Instant::now();
+        while client.health().queued_bytes < QUEUED && waiting.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        least_queued = least_queued.min(client.health().queued_bytes);
+        let (r, ms) = time_ms(|| {
+            client.call(
+                "echo",
+                json!({ "queued": i }),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(5),
+            )
+        });
+        s.check(
+            r.as_ref().is_ok_and(|reply| reply.header["queued"] == i),
+            format!("control call {i} under queued data: {r:?}"),
+        );
+        samples.push(ms);
+    }
+    stop.store(true, Ordering::SeqCst);
+    let produced = producer.join().unwrap();
+    s.check(produced.is_ok(), format!("the data stream: {produced:?}"));
+    let summary = summarize(&samples);
+    s.metric_with(
+        "control_queued_30mib_p99_ms",
+        summary.p99,
+        "ms",
+        json!({ "samples": summary.json(), "least_queued_bytes": least_queued }),
+    );
+    s.check(
+        least_queued >= QUEUED,
+        format!("every control call started with >= 30 MiB queued (least {least_queued})"),
+    );
+    s.check(
+        summary.p99 < 50.0,
+        format!(
+            "control calls answered < 50 ms with 30 MiB queued (p99 {:.2} ms, max {:.2} ms)",
+            summary.p99, summary.max
+        ),
+    );
 }
 
 /// An idle connection stays usable for 60 s (heartbeats; no reconnect).

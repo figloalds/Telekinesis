@@ -572,8 +572,61 @@ fn timeout_sends_cancel_and_the_handler_sees_it_over_wss() {
     timeout_cancels(Transport::Tls);
 }
 
-/// A raw peer that ignores CANCEL and answers the timed-out request anyway:
-/// the client drops the late reply and the next call pairs correctly.
+/// The frames of a successful reply to request `id` with `body`, as a peer
+/// sends them: the RESPONSE (with `MORE` and `total` above one chunk) and its
+/// CHUNK continuations.
+fn reply_frames(id: u64, header: Value, body: &[u8]) -> Vec<Vec<u8>> {
+    let split = body.len() > MAX_CHUNK;
+    let first = &body[..body.len().min(MAX_CHUNK)];
+    let response = ResponseHeader {
+        id,
+        ok: true,
+        header,
+        error: None,
+        total: split.then_some(body.len() as u64),
+    };
+    let flags = if split { FLAG_MORE } else { 0 };
+    let mut frames = vec![
+        encode_with(
+            FrameKind::Response,
+            flags,
+            &response,
+            first,
+            FrameLimits::SESSION,
+        )
+        .unwrap(),
+    ];
+    let mut offset = first.len();
+    while offset < body.len() {
+        let end = (offset + MAX_CHUNK).min(body.len());
+        let last = end == body.len();
+        let chunk = ChunkHeader {
+            id,
+            hash: None,
+            offset: offset as u64,
+            total: body.len() as u64,
+            last,
+        };
+        let flags = if last { FLAG_LAST } else { FLAG_MORE };
+        frames.push(
+            encode_with(
+                FrameKind::Chunk,
+                flags,
+                &chunk,
+                &body[offset..end],
+                FrameLimits::SESSION,
+            )
+            .unwrap(),
+        );
+        offset = end;
+    }
+    frames
+}
+
+/// A raw peer that ignores CANCEL and answers timed-out requests anyway: the
+/// client drops each late reply (header-only; a 2 MiB body sent after the
+/// CANCEL; a 3 MiB body whose first part arrived before the deadline and the
+/// rest after the CANCEL) and the next call pairs correctly.
 #[test]
 fn late_reply_after_cancel_is_dropped() {
     let (client_ws, mut raw) = ws_pair(Transport::Plain);
@@ -591,53 +644,72 @@ fn late_reply_after_cancel_is_dropped() {
                 _ => continue,
             }
         };
-        let first = read(&mut raw);
-        assert_eq!(first.kind, FrameKind::Request);
-        let first: RequestHeader = first.header_as().unwrap();
-        let cancel = read(&mut raw);
-        assert_eq!(
-            cancel.kind,
-            FrameKind::Cancel,
-            "a timed-out call sends CANCEL"
+        let request = |raw: &mut Ws| -> RequestHeader {
+            let frame = read(raw);
+            assert_eq!(frame.kind, FrameKind::Request);
+            frame.header_as().unwrap()
+        };
+        let cancelled = |raw: &mut Ws, id: u64| {
+            let cancel = read(raw);
+            assert_eq!(
+                cancel.kind,
+                FrameKind::Cancel,
+                "a timed-out call sends CANCEL"
+            );
+            assert_eq!(cancel.header_as::<CancelHeader>().unwrap().id, id);
+        };
+        let send = |raw: &mut Ws, frames: Vec<Vec<u8>>| {
+            for frame in frames {
+                raw.send(Message::Binary(frame.into())).unwrap();
+            }
+        };
+        // A header-only reply after the CANCEL.
+        let first = request(&mut raw);
+        cancelled(&mut raw, first.id);
+        send(&mut raw, reply_frames(first.id, json!({ "late": 1 }), &[]));
+        // A reply above one chunk after the CANCEL: RESPONSE(MORE) + CHUNK(LAST).
+        let second = request(&mut raw);
+        cancelled(&mut raw, second.id);
+        send(
+            &mut raw,
+            reply_frames(second.id, json!({ "late": 2 }), &pattern(2, 2 * MIB)),
         );
-        assert_eq!(cancel.header_as::<CancelHeader>().unwrap().id, first.id);
-        let late = ResponseHeader {
-            id: first.id,
-            ok: true,
-            header: json!({ "late": true }),
-            error: None,
-            total: None,
-        };
-        let late = encode_with(FrameKind::Response, 0, &late, &[], FrameLimits::SESSION).unwrap();
-        raw.send(Message::Binary(late.into())).unwrap();
-        let second = read(&mut raw);
-        let second: RequestHeader = second.header_as().unwrap();
-        assert_ne!(second.id, first.id);
-        let reply = ResponseHeader {
-            id: second.id,
-            ok: true,
-            header: second.header,
-            error: None,
-            total: None,
-        };
-        let reply = encode_with(FrameKind::Response, 0, &reply, &[], FrameLimits::SESSION).unwrap();
-        raw.send(Message::Binary(reply.into())).unwrap();
+        // A reply that crosses the CANCEL: its first part arrives while the
+        // call is pending, the continuations after it gave up.
+        let third = request(&mut raw);
+        let mut frames = reply_frames(third.id, json!({ "late": 3 }), &pattern(3, 3 * MIB));
+        let rest = frames.split_off(1);
+        send(&mut raw, frames);
+        cancelled(&mut raw, third.id);
+        send(&mut raw, rest);
+        // The next call pairs with its own reply.
+        let next = request(&mut raw);
+        assert!(next.id > third.id);
+        send(&mut raw, reply_frames(next.id, next.header, b"ok"));
         raw
     });
-    let error = client
-        .call(
-            "hang",
-            json!({}),
-            vec![],
-            Priority::Control,
-            Duration::from_secs(1),
-        )
-        .unwrap_err();
-    assert!(matches!(error, CallError::Timeout { .. }), "{error:?}");
-    let reply = call(&client, "echo", json!({ "second": true })).unwrap();
-    assert_eq!(reply.header, json!({ "second": true }));
+    for op in ["hang", "meta.exchange", "meta.exchange"] {
+        let error = client
+            .call(
+                op,
+                json!({}),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, CallError::Timeout { .. }),
+            "{op}: {error:?}"
+        );
+        assert!(client.closed().is_none(), "{op}: {:?}", client.closed());
+    }
+    let reply = call(&client, "echo", json!({ "next": true })).unwrap();
+    assert_eq!(reply.header, json!({ "next": true }));
+    assert_eq!(reply.body, b"ok");
     let _raw = server.join().unwrap();
-    assert!(client.closed().is_none());
+    assert!(client.closed().is_none(), "{:?}", client.closed());
+    assert_eq!(client.health().inflight, 0);
 }
 
 #[test]
@@ -927,11 +999,57 @@ fn health_reports_traffic() {
 // ---------------------------------------------------------------------------
 // Streams, bodies, backpressure
 
+/// Consumes a streamed request body; returns `(bytes, parts)`.
+fn drain_parts(req: &Incoming) -> (u64, u64) {
+    let (mut bytes, mut parts) = (0u64, 0u64);
+    for (_, data) in req.chunks.as_ref().unwrap() {
+        bytes += data.len() as u64;
+        parts += 1;
+    }
+    (bytes, parts)
+}
+
 /// Serves `download` (streams `count` chunks of `size` bytes, then replies with
 /// the digest) and `upload` (consumes `Incoming::chunks`, replies with the byte
-/// count and digest), optionally sleeping per upload chunk.
+/// count and digest), optionally sleeping per upload chunk. Also: `sink`
+/// (counts a streamed body without hashing it), `late_reader` (starts reading
+/// its parts after `delay_ms`) and `paced` (streams `count` chunks of `size`
+/// bytes, one every `pace_ms`).
 fn stream_service(upload_delay: Duration) -> Arc<dyn Handler> {
     handler(move |req| match req.op.as_str() {
+        "sink" | "late_reader" => {
+            if let Some(delay) = req.header["delay_ms"].as_u64() {
+                thread::sleep(Duration::from_millis(delay));
+            }
+            let (bytes, parts) = drain_parts(&req);
+            if !req.responder.cancelled() {
+                req.responder
+                    .reply(json!({ "bytes": bytes, "parts": parts }), vec![]);
+            }
+        }
+        "paced" => {
+            let count = req.header["count"].as_u64().unwrap();
+            let size = req.header["size"].as_u64().unwrap();
+            let pace = Duration::from_millis(req.header["pace_ms"].as_u64().unwrap());
+            for i in 0..count {
+                thread::sleep(pace);
+                let header = ChunkHeader {
+                    id: 0,
+                    hash: None,
+                    offset: i * size,
+                    total: count * size,
+                    last: i + 1 == count,
+                };
+                if req
+                    .responder
+                    .chunk(header, &vec![i as u8; size as usize])
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            req.responder.reply(json!({ "parts": count }), vec![]);
+        }
         "download" => {
             let count = req.header["count"].as_u64().unwrap();
             let size = req.header["size"].as_u64().unwrap() as usize;
@@ -1151,30 +1269,42 @@ fn large_bodies_are_chunked_and_reassembled_over_wss() {
     large_bodies(Transport::Tls);
 }
 
+/// A control call is answered within the bound while at least 30 MiB of data
+/// is queued ahead of it: a producer keeps the client's data queue (32 MiB)
+/// full for the whole measurement, and every sample is checked.
 fn control_fast_while_data_queued(transport: Transport) {
     let (client, server) = session(transport);
     server.serve(stream_service(Duration::ZERO));
-    let mut samples = Vec::new();
-    for round in 0..5u64 {
-        let mut upload = client
-            .upload("upload", json!({}), Priority::Data, Duration::from_secs(30))
-            .unwrap();
-        let data = pattern(round, MIB);
-        for i in 0..30u64 {
-            upload
-                .chunk(
-                    ChunkHeader {
-                        id: 0,
-                        hash: None,
-                        offset: i * MIB as u64,
-                        total: 30 * MIB as u64,
-                        last: i == 29,
-                    },
-                    &data,
-                )
+    let stop = Arc::new(AtomicBool::new(false));
+    let producer = {
+        let client = client.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut upload = client
+                .upload("sink", json!({}), Priority::Data, Duration::from_secs(30))
                 .unwrap();
-        }
-        let queued = client.health().queued_bytes;
+            let data = pattern(7, MIB);
+            let mut parts = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                let header = ChunkHeader {
+                    id: 0,
+                    hash: None,
+                    offset: parts * MIB as u64,
+                    total: 0,
+                    last: false,
+                };
+                upload.chunk(header, &data).unwrap();
+                parts += 1;
+            }
+            let reply = upload.finish().unwrap();
+            assert_eq!(reply.header["bytes"], parts * MIB as u64);
+        })
+    };
+    let mut samples = Vec::new();
+    for round in 0..10u64 {
+        wait_until("30 MiB queued", Duration::from_secs(10), || {
+            client.health().queued_bytes >= 30 * MIB as u64
+        });
         let started = Instant::now();
         let reply = client
             .call(
@@ -1185,21 +1315,15 @@ fn control_fast_while_data_queued(transport: Transport) {
                 Duration::from_secs(5),
             )
             .unwrap();
-        let elapsed = started.elapsed();
+        samples.push(started.elapsed());
         assert_eq!(reply.header["round"], round);
-        assert!(
-            queued >= 8 * MIB as u64,
-            "only {queued} bytes were queued when the control call started"
-        );
-        samples.push(elapsed);
-        let reply = upload.finish().unwrap();
-        assert_eq!(reply.header["bytes"], 30 * MIB as u64);
     }
-    samples.sort();
-    let median = samples[samples.len() / 2];
+    stop.store(true, Ordering::SeqCst);
+    producer.join().unwrap();
+    let worst = *samples.iter().max().unwrap();
     assert!(
-        median < latency_bound(50),
-        "control latency with 30 MiB queued: {samples:?}"
+        worst < latency_bound(50),
+        "control latency with at least 30 MiB queued: {samples:?}"
     );
 }
 
@@ -1413,6 +1537,491 @@ fn dropped_upload_cancels_the_request() {
         Duration::from_secs(2),
         || server.health().inflight == 0,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Flow control on every way out of a call, bounded outgoing queues
+
+/// A stream callback that fails or panics after the I/O thread already
+/// received the rest of the stream and the outcome, and a plain `call` that
+/// receives a stream, leave nothing counted against receive-side flow
+/// control: the connection keeps reading and serving.
+#[test]
+fn failed_stream_callbacks_release_flow_control() {
+    // Receive cap 4 MiB; each failed 3 MiB stream would leave up to 2 MiB
+    // counted, which would hold the client's reads for good.
+    let (client, server) = conns(ws_pair(Transport::Plain), small_queues(), small_queues());
+    server.serve(stream_service(Duration::ZERO));
+    let header = json!({ "count": 3, "size": MIB });
+    let stream_done = |client: &Conn| {
+        wait_until(
+            "the stream and its outcome",
+            Duration::from_secs(10),
+            || client.health().inflight == 0,
+        );
+    };
+    for round in 0..3 {
+        let mut first = true;
+        let mut fail_late = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+            if first {
+                first = false;
+                stream_done(&client);
+            }
+            Err(ErrorWire::new("DISK_FULL", "DISK_FULL: test callback"))
+        };
+        let error = client
+            .call_streaming(
+                "download",
+                header.clone(),
+                vec![],
+                Priority::Control,
+                None,
+                Duration::from_secs(10),
+                &mut fail_late,
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "DISK_FULL", "round {round}: {error}");
+    }
+    for round in 0..2 {
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut panic_late = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+                stream_done(&client);
+                panic!("test callback panics after the stream completed");
+            };
+            client.call_streaming(
+                "download",
+                header.clone(),
+                vec![],
+                Priority::Control,
+                None,
+                Duration::from_secs(10),
+                &mut panic_late,
+            )
+        }));
+        assert!(unwound.is_err(), "round {round}: the callback panicked");
+    }
+    for round in 0..3 {
+        // A stream sent to a plain call: refused locally, the call cancelled.
+        let error = client
+            .call(
+                "download",
+                header.clone(),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(10),
+            )
+            .unwrap_err();
+        assert_eq!(error.code(), "PROTOCOL_VIOLATION", "round {round}: {error}");
+    }
+    let started = Instant::now();
+    assert_eq!(
+        call(&client, "echo", json!({ "x": 1 })).unwrap().header["x"],
+        1
+    );
+    assert_eq!(
+        call(&client, "ping", json!({})).unwrap().header["alive"],
+        true
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    // Twice the receive cap still streams through (reads hold and resume).
+    let (received, expected, parts) = download(&client, 8, MIB);
+    assert_eq!((received, parts), (expected, 8));
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// After a `chunk()` timeout the upload is cancelled; `finish()` (and any
+/// later `chunk()`) reports that timeout at once instead of waiting for an
+/// outcome that cannot come.
+#[test]
+fn finish_after_a_chunk_timeout_returns_at_once() {
+    let (client_ws, server_ws, proxy) = ws_pair_proxied(Transport::Plain);
+    let one_frame = ConnOptions {
+        data_queue_bytes: 1,
+        ..ConnOptions::default()
+    };
+    let (client, server) = conns((client_ws, server_ws), one_frame, ConnOptions::default());
+    server.serve(stream_service(Duration::ZERO));
+    // A stalled link: the data queue fills and stays full.
+    proxy.stall_for(Duration::from_secs(60));
+    let mut upload = client
+        .upload(
+            "sink",
+            json!({}),
+            Priority::Data,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+    let data = vec![1u8; MIB];
+    let part = |i: u64| ChunkHeader {
+        id: 0,
+        hash: None,
+        offset: i * MIB as u64,
+        total: 0,
+        last: false,
+    };
+    let mut failed = None;
+    for i in 0..1000u64 {
+        if let Err(error) = upload.chunk(part(i), &data) {
+            failed = Some(error);
+            break;
+        }
+    }
+    let error = failed.expect("chunk() times out on a stalled link");
+    assert!(matches!(error, CallError::Timeout { .. }), "{error:?}");
+    let again = upload.chunk(part(0), b"x").unwrap_err();
+    assert!(matches!(again, CallError::Timeout { .. }), "{again:?}");
+    assert_eq!(client.health().inflight, 0, "the upload was cancelled");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || tx.send(upload.finish()).unwrap());
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("finish() returns at once after a chunk() timeout");
+    assert!(
+        matches!(outcome, Err(CallError::Timeout { .. })),
+        "{outcome:?}"
+    );
+    // The link recovers; whatever the server answers the abandoned upload is
+    // dropped, and the connection keeps serving.
+    proxy.clear();
+    assert_eq!(
+        call(&client, "echo", json!({ "after": 1 })).unwrap().header["after"],
+        1
+    );
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// Invariant 22 for outgoing queues: a peer that keeps sending requests and
+/// never reads cannot grow the server's queues past their bounds. The server
+/// stops reading (TCP pushes the flood back) and, once the peer has taken
+/// nothing for `dead_after`, closes the connection as `TRANSPORT_DEAD`.
+fn unread_replies_stay_bounded(op: &str) {
+    let options = ConnOptions {
+        control_queue_bytes: MIB,
+        heartbeat: Duration::from_millis(200),
+        dead_after: Duration::from_secs(1),
+        ..ConnOptions::default()
+    };
+    let cap = options.sanitized().control_queue_bytes as u64;
+    let (mut raw, server_ws) = ws_pair(Transport::Plain);
+    let server = Conn::from_established(server_ws, Side::Server, peer(), options).unwrap();
+    // `big`: a tiny request, a 512 KiB reply.
+    server.serve(handler(|req| {
+        req.responder
+            .reply(json!({ "op": req.op }), vec![7u8; 512 * 1024])
+    }));
+    if let MaybeTlsStream::Plain(stream) = raw.get_mut() {
+        stream
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let sampler = sample_queue(&server, stop.clone());
+    let started = Instant::now();
+    let mut sent = 0u64;
+    'flood: while started.elapsed() < Duration::from_secs(30) {
+        for _ in 0..256 {
+            sent += 1;
+            let request = raw_frame(5, 0, 0, &request_header(sent, op, None), b"");
+            if raw.write(request).is_err() {
+                break 'flood;
+            }
+        }
+        if raw.flush().is_err() {
+            break;
+        }
+    }
+    let flooded = started.elapsed();
+    assert!(
+        flooded < Duration::from_secs(30),
+        "{op}: the flood was never pushed back ({sent} requests)"
+    );
+    // The queues stay bounded while the hold lasts, and the server gives up
+    // once the peer has taken nothing for `dead_after` (1 s).
+    let closed = server.wait_closed(Duration::from_secs(10));
+    stop.store(true, Ordering::SeqCst);
+    let max = sampler.join().unwrap();
+    let closed =
+        closed.unwrap_or_else(|| panic!("{op}: the server kept a peer that reads nothing"));
+    assert_eq!(closed.code, "TRANSPORT_DEAD", "{op}: {closed}");
+    assert!(
+        closed.message.contains("read nothing"),
+        "{op}: judged by the write side: {closed}"
+    );
+    drop(raw);
+    // One bound for the control queue (`ping` replies, `BUSY`), one for reply
+    // bodies, plus one small frame.
+    let bound = if op == "ping" { cap } else { 2 * cap };
+    assert!(
+        max <= bound + 64 * 1024,
+        "{op}: {max} bytes queued (bound {bound}) after {sent} requests"
+    );
+    assert!(max > cap / 2, "{op}: the queue never filled ({max} bytes)");
+}
+
+#[test]
+fn unread_ping_replies_hold_reads_and_stay_bounded() {
+    // Answered by the I/O thread itself.
+    unread_replies_stay_bounded("ping");
+}
+
+#[test]
+fn unread_handler_replies_stay_bounded() {
+    // Handler replies wait for room in the reply-body queue; the handler
+    // queue then fills, the I/O thread answers BUSY, and reading stops.
+    unread_replies_stay_bounded("big");
+}
+
+/// An early reply to a streamed request drops the rest of its body still
+/// queued on the client instead of sending it to a server that discards it.
+#[test]
+fn early_reply_purges_the_rest_of_an_upload() {
+    let (client_ws, server_ws, proxy) = ws_pair_proxied(Transport::Plain);
+    let (client, server) = conns(
+        (client_ws, server_ws),
+        ConnOptions::default(),
+        ConnOptions::default(),
+    );
+    server.serve(stream_service(Duration::ZERO));
+    // A slow uplink: queued data would take many seconds to drain.
+    proxy.set_bandwidth(2 * MIB as u64);
+    let mut upload = client
+        .upload(
+            "reject",
+            json!({}),
+            Priority::Control,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    let data = vec![3u8; MIB];
+    let mut failed = None;
+    for i in 0..1000u64 {
+        let header = ChunkHeader {
+            id: 0,
+            hash: None,
+            offset: i * MIB as u64,
+            total: 0,
+            last: false,
+        };
+        if let Err(error) = upload.chunk(header, &data) {
+            failed = Some(error);
+            break;
+        }
+    }
+    let error = failed.expect("chunks fail once the server answered");
+    assert_eq!(error.code(), "UNSOLICITED_OBJECT", "{error}");
+    wait_until(
+        "the rejected upload's queued data to be dropped",
+        Duration::from_secs(1),
+        || client.health().queued_bytes == 0,
+    );
+    let error = upload.finish().unwrap_err();
+    assert_eq!(error.code(), "UNSOLICITED_OBJECT", "{error}");
+    proxy.set_bandwidth(0);
+    assert_eq!(
+        call(&client, "echo", json!({ "x": 3 })).unwrap().header["x"],
+        3
+    );
+}
+
+/// While the server holds its reads because one handler is behind on its
+/// parts, another streamed request whose parts wait unread behind the hold is
+/// not timed out for idleness.
+#[test]
+fn server_idle_limit_does_not_run_while_reads_are_held() {
+    let one_frame = ConnOptions {
+        data_queue_bytes: 1,
+        ..ConnOptions::default()
+    };
+    let (client, server) = conns(ws_pair(Transport::Plain), ConnOptions::default(), one_frame);
+    server.serve(stream_service(Duration::ZERO));
+    // The victim: idle 500 ms, one 16 KiB part every 100 ms for 2.5 s.
+    let victim = {
+        let client = client.clone();
+        thread::spawn(move || {
+            let mut upload = client
+                .upload(
+                    "sink",
+                    json!({}),
+                    Priority::Data,
+                    Duration::from_millis(500),
+                )
+                .unwrap();
+            for i in 0..25u64 {
+                let header = ChunkHeader {
+                    id: 0,
+                    hash: None,
+                    offset: i * 16 * 1024,
+                    total: 0,
+                    last: false,
+                };
+                upload.chunk(header, &[5u8; 16 * 1024])?;
+                thread::sleep(Duration::from_millis(100));
+            }
+            upload.finish()
+        })
+    };
+    wait_until(
+        "the server to serve the victim",
+        Duration::from_secs(5),
+        || server.health().inflight == 1,
+    );
+    // The culprit: its handler starts reading 1.5 s late, so its 8 MiB fill
+    // the server's receive buffer (cap ~1 MiB) and the server holds its reads.
+    let mut culprit = client
+        .upload(
+            "late_reader",
+            json!({ "delay_ms": 1500 }),
+            Priority::Data,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    for i in 0..8u64 {
+        let header = ChunkHeader {
+            id: 0,
+            hash: None,
+            offset: i * MIB as u64,
+            total: 0,
+            last: false,
+        };
+        culprit.chunk(header, &vec![6u8; MIB]).unwrap();
+    }
+    let reply = culprit.finish().unwrap();
+    assert_eq!(reply.header["bytes"], 8 * MIB as u64);
+    let reply = victim.join().unwrap().unwrap();
+    assert_eq!(reply.header["bytes"], 25 * 16 * 1024);
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// While the client holds its reads because one stream's callback is behind,
+/// another stream whose chunks wait unread behind the hold is not timed out
+/// for idleness.
+#[test]
+fn client_idle_limit_does_not_run_while_reads_are_held() {
+    let one_frame = ConnOptions {
+        data_queue_bytes: 1,
+        ..ConnOptions::default()
+    };
+    let (client, server) = conns(ws_pair(Transport::Plain), one_frame, ConnOptions::default());
+    server.serve(stream_service(Duration::ZERO));
+    let (sleeping, asleep) = mpsc::channel();
+    // The culprit: its callback sleeps 1.5 s on the first chunk, so the next
+    // ones fill the receive buffer (cap ~1 MiB) and the client holds its reads.
+    let culprit = {
+        let client = client.clone();
+        thread::spawn(move || {
+            let mut first = true;
+            let mut slow = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+                if first {
+                    first = false;
+                    sleeping.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(1500));
+                }
+                Ok(())
+            };
+            client.call_streaming(
+                "download",
+                json!({ "count": 4, "size": MIB }),
+                vec![],
+                Priority::Control,
+                None,
+                Duration::from_secs(10),
+                &mut slow,
+            )
+        })
+    };
+    asleep.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread::sleep(Duration::from_millis(100));
+    // The victim: idle 500 ms, one chunk every 100 ms.
+    let mut parts = 0;
+    let mut count = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+        parts += 1;
+        Ok(())
+    };
+    let reply = client
+        .call_streaming(
+            "paced",
+            json!({ "count": 10, "size": 16 * 1024, "pace_ms": 100 }),
+            vec![],
+            Priority::Control,
+            None,
+            Duration::from_millis(500),
+            &mut count,
+        )
+        .unwrap();
+    assert_eq!(reply.header["parts"], 10);
+    assert_eq!(parts, 10);
+    culprit.join().unwrap().unwrap();
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// A handler that stops taking its parts is the cause of a hold, not a victim
+/// of it: it is cancelled after its request's idle limit (`REQUEST_TIMEOUT`),
+/// which releases the hold, and the connection keeps serving.
+#[test]
+fn stuck_handler_is_cancelled_after_its_idle_limit() {
+    let one_frame = ConnOptions {
+        data_queue_bytes: 1,
+        ..ConnOptions::default()
+    };
+    let (client, server) = conns(ws_pair(Transport::Plain), ConnOptions::default(), one_frame);
+    let (saw, seen) = mpsc::channel();
+    server.serve(handler(move |req| {
+        if req.op != "stuck" {
+            return req.responder.reply(req.header, req.body);
+        }
+        while !req.responder.cancelled() {
+            thread::sleep(Duration::from_millis(5));
+        }
+        saw.send(()).unwrap();
+    }));
+    let started = Instant::now();
+    let mut upload = client
+        .upload("stuck", json!({}), Priority::Data, Duration::from_secs(1))
+        .unwrap();
+    let mut failed = None;
+    for i in 0..64u64 {
+        let header = ChunkHeader {
+            id: 0,
+            hash: None,
+            offset: i * MIB as u64,
+            total: 0,
+            last: false,
+        };
+        if let Err(error) = upload.chunk(header, &vec![4u8; MIB]) {
+            failed = Some(error);
+            break;
+        }
+    }
+    let error = match failed {
+        Some(error) => error,
+        None => upload.finish().unwrap_err(),
+    };
+    assert_eq!(error.code(), "REQUEST_TIMEOUT", "{error}");
+    seen.recv_timeout(Duration::from_secs(5))
+        .expect("the stuck handler sees cancelled()");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        call(&client, "echo", json!({ "x": 4 })).unwrap().header["x"],
+        4
+    );
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// A `Responder` can be shared with a progress thread (`&Responder` is
+/// `Send`), as the WP0.4 stub allowed.
+#[test]
+fn responder_is_send_and_sync() {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<tkfs::session::Responder>();
+    send_sync::<Conn>();
 }
 
 // ---------------------------------------------------------------------------
