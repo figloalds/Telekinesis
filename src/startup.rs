@@ -1,4 +1,5 @@
 //! Startup progress comes from the recovering thread, never a timer thread.
+//! Also the worker's other stdout startup lines (Ready, Fatal; §6.1).
 use std::{
     cell::RefCell,
     io::Write,
@@ -54,6 +55,28 @@ pub fn progress(phase: &'static str) {
             })
         );
     });
+}
+
+/// Prints one stdout startup line (a `ReadyLine` or a `FatalLine`, §6.1). A
+/// closed stdout (the supervisor went away) is ignored, never a panic.
+pub fn print_line<T: serde::Serialize>(line: &T) {
+    if let Ok(text) = serde_json::to_string(line) {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{text}");
+        let _ = out.flush();
+    }
+}
+
+/// A failure before Ready: prints the `FatalLine` on stdout, logs it on
+/// stderr (the worker log) and exits with its `exit_code`.
+pub fn fatal_exit(fatal: &crate::model::ipc::FatalLine) -> ! {
+    print_line(fatal);
+    crate::util::log::event!(fatal, (fatal.code.as_str()), {
+        "class": fatal.class,
+        "message": fatal.message,
+        "exit_code": fatal.exit_code,
+    });
+    std::process::exit(fatal.exit_code)
 }
 
 pub(crate) struct Watchdog {

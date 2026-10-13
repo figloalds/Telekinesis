@@ -1,7 +1,11 @@
 //! Qualification scenarios for WP1.4 (worker lifecycle: RPC first, worker.json,
 //! hello/watch/stop, crash-only internals). REVAMP_PLAN §14.6, §4.1, §6.1.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP1.4"]`.
+//! Created by WP0.5 against the 6298d0b baseline; enabled by WP1.4, which
+//! implements every scenario. They stay `#[ignore]` because
+//! `scripts/qualify.ps1` runs the release qualification with `--ignored`
+//! (the `watch_latency` floor is a wave 1 floor); the same behaviours run in
+//! the default suite as `tests/worker_lifecycle.rs`.
 //! Written against dynamic JSON (worker RPC ops by name, CLI flags by string).
 //! `cargo test --release --test qual_wp1_4_worker -- --ignored --test-threads=1 --nocapture`
 mod support;
