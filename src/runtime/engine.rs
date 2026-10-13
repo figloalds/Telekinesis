@@ -186,6 +186,8 @@ impl Engine {
         self.refresh_pending_saves();
         for record in records {
             crate::startup::progress("recovering pending saves");
+            // Qualification: slows recovery down to observe its progress.
+            crate::util::fault::hang("engine.recover_pending");
             let pending: PendingSave = serde_json::from_str(&record)?;
             ensure!(
                 pending.branch == self.store.active,
@@ -272,14 +274,50 @@ impl Engine {
     /// has open (and every savepoint in it), so the `pending_saves` rows below
     /// commit on their own instead of joining a transaction nobody will commit;
     /// then [`Engine::retain_all_dirty`] (invariant 8).
+    ///
+    /// If that `ROLLBACK` fails, the half-done work of the panicked request is
+    /// never committed (it may break the store's own invariants): the
+    /// connection is closed instead, which discards its transaction, and a
+    /// fresh connection to the same database writes the rows. The rollback
+    /// failure is logged, and reported with any later failure. Only when no
+    /// usable connection remains is nothing retained (rows written into the
+    /// open transaction would be rolled back at exit anyway).
     pub fn persist_after_poison(&mut self) -> Result<usize> {
+        let mut failed_rollback = None;
         if !self.store.db.is_autocommit() {
-            self.store
-                .db
-                .execute_batch("ROLLBACK")
-                .context("PENDING_SAVE_PERSIST_FAILED: cannot roll back the open transaction")?;
+            let rolled_back = crate::util::fault::fail("engine.poison_rollback")
+                .and_then(|()| Ok(self.store.db.execute_batch("ROLLBACK")?));
+            if let Err(error) = rolled_back {
+                let error = error.context("cannot roll back the open transaction");
+                let wire = crate::model::errors::ErrorWire::from_error(&error);
+                crate::util::log::event!(warn, (wire.code.as_str()), {
+                    "site": "engine.poison",
+                    "message": wire.message,
+                });
+                self.replace_connection().with_context(|| {
+                    format!("PENDING_SAVE_PERSIST_FAILED: after a failed rollback ({error:#})")
+                })?;
+                failed_rollback = Some(error);
+            }
         }
-        self.retain_all_dirty()
+        let retained = self.retain_all_dirty();
+        match failed_rollback {
+            Some(rollback) => {
+                retained.with_context(|| format!("after a failed rollback ({rollback:#})"))
+            }
+            None => retained,
+        }
+    }
+    /// Swaps the store's connection for a fresh one to the same database and
+    /// closes the old one, which rolls back whatever transaction it had open.
+    fn replace_connection(&mut self) -> Result<()> {
+        let fresh = rusqlite::Connection::open(self.store.root.join("metadata.sqlite"))?;
+        fresh.busy_timeout(std::time::Duration::from_secs(5))?;
+        fresh.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        let old = std::mem::replace(&mut self.store.db, fresh);
+        old.close()
+            .map_err(|(_, error)| error)
+            .context("cannot close the connection")
     }
     fn flush_entity(&mut self, entity: &str) -> Result<()> {
         let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
@@ -330,11 +368,13 @@ impl Engine {
             }
             Ok(revision)
         })();
-        if pending {
-            count_pending_saves(&self.store, &self.vitals);
-        }
+        // `pending_saves` is re-counted once the transaction is resolved
+        // (committed here, rolled back below), never inside it.
         match result {
             Ok(revision) => {
+                if pending {
+                    count_pending_saves(&self.store, &self.vitals);
+                }
                 session.content_base = Some(revision.clone());
                 session.alive_base = Some(revision);
                 session.dirty = false;
@@ -349,6 +389,7 @@ impl Engine {
             Err(error) => {
                 if let Some(outer) = outer {
                     rollback_staged_save(&self.store.db, outer);
+                    count_pending_saves(&self.store, &self.vitals);
                 }
                 self.retain_pending(entity, &error)
                     .context("PENDING_SAVE_PERSIST_FAILED")?;

@@ -11,6 +11,12 @@
 //! poisons it, and the poison policy (`runtime::lock_engine`) then persists
 //! every dirty session and exits 70 (`PoisonPolicy::Exit`, the worker); 50
 //! consecutive accept errors exit 70 too. The supervisor restarts the worker.
+//!
+//! Mount attaches and stops are serialized by one gate: an attach (the
+//! legacy startup attach or `mount-attach`) never starts once a stop was
+//! accepted, and a stop that arrives during an attach waits for it and then
+//! detaches what it attached, so a worker never exits with a mount it
+//! attached after its stop.
 use super::{
     Discovery, EngineGuard, EngineVitals, Shared, check_engine_poison, content::fetch_verified,
     ctx::WorkerCtx, export::export_bucket, lock_engine_tracked, notify::deliver_notifications,
@@ -20,6 +26,7 @@ use crate::{
     core::*,
     model::{
         errors::ErrorWire,
+        health::MountStatus,
         ipc::{
             HelloReply, IPC_VERSION, MountAttachRequest, MountDetachRequest, PublishedSummary,
             StopMode, StopReply, StopRequest, WatchRequest, ops, timing,
@@ -36,7 +43,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::Path,
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError,
         atomic::{AtomicU64, Ordering},
     },
     thread,
@@ -45,20 +52,19 @@ use std::{
 
 /// Legacy entry point (in-process tests and tools): builds a minimal
 /// `WorkerCtx` (unsupervised, no previous record, no activator), starts the
-/// RPC server and the heartbeat, and publishes `runtime.json` with `mount`.
+/// RPC server and the heartbeat, and publishes `runtime.json` with `mount`
+/// (as given: callers pass an absolute path, as the legacy worker did).
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
     let ctx = crate::worker::build_ctx(engine, state, false, None);
     let server = start_rpc_server(ctx.clone())?;
-    let mut info = server.discovery().clone();
-    info.mount = mount;
-    publish_discovery(&ctx.engine, state, &info)?;
+    let info = server.publish(mount)?;
     crate::worker::heartbeat::spawn(ctx, server.vitals().clone())?;
     Ok(info)
 }
 
 /// Starts the RPC listener for `ctx` (§4.1 step 6) and returns its
 /// discovery (with `mount: None`). Nothing is written to disk: the caller
-/// publishes `runtime.json` ([`publish_discovery`]) and `worker.json`.
+/// publishes `runtime.json` ([`RpcServer::publish`]) and `worker.json`.
 pub fn start_rpc_ctx(ctx: Arc<WorkerCtx>) -> Result<Discovery> {
     Ok(start_rpc_server(ctx)?.discovery().clone())
 }
@@ -93,6 +99,8 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         discovery,
         address,
         stop: Notify::new(),
+        transitions: Mutex::new(()),
+        published: Mutex::new(None),
         reply: Mutex::new(StopReplyState::default()),
         reply_flushed: Condvar::new(),
         connections: AtomicU64::new(0),
@@ -109,11 +117,13 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
 }
 
 /// Sets the engine's discovery bytes (the mount's `.tkfs-runtime.json`) and
-/// writes `STATE/runtime.json` (`Discovery`, unchanged format).
+/// writes `STATE/runtime.json` (`Discovery`, unchanged format) atomically.
 pub fn publish_discovery(engine: &Shared, state: &Path, info: &Discovery) -> Result<()> {
     lock_engine_tracked(engine).discovery = serde_json::to_vec(info)?;
-    std::fs::write(state.join("runtime.json"), serde_json::to_vec_pretty(info)?)?;
-    Ok(())
+    crate::worker::record::replace_file(
+        &state.join("runtime.json"),
+        &serde_json::to_vec_pretty(info)?,
+    )
 }
 
 /// A running RPC server. Dropping the handle does not stop it; the worker
@@ -132,9 +142,25 @@ impl RpcServer {
     pub fn vitals(&self) -> &Arc<EngineVitals> {
         &self.core.vitals
     }
+    /// Publishes this server's discovery with `mount` (an absolute path, or
+    /// `None`): the engine's discovery bytes and `STATE/runtime.json`.
+    pub fn publish(&self, mount: Option<String>) -> Result<Discovery> {
+        self.core.publish(mount)
+    }
+    /// Attaches the mount at `path` (already prepared: absolute, normalized,
+    /// not overlapping the state) unless a stop was accepted
+    /// (`WORKER_STOPPING`); a stop requested meanwhile waits for it. On
+    /// success `runtime.json` advertises `path`.
+    pub fn attach(&self, path: &Path) -> Result<MountStatus, ErrorWire> {
+        self.core.attach(path)
+    }
     /// The `stop{mode}` op without a reply to flush (signals, idle exit).
+    /// It never waits for the engine or for a mount attach: while either is
+    /// busy it refuses with `WORKER_BUSY` and the caller retries later.
     pub fn stop(&self, mode: StopMode) -> Result<StopReply> {
-        self.core.stop(mode, false)
+        let reply = self.core.stop(mode, false)?;
+        self.core.wake_accept();
+        Ok(reply)
     }
     /// Counts stop requests; pass it to [`RpcServer::wait_stop`].
     pub fn stop_count(&self) -> u64 {
@@ -178,9 +204,15 @@ struct Core {
     /// The legacy busy-status observation (`Engine::publish_observation`).
     observation: Arc<Mutex<Value>>,
     bulk: crate::bulk_sync::Worker,
+    /// This server's discovery with `mount: None`.
     discovery: Discovery,
     address: SocketAddr,
     stop: Notify,
+    /// Serializes mount attaches with stops (see the module docs). Taken
+    /// before the engine, never while holding it.
+    transitions: Mutex<()>,
+    /// The `mount` last published in `runtime.json`.
+    published: Mutex<Option<String>>,
     reply: Mutex<StopReplyState>,
     reply_flushed: Condvar,
     connections: AtomicU64,
@@ -435,11 +467,29 @@ impl Core {
     /// * force: detach the mount with `force` (a failure is logged: the exit
     ///   tears the mount down), fence new opens, `retain_all_dirty` (a failure
     ///   refuses the stop: nothing is lost by staying up), then stop.
+    ///
+    /// Over RPC (`reply_follows`) it waits for the transition gate and the
+    /// engine. The main thread's callers (no reply) must keep servicing the
+    /// idle timer and signals, so for them a busy gate or engine is a
+    /// `WORKER_BUSY` refusal they retry, never a wait on a wedged engine.
     fn stop(&self, mode: StopMode, reply_follows: bool) -> Result<StopReply> {
+        let busy = "WORKER_BUSY: the engine or a mount attach is busy; stop deferred";
+        let _transition = if reply_follows {
+            lock(&self.transitions)
+        } else {
+            try_lock(&self.transitions).context(busy)?
+        };
+        let engine = || -> Result<EngineGuard<'_>> {
+            if reply_follows {
+                Ok(lock_engine_tracked(&self.ctx.engine))
+            } else {
+                try_lock_engine(&self.ctx.engine).context(busy)
+            }
+        };
         let attached = self.ctx.mount.status().state.is_attached();
         let reply = match mode {
             StopMode::Graceful => {
-                lock_engine_tracked(&self.ctx.engine).quiet()?;
+                engine()?.quiet()?;
                 let detached = self.ctx.mount.detach(false);
                 self.beat();
                 detached.map_err(ErrorWire::into_anyhow)?;
@@ -460,7 +510,7 @@ impl Core {
                     });
                 }
                 let persisted = {
-                    let mut e = lock_engine_tracked(&self.ctx.engine);
+                    let mut e = engine()?;
                     let fenced = e.switching;
                     e.switching = true;
                     match e.retain_all_dirty() {
@@ -502,9 +552,50 @@ impl Core {
     fn mount_attach(&self, payload: &Value) -> Result<Value> {
         let MountAttachRequest { path } = serde_json::from_value(payload.clone())?;
         let attached = crate::worker::prepare_mount_path(&self.ctx.state, &path)
-            .and_then(|path| self.ctx.mount.attach(&path));
-        self.beat();
+            .and_then(|path| self.attach(&path));
         Ok(json!(attached.map_err(ErrorWire::into_anyhow)?))
+    }
+
+    /// [`RpcServer::attach`]. Under the transition gate: refused once a stop
+    /// was accepted; on success `runtime.json` advertises the attached path
+    /// (published before the gate is released, so never after the exit
+    /// removed it). A failed publish is logged; the mount stays attached.
+    fn attach(&self, path: &Path) -> Result<MountStatus, ErrorWire> {
+        let attached = {
+            let _transition = lock(&self.transitions);
+            if self.ctx.stopping.load(Ordering::SeqCst) {
+                return Err(ErrorWire::coded(
+                    "WORKER_STOPPING",
+                    format!("{} was not attached: a stop was accepted", path.display()),
+                ));
+            }
+            let attached = self.ctx.mount.attach(path);
+            let mount = Some(path.to_string_lossy().into_owned());
+            let changed = *lock(&self.published) != mount;
+            if attached.is_ok()
+                && changed
+                && let Err(error) = self.publish(mount)
+            {
+                let wire = ErrorWire::from_error(&error);
+                crate::util::log::event!(warn, (wire.code.as_str()), {
+                    "site": "worker.publish",
+                    "message": wire.message,
+                });
+            }
+            attached
+        };
+        self.beat();
+        attached
+    }
+
+    /// [`RpcServer::publish`]; serialized by `published`.
+    fn publish(&self, mount: Option<String>) -> Result<Discovery> {
+        let mut published = lock(&self.published);
+        let mut info = self.discovery.clone();
+        info.mount = mount;
+        publish_discovery(&self.ctx.engine, &self.ctx.state, &info)?;
+        published.clone_from(&info.mount);
+        Ok(info)
     }
 
     /// `published-summary` from a pooled secondary store (no engine lock).
@@ -576,6 +667,15 @@ impl Core {
             json!({"object":object,"size":total,"truncated":total > bytes.len() as u64,
             "text":if binary { "Binary content; text preview unavailable".to_owned() } else { String::from_utf8_lossy(&bytes).into_owned() }}),
         )
+    }
+}
+
+/// A poison-tolerant `try_lock`: `None` while another thread holds `mutex`.
+fn try_lock<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => None,
     }
 }
 

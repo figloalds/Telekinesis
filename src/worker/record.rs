@@ -12,7 +12,10 @@ use std::{
     fs::{self, File},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// `STATE/worker.json`.
@@ -24,16 +27,34 @@ pub fn path(state: &Path) -> PathBuf {
 /// over the old record (and, on unix, a fsync of the directory), so a reader
 /// sees the old record or the new one, never a torn one.
 pub fn write_atomic(state: &Path, record: &WorkerRecord) -> Result<()> {
-    let target = path(state);
-    let temporary = state.join(format!("{WORKER_RECORD_FILE}.{}.tmp", std::process::id()));
+    replace_file(&path(state), &serde_json::to_vec_pretty(record)?)
+}
+
+/// Replaces `target` atomically with `bytes`: a fsynced temporary file next
+/// to it, renamed over it (and, on unix, a fsync of the directory). Readers
+/// see the old content or the new one, never a torn file. Also used for
+/// `runtime.json`, which a `mount-attach` may rewrite while readers poll it.
+pub fn replace_file(target: &Path, bytes: &[u8]) -> Result<()> {
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .with_context(|| format!("no file name in {}", target.display()))?
+        .to_string_lossy();
+    // Unique per call, so two writers of one file never share a temporary.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let temporary = directory.join(format!(
+        "{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let written = (|| -> Result<()> {
         let mut file = File::create(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(record)?)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, &target)?;
+        fs::rename(&temporary, target)?;
         #[cfg(unix)]
-        File::open(state)?.sync_all()?;
+        File::open(directory)?.sync_all()?;
         Ok(())
     })();
     if written.is_err() {
