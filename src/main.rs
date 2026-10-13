@@ -62,8 +62,16 @@ enum Command {
         state: PathBuf,
         #[arg(long)]
         mount: Option<PathBuf>,
+        /// Launched by the orchestrator: report Ready once the store is
+        /// recovered and RPC is up, and attach the mount only on `mount-attach`.
+        #[arg(long)]
+        supervised: bool,
     },
-    Stop,
+    Stop {
+        /// Persist unsaved files and detach even while files are open.
+        #[arg(long)]
+        force: bool,
+    },
     Status,
     Branches,
     Conflicts,
@@ -283,7 +291,14 @@ fn run() -> Result<()> {
         Command::Daemon {
             ref state,
             ref mount,
-        } => return tkfs::worker::run(state, mount.as_deref()),
+            supervised,
+        } => {
+            return tkfs::worker::run(tkfs::worker::WorkerArgs {
+                state: state.clone(),
+                mount: mount.clone(),
+                supervised,
+            });
+        }
         Command::Create {
             label,
             mount,
@@ -308,7 +323,8 @@ fn run() -> Result<()> {
     }
     let info = discover(&args)?;
     let mut payload = match &args.command {
-        Command::Stop => json!({"op":"stop"}),
+        Command::Stop { force: false } => json!({"op":"stop"}),
+        Command::Stop { force: true } => json!({"op":"stop","mode":"force"}),
         Command::Status => json!({"op":"status"}),
         Command::Branches => json!({"op":"branches"}),
         Command::Conflicts => json!({"op":"conflicts"}),

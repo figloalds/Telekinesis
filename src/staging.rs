@@ -230,6 +230,14 @@ impl Staged {
             unreachable!()
         };
         file.sync_all()?;
+        // The caller commits a `pending_saves` row naming this file next; make
+        // its directory entry durable first, or a power loss can keep the row
+        // and lose the file (CCR-WP0.INT-3). Unix only, like the object
+        // install in `core::objects` (std cannot open a directory on Windows).
+        #[cfg(unix)]
+        if let Some(folder) = path.parent() {
+            File::open(folder)?.sync_all()?;
+        }
         *retained = true;
         Ok(path.file_name().unwrap().to_string_lossy().into_owned())
     }
