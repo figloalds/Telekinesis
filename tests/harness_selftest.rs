@@ -509,19 +509,20 @@ fn direct_rows_match_full_projection() {
 
 // ---------------------------------------------------------------- node helpers
 
-/// `Node::control()` works from another thread (also with a WP4.1 token file,
-/// which the baseline daemon ignores), `CallCounts` tells answered, refused and
-/// unreachable calls apart, and `with_stopped_folder` edits the store only
-/// after the worker has exited.
+/// `Node::control()` works from another thread, always through the token path
+/// (the daemon's own WP4.1 token when it wrote one, otherwise a dummy token
+/// file, which a pre-WP4.1 daemon ignores); `CallCounts` tells answered,
+/// refused and unreachable calls apart; `with_stopped_folder` edits the store
+/// only after the worker has exited.
 #[test]
 fn node_control_and_stopped_folder_edit() {
     let node = Node::new();
     let folder = node.create("Edit", true);
-    fs::write(
-        node.data_dir().join("orchestrator.token"),
-        "selftest-token\n",
-    )
-    .unwrap();
+    let token = node.data_dir().join("orchestrator.token");
+    let dummy_token = !token.exists();
+    if dummy_token {
+        fs::write(&token, "selftest-token\n").unwrap();
+    }
     let counts = std::sync::Arc::new(CallCounts::default());
     let (control, thread_counts) = (node.control(), counts.clone());
     thread::spawn(move || {
@@ -535,7 +536,9 @@ fn node_control_and_stopped_folder_edit() {
     };
     counts.record(&unreachable.call(&json!({"op":"list"})));
     assert_eq!(counts.get(), (1, 1, 1), "{}", counts.json());
-    fs::remove_file(node.data_dir().join("orchestrator.token")).unwrap();
+    if dummy_token {
+        fs::remove_file(&token).unwrap();
+    }
 
     let dir = state_dir(&folder);
     let before = node.worker_pids(&folder);
