@@ -60,6 +60,7 @@ impl Supervisor {
             publication_errors: BTreeMap::new(),
             links: BTreeMap::new(),
             remote_catalogs: BTreeMap::new(),
+            restarts: BTreeMap::new(),
             stopping: Arc::new(AtomicBool::new(false)),
             _lock: lock,
         })
