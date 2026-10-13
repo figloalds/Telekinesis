@@ -109,6 +109,28 @@ fn bundle(events: Vec<Event>) -> Bundle {
     }
 }
 
+/// Whether full mode also refuses the quarantined event `id`: retried, in
+/// full mode, on a consistent copy of the store.
+fn full_mode_refuses(s: &Store, id: &str) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("metadata.sqlite");
+    s.db.execute("VACUUM INTO ?", [copy.to_str().unwrap()])
+        .unwrap();
+    let _mode = ModeGuard::new(ConflictMode::Full);
+    let mut copy = Store::open(dir.path(), Some(REPO)).unwrap();
+    copy.db
+        .execute("UPDATE incoming_events SET error=NULL WHERE id=?", [id])
+        .unwrap();
+    copy.receive(bundle(vec![]), &BTreeSet::new()).unwrap();
+    let error: Option<String> = copy
+        .db
+        .query_row("SELECT error FROM incoming_events WHERE id=?", [id], |r| {
+            r.get(0)
+        })
+        .unwrap_or(None);
+    error.is_some_and(|e| e.contains("NAMESPACE_HISTORY_LIMIT"))
+}
+
 /// The visible path of an entry, if it and every ancestor are visible.
 fn path_of(p: &Projection, id: &str) -> Option<String> {
     let mut parts = vec![];
@@ -163,12 +185,22 @@ struct Fuzz {
     refusals: usize,
     /// Successful operations by kind, and final conflict shapes.
     stats: BTreeMap<String, usize>,
+    /// Refusals already checked against full mode (`replica/event`).
+    parity_checked: BTreeSet<String>,
+    stress: bool,
 }
 
 impl Fuzz {
     fn new(seed: u64, mode: ConflictMode) -> Self {
+        Self::with(seed, mode, false)
+    }
+
+    /// `stress`: four replicas that sync rarely, so concurrent namespace
+    /// chains pile up towards `MAX_NAMESPACE_CUTS` (refusals are checked
+    /// against full mode).
+    fn with(seed: u64, mode: ConflictMode, stress: bool) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
-        let count = rng.gen_range(2..=4);
+        let count = if stress { 4 } else { rng.gen_range(2..=4) };
         let mut replicas: Vec<_> = (0..count).map(|_| Replica::new()).collect();
         let allowed = replicas
             .iter_mut()
@@ -184,6 +216,8 @@ impl Fuzz {
             serial: 0,
             refusals: 0,
             stats: BTreeMap::new(),
+            parity_checked: BTreeSet::new(),
+            stress,
         }
     }
 
@@ -214,20 +248,41 @@ impl Fuzz {
         if !diff.is_empty() {
             self.fail(format!("replica {r} after {after}: oracle {diff:#?}"));
         }
-        for (id, error) in quarantined(self.replicas[r].store()) {
+        // A refusal is legitimate only if full mode refuses the same event
+        // (checked on a copy of the store); a descendant of a refused event
+        // waits on it. Anything else is a failure, reported with every row.
+        let rows: BTreeMap<String, String> =
+            quarantined(self.replicas[r].store()).into_iter().collect();
+        for (id, error) in &rows {
             if error.contains("NAMESPACE_HISTORY_LIMIT") {
+                if self.parity_checked.insert(format!("{r}/{id}")) {
+                    if !full_mode_refuses(self.replicas[r].store(), id) {
+                        self.fail(format!(
+                            "replica {r} after {after}: {id} refused ({error}) but full mode accepts it"
+                        ));
+                    }
+                    *self.stats.entry("refused_deliveries".into()).or_default() += 1;
+                }
+                continue;
+            }
+            if error
+                .strip_prefix("QUARANTINED_CAUSAL_ANCESTOR: ")
+                .is_some_and(|ancestor| rows.contains_key(ancestor))
+            {
                 continue;
             }
             self.fail(format!(
-                "replica {r} after {after}: {id} quarantined: {error}"
+                "replica {r} after {after}: {id} quarantined: {error}
+all quarantined rows: {rows:#?}"
             ));
         }
     }
 
     fn step(&mut self) {
         let r = self.rng.gen_range(0..self.replicas.len());
+        let local = if self.stress { 79 } else { 54 };
         match self.rng.gen_range(0..100) {
-            0..=54 => self.local(r),
+            n if n <= local => self.local(r),
             55..=89 => {
                 let mut to = self.rng.gen_range(0..self.replicas.len() - 1);
                 if to >= r {
@@ -495,6 +550,8 @@ impl Fuzz {
                 }
             }
         }
+        // Replicas that refused an event (a legitimate, full-mode-checked
+        // budget refusal) hold different histories; all the others agree.
         let mut reference: Option<(BTreeSet<String>, Projection, Vec<Conflict>)> = None;
         for r in 0..self.replicas.len() {
             let s = self.replicas[r].store();
@@ -510,8 +567,9 @@ impl Fuzz {
                 self.fail(format!("replica {r} did not drain: {staged:?}"));
             }
             match &reference {
+                _ if !refused.is_empty() => {}
                 None => reference = Some(state),
-                Some(reference) if refused.is_empty() => {
+                Some(reference) => {
                     if reference.0 != state.0 {
                         self.fail(format!("replica {r} holds different events"));
                     }
@@ -525,7 +583,6 @@ impl Fuzz {
                         ));
                     }
                 }
-                Some(_) => {}
             }
         }
         let s = self.replicas[0].store();
@@ -547,6 +604,7 @@ impl Fuzz {
 fn run_seed(
     seed: u64,
     steps: std::ops::RangeInclusive<usize>,
+    stress: bool,
 ) -> (DeriveCounters, usize, BTreeMap<String, usize>) {
     let mode = if seed.is_multiple_of(3) {
         ConflictMode::Verify
@@ -555,7 +613,7 @@ fn run_seed(
     };
     let _mode = ModeGuard::new(mode);
     let start = thread_derive_counters();
-    let mut fuzz = Fuzz::new(seed, mode);
+    let mut fuzz = Fuzz::with(seed, mode, stress);
     let steps = fuzz.rng.gen_range(steps);
     for _ in 0..steps {
         fuzz.step();
@@ -564,12 +622,25 @@ fn run_seed(
     (counters_since(start), fuzz.refusals, fuzz.stats)
 }
 
-fn run_seeds(seeds: impl Iterator<Item = u64>, steps: std::ops::RangeInclusive<usize>) {
+fn run_seeds(
+    seeds: impl Iterator<Item = u64>,
+    steps: std::ops::RangeInclusive<usize>,
+    stress: bool,
+) {
     let mut total = DeriveCounters::default();
     let mut refusals = 0;
     let mut stats: BTreeMap<String, usize> = BTreeMap::new();
     for seed in seeds {
-        let (c, r, seed_stats) = run_seed(seed, steps.clone());
+        let started = std::time::Instant::now();
+        let (c, r, seed_stats) = run_seed(seed, steps.clone(), stress);
+        eprintln!(
+            "DERIVE_SEED {seed}: {} ms, {} append, {} verified, {} fallbacks, {} refused deliveries",
+            started.elapsed().as_millis(),
+            c.append,
+            c.verified,
+            c.fallbacks,
+            seed_stats.get("refused_deliveries").copied().unwrap_or(0)
+        );
         for (k, v) in seed_stats {
             *stats.entry(k).or_default() += v;
         }
@@ -600,23 +671,23 @@ const DEBUG_STEPS: std::ops::RangeInclusive<usize> = 50..=90;
 
 #[test]
 fn fuzz_seeds_00_09() {
-    run_seeds(0..10, DEBUG_STEPS);
+    run_seeds(0..10, DEBUG_STEPS, false);
 }
 #[test]
 fn fuzz_seeds_10_19() {
-    run_seeds(10..20, DEBUG_STEPS);
+    run_seeds(10..20, DEBUG_STEPS, false);
 }
 #[test]
 fn fuzz_seeds_20_29() {
-    run_seeds(20..30, DEBUG_STEPS);
+    run_seeds(20..30, DEBUG_STEPS, false);
 }
 #[test]
 fn fuzz_seeds_30_39() {
-    run_seeds(30..40, DEBUG_STEPS);
+    run_seeds(30..40, DEBUG_STEPS, false);
 }
 #[test]
 fn fuzz_seeds_40_49() {
-    run_seeds(40..50, DEBUG_STEPS);
+    run_seeds(40..50, DEBUG_STEPS, false);
 }
 
 /// Qualification: `cargo test --release --test derive_oracle -- --ignored`.
@@ -633,7 +704,25 @@ fn fuzz_300_seeds_release() {
     };
     let start = env("TKFS_DERIVE_SEED_START", 1000);
     let count = env("TKFS_DERIVE_SEEDS", 300);
-    run_seeds(start..start + count, 100..=180);
+    run_seeds(start..start + count, 100..=180, false);
+}
+
+/// Stress: four rarely-syncing replicas over long runs, so receivers meet
+/// `MAX_NAMESPACE_CUTS`; every refusal must be a full-mode refusal too.
+/// `TKFS_DERIVE_STRESS_START` (default 5000), `TKFS_DERIVE_STRESS_SEEDS`
+/// (default 40).
+#[test]
+#[ignore = "WP1.7 release stress (namespace budget refusals)"]
+fn fuzz_stress_release() {
+    let env = |key: &str, default: u64| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let start = env("TKFS_DERIVE_STRESS_START", 5000);
+    let count = env("TKFS_DERIVE_STRESS_SEEDS", 40);
+    run_seeds(start..start + count, 200..=320, true);
 }
 
 /// Authors make a corpus with rich concurrency (occasional partial syncs);
