@@ -11,18 +11,30 @@
 //!    buffer internally; a turn stops early only after a large burst and then
 //!    polls again without sleeping) and dispatches every frame;
 //! 2. retries delivery of streamed request parts its handlers have not taken;
-//! 3. runs the timers: dead after `dead_after` without a received frame,
-//!    HEARTBEAT after `heartbeat` of send idleness, the 250 ms scan of request
-//!    deadlines, GOAWAY grace;
+//! 3. runs the timers: dead after `dead_after` without hearing from the peer,
+//!    HEARTBEAT after `heartbeat` of send idleness (one queued at a time), the
+//!    250 ms scan of request deadlines, GOAWAY grace;
 //! 4. writes from the priority queues while tungstenite's buffer holds less
 //!    than 256 KiB, then flushes (`WouldBlock` arms writable interest);
 //! 5. closes gracefully once a GOAWAY is in effect and nothing is in flight;
 //! 6. waits for readiness, a producer's `notify()`, or the next timer.
 //!
-//! Receive-side flow control: when more than `data_queue_bytes` of received
-//! stream data waits for its consumers, the thread stops reading (TCP then
-//! pushes back on the sender) until they catch up to half of that. Liveness is
-//! not judged while reading is paused.
+//! Liveness evidence is a received message or readable readiness of the
+//! socket (bytes arrived, possibly part of a large message on a slow link).
+//!
+//! Reads are held in two cases, and TCP then pushes back on the peer:
+//! * receive-side flow control: more than `data_queue_bytes` of received
+//!   stream data waits for its consumers; reading resumes once they are back
+//!   under half of that. Liveness is not judged while this hold lasts (the
+//!   silence is ours), and neither are the idle limits of streams whose data
+//!   may wait unread behind it;
+//! * (server) outgoing pressure: the control queue holds more than
+//!   `control_queue_bytes`, because the peer leaves our replies unread while
+//!   it keeps sending requests. Every request read produces a reply, so not
+//!   reading is what bounds the queue (`ping` replies, `BUSY` and refusals
+//!   come from this thread, which cannot wait for room). Reading resumes at
+//!   half the bound; the peer is dead after `dead_after` without taking any
+//!   byte from us.
 use crate::{
     model::{
         errors::ErrorWire,
@@ -69,10 +81,13 @@ type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 const KEY: usize = 7;
 /// A read turn yields after this many bytes or messages, and a write turn
 /// after this many bytes (the loop then polls again without sleeping), so
-/// reads, writes and timers interleave while the socket never blocks.
-const READ_BURST_BYTES: usize = 4 * 1024 * 1024;
+/// reads, writes and timers interleave while the socket never blocks. One
+/// 1 MiB frame per turn measured best (release loopback download about
+/// 850–965 MiB/s against 450–540 with 4 MiB turns) and keeps a reply that
+/// waits for the next read turn behind at most one frame of writing.
+const READ_BURST_BYTES: usize = 1024 * 1024;
 const READ_BURST_MESSAGES: usize = 1024;
-const WRITE_BURST_BYTES: usize = 4 * 1024 * 1024;
+const WRITE_BURST_BYTES: usize = 1024 * 1024;
 /// Parts of one streamed request buffered in its handler channel.
 const UPLOAD_CHANNEL: usize = 4;
 /// Idle limit of a streamed request that announced none.
@@ -176,6 +191,7 @@ struct UploadIn {
     overflow: VecDeque<(ChunkHeader, Vec<u8>)>,
     ended: bool,
     idle: Duration,
+    /// Last progress: a part arrived, or the handler took one.
     active: Instant,
 }
 
@@ -192,11 +208,20 @@ struct Io {
     read_more: bool,
     /// The last write turn stopped with frames still queued.
     write_more: bool,
-    paused: bool,
+    /// Reading is held: received stream data waits for slow consumers.
+    rx_held: bool,
+    /// Reading is held (server): the peer leaves our replies unread.
+    tx_held: bool,
+    /// Last liveness evidence: a received message or readable readiness.
     last_rx: Instant,
     last_tx: Instant,
+    /// Last time the socket took bytes from us: a flush that got everything
+    /// out, or writable readiness after a blocked write.
+    last_write_progress: Instant,
     last_heartbeat: Instant,
     heartbeat_seq: u64,
+    /// A HEARTBEAT is queued and not yet written.
+    heartbeat_queued: bool,
     /// The peer's last heartbeat `(seq, at_ms, received)`, echoed back.
     peer_heartbeat: Option<(u64, u64, Instant)>,
     next_scan: Instant,
@@ -226,11 +251,14 @@ impl Io {
             write_blocked: false,
             read_more: true,
             write_more: false,
-            paused: false,
+            rx_held: false,
+            tx_held: false,
             last_rx: now,
             last_tx: now,
+            last_write_progress: now,
             last_heartbeat: now,
             heartbeat_seq: 0,
+            heartbeat_queued: false,
             peer_heartbeat: None,
             next_scan: now + protocol::frame::DEADLINE_SCAN,
             partial: HashMap::new(),
@@ -260,13 +288,15 @@ impl Io {
                 return stop;
             }
             self.deliver_uploads();
-            self.update_pause();
+            self.update_holds();
             if let Err(stop) = self.timers() {
                 return stop;
             }
             if let Err(stop) = self.write_turn() {
                 return stop;
             }
+            // Writing may have drained the control queue below its bound.
+            self.update_holds();
             if let Some(stop) = self.goaway_complete() {
                 return stop;
             }
@@ -278,17 +308,22 @@ impl Io {
 
     // -- reading --------------------------------------------------------
 
+    /// Reading is held (see the module docs).
+    fn paused(&self) -> bool {
+        self.rx_held || self.tx_held
+    }
+
     fn read_turn(&mut self) -> Result<(), Stop> {
         self.read_more = false;
         let mut bytes = 0usize;
         let mut messages = 0usize;
-        while !self.paused {
+        while !self.paused() {
             match self.ws.read() {
                 Ok(Message::Binary(data)) => {
                     let len = data.len();
                     self.received(len);
                     self.on_frame(data)?;
-                    self.update_pause();
+                    self.update_holds();
                     bytes += len;
                     messages += 1;
                     if bytes >= READ_BURST_BYTES || messages >= READ_BURST_MESSAGES {
@@ -543,7 +578,9 @@ impl Io {
         shared.work.notify_one();
     }
 
-    /// Queues a RESPONSE produced by the I/O thread itself.
+    /// Queues a RESPONSE produced by the I/O thread itself. It cannot wait for
+    /// room; the control queue stays bounded because reading stops while the
+    /// queue is over its bound (`update_holds`).
     fn answer(&self, id: u64, result: Result<Value, ErrorWire>) {
         let frames = self.shared.response_frames(id, result, &[], false);
         let mut state = self.shared.lock();
@@ -612,7 +649,9 @@ impl Io {
         let shared = self.shared.clone();
         let mut state = shared.lock();
         let Some(slot) = state.pending.get(&id).cloned() else {
-            return Ok(()); // a late reply to an abandoned call
+            // A late reply to an abandoned call. If its body continues, the
+            // continuations are dropped on arrival too (`on_chunk`).
+            return Ok(());
         };
         if frame.body.len() > slot.limit {
             return Err(violation(format!(
@@ -650,6 +689,7 @@ impl Io {
             return Ok(());
         }
         state.pending.remove(&id);
+        shared.completed(&mut state, id);
         let result = if response.ok {
             Ok(Reply {
                 header: response.header,
@@ -705,18 +745,23 @@ impl Io {
                         "PROTOCOL_VIOLATION: chunk for request {id}, which was never sent"
                     )));
                 }
+                let state = self.shared.lock();
+                let Some(slot) = state.pending.get(&id) else {
+                    // A late frame of a call its caller gave up on (a stream
+                    // chunk, or a body continuation of a reply that crossed
+                    // the CANCEL or whose reassembly was dropped): ids are
+                    // never reused, so it is discarded whatever its flags.
+                    return Ok(());
+                };
                 if !frame.more() {
                     return Err(violation(format!(
                         "PROTOCOL_VIOLATION: stream chunk of request {id} without MORE"
                     )));
                 }
-                let state = self.shared.lock();
-                if let Some(slot) = state.pending.get(&id) {
-                    self.shared
-                        .rx_buffered
-                        .fetch_add(frame.body.len(), Ordering::AcqRel);
-                    slot.push(Event::Chunk(header, body));
-                }
+                self.shared
+                    .rx_buffered
+                    .fetch_add(frame.body.len(), Ordering::AcqRel);
+                slot.push(Event::Chunk(header, body));
                 Ok(())
             }
         }
@@ -725,6 +770,16 @@ impl Io {
     /// Appends one body continuation; completes the request or response.
     fn on_continuation(&mut self, header: ChunkHeader, frame: FrameRef<'_>) -> Result<(), Stop> {
         let id = header.id;
+        if matches!(
+            self.partial.get(&id).map(|partial| &partial.kind),
+            Some(PartialKind::Response(_))
+        ) && !self.shared.lock().pending.contains_key(&id)
+        {
+            // The caller gave up on this reply: free its reassembly now. The
+            // rest of the body is dropped on arrival (`on_chunk`).
+            self.drop_partial(id);
+            return Ok(());
+        }
         let Some(partial) = self.partial.get_mut(&id) else {
             return Ok(());
         };
@@ -755,8 +810,10 @@ impl Io {
                 }
             }
             PartialKind::Response(header) => {
-                let mut state = self.shared.lock();
+                let shared = self.shared.clone();
+                let mut state = shared.lock();
                 if let Some(slot) = state.pending.remove(&id) {
+                    shared.completed(&mut state, id);
                     slot.push(Event::Done(Ok(Reply {
                         header,
                         body: partial.body,
@@ -822,6 +879,7 @@ impl Io {
         }
         let mut finished = Vec::new();
         let mut abandoned = Vec::new();
+        let now = Instant::now();
         for (id, upload) in &mut self.uploads {
             if upload.cancel.load(Ordering::Acquire) {
                 abandoned.push(*id);
@@ -830,7 +888,11 @@ impl Io {
             while let Some(item) = upload.overflow.pop_front() {
                 let len = item.1.len();
                 match upload.tx.try_send(item) {
-                    Ok(()) => self.overflow_bytes -= len,
+                    Ok(()) => {
+                        // The handler took a part: it is making progress.
+                        self.overflow_bytes -= len;
+                        upload.active = now;
+                    }
                     Err(TrySendError::Full(item)) => {
                         upload.overflow.push_front(item);
                         break;
@@ -874,19 +936,45 @@ impl Io {
         }
     }
 
-    fn update_pause(&mut self) {
-        let shared = &self.shared;
+    /// Holds or resumes reading (see the module docs), with hysteresis: a
+    /// hold starts above a bound and ends at half of it.
+    fn update_holds(&mut self) {
+        let was = self.paused();
+        let shared = self.shared.clone();
         let buffered = shared.rx_buffered.load(Ordering::Acquire) + self.overflow_bytes;
-        let cap = shared.rx_cap();
-        if !self.paused && buffered > cap {
-            self.paused = true;
-            shared.rx_paused.store(true, Ordering::Release);
-        } else if self.paused && buffered <= cap / 2 {
-            self.paused = false;
-            shared.rx_paused.store(false, Ordering::Release);
-            // Silence while paused was ours, not the peer's.
-            self.last_rx = Instant::now();
+        let rx_cap = shared.rx_cap();
+        if !self.rx_held && buffered > rx_cap {
+            self.rx_held = true;
+        } else if self.rx_held && buffered <= rx_cap / 2 {
+            self.rx_held = false;
+        }
+        // Only a server answers what it reads; a client's control queue is
+        // bounded where requests are submitted.
+        if shared.side == Side::Server {
+            let queued = shared.lock().queues.control_bytes();
+            let tx_cap = shared.tx_cap();
+            if !self.tx_held && queued > tx_cap {
+                self.tx_held = true;
+                // The peer has `dead_after` from now to take bytes again.
+                self.last_write_progress = Instant::now();
+            } else if self.tx_held && queued <= tx_cap / 2 {
+                self.tx_held = false;
+            }
+        }
+        let paused = self.paused();
+        if paused == was {
+            return;
+        }
+        shared.rx_paused.store(paused, Ordering::Release);
+        if !paused {
+            // Silence while reading was held was ours, not the peer's; so was
+            // the stall of streamed bodies whose parts waited behind the hold.
+            let now = Instant::now();
+            self.last_rx = now;
             self.read_more = true;
+            for upload in self.uploads.values_mut() {
+                upload.active = now;
+            }
         }
     }
 
@@ -941,6 +1029,7 @@ impl Io {
             self.shared.send_limits(),
         ) {
             self.shared.lock().queues.push(Lane::Control, 0, frame);
+            self.heartbeat_queued = true;
         }
     }
 
@@ -952,7 +1041,17 @@ impl Io {
     fn timers(&mut self) -> Result<(), Stop> {
         let now = Instant::now();
         let options = self.shared.options;
-        if !self.paused && now.duration_since(self.last_rx) >= options.dead_after {
+        if self.tx_held {
+            // Reading stopped because the peer leaves our replies unread; it
+            // is dead once it has taken nothing from us for `dead_after`.
+            let silent = now.duration_since(self.last_write_progress);
+            if silent >= options.dead_after {
+                return Err(Stop::Lost(ErrorWire::coded(
+                    "TRANSPORT_DEAD",
+                    format!("the peer read nothing for {} ms", ms(silent)),
+                )));
+            }
+        } else if !self.rx_held && now.duration_since(self.last_rx) >= options.dead_after {
             return Err(Stop::Lost(ErrorWire::coded(
                 "TRANSPORT_DEAD",
                 format!(
@@ -961,7 +1060,9 @@ impl Io {
                 ),
             )));
         }
-        if now.duration_since(self.last_tx.max(self.last_heartbeat)) >= options.heartbeat {
+        if !self.heartbeat_queued
+            && now.duration_since(self.last_tx.max(self.last_heartbeat)) >= options.heartbeat
+        {
             self.queue_heartbeat(now);
         }
         if now >= self.next_scan {
@@ -1011,22 +1112,34 @@ impl Io {
                 }
             }
             Side::Server => {
-                // Streamed requests whose body stalled: answer and cancel.
-                let stalled: Vec<(u64, Duration)> = self
+                // Streamed requests that stalled: answer and cancel. A body
+                // stalls when no part arrives for its idle limit; while reading
+                // is held, parts may wait unread in TCP, so only a request
+                // whose handler left parts untaken for that long (its own
+                // consumer is behind) is judged then.
+                let held = self.paused();
+                let stalled: Vec<(u64, Duration, bool)> = self
                     .uploads
                     .iter()
                     .filter(|(_, upload)| {
-                        !upload.ended && now.duration_since(upload.active) >= upload.idle
+                        let behind = !upload.overflow.is_empty();
+                        (behind || (!held && !upload.ended))
+                            && now.duration_since(upload.active) >= upload.idle
                     })
-                    .map(|(id, upload)| (*id, upload.idle))
+                    .map(|(id, upload)| (*id, upload.idle, !upload.overflow.is_empty()))
                     .collect();
-                for (id, idle) in stalled {
+                for (id, idle, behind) in stalled {
+                    let detail = if behind {
+                        format!(
+                            "the handler took no part of the streamed body for {} ms",
+                            ms(idle)
+                        )
+                    } else {
+                        format!("no part of the streamed body for {} ms", ms(idle))
+                    };
                     let frames = shared.response_frames(
                         id,
-                        Err(ErrorWire::coded(
-                            "REQUEST_TIMEOUT",
-                            format!("no part of the streamed body for {} ms", ms(idle)),
-                        )),
+                        Err(ErrorWire::coded("REQUEST_TIMEOUT", detail)),
                         &[],
                         false,
                     );
@@ -1034,7 +1147,9 @@ impl Io {
                         let mut state = shared.lock();
                         if let Some(serving) = state.serving.remove(&id) {
                             serving.cancel.store(true, Ordering::Release);
-                            state.queues.purge(id);
+                            if state.queues.purge(id) > 0 && state.space_waiters > 0 {
+                                shared.space.notify_all();
+                            }
                             for (lane, frame) in frames {
                                 state.queues.push(lane, id, frame);
                             }
@@ -1120,18 +1235,26 @@ impl Io {
         self.write_more = false;
         let mut written = 0usize;
         loop {
-            while self.unflushed < protocol::frame::WRITE_HIGH_WATER {
+            // While the socket is blocked, frames stay in our queues (where
+            // they keep their priority and can be purged) until a flush gets
+            // through.
+            while !self.write_blocked && self.unflushed < protocol::frame::WRITE_HIGH_WATER {
                 let next = {
                     let mut state = self.shared.lock();
                     let next = state.queues.pop();
-                    if matches!(next, Some((_, true))) && state.space_waiters > 0 {
+                    // Producers and handler replies may wait for room in any
+                    // queue.
+                    if next.is_some() && state.space_waiters > 0 {
                         self.shared.space.notify_all();
                     }
                     next
                 };
-                let Some((frame, _)) = next else {
+                let Some(frame) = next else {
                     break;
                 };
+                if frame.first() == Some(&FrameKind::Heartbeat.as_u8()) {
+                    self.heartbeat_queued = false;
+                }
                 let len = frame.len();
                 written += len;
                 match self.ws.write(Message::Binary(Bytes::from(frame))) {
@@ -1147,6 +1270,9 @@ impl Io {
             }
             match self.ws.flush() {
                 Ok(()) => {
+                    if self.unflushed > 0 || self.write_blocked {
+                        self.last_write_progress = Instant::now();
+                    }
                     self.unflushed = 0;
                     self.write_blocked = false;
                 }
@@ -1180,14 +1306,20 @@ impl Io {
     fn next_wake(&self, now: Instant) -> Instant {
         let options = self.shared.options;
         let mut wake = self.next_scan;
-        wake = wake.min(after(
-            self.last_tx.max(self.last_heartbeat),
-            options.heartbeat,
-        ));
-        if !self.paused {
+        if !self.heartbeat_queued {
+            wake = wake.min(after(
+                self.last_tx.max(self.last_heartbeat),
+                options.heartbeat,
+            ));
+        }
+        if self.tx_held {
+            wake = wake.min(after(self.last_write_progress, options.dead_after));
+        } else if !self.rx_held {
             wake = wake.min(after(self.last_rx, options.dead_after));
         }
-        if self.paused || self.overflow_bytes > 0 {
+        // Consumers taking buffered parts do not notify this thread. (A hold
+        // for outgoing pressure ends through our own writes.)
+        if self.rx_held || self.overflow_bytes > 0 {
             wake = wake.min(now + RETRY);
         }
         if let Some(deadline) = self.shared.lock().goaway_deadline {
@@ -1197,7 +1329,7 @@ impl Io {
     }
 
     fn wait(&mut self) -> Result<(), Stop> {
-        let desired = (!self.paused, self.write_blocked);
+        let desired = (!self.paused(), self.write_blocked);
         if self.armed != Some(desired) {
             let interest = Readiness::new(KEY, desired.0, desired.1);
             let armed =
@@ -1219,8 +1351,24 @@ impl Io {
         {
             return Err(Stop::Lost(self.lost("CONNECTION_LOST", error)));
         }
-        if self.events.iter().any(|event| event.key == KEY) {
+        let (mut readable, mut writable) = (false, false);
+        for event in self.events.iter().filter(|event| event.key == KEY) {
+            readable |= event.readable;
+            writable |= event.writable;
+        }
+        if readable || writable {
             self.armed = None;
+        }
+        let now = Instant::now();
+        if readable {
+            // Bytes arrived (every read turn drains to `WouldBlock` before
+            // waiting): the peer is alive even when they only continue a
+            // large message on a slow link.
+            self.last_rx = now;
+        }
+        if writable {
+            // The socket took bytes off our send buffer: the peer is reading.
+            self.last_write_progress = now;
         }
         Ok(())
     }

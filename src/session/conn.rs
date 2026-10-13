@@ -24,9 +24,16 @@
 //! * **Queues.** Outgoing frames wait in three queues, written in priority
 //!   order: control (header-only REQUEST/RESPONSE, PROGRESS, CANCEL,
 //!   HEARTBEAT, GOAWAY; ≤ `control_queue_bytes`), response bodies
-//!   (round-robin per request id) and data CHUNKs (round-robin per request id;
-//!   ≤ `data_queue_bytes`). Producers of data block, outside the I/O thread,
-//!   while the data queue is full (backpressure). All frames of one request id
+//!   (round-robin per request id; ≤ `control_queue_bytes`) and data CHUNKs
+//!   (round-robin per request id; ≤ `data_queue_bytes`). Producers block,
+//!   outside the I/O thread, while their queue is full (backpressure): data
+//!   producers, request bodies and handler replies wait for room; a request
+//!   header that finds the control queue full is refused (`Busy`). Frames the
+//!   I/O thread produces itself (`ping` replies, `BUSY` and refusals) cannot
+//!   wait: while the control queue is over its bound, the server's I/O thread
+//!   stops reading, so a peer that leaves our replies unread is held back by
+//!   TCP (and judged dead after `dead_after` without reading anything). An
+//!   empty queue admits one item of any size. All frames of one request id
 //!   stay in order: the final RESPONSE of a streamed reply follows its chunks
 //!   through the data queue.
 //! * **Bodies** larger than one chunk (`max_chunk`, 1 MiB) are split: the
@@ -60,8 +67,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    cell::Cell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::TcpStream,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
@@ -353,6 +359,9 @@ impl RoundRobin {
 pub(crate) struct Queues {
     control: VecDeque<(u64, Vec<u8>)>,
     control_bytes: usize,
+    /// Requests with a PROGRESS frame still queued (one resets the same idle
+    /// deadline as many).
+    progress: HashSet<u64>,
     response: RoundRobin,
     pub(crate) data: RoundRobin,
 }
@@ -369,20 +378,31 @@ impl Queues {
         }
     }
 
-    /// The next frame in priority order, and whether it came from the data
-    /// queue (whose producers may be waiting for space).
-    pub(crate) fn pop(&mut self) -> Option<(Vec<u8>, bool)> {
-        if let Some((_, frame)) = self.control.pop_front() {
-            self.control_bytes -= frame.len();
-            return Some((frame, false));
+    /// Queues a PROGRESS frame of request `id` unless one is still queued.
+    fn push_progress(&mut self, id: u64, frame: Vec<u8>) -> bool {
+        if !self.progress.insert(id) {
+            return false;
         }
-        if let Some(frame) = self.response.pop() {
-            return Some((frame, false));
-        }
-        self.data.pop().map(|frame| (frame, true))
+        self.push(Lane::Control, id, frame);
+        true
     }
 
-    /// Drops every queued frame of request `id`; returns the data bytes freed.
+    /// The next frame in priority order.
+    pub(crate) fn pop(&mut self) -> Option<Vec<u8>> {
+        if let Some((id, frame)) = self.control.pop_front() {
+            self.control_bytes -= frame.len();
+            if frame.first() == Some(&FrameKind::Progress.as_u8()) {
+                self.progress.remove(&id);
+            }
+            return Some(frame);
+        }
+        if let Some(frame) = self.response.pop() {
+            return Some(frame);
+        }
+        self.data.pop()
+    }
+
+    /// Drops every queued frame of request `id`; returns the bytes freed.
     pub(crate) fn purge(&mut self, id: u64) -> usize {
         let mut freed = 0;
         self.control.retain(|(other, frame)| {
@@ -393,12 +413,16 @@ impl Queues {
             keep
         });
         self.control_bytes -= freed;
-        self.response.purge(id);
-        self.data.purge(id)
+        self.progress.remove(&id);
+        freed + self.response.purge(id) + self.data.purge(id)
     }
 
     pub(crate) fn bytes(&self) -> usize {
         self.control_bytes + self.response.bytes() + self.data.bytes()
+    }
+
+    pub(crate) fn control_bytes(&self) -> usize {
+        self.control_bytes
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -408,9 +432,16 @@ impl Queues {
     pub(crate) fn clear(&mut self) {
         self.control.clear();
         self.control_bytes = 0;
+        self.progress.clear();
         self.response.clear();
         self.data.clear();
     }
+}
+
+/// Whether `bytes` more fit a queue holding `queued` under `cap`. An empty
+/// queue admits one item of any size.
+fn fits(queued: usize, bytes: usize, cap: usize) -> bool {
+    bytes == 0 || queued == 0 || queued + bytes <= cap
 }
 
 /// What a waiting call receives from the I/O thread. A stream chunk is a
@@ -479,6 +510,15 @@ impl Slot {
 
     fn drain(&self) -> Vec<Event> {
         lock(&self.events).drain(..).collect()
+    }
+
+    /// Whether the call's outcome (`Done` or `Lost`) is queued. The I/O thread
+    /// pushes it while holding the state lock, in the same critical section
+    /// that removes the call from `State::pending`.
+    fn has_outcome(&self) -> bool {
+        lock(&self.events)
+            .iter()
+            .any(|event| matches!(event, Event::Done(_) | Event::Lost(_)))
     }
 
     /// The error an unfinished upload reports once its request has ended.
@@ -577,7 +617,8 @@ pub(crate) struct Shared {
     pub(crate) rtt_ms: AtomicU64,
     /// Received stream bytes not yet taken by their callers.
     pub(crate) rx_buffered: AtomicUsize,
-    /// The I/O thread stopped reading because receivers are behind.
+    /// The I/O thread holds its reads: receivers are behind, or (server) the
+    /// peer leaves our replies unread.
     pub(crate) rx_paused: AtomicBool,
 }
 
@@ -617,6 +658,11 @@ impl Shared {
         self.options.data_queue_bytes
     }
 
+    /// Bound of the control queue, and separately of the response-body queue.
+    pub(crate) fn tx_cap(&self) -> usize {
+        self.options.control_queue_bytes
+    }
+
     fn rx_consumed(&self, bytes: usize) {
         let before = self.rx_buffered.fetch_sub(bytes, Ordering::AcqRel);
         if self.rx_paused.load(Ordering::Acquire)
@@ -626,9 +672,47 @@ impl Shared {
         }
     }
 
+    /// Drops whatever events a finished or abandoned call left in its slot,
+    /// returning their stream bytes to receive-side flow control. Every way
+    /// out of a call ends here (`PendingGuard`, `Upload`), so a chunk the I/O
+    /// thread counted is always uncounted, even when the caller stopped early.
+    fn release(&self, slot: &Slot) {
+        for event in slot.drain() {
+            if let Event::Chunk(_, bytes) = event {
+                self.rx_consumed(bytes.len());
+            }
+        }
+    }
+
     fn data_room(&self, state: &State, bytes: usize) -> bool {
-        let queued = state.queues.data.bytes();
-        queued == 0 || queued + bytes <= self.options.data_queue_bytes
+        fits(
+            state.queues.data.bytes(),
+            bytes,
+            self.options.data_queue_bytes,
+        )
+    }
+
+    /// Whether `frames` fit the bounds of their queues.
+    fn room(&self, state: &State, frames: &[(Lane, Vec<u8>)]) -> bool {
+        let need = |lane: Lane| -> usize {
+            frames
+                .iter()
+                .filter(|(other, _)| *other == lane)
+                .map(|(_, frame)| frame.len())
+                .sum()
+        };
+        let queues = &state.queues;
+        fits(queues.control_bytes, need(Lane::Control), self.tx_cap())
+            && fits(queues.response.bytes(), need(Lane::Response), self.tx_cap())
+            && self.data_room(state, need(Lane::Data))
+    }
+
+    /// Drops the frames of call `id` still queued once it has its outcome (an
+    /// early reply to a streamed request leaves no reason to send the rest).
+    pub(crate) fn completed(&self, state: &mut State, id: u64) {
+        if state.queues.purge(id) > 0 && state.space_waiters > 0 {
+            self.space.notify_all();
+        }
     }
 
     fn wait_space<'a>(
@@ -820,29 +904,28 @@ impl Shared {
         frames: Vec<(Lane, Vec<u8>)>,
         space_until: Instant,
     ) -> Result<(), CallError> {
-        let bytes = |lane: Lane| -> usize {
-            frames
-                .iter()
-                .filter(|(other, _)| *other == lane)
-                .map(|(_, frame)| frame.len())
-                .sum()
-        };
-        let (data, control) = (bytes(Lane::Data), bytes(Lane::Control));
+        let control: usize = frames
+            .iter()
+            .filter(|(lane, _)| *lane == Lane::Control)
+            .map(|(_, frame)| frame.len())
+            .sum();
         let mut state = self.lock();
         loop {
             if let Some(reason) = state.refusal() {
                 return Err(CallError::Unavailable(reason));
             }
-            if data == 0 || self.data_room(&state, data) {
+            // A full control queue refuses a request header at once; bodies
+            // and data wait for room until `space_until`.
+            if control > 0 && state.queues.control_bytes + control > self.tx_cap() {
+                return Err(CallError::Busy);
+            }
+            if self.room(&state, &frames) {
                 break;
             }
             if Instant::now() >= space_until {
                 return Err(CallError::Busy);
             }
             state = self.wait_space(state, space_until);
-        }
-        if control > 0 && state.queues.control_bytes + control > self.options.control_queue_bytes {
-            return Err(CallError::Busy);
         }
         state.pending.insert(id, slot.clone());
         for (lane, frame) in frames {
@@ -854,8 +937,9 @@ impl Shared {
     }
 
     /// Gives up on call `id`: unregisters it, drops its queued frames and
-    /// sends CANCEL. Returns `false` when the call had already ended (its
-    /// final event is then in the slot).
+    /// sends CANCEL. Returns `false` when the call was no longer pending: it
+    /// ended (its outcome is then in the slot, see [`Slot::has_outcome`]) or
+    /// was abandoned before.
     fn abandon(&self, id: u64, slot: &Slot) -> bool {
         let removed = {
             let mut state = self.lock();
@@ -881,11 +965,7 @@ impl Shared {
         };
         if removed {
             self.wake();
-            for event in slot.drain() {
-                if let Event::Chunk(_, bytes) = event {
-                    self.rx_consumed(bytes.len());
-                }
-            }
+            self.release(slot);
         }
         removed
     }
@@ -909,20 +989,41 @@ impl Shared {
         let mut active = Instant::now();
         let mut ended = false;
         loop {
+            let idle_at = idle.map(|idle| after(active, idle));
             let wait = if ended {
                 None
             } else {
-                earliest(until, idle.map(|idle| after(active, idle)))
+                earliest(until, idle_at)
             };
             let Some(event) = slot.next(wait) else {
+                let now = Instant::now();
+                if idle_at.is_some_and(|at| now >= at)
+                    && until.is_none_or(|until| now < until)
+                    && self.rx_paused.load(Ordering::Acquire)
+                {
+                    // This side holds its reads (some consumer is behind):
+                    // the stream's next frame may be waiting unread behind
+                    // the hold, so the idle deadline restarts. The absolute
+                    // deadline still applies.
+                    active = now;
+                    continue;
+                }
                 if guard.abandon() {
                     return Err(CallError::Timeout {
                         after_ms: ms(started.elapsed()),
                     });
                 }
-                // The outcome arrived as the deadline passed; it is queued.
-                ended = true;
-                continue;
+                if slot.has_outcome() {
+                    // The outcome arrived as the deadline passed; it is
+                    // queued, so the wait below cannot block.
+                    ended = true;
+                    continue;
+                }
+                // Abandoned earlier (an `Upload` whose `chunk` timed out):
+                // nothing more will arrive.
+                return Err(CallError::Timeout {
+                    after_ms: ms(started.elapsed()),
+                });
             };
             match event {
                 Event::Chunk(header, bytes) => {
@@ -979,7 +1080,8 @@ impl Shared {
     }
 }
 
-/// Abandons a call (CANCEL) when its caller returns or unwinds early.
+/// Abandons a call (CANCEL) when its caller returns or unwinds early, and
+/// always releases what is left in its slot.
 struct PendingGuard<'a> {
     shared: &'a Shared,
     id: u64,
@@ -999,6 +1101,10 @@ impl Drop for PendingGuard<'_> {
         if self.armed {
             self.shared.abandon(self.id, self.slot);
         }
+        // A call that stopped early (its callback failed or panicked) after
+        // the I/O thread had queued more chunks, or its outcome, leaves them
+        // here; no event can arrive any more.
+        self.shared.release(self.slot);
     }
 }
 
@@ -1113,6 +1219,7 @@ impl Conn {
             sent: 0,
             started,
             done: false,
+            failed: None,
         })
     }
 
@@ -1258,16 +1365,24 @@ pub struct Upload {
     idle: Duration,
     sent: u64,
     started: Instant,
+    /// The request no longer needs abandoning when dropped.
     done: bool,
+    /// Why this side gave up on the request (a `chunk` that found no room
+    /// within `idle`); later calls, `finish` included, report it.
+    failed: Option<CallError>,
 }
 
 impl Upload {
     /// Queues one part of the body (blocks while the data queue is full, at
-    /// most `idle`). `h.id` is set to this request's id. Fails once the
-    /// request has ended: `Remote` if the server answered with an error,
-    /// `Cancelled` if it answered early (call [`Upload::finish`] for the
-    /// reply), `ConnectionLost` if the connection failed.
+    /// most `idle`; then the request is cancelled and `Timeout` returned, here
+    /// and by every later call). `h.id` is set to this request's id. Fails
+    /// once the request has ended: `Remote` if the server answered with an
+    /// error, `Cancelled` if it answered early (call [`Upload::finish`] for
+    /// the reply), `ConnectionLost` if the connection failed.
     pub fn chunk(&mut self, h: ChunkHeader, bytes: &[u8]) -> Result<(), CallError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         if self.done {
             return Err(CallError::Cancelled);
         }
@@ -1295,11 +1410,17 @@ impl Upload {
             }
             if Instant::now() >= until {
                 drop(state);
-                self.done = true;
-                shared.abandon(self.id, &self.slot);
-                return Err(CallError::Timeout {
-                    after_ms: ms(self.started.elapsed()),
-                });
+                if shared.abandon(self.id, &self.slot) {
+                    let error = CallError::Timeout {
+                        after_ms: ms(self.started.elapsed()),
+                    };
+                    self.done = true;
+                    self.failed = Some(error.clone());
+                    return Err(error);
+                }
+                // The request ended as the wait expired: `finish` has its
+                // outcome.
+                return Err(self.slot.ended_error());
             }
             state = shared.wait_space(state, until);
         }
@@ -1311,9 +1432,12 @@ impl Upload {
     }
 
     /// Ends the body and waits for the response (idle deadline; PROGRESS
-    /// resets it).
+    /// resets it). After a `chunk` timeout it returns that `Timeout` at once.
     pub fn finish(mut self) -> Result<Reply, CallError> {
         self.done = true;
+        if let Some(error) = self.failed.take() {
+            return Err(error);
+        }
         let shared = self.conn.inner.clone();
         {
             let mut state = shared.lock();
@@ -1347,9 +1471,11 @@ impl Upload {
 
 impl Drop for Upload {
     fn drop(&mut self) {
+        let shared = &self.conn.inner;
         if !self.done {
-            self.conn.inner.abandon(self.id, &self.slot);
+            shared.abandon(self.id, &self.slot);
         }
+        shared.release(&self.slot);
     }
 }
 
@@ -1373,15 +1499,18 @@ pub struct Incoming {
 }
 
 /// Answers one request. Exactly one of `reply` or `error` should be called;
-/// dropping it unanswered replies `UNKNOWN_ERROR`.
+/// dropping it unanswered replies `UNKNOWN_ERROR`. A reply waits while its
+/// queue is full (the peer is behind on reading); it is dropped if the
+/// request is cancelled or the connection closes meanwhile.
 pub struct Responder {
     id: u64,
     shared: Arc<Shared>,
     cancel: Arc<AtomicBool>,
     /// Response body limit of the op.
     limit: usize,
-    streamed: Cell<bool>,
-    answered: Cell<bool>,
+    /// Atomics, so a `&Responder` can be shared with a progress thread.
+    streamed: AtomicBool,
+    answered: AtomicBool,
 }
 
 impl Responder {
@@ -1391,8 +1520,8 @@ impl Responder {
             shared,
             cancel,
             limit,
-            streamed: Cell::new(false),
-            answered: Cell::new(false),
+            streamed: AtomicBool::new(false),
+            answered: AtomicBool::new(false),
         }
     }
 
@@ -1430,11 +1559,12 @@ impl Responder {
         state.queues.push(Lane::Data, self.id, frame);
         drop(state);
         shared.wake();
-        self.streamed.set(true);
+        self.streamed.store(true, Ordering::Release);
         Ok(())
     }
 
-    /// Resets the client's idle deadline.
+    /// Resets the client's idle deadline. A PROGRESS still queued for this
+    /// request makes another one redundant, so at most one waits at a time.
     pub fn progress(&self) {
         if self.cancelled() {
             return;
@@ -1454,10 +1584,10 @@ impl Responder {
         };
         {
             let mut state = shared.lock();
-            if !state.serving.contains_key(&self.id) {
+            if !state.serving.contains_key(&self.id) || !state.queues.push_progress(self.id, frame)
+            {
                 return;
             }
-            state.queues.push(Lane::Control, self.id, frame);
         }
         shared.wake();
     }
@@ -1485,18 +1615,32 @@ impl Responder {
         self.cancel.load(Ordering::Acquire)
     }
 
+    /// Queues the reply once its queues have room (backpressure: a peer that
+    /// leaves replies unread holds handlers here, not memory). Gives up when
+    /// the request is cancelled or expires, or the connection closes.
     fn answer(&self, result: Result<Value, ErrorWire>, body: &[u8]) {
-        self.answered.set(true);
+        self.answered.store(true, Ordering::Release);
         if self.cancelled() {
             return;
         }
         let shared = &self.shared;
-        let frames = shared.response_frames(self.id, result, body, self.streamed.get());
+        let streamed = self.streamed.load(Ordering::Acquire);
+        let frames = shared.response_frames(self.id, result, body, streamed);
         {
             let mut state = shared.lock();
-            if state.serving.remove(&self.id).is_none() {
-                return;
+            loop {
+                if state.closed.is_some()
+                    || self.cancelled()
+                    || !state.serving.contains_key(&self.id)
+                {
+                    return;
+                }
+                if shared.room(&state, &frames) {
+                    break;
+                }
+                state = shared.wait_space(state, after(Instant::now(), RECHECK));
             }
+            state.serving.remove(&self.id);
             for (lane, frame) in frames {
                 state.queues.push(lane, self.id, frame);
             }
@@ -1507,7 +1651,7 @@ impl Responder {
 
 impl Drop for Responder {
     fn drop(&mut self) {
-        if !self.answered.get() && !self.cancelled() {
+        if !self.answered.load(Ordering::Acquire) && !self.cancelled() {
             self.answer(
                 Err(ErrorWire::coded(
                     "UNKNOWN_ERROR",
