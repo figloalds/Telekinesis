@@ -31,7 +31,11 @@ use tkfs::{
     },
     ws::{self, RawSocket},
 };
-use tungstenite::{Message, stream::MaybeTlsStream};
+use tungstenite::{
+    Message,
+    protocol::{CloseFrame, frame::coding::CloseCode},
+    stream::MaybeTlsStream,
+};
 
 const CLIENT: &str = "client-installation";
 const SERVER: &str = "server-installation";
@@ -1268,6 +1272,142 @@ fn preauth_protocol_violations_close_the_connection() {
         let error = server.join().unwrap().unwrap_err();
         assert_eq!(error.code, "PROTOCOL_VIOLATION", "{case}: {error}");
         assert!(policy.admitted.lock().unwrap().is_empty(), "{case}");
+    }
+}
+
+/// Reads until the peer closes, expecting no data message; returns the code
+/// of its close frame (`None` when the connection ended without one).
+fn close_code(ws: &mut RawSocket) -> Option<CloseCode> {
+    loop {
+        match ws.read() {
+            Ok(Message::Close(frame)) => {
+                let _ = ws.flush();
+                return frame.map(|frame| frame.code);
+            }
+            Err(_) => return None,
+            Ok(Message::Ping(_) | Message::Pong(_)) => {}
+            Ok(message) => panic!("unexpected message {message:?}"),
+        }
+    }
+}
+
+/// A scripted v3 server: echoes the upgrade, reads HELLO, then closes with
+/// `code` and `reason` instead of answering.
+fn closing_server(code: CloseCode, reason: &'static str) -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut ws = ws::accept_with(stream, 64 * 1024, |_, response| {
+            response
+                .headers_mut()
+                .insert("X-Tkfs-Sync", "3".parse().unwrap());
+        })
+        .unwrap();
+        assert_eq!(read_frame(&mut ws).0, 1);
+        ws.close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        }))
+        .unwrap();
+        drain_until_closed(&mut ws);
+    });
+    (endpoint, server)
+}
+
+#[test]
+fn peer_closes_are_not_protocol_violations() {
+    // A v3 dialer that hangs up politely, with a reason, instead of sending
+    // HELLO: the server reports a closed connection, not a violation, and
+    // does not answer with a protocol close.
+    let (_, _, policy) = paired();
+    let (endpoint, _, server) = serve_once(policy.clone());
+    let mut ws = raw_v3(&endpoint);
+    ws.close(Some(CloseFrame {
+        code: CloseCode::Away,
+        reason: "going away\n".into(),
+    }))
+    .unwrap();
+    assert_ne!(close_code(&mut ws), Some(CloseCode::Protocol));
+    let error = server.join().unwrap().unwrap_err();
+    assert_eq!(error.code, "WS_CLOSED", "{error}");
+    assert!(error.message.contains(r"going away\n"), "{error}");
+    assert!(!error.message.contains('\n'), "{error}");
+    assert!(policy.admitted.lock().unwrap().is_empty());
+
+    // The same from a legacy dialer: no legacy attempt, no violation.
+    let (endpoint, _, server) = serve_once(policy.clone());
+    let mut socket = ws::connect(&endpoint).unwrap();
+    socket
+        .close(Some(CloseFrame {
+            code: CloseCode::Away,
+            reason: "going away".into(),
+        }))
+        .unwrap();
+    let error = server.join().unwrap().unwrap_err();
+    assert_eq!(error.code, "WS_CLOSED", "{error}");
+    assert!(policy.legacy.lock().unwrap().is_empty());
+
+    // Client side: a server that closes politely is a closed connection
+    // (Transient); one that closes with a protocol error is a violation.
+    let (code, _) = Verifier::generate();
+    for (close, reason, expected) in [
+        (CloseCode::Away, "going away", "WS_CONNECT_FAILED"),
+        (
+            CloseCode::Protocol,
+            "PROTOCOL_VIOLATION: bad hello",
+            "PROTOCOL_VIOLATION",
+        ),
+    ] {
+        let (endpoint, server) = closing_server(close, reason);
+        let error = handshake::connect_v3(
+            &endpoint,
+            hello(LaneRole::Control, None),
+            &CodeAuth { code: code.clone() },
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_wire().code, expected, "{error:?}");
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn an_invalid_server_installation_is_the_servers_failure() {
+    // The server's own id is invalid: it refuses every handshake as its own
+    // failure (INSTALLATION_REQUIRED, close code 1011) and never blames the
+    // dialer with PROTOCOL_VIOLATION.
+    let (code, verifier) = Verifier::generate();
+    for installation in [String::new(), "bad\u{0}id".into(), "x".repeat(129)] {
+        let policy = Policy::new(&installation, Some((verifier.clone(), GENERATION)));
+        let (endpoint, _, server) = serve_once(policy.clone());
+        let error = handshake::connect_v3(
+            &endpoint,
+            hello(LaneRole::Control, None),
+            &CodeAuth { code: code.clone() },
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, DialError::Connect(_)), "{error:?}");
+        assert_eq!(error.class(), ErrorClass::Transient);
+        let failure = server.join().unwrap().unwrap_err();
+        assert_eq!(failure.code, "INSTALLATION_REQUIRED", "{failure}");
+        assert!(policy.admitted.lock().unwrap().is_empty());
+
+        // On the wire: no HELLO_ACK, an internal-error close.
+        let (endpoint, _, server) = serve_once(policy.clone());
+        let mut ws = raw_v3(&endpoint);
+        send_frame(&mut ws, 1, &hello(LaneRole::Control, None));
+        assert_eq!(close_code(&mut ws), Some(CloseCode::Error));
+        assert_eq!(
+            server.join().unwrap().unwrap_err().code,
+            "INSTALLATION_REQUIRED"
+        );
     }
 }
 
