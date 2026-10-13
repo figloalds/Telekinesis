@@ -798,7 +798,7 @@ pub mod objects {
     }
 
     /// Worker `objects.want` header; reply [`WantReply`].
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct WantHeader {
         pub route: SyncRoute,
         pub lane: LaneSpec,
@@ -814,7 +814,7 @@ pub mod objects {
     }
 
     /// Worker `objects.read` header; reply header [`ReadReply`], body = bytes.
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReadHeader {
         pub route: SyncRoute,
         pub hash: String,
@@ -838,7 +838,7 @@ pub mod objects {
     }
 
     /// Worker `objects.write` header; reply [`WriteReply`].
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct WriteHeader {
         pub route: SyncRoute,
         pub session: String,
@@ -860,7 +860,7 @@ pub mod objects {
     }
 
     /// Worker `objects.report` header; reply [`ReportReply`].
-    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ReportHeader {
         pub route: SyncRoute,
         pub hash: String,

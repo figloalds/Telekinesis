@@ -396,15 +396,13 @@ pub struct WorkerHeartbeat {
 }
 
 /// `feed-offer{route}` → [`MetaExchangeRequest`].
-/// (`SyncRoute` has no `PartialEq`; compare serialized forms.)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedOfferRequest {
     pub route: SyncRoute,
 }
 
 /// `feed-exchange{route, request}` → [`FeedExchangeReply`].
-/// (`SyncRoute` has no `PartialEq`; compare serialized forms.)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedExchangeRequest {
     pub route: SyncRoute,
     pub request: MetaExchangeRequest,
@@ -418,8 +416,7 @@ pub struct FeedExchangeReply {
 }
 
 /// `feed-apply{route, request_id, reply}` → [`FeedApplyResult`].
-/// (`SyncRoute` has no `PartialEq`; compare serialized forms.)
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedApplyRequest {
     pub route: SyncRoute,
     pub request_id: String,

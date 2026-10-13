@@ -1,7 +1,9 @@
 /target/
 # Local test output and archived evidence; keep tests and harnesses in source control.
 /test-runs/
-/test-evidence/
+/test-evidence/*
+# Integrators commit qualification evidence (REVAMP_PLAN §13 rule 8.5; CCR-WP0.5-2).
+!/test-evidence/qualification-*.json
 # Legacy report locations (current harnesses use the directories above).
 /VALIDATION.json
 /*-VALIDATION.json
@@ -11,3 +13,9 @@
 *.sqlite*
 *.log
 __pycache__/
+# Committed test fixtures include SQLite databases and logs (CCR-WP0.5-2).
+!/tests/fixtures/**
+# ...but never SQLite side files left by opening a fixture in place.
+/tests/fixtures/**/*-wal
+/tests/fixtures/**/*-shm
+/tests/fixtures/**/*-journal
