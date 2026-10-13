@@ -62,6 +62,10 @@ done
 run_dir="$root/test-runs/qualify-$kind-linux-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$run_dir" "$(dirname "$evidence")"
 started=$(date +%s)
+# Git state when the run starts (edits made during a long run do not belong to it).
+git -C "$root" rev-parse HEAD >"$run_dir/git-head.txt" 2>/dev/null || true
+git -C "$root" rev-parse --abbrev-ref HEAD >"$run_dir/git-branch.txt" 2>/dev/null || true
+git -C "$root" status --porcelain >"$run_dir/git-status.txt" 2>/dev/null || true
 echo "qualify: $kind (linux), files: ${selected[*]}"
 if [ "$build" = 1 ]; then
   args=(test --release --no-run)
@@ -90,9 +94,8 @@ import json, os, platform, subprocess, sys, time
 root, run_dir, evidence, kind, wave, baseline, budget, file_timeout, flt, started = sys.argv[1:11]
 statuses = sys.argv[11:]
 wave, baseline = int(wave), baseline == "1"
-def git(*a):
-    try: return subprocess.check_output(["git", *a], cwd=root, text=True,
-                                        stderr=subprocess.DEVNULL).strip()
+def started_git(name):
+    try: return open(os.path.join(run_dir, name)).read().strip()
     except Exception: return ""
 floors = json.load(open(os.path.join(root, "tests/qualification-floors.json")))["floors"]
 records, files = [], []
@@ -159,8 +162,9 @@ except Exception: mem = None
 doc = {
     "schema": 1, "kind": kind, "platform": "linux", "wave": wave,
     "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "duration_s": int(time.time()) - int(started),
-    "git": {"commit": git("rev-parse", "HEAD"), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
-            "dirty": bool(git("status", "--porcelain"))},
+    "git": {"commit": started_git("git-head.txt"), "branch": started_git("git-branch.txt"),
+            "dirty": bool(started_git("git-status.txt")),
+            "dirty_paths": started_git("git-status.txt").splitlines()[:50]},
     "toolchain": subprocess.run(["rustc", "-V"], capture_output=True, text=True).stdout.strip(),
     "hardware": {"cpu": cpu, "threads": os.cpu_count(), "memory_gb": mem, "os": platform.platform(),
                  "fuse": os.path.exists("/dev/fuse")},
