@@ -38,8 +38,10 @@ pub enum Action {
     Stop {
         state: String,
         /// `false` returns at once instead of waiting for `Stopped|StopBlocked`
-        /// (§3.5). The legacy supervisor always stops synchronously.
-        #[serde(default)]
+        /// (§3.5). The legacy supervisor always stops synchronously. Omitted
+        /// when `None`, so a stop request still parses on a 6298d0b daemon,
+        /// whose `Action` denies unknown fields.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         wait: Option<bool>,
     },
     Shutdown,

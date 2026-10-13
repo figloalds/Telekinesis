@@ -83,14 +83,17 @@ rule 6 and item 7 of rule 8).
      hold one). On drop a connection goes back to the pool only while fewer
      than `MAX_IDLE = 8` are idle and it is in autocommit; otherwise it is
      closed (which rolls back anything left open). Pooled connections see the
-     engine's commits through WP0.3's `data_version` view key (tested).
+     engine's commits through WP0.3's `data_version` view key (tested), and
+     every checkout re-reads `active` and `generation` from `config`, so a
+     reused connection follows the engine's `checkout` (fix round 1).
    - **`EngineGaugeCell`** keeps its counters in atomics, plus a
      1,024-sample ring of waits for `wait_p99_ms` (nearest rank) behind a
-     short internal mutex (never the engine lock). `record_hold` counts the
-     hold, updates `longest_hold_ms` and ends the hold in progress;
-     `begin_hold` starts it, so `current_hold_ms` and `stalled`
-     (> `timing::ENGINE_STALLED_AFTER`, 120 s) are computable without the
-     engine lock; `begin_wait` returns a guard that counts a waiter.
+     short internal mutex (never the engine lock). `begin_hold` marks a hold
+     in progress by the calling thread (monotonic clock), so `current_hold_ms`
+     and `stalled` (> `timing::ENGINE_STALLED_AFTER`, 120 s) are computable
+     without the engine lock; `record_hold` counts the hold, updates
+     `longest_hold_ms` and ends the mark only if the calling thread began it
+     (fix round 1); `begin_wait` returns a guard that counts a waiter.
    - **`MountController`** (today's semantics): `attach(path)` calls
      `mount::start`; on failure it records
      `AttachFailed{error: ErrorWire::from_error, attempt, next_retry_at_ms: None}`
@@ -105,6 +108,33 @@ rule 6 and item 7 of rule 8).
 
 3. **CCRs applied** (commit "apply wave 0 CCRs"); see the CCR section.
 
+## Fix round 1
+
+The review (verdict `changes_required`) had one blocker, one major and three
+minor findings. All five are addressed; none is rejected.
+
+| # | Severity | Finding | Change |
+|---|---|---|---|
+| 1 | blocker | The full suite is not reliably green: `orchestrator::three_orchestrators_relay_origins_and_private_branches_stay_local` fails with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` from `Engine::control` (CCR-WP0.INT-2, filed but not applied) | **CCR-WP0.INT-2 applied** (§13 rule 5: `control.rs` has no owner in Waves 1–4). From autocommit, `Engine::control` now opens its journaled request with `BEGIN IMMEDIATE` and then `SAVEPOINT control_request`. It runs `RELEASE` then `COMMIT` before `fault("receipt_committed")`, and on any error (including a failed `COMMIT`) it runs `ROLLBACK`. Inside a caller's transaction it opens only the savepoint, as before. Regression tests: `tests/control_transactions.rs` (below). The old code fails 2 of its 4 tests with exactly the two production errors (`Error code 5`, `Error code 517`). |
+| 2 | major | `SyncStorePool` hands out reused connections with a stale `active` branch and `generation` after the engine's `checkout` | `SyncStorePool::checkout` re-reads `active` and `generation` from `config` on every checkout, for reused **and** new connections (`open_secondary` reads `active` once and always starts at generation 0, so a new connection also reported the wrong generation). The adapter is in `ctx.rs`, so `core.rs` is unchanged. A failed refresh drops (closes) the connection. Test: `seam_stubs::sync_store_pool_follows_the_engine_checkout`; it fails on the old `ctx.rs`. |
+| 3 | minor | `EngineGaugeCell::record_hold` always clears the hold in progress, so a late report can wipe the next holder's mark; stall detection uses the wall clock | The hold in progress is now `Mutex<Option<(ThreadId, Instant)>>`. `begin_hold` marks the calling thread and a monotonic start. `record_hold(ms)` (signature unchanged) still counts the hold and updates `longest_hold_ms`, but it ends the mark only when called on the thread that began it. Lock guards are not `Send`, so a hold begins and ends on one thread, and a late report from the previous holder never clears the next holder's mark. `current_hold_ms` and `stalled` come from `Instant::elapsed`. The gauge test gained this case, and it fails on the old `ctx.rs`. |
+| 4 | minor | `Action::Stop{wait: None}` serializes `"wait":null`, which a 6298d0b daemon (`deny_unknown_fields`) rejects, so the new CLI/GUI cannot stop an old daemon | `#[serde(default, skip_serializing_if = "Option::is_none")]` on `Stop.wait`. `stop` without `wait` serializes exactly as before. The parse is unchanged, and `Subscribe.wait_ms` still serializes `null` (no old daemon knows `subscribe`). `seam_stubs::action_v2_variants_parse_the_frozen_json` pins both `Stop` forms. |
+| 5 | minor | `MountController` holds its `attempts` mutex across `mount::start`/`mount::stop` (§2.2 rule 2) | Kept, and documented as the deliberate serialization lock of this stub (the reviewer's first option), in the module docs and on the field. Attach and detach must never overlap, and a concurrent caller waits for the transition in progress. Nothing else takes that mutex (not `status()`, the heartbeat or the engine), so no reader waits on mount I/O. WP1.5 replaces it with the `mount-ctl` mailbox of §2.5 (that thread is listed as "serialized attach/detach"). A busy flag that rejects concurrent callers would have changed today's semantics in a stub WP1.5 rewrites anyway. |
+
+**Stress evidence for finding 1** (same method as the review: `--exact
+three_orchestrators_relay_origins_and_private_branches_stay_local`, 6 copies
+in parallel per round, under `C:/tkfs-build/suite-lock.ps1`, Windows debug
+build, same target dir):
+
+| Build | Runs | Failed | Errors |
+|---|---|---|---|
+| Pre-fix `control.rs` (A/B: only that file swapped back, rebuilt) | 60 (10 × 6) | **5** | 4 × `Error code 5: The database file is locked`, 1 × `Error code 517: Cannot promote read transaction to write transaction`, all at `tests/orchestrator.rs:168` |
+| Fixed | 90 (5 × 6 + 10 × 6) | **0** | none |
+
+The same deferred read-then-write pattern exists in two more engine-connection
+transactions owned by Wave 1 packages. They are filed as CCR-WP0.INT-5 and not
+changed here.
+
 ## Deviations from the spec, and why
 
 1. **Additive API on the frozen `ctx.rs` types.** The table lists only
@@ -114,7 +144,10 @@ rule 6 and item 7 of rule 8).
    `PooledStore`, `EngineGaugeCell::{new, begin_wait, begin_hold, waiters,
    WAIT_SAMPLES}` and its `WaitGuard`, and `Clone, Debug, Default, PartialEq,
    Eq` on `ObjectLease`. `EngineGauges.waiters` and `current_hold_ms` cannot
-   be derived from completed waits and holds alone.
+   be derived from completed waits and holds alone. Fix round 1 refined two
+   semantics without changing a signature: `checkout` refreshes the
+   connection's `active`/`generation`, and `record_hold` ends only the
+   calling thread's hold in progress.
 2. **"max 8" is the idle limit, not a concurrency limit.** Blocking a 9th
    checkout would stall `status` behind long object streams (and could
    deadlock a thread that checks out twice); overflow connections are opened
@@ -161,10 +194,14 @@ rule 6 and item 7 of rule 8).
    by the other agents running now. The repo's `scripts/suite-lock.ps1`
    takes `Local\tkfs-full-suite` first and then `Global\tkfs-full-suite`, so
    the two exclude each other; VERIFY used the repo script.
-10. **Behaviour-neutral Wave 0.** Pre-existing product defects found in
-    review (CCR-WP0.INT-2, -3, -4) are filed, not fixed: none has a
-    deterministic reproduction here, and the wave's contract is no
-    behaviour change.
+10. **Behaviour-neutral Wave 0, with one exception.** Pre-existing product
+    defects found in review (CCR-WP0.INT-3, -4, -5) are filed, not fixed.
+    CCR-WP0.INT-2 was also filed at first, but the fix-round review made it a
+    blocker: the wave's acceptance ("full suite") failed on it. It is now
+    applied under §13 rule 5, with a deterministic reproduction
+    (`tests/control_transactions.rs`). The only behaviour change is that a
+    control request waits up to `busy_timeout` (5 s) for SQLite's writer slot
+    instead of failing at once. No API, wire format or schema changes.
 
 ## CCRs
 
@@ -195,26 +232,28 @@ rule 6 and item 7 of rule 8).
   48/48, so this run is not a comparison; the fix is justified by the failure
   mode itself. WP2.3's "retry `try_lock` ≤ 100 ms before `WORKER_BUSY`" fixes
   the product side.
-- **CCR-WP0.INT-2 (not applied).** Requested change: `Engine::control`
-  (`src/runtime/control.rs:169`) opens a deferred `SAVEPOINT control_request`,
-  reads, then writes. When another connection to the same WAL database (the
-  bulk transfer view, a pooled `SyncStore`) commits in between, the
-  read-to-write upgrade fails with `SQLITE_BUSY_SNAPSHOT` (517) or
-  `SQLITE_BUSY` (5) without running the busy handler, so the 5 s
-  `busy_timeout` does not help. Fix: when the connection is in autocommit,
-  start with `BEGIN IMMEDIATE; SAVEPOINT control_request`, and `COMMIT` after
-  `RELEASE` (before `fault("receipt_committed")`) and after the rollback
-  path; or retry the whole request on BUSY (the savepoint is rolled back and
-  receipts make it idempotent). Reason: it is the pre-existing flake in
+- **CCR-WP0.INT-2 (applied in fix round 1, under §13 rule 5).** Requested
+  change: `Engine::control` (`src/runtime/control.rs`) opened a deferred
+  `SAVEPOINT control_request`, read, then wrote. When another connection to
+  the same WAL database (the bulk transfer view, a pooled `SyncStore`) held the
+  writer slot, or committed between the read and the first write, the
+  read-to-write upgrade failed at once with `SQLITE_BUSY` (5) or
+  `SQLITE_BUSY_SNAPSHOT` (517). SQLite runs the busy handler only for a
+  connection with no open read transaction, so the 5 s `busy_timeout` did not
+  help. A user's `import`/`mkdir` failed spuriously during bulk transfer. This
+  was the pre-existing flake in
   `orchestrator::three_orchestrators_relay_origins_and_private_branches_stay_local`
-  (WP0.2 notes and review). It failed once during this integration, in a
-  targeted `--test orchestrator` run after the seam commit, panicking in the
-  same `rpc(…).unwrap()` helper (`tests/orchestrator.rs:168`) as the WP0.2
-  runs; the error text was not captured, and the test then passed 6/6 alone
-  and 15/15 in the full suite. Owner:
-  `control.rs` has no owner in Waves 1–4, so WP1.INT (or WP1.6 under this
-  CCR, since it classifies BUSY as retry) should apply it. Adapter: none; the
-  suite is re-run when it fails.
+  (WP0.2 notes and review; the first VERIFY run of the review failed on it).
+  Applied fix: from autocommit, `BEGIN IMMEDIATE; SAVEPOINT control_request`.
+  On success `RELEASE` then `COMMIT`, before `fault("receipt_committed")`. On
+  error, `ROLLBACK` (only if SQLite has not already rolled back). Inside a
+  caller's transaction only the savepoint is used, as before. `bulk_sync.rs`
+  already used `BEGIN IMMEDIATE` for the same reason ("avoiding a WAL
+  snapshot-upgrade race"). The crash boundary is unchanged:
+  `additional::mutation_and_receipt_have_one_crash_boundary` (`sql_committed`
+  means nothing is durable, `receipt_committed` means both are) passes.
+  Tests: `tests/control_transactions.rs` (4); stress evidence in "Fix
+  round 1".
 - **CCR-WP0.INT-3 (not applied).** Requested change: `Staged::retain`
   (`src/staging.rs`) creates `staging/<uuid>.stage` and fsyncs only the file;
   `retain_pending` then commits the `pending_saves` row with
@@ -255,24 +294,55 @@ rule 6 and item 7 of rule 8).
   These are for the Wave 1 integrator to schedule (items 3–6 are used by
   Wave 1 packages; 1–2 by Wave 2). Adapter: none needed in Wave 0.
 
+- **CCR-WP0.INT-5 (not applied; same defect class as CCR-WP0.INT-2 in
+  files owned by Wave 1 packages).** Two more engine-connection
+  transactions start deferred from autocommit, read, then write. They can
+  fail with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` while the bulk transfer view
+  or a pooled `SyncStore` writes:
+  1. `Engine::flush_entity` (`src/runtime/engine.rs`, `SAVEPOINT staged_save`,
+     when a `pending_saves` row exists): the write of a retained save reads
+     the projection before its first write. Owner: WP1.4.
+  2. `Store::drain_incoming` (`src/core/inbox.rs`, `SAVEPOINT incoming_<id>`):
+     selects `incoming_events`, then commits. Owner: WP1.6, which also
+     classifies BUSY as retryable.
+
+  Requested change: when the connection is in autocommit, begin with
+  `BEGIN IMMEDIATE` and `COMMIT`/`ROLLBACK` around the existing savepoint, as
+  `Engine::control` now does (`begin_request`, `commit_request` and
+  `rollback_request` in `src/runtime/control.rs`). No failure in this suite
+  was traced to either site. Adapter: none needed in Wave 0.
+
 ## Package status
 
 | Package | Review | Merged | Status in the merged tree | Open issues (owner) |
 |---|---|---|---|---|
 | WP0.1 orchestrator carve-up | approved | yes (`c229825`) | green; public API unchanged | RC8 behaviour kept by design: global `Supervisor` mutex across I/O, 10 ms main loop, fatal `peers()` error (WP1.12, WP2.1) |
-| WP0.2 runtime carve-up, worker entry, seams | approved | yes (`97a0213`) | green; `DIRTY_SESSION_RETAINED` registered (CCR-WP0.4-3) | `three_orchestrators_*` SQLite busy-snapshot flake (CCR-WP0.INT-2); staging directory fsync (CCR-WP0.INT-3); WP1.4's poison handler must roll back open savepoints before `retain_all_dirty`; WP1.5 must keep or reload sessions after a force detach; review minors: `worker_seams.rs:77` `quiet().is_err()` holds regardless of the retain (assert the message), and the failure path of `retain_all_dirty` (`k of n`) has no test (WP1.4/WP1.5) |
+| WP0.2 runtime carve-up, worker entry, seams | approved | yes (`97a0213`) | green; `DIRTY_SESSION_RETAINED` registered (CCR-WP0.4-3) | `three_orchestrators_*` SQLite busy-snapshot flake (CCR-WP0.INT-2, fixed in fix round 1); same pattern in `staged_save` (CCR-WP0.INT-5, WP1.4); staging directory fsync (CCR-WP0.INT-3); WP1.4's poison handler must roll back open savepoints before `retain_all_dirty`; WP1.5 must keep or reload sessions after a force detach; review minors: `worker_seams.rs:77` `quiet().is_err()` holds regardless of the retain (assert the message), and the failure path of `retain_all_dirty` (`k of n`) has no test (WP1.4/WP1.5) |
 | WP0.3 core carve-up, oracle, view freshness | approved | yes (`ccec5db`) | green | oracle blind spots: inflated `resolved_by` is not reported (clear `resolved_by` inside the savepoint before rebuild) and fabricated register conflict rows are not reported; oracle error path checks `rollback?` before `result?` and reads before writing in a deferred savepoint (BUSY_SNAPSHOT on a live worker) (WP1.7 uses the oracle; `verify.rs` has no later owner: WP1.INT); `data_version` makes the engine reload its view after foreign commits such as bulk bookkeeping, O(projection) per reload (WP1.8/WP2.x qualification); no test pins `open_existing_with` W0 behaviour (WP1.8); `partial_content` race fixed here (CCR-WP0.INT-1) |
 | WP0.4 contracts, utilities, session stubs | approved | yes (`6417df3`) | green; CCR-WP0.4-1/-2/-3 applied | review findings filed as CCR-WP0.INT-4 (need budget vs `MAX_BODY_META`; `catalog.list` probe role; `Cancel` hook ordering and deregistration; `Tracked` drop order and log I/O under the logger lock; unbounded log rate-limit map; `Backoff` pub jitter; `event!` identifiers not scanned); minors: `ProcessEvent::Exited` `Option` fields lack `#[serde(default)]` (no runtime effect); `objects.wants` reply is `{"items":[…]}` rather than the bare `[WantItem]` of §6.2, undocumented in notes/wp0-4.md (WP2.8/WP3.2 should follow the frozen type) |
 | WP0.5 harness, goldens, fixtures | **not approved** | yes (`1ee843c`); nothing in it blocked integration | `harness_selftest` green; 77 qual scenarios compile and are ignored; CCR-WP0.5-1/-2/-3 applied | **major:** `qual_wp3_int_e2e::idle_exchange_daemons` computes `(bytes1-bytes0)/(ex1-ex0).max(1)` with unchecked `u64` subtraction and no proof an exchange happened, so the W3 floor `e2e_idle_exchange_bytes` can pass with nothing measured (WP3.INT, owner of the file; WP0.5 follow-up if reopened). **minor:** no daemon-level (W3) idle-exchange CPU floor; `qual_wp1_12_legacy::crash_backoff` and both `interval_20s_no_reconnects` can pass vacuously (no restart lower bound; no "lanes still connected" check) (WP1.12, WP3.1); `qual_wp2_4_offlock` lock-hold probe ignores RPC errors (WP2.4); `worker_busy_not_counted` passes with no contention observed (WP1.12); `qual_wp3_2_objects::crash_resume` never checks it was killed mid-object (WP3.2); `metrics::qual()` lets `extra` override reserved keys, and `qual_wp2_3_worker` passes `"status"` (WP2.3/WP0.5) |
 
 ## Tests added
 
-- `tests/seam_stubs.rs` (7 tests, Windows and Linux):
+- `tests/control_transactions.rs` (4 tests, fix round 1, CCR-WP0.INT-2):
+  `control_request_waits_for_another_writer_instead_of_failing`
+  (deterministic: another connection holds the writer slot for 300 ms while
+  `import` of an existing path runs; the old code fails it with
+  `Error code 5`),
+  `control_requests_interleaved_with_foreign_commits_never_fail_busy`
+  (60 requests against a connection committing every ~2 ms; the old code
+  failed 16 of 60 with `Error code 517` and `Error code 5`),
+  `control_request_inside_a_caller_transaction_leaves_it_to_the_caller`, and
+  `failed_control_request_rolls_back_and_releases_the_writer_slot`.
+- `tests/seam_stubs.rs` (8 tests, Windows and Linux; fix round 1 added
+  `sync_store_pool_follows_the_engine_checkout`, the late-report case of the
+  gauge test, and the `Stop` serialization assertions):
   `stub_signatures_are_exactly_the_landed_ones`,
   `action_v2_variants_parse_the_frozen_json`,
   `legacy_manage_answers_v2_actions_not_implemented`,
   `worker_rpc_seams_answer_unknown_ops_unsupported`,
   `sync_store_pool_reuses_up_to_eight_idle_connections`,
+  `sync_store_pool_follows_the_engine_checkout`,
   `engine_gauge_cell_reports_waits_holds_and_stalls`,
   `mount_failures_stay_mount_scoped`.
 - `src/pairing_code.rs` unit test `verifier_debug_redacts_the_hash`
@@ -280,43 +350,71 @@ rule 6 and item 7 of rule 8).
 
 ## VERIFY
 
-All on the final code (`1f16b00`; the commits after it only add these notes
-and the evidence file), Windows `CARGO_TARGET_DIR=C:/tkfs-target/wp0-int`,
+### Fix round 1 (final code)
+
+All on the final fix-round code, Windows `CARGO_TARGET_DIR=C:/tkfs-target/wp0-int`,
 WSL `CARGO_TARGET_DIR=$HOME/tkfs-target/wp0-int`.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo build --all-targets` | pass, no warnings |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp0-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` (the exact VERIFY command, without `--no-fail-fast`) | **two consecutive runs, both EXIT=0: 199 passed, 0 failed, 80 ignored** across 39 test binaries. The first run was on the code before the last comment-only edits (`control.rs`, `mount_ctl.rs`); the second on the committed code |
+| WSL `cargo check --all-targets` | pass, no warnings |
+| WSL `cargo clippy --all-targets -- -D warnings` (extra: covers the `cfg(unix)` code) | pass |
+| WSL `cargo test --lib --test orchestrator --test seam_stubs --test control_transactions --test additional --test worker_seams --test contracts --test harness_selftest --test partial_content --test oracle_smoke --test runtime_lanes --test availability --test paired_sync` | **pass: 134 passed, 0 failed, 3 ignored** (lib 16 + 1 ignored, additional 5, availability 10, contracts 31, control_transactions 4, harness_selftest 18 + 2 ignored, oracle_smoke 4, orchestrator 15, paired_sync 9, partial_content 8, runtime_lanes 3, seam_stubs 8, worker_seams 3). `/dev/fuse` is present, so the FUSE mount tests ran |
+| Stability of the new tests (Windows) | `control_transactions` 25/25 runs green, `seam_stubs` 25/25 runs green |
+| Stress of the former flake | see "Fix round 1": pre-fix 5 of 60 failed, fixed 0 of 90 |
+
+**Full-suite breakdown (Windows, fix round 1).** 199 = the 194 of the first
+round + `control_transactions` 4 + `seam_stubs::sync_store_pool_follows_the_engine_checkout`.
+Per binary: lib 14 (+1 ignored), main 4, acknowledgements 3, additional 5,
+availability 13, basic_metadata 4, bulk_lanes 3, contracts 31,
+control_transactions 4, core 16, directory_progress 3, harness_selftest 18
+(+2), oracle_smoke 4, orchestrator 15, paired_sync 9, partial_content 8,
+posix_metadata 3, recovery 6, replication_regressions 9, runtime_lanes 3,
+scalability 5, seam_stubs 8, startup_snapshots 8, worker_seams 3, and 15 qual
+binaries with 0 run and 77 ignored.
+
+The qualification evidence below was not re-run in fix round 1: the fix-round
+changes touch only the control-request transaction, the unused `ctx.rs` seam
+types and a serialization attribute, and the review already confirmed 0 of 77
+scenario and 0 of 49 floor differences against the baseline.
+
+### First round
+
+On the code at `1f16b00` (the commits after it only added these notes and
+the evidence file).
 
 | Check | Result |
 |---|---|
 | `cargo fmt --check` | pass |
 | `cargo build --all-targets` | pass, no warnings |
 | `cargo clippy --all-targets -- -D warnings` | pass |
-| `powershell -NoProfile -File scripts/suite-lock.ps1 cargo test --all-targets` (the repo's lock script works and was used, see deviation 9) | **pass, EXIT=0: 194 passed, 0 failed, 80 ignored** across 38 test binaries |
+| `powershell -NoProfile -File scripts/suite-lock.ps1 cargo test --all-targets` (the repo's lock script works and was used, see deviation 9) | pass, EXIT=0: 194 passed, 0 failed, 80 ignored across 38 test binaries. The review's first run of the same suite failed once on the `three_orchestrators_*` flake, which fix round 1 fixed |
 | WSL `cargo check --all-targets` | pass, no warnings |
-| WSL `cargo clippy --all-targets -- -D warnings` (extra: covers the `cfg(unix)` code) | pass |
-| WSL `cargo test --lib --test orchestrator --test seam_stubs --test worker_seams --test contracts --test harness_selftest --test partial_content --test oracle_smoke --test runtime_lanes --test availability --test paired_sync` | **pass: 124 passed, 0 failed** (lib 16 + 1 ignored, orchestrator 15, seam_stubs 7, worker_seams 3, contracts 31, harness_selftest 18 + 2 ignored, partial_content 8, oracle_smoke 4, runtime_lanes 3, availability 10, paired_sync 9). Of §13 rule 8's subset only `orchestrator` exists yet (`session_*`, `worker_lifecycle`, `mount_lifecycle` arrive in Wave 1); `/dev/fuse` is present, so the FUSE mount tests ran |
-| Legacy fixtures (§13 rule 8.3) | `harness_selftest::legacy_worker_fixture_opens_with_current_build` and `legacy_datadir_fixture_opens_with_current_build` pass on Windows and WSL; the release qual scenario `legacy_fixture_upgrade_then_sync` passes |
-| Compat goldens | `harness_selftest::compat_goldens_recapture_identically` passes on Windows and WSL |
+| WSL `cargo clippy --all-targets -- -D warnings` | pass |
+| WSL `cargo test --lib --test orchestrator --test seam_stubs --test worker_seams --test contracts --test harness_selftest --test partial_content --test oracle_smoke --test runtime_lanes --test availability --test paired_sync` | pass: 124 passed, 0 failed. Of §13 rule 8's subset only `orchestrator` exists yet (`session_*`, `worker_lifecycle`, `mount_lifecycle` arrive in Wave 1) |
+| Legacy fixtures (§13 rule 8.3) | `harness_selftest::legacy_worker_fixture_opens_with_current_build` and `legacy_datadir_fixture_opens_with_current_build` pass on Windows and WSL (also in fix round 1); the release qual scenario `legacy_fixture_upgrade_then_sync` passes |
+| Compat goldens | `harness_selftest::compat_goldens_recapture_identically` passes on Windows and WSL (also in fix round 1) |
 | Qualify baseline reproduced | see below |
 
-**Full-suite breakdown (Windows).** 194 = the 130 baseline tests (lib 13 +
+**Full-suite breakdown (Windows, first round).** 194 = the 130 baseline tests (lib 13 +
 1 ignored, bin 4, integration 113) + `worker_seams` 3 (WP0.2) +
 `oracle_smoke` 4 (WP0.3) + `contracts` 31 (WP0.4) + `harness_selftest` 18
 (WP0.5) + `seam_stubs` 7 + the `pairing_code` unit test (lib is now 14). The
 80 ignored are the baseline's 1, WP0.5's 2 capture routines and the 77 qual
-scenarios. Per binary: lib 14 (+1 ignored), main 4, acknowledgements 3,
-additional 5, availability 13, basic_metadata 4, bulk_lanes 3, contracts 31,
-core 16, directory_progress 3, harness_selftest 18 (+2), oracle_smoke 4,
-orchestrator 15, paired_sync 9, partial_content 8, posix_metadata 3,
-recovery 6, replication_regressions 9, runtime_lanes 3, scalability 5,
-seam_stubs 7, startup_snapshots 8, worker_seams 3, and 15 qual binaries with
-0 run and 77 ignored. The brief's "135" baseline does not match the tree:
+scenarios. The brief's "135" baseline does not match the tree:
 like WP0.1–WP0.4, I count 131 listed (130 run + 1 ignored) on Windows at
 `4af40db`.
 
-**Flakes seen during the integration** (none in the final full suite):
+**Flakes seen during the integration:**
 `partial_content::bulk_install_wait_does_not_block_control_rpc` once
 (fixed, CCR-WP0.INT-1) and
 `orchestrator::three_orchestrators_relay_origins_and_private_branches_stay_local`
-once in a targeted run (filed, CCR-WP0.INT-2).
+once in a targeted run and once in the review's first full-suite run (fixed
+in fix round 1, CCR-WP0.INT-2). None in the fix-round full suites.
 
 **Qualification baseline reproduced** (`test-evidence/qualification-wave-0.json`,
 committed now that CCR-WP0.5-2 un-ignores it). Command:
@@ -354,6 +452,15 @@ single-connection `Store::content_status` code, moved verbatim by WP0.3.
 - `MountController` keeps today's limits (no re-attach on WinFsp, no force
   detach, no FUSE recovery with `previous`) until WP1.5.
 - `EngineGaugeCell` is not fed by anything yet: WP1.4 routes the engine locks
-  through `runtime::lock_engine` and reports into it.
+  through `runtime::lock_engine` and reports into it. It must call
+  `begin_hold` and `record_hold` on the thread that holds the engine lock
+  (the guard's own thread); a hold begun and never recorded keeps
+  `current_hold_ms` growing until that thread's next `record_hold`.
+- `MountController` holds its serialization mutex across mount I/O by design
+  (fix round 1, finding 5) until WP1.5's mailbox replaces it.
+- A control request now waits up to 5 s (`busy_timeout`) for SQLite's writer
+  slot. A writer that holds the slot longer still makes the request fail
+  with `database is locked`, as any SQLite writer would. CCR-WP0.INT-5 lists
+  the two remaining deferred read-then-write transactions (WP1.4, WP1.6).
 - The open issues in the package table, and the CCRs filed above, are not
   addressed in Wave 0.
