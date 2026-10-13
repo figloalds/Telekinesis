@@ -12,6 +12,14 @@
 //!   fence, drain and `retain_all_dirty` sequence.
 //! - `status()` reads a published snapshot and never waits for an attach or
 //!   detach in progress.
+//! - Attach and detach are serialized by the `attempts` mutex, which is held
+//!   across `mount::start`/`mount::stop` on purpose: two transitions must
+//!   never run at once, so a concurrent caller waits for the one in progress.
+//!   It is the one deliberate exception to §2.2 rule 2 in this stub: nothing
+//!   else takes that mutex (not `status()`, the heartbeat or the engine), so
+//!   no reader waits on mount I/O. WP1.5 replaces it with the mount-ctl
+//!   mailbox (§2.5), where callers enqueue a transition instead of blocking
+//!   on a lock.
 //!
 //! WP1.5 replaces the internals (preflight, re-attach, force detach, FUSE
 //! recovery with `previous`) behind the same constructor and trait.
@@ -33,7 +41,9 @@ pub struct MountController {
     engine: Shared,
     previous: Option<WorkerRecord>,
     status: Snapshot<MountStatus>,
-    /// Serializes attach and detach; counts consecutive failed attaches.
+    /// Serializes attach and detach and counts consecutive failed attaches.
+    /// Held across mount I/O by design (see the module docs); never taken by
+    /// `status()`.
     attempts: Mutex<u32>,
 }
 

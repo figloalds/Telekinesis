@@ -164,9 +164,10 @@ impl Engine {
             );
         }
         let before = self.store.projection(&self.store.active)?;
-        // Semantic mutation and retry receipt share an outer savepoint. All inner
-        // journal/current-state/outbox changes commit together with the receipt.
-        self.store.db.execute_batch("SAVEPOINT control_request")?;
+        // Semantic mutation and retry receipt share one transaction (an outer
+        // savepoint, begun `IMMEDIATE` from autocommit). All inner journal,
+        // current-state and outbox changes commit together with the receipt.
+        let outer = begin_request(&self.store.db)?;
         let old_active = self.store.active.clone();
         let old_generation = self.store.generation;
         let result = (|| -> Result<Value> {
@@ -229,9 +230,12 @@ impl Engine {
                 ],
             )?;
             Ok(result)
-        })();
+        })()
+        .and_then(|result| {
+            commit_request(&self.store.db, outer)?;
+            Ok(result)
+        });
         if result.is_ok() {
-            self.store.db.execute_batch("RELEASE control_request")?;
             fault("receipt_committed");
             if op != "checkout" {
                 self.notifications.extend(namespace_notifications(
@@ -243,12 +247,57 @@ impl Engine {
                 self.notification_error = None;
             }
         } else {
-            self.store
-                .db
-                .execute_batch("ROLLBACK TO control_request; RELEASE control_request")?;
             self.store.active = old_active;
             self.store.generation = old_generation;
+            rollback_request(&self.store.db, outer)?;
         }
         result
     }
+}
+
+/// Opens the transaction of one journaled control request and reports whether
+/// it is the outermost one (the connection was in autocommit).
+///
+/// From autocommit the request starts with `BEGIN IMMEDIATE`, which takes
+/// SQLite's writer slot before the request's first read. A deferred
+/// transaction reads first and upgrades to a writer on its first write; when
+/// another connection to the same WAL database (the bulk transfer view, a
+/// pooled secondary store) holds the writer slot or has committed since the
+/// read, that upgrade fails at once with `SQLITE_BUSY` or
+/// `SQLITE_BUSY_SNAPSHOT`, without running the busy handler, so the 5 s
+/// `busy_timeout` never applies. Inside a caller's transaction only the
+/// savepoint is opened, as before.
+fn begin_request(db: &rusqlite::Connection) -> Result<bool> {
+    let outer = db.is_autocommit();
+    if outer {
+        db.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    if let Err(error) = db.execute_batch("SAVEPOINT control_request") {
+        if outer {
+            let _ = db.execute_batch("ROLLBACK");
+        }
+        return Err(error.into());
+    }
+    Ok(outer)
+}
+
+/// Commits the request: the mutation and its receipt become durable together.
+fn commit_request(db: &rusqlite::Connection, outer: bool) -> Result<()> {
+    db.execute_batch("RELEASE control_request")?;
+    if outer {
+        db.execute_batch("COMMIT")?;
+    }
+    Ok(())
+}
+
+/// Discards everything the request wrote, including a failed commit.
+fn rollback_request(db: &rusqlite::Connection, outer: bool) -> Result<()> {
+    if !outer {
+        db.execute_batch("ROLLBACK TO control_request; RELEASE control_request")?;
+    } else if !db.is_autocommit() {
+        // SQLite may already have rolled the transaction back (for example
+        // after an I/O error); then there is nothing left to discard.
+        db.execute_batch("ROLLBACK")?;
+    }
+    Ok(())
 }

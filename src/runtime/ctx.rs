@@ -8,7 +8,7 @@
 use crate::{
     core::Store,
     model::{health::EngineGauges, ipc::timing::ENGINE_STALLED_AFTER},
-    util::{lock::lock, time::now_ms},
+    util::lock::lock,
 };
 use anyhow::Result;
 use std::{
@@ -20,6 +20,8 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
+    thread::{self, ThreadId},
+    time::Instant,
 };
 
 /// Everything a worker thread needs besides the engine lock (§14 WP0.INT).
@@ -74,9 +76,13 @@ pub struct ObjectLease {
 /// paths that never take the engine lock (`feed-*`, `objects.*`, `status`).
 ///
 /// `checkout` reuses an idle connection or opens a new one, so it never
-/// blocks on other checkouts. A returned connection is kept for reuse while
-/// fewer than [`SyncStorePool::MAX_IDLE`] are idle and it has no open
-/// transaction; otherwise it is closed (which rolls back anything left open).
+/// blocks on other checkouts. Every checkout re-reads the active branch and
+/// the view generation from `config`, so a connection reused after the engine
+/// ran `checkout` reports the engine's branch and generation, not the ones it
+/// was opened with (a new secondary handle reads `active` once and starts at
+/// generation 0). A returned connection is kept for reuse while fewer than
+/// [`SyncStorePool::MAX_IDLE`] are idle and it has no open transaction;
+/// otherwise it is closed (which rolls back anything left open).
 pub struct SyncStorePool {
     inner: Arc<PoolInner>,
 }
@@ -107,13 +113,16 @@ impl SyncStorePool {
         }
     }
 
-    /// An idle connection, or a new one (`Store::open_secondary`).
+    /// An idle connection, or a new one (`Store::open_secondary`), with the
+    /// engine's current active branch and generation.
     pub fn checkout(&self) -> Result<PooledStore> {
         let reused = lock(&self.inner.idle).pop();
-        let store = match reused {
+        let mut store = match reused {
             Some(store) => store,
             None => Store::open_secondary(&self.inner.root, &self.inner.repo, &self.inner.device)?,
         };
+        // On error the connection is dropped (closed), never returned.
+        refresh_view_identity(&mut store)?;
         Ok(PooledStore {
             store: Some(store),
             pool: self.inner.clone(),
@@ -124,6 +133,23 @@ impl SyncStorePool {
     pub fn idle(&self) -> usize {
         lock(&self.inner.idle).len()
     }
+}
+
+/// Copies the engine's `active` branch and view `generation` (both written by
+/// `Store::checkout`) from `config` into a secondary handle.
+fn refresh_view_identity(store: &mut Store) -> Result<()> {
+    let (active, generation): (String, Option<String>) = store.db.query_row(
+        "SELECT (SELECT value FROM config WHERE key='active'),
+                (SELECT value FROM config WHERE key='generation')",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    store.generation = match generation {
+        Some(generation) => generation.parse()?,
+        None => 0,
+    };
+    store.active = active;
+    Ok(())
 }
 
 impl fmt::Debug for SyncStorePool {
@@ -173,17 +199,24 @@ impl Drop for PooledStore {
     }
 }
 
-/// Engine-lock gauges kept in atomics, so the heartbeat reads them without the
-/// engine lock (§4.2, §4.5). The lock seam reports every wait and hold:
-/// `begin_wait` while blocked, `record_wait` once acquired, `begin_hold` while
-/// held and `record_hold` on release.
+/// Engine-lock gauges, kept outside the engine lock so the heartbeat reads
+/// them without it (§4.2, §4.5). The lock seam reports every wait and hold:
+/// `begin_wait` while blocked, `record_wait` once acquired, then `begin_hold`
+/// and, on release, `record_hold`, both on the thread that holds the lock.
+///
+/// The hold in progress (`current_hold_ms`, `stalled`) is measured on the
+/// monotonic clock and belongs to the thread that began it: `record_hold` ends
+/// it only when called on that thread. A release reported after the mutex was
+/// already unlocked therefore never clears the mark of a next holder on
+/// another thread (lock guards are not `Send`, so a hold begins and ends on
+/// one thread).
 #[derive(Default)]
 pub struct EngineGaugeCell {
     waiters: AtomicU32,
     holds: AtomicU64,
     longest_hold_ms: AtomicU64,
-    /// Start (wall-clock ms) of the hold in progress; 0 when unlocked.
-    hold_since_ms: AtomicU64,
+    /// The hold in progress: its thread and start; `None` when unlocked.
+    holding: Mutex<Option<(ThreadId, Instant)>>,
     /// The most recent waits (ms), for `wait_p99_ms`.
     waits: Mutex<VecDeque<u64>>,
 }
@@ -205,11 +238,15 @@ impl EngineGaugeCell {
         waits.push_back(ms);
     }
 
-    /// A completed hold of the engine lock; ends the hold in progress.
+    /// A completed hold of the engine lock. Ends the hold in progress if the
+    /// calling thread began it (`begin_hold`); another thread's mark stays.
     pub fn record_hold(&self, ms: u64) {
         self.holds.fetch_add(1, Ordering::Relaxed);
         self.longest_hold_ms.fetch_max(ms, Ordering::Relaxed);
-        self.hold_since_ms.store(0, Ordering::Relaxed);
+        let mut holding = lock(&self.holding);
+        if holding.is_some_and(|(owner, _)| owner == thread::current().id()) {
+            *holding = None;
+        }
     }
 
     /// Counts the calling thread as a waiter until the guard drops.
@@ -218,9 +255,10 @@ impl EngineGaugeCell {
         WaitGuard { cell: self }
     }
 
-    /// Marks a hold in progress from now (for `current_hold_ms`/`stalled`).
+    /// Marks a hold in progress by the calling thread from now (monotonic),
+    /// for `current_hold_ms` and `stalled`.
     pub fn begin_hold(&self) {
-        self.hold_since_ms.store(now_ms().max(1), Ordering::Relaxed);
+        *lock(&self.holding) = Some((thread::current().id(), Instant::now()));
     }
 
     /// Threads currently waiting for the engine lock.
@@ -229,12 +267,10 @@ impl EngineGaugeCell {
     }
 
     pub fn snapshot(&self) -> EngineGauges {
-        let since = self.hold_since_ms.load(Ordering::Relaxed);
-        let current_hold_ms = if since == 0 {
-            0
-        } else {
-            now_ms().saturating_sub(since)
-        };
+        let since = lock(&self.holding).map(|(_, since)| since);
+        let current_hold_ms = since.map_or(0, |since| {
+            u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
         let mut waits: Vec<u64> = lock(&self.waits).iter().copied().collect();
         waits.sort_unstable();
         let wait_p99_ms = match waits.len() {

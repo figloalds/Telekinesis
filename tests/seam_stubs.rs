@@ -175,6 +175,20 @@ fn action_v2_variants_parse_the_frozen_json() {
         .unwrap(),
         json!({"op":"subscribe","since":3,"wait_ms":null})
     );
+    // `stop` without `wait` serializes exactly as before, so the new CLI and
+    // GUI can still stop a 6298d0b daemon (`deny_unknown_fields`).
+    let stop = |wait| {
+        serde_json::to_value(Action::Stop {
+            state: "s".into(),
+            wait,
+        })
+        .unwrap()
+    };
+    assert_eq!(stop(None), json!({"op":"stop","state":"s"}));
+    assert_eq!(
+        stop(Some(true)),
+        json!({"op":"stop","state":"s","wait":true})
+    );
     // `deny_unknown_fields` still applies, and required fields stay required.
     assert!(
         serde_json::from_value::<Action>(json!({"op":"subscribe","since":1,"bogus":2})).is_err()
@@ -295,6 +309,55 @@ fn sync_store_pool_reuses_up_to_eight_idle_connections() {
 }
 
 #[test]
+fn sync_store_pool_follows_the_engine_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = engine(dir.path());
+    let ctx = worker_ctx(shared.clone(), dir.path());
+    let pool = &ctx.sync_stores;
+    let engine_view = || {
+        let e = shared.lock().unwrap();
+        (
+            e.store.active.clone(),
+            e.store.generation,
+            e.store.status().unwrap(),
+        )
+    };
+    let (first, generation, _) = engine_view();
+    {
+        let store = pool.checkout().unwrap();
+        assert_eq!(store.active, first);
+        assert_eq!(store.generation, generation);
+    }
+    assert_eq!(pool.idle(), 1);
+    {
+        let mut e = shared.lock().unwrap();
+        e.control("fork", &json!({"op":"branch","name":"second"}))
+            .unwrap();
+        e.control("switch", &json!({"op":"checkout","name":"second"}))
+            .unwrap();
+        let (handle, _) = e.open("on-second", Some("file"), true).unwrap();
+        e.write(handle, 0, b"bytes", false, false).unwrap();
+        e.close(handle).unwrap();
+    }
+    let (second, generation, status) = engine_view();
+    assert_ne!(second, first);
+    // The idle connection opened on the first branch is reused, and reports
+    // the engine's branch, generation and namespace.
+    let reused = pool.checkout().unwrap();
+    assert_eq!(pool.idle(), 0, "the idle connection was reused");
+    assert_eq!(reused.active, second);
+    assert_eq!(reused.generation, generation);
+    let pooled = reused.status().unwrap();
+    assert_eq!(pooled["branch"], status["branch"]);
+    assert_eq!(pooled["generation"], status["generation"]);
+    assert!(reused.lookup("on-second").is_ok());
+    // A new connection agrees.
+    let fresh = pool.checkout().unwrap();
+    assert_eq!(fresh.active, second);
+    assert_eq!(fresh.generation, generation);
+}
+
+#[test]
 fn engine_gauge_cell_reports_waits_holds_and_stalls() {
     let cell = EngineGaugeCell::new();
     assert_eq!(cell.snapshot(), Default::default());
@@ -327,6 +390,18 @@ fn engine_gauge_cell_reports_waits_holds_and_stalls() {
     assert_eq!(released.current_hold_ms, 0);
     assert!(released.longest_hold_ms >= 40);
     assert!(!released.stalled);
+    // A hold reported late, from another thread, after the next holder began
+    // (here: this thread), never clears the next holder's mark.
+    cell.begin_hold();
+    std::thread::scope(|s| {
+        s.spawn(|| cell.record_hold(1));
+    });
+    std::thread::sleep(Duration::from_millis(30));
+    let next = cell.snapshot();
+    assert_eq!(next.holds, 3);
+    assert!(next.current_hold_ms >= 20, "{next:?}");
+    cell.record_hold(30);
+    assert_eq!(cell.snapshot().current_hold_ms, 0);
 }
 
 #[test]
