@@ -1180,9 +1180,12 @@ impl Io {
     fn next_wake(&self, now: Instant) -> Instant {
         let options = self.shared.options;
         let mut wake = self.next_scan;
-        wake = wake.min(self.last_tx.max(self.last_heartbeat) + options.heartbeat);
+        wake = wake.min(after(
+            self.last_tx.max(self.last_heartbeat),
+            options.heartbeat,
+        ));
         if !self.paused {
-            wake = wake.min(self.last_rx + options.dead_after);
+            wake = wake.min(after(self.last_rx, options.dead_after));
         }
         if self.paused || self.overflow_bytes > 0 {
             wake = wake.min(now + RETRY);
