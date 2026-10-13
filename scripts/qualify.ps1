@@ -68,7 +68,13 @@ $qualFiles = [ordered]@{
 if ($All -or $Baseline) { $Wave = 4 }
 if ($Wave -lt 1 -or $Wave -gt 4) { throw "use -Wave 1..4, -All or -Baseline" }
 $selected = @($qualFiles.Keys | Where-Object { $qualFiles[$_] -le $Wave })
-if ($Files) { $selected = @($selected | Where-Object { $Files -contains $_ }) }
+if ($Files) {
+    # `powershell -File` passes "a,b" as one string: accept commas as separators.
+    $Files = @($Files | ForEach-Object { $_ -split "," } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $unknown = @($Files | Where-Object { -not $qualFiles.Contains($_) })
+    if ($unknown.Count -gt 0) { throw "unknown qualification files: $($unknown -join ', ')" }
+    $selected = @($selected | Where-Object { $Files -contains $_ })
+}
 if ($selected.Count -eq 0) { throw "no qualification files selected" }
 
 if ($Baseline) { $kind = "baseline" } elseif ($All) { $kind = "all" } else { $kind = "wave-$Wave" }
