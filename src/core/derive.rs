@@ -18,6 +18,27 @@
 //!
 //! A rebuild (`new_event == None`) always derives in full.
 //!
+//! ## Pure derivation, cheap write (WP2.4)
+//!
+//! `persist_projection` is `derive_conflicts` (pure: it reads no table, so a
+//! slow commit derives off-lock on a read handle) followed by
+//! `write_projection` (the DELETE of namespace rows no longer derived when
+//! the result asks for it, the upsert, the review receipts; in verify mode
+//! and under the commit checks, the comparisons, which need the stored rows).
+//! The only stored rows a derivation used to read, those the new event
+//! reviews, are read first into `DeriveInput::reviewed`. Reviews are
+//! validated during derivation (`INVALID_CONFLICT_REVIEW` is a derivation
+//! error); the write only applies their receipts. Every refusal therefore
+//! surfaces where it did before, with the same text.
+//!
+//! ## Successor counting (CCR-WP1.6-5)
+//!
+//! `successor_may_add_cuts` and `check_successor_cuts` give the commit path's
+//! namespace successor full replay's `NAMESPACE_HISTORY_LIMIT` count without
+//! deriving any record (see `commit.rs`). `check_successor_cuts` counts with
+//! the same relevance, compression and enumeration as `cone_conflicts`
+//! (`count_cuts`).
+//!
 //! ## Why append mode equals full mode (proof obligation)
 //!
 //! Notation: `O` = the branch's committed events, `N = O ∪ {E}`. `S` = the
@@ -359,6 +380,12 @@ pub fn thread_fallback_reasons() -> BTreeMap<&'static str, u64> {
     FALLBACK_REASONS.with(|cell| cell.borrow().clone())
 }
 
+/// Rewrites `branch`'s stored projection as `p` (`current_state`, with its
+/// `current_parts` folded in) and derives and writes its conflict records:
+/// every source in full for a rebuild (`new_event == None`), else the records
+/// of the newly accepted event in the configured mode. `derive_conflicts`
+/// plus `write_projection`; only the stored rows the new event reviews are
+/// read first.
 pub(super) fn persist_projection(
     tx: &Connection,
     branch: &str,
@@ -368,70 +395,213 @@ pub(super) fn persist_projection(
 ) -> Result<()> {
     tx.execute("DELETE FROM current_parts WHERE branch=?", [branch])?;
     tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload",params![branch,serde_json::to_string(p)?])?;
-    let Some(new_id) = new_event else {
+    let reviewed = reviewed_rows(tx, branch, events, new_event)?;
+    let out = derive_conflicts(&DeriveInput {
+        branch,
+        projection: p,
+        events,
+        new_event,
+        reviewed: &reviewed,
+    })?;
+    write_projection(tx, branch, &out)
+}
+
+/// Everything a derivation reads (WP2.4, REVAMP_PLAN §14 WP2.4 task 1).
+/// Derivation itself touches no table, so it runs off-lock on any handle:
+/// the only stored rows it needs, those the new event reviews, are read
+/// before (`read_reviewed`).
+#[derive(Debug, Clone, Copy)]
+pub struct DeriveInput<'a> {
+    pub branch: &'a str,
+    /// The projection of `events` (with the new event).
+    pub projection: &'a Projection,
+    /// The branch's events, the new one included. The historical commit
+    /// path passes them in `id` order with the new event last; the order
+    /// decides only which of two records with one id is kept, so the same
+    /// order gives the same rows.
+    pub events: &'a [Event],
+    /// The newly accepted event (a commit), or `None` (a rebuild: every
+    /// source in full, whatever the mode).
+    pub new_event: Option<&'a str>,
+    /// The stored conflict rows (payloads) that the new event reviews, in
+    /// its `reviewed` order; missing ones are skipped. Empty for a rebuild.
+    pub reviewed: &'a [Conflict],
+}
+
+/// A derived record set ready to write: rows deduplicated by id (the last
+/// record of an id wins), the receipts of the validated reviews in order
+/// (`(review event, reviewed record)`), and whether full mode's DELETE of
+/// the namespace rows it no longer derives runs first.
+#[derive(Debug, Clone, PartialEq)]
+struct Rows {
+    rows: Vec<Conflict>,
+    receipts: Vec<(String, String)>,
+    delete_stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Derived {
+    /// One record set (append, full, a fallback or a rebuild).
+    Rows(Rows),
+    /// Verify mode: both results, compared at write time in savepoints;
+    /// the full one is kept.
+    Verify { append: Rows, full: Rows },
+}
+
+/// The commit check of `set_thread_commit_checks`: after the commit's own
+/// rows are written, the branch's rows must equal a derivation from no rows
+/// (the oracle's rebuild), computed off-lock with the derivation.
+#[derive(Debug, Clone, PartialEq)]
+struct CommitCheck {
+    mode: &'static str,
+    /// A derivation from no rows, or its error text.
+    from_empty: std::result::Result<Rows, String>,
+}
+
+/// The output of `derive_conflicts`: what `write_projection` writes. It is
+/// opaque; only `derive_conflicts` makes one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeriveOutput {
+    new_event: Option<String>,
+    derived: Derived,
+    check: Option<CommitCheck>,
+}
+
+impl DeriveOutput {
+    /// The records this output writes (the kept ones in verify mode),
+    /// deduplicated, in id order.
+    pub fn conflicts(&self) -> &[Conflict] {
+        match &self.derived {
+            Derived::Rows(rows) | Derived::Verify { full: rows, .. } => &rows.rows,
+        }
+    }
+    /// Whether the write runs full mode's DELETE of namespace rows that are
+    /// no longer derived (full mode, a fallback, a rebuild).
+    pub fn deletes_stale_namespace_rows(&self) -> bool {
+        match &self.derived {
+            Derived::Rows(rows) | Derived::Verify { full: rows, .. } => rows.delete_stale,
+        }
+    }
+}
+
+/// The pure half of `persist_projection` (WP2.4): the conflict records of a
+/// commit of `input.new_event` in the configured mode (`conflict_mode`), or
+/// of a rebuild, with the reviews validated. Reads no table and writes
+/// nothing, so a slow commit can derive off-lock; `write_projection` writes
+/// the result. A refusal (`NAMESPACE_HISTORY_LIMIT`, `INVALID_CONFLICT_REVIEW`,
+/// a projection failure of a cut, `CONFLICT_MODE_MISMATCH` in verify mode or
+/// under the commit checks) is an error here, exactly where the historical
+/// `persist_projection` raised it. Counts the derivation (`derive_counters`).
+pub fn derive_conflicts(input: &DeriveInput) -> Result<DeriveOutput> {
+    let Some(new_id) = input.new_event else {
         count(Count::Rebuild);
-        return persist_full(tx, branch, p, events, None);
+        return Ok(DeriveOutput {
+            new_event: None,
+            derived: Derived::Rows(full_rows(input, None)?),
+            check: None,
+        });
     };
-    persist_commit(tx, branch, p, events, new_id)
-}
-
-/// `persist_projection` for a commit whose caller has already stored the
-/// projection `p` as `current_parts` rows (a slow commit's delta,
-/// `Store::projection_delta`, CCR-WP1.INT-4): the derived records only, in
-/// the configured mode, with no rewrite of `current_state`. Derivation reads
-/// neither table.
-pub(super) fn persist_commit_records(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_id: &str,
-) -> Result<()> {
-    persist_commit(tx, branch, p, events, new_id)
-}
-
-/// A commit's records, in the configured mode, checked against the
-/// reference when the thread asks for it (`set_thread_commit_checks`).
-fn persist_commit(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_id: &str,
-) -> Result<()> {
     // The derivation's own time (not the checks').
     let timed = || {
         let started = std::time::Instant::now();
-        let result = persist_in_mode(tx, branch, p, events, new_id);
+        let result = derive_in_mode(input, new_id);
         add(Count::CommitMicros, started.elapsed().as_micros() as u64);
         result
     };
     if !COMMIT_CHECKS.with(Cell::get) {
-        return timed();
+        return Ok(DeriveOutput {
+            new_event: Some(new_id.to_owned()),
+            derived: timed()?,
+            check: None,
+        });
     }
     count(Count::Checked);
-    // In a savepoint, so that a refusal leaves the transaction as it was for
-    // the full-mode retry.
-    let outcome = in_savepoint(tx, "tkfs_derive_commit", true, timed);
     let mode = conflict_mode().as_str();
-    if let Err(refused) = outcome {
-        let full = in_savepoint(tx, "tkfs_derive_check", false, || {
-            persist_full(tx, branch, p, events, Some(new_id))
-        });
-        return match full {
-            Ok(()) => bail!(
-                "CONFLICT_MODE_MISMATCH: {mode} refused {new_id} ({refused:#}), full accepted it"
-            ),
-            Err(full) if format!("{full:#}") != format!("{refused:#}") => bail!(
-                "CONFLICT_MODE_MISMATCH: {mode} refused {new_id} ({refused:#}), full refused it with {full:#}"
-            ),
-            Err(_) => Err(refused),
-        };
+    let derived = match timed() {
+        Ok(derived) => derived,
+        Err(refused) => {
+            // A refusal must be full mode's, with the same error.
+            return match full_rows(input, Some(new_id)) {
+                Ok(_) => bail!(
+                    "CONFLICT_MODE_MISMATCH: {mode} refused {new_id} ({refused:#}), full accepted it"
+                ),
+                Err(full) if format!("{full:#}") != format!("{refused:#}") => bail!(
+                    "CONFLICT_MODE_MISMATCH: {mode} refused {new_id} ({refused:#}), full refused it with {full:#}"
+                ),
+                Err(_) => Err(refused),
+            };
+        }
+    };
+    // The rebuild from no rows reads no stored review either.
+    let from_empty = full_rows(
+        &DeriveInput {
+            new_event: None,
+            reviewed: &[],
+            ..*input
+        },
+        None,
+    )
+    .map_err(|error| format!("{error:#}"));
+    Ok(DeriveOutput {
+        new_event: Some(new_id.to_owned()),
+        derived,
+        check: Some(CommitCheck { mode, from_empty }),
+    })
+}
+
+/// The cheap half of `persist_projection` (WP2.4): writes `out` to
+/// `branch`'s conflict rows inside the caller's transaction. Full mode's
+/// DELETE of namespace rows no longer derived (when `out` asks for it), the
+/// upsert, then the review receipts (`resolved_by`). In verify mode both
+/// results are written in savepoints and compared (`CONFLICT_MODE_MISMATCH`
+/// on any difference; the full one is kept), and under the commit checks
+/// the rows are compared with a derivation from no rows. The stored
+/// projection itself (`current_state`, `current_parts`) is the caller's.
+pub fn write_projection(tx: &Connection, branch: &str, out: &DeriveOutput) -> Result<()> {
+    let new_id = out.new_event.as_deref().unwrap_or_default();
+    match &out.derived {
+        Derived::Rows(rows) => write_rows(tx, branch, rows)?,
+        Derived::Verify { append, full } => {
+            let append = in_savepoint(tx, "tkfs_derive_append", false, || {
+                write_rows(tx, branch, append)?;
+                capture_conflicts(tx, branch)
+            });
+            let full = in_savepoint(tx, "tkfs_derive_full", true, || {
+                write_rows(tx, branch, full)?;
+                capture_conflicts(tx, branch)
+            });
+            match (append, full) {
+                (Ok(append), Ok(full)) => {
+                    let differences = row_differences(&append, &full, ["append", "full"]);
+                    ensure!(
+                        differences.is_empty(),
+                        "CONFLICT_MODE_MISMATCH: append and full derivation differ for {new_id}: {}",
+                        differences.join("; ")
+                    );
+                    count(Count::Verified);
+                }
+                (Err(_), Err(full)) => return Err(full),
+                (Ok(_), Err(full)) => bail!(
+                    "CONFLICT_MODE_MISMATCH: append accepted {new_id}, full refused it: {full:#}"
+                ),
+                (Err(append), Ok(_)) => bail!(
+                    "CONFLICT_MODE_MISMATCH: append refused {new_id} ({append:#}), full accepted it"
+                ),
+            }
+        }
     }
+    let Some(check) = &out.check else {
+        return Ok(());
+    };
+    let mode = check.mode;
     let (stored, rebuilt) = in_savepoint(tx, "tkfs_derive_check", false, || {
         let stored = capture_conflicts(tx, branch)?;
         tx.execute("DELETE FROM conflicts WHERE branch=?", [branch])?;
-        persist_full(tx, branch, p, events, None)?;
+        let rows = check
+            .from_empty
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        write_rows(tx, branch, rows)?;
         Ok((stored, capture_conflicts(tx, branch)?))
     })
     .map_err(|error| {
@@ -449,47 +619,83 @@ fn persist_commit(
 }
 
 /// A commit's records, in the configured mode.
-fn persist_in_mode(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_id: &str,
-) -> Result<()> {
+fn derive_in_mode(input: &DeriveInput, new_id: &str) -> Result<Derived> {
     match conflict_mode() {
         ConflictMode::Full => {
             count(Count::Full);
-            persist_full(tx, branch, p, events, Some(new_id))
+            Ok(Derived::Rows(full_rows(input, Some(new_id))?))
         }
-        ConflictMode::Append => match derive_append(tx, branch, p, events, new_id)? {
+        ConflictMode::Append => match derive_append_with(input, new_id)? {
             Plan::Derived(conflicts) => {
                 count(Count::Append);
-                write_conflicts(tx, branch, p, events, Some(new_id), conflicts, false)
+                Ok(Derived::Rows(finish(
+                    input,
+                    Some(new_id),
+                    conflicts,
+                    false,
+                )?))
             }
             Plan::Fallback(reason) => {
                 fallback(reason);
-                persist_full(tx, branch, p, events, Some(new_id))
+                Ok(Derived::Rows(full_rows(input, Some(new_id))?))
             }
         },
-        ConflictMode::Verify => persist_verified(tx, branch, p, events, new_id),
+        ConflictMode::Verify => derive_verified(input, new_id),
     }
 }
 
-/// Full derivation: every source over the whole branch history, then the
-/// DELETE of namespace rows that are no longer derived.
-fn persist_full(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_event: Option<&str>,
-) -> Result<()> {
-    let conflicts = derive_full(tx, branch, p, events, new_event)?;
-    write_conflicts(tx, branch, p, events, new_event, conflicts, true)
+/// Full derivation: every source over the whole branch history, written
+/// after the DELETE of namespace rows that are no longer derived.
+fn full_rows(input: &DeriveInput, new_event: Option<&str>) -> Result<Rows> {
+    let conflicts = derive_full_with(input, new_event)?;
+    finish(input, new_event, conflicts, true)
 }
 
-/// Every full-mode source, in the historical order (the deduplication keeps
-/// the last record of each id).
+/// Deduplicate `conflicts` (the last record of an id wins) and validate the
+/// new event's reviews (every event's, on rebuild) against them.
+fn finish(
+    input: &DeriveInput,
+    new_event: Option<&str>,
+    conflicts: Vec<Conflict>,
+    delete_stale: bool,
+) -> Result<Rows> {
+    let rows: Vec<_> = conflicts
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect::<BTreeMap<_, _>>()
+        .into_values()
+        .collect();
+    let receipts = review_receipts(input.projection, input.events, new_event, &rows)?;
+    Ok(Rows {
+        rows,
+        receipts,
+        delete_stale,
+    })
+}
+
+/// The stored rows `event` reviews (payloads), in its `reviewed` order;
+/// missing ones are skipped. What `DeriveInput::reviewed` holds for a
+/// commit of `event`.
+pub(super) fn read_reviewed(db: &Connection, branch: &str, event: &Event) -> Result<Vec<Conflict>> {
+    let mut rows = vec![];
+    for reviewed in &event.reviewed {
+        let payload: Option<String> = db
+            .query_row(
+                "SELECT payload FROM conflicts WHERE id=? AND branch=?",
+                params![reviewed, branch],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(payload) = payload {
+            rows.push(serde_json::from_str(&payload)?);
+        }
+    }
+    Ok(rows)
+}
+
+/// `derive_full_with` reading the stored rows the new event reviews from
+/// `tx` (the historical signature, for the unit tests).
+#[cfg(test)]
 fn derive_full(
     tx: &Connection,
     branch: &str,
@@ -497,8 +703,33 @@ fn derive_full(
     events: &[Event],
     new_event: Option<&str>,
 ) -> Result<Vec<Conflict>> {
+    let reviewed = reviewed_rows(tx, branch, events, new_event)?;
+    derive_full_with(
+        &DeriveInput {
+            branch,
+            projection: p,
+            events,
+            new_event,
+            reviewed: &reviewed,
+        },
+        new_event,
+    )
+}
+
+/// Every full-mode source, in the historical order (the deduplication keeps
+/// the last record of each id). The stored rows the new event reviews come
+/// from `input.reviewed` (none for a rebuild).
+fn derive_full_with(input: &DeriveInput, new_event: Option<&str>) -> Result<Vec<Conflict>> {
+    let DeriveInput {
+        branch,
+        projection: p,
+        events,
+        ..
+    } = *input;
     let mut conflicts = p.conflicts.clone();
-    conflicts.extend(reviewed_rows(tx, branch, events, new_event)?);
+    if new_event.is_some() {
+        conflicts.extend(input.reviewed.iter().cloned());
+    }
     // Namespace collisions also have a deterministic historical basis. A later
     // rename arriving first must not erase evidence of concurrent same-name
     // placement. Sequential temp replacement is ordered by event context.
@@ -560,22 +791,10 @@ fn reviewed_rows(
     events: &[Event],
     new_event: Option<&str>,
 ) -> Result<Vec<Conflict>> {
-    let mut rows = vec![];
-    if let Some(event) = events.iter().find(|e| Some(e.id.as_str()) == new_event) {
-        for reviewed in &event.reviewed {
-            let payload: Option<String> = tx
-                .query_row(
-                    "SELECT payload FROM conflicts WHERE id=? AND branch=?",
-                    params![reviewed, branch],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(payload) = payload {
-                rows.push(serde_json::from_str(&payload)?);
-            }
-        }
+    match events.iter().find(|e| Some(e.id.as_str()) == new_event) {
+        Some(event) => read_reviewed(tx, branch, event),
+        None => Ok(vec![]),
     }
-    Ok(rows)
 }
 
 /// The record of two placements of different entities into one slot, unless
@@ -711,26 +930,12 @@ fn register_pairs(
     conflicts
 }
 
-/// Deduplicate (the last record of an id wins), optionally delete namespace
-/// rows that are no longer derived (full mode), upsert, then validate the new
-/// event's reviews (every event's, on rebuild) and record their receipts.
-fn write_conflicts(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_event: Option<&str>,
-    conflicts: Vec<Conflict>,
-    delete_stale_namespace: bool,
-) -> Result<()> {
-    let conflicts: Vec<_> = conflicts
-        .into_iter()
-        .map(|c| (c.id.clone(), c))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect();
-    if delete_stale_namespace {
-        let namespace_ids: BTreeSet<_> = conflicts
+/// Writes `rows`: full mode's DELETE of the namespace rows they lack (when
+/// asked), the upsert, then the receipts of the validated reviews.
+fn write_rows(tx: &Connection, branch: &str, rows: &Rows) -> Result<()> {
+    if rows.delete_stale {
+        let namespace_ids: BTreeSet<_> = rows
+            .rows
             .iter()
             .filter(|c| c.field == "namespace")
             .map(|c| c.id.clone())
@@ -748,14 +953,31 @@ fn write_conflicts(
     }
     {
         let mut insert=tx.prepare_cached("INSERT INTO conflicts(id,branch,payload) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE conflicts.payload<>excluded.payload")?;
-        for c in &conflicts {
+        for c in &rows.rows {
             insert.execute(params![c.id, branch, serde_json::to_string(c)?])?;
         }
     }
+    for (event, reviewed) in &rows.receipts {
+        // Concurrent review events converge on a stable receipt as well.
+        tx.execute("UPDATE conflicts SET resolved_by=CASE WHEN resolved_by IS NULL OR resolved_by < ? THEN ? ELSE resolved_by END WHERE id=? AND branch=?",params![event,event,reviewed,branch])?;
+    }
+    Ok(())
+}
+
+/// Validate the new event's reviews (every event's, on rebuild) against the
+/// deduplicated `rows`: the receipts to record, in order, or
+/// `INVALID_CONFLICT_REVIEW`.
+fn review_receipts(
+    p: &Projection,
+    events: &[Event],
+    new_event: Option<&str>,
+    rows: &[Conflict],
+) -> Result<Vec<(String, String)>> {
+    let mut receipts = vec![];
     for e in events {
         if !p.pending.contains(&e.id) && new_event.is_none_or(|id| id == e.id) {
             for reviewed in &e.reviewed {
-                let c = conflicts
+                let c = rows
                     .iter()
                     .find(|c| &c.id == reviewed)
                     .context("INVALID_CONFLICT_REVIEW")?;
@@ -792,12 +1014,11 @@ fn write_conflicts(
                     })
                 };
                 ensure!(valid_review, "INVALID_CONFLICT_REVIEW");
-                // Concurrent review events converge on a stable receipt as well.
-                tx.execute("UPDATE conflicts SET resolved_by=CASE WHEN resolved_by IS NULL OR resolved_by < ? THEN ? ELSE resolved_by END WHERE id=? AND branch=?",params![e.id,e.id,reviewed,branch])?;
+                receipts.push((e.id.clone(), reviewed.clone()));
             }
         }
     }
-    Ok(())
+    Ok(receipts)
 }
 
 /// The outcome of the append-mode precondition.
@@ -1147,9 +1368,9 @@ impl<'a> ConeGraph<'a> {
     }
 }
 
-/// Append mode (§5.2): the records the new event adds, or a fallback reason.
-/// Errors are refusals, raised exactly where full mode raises them (module
-/// docs): nothing here fails on history that a rebuild accepts.
+/// `derive_append_with` reading the stored rows the new event reviews from
+/// `tx` (the historical signature, for the unit tests).
+#[cfg(test)]
 fn derive_append(
     tx: &Connection,
     branch: &str,
@@ -1157,6 +1378,29 @@ fn derive_append(
     events: &[Event],
     new_id: &str,
 ) -> Result<Plan> {
+    let reviewed = reviewed_rows(tx, branch, events, Some(new_id))?;
+    derive_append_with(
+        &DeriveInput {
+            branch,
+            projection: p,
+            events,
+            new_event: Some(new_id),
+            reviewed: &reviewed,
+        },
+        new_id,
+    )
+}
+
+/// Append mode (§5.2): the records the new event adds, or a fallback reason.
+/// Errors are refusals, raised exactly where full mode raises them (module
+/// docs): nothing here fails on history that a rebuild accepts.
+fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
+    let DeriveInput {
+        branch,
+        projection: p,
+        events,
+        ..
+    } = *input;
     let mut positions = events
         .iter()
         .enumerate()
@@ -1172,7 +1416,7 @@ fn derive_append(
     let locations = Locations::new(events);
     // Same source order as full mode, so a refusal surfaces with the same error.
     let mut conflicts = p.conflicts.clone();
-    conflicts.extend(reviewed_rows(tx, branch, events, Some(new_id))?);
+    conflicts.extend(input.reviewed.iter().cloned());
     conflicts.extend(location_pairs_with(branch, events, &locations, new)?);
     if !e.reviewed.is_empty() {
         conflicts.extend(reviewed_cut(branch, events, e)?);
@@ -1271,6 +1515,154 @@ fn append_guard(p: &Projection, events: &[Event], new: usize) -> Option<&'static
     None
 }
 
+/// CCR-WP1.6-5: whether committing `events[new]` through the namespace
+/// successor can change the competing-cut count of a dependency cone, so
+/// that `check_successor_cuts` must count. A successor's event follows the
+/// whole branch (`dependencies == frontier`), so it is in no antichain of two
+/// or more events and adds no competing cut itself; it is also a descendant
+/// of every version of the registers it changes (one head, parented by it),
+/// so it changes no presence-witness group of an existing tombstone. A cone
+/// can only gain competing cuts when the event
+///
+/// - places an existing entity under a parent it never had (its cone takes
+///   in the parent's), or into a slot it never used that another entity
+///   used (it takes in the slot competitors' cones), or
+/// - writes the first tombstone of an entity that has `alive = true`
+///   versions outside its placements (TRUE presence compression starts, and
+///   the witnesses join the relevant set).
+///
+/// A fresh entity (a create) only joins the cone of its parent or of its
+/// slot's past occupants, which already contains that parent: never two
+/// cones. Conservative: anything unexpected answers `true`.
+pub(super) fn successor_may_add_cuts(events: &[Event], new: usize) -> bool {
+    let others = || {
+        events
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| *i != new)
+            .map(|(_, e)| e)
+    };
+    for c in &events[new].changes {
+        let x = c.entity.as_str();
+        match c.field.as_str() {
+            "location" => {
+                let (Some(parent), Some(name)) =
+                    (c.value["parent"].as_str(), c.value["name"].as_str())
+                else {
+                    return true;
+                };
+                let Ok(key) = slot_key(name) else {
+                    return true;
+                };
+                let mut fresh = true;
+                let mut new_parent = parent != ROOT;
+                let mut new_slot = true;
+                let mut occupied = false;
+                for prior in others() {
+                    for pc in &prior.changes {
+                        if pc.entity == x {
+                            fresh = false;
+                        }
+                        if pc.field != "location" || pc.value["parent"].as_str() != Some(parent) {
+                            continue;
+                        }
+                        if pc.entity == x {
+                            new_parent = false;
+                        }
+                        let Some(other) = pc.value["name"].as_str() else {
+                            return true;
+                        };
+                        // ASCII names share a slot exactly when they are equal
+                        // ignoring ASCII case (`name_key` is NFC plus lower
+                        // case; validity is the same for both spellings).
+                        let same_slot = if name.is_ascii() && other.is_ascii() {
+                            name.eq_ignore_ascii_case(other)
+                        } else {
+                            match slot_key(other) {
+                                Ok(k) => k == key,
+                                Err(_) => return true,
+                            }
+                        };
+                        if same_slot {
+                            if pc.entity == x {
+                                new_slot = false;
+                            } else {
+                                occupied = true;
+                            }
+                        }
+                    }
+                }
+                if !fresh && (new_parent || (new_slot && occupied)) {
+                    return true;
+                }
+            }
+            "alive" if c.value == false => {
+                let mut tombstone = false;
+                let mut witness = false;
+                for prior in others() {
+                    let places = prior
+                        .changes
+                        .iter()
+                        .any(|pc| pc.entity == x && (pc.field == "location" || pc.field == "kind"));
+                    for pc in prior
+                        .changes
+                        .iter()
+                        .filter(|pc| pc.entity == x && pc.field == "alive")
+                    {
+                        if pc.value == false {
+                            tombstone = true;
+                        } else if !places {
+                            witness = true;
+                        }
+                    }
+                }
+                if !tombstone && witness {
+                    return true;
+                }
+            }
+            "kind" if others().any(|prior| prior.changes.iter().any(|pc| pc.entity == x)) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// CCR-WP1.6-5: the `NAMESPACE_HISTORY_LIMIT` count that full replay makes
+/// when `events[new]` is committed, for a successor commit (which derives
+/// no record and so never counted before). Counts the competing cuts of
+/// every dependency cone (with the new event) that contains an entity the
+/// event touches, exactly as full mode enumerates them (`cone_conflicts`),
+/// and refuses with full mode's error when one exceeds `MAX_NAMESPACE_CUTS`.
+/// Every other cone of the branch is a cone of the history without the
+/// event, with the same relevant events (`successor_may_add_cuts`), whose
+/// count the accepted history already bounds. Pure; only the counting, no
+/// cut is projected.
+pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -> Result<()> {
+    let locations = Locations::new(events);
+    locations.first_error()?;
+    let graph = ConeGraph::new(events, &locations, new);
+    let touched: BTreeSet<&str> = events[new]
+        .changes
+        .iter()
+        .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
+        .map(|c| c.entity.as_str())
+        .collect();
+    let cones: BTreeSet<BTreeSet<&str>> = graph
+        .reaching(&touched)
+        .into_iter()
+        .map(|entity| graph.cone(entity, false))
+        .filter(|cone| cone.iter().any(|m| touched.contains(m)))
+        .collect();
+    let ns = NsContext::new(branch, events);
+    for members in &cones {
+        let relevant = ns.relevant(members, None);
+        ns.count_cuts(&relevant)?;
+    }
+    Ok(())
+}
+
 /// The location pairs that include the new event's location change, in the
 /// order full mode evaluates them (pairs of two older changes are stored).
 fn location_pairs_with(
@@ -1308,45 +1700,22 @@ fn location_pairs_with(
     Ok(conflicts)
 }
 
-/// Verify mode: append and full in separate savepoints; the full result is
-/// kept. Both refusing is a refusal (full mode's error); any other difference
-/// is `CONFLICT_MODE_MISMATCH`.
-fn persist_verified(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_id: &str,
-) -> Result<()> {
-    let derived = match derive_append(tx, branch, p, events, new_id) {
+/// Verify mode: both derivations; `write_projection` writes each in its own
+/// savepoint, compares them and keeps the full result. Both refusing is a
+/// refusal (full mode's error); any other difference is
+/// `CONFLICT_MODE_MISMATCH`.
+fn derive_verified(input: &DeriveInput, new_id: &str) -> Result<Derived> {
+    let append = match derive_append_with(input, new_id) {
         Ok(Plan::Fallback(reason)) => {
             fallback(reason);
-            return persist_full(tx, branch, p, events, Some(new_id));
+            return Ok(Derived::Rows(full_rows(input, Some(new_id))?));
         }
-        Ok(Plan::Derived(conflicts)) => Ok(conflicts),
+        Ok(Plan::Derived(conflicts)) => finish(input, Some(new_id), conflicts, false),
         Err(error) => Err(error),
     };
-    let append = derived.and_then(|conflicts| {
-        in_savepoint(tx, "tkfs_derive_append", false, || {
-            write_conflicts(tx, branch, p, events, Some(new_id), conflicts, false)?;
-            capture_conflicts(tx, branch)
-        })
-    });
-    let full = in_savepoint(tx, "tkfs_derive_full", true, || {
-        persist_full(tx, branch, p, events, Some(new_id))?;
-        capture_conflicts(tx, branch)
-    });
+    let full = full_rows(input, Some(new_id));
     match (append, full) {
-        (Ok(append), Ok(full)) => {
-            let differences = row_differences(&append, &full, ["append", "full"]);
-            ensure!(
-                differences.is_empty(),
-                "CONFLICT_MODE_MISMATCH: append and full derivation differ for {new_id}: {}",
-                differences.join("; ")
-            );
-            count(Count::Verified);
-            Ok(())
-        }
+        (Ok(append), Ok(full)) => Ok(Derived::Verify { append, full }),
         (Err(_), Err(full)) => Err(full),
         (Ok(_), Err(full)) => {
             bail!("CONFLICT_MODE_MISMATCH: append accepted {new_id}, full refused it: {full:#}")
@@ -2231,6 +2600,37 @@ impl<'a> NsContext<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The competing cuts (antichains of two or more events) of a cone's
+    /// relevant events, enumerated and refused exactly as `cone_conflicts`
+    /// does, without projecting any cut (CCR-WP1.6-5).
+    fn count_cuts(&self, relevant: &[usize]) -> Result<usize> {
+        let ancestors: Vec<_> = relevant.iter().map(|&i| self.closure(i, false)).collect();
+        let mut antichains: Vec<Vec<usize>> = vec![vec![]];
+        let mut competing_cuts = 0;
+        for (i, &event) in relevant.iter().enumerate() {
+            let before = antichains.len();
+            for index in 0..before {
+                if !antichains[index]
+                    .iter()
+                    .all(|&j| !ancestors[i].contains(relevant[j]) && !ancestors[j].contains(event))
+                {
+                    continue;
+                }
+                let mut selected = antichains[index].clone();
+                selected.push(i);
+                if selected.len() > 1 {
+                    competing_cuts += 1;
+                    ensure!(
+                        competing_cuts <= MAX_NAMESPACE_CUTS,
+                        "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
+                    );
+                }
+                antichains.push(selected);
+            }
+        }
+        Ok(competing_cuts)
     }
 
     /// Full mode: every antichain of every cone (the historical
@@ -4762,5 +5162,232 @@ current {current:#?}"
             ctx.append_plan(4, &locations),
             Ok(Err("a touched cone lost a relevant event"))
         ));
+    }
+
+    /// `e` as a successor would carry it after `old`: depending on the whole
+    /// frontier of `old` and parenting every head of each register it
+    /// changes (so it descends from every event and every version).
+    fn successor_shaped(old: &[Event], e: &Event) -> Event {
+        let referenced: BTreeSet<&str> = old
+            .iter()
+            .flat_map(|o| {
+                o.dependencies
+                    .iter()
+                    .chain(o.changes.iter().flat_map(|c| c.parents.iter()))
+                    .map(String::as_str)
+            })
+            .collect();
+        let mut dependencies: Vec<String> = old
+            .iter()
+            .map(|o| o.id.clone())
+            .filter(|id| !referenced.contains(id.as_str()))
+            .collect();
+        dependencies.sort();
+        let changes = e
+            .changes
+            .iter()
+            .map(|c| {
+                let versions: Vec<(&Event, &Change)> = old
+                    .iter()
+                    .flat_map(|o| {
+                        o.changes
+                            .iter()
+                            .filter(|oc| oc.entity == c.entity && oc.field == c.field)
+                            .map(move |oc| (o, oc))
+                    })
+                    .collect();
+                let dominated: BTreeSet<&str> = versions
+                    .iter()
+                    .flat_map(|(_, oc)| oc.parents.iter().map(String::as_str))
+                    .collect();
+                Change {
+                    parents: versions
+                        .iter()
+                        .map(|(o, _)| o.id.clone())
+                        .filter(|id| !dominated.contains(id.as_str()))
+                        .collect(),
+                    ..c.clone()
+                }
+            })
+            .collect();
+        Event {
+            id: format!("succ-{}", e.id),
+            dependencies,
+            changes,
+            ..e.clone()
+        }
+    }
+
+    /// CCR-WP1.6-5, as pure functions over random histories (three
+    /// generators): for an event shaped like a successor's (after the whole
+    /// history, parenting every head), `check_successor_cuts` refuses exactly
+    /// when full replay refuses with `NAMESPACE_HISTORY_LIMIT` (same text),
+    /// and whenever `successor_may_add_cuts` says it cannot, every cone that
+    /// contains a touched entity has no more competing cuts than the cone of
+    /// the same entities had before the event.
+    #[test]
+    fn successor_cut_count_matches_full_replay_and_the_flag_is_sound() {
+        let mut compared = 0;
+        let mut flagged = 0;
+        let mut unflagged_cones = 0;
+        let mut refusals = 0;
+        for seed in 0..160u64 {
+            let mut rng = StdRng::seed_from_u64(9000 + seed);
+            let events = match seed % 3 {
+                0 => {
+                    let len = rng.gen_range(4..=16);
+                    history(&mut rng, len)
+                }
+                1 => {
+                    let len = rng.gen_range(8..=24);
+                    device_history(&mut rng, len)
+                }
+                _ => {
+                    let len = rng.gen_range(8..=20);
+                    device_history_with(&mut rng, len, true)
+                }
+            };
+            for k in 1..events.len() {
+                let old = &events[..k];
+                if NsContext::new(BRANCH, old).full().is_err() {
+                    continue;
+                }
+                let mut new = old.to_vec();
+                new.push(successor_shaped(old, &events[k]));
+                let full = NsContext::new(BRANCH, &new).full();
+                let check = check_successor_cuts(BRANCH, &new, k);
+                let limit =
+                    |e: &anyhow::Error| format!("{e:#}").contains("NAMESPACE_HISTORY_LIMIT");
+                match (&full, &check) {
+                    (Err(f), _) if !limit(f) => continue,
+                    (Ok(_), Ok(())) => {}
+                    (Err(f), Err(c)) => {
+                        assert_eq!(format!("{f:#}"), format!("{c:#}"), "seed {seed} k {k}");
+                        refusals += 1;
+                    }
+                    (full, check) => panic!(
+                        "seed {seed} k {k}: full {:?} check {:?}",
+                        full.as_ref().err(),
+                        check.as_ref().err()
+                    ),
+                }
+                compared += 1;
+                if successor_may_add_cuts(&new, k) {
+                    flagged += 1;
+                    continue;
+                }
+                // Not flagged: no touched cone gains a competing cut.
+                assert!(full.is_ok(), "seed {seed} k {k}: unflagged refusal");
+                let locations = Locations::new(&new);
+                if locations.first_error().is_err() {
+                    continue;
+                }
+                let graph = ConeGraph::new(&new, &locations, k);
+                let touched: BTreeSet<&str> = new[k]
+                    .changes
+                    .iter()
+                    .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
+                    .map(|c| c.entity.as_str())
+                    .collect();
+                let existing: BTreeSet<&str> = old
+                    .iter()
+                    .flat_map(|e| e.changes.iter().map(|c| c.entity.as_str()))
+                    .collect();
+                let (ns_new, ns_old) = (NsContext::new(BRANCH, &new), NsContext::new(BRANCH, old));
+                for entity in graph.reaching(&touched) {
+                    let members = graph.cone(entity, false);
+                    let now = ns_new.count_cuts(&ns_new.relevant(&members, None)).unwrap();
+                    let before: BTreeSet<&str> = members
+                        .iter()
+                        .copied()
+                        .filter(|m| existing.contains(m))
+                        .collect();
+                    let then = ns_old.count_cuts(&ns_old.relevant(&before, None)).unwrap();
+                    assert!(
+                        now <= then,
+                        "seed {seed} k {k}: unflagged cone {members:?} grew from {then} to {now} competing cuts"
+                    );
+                    unflagged_cones += 1;
+                }
+            }
+        }
+        println!(
+            "{compared} compared, {flagged} flagged, {unflagged_cones} unflagged cones, {refusals} refusals"
+        );
+        assert!(
+            compared > 1000 && flagged > 200 && unflagged_cones > 1000,
+            "{compared} {flagged} {unflagged_cones}"
+        );
+    }
+
+    /// `n` devices that never sync each create an entity in one slot: one
+    /// cone of `n` concurrent relevant events, 2^n - 1 - n competing cuts.
+    fn same_slot(n: usize) -> Vec<Event> {
+        (0..n)
+            .map(|d| {
+                let entity = format!("e{d:02}");
+                let change = |field: &str, value: Value| Change {
+                    entity: entity.clone(),
+                    field: field.into(),
+                    parents: vec![],
+                    value,
+                };
+                Event {
+                    id: format!("{d:02}"),
+                    repo: "repo".into(),
+                    branch: Branch {
+                        id: BRANCH.into(),
+                        name: "main".into(),
+                        shared: true,
+                    },
+                    device: format!("dev-{d:02}"),
+                    created_ms: d as u64,
+                    changes: vec![
+                        change("kind", json!("file")),
+                        change("location", json!({"parent": ROOT, "name": "a"})),
+                        change("alive", json!(true)),
+                    ],
+                    dependencies: vec![],
+                    reviewed: vec![],
+                    object_sizes: BTreeMap::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// `count_cuts` counts and refuses exactly as `cone_conflicts` does, on
+    /// both sides of the 4,096-cut boundary (12 events: 4,083; 13: 8,178).
+    #[test]
+    fn count_cuts_matches_the_enumeration_of_cone_conflicts() {
+        let mut refused = 0;
+        let histories = [1usize, 2, 8]
+            .into_iter()
+            .map(collisions)
+            .chain([3usize, 12, 13].into_iter().map(same_slot));
+        for events in histories {
+            let n = events.len();
+            let ns = NsContext::new(BRANCH, &events);
+            let cones = NamespaceCones::new(&events).unwrap();
+            for members in cones.members() {
+                let members: BTreeSet<&str> = members.iter().map(String::as_str).collect();
+                let relevant = ns.relevant(&members, None);
+                let mut out = BTreeMap::new();
+                let enumerated = ns.cone_conflicts(&members, &relevant, None, false, &mut out);
+                let counted = ns.count_cuts(&relevant);
+                match (enumerated, counted) {
+                    (Ok(()), Ok(count)) => {
+                        if members.len() == 12 {
+                            assert_eq!(count, 4083);
+                        }
+                    }
+                    (Err(a), Err(b)) => {
+                        assert_eq!(format!("{a:#}"), format!("{b:#}"));
+                        refused += 1;
+                    }
+                    (a, b) => panic!("n {n}: {:?} vs {:?}", a.err(), b.err()),
+                }
+            }
+        }
+        assert!(refused > 0, "the boundary was crossed");
     }
 }
