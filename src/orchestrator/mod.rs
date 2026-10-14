@@ -1,17 +1,13 @@
 //! Folder lifecycle and networking belong to one daemon. Workers never dial peers.
 mod api;
-// The legacy `Supervisor` and its catalog SQL stay compiled, and reachable
-// through the legacy `api::manage`, but the daemon no longer runs them
-// (REVAMP_PLAN §14 WP2.1 task 6); WP2.INT deletes both files.
-#[allow(dead_code)]
-mod catalog_db;
+// The legacy `Supervisor` (`supervisor.rs`) and its catalog SQL
+// (`catalog_db.rs`) were deleted by WP2.INT (REVAMP_PLAN §14 WP2.INT task 1);
+// the daemon runs the Wave 1 actors since WP2.1.
 mod config;
 mod lanes;
 mod peering;
 mod run;
 mod status;
-#[allow(dead_code)]
-mod supervisor;
 
 // Seam modules landed by WP0.INT (REVAMP_PLAN §14 WP0.INT); each file names
 // its owner in its first line.
@@ -37,10 +33,12 @@ pub mod scheduler;
 pub mod shutdown;
 pub mod worker_client;
 
-pub use api::{Action, Project, client, manage};
+pub use api::{Action, Project, client};
+// CCR-WP2.2-1 (applied by WP2.INT): the client side of the management API
+// where §14 names it (`orchestrator::ControlClient`, `api::format_status`).
+pub use api::{ControlClient, default_deadline, format_folder, format_status, is_read_only};
 pub use config::{Config, Network};
 pub use run::{run, serve, serve_with};
-pub use supervisor::{Shared, Supervisor};
 
 #[cfg(unix)]
 use anyhow::ensure;

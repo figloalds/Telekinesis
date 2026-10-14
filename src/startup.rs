@@ -99,6 +99,9 @@ impl Watchdog {
             self.last = now;
         }
     }
+    /// The legacy supervisor's rule (deleted by WP2.INT); the unit tests
+    /// still pin it as `expired_after(now, LEEWAY)`.
+    #[cfg(test)]
     pub fn expired(&self, now: Instant) -> bool {
         self.expired_after(now, LEEWAY)
     }

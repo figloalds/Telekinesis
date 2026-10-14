@@ -14,7 +14,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
@@ -31,7 +31,7 @@ use tkfs::{
         },
     },
     orchestrator::{
-        self, Action, Config, Network, Project, Supervisor,
+        Config, Network, Project,
         catalog::{self, Catalog, validate_mount_path},
         published::PublishedCatalog,
     },
@@ -200,10 +200,263 @@ fn raw_count(config: &Config, table: &str, state: &str) -> i64 {
 fn legacy_view(config: &Config) -> (Vec<Project>, Value, Value) {
     let supervisor = Supervisor::open(config.clone()).unwrap();
     let projects = supervisor.projects().unwrap();
-    let shared = Arc::new(Mutex::new(supervisor));
-    let list = orchestrator::manage(&shared, Action::List).unwrap();
-    let peers = orchestrator::manage(&shared, Action::Peers).unwrap();
+    let list = supervisor.list().unwrap();
+    let peers = supervisor.peers_reply().unwrap();
     (projects, list, peers)
+}
+
+use legacy_oracle::Supervisor;
+
+/// The 6298d0b daemon's view of a data directory, the oracle of the
+/// downgrade and mount-path tests below.
+///
+/// WP2.INT deleted the legacy `Supervisor` (`src/orchestrator/supervisor.rs`,
+/// `catalog_db.rs` and the legacy `api::manage`, REVAMP_PLAN §14 WP2.INT
+/// task 1), which these tests used as the oracle. This module ports, with the
+/// same SQL and the same JSON shapes, exactly the parts they exercised: `open`
+/// (the lock, the schema, the installation), `projects`, the List, Inspect and
+/// Peers replies of a daemon with no worker and no lane running (the oracle
+/// never started one), and the legacy `ConfigureMount` with its
+/// `mount_path` rule.
+mod legacy_oracle {
+    use anyhow::{Context, Result, ensure};
+    use rusqlite::{Connection, OptionalExtension, params};
+    use serde_json::{Value, json};
+    use std::{
+        fs::{self, File},
+        path::{Path, PathBuf},
+    };
+    use tkfs::{
+        core::id,
+        orchestrator::{Config, Project, lock},
+    };
+
+    struct Peer {
+        endpoint: String,
+        installation: String,
+        connections: usize,
+    }
+    impl Peer {
+        fn pool_size(&self) -> usize {
+            self.connections.max(2)
+        }
+    }
+
+    fn lane_role(lane: usize) -> &'static str {
+        if lane == 0 { "control" } else { "bulk" }
+    }
+
+    pub struct Supervisor {
+        config: Config,
+        db: Connection,
+        installation: String,
+        _lock: File,
+    }
+
+    impl Supervisor {
+        pub fn open(config: Config) -> Result<Self> {
+            fs::create_dir_all(&config.data_directory)?;
+            fs::create_dir_all(&config.default_mount_directory)?;
+            let lock = lock(&config.data_directory.join("orchestrator.lock"))?;
+            let db = Connection::open(config.data_directory.join("folders.sqlite"))?;
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+                CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS projects(state TEXT PRIMARY KEY,label TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,device TEXT NOT NULL,directory TEXT NOT NULL,mount TEXT,desired INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS peers(endpoint TEXT PRIMARY KEY,code TEXT NOT NULL,installation TEXT NOT NULL,connections INTEGER NOT NULL,revision TEXT NOT NULL);")?;
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS initial_sync(state TEXT PRIMARY KEY,endpoint TEXT NOT NULL);",
+            )?;
+            db.execute(
+                "INSERT OR IGNORE INTO settings VALUES('installation',?)",
+                [id()],
+            )?;
+            let installation = db.query_row(
+                "SELECT value FROM settings WHERE key='installation'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(Self {
+                config,
+                db,
+                installation,
+                _lock: lock,
+            })
+        }
+
+        pub fn projects(&self) -> Result<Vec<Project>> {
+            Ok(self
+                .db
+                .prepare("SELECT state,label,repo,device,directory,mount,desired FROM projects ORDER BY label,state")?
+                .query_map([], |r| {
+                    Ok(Project {
+                        state: r.get(0)?,
+                        label: r.get(1)?,
+                        repo: r.get(2)?,
+                        device: r.get(3)?,
+                        directory: PathBuf::from(r.get::<_, String>(4)?),
+                        mount: r.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                        desired_running: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+
+        fn project(&self, state: &str) -> Result<Project> {
+            self.projects()?
+                .into_iter()
+                .find(|p| p.state == state)
+                .context("FOLDER_NOT_FOUND")
+        }
+
+        fn peers(&self) -> Result<Vec<Peer>> {
+            Ok(self
+                .db
+                .prepare("SELECT endpoint,code,installation,connections,revision FROM peers ORDER BY endpoint")?
+                .query_map([], |r| {
+                    Ok(Peer {
+                        endpoint: r.get(0)?,
+                        installation: r.get(2)?,
+                        connections: r.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?)
+        }
+
+        fn initial_peer(&self, state: &str) -> Result<Option<String>> {
+            Ok(self
+                .db
+                .query_row(
+                    "SELECT endpoint FROM initial_sync WHERE state=?",
+                    [state],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        }
+
+        /// `Supervisor::inspect` with no worker and no link: every worker
+        /// and lane member at its "not running" value.
+        fn inspect(&self, state: &str) -> Result<Value> {
+            let project = self.project(state)?;
+            let mut value = json!(project);
+            let initial_peer = self.initial_peer(state)?;
+            value["running"] = json!(false);
+            value["starting"] = json!(false);
+            value["mounted"] = json!(false);
+            value["initial_sync_pending"] = json!(initial_peer.is_some());
+            value["startup_phase"] = Value::Null;
+            let mut sync = Vec::new();
+            for peer in self.peers()? {
+                let lanes: Vec<Value> = (0..peer.pool_size())
+                    .map(|lane| {
+                        json!({
+                            "lane": lane,
+                            "role": lane_role(lane),
+                            "connected": false,
+                            "transport": Value::Null,
+                            "parallel_bulk": false,
+                            "error": Value::Null,
+                            "repository": Value::Null,
+                        })
+                    })
+                    .collect();
+                sync.push(json!({
+                    "endpoint": peer.endpoint,
+                    "connected": false,
+                    "remote_available": Value::Null,
+                    "error": Value::Null,
+                    "metadata": Value::Null,
+                    "lanes": lanes,
+                }));
+            }
+            value["sync"] = Value::Array(sync);
+            value["error"] = Value::Null;
+            value["publication_error"] = Value::Null;
+            Ok(value)
+        }
+
+        /// The legacy `Action::List` reply.
+        pub fn list(&self) -> Result<Value> {
+            let folders = self
+                .projects()?
+                .iter()
+                .map(|p| self.inspect(&p.state))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(json!({"installation": self.installation, "folders": folders}))
+        }
+
+        /// The legacy `Action::Peers` reply: every lane a default
+        /// `LinkStatus` plus its role.
+        pub fn peers_reply(&self) -> Result<Value> {
+            let mut peers = Vec::new();
+            for p in self.peers()? {
+                let lanes: Vec<Value> = (0..p.pool_size())
+                    .map(|lane| {
+                        json!({
+                            "connected": false,
+                            "exchanges": 0,
+                            "last_success_ms": Value::Null,
+                            "error": Value::Null,
+                            "transport": Value::Null,
+                            "parallel_bulk": false,
+                            "repositories": {},
+                            "role": lane_role(lane),
+                        })
+                    })
+                    .collect();
+                peers.push(json!({
+                    "endpoint": p.endpoint,
+                    "installation": p.installation,
+                    "connections": p.pool_size(),
+                    "configured_connections": p.connections,
+                    "reserved_connections": 1,
+                    "lanes": lanes,
+                }));
+            }
+            Ok(Value::Array(peers))
+        }
+
+        /// The legacy `Action::ConfigureMount` (no worker running).
+        pub fn configure_mount(&self, state: &str, mount: Option<PathBuf>) -> Result<Value> {
+            let p = self.project(state)?;
+            let mount = if mount == p.mount {
+                mount
+            } else {
+                mount
+                    .map(|requested| self.mount_path(&p.directory, &requested))
+                    .transpose()?
+            };
+            self.db.execute(
+                "UPDATE projects SET mount=? WHERE state=?",
+                params![mount.map(|p| p.to_string_lossy().into_owned()), state],
+            )?;
+            self.inspect(state)
+        }
+
+        fn mount_path(&self, directory: &Path, requested: &Path) -> Result<PathBuf> {
+            let path = std::path::absolute(requested)?;
+            let parent = path.parent().context("MOUNT_PARENT_REQUIRED")?;
+            fs::create_dir_all(parent)?;
+            let path =
+                fs::canonicalize(parent)?.join(path.file_name().context("FOLDER_MOUNT_REQUIRED")?);
+            let data = fs::canonicalize(&self.config.data_directory)?;
+            ensure!(
+                !path.starts_with(&data)
+                    && !data.starts_with(&path)
+                    && !directory.starts_with(&path),
+                "MOUNT_OVERLAPS_DATA"
+            );
+            ensure!(!path.exists(), "MOUNT_PATH_MUST_NOT_EXIST");
+            for p in self.projects()? {
+                if let Some(other) = p.mount {
+                    ensure!(
+                        !path.starts_with(&other) && !other.starts_with(&path),
+                        "MOUNT_OVERLAPS_FOLDER"
+                    );
+                }
+            }
+            Ok(path)
+        }
+    }
 }
 
 /// Applies commands and checks that the generation moves by exactly one per
@@ -1341,16 +1594,10 @@ fn layout(own_mount: bool) -> Layout {
 /// `Supervisor::mount_path` for a changed mount): the stored path or the code.
 fn legacy_mount_path(layout: &Layout, requested: &Path) -> Result<PathBuf, String> {
     let supervisor = Supervisor::open(layout.config.clone()).unwrap();
-    let shared = Arc::new(Mutex::new(supervisor));
-    orchestrator::manage(
-        &shared,
-        Action::ConfigureMount {
-            state: layout.target.state.clone(),
-            mount: Some(requested.to_path_buf()),
-        },
-    )
-    .map(|inspect| PathBuf::from(inspect["mount"].as_str().unwrap()))
-    .map_err(|error| code_of(&error))
+    supervisor
+        .configure_mount(&layout.target.state, Some(requested.to_path_buf()))
+        .map(|inspect| PathBuf::from(inspect["mount"].as_str().unwrap()))
+        .map_err(|error| code_of(&error))
 }
 
 type Requested = fn(&Layout) -> PathBuf;
