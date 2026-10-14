@@ -136,7 +136,10 @@ fn bundle(events: Vec<Event>) -> Bundle {
 }
 
 /// Whether full mode also refuses the quarantined event `id`: retried, in
-/// full mode, on a consistent copy of the store.
+/// full mode, on a consistent copy of the store. The row is re-queued with
+/// `Store::revalidate` (WP1.6's inbox state machine: clearing `error` alone
+/// leaves the row `quarantined`, never retried, so every refusal read as
+/// "full mode accepts it"; WP1.INT fix round 1).
 fn full_mode_refuses(s: &Store, id: &str) -> bool {
     let dir = tempfile::tempdir().unwrap();
     let copy = dir.path().join("metadata.sqlite");
@@ -144,9 +147,11 @@ fn full_mode_refuses(s: &Store, id: &str) -> bool {
         .unwrap();
     let _mode = ModeGuard::new(ConflictMode::Full);
     let mut copy = Store::open(dir.path(), Some(REPO)).unwrap();
-    copy.db
-        .execute("UPDATE incoming_events SET error=NULL WHERE id=?", [id])
-        .unwrap();
+    // The row itself, plus any row blocked on it.
+    assert!(
+        copy.revalidate(Some(&[id.to_owned()])).unwrap() >= 1,
+        "{id}"
+    );
     copy.receive(bundle(vec![]), &BTreeSet::new()).unwrap();
     let error: Option<String> = copy
         .db
