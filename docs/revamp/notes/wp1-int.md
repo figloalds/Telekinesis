@@ -8,6 +8,11 @@ created: the coordinator does both after review (§13 rule 6 and rule 8 item 7).
 summarized in *Fix round 1* below. Every finding was fixed; the VERIFY,
 Qualification and Package status sections describe the tree after it.
 
+The **post-integration re-review** (the session and hub areas of `4971afa`:
+four majors, five minors) is at the end, in *Post-integration re-review*.
+Every finding was fixed, and that section's verification supersedes the
+VERIFY counts below.
+
 ## Summary
 
 1. **Merges.** All twelve package branches, each as a `--no-ff` merge commit,
@@ -201,6 +206,13 @@ option (the review's point).
   sleeping callback), and pass with it (the server reads < 4 MiB with a
   1 MiB bound, the sender is held back by TCP, the stalled stream ends with a
   timeout and the connection keeps serving).
+  *Correction (post-integration re-review):* the client-side rationale above
+  was wrong. A client chunk was a slice of the received message, and that
+  message was itself a slice of tungstenite's read buffer, so a chunk waiting
+  for its callback kept the whole buffer allocation alive, not just its
+  message: with two interleaved streams the review measured +132 MiB of live
+  heap for about 2.4 MiB charged, unseen by the bound. The I/O thread now
+  copies every chunk body; see *Post-integration re-review*, finding S1.
 - **CCR-WP1.INT-3 (WP1.11, `src/orchestrator/hub.rs`; applied,
   `1bae081`).** `on_exchange_finished` fed every exchange's bytes to the
   (repo, peer) pair EWMAs, which are only read as the object transfer rates
@@ -491,9 +503,9 @@ mounted folders.
 | WP1.6 inbox and fast paths | approved | `226fcb7` | green: `activation_inbox` 21 (also under the strict oracle of CCR-WP1.7-1); remote fast paths on by default | CCR-WP1.6-5 (successors do not count `NAMESPACE_HISTORY_LIMIT` cuts; invariant 11's "refused before ACK" not guaranteed for > 4,096 competing cuts); the `TKFS_REMOTE_FASTPATH=0` doc says "exactly" but gates on the event's branch; `core.commit.busy` ignores the fault action; CCR-WP1.6-1/-3/-4 deferred (above) |
 | WP1.7 append-mode derivation | approved | `63846e5` (+ `801ca56`) | green: `derive_oracle` 11; CCR-WP1.7-1 applied, which also resolves the review finding that the adapter's plain pass used a deferred savepoint; every wave 1 floor passes since fix round 1 (`concurrent_namespace_ops_5k` through CCR-WP1.INT-4, which touches WP1.6's `commit.rs` and adds `derive::persist_commit_records`); the stress fuzzer's parity helper repaired for WP1.6's inbox (deviation 3) | minors: verify mode returns full's refusal without comparing it with append's (the fuzzer's commit checks do compare); `append_guard` scans the whole branch and two of its guards depend on peer-controlled data (a `,` in an entity id, > 16 multi-relocation events), after which every slow commit of that branch runs full mode (a CCR on `commit.rs` validation to reject `,` is suggested; Wave 2) |
 | WP1.8 object indexes | approved | `c359811` | green: `availability_index` 21, `availability`, `partial_content`, `bulk_lanes`; CCR-WP1.8-1/-2 applied | minors: on Linux `scan_objects` fails the whole call when an entry vanishes between readdir and stat (ENOENT; skip it); the cached `objects/` listing has no maximum age (filesystems without directory mtime updates); `put_object`/`put_stream` add a separate durable commit per new local object (13–20 % slower local writes in `scalability`); a cold `content_status` costs ~0.7 s at 50K objects during active sync (WP2.3 status cell); CCR-WP1.8-3 deferred |
-| WP1.9 session core | **not approved** (its review) | `237a852` (+ `51c9eba`) | green: `session_core` 55; a real `Conn` runs over the real handshake in `w1_integration`. No wire path uses v3 sessions until WP3.1 | **both blockers fixed by the integrator in fix round 1** (CCR-WP1.INT-2: every buffered part is charged its frame plus 128 B, on both sides; delivery driven by overflow emptiness; 3 new tests). Remaining minors: `control_call_is_fast_while_data_is_queued` checks every sample < 50 ms in release (1 in 12 runs fails; use p99); a residual cross-side idle case and up to 4 MiB (now 4 parts of up to 1 MiB + 64 KiB) uncounted per running stream's handler channel (documented) |
+| WP1.9 session core | **not approved** (its review) | `237a852` (+ `51c9eba`, + the post-integration re-review) | green: `session_core` 55 (59 after the re-review); a real `Conn` runs over the real handshake in `w1_integration`. No wire path uses v3 sessions until WP3.1 | **both blockers fixed by the integrator in fix round 1** (CCR-WP1.INT-2: every buffered part is charged its frame plus 128 B, on both sides; delivery driven by overflow emptiness; 3 new tests). Remaining minors: `control_call_is_fast_while_data_is_queued` checks every sample < 50 ms in release (1 in 12 runs fails; use p99); a residual cross-side idle case and up to 4 MiB (now 4 parts of up to 1 MiB + 64 KiB) uncounted per running stream's handler channel (documented) |
 | WP1.10 session handshake | approved | `963d478` | green: `session_handshake` 21; CCR-WP1.10-1/-2/-3 applied; its "accept either outcome" tests now reach a real `Conn` | minors: the distinct-nonce check compares hex strings (an upper-case echo passes; no exploit: proofs use different labels); peer-chosen text (serde error detail, GOAWAY message) reaches error messages unescaped; `ws::connect_any` keeps only the last address's error (an HTTP 401/403 can be reported as `WS_CONNECT_FAILED`). Optional: switch the private pre-auth frame codec to `session::frame` |
-| WP1.11 status hub | **not approved** (its review) | `a818984` (+ `1bae081`) | green: `status_hub` 75; used with a real registry in `w1_integration`. Not wired until WP2.1 | **the major fixed by the integrator in fix round 1** (CCR-WP1.INT-3: pair EWMAs count objects ops only; new 5 % test with mixed traffic). Remaining minors: exchange activity entries coalesce only with the newest entry, so two concurrent transfers fill the 500-entry ring; inbound-incompatible notices whose code changes still fill the daemon history; CCR-WP1.11-1/-2 deferred to WP2.INT |
+| WP1.11 status hub | **not approved** (its review) | `a818984` (+ `1bae081`, + the post-integration re-review) | green: `status_hub` 75 (82 after the re-review); used with a real registry in `w1_integration`. Not wired until WP2.1 | **the major fixed by the integrator in fix round 1** (CCR-WP1.INT-3: pair EWMAs count objects ops only; new 5 % test with mixed traffic). Remaining minors: exchange activity entries coalesce only with the newest entry, so two concurrent transfers fill the 500-entry ring; inbound-incompatible notices whose code changes still fill the daemon history; CCR-WP1.11-1/-2 deferred to WP2.INT |
 | WP1.12 legacy stabilizers | approved | `d7b10f3` (+ `9b36508`, `956c842`) | green: `legacy_stabilizers` 7 (the mount-failure test un-ignored and passing with real WinFsp); all four release scenarios pass their floors (crash backoff after the counting fix); CCR-WP1.12-2 applied | minors: `DeadlineLane`'s 3 s does not bound the WebSocket upgrade (a frozen worker costs ~15 s per `list` call; widen CCR-WP1.12-1 to a deadline-aware `ws::connect`); `LOCAL_WORKER_UNAVAILABLE` anywhere in a chain is Contention, which hides wrapped `WORKER_STATE_MISMATCH` and `runtime.json` errors (only `WORKER_NOT_RUNNING` should be); `WORKER_LIMIT` escalates the crash backoff (up to 60 s to start once a slot frees); `lane_active` retires lanes on a `peers()` error while `run.rs` keeps the list (lane churn); discovery runs under the supervisor mutex for backed-off repositories; the notes' VERIFY table names the wrong ignored `harness_selftest` tests |
 
 ## Known limitations
@@ -501,7 +513,9 @@ mounted folders.
 - WP1.9's and WP1.11's reviews never approved their packages; their open
   blockers and major were fixed here (fix round 1) and verified only by this
   integration's tests and review, not by a WP1.9/WP1.11 re-review. Their
-  remaining minors are in the package table.
+  remaining minors are in the package table. A post-integration re-review of
+  both areas found nine more defects, all fixed here (last section). Those
+  fixes have not been reviewed again.
 - `concurrent_namespace_ops_5k` passes with margin on this machine (max
   261–346 ms in six runs plus the qualification run), but it is a
   per-operation maximum over fsync-bound commits: a slow commit still writes
@@ -535,3 +549,117 @@ mounted folders.
   `C:/tkfs-target/wp1-int-wp17` (WP1.7's branch tip alone) and
   `C:/tkfs-target/wp1-int-stress` (the stress fuzzer run beside the 300-seed
   one); they only served the comparisons above and can be deleted.
+
+## Post-integration re-review
+
+An independent review of the integrated tree at `4971afa` covered the two
+areas whose fixes the integrator had applied without one (CCR-WP1.INT-2 in
+`src/session`, CCR-WP1.INT-3 in `src/orchestrator/hub.rs`). Both areas came
+back *changes required*: the session area with one major and two minors, the
+hub with three majors and three minors. All nine are fixed here. Each fix
+has a regression test that fails on `4971afa` (the failure is quoted below)
+and passes after.
+
+Public signatures are unchanged (§13). The additions are:
+
+- in the session code, crate-private members only: `Event::Expired`
+  (and `Event::Chunk` now carries an owned `Vec<u8>`),
+  `Shared::{rx_taken, chunk_pool, chunk_body, recycle, expire_heaviest,
+  track_undrained}` and `State::undrained`;
+- in `hub_rules`, three new public items: `TransferRate`,
+  `MIN_RATE_SEGMENT` and `Ewma::fold`. `Ewma::tick` now delegates to
+  `Ewma::fold` and behaves as before.
+
+### Session (`src/session/{io,conn}.rs`, WP1.9)
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| S1 | **Major.** Client stream chunks were slices of the received message, which itself was a slice of tungstenite's read buffer. A chunk waiting for its callback therefore pinned the whole buffer allocation and the data of every frame read into it, far beyond its charge. The 32 MiB hold never engaged. | The client copies each chunk body out of the message (`Shared::chunk_body`, before the state lock is taken). Bodies of 512 KiB or more go into recycled 1 MiB buffers (at most 4 per connection, returned after the callback), and each chunk is charged `max(frame, buffer capacity) + 128 B`. The server path was already a copy and is unchanged. The CCR-WP1.INT-2 note and the WP1.9 notes are corrected. See *Throughput* below for why the buffers are recycled. | `stream_chunks_do_not_pin_received_messages`. It runs in a child process with a counting `#[global_allocator]`. Two streams interleave on one connection: 400 × 1 MiB consumed at once, and 2,000 × 1 KiB whose callback blocks on its first chunk. Live heap while blocked: **247,961,791 B** (for about 2.4 MiB charged) **→ 3,345,068 B**, recycled buffers included; once released, it falls back to about 1 MB above baseline (the recycled buffers). |
+| S2 | **Minor.** GOAWAY race. The side that sent the GOAWAY closed as soon as it was idle, and its linger discarded the requests the peer had sent before it read the GOAWAY. Their callers got `ConnectionLost` (uncertain, invariant 16) for requests that never ran. | `goaway_complete` closes on idle only when a GOAWAY was *received*. The sender keeps reading and refusing crossing requests (`WS_CLOSED`, from `dispatch`) until the peer's Close or the 5 s grace. The peer closes once its own calls have ended, and that close follows every request it sent. `Conn::goaway`'s doc says so. | `requests_crossing_a_goaway_are_refused_not_lost`: 20 rounds of 8 callers looping `echo` while the server sends `goaway("PEER_REVOKED")`. Every caller must end with `Unavailable(PEER_REVOKED)` or `Remote(WS_CLOSED)`, and both ends must close with `PEER_REVOKED`. Before: `ConnectionLost("PEER_REVOKED: the peer was revoked")` in round 0. After: none lost (also in 5 + 5 repeat runs). |
+| S3 | **Minor.** A stream callback that fell behind held the client's reads for as long as it stayed stuck. That suspended dead-peer detection and every other call's idle limit with it. | A client hold is bounded (`Io::bound_hold`). If no stream callback takes a chunk (`Shared::rx_taken`) for `dead_after` during a hold, `Shared::expire_heaviest` gives up the call whose queued chunks cost the most and frees them. The caller gets `CallError::Timeout` when its callback returns (`Event::Expired`). A pending call is abandoned (CANCEL, frames purged). A call whose reply has already arrived behind its chunks (`State::undrained`) loses that reply too, because its caller can no longer have every chunk. Reading and liveness then resume. Server holds were already bounded: a behind handler is answered `REQUEST_TIMEOUT` after its stream's idle limit. | `a_stuck_stream_consumer_does_not_hold_the_connection` (1 MiB bound, `dead_after` 1 s, a blocked 64 MiB download). On a healthy link, a call made during the hold completes in < 5 s; before, `Timeout { after_ms: 12015 }` at its 12 s deadline. On a blackholed link, the client closes `TRANSPORT_DEAD` and the call fails `ConnectionLost` in < 5 s. `a_stuck_consumer_of_a_finished_stream_does_not_hold_the_connection`: the stuck stream's reply has already arrived, and a slow second stream fills the bound. With expiry of pending calls only (and so also on `4971afa`, which has no expiry), the second stream hit `Timeout { after_ms: 8013 }` at its deadline. After: it completes in about 1.9 s, and the stuck call returns `Timeout`. |
+
+### Hub (`src/orchestrator/{hub,hub_rules}.rs`, WP1.11)
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| H1 | **Major.** A peer that had ever dialed us for a repo (`inbound_seen`) shared it for good, with its last summary frozen. After it unshared the repo, the folder showed "Syncing metadata · 3 events left", then a permanent false "Stalled". | A known catalog decides sharing. The new `shares()` is used by `pair_facts`, `build_peer.shared_folders` and, through `pair_facts`, `clear_idle_errors`. Exchange evidence in either direction counts only while the peer's catalog is unknown (inbound-only peers, or a peer not listed yet). `on_catalog` drops `inbound_seen` and the last summary of pairs whose repo it no longer lists. | `a_peer_seen_both_ways_that_unshares_the_repo_stops_counting`. Before: `Metadata` right after the catalog dropped the repo. After: `NotShared` at once and 70 s later, with an empty `shared_folders`; when the repo is listed again, no stale summary is shown. |
+| H2 | **Major.** Any objects exchange that moved ≥ 64 KiB counted as progress, failed or not. A download whose pulls time out, or whose writes are rejected, never stalled. | Progress is now a completed object of a successful exchange (`ok && objects_* > 0`), alongside the existing signals: summary movement, the content counters (`on_heartbeat`: missing objects or bytes fall, or the spool grows) and the tick's decrease of remaining work, which includes the peer's published counters for uploads. Moving ≥ 64 KiB (`PROGRESS_MIN_BYTES`) is now only evidence that the peer supplies (`may_supply`). The per-direction `last_progress_ms` follows completed objects and the tick's decreases. | `objects_exchanges_that_complete_nothing_are_not_progress`: a 1 MiB pull every 10 s while content stays flat. Pulls that are `ok` with 0 objects, and pulls failing with `REQUEST_TIMEOUT`, both stall at 60 s ("Stalled 1 min · 1 of 1 peer"). A growing spool does not stall, and a completed object clears the stall. Before: `Downloading` at 65 s. |
+| H3 | **Major.** Each exchange's bytes landed in the one tick in which it finished. A 16 MiB pull at 1 MB/s first read 16 MiB/s, then the rate swung with every pull (ETA 50–253 % of the true one). | `hub_rules::TransferRate`, used for the pair, peer and lane rates. Each exchange becomes a constant-rate segment of `bytes / duration_ms`, at least `MIN_RATE_SEGMENT` (one tick), starting when it is reported. Each tick folds exactly the stretch since the previous one (`HubState::rates_at`), split at segment boundaries (`Ewma::fold`). Bias correction starts with the first segment, so the first reading is that transfer's own rate. An exchange shorter than a tick still counts as that tick's average, so the existing 35 ms-exchange tests are unchanged. | `rates_of_large_pulls_follow_their_duration`: back-to-back 16 MiB pulls at 1 and 2 MB/s for 240 s. From the first reading on, every pair and bulk-lane rate is within 5 % and every ETA within 5 %; the peer rate is within 5 % from 60 s (it also counts the 0 s metadata exchange). Before: "reading 1 at 17 s shows 16777216 B/s". Also the pure test `transfer_rate_spreads_each_transfer_over_its_duration`. |
+| H4 | **Minor.** Any growth of `activation.activated` was credited as progress to every pair of the repo with metadata work. A pair stuck on its own work never stalled. | The credit is removed. Activation counts only as a decrease of the pair's own metadata work, which the tick sees: its feed counters (fresh every heartbeat since H5) or its next summary. | `activation_elsewhere_is_not_progress_for_a_stuck_pair`: `to_send` 5 never moves while `activated` grows every second. Before: `Metadata` at 65 s. After: `Stalled`, and the pair's own `staged_pending` shrinking clears the stall. |
+| H5 | **Minor.** The worker stamps its per-peer counters when it applies an exchange, before the hub records that exchange's summary. The counters therefore never won, and `meta.rejected` (counters only) read 0, so rule 8 "only rejected work" could not appear. | The counters win when stamped at or after the summary's exchange *began* (`PairEntry::meta_exchange_started_ms` = recorded − `duration_ms`). `rejected` always comes from the counters when present. | `worker_counters_of_the_same_exchange_win_over_its_summary`. Before: `local_pending` 0 (expected 7). After: 7 with `rejected` 4. The pair then reads `Blocked` ("Blocked — 4 events rejected") once only rejected work is left. A newer summary still wins over older counters, keeping `rejected`. |
+| H6 | **Minor.** Remote catalogs are not kept across restarts, so after a restart a folder whose only peer was offline or in backoff read "Not shared with any peer". | A configured outbound peer whose catalog is unknown counts as possibly sharing while it is not Online, so the folder reads Backoff, Offline and so on. It is not listed in `PeerStatus.shared_folders`. Once it is Online, its catalog (listed every 2 s) decides, and the last good copy survives later outages. CCR-WP1.INT-5 asks the spec to state this. | `a_configured_peer_whose_catalog_is_unknown_may_share`. Before: `NotShared`. After: Backoff ("Retrying · 1 of 1 peer in backoff"), then Offline ("Waiting for peers · 1 of 1 peer unreachable"), then NotShared once its catalog omits the folder, also through a later outage. |
+
+**Throughput (S1).** In alternating release runs of
+`qual_wp1_9_session::loopback_throughput` (plain-WS download, MiB/s), a plain
+copy with a fresh 1 MiB allocation per chunk measured 271, 260, 250 and 282,
+against 381, 396, 392 and 436 for the old slice. That fails the 300 MiB/s
+floor (`session_loopback_throughput`). On Windows each allocation that large
+maps fresh pages; the copy itself is cheap, and the first version also made
+an unused copy on the server path. With recycled buffers the download
+measured 665, 513, 553 and 726, against 639, 483, 457 and 602 for the slice
+in the same alternation. WSS (about 500) and upload were unaffected.
+
+**CCR-WP1.INT-5 (spec ratification, §7.1 rule 4; no contract change).**
+Rule 4 reads "no peer's catalog lists the repo". Until a configured peer's
+catalog has been listed (it is not persisted, §3.7), H6 treats that peer as
+possibly sharing while it cannot be reached. Requested: §7.1 states this
+startup case, as the review proposed.
+
+### For Wave 2 and 3 authors
+
+- **`ExchangeFinished` producers** (WP2.7, WP2.8, WP3.3) must follow two
+  rules. `duration_ms` must be the exchange's real duration, because rates
+  now spread its bytes over it. `objects_up`/`objects_down` must count
+  completed objects only (installed, or acknowledged by the peer), because
+  those are what the stall detector treats as progress. The WP1.11 notes'
+  integration contract says so.
+- **GOAWAY**: the sending side now closes when the peer closes (after the
+  peer's calls end) or after the 5 s grace, not as soon as it is idle.
+  WP2.8 (rotation, revocation) and WP2.1 (shutdown) should expect this.
+- **Stream consumers**: a `call_streaming` callback that takes nothing for
+  `dead_after` (20 s) while the client holds its reads loses its call with
+  `Timeout`. For WP3.3's `objects.pull` consumer, which writes into worker
+  `objects.write`, that is a retryable per-pull failure; issue a fresh request
+  (invariant 16).
+- **CCR-WP1.9-2** (`Bytes` in `Incoming::chunks`) must not be done by slicing
+  the received message: that pins tungstenite's read buffer as S1 did. If the
+  server's per-part copy ever needs to be cheaper, recycle buffers as the
+  client does (S1, *Throughput*).
+- **Review observations** (not defects, recorded for their owners):
+  - Reassembled request bodies waiting in the handler queue are bounded only
+    by count: (handler_queue + handlers) × 16 MiB, about 320 MiB per control
+    connection, plus 64 MiB of reassembly.
+  - `Conn` does not close when its last handle drops, and heartbeats keep both
+    ends alive. WP2.6/2.8 must call `close()` or `goaway()`, including on error
+    paths after `dial` returns.
+  - On a closed connection, `Responder::chunk` returns `Cancelled` rather than
+    `ConnectionLost`.
+  - `objects.wants` and `objects.report` count as both down and up in the hub.
+  - The 60 s EWMA is computed but never published.
+  - A pair's `stalled_since_ms` (the threshold crossing) and the summary's
+    "Stalled N" (time since the last progress) differ by `stall_after`.
+
+### Verification (post-integration re-review)
+
+Run on the final tree (Windows `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int`,
+WSL `$HOME/tkfs-target/wp1-int`). Before the timing-sensitive runs I checked
+that no other cargo, test or tkfs process was running.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo clippy --all-targets -- -D warnings` | pass (exit 0), on Windows and in WSL |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell -NoProfile -File scripts/suite-lock.ps1 cargo test --all-targets` | **pass, SUITE_EXIT=0: 599 passed, 0 failed, 84 ignored** across 52 binaries. That is 588 plus 11 new tests: `session_core` 55 → 59, `status_hub` 75 → 82. An earlier full run, before the recycled buffers (S1) and the GOAWAY test's start condition, was also green (599/0/84) |
+| WSL `cargo test --test session_core --test session_handshake --test status_hub` | **pass, exit 0**: 59, 21 and 82 passed |
+| Release `cargo test --release --test qual_wp1_9_session -- --ignored --test-threads=1`, run twice | 5 of 5 scenarios pass both times. `session_loopback_throughput` 578.1 / 566.9 MiB/s against ≥ 300 (upload 651 / 675, WSS 502 / 502). `session_slow_does_not_block_fast` p99 0.12 / 0.13 ms against < 50. `session_control_under_queued_data` p99 46.3 / 34.0 ms against < 50. `dead_peer_detection` 20.0 s; `duplex_32mib` 60 / 110 ms (WSS 120 / 108). These floors are the only ones the re-review touches; `test-evidence/qualification-wave-1.json` stays the full-wave run of fix round 1 |
+| Stability | The whole `session_core` binary was run 5 times on the final code, green each time. The new session tests were also run 5 times, plus 3 more after the recycled buffers |
+| Each regression test fails before its fix | Shown in the tables above: each was run on the `4971afa` code before its fix. S2's test (in its final form) and S3's finished-stream test were also run with only their fix reverted on the final code (the `goaway_received` gate; `track_undrained`), and both failed |
+
+### Commits
+
+- `96bc19b` WP1.INT: re-review fix: session chunk copies, GOAWAY
+  crossings, bounded client holds (S1–S3, 4 `session_core` tests)
+- `6ab1b03` WP1.INT: re-review fix: hub sharing, stall progress, rates and
+  feed counters (H1–H6, 7 `status_hub` tests)
+- the notes commit that adds this section and corrects the CCR-WP1.INT-2,
+  WP1.9 and WP1.11 notes
