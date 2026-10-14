@@ -665,8 +665,10 @@ impl Core {
     /// reflects that pass. While the background activator runs, the pass is
     /// the activator's: the request wakes it and waits (without the engine,
     /// at most [`REVALIDATE_WAIT`]) for one activator cycle that began after
-    /// the re-queue (re-queued rows keep their arrival order, so they are at
-    /// the head of that cycle's slice), and nothing is activated under the
+    /// the re-queue and ran its slice (a cycle whose slice found SQLite's
+    /// writer busy did nothing and does not count; re-queued rows keep their
+    /// arrival order, so they are at the head of that cycle's slice), and
+    /// nothing is activated under the
     /// request's own engine hold (§4.4: a slow event is prepared off-lock,
     /// never committed inline on a request). Without the activator (the
     /// in-process `start_rpc` wrapper) the request activates inline (≤ 32

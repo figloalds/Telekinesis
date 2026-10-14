@@ -158,8 +158,9 @@ pub struct EngineVitals {
     /// `before` projections captured for notifications (an O(entries) clone
     /// under the engine lock; only while mounted, on Windows).
     captures: AtomicU64,
-    /// Background activator cycles (slice plus slow commit) begun and
-    /// finished; a cycle begins before it takes the engine.
+    /// Background activator cycles (slice plus slow commit) begun (each
+    /// numbered by it; a cycle begins before it takes the engine), and the
+    /// number of the latest one that finished as an activation pass.
     activator_cycles_begun: AtomicU64,
     activator_cycles_finished: AtomicU64,
 }
@@ -256,17 +257,24 @@ impl EngineVitals {
     pub fn captures(&self) -> u64 {
         self.captures.load(Ordering::Relaxed)
     }
-    /// Marks a background activator cycle as begun until the returned guard
-    /// drops (finished). Begun before the cycle takes the engine, so a cycle
-    /// numbered past [`EngineVitals::activator_cycles`]`().0` sees every row
-    /// committed before that read.
+    /// Begins a background activator cycle, numbered one past every cycle
+    /// begun before it; it finishes when the returned guard drops, unless
+    /// [`ActivatorCycle::abandon`]ed. Begun before the cycle takes the engine,
+    /// so a cycle numbered past [`EngineVitals::activator_cycles`]`().0` sees
+    /// every row committed before that read.
     pub fn activator_cycle(self: &Arc<Self>) -> ActivatorCycle {
-        self.activator_cycles_begun.fetch_add(1, Ordering::SeqCst);
+        let number = self.activator_cycles_begun.fetch_add(1, Ordering::SeqCst) + 1;
         ActivatorCycle {
             vitals: self.clone(),
+            number,
+            pass: true,
         }
     }
-    /// `(begun, finished)` background activator cycles.
+    /// `(begun, finished)`: the background activator cycles begun, and the
+    /// number of the latest cycle that finished as an activation pass. A
+    /// cycle that began after a read of `begun` ran a whole pass once
+    /// `finished > begun` (cycles run one at a time, on the activator
+    /// thread); an abandoned cycle never satisfies that, nor delays it.
     pub fn activator_cycles(&self) -> (u64, u64) {
         (
             self.activator_cycles_begun.load(Ordering::SeqCst),
@@ -290,16 +298,29 @@ impl EngineVitals {
     }
 }
 
-/// Returned by [`EngineVitals::activator_cycle`]: counts the cycle finished
-/// on drop (also on an error or a panic).
+/// Returned by [`EngineVitals::activator_cycle`]: records the cycle as the
+/// latest finished pass on drop (also on an error or a panic), unless it was
+/// abandoned.
 pub struct ActivatorCycle {
     vitals: Arc<EngineVitals>,
+    number: u64,
+    pass: bool,
+}
+impl ActivatorCycle {
+    /// The cycle did nothing (its slice found SQLite's writer held by
+    /// another connection and is retried): it is not an activation pass, so
+    /// a `revalidate` waiting for one keeps waiting.
+    pub fn abandon(mut self) {
+        self.pass = false;
+    }
 }
 impl Drop for ActivatorCycle {
     fn drop(&mut self) {
-        self.vitals
-            .activator_cycles_finished
-            .fetch_add(1, Ordering::SeqCst);
+        if self.pass {
+            self.vitals
+                .activator_cycles_finished
+                .fetch_max(self.number, Ordering::SeqCst);
+        }
     }
 }
 
