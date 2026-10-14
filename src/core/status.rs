@@ -177,8 +177,8 @@ impl Store {
     pub fn pending_causal_events(&self) -> Result<Vec<String>> {
         Ok(self.view(&self.active)?.projection.pending.clone())
     }
-    /// Journal counters (§4.5): `epoch` stays `None` (the feed epoch is
-    /// WP2.5's).
+    /// Journal counters (§4.5); `epoch` is the feed epoch (`journal_epoch`,
+    /// WP2.5; wired by WP2.INT, CCR-WP2.5-5).
     pub fn journal_counters(&self) -> Result<JournalCounters> {
         let counters = self.status_counters()?;
         let count = |sql: &str| -> Result<u64> {
@@ -192,7 +192,7 @@ impl Store {
             )?,
             branches: count("SELECT count(*) FROM branches")?,
             tip: counters.tip,
-            epoch: None,
+            epoch: Some(self.feed_epoch()?),
             outgoing_unacknowledged: counters.outgoing_unacknowledged,
             unresolved_conflicts: counters.unresolved_conflicts,
         })

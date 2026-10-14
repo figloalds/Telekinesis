@@ -731,20 +731,16 @@ impl Core {
             .into_iter()
             .filter(|branch| branch.shared)
             .collect();
-        let seq: i64 = store.db.query_row(
-            "SELECT COALESCE(MAX(seq),0) FROM journal_sequence",
-            [],
-            |row| row.get(0),
-        )?;
         Ok(json!(PublishedSummary {
             repo: self.ctx.repo.clone(),
             replica: self.ctx.device.clone(),
             label: self.ctx.repo.clone(),
             branches,
-            // The feed epoch arrives with WP2.5.
+            // The feed tip (WP2.5): shared events only, so the remote catalog
+            // never counts private ones (CCR-WP2.5-5, wired by WP2.INT).
             tip: FeedTip {
-                epoch: String::new(),
-                seq,
+                epoch: store.feed_epoch()?,
+                seq: store.feed_tip()?,
             },
             sync_generation: crate::worker::status_cell::sync_generation(&self.ctx, &self.vitals),
         }))
