@@ -4,7 +4,7 @@
 //! accept loop that never gives up on transient errors, one thread per
 //! connection with a persistent request loop, `catch_unwind` around every
 //! request, and the IPC v3 ops (`hello`, `watch`, `stop{mode}`,
-//! `mount-attach`/`-detach`/`-status`, `published-summary`, prefix routing for
+//! `mount-attach`/`-detach`/`-status`, `revalidate`, `published-summary`, prefix routing for
 //! `feed-*` and `objects.*`) next to the legacy ones.
 //!
 //! Crash-only internals: a request that panics while holding the engine
@@ -30,13 +30,14 @@ use crate::{
         health::MountStatus,
         ipc::{
             HelloReply, IPC_VERSION, MountAttachRequest, MountDetachRequest, PublishedSummary,
-            StopMode, StopReply, StopRequest, WatchRequest, ops, timing,
+            RevalidateReply, RevalidateRequest, StopMode, StopReply, StopRequest, WatchRequest,
+            ops, timing,
         },
         orchestrator::FeedTip,
     },
     util::{fault, lock::lock, notify::Notify, time::now_ms},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -413,8 +414,8 @@ impl Core {
                 Ok(json!(status.map_err(ErrorWire::into_anyhow)?))
             }
             ops::MOUNT_STATUS => Ok(json!(self.ctx.mount.status())),
-            // `Store::revalidate` arrives with WP1.6; WP1.INT wires this arm.
-            ops::REVALIDATE => bail!("UNSUPPORTED_OPERATION: {op}"),
+            // `Store::revalidate` (WP1.6), wired by WP1.INT (§14 WP1.INT task 1).
+            ops::REVALIDATE => self.revalidate(payload),
             ops::PUBLISHED_SUMMARY => self.published_summary(),
             ops::STATUS => self.status(request, payload),
             op if op.starts_with(ops::FEED_PREFIX) => sync_rpc::dispatch(&self.ctx, op, payload),
@@ -645,6 +646,44 @@ impl Core {
         publish_discovery(&self.ctx.engine, &self.ctx.state, &info)?;
         published.clone_from(&info.mount);
         Ok(info)
+    }
+
+    /// `revalidate{ids?}` (§6.1, wired by WP1.INT): re-queue quarantined,
+    /// blocked and retry inbox rows (all, or `ids` and the rows blocked on
+    /// them) through `Store::revalidate`, then activate what is now ready in
+    /// one bounded pass, as a legacy lane's receive does (≤ 32 events,
+    /// ≤ 50 ms, with the engine's namespace notifications and session
+    /// refresh). Whatever is left activates on the next receive (or WP2.3's
+    /// activator, which `ctx.activation` wakes). The rows are re-queued
+    /// durably before the activation, so an activation failure is logged,
+    /// not returned.
+    fn revalidate(&self, payload: &Value) -> Result<Value> {
+        let RevalidateRequest { ids } = serde_json::from_value(payload.clone())?;
+        let requeued = {
+            let mut engine = self.engine()?;
+            let requeued = engine.store.revalidate(ids.as_deref())?;
+            if requeued > 0 {
+                let empty = Bundle {
+                    repo: engine.store.repo.clone(),
+                    branches: vec![],
+                    events: vec![],
+                    objects: Default::default(),
+                };
+                if let Err(error) = engine.receive_peer_budget(empty, &Default::default(), Some(32))
+                {
+                    crate::util::log::event!(info, (crate::model::errors::code_of(&error)), {
+                        "site": "worker.revalidate",
+                        "requeued": requeued,
+                        "message": format!("{error:#}"),
+                    });
+                }
+            }
+            requeued
+        };
+        self.ctx.activation.poke();
+        Ok(json!(RevalidateReply {
+            requeued: requeued as u64
+        }))
     }
 
     /// `published-summary` from a pooled secondary store (no engine lock).

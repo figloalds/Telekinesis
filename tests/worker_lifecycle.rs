@@ -403,9 +403,11 @@ fn ready_worker_record_and_hello_describe_the_same_process() {
             process_start: written.process_start,
         }
     );
+    // WP1.INT wired `revalidate` to `Store::revalidate` (§14 WP1.INT task
+    // 1): nothing is quarantined here, so nothing is re-queued.
     assert_eq!(
-        remote_error(worker.rpc(json!({"op":"revalidate"}))),
-        "UNSUPPORTED_OPERATION: revalidate"
+        worker.rpc(json!({"op":"revalidate"})).unwrap(),
+        json!({"requeued": 0})
     );
     assert!(
         remote_error(worker.rpc(json!({"op":"feed-offer","route":{}})))
