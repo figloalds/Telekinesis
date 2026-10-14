@@ -1100,15 +1100,16 @@ fn a_failed_slow_preparation_requeues_only_its_event() {
     a.create("shared.txt", "file").unwrap();
     let allowed = devices([&a, &b, &c]);
     sync_into(&a, &mut b, &allowed).unwrap();
-    sync_into(&a, &mut c, &allowed).unwrap();
     let write = |s: &mut Store, bytes: &[u8]| {
         let entry = s.lookup("shared.txt").unwrap();
         s.write_revision(&entry.id, entry.revisions.get("content").cloned(), bytes)
             .unwrap();
     };
     // A two-way edit: the worker's own edit is committed, the remote one
-    // needs the slow path.
+    // needs the slow path. C's creates follow the worker's edit, so they are
+    // fast successors there, independent of A's edit.
     write(&mut b, b"from b");
+    sync_into(&b, &mut c, &allowed).unwrap();
     write(&mut a, b"from a");
     for i in 0..5 {
         c.create(&format!("c-{i}.txt"), "file").unwrap();
@@ -1125,42 +1126,49 @@ fn a_failed_slow_preparation_requeues_only_its_event() {
             store.put_object(&hex::decode(bytes).unwrap()).unwrap();
         }
     }
-    fault::configure(Some(FaultConfig {
-        count: Some(1),
-        ..FaultConfig::new("worker.activator.prepare", FaultAction::Fail)
-    }));
+    // Every preparation fails until the independent creates are in.
+    fault::configure(Some(FaultConfig::new(
+        "worker.activator.prepare",
+        FaultAction::Fail,
+    )));
     // The edit is staged first, so it is popped first.
     let mut staged = edit.events.clone();
     staged.extend(creates.iter().cloned());
     w.stage(&staged, &allowed);
     worker::activator::try_spawn(w.ctx.clone()).unwrap();
-    w.wait_drained(Duration::from_secs(60));
-    fault::configure(None);
-    let seq = |event: &str| -> i64 {
+    let committed = |event: &str| -> bool {
         w.ctx
             .sync_stores
             .checkout()
             .unwrap()
             .db
             .query_row(
-                "SELECT seq FROM journal_sequence WHERE event=?",
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
                 [event],
                 |r| r.get(0),
             )
             .unwrap()
     };
-    let slow = seq(&edit.events[0].id);
-    for create in &creates {
-        assert!(
-            seq(&create.id) < slow,
-            "the events behind the failed preparation waited for it"
-        );
-    }
+    let created = wait_until(Duration::from_secs(60), || {
+        creates.iter().all(|create| committed(&create.id))
+    });
+    let edit_committed = committed(&edit.events[0].id);
+    fault::configure(None);
+    assert!(
+        created,
+        "the events behind the failing preparation waited for it: {}",
+        w.status()
+    );
+    assert!(!edit_committed, "committed while its preparation failed");
     let status = w.status();
     assert!(
         status["activation"]["retried"].as_u64().unwrap() >= 1,
         "{status}"
     );
+    // Once preparations succeed again, it commits (after its backoff).
+    w.wait_drained(Duration::from_secs(60));
+    assert!(committed(&edit.events[0].id));
+    let status = w.status();
     assert!(
         status["activation"]["slow"].as_u64().unwrap() >= 1,
         "{status}"
