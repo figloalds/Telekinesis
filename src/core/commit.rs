@@ -77,6 +77,28 @@
 //! and stay so). Events are immutable (invariant 6), and a staged or
 //! committed id never carries another payload (`EVENT_ID_REUSED`), so a row
 //! known by `(seq, id)` never changes its payload.
+//!
+//! # Rolled-back commits and the view (WP2.4 fix round 2)
+//!
+//! A commit patches (or seeds) the connection's cached view, and the view's
+//! freshness key (`total_changes`, `data_version`, an open transaction)
+//! cannot see a rollback by a caller the store never hears of (a runtime
+//! request's `ROLLBACK`, or its `ROLLBACK TO` inside a caller's
+//! transaction): the key matches again as soon as a transaction is open,
+//! and the view still holds the rolled-back commit. The commit path must not
+//! build on such a view: the successor checks and deltas, the
+//! stored-projection delta of a slow commit and the periodic seal written
+//! from the patched view (CCR-WP1.6-1 adapter) all read it. So every commit
+//! also bumps a counter in a TEMP table of its connection, inside its
+//! savepoint (`temp.tkfs_commit_epoch`: a rollback of the commit, at any
+//! nesting, undoes the bump), and `Cache::epoch` holds the value the
+//! connection's own commits left. Before the commit path reads the view
+//! (`drop_rolled_back_view`), a different stored value means a commit was
+//! rolled back since: the view is dropped (its next use loads the stored
+//! projection) and the counter is resynchronized. A handle that never
+//! committed (a read store) never reads the table. Readers outside the
+//! commit path (`Store::view`) keep the view until the next commit or write
+//! transaction drops it (CCR-WP2.4-6).
 use super::derive::{self, DeriveInput, DeriveOutput, derive_conflicts};
 use super::*;
 use std::{
@@ -173,6 +195,30 @@ pub(crate) struct Cache {
     /// Forced seals of prepared slow commits written from their off-lock
     /// parts (`seal_prepared`; tests).
     prepared_seals: Cell<u64>,
+    /// The `temp.tkfs_commit_epoch` value this connection's own commits left
+    /// (0: none yet; module docs, "Rolled-back commits and the view").
+    epoch: Cell<i64>,
+    /// Views dropped because a commit was rolled back around the store
+    /// (tests).
+    rolled_back_views: Cell<u64>,
+}
+
+/// Bumps the connection's commit counter inside the commit's savepoint and
+/// returns the new value (module docs, "Rolled-back commits and the view").
+/// `held`: the value the connection's commits left before this one; the
+/// TEMP table is created by the first commit (or again, after a rollback
+/// undid its creation).
+fn bump_commit_epoch(tx: &Connection, held: i64) -> Result<i64> {
+    if held == 0 {
+        tx.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS tkfs_commit_epoch(id INTEGER PRIMARY KEY CHECK(id=0), n INTEGER NOT NULL)",
+        )?;
+    }
+    Ok(tx
+        .prepare_cached(
+            "INSERT INTO temp.tkfs_commit_epoch VALUES(0,1) ON CONFLICT(id) DO UPDATE SET n=n+1 RETURNING n",
+        )?
+        .query_row([], |r| r.get(0))?)
 }
 
 /// How many branches the event cache keeps (the least recently used is
@@ -448,6 +494,7 @@ impl Store {
         local: bool,
         committed_view: bool,
     ) -> Result<Option<Projection>> {
+        self.drop_rolled_back_view();
         let mut fast = self.content_successor(event)?;
         if fast.is_none() && (local || remote_fast_paths_enabled()) {
             fast = self.creation_successor(event)?;
@@ -487,6 +534,37 @@ impl Store {
     pub fn known_projection_seals(&self) -> u64 {
         self.caches.commit.known_seals.get()
     }
+    /// How many times this handle dropped its view because a commit it had
+    /// made was rolled back around the store (tests).
+    #[doc(hidden)]
+    pub fn rolled_back_views(&self) -> u64 {
+        self.caches.commit.rolled_back_views.get()
+    }
+    /// Drops the cached view if a commit of this connection was rolled back
+    /// since its last commit (module docs, "Rolled-back commits and the
+    /// view"). Call before the commit path reads the view. No query on a
+    /// handle that never committed.
+    pub(super) fn drop_rolled_back_view(&self) {
+        let cache = &self.caches.commit;
+        let held = cache.epoch.get();
+        if held == 0 {
+            return;
+        }
+        // No table (its creation rolled back, or a replaced connection): 0.
+        let stored: i64 = self
+            .db
+            .prepare_cached("SELECT n FROM temp.tkfs_commit_epoch WHERE id=0")
+            .and_then(|mut statement| statement.query_row([], |r| r.get(0)).optional())
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        if stored != held {
+            self.view_cache.borrow_mut().take();
+            cache.epoch.set(stored);
+            let dropped = &cache.rolled_back_views;
+            dropped.set(dropped.get().saturating_add(1));
+        }
+    }
     /// How a slow-path commit stores its projection `p` on `branch`
     /// (WP1.INT fix round 1, CCR-WP1.INT-4): `Some(entities)` when writing
     /// the `current_parts` rows of those entities makes the stored projection
@@ -514,6 +592,7 @@ impl Store {
     /// stored projection of the branch state it derived from; the write
     /// happens only if the branch is still in that state (`commit_prepared`).
     fn projection_delta(&self, branch: &str, p: &Projection) -> Option<BTreeSet<String>> {
+        self.drop_rolled_back_view();
         let view = self.view(branch).ok()?;
         let stored = &view.projection;
         if stored.conflicts != p.conflicts
@@ -662,6 +741,8 @@ impl Store {
         let Checked { payload, objects } = checked;
         let incremental = matches!(plan, Plan::Fast(_));
         let branch = event.branch.id.clone();
+        // Never patch (or seal) a view that holds a rolled-back commit.
+        self.drop_rolled_back_view();
         // A fast commit patches the view if no other connection committed
         // since it was loaded (I6).
         let patchable = incremental && {
@@ -809,7 +890,9 @@ impl Store {
                 Plan::Slow(slow)
             }
         };
+        let epoch = bump_commit_epoch(&tx, self.caches.commit.epoch.get())?;
         tx.commit()?;
+        self.caches.commit.epoch.set(epoch);
         self.count_commit(&event.id, incremental);
         // Patch the view only if no other connection committed since it was
         // loaded (I6); otherwise drop it. Never fail after the commit.

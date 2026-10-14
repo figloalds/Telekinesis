@@ -433,7 +433,8 @@ fn activate(
         let Prepared::Computed(computed) = &prepared else {
             panic!("prepare_slow computes off-lock");
         };
-        stats.computed += usize::from(computed.is_computed());
+        let computed_now = computed.is_computed();
+        stats.computed += usize::from(computed_now);
         let mut wrote = false;
         let outcome = match between(&ticket, s) {
             Between::Nothing => s.commit_prepared(prepared).unwrap(),
@@ -476,7 +477,15 @@ fn activate(
                 );
                 stats.committed_slow += usize::from(slow);
             }
-            CommitOutcome::Failed(_) => stats.failed += 1,
+            CommitOutcome::Failed(error) => {
+                // A refusal (or a transient retry) the commit applied: named
+                // in the output, so a run that reports some says which.
+                eprintln!(
+                    "OFFLOCK_FAILED {} computed={} {:?}: {}",
+                    ticket.id, computed_now, error.code, error.message
+                );
+                stats.failed += 1;
+            }
         }
     }
     unreachable!()
@@ -2160,4 +2169,167 @@ fn successor_commits_count_competing_cuts_like_full_replay() {
     assert_eq!(slice.quarantined[0].1.code, "NAMESPACE_HISTORY_LIMIT");
     assert_eq!(s.inbox_counts().unwrap().pending_active(), 0);
     assert_oracle_empty(&mut s, "after the remote refusal");
+}
+
+/// Fix round 2: a commit that an enclosing transaction rolls back without
+/// the store seeing it (a runtime request's outer `ROLLBACK`, or its
+/// `ROLLBACK TO` inside a caller's transaction) leaves the cached view
+/// patched with it, under a freshness key that matches again once a
+/// transaction is open. The next commit must not build on that view: not its
+/// successor delta, not the periodic seal it serializes (CCR-WP1.6-1
+/// adapter), not the view it patches for later readers. Every seal stays a
+/// replay of its journal prefix, and the view, the stored projection and the
+/// oracle agree after every request.
+#[test]
+fn commits_rolled_back_around_the_store_never_reach_the_view_or_a_seal() {
+    for nested in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), Some(REPO)).unwrap();
+        let read = Store::open_secondary(&s.root, &s.repo, &s.device).unwrap();
+        // What a writer observed: committed state, not the view.
+        let content = |id: &str| read.entry(id).unwrap().revisions.get("content").cloned();
+        let file = s.create("file", "file").unwrap().id;
+        let other = s.create("other", "file").unwrap().id;
+        for bytes in [
+            b"even", b"odd
+",
+        ] {
+            s.write_revision(&other, content(&other), bytes).unwrap();
+        }
+        let kept = content(&file);
+        let active = s.active.clone();
+        let (detected, seals) = (s.rolled_back_views(), s.known_projection_seals());
+        let mut sealed_at_tip = 0;
+        for i in 0..300 {
+            assert_eq!(content(&file), kept, "{nested} {i}");
+            s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+            if nested {
+                s.db.execute_batch("SAVEPOINT request").unwrap();
+            }
+            // A content successor (fast): it patches the view.
+            s.write_revision(&file, kept.clone(), format!("rolled back {i}").as_bytes())
+                .unwrap();
+            if nested {
+                s.db.execute_batch("ROLLBACK TO request; RELEASE request")
+                    .unwrap();
+            } else {
+                s.db.execute_batch("ROLLBACK").unwrap();
+                s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+            }
+            // The next request's commit: a content successor of bytes already
+            // stored, so the commit is the request's first write.
+            let bytes: &[u8] = if i % 2 == 0 {
+                b"even"
+            } else {
+                b"odd
+"
+            };
+            s.write_revision(&other, content(&other), bytes).unwrap();
+            s.db.execute_batch("COMMIT").unwrap();
+            if assert_snapshot_valid(&s, &active) {
+                sealed_at_tip += 1;
+            }
+            assert_eq!(
+                s.projection(&active).unwrap(),
+                read.projection(&active).unwrap(),
+                "{nested} {i}: the view is the stored projection"
+            );
+        }
+        assert!(
+            sealed_at_tip >= 2,
+            "{nested}: {sealed_at_tip} seals at the tip"
+        );
+        assert!(
+            s.known_projection_seals() >= seals + 2,
+            "{nested}: periodic seals still serialize the view they hold"
+        );
+        assert!(s.rolled_back_views() > detected, "{nested}");
+        let counters = s.commit_path_counters();
+        assert!(counters.fast >= 300, "{nested}: {counters:?}");
+        assert_eq!(
+            s.entry(&file).unwrap().revisions.get("content").cloned(),
+            kept
+        );
+        assert_oracle_empty(&mut s, "after the rolled-back requests");
+        let expected = read.projection(&active).unwrap();
+        drop(read);
+        drop(s);
+        let s = Store::open(dir.path(), Some(REPO)).unwrap();
+        assert_eq!(s.projection(&active).unwrap(), expected, "{nested}");
+    }
+}
+
+const ROLLBACK_CHILD: &str = "TKFS_OFFLOCK_ROLLBACK_CHILD";
+
+/// Child of `a_failed_read_rollback_is_an_error_and_the_next_preparation_ends_it`
+/// (a fault configuration is process-wide). A no-op unless the variable is
+/// set.
+#[test]
+fn rollback_fault_child() {
+    let Ok(marker) = std::env::var(ROLLBACK_CHILD) else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (_a, mut b, event, allowed) = two_way(dir.path());
+    let read = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    b.stage_incoming(vec![staged(event.clone())], &allowed)
+        .unwrap();
+    let ticket = b
+        .activate_slice(SliceBudget::ACTIVATOR)
+        .unwrap()
+        .slow_ticket
+        .expect("a two-way save is slow");
+    let mut fault = tkfs::util::fault::FaultConfig::new(
+        "core.prepare.rollback",
+        tkfs::util::fault::FaultAction::Fail,
+    );
+    fault.count = Some(1);
+    tkfs::util::fault::configure(Some(fault));
+    let error = Store::prepare_slow(&read, &ticket).unwrap_err();
+    assert!(format!("{error:#}").contains("FAULT_INJECTED"), "{error:#}");
+    assert!(
+        !read.db.is_autocommit(),
+        "the read transaction is still open"
+    );
+    // The branch moves: a preparation inside the old snapshot is `Stale`.
+    b.create("local-between.txt", "file").unwrap();
+    let prepared = Store::prepare_slow(&read, &ticket).unwrap();
+    assert!(read.db.is_autocommit(), "no read transaction left open");
+    assert!(matches!(&prepared, Prepared::Computed(p) if p.is_computed()));
+    match b.commit_prepared(prepared).unwrap() {
+        CommitOutcome::Committed { id, .. } => assert_eq!(id, event.id),
+        other => panic!("expected a commit, got {other:?}"),
+    }
+    assert_oracle_empty(&mut b, "after the preparation that ended it");
+    std::fs::write(Path::new(&marker).join("rollback.done"), b"").unwrap();
+}
+
+/// Fix round 2: a `ROLLBACK` of `prepare_slow`'s own read transaction that
+/// fails and leaves it open is an error, and the next call on the handle
+/// ends that transaction first: it prepares from the current state (no
+/// pinned snapshot, no endless `Stale`).
+#[test]
+fn a_failed_read_rollback_is_an_error_and_the_next_preparation_ends_it() {
+    let marker = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "rollback_fault_child",
+            "--exact",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(ROLLBACK_CHILD, marker.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        marker.path().join("rollback.done").is_file(),
+        "the child ran the scenario: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
