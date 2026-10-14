@@ -5,9 +5,10 @@
 //! real `Catalog` (temporary data directory) and a real `StatusHub`.
 use serde_json::{Value, json};
 use std::{
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Barrier, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -47,10 +48,23 @@ const SERVER: &str = "peer-server-installation";
 struct Recorder {
     hub: Arc<StatusHub>,
     events: Mutex<Vec<(Instant, u64, StatusEvent)>>,
+    /// When set, the next `LaneState{Dialing}` panics (once): a lane thread
+    /// that dies right after it took the probe.
+    panic_on_dialing: AtomicBool,
 }
 
 impl StatusSink for Recorder {
     fn record(&self, event: StatusEvent) {
+        if matches!(
+            event,
+            StatusEvent::LaneState {
+                state: LaneState::Dialing,
+                ..
+            }
+        ) && self.panic_on_dialing.swap(false, Ordering::SeqCst)
+        {
+            panic!("injected: the status sink panics on a Dialing lane");
+        }
         self.events.lock().unwrap().push((
             Instant::now(),
             tkfs::util::time::now_ms(),
@@ -98,6 +112,66 @@ impl Recorder {
             .iter()
             .filter(|(_, _, event)| matches(event))
             .count()
+    }
+
+    /// The index of the (single) `PeerRemoved` of `installation`.
+    fn removed_at(&self, installation: &str) -> usize {
+        let events = self.events();
+        let removed: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, event))| {
+                matches!(event, StatusEvent::PeerRemoved { installation: i } if i == installation)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(removed.len(), 1, "one PeerRemoved for {installation}");
+        removed[0]
+    }
+
+    /// Every event of `installation` (lanes, catalog, configuration) from
+    /// index `from` on.
+    fn of_peer_from(&self, installation: &str, from: usize) -> Vec<StatusEvent> {
+        self.events()
+            .into_iter()
+            .skip(from)
+            .map(|(_, _, event)| event)
+            .filter(|event| match event {
+                StatusEvent::LaneState {
+                    installation: i, ..
+                }
+                | StatusEvent::PeerCatalog {
+                    installation: i, ..
+                }
+                | StatusEvent::PeerConfigured {
+                    installation: i, ..
+                } => i == installation,
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The last `LaneState` of each lane of `installation` among the first
+    /// `until` events.
+    fn last_lane_states(&self, installation: &str, pool: u32, until: usize) -> Vec<LaneState> {
+        let events = self.events();
+        (0..pool)
+            .map(|lane| {
+                events[..until]
+                    .iter()
+                    .rev()
+                    .find_map(|(_, _, event)| match event {
+                        StatusEvent::LaneState {
+                            installation: i,
+                            lane: l,
+                            state,
+                            ..
+                        } if i == installation && *l == lane => Some(*state),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("lane {lane} of {installation} never reported"))
+            })
+            .collect()
     }
 }
 
@@ -174,6 +248,7 @@ fn local_with(wrap: impl FnOnce(Arc<Catalog>) -> Arc<dyn CatalogApi>) -> Local {
     let recorder = Arc::new(Recorder {
         hub: hub.clone(),
         events: Mutex::new(Vec::new()),
+        panic_on_dialing: AtomicBool::new(false),
     });
     let ctx = Arc::new(Ctx {
         installation: installation.clone(),
@@ -595,6 +670,60 @@ fn legacy_server() -> LegacyServer {
         accepts,
         received,
     }
+}
+
+/// A TCP proxy in front of `target` that holds every server-to-client chunk
+/// for `delay`: each handshake step of a dial through it takes `delay`, so a
+/// dial takes about three times `delay` (upgrade, `HELLO_ACK`, `AUTH_OK`),
+/// and it cannot be interrupted (CCR-WP2.6-2). End-of-stream is forwarded
+/// both ways.
+fn slow_proxy(target: SocketAddr, delay: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { continue };
+            let Ok(server) = TcpStream::connect(target) else {
+                continue;
+            };
+            let (Ok(client_out), Ok(server_in)) = (client.try_clone(), server.try_clone()) else {
+                continue;
+            };
+            pump(client, server_in, Duration::ZERO);
+            pump(server, client_out, delay);
+        }
+    });
+    endpoint
+}
+
+fn pump(mut from: TcpStream, mut to: TcpStream, delay: Duration) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match from.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    thread::sleep(delay);
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = to.shutdown(Shutdown::Write);
+        let _ = from.shutdown(Shutdown::Read);
+    });
+}
+
+/// Every lane of `installation` in the hub's snapshot (outbound).
+fn hub_lanes(node: &Local, installation: &str) -> Vec<LaneState> {
+    node.hub
+        .snapshot_now()
+        .peers
+        .iter()
+        .find(|peer| peer.installation == installation)
+        .map(|peer| peer.lanes.iter().map(|lane| lane.state).collect())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,14 +1277,23 @@ fn rotation_goaway_closes_sessions_and_the_peer_becomes_unauthorized() {
         SERVER,
         LaneState::Ready
     )));
+    // The fake server lists a session only after `accept` returns, which
+    // can lag the client's Ready: wait until both are listed, or the GOAWAY
+    // below would miss one.
+    assert!(wait_until(Duration::from_secs(5), || server.open_count() == 2));
     let (_, rotated) = Verifier::generate();
     *server.policy.verifier.lock().unwrap() = Some((rotated, 2));
     server.goaway_all("PAIRING_CODE_CHANGED");
-    assert!(wait_until(Duration::from_secs(10), || all_lanes(
-        &manager,
-        SERVER,
-        LaneState::Unauthorized
-    )));
+    assert!(
+        wait_until(Duration::from_secs(10), || all_lanes(
+            &manager,
+            SERVER,
+            LaneState::Unauthorized
+        )),
+        "{:#?}\n{:#?}",
+        lanes(&manager, SERVER),
+        node.recorder.of_peer_from(SERVER, 0)
+    );
     for lane in 0..2 {
         let events = node.recorder.lane(SERVER, lane);
         assert!(
@@ -1460,7 +1598,9 @@ fn remote_list_lists_the_catalog_and_checks_the_installation() {
     assert_eq!(error.code, "PEER_INSTALLATION_CHANGED");
     assert_eq!(error.class, ErrorClass::NeedsUserAction);
     // Live sessions keep their authenticated peer; reconnecting finds the
-    // change and the peer is refused until re-paired.
+    // change and the peer is refused until re-paired. (Both lane sessions
+    // must be listed by the fake server before they can be closed.)
+    assert!(wait_until(Duration::from_secs(5), || server.open_count() == 2));
     server.close(LaneRole::Control);
     server.close(LaneRole::Bulk);
     assert!(wait_until(Duration::from_secs(10), || all_lanes(
@@ -1494,8 +1634,15 @@ fn unpair_cancels_and_joins_every_lane_within_5s() {
     assert!(took < Duration::from_secs(5), "unpair took {took:?}");
     assert!(manager.peer(SERVER).is_none());
     assert!(node.catalog.snapshot().peers.is_empty());
-    // Every lane ended (Closed reported), and the peer closed every session
-    // after our GOAWAY.
+    // Every lane ended and was joined (none detached), each reported Closed
+    // before PeerRemoved, and the peer closed every session after our
+    // GOAWAY.
+    assert_eq!(manager.detached_lanes(), 0);
+    let removed = node.recorder.removed_at(SERVER);
+    assert_eq!(
+        node.recorder.last_lane_states(SERVER, 4, removed),
+        vec![LaneState::Closed; 4]
+    );
     for lane in 0..4 {
         assert_eq!(
             node.recorder.lane(SERVER, lane).last().unwrap().2,
@@ -1557,12 +1704,373 @@ fn unpair_joins_within_5s_while_the_peer_holds_a_request() {
     let started = Instant::now();
     manager.unpair(&server.endpoint).unwrap();
     let took = started.elapsed();
+    // The peer never closes lane 0 after our GOAWAY: the session is closed
+    // outright one second before the 5 s deadline, which ends lane 0's call
+    // and the lane, and unpair returns well within 5 s.
     assert!(
-        took < Duration::from_millis(5500),
-        "unpair took {took:?} (the join deadline is 5 s)"
+        took >= Duration::from_millis(3500) && took < Duration::from_millis(4750),
+        "unpair took {took:?} (sessions are force-closed at 4 s)"
     );
     assert!(manager.peer(SERVER).is_none());
-    assert!(wait_until(Duration::from_secs(3), || server.open_count() == 0));
+    // Both lanes were joined, not detached at the deadline, and reported
+    // Closed before PeerRemoved.
+    assert_eq!(manager.detached_lanes(), 0, "every lane was joined");
+    let removed = node.recorder.removed_at(SERVER);
+    assert_eq!(
+        node.recorder.last_lane_states(SERVER, 2, removed),
+        vec![LaneState::Closed; 2]
+    );
+    assert!(node.recorder.of_peer_from(SERVER, removed + 1).is_empty());
+    assert!(wait_until(Duration::from_secs(1), || server.open_count() == 0));
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn a_lane_detached_at_the_deadline_reports_nothing_after_peer_removed() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    // Every dial through the proxy takes about 4.5 s: longer than the join.
+    let proxy = slow_proxy(server.addr, Duration::from_millis(1500));
+    node.add_peer(&proxy, &code, SERVER, 2);
+    let options = PeerOptions {
+        join: Duration::from_secs(2),
+        force_close_margin: Duration::from_millis(500),
+        ..fast()
+    };
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    assert!(wait_until(Duration::from_secs(5), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Dialing
+    )));
+
+    // Both lanes are inside their dial: unpair waits for the deadline, then
+    // detaches them, reporting them Closed itself before PeerRemoved.
+    let started = Instant::now();
+    manager.unpair(&proxy).unwrap();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(1900) && took < Duration::from_secs(3),
+        "unpair took {took:?} (the join deadline is 2 s here)"
+    );
+    assert_eq!(manager.detached_lanes(), 2);
+    let removed = node.recorder.removed_at(SERVER);
+    assert_eq!(
+        node.recorder.last_lane_states(SERVER, 2, removed),
+        vec![LaneState::Closed; 2]
+    );
+    assert!(wait_until(Duration::from_secs(2), || node
+        .peer_state(SERVER)
+        .is_none()));
+
+    // The dials complete later (the server establishes both sessions) and
+    // the detached lanes close what they dialed at once; their late
+    // `Handshaking` and `Closed` never reach the status sink, so the hub
+    // does not bring the unpaired peer back.
+    assert!(wait_until(Duration::from_secs(10), || server.established()
+        == 2
+        && server.open_count() == 0));
+    thread::sleep(Duration::from_millis(500));
+    let late = node.recorder.of_peer_from(SERVER, removed + 1);
+    assert!(late.is_empty(), "status after PeerRemoved: {late:?}");
+    assert_eq!(node.peer_state(SERVER), None, "no ghost peer in the hub");
+    assert!(node.hub.snapshot_now().peers.is_empty());
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn a_respawn_is_not_overwritten_by_the_old_supervisors_late_lanes() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    let proxy = slow_proxy(server.addr, Duration::from_millis(1500));
+    node.add_peer(&proxy, &code, SERVER, 2);
+    let options = PeerOptions {
+        join: Duration::from_secs(2),
+        force_close_margin: Duration::from_millis(500),
+        ..fast()
+    };
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    assert!(wait_until(Duration::from_secs(5), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Dialing
+    )));
+
+    // Re-pairing the installation at its direct endpoint replaces the
+    // proxied supervisor (respawn) while its lanes are inside their dial:
+    // they are detached at the deadline, and the successor runs the same
+    // (installation, lane) pairs.
+    manager.pair(&server.endpoint, &code, Some(2)).unwrap();
+    assert_eq!(manager.detached_lanes(), 2);
+    assert_eq!(manager.peer(SERVER).unwrap().endpoint, server.endpoint);
+    let respawned = node
+        .recorder
+        .events()
+        .iter()
+        .rposition(|(_, _, event)| {
+            matches!(event, StatusEvent::PeerConfigured { installation, .. } if installation == SERVER)
+        })
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Ready
+    )));
+
+    // The old dials complete (two more sessions, closed at once: only the
+    // successor's two stay open; the fifth is pair's probe). Their late
+    // events are muted: since the respawn every lane event is the
+    // successor's, and the hub still shows both lanes Ready.
+    assert!(wait_until(Duration::from_secs(10), || server.established()
+        == 5
+        && server.open_count() == 2));
+    thread::sleep(Duration::from_millis(500));
+    let since: Vec<LaneState> = node
+        .recorder
+        .of_peer_from(SERVER, respawned + 1)
+        .into_iter()
+        .filter_map(|event| match event {
+            StatusEvent::LaneState { state, .. } => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !since.contains(&LaneState::Closed) && !since.contains(&LaneState::Backoff),
+        "{since:?}"
+    );
+    assert_eq!(hub_lanes(&node, SERVER), vec![LaneState::Ready; 2]);
+    assert_eq!(node.peer_state(SERVER), Some(PeerConnState::Online));
+    assert!(all_lanes(&manager, SERVER, LaneState::Ready));
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn a_slow_supervisor_does_not_take_another_ones_stop_time() {
+    let node = local();
+    // "peer-a-slow" sorts first: its lanes are inside a dial (6 s through
+    // the proxy) for the whole shutdown.
+    let (slow, slow_code) = FakePeer::start("peer-a-slow");
+    let (holding, holding_code) = FakePeer::start("peer-b-holding");
+    let proxy = slow_proxy(slow.addr, Duration::from_secs(2));
+    node.add_peer(&proxy, &slow_code, "peer-a-slow", 2);
+    node.add_peer(&holding.endpoint, &holding_code, "peer-b-holding", 2);
+    let manager = PeerManager::start_with(node.ctx.clone(), fast());
+    assert!(wait_until(Duration::from_secs(10), || all_lanes(
+        &manager,
+        "peer-b-holding",
+        LaneState::Ready
+    )));
+    // The second peer stops answering `catalog.list`: its lane 0 sits in a
+    // call, so it is never idle and needs the forced close.
+    holding.state.hang_catalog.store(true, Ordering::SeqCst);
+    let calls = holding.state.since.lock().unwrap().len();
+    assert!(wait_until(Duration::from_secs(5), || holding
+        .state
+        .since
+        .lock()
+        .unwrap()
+        .len()
+        > calls));
+    assert!(all_lanes(&manager, "peer-a-slow", LaneState::Dialing));
+
+    // One deadline, in phases: the holding peer is force-closed one second
+    // before it and joined, although the slow peer's lanes use the whole
+    // deadline (and are the only ones detached).
+    let started = Instant::now();
+    manager.shutdown(Duration::from_secs(3));
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(3500), "shutdown took {took:?}");
+    assert_eq!(
+        manager.detached_lanes(),
+        2,
+        "only the slow peer's dialing lanes are detached"
+    );
+    assert!(wait_until(Duration::from_secs(1), || holding.open_count() == 0));
+    let all = node.recorder.events().len();
+    assert_eq!(
+        node.recorder.last_lane_states("peer-b-holding", 2, all),
+        vec![LaneState::Closed; 2]
+    );
+}
+
+#[test]
+fn shutdown_also_stops_a_peer_an_unpair_is_stopping() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    node.add_peer(&server.endpoint, &code, SERVER, 2);
+    let manager = PeerManager::start_with(node.ctx.clone(), fast());
+    assert!(wait_until(Duration::from_secs(10), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Ready
+    )));
+    server.state.hang_catalog.store(true, Ordering::SeqCst);
+    let calls = server.state.since.lock().unwrap().len();
+    assert!(wait_until(Duration::from_secs(5), || server
+        .state
+        .since
+        .lock()
+        .unwrap()
+        .len()
+        > calls));
+
+    // An unpair takes the supervisor out and waits (up to 5 s) for lane 0,
+    // which sits in a call the peer never answers.
+    let unpairing = {
+        let manager = manager.clone();
+        let endpoint = server.endpoint.clone();
+        thread::spawn(move || manager.unpair(&endpoint))
+    };
+    assert!(wait_until(Duration::from_secs(2), || manager
+        .peer(SERVER)
+        .is_none()));
+
+    // A shutdown meanwhile stops that supervisor under its own deadline:
+    // the session is closed one second before it and the lanes are joined,
+    // long before the unpair's own deadline.
+    let started = Instant::now();
+    manager.shutdown(Duration::from_secs(2));
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(800) && took < Duration::from_millis(2500),
+        "shutdown took {took:?}"
+    );
+    assert!(wait_until(Duration::from_millis(500), || server
+        .open_count()
+        == 0));
+    assert_eq!(manager.detached_lanes(), 0);
+    unpairing.join().unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the unpair ended too"
+    );
+    let removed = node.recorder.removed_at(SERVER);
+    assert_eq!(
+        node.recorder.last_lane_states(SERVER, 2, removed),
+        vec![LaneState::Closed; 2]
+    );
+    assert!(node.catalog.snapshot().peers.is_empty());
+}
+
+#[test]
+fn shutdown_accepts_an_unbounded_deadline() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    node.add_peer(&server.endpoint, &code, SERVER, 2);
+    let manager = PeerManager::start_with(node.ctx.clone(), fast());
+    assert!(wait_until(Duration::from_secs(10), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Ready
+    )));
+    let started = Instant::now();
+    manager.shutdown(Duration::MAX);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(manager.peers().is_empty());
+    assert!(wait_until(Duration::from_secs(2), || server.open_count() == 0));
+}
+
+/// The real catalog, except that every `RemovePeer` waits 300 ms first.
+struct SlowRemove {
+    inner: Arc<Catalog>,
+}
+
+impl CatalogApi for SlowRemove {
+    fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.inner.snapshot()
+    }
+    fn apply(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
+        if matches!(cmd, CatalogCmd::RemovePeer { .. }) {
+            thread::sleep(Duration::from_millis(300));
+        }
+        self.inner.apply(cmd)
+    }
+    fn wait_newer(&self, generation: u64, timeout: Duration) -> Arc<CatalogSnapshot> {
+        self.inner.wait_newer(generation, timeout)
+    }
+}
+
+#[test]
+fn concurrent_pairs_of_one_installation_keep_one_record() {
+    let node = local_with(|catalog| Arc::new(SlowRemove { inner: catalog }));
+    let (first, first_code) = FakePeer::start(SERVER);
+    let (second, second_code) = FakePeer::start(SERVER);
+    // A legacy catalog with the installation at both endpoints.
+    node.add_peer(&first.endpoint, &first_code, SERVER, 2);
+    node.add_peer(&second.endpoint, &second_code, SERVER, 2);
+    let manager = PeerManager::start_with(node.ctx.clone(), fast());
+
+    // Pairing it at both endpoints at once: each pair stores its record and
+    // removes the installation's other endpoint. Unserialized, both stores
+    // land before both (slow) removals and each removes the other's fresh
+    // record; serialized, the last pair wins.
+    let barrier = Barrier::new(2);
+    let (a, b) = thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            manager.pair(&first.endpoint, &first_code, Some(2))
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            manager.pair(&second.endpoint, &second_code, Some(2))
+        });
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    a.unwrap();
+    b.unwrap();
+    let peers = node.catalog.snapshot().peers.clone();
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    let kept = peers[0].endpoint.clone();
+    assert!(kept == first.endpoint || kept == second.endpoint);
+    assert!(wait_until(Duration::from_secs(10), || {
+        manager
+            .peer(SERVER)
+            .is_some_and(|peer| peer.endpoint == kept)
+            && all_lanes(&manager, SERVER, LaneState::Ready)
+    }));
+    manager.shutdown(Duration::from_secs(5));
+}
+
+#[test]
+fn a_lane_that_dies_holding_the_probe_hands_it_on() {
+    let node = local();
+    let legacy = legacy_server();
+    node.add_peer(&legacy.endpoint, "some-code", SERVER, 2);
+    let options = PeerOptions {
+        incompatible_recheck: Duration::from_secs(1),
+        ..fast()
+    };
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    assert!(wait_until(Duration::from_secs(10), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Incompatible
+    )));
+    let dials = legacy.accepts.load(Ordering::SeqCst);
+
+    // At the recheck, the lane that takes the probe dies (its `Dialing`
+    // report panics) before it dials. The probe passes to the other lane,
+    // which dials at once instead of waiting for a respawn.
+    node.recorder.panic_on_dialing.store(true, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(4), || {
+        !node.recorder.panic_on_dialing.load(Ordering::SeqCst)
+            && legacy.accepts.load(Ordering::SeqCst) > dials
+    }));
+    let states: Vec<LaneState> = lanes(&manager, SERVER)
+        .iter()
+        .map(|lane| lane.state)
+        .collect();
+    assert_eq!(
+        states.iter().filter(|s| **s == LaneState::Closed).count(),
+        1,
+        "{states:?}"
+    );
+    // The surviving lane keeps probing at every recheck.
+    let after = legacy.accepts.load(Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(4), || legacy
+        .accepts
+        .load(Ordering::SeqCst)
+        > after));
     manager.shutdown(Duration::from_secs(5));
 }
 
@@ -1653,6 +2161,7 @@ fn shutdown_sends_goaway_and_joins_every_peer() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(5), "shutdown took {took:?}");
     assert!(manager.peers().is_empty());
+    assert_eq!(manager.detached_lanes(), 0, "every lane was joined");
     for server in [&first, &second] {
         assert!(wait_until(Duration::from_secs(2), || server.open_count() == 0));
         let reasons = server.close_reasons();
