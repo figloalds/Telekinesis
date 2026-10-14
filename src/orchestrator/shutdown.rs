@@ -351,8 +351,17 @@ mod platform {
     /// signal handler must never block).
     pub(super) fn signal_pipe() -> std::io::Result<[libc::c_int; 2]> {
         let mut fds = [0 as libc::c_int; 2];
+        // Linux and Android create both ends close-on-exec atomically
+        // (pipe2), so a worker forked by a controller in the meantime never
+        // inherits them (WP2.1 review minor, fixed by WP2.INT); elsewhere
+        // pipe(2), then FD_CLOEXEC below.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: pipe2(2) on a valid two-element array.
+        let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         // SAFETY: pipe(2) on a valid two-element array.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if created != 0 {
             return Err(std::io::Error::last_os_error());
         }
         let close = |fds: [libc::c_int; 2]| {
