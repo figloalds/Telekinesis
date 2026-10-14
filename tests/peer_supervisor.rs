@@ -2119,13 +2119,20 @@ fn catalog_changes_respawn_or_stop_supervisors() {
         .peer(SERVER)
         .is_none()));
     assert!(wait_until(Duration::from_secs(5), || server.open_count() == 0));
-    assert_eq!(
-        node.recorder.count(|event| matches!(
-            event,
-            StatusEvent::PeerRemoved { installation } if installation == SERVER
-        )),
-        1
-    );
+    // WP2.INT: the catalog watcher records `PeerRemoved` once the lanes are
+    // joined, and since WP2.7 a lane joins its real `run_control` runner
+    // (its watcher slice, up to ~0.5 s) after the sessions closed, so wait
+    // for the event before counting it.
+    let removed = || {
+        node.recorder.count(|event| {
+            matches!(
+                event,
+                StatusEvent::PeerRemoved { installation } if installation == SERVER
+            )
+        })
+    };
+    assert!(wait_until(Duration::from_secs(5), || removed() >= 1));
+    assert_eq!(removed(), 1);
     assert_eq!(
         lanes(&manager, "peer-other-installation")
             .iter()
