@@ -181,7 +181,7 @@ pub fn run_bulk_lane_with(
         conn: conn.clone(),
         lane,
         options: options.clone(),
-        inventories: Mutex::new(HashMap::new()),
+        inventories: Mutex::new(Inventories::default()),
     });
     drive(
         &ctx,
@@ -201,9 +201,26 @@ struct BulkJob {
     conn: session::Conn,
     lane: LaneSpec,
     options: BulkOptions,
-    /// The peer's last inventory per repository (the legacy lane's cache):
-    /// the next offer sends the parts it lacks. Dropped after a failure.
-    inventories: Mutex<HashMap<String, Page>>,
+    inventories: Mutex<Inventories>,
+}
+
+/// The peer's last inventory per repository (the legacy lane's cache): the
+/// next offer sends the parts it lacks. Dropped after a failure of the key,
+/// and when the key is reset (new worker, new remote replica, readiness
+/// regained), removed or created.
+#[derive(Default)]
+struct Inventories {
+    pages: HashMap<String, Page>,
+    /// Bumped by every [`Job::forget`] of a repository. An exchange that was
+    /// running when its key was reset or removed keeps the epoch it started
+    /// with, and does not put its (now stale) inventory back.
+    epochs: HashMap<String, u64>,
+}
+
+impl Inventories {
+    fn epoch(&self, repo: &str) -> u64 {
+        self.epochs.get(repo).copied().unwrap_or(0)
+    }
 }
 
 impl Job for BulkJob {
@@ -231,7 +248,13 @@ impl Job for BulkJob {
         target: &Target,
         retry_after: &mut dyn FnMut(&ExchangeError) -> Option<Duration>,
     ) -> Result<Next, ExchangeError> {
-        let inventory = lock(&self.inventories).get(&target.repo).cloned();
+        let (epoch, inventory) = {
+            let cache = lock(&self.inventories);
+            (
+                cache.epoch(&target.repo),
+                cache.pages.get(&target.repo).cloned(),
+            )
+        };
         let result = bulk_exchange(
             &self.ctx,
             &self.conn,
@@ -243,11 +266,15 @@ impl Job for BulkJob {
             &self.options,
             retry_after,
         );
-        let mut inventories = lock(&self.inventories);
+        let mut cache = lock(&self.inventories);
         match result {
             Ok(outcome) => {
                 let moved = outcome.moved();
-                inventories.insert(target.repo.clone(), outcome.inventory);
+                // Not if the key was reset or removed meanwhile: this is the
+                // inventory of the old route (or of a key that is gone).
+                if cache.epoch(&target.repo) == epoch {
+                    cache.pages.insert(target.repo.clone(), outcome.inventory);
+                }
                 Ok(Next {
                     after: moved.then_some(self.options.content_yield),
                     progress: moved,
@@ -256,20 +283,24 @@ impl Job for BulkJob {
             Err(error) => {
                 // A failed exchange may leave the cached inventory stale (a
                 // replica change, say): the next offer starts without it.
-                inventories.remove(&target.repo);
+                cache.pages.remove(&target.repo);
                 Err(error)
             }
         }
     }
 
     fn forget(&self, repo: &str) {
-        lock(&self.inventories).remove(repo);
+        let mut cache = lock(&self.inventories);
+        cache.pages.remove(repo);
+        let epoch = cache.epochs.entry(repo.to_owned()).or_default();
+        *epoch = epoch.wrapping_add(1);
     }
 }
 
 /// One interim object exchange of `folder` with `peer`'s `remote` entry on
 /// bulk lane `lane`. `inventory` is the peer's inventory from the previous
-/// exchange of this repository on this lane, if any.
+/// exchange of this repository on this lane, if any. It is used only if it
+/// fits this exchange's route and lane ([`fits`]); any other is left out.
 #[allow(clippy::too_many_arguments)]
 pub fn bulk_exchange(
     ctx: &Ctx,
@@ -334,6 +365,9 @@ fn run(
         )));
     }
     let page_lane = page_lane(lane);
+    // The worker refuses an inventory of another route (`BULK_ROUTE_MISMATCH`,
+    // Fatal): a stale one is dropped here rather than park the key.
+    let inventory = inventory.filter(|page| fits(page, &route, page_lane));
     let client = ctx.folders.client(&folder.record.state).ok_or_else(|| {
         local(CallError::Unavailable(format!(
             "LOCAL_WORKER_UNAVAILABLE: folder {} has no running worker",
@@ -459,6 +493,17 @@ fn collect(
     }
     body.extend_from_slice(bytes);
     Ok(())
+}
+
+/// Whether `page`, a page of the peer, is one the worker accepts for `route`
+/// and `lane` (the route half of `bulk_sync`'s page validation): our bulk
+/// protocol and lane, our repository, from the remote replica to us.
+pub fn fits(page: &Page, route: &SyncRoute, lane: bulk_sync::Lane) -> bool {
+    page.format == bulk_sync::PROTOCOL
+        && page.lane == lane
+        && page.repo == route.repo
+        && page.sender == route.remote_replica
+        && page.receiver == route.local_replica
 }
 
 /// Objects whose part in `page` ends at their total size (the part that
