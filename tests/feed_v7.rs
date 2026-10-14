@@ -2101,8 +2101,9 @@ fn feed_rpc_errors() {
     let b = worker(&dir.path().join("b"), &repo);
     let error = |payload: Value| format!("{:#}", rpc(&a, payload).unwrap_err());
     assert!(error(json!({"op":"feed-unknown"})).starts_with("UNSUPPORTED_OPERATION"));
-    // The Wave 0 answer to a malformed request is kept (CCR-WP2.5-1).
-    assert!(error(json!({"op":"feed-offer","route":{}})).starts_with("UNSUPPORTED_OPERATION"));
+    // A malformed request (CCR-WP2.5-1, applied by WP2.INT: it answered the
+    // Wave 0 stub's `UNSUPPORTED_OPERATION` before).
+    assert!(error(json!({"op":"feed-offer","route":{}})).starts_with("INVALID_REQUEST"));
     let mut foreign = route_json(&a, &b);
     foreign["repo"] = json!(id());
     assert!(error(json!({"op":"feed-offer","route":foreign})).starts_with("REPOSITORY_MISMATCH"));

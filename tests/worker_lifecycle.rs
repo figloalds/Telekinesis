@@ -409,9 +409,12 @@ fn ready_worker_record_and_hello_describe_the_same_process() {
         worker.rpc(json!({"op":"revalidate"})).unwrap(),
         json!({"requeued": 0})
     );
+    // CCR-WP2.5-1 (WP2.INT): `feed-offer` exists since WP2.5, so a request
+    // whose route does not parse is a malformed request, not the Wave 0
+    // stub's unsupported operation.
     assert!(
         remote_error(worker.rpc(json!({"op":"feed-offer","route":{}})))
-            .starts_with("UNSUPPORTED_OPERATION")
+            .starts_with("INVALID_REQUEST")
     );
     assert!(
         remote_error(worker.rpc(json!({"op":"objects.unknown"})))

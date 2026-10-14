@@ -559,7 +559,13 @@ impl Store {
             .flatten()
             .unwrap_or(0);
         if stored != held {
-            self.view_cache.borrow_mut().take();
+            // `Store::view` calls this too (CCR-WP2.4-6, applied by WP2.INT),
+            // possibly while an outer reader still holds the view: then the
+            // drop waits for the next call (the epoch is left unsynced).
+            let Ok(mut view) = self.view_cache.try_borrow_mut() else {
+                return;
+            };
+            view.take();
             cache.epoch.set(stored);
             let dropped = &cache.rolled_back_views;
             dropped.set(dropped.get().saturating_add(1));
