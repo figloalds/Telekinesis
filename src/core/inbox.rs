@@ -29,7 +29,22 @@
 //! `(received_ms, rowid)` order with point lookups only, commit each event in
 //! its own savepoint inside the slice transaction, and release the children
 //! of every committed event from `waiting` to `ready` within the same slice.
-use super::commit::Check;
+//!
+//! **Off-lock slow path (WP2.4).** A slice with `inline_slow: false` stops at
+//! the first event that needs full replay and returns its `SlowTicket` (the
+//! row stays `ready`). `Store::prepare_slow` then computes that commit on a
+//! read handle, in a read transaction of its own, without the engine lock or
+//! the SQLite writer (`commit::Store::compute_slow`: event cache, projection,
+//! pure derivation, stored-projection delta, the projection's JSON and the
+//! seal's journal hash). `commit_prepared` re-checks the row, its links, the
+//! commit validations and the branch's journal sequence under the lock and
+//! writes the computation; if the branch moved since the read the ticket is
+//! `Stale`, nothing is written and the caller re-queues it (`requeue`), never
+//! committing inline. `inline_slow: true` (legacy receive, startup drain,
+//! `Prepared::Inline`) keeps the historical path: the slow event is computed
+//! and written under the caller's lock.
+use super::commit::{Check, Plan, SlowPlan};
+use super::derive::DeriveOutput;
 use super::*;
 use crate::model::errors::{ErrorClass, ErrorWire, code_in, code_of, explicit_class};
 use crate::model::health::InboxCounts;
@@ -39,9 +54,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Inbox cache (owned by WP1.6 / WP2.4; nothing cached in Wave 1).
+/// Inbox cache (owned by WP1.6 / WP2.4; the slow path's event cache lives in
+/// `commit::Cache`, beside the commit path that reads it).
 #[derive(Default)]
-pub(crate) struct Cache {}
+pub(crate) struct Cache {
+    /// `prepare_slow` began a read transaction on this handle and has not
+    /// seen it end (its `ROLLBACK` failed): the next call ends it first.
+    read_open: std::cell::Cell<bool>,
+}
+
+/// Fault point (tests): fails `prepare_slow`'s `ROLLBACK` of its own read
+/// transaction, which then stays open.
+const PREPARE_ROLLBACK_FAULT: &str = "core.prepare.rollback";
 
 /// Rows loaded per slice, both for classification and for the ready window.
 const WINDOW: usize = 512;
@@ -141,15 +165,77 @@ pub enum Prepared {
     Computed(Box<PreparedCommit>),
 }
 
-/// The opaque result of an off-lock slow-path preparation (WP2.4 fills it).
+/// The result of an off-lock slow-path preparation (`Store::prepare_slow`,
+/// WP2.4): the staged event as the read store saw it, the branch state the
+/// computation read (`base_seq`, the branch's journal sequence) and the
+/// computation itself: the projection and its derived conflict records
+/// (`DeriveOutput`, with the stored rows the event reviews already folded
+/// in), plus how the projection is stored. `commit_prepared` writes it only
+/// if the branch is still at `base_seq`. Opaque: only `prepare_slow` makes
+/// one, so a commit never writes a computation it did not derive.
 #[derive(Debug)]
 pub struct PreparedCommit {
     ticket: SlowTicket,
+    /// The staged event as the read store saw it (`None`: no ready row).
+    event: Option<Event>,
+    base_seq: i64,
+    outcome: Outcome,
+}
+
+/// What `prepare_slow` computed.
+#[derive(Debug)]
+enum Outcome {
+    /// Nothing computed. Either the ticket did not apply on the read store
+    /// (no ready row, links not all committed; `event` is `None` and the
+    /// ticket is `Stale`), or the read store found the event committed or
+    /// refused one of its commit validations: `commit_prepared` then re-runs
+    /// the validations under the lock, which decide (a refusal is applied
+    /// as the inline path applies it; committed is reported as committed;
+    /// a pass is `Stale`, to be prepared again).
+    NotReady,
+    /// A successor applies at `base_seq` (the branch moved after the
+    /// ticket): its delta, with the competing cuts counted (CCR-WP1.6-5).
+    Fast(Projection),
+    /// The slow path's computation.
+    Slow(Box<SlowPlan>),
+    /// The projection is pending: a prerequisite outside the branch's journal.
+    Pending,
+    /// The slow path refuses the event (validation) or reading failed
+    /// (transient); applied under the lock exactly as the inline path would.
+    Refused(anyhow::Error),
 }
 
 impl PreparedCommit {
     pub fn ticket(&self) -> &SlowTicket {
         &self.ticket
+    }
+    /// The staged event the computation is for (`None`: the ticket did not
+    /// apply on the read store).
+    pub fn event(&self) -> Option<&Event> {
+        self.event.as_ref()
+    }
+    /// The branch's journal sequence the computation read.
+    pub fn base_seq(&self) -> i64 {
+        self.base_seq
+    }
+    /// The computed projection of the branch with the event (slow path).
+    pub fn projection(&self) -> Option<&Projection> {
+        match &self.outcome {
+            Outcome::Slow(plan) => Some(&plan.projection),
+            _ => None,
+        }
+    }
+    /// The derived conflict records (slow path).
+    pub fn derived(&self) -> Option<&DeriveOutput> {
+        match &self.outcome {
+            Outcome::Slow(plan) => Some(&plan.derived),
+            _ => None,
+        }
+    }
+    /// Whether a computation is ready to write (a slow plan or a successor
+    /// delta); otherwise `commit_prepared` decides under the lock.
+    pub fn is_computed(&self) -> bool {
+        matches!(self.outcome, Outcome::Slow(_) | Outcome::Fast(_))
     }
 }
 
@@ -1241,23 +1327,24 @@ impl Store {
         )?;
         Ok(())
     }
-    /// The branch's latest journal sequence (0 when it has no events).
+    /// The branch's latest journal sequence (0 when it has no events): the
+    /// newest of its frontier events (`commit::frontier_seq`), a few index
+    /// lookups for any branch (a join over the events scanned every event
+    /// of the journal; walking the journal from its tip cost one lookup per
+    /// newer row of other branches, WP2.4 fix round 1). It grows with every
+    /// commit to the branch and changes with nothing else, which is what
+    /// the ticket's `base_seq` and the staleness check need.
     fn branch_seq(&self, branch: &str) -> Result<i64> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT s.seq FROM journal_sequence s JOIN events e ON e.id=s.event WHERE e.branch=? ORDER BY s.seq DESC LIMIT 1",
-                [branch],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0))
+        commit::frontier_seq(&self.db, branch)
     }
     /// Run `f` in a write transaction: `BEGIN IMMEDIATE` from autocommit
     /// (CCR-WP0.INT-5: no deferred read-then-write upgrade that fails with
     /// `SQLITE_BUSY` when another connection writes), else a savepoint inside
     /// the caller's transaction. Any failure rolls back and drops the view.
     fn with_write<T>(&mut self, name: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // A view still holding a commit rolled back around the store is not
+        // kept (`commit` module docs, "Rolled-back commits and the view").
+        self.drop_rolled_back_view();
         // Opening the transaction changes no data: keep a fresh view fresh.
         let view = self.keep_view();
         let outer = begin_write(&self.db, name)?;
@@ -1279,6 +1366,9 @@ impl Store {
         // Commits of this transaction count once it committed (and not at
         // all if it rolled back); inside a caller's transaction this waits.
         self.settle_commit_counters();
+        // The event cache's rows read in the transaction are now known
+        // committed or rolled back (WP2.4).
+        self.settle_event_cache();
         result
     }
     /// The `data_version` under which the cached view is fresh right now, if
@@ -1312,46 +1402,278 @@ impl Store {
         }
     }
 
-    /// Off-lock preparation of a slow commit. Wave 1: nothing is precomputed;
-    /// `commit_prepared` runs the slow path under the caller's lock.
+    /// Off-lock preparation of a slow commit (WP2.4, §4.4): on `read`, a
+    /// secondary handle (`Store::open_secondary`; no engine lock, no SQLite
+    /// writer), inside one read transaction of its own, so every read sees
+    /// one committed state. It re-reads the staged row, checks its links and
+    /// the commit validations, records the branch's journal sequence
+    /// (`base_seq`), then computes the slow path: the branch's events from
+    /// the read handle's event cache (keep the handle across calls: the
+    /// cache then loads only new journal rows), the projection, the derived
+    /// conflict records and the stored-projection delta (CCR-WP1.INT-4),
+    /// with a full rewrite's JSON and the view slots serialized here rather
+    /// than under the lock. If a successor applies at that state it computes
+    /// its delta instead. A refusal is recorded, not returned:
+    /// `commit_prepared` applies it as the inline path would. `Err` only when
+    /// the read transaction cannot be used; nothing changed then.
+    ///
+    /// A read transaction left open (its `ROLLBACK` failed) would pin its
+    /// snapshot: every later call on the handle would join it, compute from
+    /// that old state and come back `Stale`, and the open reader would hold
+    /// WAL checkpoints back. So a failed `ROLLBACK` that leaves the
+    /// transaction open is an `Err`, and the next call ends that transaction
+    /// before it begins its own (`Err` if it still cannot: replace the
+    /// handle).
     pub fn prepare_slow(read: &Store, t: &SlowTicket) -> Result<Prepared> {
-        let _ = read;
-        Ok(Prepared::Inline(t.clone()))
+        let open = &read.caches.inbox.read_open;
+        if open.get() {
+            if !read.db.is_autocommit() {
+                read.db
+                    .execute_batch("ROLLBACK")
+                    .context("cannot end the read transaction of an earlier prepare_slow")?;
+            }
+            open.set(false);
+        }
+        let own = read.db.is_autocommit();
+        if own {
+            read.db.execute_batch("BEGIN")?;
+            open.set(true);
+        }
+        let result = read.prepare_computed(t, own);
+        if own {
+            // Read-only: nothing to keep.
+            let ended = crate::util::fault::fail(PREPARE_ROLLBACK_FAULT)
+                .and_then(|()| Ok(read.db.execute_batch("ROLLBACK")?));
+            if let Err(error) = ended
+                && !read.db.is_autocommit()
+            {
+                return Err(error.context("cannot end prepare_slow's read transaction"));
+            }
+            open.set(false);
+            // Copy the WAL into the database here, off-lock, so that the
+            // commit (a forced seal writes the whole projection) does not
+            // run SQLite's automatic checkpoint under the engine lock: with
+            // every frame checkpointed and no reader left on them, the next
+            // write restarts the WAL. Best effort (PASSIVE never waits).
+            let _ = read
+                .db
+                .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+        }
+        Ok(Prepared::Computed(Box::new(result?)))
+    }
+    /// `prepare_slow` inside its read transaction. `committed_view`: the
+    /// transaction is `prepare_slow`'s own (it reads committed state only).
+    fn prepare_computed(&self, t: &SlowTicket, committed_view: bool) -> Result<PreparedCommit> {
+        let mut prepared = PreparedCommit {
+            ticket: t.clone(),
+            event: None,
+            base_seq: 0,
+            outcome: Outcome::NotReady,
+        };
+        let row: Option<(String, Option<String>)> = self
+            .db
+            .prepare_cached("SELECT payload,state FROM incoming_events WHERE id=?")?
+            .query_row([&t.id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((payload, state)) = row else {
+            return Ok(prepared);
+        };
+        if !matches!(state.as_deref(), Some(READY) | Some(RETRY)) {
+            return Ok(prepared);
+        }
+        let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+            return Ok(prepared);
+        };
+        if event.id != t.id || event.branch.id != t.branch {
+            return Ok(prepared);
+        }
+        if !matches!(self.classify_links(&event)?, Class::Ready) {
+            return Ok(prepared);
+        }
+        prepared.base_seq = self.branch_seq(&event.branch.id)?;
+        // Committed already, or a commit validation refuses it here:
+        // nothing to compute; `commit_prepared` re-runs the validations
+        // under the lock, and they decide (`Outcome::NotReady`).
+        if let Ok(Check::Ready(_)) = self.check_commit(&event, false) {
+            prepared.outcome = match self.fast_successor_in(&event, false, committed_view) {
+                Err(error) => Outcome::Refused(error),
+                Ok(Some(delta)) => Outcome::Fast(delta),
+                Ok(None) => match self.compute_slow(&event, committed_view, true) {
+                    Err(error) => Outcome::Refused(error),
+                    Ok(None) => Outcome::Pending,
+                    Ok(Some(plan)) => Outcome::Slow(plan),
+                },
+            };
+        }
+        prepared.event = Some(event);
+        Ok(prepared)
     }
     /// Commit a prepared slow event under the caller's lock, in its own write
-    /// transaction. The row must still be staged as `ready` (or `retry`) with
-    /// every parent committed; otherwise the ticket is `Stale`. An event that
-    /// was committed meanwhile is reported as committed.
+    /// transaction (`BEGIN IMMEDIATE` from autocommit). The row must still be
+    /// staged as `ready` (or `retry`) with every parent committed; otherwise
+    /// the ticket is `Stale`. An event that was committed meanwhile is
+    /// reported as committed.
+    ///
+    /// `Prepared::Computed` (WP2.4): the commit validations are re-run here
+    /// (`EVENT_ID_REUSED`, `OBJECT_SIZE_CHANGED`, `BRANCH_DESCRIPTOR_CHANGED`,
+    /// `UNREFERENCED_OBJECT_SIZE`, the size limits; invariants 6 and 7, I7)
+    /// and the branch must still be at the computation's `base_seq`, else
+    /// `Stale` (re-queue with backoff, never commit inline). Then the
+    /// precomputed write runs: no projection, no derivation and no
+    /// serialization of the projection under the lock, only the rows, the
+    /// forced snapshot seal and the commit. A refusal recorded by
+    /// `prepare_slow` quarantines (or retries) the event as the inline path
+    /// would. `Prepared::Inline` keeps the compatibility path: the slow path
+    /// runs here, under the caller's lock.
     pub fn commit_prepared(&mut self, p: Prepared) -> Result<CommitOutcome> {
-        let ticket = match p {
-            Prepared::Inline(ticket) => ticket,
-            Prepared::Computed(prepared) => prepared.ticket,
-        };
-        self.with_write("inbox_prepared", |store| {
-            let committed = |store: &Store| -> Result<bool> {
-                Ok(store.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
-                    [&ticket.id],
-                    |r| r.get(0),
-                )?)
-            };
-            Ok(match store.attempt(&ticket.id, true, false)? {
-                Attempt::Activated { fast, .. } => CommitOutcome::Committed {
-                    id: ticket.id.clone(),
-                    slow: fast == Some(false),
-                },
-                Attempt::Quarantined(error) | Attempt::Retried(error) => {
-                    CommitOutcome::Failed(error)
-                }
-                Attempt::Gone if committed(store)? => CommitOutcome::Committed {
-                    id: ticket.id.clone(),
-                    slow: false,
-                },
-                Attempt::Gone | Attempt::Deferred | Attempt::Ticket(_) | Attempt::SlowSpent => {
-                    CommitOutcome::Stale
-                }
-            })
+        match p {
+            Prepared::Inline(ticket) => {
+                self.with_write("inbox_prepared", |store| store.commit_inline(&ticket))
+            }
+            Prepared::Computed(prepared) => {
+                self.with_write("inbox_prepared", |store| store.commit_computed(*prepared))
+            }
+        }
+    }
+    /// `commit_prepared` of `Prepared::Inline`: the slow path under the lock.
+    fn commit_inline(&mut self, ticket: &SlowTicket) -> Result<CommitOutcome> {
+        Ok(match self.attempt(&ticket.id, true, false)? {
+            Attempt::Activated { fast, .. } => CommitOutcome::Committed {
+                id: ticket.id.clone(),
+                slow: fast == Some(false),
+            },
+            Attempt::Quarantined(error) | Attempt::Retried(error) => CommitOutcome::Failed(error),
+            Attempt::Gone if self.is_committed(&ticket.id)? => CommitOutcome::Committed {
+                id: ticket.id.clone(),
+                slow: false,
+            },
+            Attempt::Gone | Attempt::Deferred | Attempt::Ticket(_) | Attempt::SlowSpent => {
+                CommitOutcome::Stale
+            }
         })
+    }
+    /// `commit_prepared` of `Prepared::Computed` (inside its transaction).
+    fn commit_computed(&mut self, prepared: PreparedCommit) -> Result<CommitOutcome> {
+        let PreparedCommit {
+            ticket,
+            event: seen,
+            base_seq,
+            outcome,
+        } = prepared;
+        let id = ticket.id.as_str();
+        let row: Option<(String, Option<String>)> = self
+            .db
+            .prepare_cached("SELECT payload,state FROM incoming_events WHERE id=?")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((payload, state)) = row else {
+            return Ok(if self.is_committed(id)? {
+                CommitOutcome::Committed {
+                    id: id.to_owned(),
+                    slow: false,
+                }
+            } else {
+                CommitOutcome::Stale
+            });
+        };
+        if !matches!(state.as_deref(), Some(READY) | Some(RETRY)) {
+            return Ok(CommitOutcome::Stale);
+        }
+        // As `attempt`: a malformed row is quarantined.
+        let event: Event = match serde_json::from_str(&payload) {
+            Ok(event) => event,
+            Err(error) => {
+                let error = anyhow::Error::new(error).context("INVALID_EVENT");
+                return self.failed(id, error);
+            }
+        };
+        if event.id != id {
+            return self.failed(
+                id,
+                anyhow::anyhow!("INVALID_EVENT: staged payload id mismatch"),
+            );
+        }
+        match self.classify_links(&event)? {
+            Class::Ready => {}
+            Class::Quarantined(error) => return self.failed(id, error),
+            class => {
+                self.apply_class(id, class)?;
+                return Ok(CommitOutcome::Stale);
+            }
+        }
+        // The preparation is for this event at this branch state, or stale.
+        if seen.as_ref() != Some(&event) || self.branch_seq(&event.branch.id)? != base_seq {
+            return Ok(CommitOutcome::Stale);
+        }
+        // Re-validated under the lock: the global tables may have changed
+        // since the read (I7). This also decides a preparation whose own
+        // validation refused the event or found it committed (`NotReady`
+        // with the event seen): a refusal quarantines it now (or retries,
+        // if transient), as the inline path does, instead of a stale round.
+        let checked = match self.check_commit(&event, false) {
+            Ok(Check::Ready(checked)) => checked,
+            Ok(Check::Committed) => {
+                self.finish_row(id)?;
+                return Ok(CommitOutcome::Committed {
+                    id: id.to_owned(),
+                    slow: false,
+                });
+            }
+            Err(error) => return self.failed(id, error),
+        };
+        let plan = match outcome {
+            // The read store refused (or found committed) what passes now:
+            // nothing was computed; prepare again.
+            Outcome::NotReady => return Ok(CommitOutcome::Stale),
+            Outcome::Pending => {
+                return Ok(match self.defer_pending(id)? {
+                    Attempt::Retried(error) => CommitOutcome::Failed(error),
+                    _ => CommitOutcome::Stale,
+                });
+            }
+            Outcome::Refused(error) => return self.failed(id, error),
+            Outcome::Fast(delta) => Plan::Fast(delta),
+            Outcome::Slow(plan) => Plan::Slow(plan),
+        };
+        let slow = matches!(plan, Plan::Slow(_));
+        // Inside this write transaction nothing else commits, so the stored
+        // projection after the write is exactly the computed one.
+        let view_base = self.data_version().ok();
+        // Row bookkeeping first, the commit last (as `attempt`).
+        self.db.execute_batch("SAVEPOINT inbox_event")?;
+        if let Err(error) = self.finish_row(id) {
+            self.abort_event()?;
+            return Err(error);
+        }
+        match self.write_commit(event, false, checked, plan, view_base) {
+            Ok(()) => {
+                self.db.execute_batch("RELEASE inbox_event")?;
+                Ok(CommitOutcome::Committed {
+                    id: id.to_owned(),
+                    slow,
+                })
+            }
+            Err(error) => {
+                if let Err(rollback) = self.abort_event() {
+                    return Err(error.context(format!("{rollback:#}")));
+                }
+                self.failed(id, error)
+            }
+        }
+    }
+    /// `fail` as a `CommitOutcome`.
+    fn failed(&mut self, id: &str, error: anyhow::Error) -> Result<CommitOutcome> {
+        Ok(match self.fail(id, error)? {
+            Attempt::Quarantined(error) | Attempt::Retried(error) => CommitOutcome::Failed(error),
+            _ => CommitOutcome::Stale,
+        })
+    }
+    fn is_committed(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
+            [id],
+            |r| r.get(0),
+        )?)
     }
     /// Inbox rows by state (§4.4).
     pub fn inbox_counts(&self) -> Result<InboxCounts> {
