@@ -384,11 +384,12 @@ fn staged_events_activate_in_the_background_and_move_the_heartbeat() {
 
 /// While 2,000 remote events activate in the background: simulated
 /// filesystem operations (three engine acquisitions each, as a lookup, an
-/// open and a close; 2 ms apart) stay fast (p99 < 200 ms in debug; the
-/// release floor is `qual_wp2_3_worker::fs_p99_during_catchup`), and `status`
-/// stays fast with full counts and is never busy. The events are staged on a
-/// secondary connection (as feed exchanges stage), so only activation
-/// competes with the filesystem for the engine.
+/// open and a close; 2 ms apart) stay fast (§14 WP2.3 acceptance: p99
+/// < 50 ms in release, < 200 ms in debug; the mounted variant is
+/// `qual_wp2_3_worker::fs_p99_during_catchup`), and `status` stays fast with
+/// full counts and is never busy. The events are staged on a secondary
+/// connection (as feed exchanges stage), so only activation competes with
+/// the filesystem for the engine.
 #[test]
 fn filesystem_and_status_stay_responsive_during_background_activation() {
     let mut p = pair(5);
@@ -452,7 +453,13 @@ fn filesystem_and_status_stay_responsive_during_background_activation() {
         fs.len(),
         status.len()
     );
-    assert!(fs_p99 < 200.0, "filesystem p99 {fs_p99} ms");
+    // The acceptance's release bound applies whenever the suite runs in
+    // release (`cargo test --release`).
+    let fs_bound = if cfg!(debug_assertions) { 200.0 } else { 50.0 };
+    assert!(
+        fs_p99 < fs_bound,
+        "filesystem p99 {fs_p99} ms (bound {fs_bound})"
+    );
     assert!(status_p99 < 200.0, "status p99 {status_p99} ms");
 }
 
@@ -942,4 +949,265 @@ fn worker_binary_activates_staged_rows_after_ready() {
     });
     assert!(activated, "{}", worker.log_tail());
     worker.stop().unwrap();
+}
+
+/// Waits until the engine's hold count stops moving for `quiet` (the worker
+/// settled after a drain), and returns it.
+fn settled_holds(w: &Worker, quiet: Duration) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut holds = w.ctx.gauges.snapshot().holds;
+    loop {
+        thread::sleep(quiet);
+        let now = w.ctx.gauges.snapshot().holds;
+        if now == holds || Instant::now() >= deadline {
+            return now;
+        }
+        holds = now;
+    }
+}
+
+/// An idle worker never takes the engine (review WP2.3 fix round 1): the
+/// activator's wakeups (its 1 s timeout, pokes after empty exchanges) first
+/// probe a secondary store for ready, unclassified or due rows, and
+/// maintenance and the notifier take the engine only for actual work. In
+/// particular no `before` projection (an O(entries) clone under the engine
+/// lock, captured only while mounted on Windows) is captured on an idle
+/// cycle, while a working cycle does capture one.
+#[test]
+fn an_idle_worker_never_takes_the_engine() {
+    let mut p = pair(3);
+    linear_history_named(&mut p.a, "idle", 50).unwrap();
+    let w = Worker::start(&p.state, true);
+    runtime::notify::spawn_notifier(w.ctx.clone()).unwrap();
+    let vitals = w.server.vitals().clone();
+    // Mounted as far as the engine knows: activations compute notifications.
+    lock_engine(&w.engine).mounted = true;
+    let events = p.events_after(
+        &w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .shared_event_inventory()
+            .unwrap(),
+    );
+    w.stage(&events, &p.allowed);
+    w.wait_drained(Duration::from_secs(60));
+    if cfg!(windows) {
+        assert!(vitals.captures() > 0, "a working cycle captures `before`");
+    }
+    let holds = settled_holds(&w, Duration::from_millis(400));
+    let captures = vitals.captures();
+    // Pokes as empty exchanges send them, two idle timeouts, two
+    // maintenance ticks and several notifier rounds.
+    for _ in 0..10 {
+        w.ctx.activation.poke();
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(
+        w.ctx.gauges.snapshot().holds,
+        holds,
+        "an idle worker took the engine"
+    );
+    assert_eq!(
+        vitals.captures(),
+        captures,
+        "an idle cycle captured `before`"
+    );
+    // Still working: a new row is activated at once.
+    p.a.create("late.txt", "file").unwrap();
+    let known = w
+        .ctx
+        .sync_stores
+        .checkout()
+        .unwrap()
+        .shared_event_inventory()
+        .unwrap();
+    w.stage(&p.events_after(&known), &p.allowed);
+    w.wait_drained(Duration::from_secs(60));
+    assert!(lock_engine(&w.engine).store.lookup("late.txt").is_ok());
+}
+
+/// With the background activator running, `revalidate` only re-queues and
+/// wakes it (review WP2.3 fix round 1): nothing is activated on the request,
+/// so a slow event it re-queues is never derived under the request's engine
+/// hold (§4.4); the activator then commits the rows.
+#[test]
+fn revalidate_only_requeues_while_the_activator_runs() {
+    let mut p = pair(2);
+    linear_history_named(&mut p.a, "requeued", 5).unwrap();
+    let w = Worker::start(&p.state, false);
+    // The activator's flags, before its thread runs.
+    lock_engine(&w.engine).background_activation = true;
+    w.ctx.activator_running.store(true, Ordering::SeqCst);
+    let committed = w.committed();
+    let events = p.events_after(
+        &w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .shared_event_inventory()
+            .unwrap(),
+    );
+    assert_eq!(events.len(), 5);
+    w.stage(&events, &p.allowed);
+    {
+        // Classified only (a slice of no attempts), then the ready row (the
+        // head of the linear history; the others wait for it) deferred, as
+        // after a transient failure.
+        let mut engine = lock_engine(&w.engine);
+        let slice = engine
+            .store
+            .activate_slice(tkfs::core::inbox::SliceBudget {
+                max_events: 0,
+                max_ms: 0,
+                inline_slow: false,
+            })
+            .unwrap();
+        assert!(slice.activated.is_empty());
+        for event in &events {
+            engine.store.requeue(&event.id, 3_600_000).unwrap();
+        }
+    }
+    let status = w.status();
+    assert_eq!(status["inbox"]["retry"], 1, "{status}");
+    assert_eq!(status["inbox"]["ready"], 0, "{status}");
+    let pokes = w.ctx.activation.count();
+    let reply = w.rpc(json!({"op":"revalidate"})).unwrap();
+    assert_eq!(reply["requeued"], 1, "{reply}");
+    assert_eq!(w.committed(), committed, "nothing activated on the request");
+    assert!(w.ctx.activation.count() > pokes, "the activator was poked");
+    // Re-queued (back to classification), not activated.
+    let status = w.status();
+    assert_eq!(status["inbox"]["retry"], 0, "{status}");
+    assert_eq!(status["incoming_active"], 5, "{status}");
+    worker::activator::try_spawn(w.ctx.clone()).unwrap();
+    w.wait_drained(Duration::from_secs(60));
+    assert_eq!(w.committed(), committed + 5);
+}
+
+/// A slow event whose off-lock preparation fails is re-queued with its own
+/// backoff (review WP2.3 fix round 1): the events staged behind it activate
+/// meanwhile (no head-of-line stall), and it commits once due.
+#[test]
+fn a_failed_slow_preparation_requeues_only_its_event() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let state = dir.path().join("b");
+    let mut b = Store::initialize(&state, &repo, &id()).unwrap();
+    let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
+    let mut c = Store::open(&dir.path().join("c"), Some(&repo)).unwrap();
+    a.create("shared.txt", "file").unwrap();
+    let allowed = devices([&a, &b, &c]);
+    sync_into(&a, &mut b, &allowed).unwrap();
+    sync_into(&a, &mut c, &allowed).unwrap();
+    let write = |s: &mut Store, bytes: &[u8]| {
+        let entry = s.lookup("shared.txt").unwrap();
+        s.write_revision(&entry.id, entry.revisions.get("content").cloned(), bytes)
+            .unwrap();
+    };
+    // A two-way edit: the worker's own edit is committed, the remote one
+    // needs the slow path.
+    write(&mut b, b"from b");
+    write(&mut a, b"from a");
+    for i in 0..5 {
+        c.create(&format!("c-{i}.txt"), "file").unwrap();
+    }
+    let edit = missing_bundle(&a, &b).unwrap();
+    assert_eq!(edit.events.len(), 1);
+    let creates = metadata_bundle(&c, &b).unwrap().events;
+    assert_eq!(creates.len(), 5);
+    drop(b);
+    let w = Worker::start(&state, false);
+    {
+        let store = w.ctx.sync_stores.checkout().unwrap();
+        for bytes in edit.objects.values() {
+            store.put_object(&hex::decode(bytes).unwrap()).unwrap();
+        }
+    }
+    fault::configure(Some(FaultConfig {
+        count: Some(1),
+        ..FaultConfig::new("worker.activator.prepare", FaultAction::Fail)
+    }));
+    // The edit is staged first, so it is popped first.
+    let mut staged = edit.events.clone();
+    staged.extend(creates.iter().cloned());
+    w.stage(&staged, &allowed);
+    worker::activator::try_spawn(w.ctx.clone()).unwrap();
+    w.wait_drained(Duration::from_secs(60));
+    fault::configure(None);
+    let seq = |event: &str| -> i64 {
+        w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT seq FROM journal_sequence WHERE event=?",
+                [event],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    let slow = seq(&edit.events[0].id);
+    for create in &creates {
+        assert!(
+            seq(&create.id) < slow,
+            "the events behind the failed preparation waited for it"
+        );
+    }
+    let status = w.status();
+    assert!(
+        status["activation"]["retried"].as_u64().unwrap() >= 1,
+        "{status}"
+    );
+    assert!(
+        status["activation"]["slow"].as_u64().unwrap() >= 1,
+        "{status}"
+    );
+}
+
+/// Writes through the mount move the engine's store revision, not
+/// `status_generation` (review WP2.3 fix round 1): the next `status`
+/// recomputes the cheap counters, so a file written and closed shows in the
+/// journal tip and the outbox at once (never reported acknowledged by an
+/// older cell, which made `caught_up` briefly true).
+#[test]
+fn status_follows_writes_through_the_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    drop(Store::initialize(&state, &id(), &id()).unwrap());
+    let engine: Shared = Arc::new(Mutex::new(Engine::new(
+        Store::open_existing(&state).unwrap(),
+    )));
+    let ctx = worker::build_ctx(engine.clone(), &state, false, None);
+    let server = runtime::server::start_rpc_server(ctx.clone()).unwrap();
+    let info = server.publish(None).unwrap();
+    let call = |payload: Value| runtime::rpc(&info, &id(), payload).unwrap();
+    let before = call(json!({"op":"status"}));
+    let generation = ctx.status_generation.load(Ordering::SeqCst);
+    {
+        // As the filesystem callbacks do, under the engine lock.
+        let mut e = lock_engine(&engine);
+        let (h, _) = e.open("written.txt", Some("file"), true).unwrap();
+        e.write(h, 0, b"through the mount", false, false).unwrap();
+        e.close(h).unwrap();
+    }
+    assert_eq!(
+        ctx.status_generation.load(Ordering::SeqCst),
+        generation,
+        "no request moved the status generation"
+    );
+    let after = call(json!({"op":"status"}));
+    let tip = |s: &Value| s["tip"]["seq"].as_i64().unwrap();
+    assert!(tip(&after) > tip(&before), "{before}\n{after}");
+    assert_eq!(after["journal"]["tip"], after["tip"]["seq"], "{after}");
+    assert_eq!(after["unflushed_files"], 0, "{after}");
+    if after["branch"]["shared"] == true {
+        assert!(
+            after["outgoing_unacknowledged"].as_u64() > before["outgoing_unacknowledged"].as_u64(),
+            "{before}\n{after}"
+        );
+    }
+    ctx.stopping.store(true, Ordering::SeqCst);
 }

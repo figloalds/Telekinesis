@@ -6,7 +6,15 @@
 //! * **pending saves**: `Engine::retry_pending_due` under `try_lock` (a busy
 //!   engine skips the tick), with a per-entity backoff of 1 s → 60 s; then
 //!   `publish_observation`. On platforms without filesystem notifications it
-//!   also empties the engine's notification list (as the old loop did);
+//!   also empties the engine's notification list (as the old loop did). The
+//!   engine is taken only when its lock-free vitals show such work (a dirty
+//!   session, or control notifications to drop), and that hold is marked as a
+//!   background hold, so the activator does not take it for filesystem load;
+//! * **WAL checkpoint**: a `PASSIVE` checkpoint on a pooled secondary store
+//!   ([`checkpoint_wal`]), so the engine's commits seldom run SQLite's
+//!   automatic checkpoint under the engine lock. Not while the activator
+//!   drains a backlog: it checkpoints between its own slices then, and a
+//!   checkpoint here (a disk flush) would run concurrently with its commits;
 //! * **status cell**: `status_cell::refresh_full` about once a second, spaced
 //!   to at least four times its own duration (a cold content scan of a large
 //!   repository during active sync costs hundreds of ms; the spacing caps its
@@ -23,7 +31,7 @@
 //! maintenance never waits for the engine. Failures are logged.
 use crate::{
     model::{errors::ErrorWire, ipc::timing::MAINTENANCE_INTERVAL},
-    runtime::{ctx::WorkerCtx, try_lock_engine},
+    runtime::{EngineVitals, ctx::WorkerCtx, lock_engine, try_lock_engine},
     util::time::now_ms,
     worker::status_cell,
 };
@@ -39,6 +47,9 @@ pub const SCRUB_RATE: u64 = 32 * 1024 * 1024;
 pub const SCRUB_QUIET: Duration = Duration::from_secs(5);
 /// An available object verified longer ago than this is due again.
 pub const SCRUB_REVERIFY_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
+/// Maintenance checkpoints the WAL only once the activator has been idle
+/// this long (during a backlog the activator checkpoints itself).
+const CHECKPOINT_QUIET: Duration = Duration::from_secs(2);
 /// The status cell's full refresh is spaced at least this many times its own
 /// last duration.
 const FULL_REFRESH_SPACING: u32 = 4;
@@ -51,7 +62,11 @@ pub fn spawn(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
 }
 
 fn run(ctx: &WorkerCtx) {
-    let mut maintenance = Maintenance::default();
+    let mut maintenance = Maintenance {
+        vitals: lock_engine(&ctx.engine).vitals.clone(),
+        next_full: None,
+        next_scrub: None,
+    };
     while !ctx.stopping.load(Ordering::Relaxed) {
         let started = Instant::now();
         maintenance.tick(ctx, started);
@@ -66,8 +81,9 @@ fn run(ctx: &WorkerCtx) {
     }
 }
 
-#[derive(Default)]
 struct Maintenance {
+    /// The engine's lock-free vitals: whether the engine is worth taking.
+    vitals: Arc<EngineVitals>,
     /// No full refresh before this.
     next_full: Option<Instant>,
     /// No scrub step before this (the rate cap).
@@ -77,9 +93,17 @@ struct Maintenance {
 impl Maintenance {
     fn tick(&mut self, ctx: &WorkerCtx, now: Instant) {
         self.pending_saves(ctx, now);
+        // While a backlog drains, the activator checkpoints between its own
+        // slices; a checkpoint here would flush the disk concurrently with
+        // an engine commit.
+        let draining = ctx.activator_running.load(Ordering::SeqCst)
+            && !status_cell::activator_idle(ctx, CHECKPOINT_QUIET);
+        if !draining {
+            checkpoint_wal(ctx);
+        }
         if self.next_full.is_none_or(|at| now >= at) {
             let started = Instant::now();
-            match status_cell::refresh_full(ctx) {
+            match status_cell::refresh_full_with(ctx, Some(&self.vitals)) {
                 Ok(()) => {
                     let spacing = started.elapsed().saturating_mul(FULL_REFRESH_SPACING);
                     self.next_full = Some(started + spacing.max(MAINTENANCE_INTERVAL));
@@ -98,11 +122,22 @@ impl Maintenance {
     }
 
     /// Retries due pending saves and publishes the observation, without
-    /// waiting for the engine.
+    /// waiting for the engine, and only when the vitals show work: a dirty
+    /// session (a save to retry) or, without filesystem notifications,
+    /// control notifications to drop. An idle worker's maintenance never
+    /// takes the engine (every other vital is refreshed by the engine guards
+    /// themselves).
     fn pending_saves(&mut self, ctx: &WorkerCtx, now: Instant) {
+        let work = self.vitals.unflushed_files() > 0
+            || (!cfg!(windows) && self.vitals.control_notifications() > 0);
+        if !work {
+            return;
+        }
         let Some(mut engine) = try_lock_engine(&ctx.engine) else {
             return;
         };
+        // Not filesystem load for the activator (dropped before `engine`).
+        let hold = self.vitals.background_hold();
         let committed = engine.retry_pending_due(now);
         engine.publish_observation();
         if !cfg!(windows) {
@@ -110,9 +145,10 @@ impl Maintenance {
             engine.notifications.clear();
             engine.notification_error = None;
         }
+        drop(hold);
         drop(engine);
         if committed > 0 {
-            status_cell::note_mutation(ctx, true);
+            status_cell::note_mutation(ctx, &self.vitals, true);
         }
     }
 
@@ -142,7 +178,7 @@ impl Maintenance {
                     Instant::now() + Duration::from_secs_f64(seconds).max(MAINTENANCE_INTERVAL),
                 );
                 if outcome.corrupt > 0 {
-                    status_cell::note_mutation(ctx, true);
+                    status_cell::note_mutation(ctx, &self.vitals, true);
                 }
             }
             Err(error) => {
@@ -151,6 +187,23 @@ impl Maintenance {
             }
         }
     }
+}
+
+/// Copies the committed WAL frames into the database on a pooled secondary
+/// connection, off the engine lock: `PRAGMA wal_checkpoint(PASSIVE)` never
+/// waits for readers or writers, and the next write restarts a fully copied
+/// WAL. So the engine connection's commits (a startup-snapshot seal writes
+/// megabytes) rarely cross SQLite's automatic checkpoint threshold under the
+/// engine lock (CCR-WP2.4-5). Best effort: returns the WAL's frames and the
+/// frames copied, or `None`.
+pub(crate) fn checkpoint_wal(ctx: &WorkerCtx) -> Option<(i64, i64)> {
+    let store = ctx.sync_stores.checkout().ok()?;
+    store
+        .db
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(1)?, row.get(2)?))
+        })
+        .ok()
 }
 
 fn log(site: &str, error: &anyhow::Error) {
