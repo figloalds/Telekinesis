@@ -121,6 +121,10 @@ pub const BUSY_SLICE: SliceBudget = SliceBudget {
 /// CCR-WP2.3-5): if the two ever differ, the seal is only no longer isolated
 /// in its own slice.
 pub const SEAL_INTERVAL: i64 = 128;
+/// At most this many head rows are looked at by [`seal_forecast`].
+pub const FORECAST_ROWS: usize = 8;
+/// [`seal_forecast`] parses a head row's payload only up to this size.
+pub const FORECAST_PAYLOAD: i64 = 64 * 1024;
 /// How long the activator's drop guard retries the engine to clear
 /// `background_activation` when the loop ends while the worker is still
 /// running (a panic outside a contained step).
@@ -428,6 +432,15 @@ pub struct SealForecast {
 /// normal slice (a due branch not at the head, rows the slice itself
 /// classifies), which costs that slice's hold, never a run of short slices.
 /// `None` when it cannot be read (the slice then keeps its budget).
+///
+/// Bounded under the lock (WP2.3 review major, fixed by WP2.INT): it looks
+/// at no more than [`FORECAST_ROWS`] head rows, and parses the payload of a
+/// row only when it is at most [`FORECAST_PAYLOAD`] bytes (`octet_length`
+/// reads no payload). A larger event's branch is not read: that row counts
+/// as one whose branch is unknown (it caps nothing, and it is never the
+/// one-event slice), so its seal can fall inside a normal slice, the cost of
+/// that one slice. Before, the forecast parsed up to 2 x 64 head payloads
+/// (peer-supplied events up to 8 MiB) before every slice.
 pub fn seal_forecast(store: &Store, lookahead: usize) -> Option<SealForecast> {
     forecast(store, lookahead).ok()
 }
@@ -440,29 +453,33 @@ fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
     if lookahead == 0 {
         return Ok(SealForecast { tip, at: None });
     }
+    let lookahead = lookahead.min(FORECAST_ROWS);
     let limit = i64::try_from(lookahead).unwrap_or(i64::MAX);
     let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
     let key = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, i64, Option<String>)> {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
     };
-    // The slice's own window queries (`Store::slice`), with each row's branch.
+    // The slice's own window queries (`Store::slice`), with the branch of
+    // each row whose payload is small enough to parse under the lock.
     let mut head: Vec<(i64, i64, Option<String>)> = store
         .db
         .prepare_cached(
-            "SELECT coalesce(received_ms,0),rowid,json_extract(payload,'$.branch.id')
+            "SELECT coalesce(received_ms,0),rowid,
+                    CASE WHEN octet_length(payload)<=?2 THEN json_extract(payload,'$.branch.id') END
              FROM incoming_events WHERE state='ready' ORDER BY received_ms,rowid LIMIT ?1",
         )?
-        .query_map([limit], key)?
+        .query_map(rusqlite::params![limit, FORECAST_PAYLOAD], key)?
         .collect::<rusqlite::Result<_>>()?;
     head.extend(
         store
             .db
             .prepare_cached(
-                "SELECT coalesce(received_ms,0),rowid,json_extract(payload,'$.branch.id')
+                "SELECT coalesce(received_ms,0),rowid,
+                        CASE WHEN octet_length(payload)<=?3 THEN json_extract(payload,'$.branch.id') END
                  FROM incoming_events WHERE state='retry' AND coalesce(retry_at_ms,0)<=?1
                  ORDER BY received_ms,rowid LIMIT ?2",
             )?
-            .query_map(rusqlite::params![now, limit], key)?
+            .query_map(rusqlite::params![now, limit, FORECAST_PAYLOAD], key)?
             .collect::<rusqlite::Result<Vec<_>>>()?,
     );
     head.sort();
@@ -473,7 +490,8 @@ fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
     let mut distances: BTreeMap<String, i64> = BTreeMap::new();
     let mut rows = Vec::with_capacity(head.len());
     for (_, _, branch) in head {
-        // A row without a branch is quarantined by its attempt: no commit.
+        // A row without a branch read (quarantined by its attempt, or too
+        // large to parse here) is left out of the forecast.
         let Some(branch) = branch else {
             rows.push(None);
             continue;
@@ -829,7 +847,10 @@ impl Activator {
     fn slow(&mut self, ctx: &WorkerCtx, ticket: SlowTicket) -> Result<bool> {
         let prepared = {
             let read = ctx.sync_stores.checkout()?;
-            crate::util::fault::fail("worker.activator.prepare")
+            // Fault point `worker.activator.prepare.<repo>` (tests): scoped
+            // to one in-process worker's repository, so arming it never
+            // fails another test's activator (WP2.3 review minor, WP2.INT).
+            crate::util::fault::fail(&format!("worker.activator.prepare.{}", ctx.repo))
                 .and_then(|()| Store::prepare_slow(&read, &ticket))
         };
         let prepared = match prepared {

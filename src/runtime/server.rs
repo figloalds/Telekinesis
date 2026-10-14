@@ -701,9 +701,21 @@ impl Core {
         self.ctx.activation.poke();
         if requeued > 0 && background {
             let deadline = Instant::now() + REVALIDATE_WAIT;
+            let mut polls = 0u32;
             while self.vitals.activator_cycles().1 <= begun
                 && self.ctx.activator_running.load(Ordering::SeqCst)
             {
+                // A cycle numbered before `begun` was read can still run the
+                // slice that activates the re-queued rows; the activator
+                // then idles without numbering a cycle. So every 10 ms the
+                // wait also ends once no row is left to activate (WP2.3
+                // review minor, fixed by WP2.INT).
+                polls += 1;
+                if polls.is_multiple_of(10)
+                    && matches!(crate::worker::activator::has_work(&self.ctx), Ok(false))
+                {
+                    break;
+                }
                 if Instant::now() >= deadline {
                     crate::util::log::event!(info, REQUEST_TIMEOUT, {
                         "site": "worker.revalidate",

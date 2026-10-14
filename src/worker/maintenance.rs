@@ -67,10 +67,28 @@ fn run(ctx: &WorkerCtx) {
         next_full: None,
         next_scrub: None,
     };
+    let mut errors = crate::util::backoff::Backoff::inbox();
     while !ctx.stopping.load(Ordering::Relaxed) {
         let started = Instant::now();
-        maintenance.tick(ctx, started);
-        let next = started + MAINTENANCE_INTERVAL;
+        // A panic in one tick (under the engine: `retry_pending_due`) never
+        // ends the thread: the poison policy runs, the panic is logged and
+        // the next tick waits for a growing delay, as the activator's loop
+        // and the recovery loop this thread replaced do (WP2.3 review minor,
+        // fixed by WP2.INT).
+        let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            maintenance.tick(ctx, started);
+        }));
+        let mut next = started + MAINTENANCE_INTERVAL;
+        if tick.is_err() {
+            crate::runtime::check_engine_poison(&ctx.engine);
+            crate::util::log::event!(error, UNKNOWN_ERROR, {
+                "site": "worker.maintenance",
+                "message": "a maintenance tick panicked",
+            });
+            next = Instant::now() + errors.failure(Instant::now());
+        } else {
+            errors.success(Instant::now());
+        }
         while !ctx.stopping.load(Ordering::Relaxed) {
             let left = next.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -92,6 +110,9 @@ struct Maintenance {
 
 impl Maintenance {
     fn tick(&mut self, ctx: &WorkerCtx, now: Instant) {
+        // Fault point `worker.maintenance.tick.<repo>` (tests: a panicking
+        // tick is contained; the repo keeps it to one in-process worker).
+        let _ = crate::util::fault::trigger(&format!("worker.maintenance.tick.{}", ctx.repo));
         self.pending_saves(ctx, now);
         // While a backlog drains, the activator checkpoints between its own
         // slices; a checkpoint here would flush the disk concurrently with

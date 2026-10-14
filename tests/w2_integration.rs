@@ -603,3 +603,60 @@ fn the_feed_journal_backfill_resumes_from_its_cursor() {
     assert_eq!(rows(&s.db, FEED_JOURNAL), expected);
     assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
 }
+
+/// Stages `count` ready rows on `branch` with `pad` bytes of padding each
+/// (only their keys, size and branch matter to the forecast).
+fn stage_rows(s: &Store, branch: &str, count: usize, pad: usize) {
+    let padding = "x".repeat(pad);
+    for i in 0..count {
+        let payload = json!({
+            "id": format!("{branch}-{i}"),
+            "repo": "w2-forecast",
+            "branch": {"id": branch, "name": branch, "shared": true},
+            "pad": padding,
+        })
+        .to_string();
+        s.db.execute(
+            "INSERT INTO incoming_events(id,payload,state,received_ms) VALUES(?1,?2,'ready',?3)",
+            rusqlite::params![format!("{branch}-{i}"), payload, i as i64],
+        )
+        .unwrap();
+    }
+}
+
+/// WP2.3 review (major): the seal forecast runs under the engine lock before
+/// every slice, so it never parses large payloads: a head of 64 events of
+/// 1 MiB is forecast in milliseconds (it parsed up to 128 such payloads), and
+/// small rows are still read (a head row on a branch due for its seal makes
+/// a one-event slice).
+#[test]
+fn the_seal_forecast_never_parses_large_payloads() {
+    use tkfs::worker::activator::{FORECAST_ROWS, seal_forecast};
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), Some("w2-forecast")).unwrap();
+    stage_rows(&s, "large-branch", 64, 1024 * 1024);
+    // Best of three, so a load spike on a shared machine is not measured:
+    // about 0.4 ms here (debug), against about 90 ms when every head
+    // payload was parsed (1 MiB each; 8 MiB events cost 8 times as much).
+    let took = (0..3)
+        .map(|_| {
+            let started = Instant::now();
+            let forecast = seal_forecast(&s, 64).expect("forecast");
+            let took = started.elapsed();
+            assert_eq!(
+                forecast.at, None,
+                "a large row's branch is not read: it caps nothing"
+            );
+            took
+        })
+        .min()
+        .unwrap();
+    assert!(took < Duration::from_millis(25), "{took:?}");
+
+    // Small rows on a branch without a snapshot (due at its next commit):
+    // the first row seals if it commits, so the slice is one event.
+    let dir = tempfile::tempdir().unwrap();
+    let s = Store::open(dir.path(), Some("w2-forecast")).unwrap();
+    stage_rows(&s, "small-branch", FORECAST_ROWS * 2, 100);
+    assert_eq!(seal_forecast(&s, 64).expect("forecast").at, Some(1));
+}
