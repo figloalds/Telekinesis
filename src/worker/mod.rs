@@ -8,7 +8,10 @@
 //! 1. take `owner.lock` (held: `FatalLine{ALREADY_RUNNING}`, exit 75);
 //! 2. read the previous `worker.json` (`WorkerCtx.previous`);
 //! 3. open and recover the store, emitting `startup_progress` from this
-//!    thread (invariant 28);
+//!    thread (invariant 28). Staged inbox rows are classified, not activated
+//!    (`defer_activation`, WP2.3): the background activator drains them after
+//!    Ready, so a large inbox no longer delays Ready (invariant 24: deferred
+//!    activation is not recovery);
 //! 4. `Engine::new` (recovers pending saves);
 //! 5. build the `WorkerCtx`;
 //! 6. start the RPC listener: recovery is complete before any RPC (invariant
@@ -24,7 +27,9 @@
 //!    skips it); `--supervised`: the orchestrator attaches later through
 //!    `mount-attach`;
 //! 9. print the `ReadyLine`;
-//! 10. install the Linux signal handlers;
+//! 10. install the Linux signal handlers; start the activator, maintenance
+//!     and notifier threads (WP2.3; a thread that cannot start is logged,
+//!     never fatal after Ready);
 //! 11. wait for `stopping`, let the stop reply flush (≤ 2 s), remove
 //!     `runtime.json` and `worker.json`.
 //!
@@ -290,7 +295,7 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     let store = Store::open_existing_with(
         &state,
         OpenOptions {
-            defer_activation: false,
+            defer_activation: true,
             verify: VerifyMode::Changed,
         },
     )
@@ -395,12 +400,36 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
         libc::signal(libc::SIGINT, signal_stop as libc::sighandler_t);
         libc::signal(libc::SIGTERM, signal_stop as libc::sighandler_t);
     }
+    start_background(&ctx);
     Ok(Running {
         server,
         state,
         idle_limit: args.supervised.then(idle_limit).flatten(),
         _lock: lock,
     })
+}
+
+/// §4.1 step 10 (WP2.3): the activator, maintenance and notifier threads.
+/// After Ready nothing is fatal: a thread that cannot start is logged (the
+/// worker still serves; without the activator a legacy receive keeps its
+/// bounded inline activation).
+fn start_background(ctx: &Arc<WorkerCtx>) {
+    let started = [
+        ("activator", activator::try_spawn(ctx.clone()).map(drop)),
+        ("maintenance", maintenance::spawn(ctx.clone()).map(drop)),
+        (
+            "notifier",
+            crate::runtime::notify::spawn_notifier(ctx.clone()).map(drop),
+        ),
+    ];
+    for (thread, result) in started {
+        if let Err(error) = result {
+            crate::util::log::event!(error, WORKER_START, {
+                "thread": thread,
+                "message": error.to_string(),
+            });
+        }
+    }
 }
 
 /// A fatal failure once step 7 began (before Ready): remove `runtime.json`
