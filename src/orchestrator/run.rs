@@ -19,7 +19,13 @@
 //!   cancels `ctx.shutdown`; a signal cancels it directly and the main thread
 //!   runs the sequence. Either way the main thread then stops accepting, lets
 //!   requests in flight finish, closes the control connections and joins
-//!   their threads (2 s), and removes `orchestrator.json`.
+//!   their threads (2 s), removes `orchestrator.json` (while the catalog
+//!   still holds `orchestrator.lock`, so a successor's file is never
+//!   touched), and closes the catalog.
+//! * Stopping an accept loop wakes it with a connection of its own to the
+//!   listener's port, on loopback when the listener is bound to every
+//!   interface (`0.0.0.0`, `[::]`: Windows refuses a connect to the
+//!   unspecified address), and waits for its thread a bounded time.
 //!
 //! On Windows the daemon first makes its own standard handles
 //! non-inheritable (CCR-WP1.INT-1): a worker it spawns must not inherit the
@@ -44,7 +50,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::Write,
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
@@ -115,8 +121,10 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
         inbound.stop();
     }
     controls.stop(limits::SHUTDOWN_CONTROL_JOIN);
-    catalog.close_within(Duration::from_secs(1));
+    // The file goes first, while `orchestrator.lock` is still held: a
+    // successor cannot have written its own yet.
     drop(file);
+    catalog.close_within(Duration::from_secs(1));
     shutdown::completed();
     Ok(())
 }
@@ -124,33 +132,79 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // orchestrator.json
 
-/// `orchestrator.json`, removed when dropped.
-struct DiscoveryFile(PathBuf);
+/// `orchestrator.json`, removed when dropped if it still holds what this
+/// daemon wrote.
+struct DiscoveryFile {
+    path: PathBuf,
+    written: Vec<u8>,
+}
 
 impl DiscoveryFile {
     /// Writes `value` atomically (a temporary file, then a rename).
     fn write(path: &Path, value: &Value) -> Result<Self> {
         let temporary = path.with_extension("json.tmp");
-        fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
+        let written = serde_json::to_vec_pretty(value)?;
+        fs::write(&temporary, &written)?;
         fs::rename(&temporary, path)?;
-        Ok(Self(path.to_owned()))
+        Ok(Self {
+            path: path.to_owned(),
+            written,
+        })
     }
 }
 
 impl Drop for DiscoveryFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        // Another daemon's file (it replaced ours) is left alone.
+        if fs::read(&self.path).is_ok_and(|bytes| bytes == self.written) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Accept loops
 
-/// Stops a blocking accept loop: sets its flag and wakes `accept` with a
-/// connection of its own.
-fn wake_accept(stop: &AtomicBool, address: SocketAddr) {
+/// How long stopping an accept loop waits for its thread after the wake-up
+/// connection; a thread still blocked then is left to the process exit.
+const ACCEPT_JOIN: Duration = Duration::from_secs(2);
+
+/// Where a wake-up connection for a listener bound to `address` goes: the
+/// same address, except that an unspecified IP (`0.0.0.0`, `[::]`) becomes
+/// the loopback of its family. Windows refuses a connect to the unspecified
+/// address (`WSAEADDRNOTAVAIL`), and a listener on every interface also
+/// listens on loopback.
+fn wake_address(address: SocketAddr) -> SocketAddr {
+    let ip = match address.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, address.port())
+}
+
+/// Stops a blocking accept loop: sets its flag, wakes `accept` with a
+/// connection of its own, and waits at most [`ACCEPT_JOIN`] for the thread.
+/// Shutdown never depends on the wake-up: a thread that has not ended by
+/// then (the connect failed) is logged and left blocked until the process
+/// exits.
+fn stop_accept(name: &str, stop: &AtomicBool, address: SocketAddr, accept: thread::JoinHandle<()>) {
     stop.store(true, Ordering::Release);
-    let _ = TcpStream::connect_timeout(&address, Duration::from_secs(1));
+    let woken = TcpStream::connect_timeout(&wake_address(address), Duration::from_secs(1));
+    let deadline = Instant::now() + ACCEPT_JOIN;
+    while !accept.is_finished() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    if accept.is_finished() {
+        let _ = accept.join();
+    } else {
+        event!(warn, REQUEST_TIMEOUT, {
+            "detail": "an accept loop did not stop; it is left to the process exit",
+            "listener": name,
+            "address": address.to_string(),
+            "wake_error": woken.err().map(|error| error.to_string()),
+        });
+    }
 }
 
 /// Pause after an accept error (for example a full descriptor table), so a
@@ -237,9 +291,8 @@ impl ControlServer {
     /// closes every connection and waits for their threads (the rest).
     fn stop(mut self, budget: Duration) {
         let deadline = Instant::now() + budget;
-        wake_accept(&self.stop, self.address);
         if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
+            stop_accept("control", &self.stop, self.address, accept);
         }
         let settle = Instant::now() + budget / 2;
         self.connections.wait(settle, |live| {
@@ -342,11 +395,13 @@ fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, busy: &AtomicBool) {
                 .unwrap_or_else(|_| Err(anyhow!("UNKNOWN_ERROR: the request handler panicked"))),
             Err(error) => Err(anyhow!("INVALID_REQUEST: {error}")),
         };
-        let accepted = result.is_ok();
         let sent = ws::reply(&mut socket, result);
         busy.store(false, Ordering::Release);
-        if shutdown && accepted {
-            // The reply is flushed: now the main thread may finish (§3.6 4–6).
+        if shutdown {
+            // The reply is flushed: now the main thread may finish (§3.6
+            // 4–6). Also after an error: a refused Shutdown means a sequence
+            // is already under way (the main thread waits for its result),
+            // and a sequence that panicked must still end the daemon.
             ctx.shutdown.cancel();
             return;
         }
@@ -381,9 +436,8 @@ impl InboundServer {
     }
 
     fn stop(mut self) {
-        wake_accept(&self.stop, self.address);
         if let Some(accept) = self.accept.take() {
-            let _ = accept.join();
+            stop_accept("network", &self.stop, self.address, accept);
         }
     }
 }
@@ -405,18 +459,21 @@ fn accept_inbound(bridge: Arc<LegacyBridge>, listener: TcpListener, stop: Arc<At
                 continue;
             }
         };
-        if bridge.inbound_sessions() >= limits::MAX_SESSIONS {
+        // The slot is taken here, before the thread starts, so a burst of
+        // connections cannot exceed the cap; it is released when the
+        // connection ends (or with the closure if the thread cannot start).
+        let Some(slot) = bridge.reserve_inbound(limits::MAX_SESSIONS) else {
             event!(warn, BUSY, {
                 "detail": "peer connection refused: too many sessions",
                 "limit": limits::MAX_SESSIONS,
             });
             continue;
-        }
+        };
         next += 1;
         let bridge = bridge.clone();
         let spawned = thread::Builder::new()
             .name(format!("net-conn-{next}"))
-            .spawn(move || bridge.serve_inbound(stream));
+            .spawn(move || bridge.serve_inbound_reserved(slot, stream));
         if let Err(error) = spawned {
             event!(warn, BUSY, {
                 "detail": "cannot start a peer connection thread",
@@ -531,5 +588,50 @@ fn keep_inherited_handles_private() {
             }
         }
         return;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listener on every interface is woken on loopback: the stop returns
+    /// well before the bounded wait (Windows refuses a connect to
+    /// `0.0.0.0`/`[::]`, which used to leave the accept thread blocked).
+    #[test]
+    fn a_listener_on_every_interface_is_woken_on_loopback() {
+        for bind in ["0.0.0.0:0", "[::]:0"] {
+            let Ok(listener) = TcpListener::bind(bind) else {
+                continue; // no IPv6 on this host
+            };
+            let address = listener.local_addr().unwrap();
+            let wake = wake_address(address);
+            assert!(wake.ip().is_loopback(), "{bind}: {wake}");
+            assert_eq!(wake.port(), address.port());
+            let stop = Arc::new(AtomicBool::new(false));
+            let accept = {
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    for stream in listener.incoming() {
+                        if stop.load(Ordering::Acquire) {
+                            return;
+                        }
+                        drop(stream);
+                    }
+                })
+            };
+            let started = Instant::now();
+            stop_accept("test", &stop, address, accept);
+            assert!(
+                started.elapsed() < ACCEPT_JOIN,
+                "{bind}: the accept loop was not woken ({:?})",
+                started.elapsed()
+            );
+        }
+        // A specific address is kept as it is.
+        let specific: SocketAddr = "127.0.0.1:5".parse().unwrap();
+        assert_eq!(wake_address(specific), specific);
+        let specific: SocketAddr = "[::1]:5".parse().unwrap();
+        assert_eq!(wake_address(specific), specific);
     }
 }

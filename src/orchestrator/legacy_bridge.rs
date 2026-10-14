@@ -76,6 +76,17 @@ impl Activity {
         ActivityGuard(self.clone())
     }
 
+    /// [`enter`](Self::enter) unless `limit` threads are already active (one
+    /// atomic step: concurrent callers cannot overshoot the limit).
+    fn try_enter(self: &Arc<Self>, limit: usize) -> Option<ActivityGuard> {
+        self.count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| ActivityGuard(self.clone()))
+    }
+
     fn active(&self) -> usize {
         self.count.load(Ordering::Acquire)
     }
@@ -101,6 +112,19 @@ impl Drop for ActivityGuard {
     fn drop(&mut self) {
         self.0.count.fetch_sub(1, Ordering::AcqRel);
         self.0.ended.poke();
+    }
+}
+
+/// A reserved inbound connection slot ([`LegacyBridge::reserve_inbound`]):
+/// it counts in [`LegacyBridge::inbound_sessions`] from the reservation
+/// until it is dropped.
+pub struct InboundSlot {
+    _held: ActivityGuard,
+}
+
+impl std::fmt::Debug for InboundSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InboundSlot")
     }
 }
 
@@ -203,10 +227,30 @@ impl LegacyBridge {
         self.lane_threads.active()
     }
 
+    /// Reserves one inbound connection slot unless `limit` connections are
+    /// already being served (or reserved). An accept loop reserves before it
+    /// starts the connection's thread, so a burst of connections cannot
+    /// exceed the cap; the slot is released when dropped.
+    pub fn reserve_inbound(&self, limit: usize) -> Option<InboundSlot> {
+        self.inbound_threads
+            .try_enter(limit)
+            .map(|held| InboundSlot { _held: held })
+    }
+
     /// Serves one inbound legacy connection on the calling thread until the
     /// peer goes away or the bridge shuts down.
     pub fn serve_inbound(&self, stream: TcpStream) {
-        let _active = self.inbound_threads.enter();
+        let slot = InboundSlot {
+            _held: self.inbound_threads.enter(),
+        };
+        self.serve_inbound_reserved(slot, stream);
+    }
+
+    /// [`serve_inbound`](Self::serve_inbound) in a slot taken by
+    /// [`reserve_inbound`](Self::reserve_inbound); the slot is released when
+    /// the connection ends.
+    pub fn serve_inbound_reserved(&self, slot: InboundSlot, stream: TcpStream) {
+        let _active = slot;
         let Ok(ctx) = self.ctx() else {
             return;
         };
@@ -669,5 +713,41 @@ impl LegacyNetworkView for LegacyBridge {
 
     fn peers(&self) -> Value {
         self.peers_with(&self.peers_of())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reserved_inbound_slots_never_exceed_the_limit() {
+        let activity = Arc::new(Activity::default());
+        let held: Vec<_> = (0..5).filter_map(|_| activity.try_enter(3)).collect();
+        assert_eq!(held.len(), 3);
+        assert_eq!(activity.active(), 3);
+        drop(held);
+        assert_eq!(activity.active(), 0);
+        // Concurrent reservations (an accept burst): the count never passes
+        // the limit, and every slot is released.
+        let peak = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (activity, peak) = (activity.clone(), peak.clone());
+                thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        if let Some(slot) = activity.try_enter(3) {
+                            peak.fetch_max(activity.active(), Ordering::AcqRel);
+                            drop(slot);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(peak.load(Ordering::Acquire) <= 3, "{peak:?}");
+        assert_eq!(activity.active(), 0);
     }
 }
