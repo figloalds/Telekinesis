@@ -582,6 +582,10 @@ impl Store {
             .query_row([], |r| r.get(0))?)
     }
     fn view(&self, branch: &str) -> Result<Ref<'_, ViewCache>> {
+        // CCR-WP2.4-6 (WP2.INT): a caller's rollback (`ROLLBACK`, `ROLLBACK
+        // TO`) can undo a commit of this connection without moving the
+        // freshness key below; drop such a view before any reader sees it.
+        self.drop_rolled_back_view();
         let changes = self.db.total_changes();
         let data_version = self.data_version()?;
         let transactional = !self.db.is_autocommit();

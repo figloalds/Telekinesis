@@ -41,7 +41,11 @@ impl Engine {
                                 .as_u64()
                                 .is_some_and(|at| time().saturating_sub(at) < 15000))
                         && s["outgoing_unacknowledged"] == 0
-                        && s["incoming_pending"] == 0
+                        // CCR-WP2.3-1 (WP2.INT): staged rows that still need
+                        // activation; quarantined and blocked rows are
+                        // reported apart and never keep this false (the
+                        // worker `status` RPC's rule since WP2.3).
+                        && s["incoming_active"] == 0
                         && s["pending_causal_events"] == json!([])
                         && s["unflushed_files"] == 0
                         && self.health.is_none()

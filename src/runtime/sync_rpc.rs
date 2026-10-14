@@ -100,13 +100,11 @@ fn request<'a, T: Deserialize<'a>>(op: &str, payload: &'a Value) -> Result<T> {
 }
 
 /// The code of a feed op payload that does not parse:
-/// - `UNSUPPORTED_OPERATION` for a `feed-offer` whose `route` does not parse,
-///   the answer the Wave 0 stub gave, which `tests/worker_lifecycle.rs` still
-///   pins (CCR-WP2.5-1 asks for `INVALID_REQUEST`); nothing else gets it, so
-///   it never stands for a peer's malformed message;
 /// - `PROTOCOL_VIOLATION` when only the peer's message does not parse (the
 ///   `request` of `feed-exchange`, the `reply` of `feed-apply`);
-/// - `INVALID_REQUEST` otherwise (the orchestrator's own members).
+/// - `INVALID_REQUEST` otherwise (the orchestrator's own members), also for
+///   a `feed-offer` whose `route` does not parse (CCR-WP2.5-1, applied by
+///   WP2.INT: the Wave 0 stub's `UNSUPPORTED_OPERATION` is gone).
 fn malformed(op: &str, payload: &Value) -> &'static str {
     // Whether member `key` is present and `check` holds for it.
     let member = |key: &str, check: fn(&Value) -> bool| payload.get(key).is_some_and(check);
@@ -119,10 +117,10 @@ fn malformed(op: &str, payload: &Value) -> &'static str {
         }
         _ => false,
     };
-    match op {
-        ops::FEED_OFFER if !route => "UNSUPPORTED_OPERATION",
-        _ if route && peer_message_bad => "PROTOCOL_VIOLATION",
-        _ => "INVALID_REQUEST",
+    if route && peer_message_bad {
+        "PROTOCOL_VIOLATION"
+    } else {
+        "INVALID_REQUEST"
     }
 }
 
