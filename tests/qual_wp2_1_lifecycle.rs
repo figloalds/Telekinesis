@@ -1,10 +1,22 @@
 //! Qualification scenarios for WP2.1 (actor orchestrator wiring, legacy bridge,
 //! Shutdown). REVAMP_PLAN §14.6, §3.3, §3.6, §7.3.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP2.1"]`.
+//! Created by WP0.5 against the 6298d0b baseline; enabled by WP2.1. They stay
+//! `#[ignore]` because `scripts/qualify.ps1` runs the release qualification
+//! with `--ignored` (the `api_p99_under_churn`, `shutdown_busy_folder` and
+//! `subscribe_latency` floors are wave 2 floors); the same behaviours run in
+//! the default suite as `tests/orchestrator_runtime.rs`.
 //! Written against dynamic action JSON (`raw_call`), so the new `status` member
 //! (§7.3) and new actions are read by name.
 //! `cargo test --release --test qual_wp2_1_lifecycle -- --ignored --test-threads=1 --nocapture`
+//!
+//! WP2.1 changes to the WP0.5 drafts (see `docs/revamp/notes/wp2-1.md`):
+//! * a crash loop is `TKFS_FAULT_POINT=worker.startup` (exit), scoped to one
+//!   folder (§14 WP2.1 acceptance). Deleting a folder's store, the baseline's
+//!   crasher, is a Fatal `STATE_NOT_INITIALIZED` now: `Failed` at once, no loop;
+//! * a hung worker is a frozen process (SIGSTOP / `NtSuspendProcess`): with
+//!   `worker.watch_hang` alone the worker still answers `hello`, which §3.3
+//!   treats as alive (`watch_hang_alone_is_not_unresponsive`).
 mod support;
 
 use serde_json::{Value, json};
@@ -22,19 +34,14 @@ use support::*;
 
 const FILE: &str = "qual_wp2_1_lifecycle";
 
-/// Turn `folder` into a crash loop: remove its store so every start fails.
-/// The store is deleted only after the worker has exited.
-fn make_crasher(node: &Node, folder: &Value) {
-    let state = state_id(folder);
-    node.stop_folder_exited(folder, STOP_EXIT_TIMEOUT).unwrap();
-    for name in [
-        "metadata.sqlite",
-        "metadata.sqlite-wal",
-        "metadata.sqlite-shm",
-    ] {
-        let _ = fs::remove_file(state_dir(folder).join(name));
-    }
-    let _ = node.raw_call(json!({"op":"start","state":state}));
+/// The daemon environment that makes `folder` crash-loop: its worker exits
+/// right after recovery (`worker.startup`, exit 86), every start.
+fn crash_env(folder: &Value) -> Vec<(String, String)> {
+    vec![
+        ("TKFS_FAULT_POINT".into(), "worker.startup".into()),
+        ("TKFS_FAULT_ACTION".into(), "exit".into()),
+        ("TKFS_FAULT_SCOPE".into(), state_id(folder)),
+    ]
 }
 
 /// Lifecycle phase from the §7.3 `status` member (None before WP2.1).
@@ -44,24 +51,87 @@ fn phase(inspect: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The `pid` of `STATE/worker.json`.
+fn worker_pid(folder: &Value) -> Option<u32> {
+    let bytes = fs::read(state_dir(folder).join("worker.json")).ok()?;
+    let record: Value = serde_json::from_slice(&bytes).ok()?;
+    record["pid"].as_u64().map(|pid| pid as u32)
+}
+
+/// `LOCK_HOLD_EXCEEDED` lines in the daemon log (debug builds log every
+/// `Tracked` hold over 50 ms; release builds log none).
+fn lock_violations(node: &Node) -> usize {
+    fs::read_to_string(node.log_path())
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains("LOCK_HOLD_EXCEEDED"))
+        .count()
+}
+
+/// Freezes a process (every thread stops; it holds its sockets and locks).
+#[cfg(windows)]
+fn freeze(pid: u32) -> bool {
+    type Handle = *mut core::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSuspendProcess(handle: Handle) -> i32;
+    }
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    // SAFETY: a handle opened, used and closed here.
+    unsafe {
+        let handle = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let suspended = NtSuspendProcess(handle) >= 0;
+        CloseHandle(handle);
+        suspended
+    }
+}
+
+#[cfg(unix)]
+fn freeze(pid: u32) -> bool {
+    // SAFETY: a signal to a worker this scenario started.
+    unsafe { libc::kill(pid as i32, libc::SIGSTOP) == 0 }
+}
+
 /// `List` p99 < 100 ms over 200 calls while one folder crash-loops, one is
 /// churned by Start/Stop and (with mounts) one is StopBlocked by an open file.
 #[test]
 #[ignore = "WP2.1"]
 fn api_latency_under_churn() {
     let mut s = Scenario::new(FILE, "api_latency_under_churn");
-    let a = Node::new();
+    let mut a = Node::new();
     let crasher = a.create("Crash loop", true);
-    make_crasher(&a, &crasher);
     let churn = a.create("Churn", true);
     let mut _open = None;
+    let mut busy = None;
     if mount_supported() {
         let mount = a.path().join("busy-mount");
-        let busy = a.create_mounted("Busy", &mount);
+        let folder = a.create_mounted("Busy", &mount);
         let mut f = fs::File::create(mount.join("open.txt")).unwrap();
         f.write_all(b"held open").unwrap();
         _open = Some(f);
-        let _ = a.raw_call(json!({"op":"stop","state":state_id(&busy),"wait":false}));
+        busy = Some(folder);
+    }
+    // The crasher's worker exits at every start from now on; the busy worker
+    // is left running by the restart (open file) and adopted.
+    a.restart_with_env(crash_env(&crasher));
+    if let Some(busy) = &busy {
+        let state = state_id(busy);
+        a.wait_for("busy adopted", Duration::from_secs(60), || {
+            a.try_inspect(&state).is_ok_and(|p| p["running"] == true)
+        });
+        let _ = a.raw_call(json!({"op":"stop","state":state,"wait":false}));
+        a.wait_for("busy stop blocked", Duration::from_secs(30), || {
+            a.try_inspect(&state)
+                .is_ok_and(|p| phase(&p).as_deref() == Some("stop_blocked"))
+        });
     }
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(CallCounts::default());
@@ -94,10 +164,31 @@ fn api_latency_under_churn() {
     // upgrades) would let the floor pass without any churn.
     let (ok, _, _) = counts.get();
     s.check(ok >= 2, format!("churner made progress: {}", counts.json()));
+    let crasher_phase = a
+        .try_inspect(&state_id(&crasher))
+        .ok()
+        .and_then(|p| phase(&p));
+    s.check(
+        matches!(
+            crasher_phase.as_deref(),
+            Some("backoff" | "starting" | "failed")
+        ),
+        format!("the crasher crash-loops: {crasher_phase:?}"),
+    );
+    let violations = lock_violations(&a);
+    s.check(
+        violations == 0,
+        format!("{violations} orchestrator lock holds over 50 ms (debug builds log them)"),
+    );
     let summary = summarize(&samples);
     let mut extra = summary.json();
     extra["churn"] = counts.json();
+    extra["lock_violations_logged"] = json!(violations);
     s.metric_with("list_p99_ms", summary.p99, "ms", extra);
+    if let Some(busy) = &busy {
+        // Let the blocked stop go: its file closes with the scenario.
+        let _ = a.raw_call(json!({"op":"start","state":state_id(busy)}));
+    }
     s.finish();
 }
 
@@ -106,9 +197,10 @@ fn api_latency_under_churn() {
 #[ignore = "WP2.1"]
 fn crash_loop_reaches_failed() {
     let mut s = Scenario::new(FILE, "crash_loop_reaches_failed");
-    let a = Node::new();
+    let mut a = Node::new();
     let crasher = a.create("Crash loop", true);
-    make_crasher(&a, &crasher);
+    let healthy = a.create("Healthy", true);
+    a.restart_with_env(crash_env(&crasher));
     s.measure_from_now();
     let state = state_id(&crasher);
     let watch = Stopwatch::start();
@@ -125,6 +217,11 @@ fn crash_loop_reaches_failed() {
             last["status"]
         ));
     }
+    s.check(
+        a.try_inspect(&state_id(&healthy))
+            .is_ok_and(|p| p["running"] == true),
+        "the other folder keeps running",
+    );
     s.finish();
 }
 
@@ -169,6 +266,10 @@ fn shutdown_with_busy_folder() {
         })
     });
     s.check(left, format!("outcome left_running: {reply:?}"));
+    s.check(
+        !a.data_dir().join("orchestrator.json").exists(),
+        "orchestrator.json removed",
+    );
     if status.is_some() {
         a.spawn();
         let state = state_id(&busy);
@@ -214,6 +315,11 @@ fn adoption_after_daemon_kill() {
     let adopted = worker_address(&pb) == address && b.worker_pids(&pb) == pids;
     s.metric("adopted", if adopted { 1.0 } else { 0.0 }, "bool");
     s.check(adopted, "running worker adopted, not restarted");
+    s.check(
+        b.try_inspect(&state)
+            .is_ok_and(|p| p["status"]["lifecycle"]["adopted"] == true),
+        "status says adopted",
+    );
     let watch = Stopwatch::start();
     let resumed = wait_until(s.remaining(), || {
         has_file(&pb, "while-down.txt", b"while the daemon was down")
@@ -223,12 +329,55 @@ fn adoption_after_daemon_kill() {
     s.finish();
 }
 
-/// A worker whose `watch` hangs is detected (Unresponsive) and restarted;
-/// another folder's worker is unaffected.
+/// A worker that stops answering (its process frozen: `watch` and `hello`
+/// both stall) is detected (Unresponsive), killed and restarted; the other
+/// folder's worker is unaffected.
 #[test]
 #[ignore = "WP2.1"]
 fn hung_worker_restarted() {
     let mut s = Scenario::new(FILE, "hung_worker_restarted");
+    let a = Node::new();
+    let hung = a.create("Hung watch", true);
+    let healthy = a.create("Healthy", true);
+    let hung_address = worker_address(&hung);
+    let healthy_address = worker_address(&healthy);
+    let pid = worker_pid(&hung).unwrap();
+    s.check(freeze(pid), "worker frozen");
+    s.measure_from_now();
+    let watch = Stopwatch::start();
+    let restarted = wait_until(s.remaining(), || {
+        let now = worker_address(&hung);
+        now.is_some() && now != hung_address && worker_pid(&hung) != Some(pid)
+    });
+    s.metric("restart_ms", watch.ms(), "ms");
+    if !restarted {
+        s.timeout("hung worker never restarted");
+    }
+    let state = state_id(&hung);
+    let recovered = wait_until(Duration::from_secs(30).min(s.remaining()), || {
+        a.try_inspect(&state).is_ok_and(|p| p["running"] == true)
+    });
+    s.check(recovered, "the folder runs again");
+    s.check(
+        fs::read_to_string(a.log_path())
+            .unwrap_or_default()
+            .contains("WORKER_UNRESPONSIVE"),
+        "WORKER_UNRESPONSIVE logged",
+    );
+    s.check(
+        worker_address(&healthy) == healthy_address,
+        "healthy folder's worker untouched",
+    );
+    s.finish();
+}
+
+/// `worker.watch_hang` alone: the worker still answers `hello`, which §3.3
+/// treats as alive, so it is never killed (a worker that answers may hold
+/// dirty sessions, invariant 8); the other folder is unaffected.
+#[test]
+#[ignore = "WP2.1"]
+fn watch_hang_alone_is_not_unresponsive() {
+    let mut s = Scenario::new(FILE, "watch_hang_alone_is_not_unresponsive");
     let mut a = Node::new();
     let hung = a.create("Hung watch", true);
     let healthy = a.create("Healthy", true);
@@ -243,21 +392,21 @@ fn hung_worker_restarted() {
             a.try_inspect(&state).is_ok_and(|p| p["running"] == true)
         });
     }
-    let hung_address = worker_address(&hung);
-    let healthy_address = worker_address(&healthy);
+    let pid = worker_pid(&hung);
     s.measure_from_now();
-    let watch = Stopwatch::start();
-    let restarted = wait_until(s.remaining(), || {
-        let now = worker_address(&hung);
-        now.is_some() && now != hung_address
-    });
-    s.metric("restart_ms", watch.ms(), "ms");
-    if !restarted {
-        s.timeout("hung worker never restarted");
-    }
+    // Three watch failures (4 s each) and the heartbeat timeout (8 s) pass
+    // more than once in 25 s; each ends with a hello probe that answers.
+    let killed = wait_until(Duration::from_secs(25), || worker_pid(&hung) != pid);
+    s.check(!killed, "a worker answering hello is not killed");
     s.check(
-        worker_address(&healthy) == healthy_address,
-        "healthy folder's worker untouched",
+        a.try_inspect(&state_id(&hung))
+            .is_ok_and(|p| p["running"] == true),
+        "still running",
+    );
+    s.check(
+        a.try_inspect(&state_id(&healthy))
+            .is_ok_and(|p| p["running"] == true),
+        "the other folder runs",
     );
     s.finish();
 }
@@ -306,7 +455,8 @@ fn mount_failure_end_to_end() {
     s.finish();
 }
 
-/// SIGTERM produces the same outcome as the Shutdown action (Unix).
+/// SIGTERM produces the same outcome as the Shutdown action (Unix): exit 0,
+/// every worker stopped, `orchestrator.json` removed, `desired_running` kept.
 #[test]
 #[ignore = "WP2.1"]
 fn sigterm_matches_shutdown() {
@@ -319,7 +469,8 @@ fn sigterm_matches_shutdown() {
     {
         let mut s = s;
         let mut a = Node::new();
-        let p = a.create("Signal", true);
+        let folders = [a.create("Signal one", true), a.create("Signal two", true)];
+        let workers: Vec<u32> = folders.iter().filter_map(worker_pid).collect();
         let pid = a.pid().unwrap();
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
@@ -333,12 +484,30 @@ fn sigterm_matches_shutdown() {
             !a.data_dir().join("orchestrator.json").exists(),
             "orchestrator.json removed",
         );
-        a.spawn();
-        let inspect = a.inspect(&state_id(&p));
+        let alive = |pid: u32| unsafe { libc::kill(pid as i32, 0) == 0 };
         s.check(
-            inspect["desired_running"] == true,
-            "desired_running unchanged",
+            wait_until(Duration::from_secs(10), || {
+                !workers.iter().any(|w| alive(*w))
+            }),
+            "SIGTERM stopped every worker",
         );
+        a.spawn();
+        for folder in &folders {
+            let state = state_id(folder);
+            s.check(
+                a.inspect(&state)["desired_running"] == true,
+                "desired_running unchanged",
+            );
+            a.wait_for("running", Duration::from_secs(60), || {
+                a.try_inspect(&state).is_ok_and(|p| p["running"] == true)
+            });
+        }
+        // The Shutdown action on the same folders: the same outcome.
+        let reply = a.stop();
+        let stopped = reply["folders"].as_array().is_some_and(|outcomes| {
+            outcomes.len() == folders.len() && outcomes.iter().all(|o| o["outcome"] == "stopped")
+        });
+        s.check(stopped, format!("Shutdown stops every worker too: {reply}"));
         s.finish();
     }
 }

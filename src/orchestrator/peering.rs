@@ -1,10 +1,30 @@
-use super::{api::Project, supervisor::Shared};
+//! Owned by WP2.1 in Wave 2 (WP1.12 in Wave 1; deleted by WP3.1).
+//!
+//! Legacy v2 peering: the pairing dial, `remote_list`, the deadline-bounded
+//! loopback worker call, and the inbound server (`serve_inbound`, adapted
+//! from the WP1.12 `serve_peer` to the actor orchestrator, REVAMP_PLAN §14
+//! WP2.1 task 4):
+//!
+//! * the verifier and the folders come from the catalog snapshot (O(1), no
+//!   lock), checked again on every request (`PAIRING_CODE_CHANGED`);
+//! * `list` is the published-catalog cache (`PublishedCatalogApi::list()`,
+//!   running entries only), never a fan-out to the workers;
+//! * the local worker of a folder is its controller's endpoint
+//!   (`LegacyBridge::discovery`); a paused folder answers
+//!   `FOLDER_SYNC_PAUSED`, a folder without a running worker
+//!   `LOCAL_WORKER_UNAVAILABLE`;
+//! * each worker call is bounded by [`INBOUND_WORKER_DEADLINE`].
+use super::{lanes, legacy_bridge::LegacyBridge, supervisor::Shared};
 use crate::{
     core::id,
-    model::ipc::deadlines,
+    model::{
+        orchestrator::{Ctx, EntryState, FolderPhase},
+        protocol::LaneRole,
+        status::Direction,
+    },
     paired_sync::{PublishedState, SyncPage, SyncRoute},
     pairing_code::Verifier,
-    runtime::{self, Discovery},
+    runtime::Discovery,
     util::lock::lock,
     ws,
 };
@@ -15,6 +35,14 @@ use std::{
     sync::atomic::Ordering,
     time::{Duration, Instant},
 };
+
+/// The bound of one inbound worker call (`published-exchange`,
+/// `published-bulk-exchange`): the legacy lanes' socket timeout, so a worker
+/// call never outlives what the dialer waits for its reply.
+pub(crate) const INBOUND_WORKER_DEADLINE: Duration = Duration::from_secs(15);
+/// `list` waits at most this long for the first `published-summary` of a
+/// folder that is already Running (its controller asks right after Ready).
+pub(crate) const FIRST_SUMMARY_WAIT: Duration = Duration::from_secs(1);
 
 pub(crate) fn dial(endpoint: &str, code: &str, installation: &str) -> Result<(ws::Socket, String)> {
     let (socket, installation, _) = dial_role(endpoint, code, installation, Some("control"), None)?;
@@ -54,6 +82,25 @@ pub(crate) fn dial_role(
         parallel,
     ))
 }
+
+/// Dials `endpoint` as installation `installation` and lists its published
+/// folders; the remote must still be `expected` (`PEER_INSTALLATION_CHANGED`).
+pub(crate) fn remote_catalog(
+    endpoint: &str,
+    code: &str,
+    installation: &str,
+    expected: &str,
+) -> Result<Vec<PublishedState>> {
+    let (mut socket, remote) = dial(endpoint, code, installation)?;
+    ensure!(remote == expected, "PEER_INSTALLATION_CHANGED");
+    Ok(serde_json::from_value(ws::call(
+        &mut socket,
+        &json!({"op":"list"}),
+    )?)?)
+}
+
+/// [`remote_catalog`] through the legacy `Supervisor` (the legacy
+/// `api::manage`, which stays compiled until WP2.INT).
 pub(crate) fn remote_list(shared: &Shared, endpoint: &str) -> Result<Vec<PublishedState>> {
     let (p, installation) = {
         let s = lock(shared);
@@ -65,19 +112,15 @@ pub(crate) fn remote_list(shared: &Shared, endpoint: &str) -> Result<Vec<Publish
             s.installation.clone(),
         )
     };
-    let (mut socket, remote) = dial(&p.endpoint, &p.code, &installation)?;
-    ensure!(remote == p.installation, "PEER_INSTALLATION_CHANGED");
-    Ok(serde_json::from_value(ws::call(
-        &mut socket,
-        &json!({"op":"list"}),
-    )?)?)
+    remote_catalog(&p.endpoint, &p.code, &installation, &p.installation)
 }
-/// A loopback worker connection for `published-summary` with a hard
-/// per-call deadline. It mirrors `runtime::RpcLane` (one reused socket,
-/// reconnect after 10 s idle or an address change, dropped after any
-/// transport error, never replayed) and adds the deadline: the request and
-/// its reply must complete within what is left of it after connecting.
-/// Adapter for CCR-WP1.12-1 (`RpcLane` with a timeout).
+
+/// A loopback worker connection with a hard per-call deadline. It mirrors
+/// `runtime::RpcLane` (one reused socket, reconnect after 10 s idle or an
+/// address change, dropped after any transport error, never replayed) and
+/// adds the deadline: the request and its reply must complete within what is
+/// left of it after connecting. Adapter for CCR-WP1.12-1 (`RpcLane` with a
+/// timeout); the inbound server and the `Folder` passthrough use it.
 #[derive(Default)]
 pub(crate) struct DeadlineLane {
     connection: Option<(String, ws::Socket)>,
@@ -87,6 +130,18 @@ impl DeadlineLane {
     pub(crate) fn call(
         &mut self,
         info: &Discovery,
+        payload: Value,
+        deadline: Duration,
+    ) -> Result<Value> {
+        self.call_as(info, &id(), payload, deadline)
+    }
+
+    /// [`call`](Self::call) with the caller's request id (the worker's
+    /// receipts make a retried mutation with the same id idempotent).
+    pub(crate) fn call_as(
+        &mut self,
+        info: &Discovery,
+        request: &str,
         payload: Value,
         deadline: Duration,
     ) -> Result<Value> {
@@ -108,7 +163,7 @@ impl DeadlineLane {
             .saturating_sub(started.elapsed())
             .max(Duration::from_millis(1));
         let result = socket_deadline(socket, remaining)
-            .and_then(|()| ws::call(socket, &json!({"request":id(),"payload":payload})));
+            .and_then(|()| ws::call(socket, &json!({"request":request,"payload":payload})));
         self.last_used = Some(Instant::now());
         match result {
             Ok(value) => Ok(value),
@@ -154,87 +209,6 @@ fn timed_out(error: &anyhow::Error) -> bool {
     })
 }
 
-fn summary(
-    client: &mut DeadlineLane,
-    project: &Project,
-    info: Result<Discovery>,
-) -> Result<PublishedState> {
-    let info = info?;
-    let state: PublishedState = serde_json::from_value(client.call(
-        &info,
-        json!({"op":"published-summary"}),
-        deadlines::PUBLISHED_SUMMARY,
-    )?)?;
-    ensure!(
-        state.repo == project.repo && state.replica == project.device,
-        "WORKER_STATE_MISMATCH"
-    );
-    Ok(state)
-}
-
-/// The catalog this daemon publishes to an authenticated peer (`list`).
-/// Every running worker is asked at once, each under the 3 s
-/// `PUBLISHED_SUMMARY` deadline, so a hung worker costs at most that
-/// deadline and never the dialer's 15 s `list` budget. A worker that fails
-/// or times out is left out and reported as the folder's publication error.
-fn published(
-    shared: &Shared,
-    clients: &mut BTreeMap<String, DeadlineLane>,
-) -> Result<Vec<PublishedState>> {
-    let workers = {
-        let s = lock(shared);
-        s.projects()?
-            .into_iter()
-            .filter(|p| s.workers.get(&p.state).is_some_and(|w| w.startup.is_none()))
-            .map(|p| {
-                let info = s.discovery(&p.state);
-                (p, info)
-            })
-            .collect::<Vec<_>>()
-    };
-    let states: Vec<String> = workers.iter().map(|(p, _)| p.state.clone()).collect();
-    let mut ask = |(p, info): (Project, Result<Discovery>)| {
-        let mut client = clients.remove(&p.state).unwrap_or_default();
-        move || {
-            let result = summary(&mut client, &p, info);
-            (p, result, client)
-        }
-    };
-    let answers: Vec<_> = if workers.len() <= 1 {
-        workers.into_iter().map(|w| ask(w)()).collect()
-    } else {
-        std::thread::scope(|scope| {
-            let pending: Vec<_> = workers.into_iter().map(|w| scope.spawn(ask(w))).collect();
-            pending
-                .into_iter()
-                .filter_map(|answer| answer.join().ok())
-                .collect()
-        })
-    };
-    let mut published = Vec::new();
-    let mut errors = BTreeMap::new();
-    for state in states {
-        errors.insert(
-            state,
-            "PUBLISHED_SUMMARY_FAILED: no answer from the summary thread".to_owned(),
-        );
-    }
-    for (p, result, client) in answers {
-        clients.insert(p.state.clone(), client);
-        match result {
-            Ok(mut state) => {
-                errors.remove(&p.state);
-                state.label = p.label;
-                published.push(state);
-            }
-            Err(error) => {
-                errors.insert(p.state, format!("PUBLISHED_SUMMARY_FAILED: {error:#}"));
-            }
-        }
-    }
-    lock(shared).publication_errors = errors;
-    Ok(published)
-}
 pub(crate) fn route(info: &Discovery, peer: &str, replica: &str) -> SyncRoute {
     SyncRoute {
         peer: peer.into(),
@@ -243,14 +217,82 @@ pub(crate) fn route(info: &Discovery, peer: &str, replica: &str) -> SyncRoute {
         remote_replica: replica.into(),
     }
 }
-pub(crate) fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<()> {
+
+/// The folders this daemon publishes to an authenticated peer (`list`): the
+/// published-catalog cache, Running entries only, labelled with the catalog
+/// label (the legacy `list` did the same). A folder that is Running but whose
+/// first `published-summary` has not come back yet (it is asked right after
+/// Ready) is waited for, at most [`FIRST_SUMMARY_WAIT`]; a worker that does
+/// not answer it is left out, and its controller records the publication
+/// error (`PUBLISHED_SUMMARY_FAILED`).
+pub(crate) fn published_list(ctx: &Ctx) -> Vec<PublishedState> {
+    let deadline = Instant::now() + FIRST_SUMMARY_WAIT;
+    loop {
+        let (generation, entries) = ctx.published.list();
+        let snapshot = ctx.catalog.snapshot();
+        let awaiting = snapshot.folders.iter().any(|folder| {
+            folder.sync_enabled
+                && !entries.iter().any(|entry| entry.repo == folder.repo)
+                && ctx
+                    .folders
+                    .view(&folder.state)
+                    .is_some_and(|view| matches!(view.phase, FolderPhase::Running { .. }))
+        });
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !awaiting || remaining.is_zero() {
+            return entries
+                .iter()
+                .filter(|entry| entry.state == EntryState::Running)
+                .map(|entry| PublishedState {
+                    repo: entry.repo.clone(),
+                    replica: entry.replica.clone(),
+                    label: snapshot
+                        .folder_by_repo(&entry.repo)
+                        .map_or_else(|| entry.label.clone(), |folder| folder.label.clone()),
+                    branches: entry.branches.clone(),
+                })
+                .collect();
+        }
+        ctx.published.wait_newer(generation, remaining);
+    }
+}
+
+/// The role and lane of an inbound connection, from its pairing hello.
+struct Hello {
+    peer: String,
+    role: Option<String>,
+    parallel: bool,
+    bulk_lane: Option<crate::bulk_sync::Lane>,
+}
+
+impl Hello {
+    fn lane(&self) -> (u32, LaneRole) {
+        match (self.role.as_deref(), self.bulk_lane) {
+            (Some("bulk"), Some(lane)) => (
+                u32::try_from(lane.index + 1).unwrap_or(u32::MAX),
+                LaneRole::Bulk,
+            ),
+            (Some("bulk"), None) => (1, LaneRole::Bulk),
+            (Some("control"), _) => (0, LaneRole::Control),
+            _ => (0, LaneRole::Probe),
+        }
+    }
+}
+
+/// One inbound legacy connection: the pairing hello, then a request loop
+/// until the peer goes away (or its socket is shut down by the bridge).
+pub(crate) fn serve_inbound(
+    bridge: &LegacyBridge,
+    ctx: &Ctx,
+    stream: std::net::TcpStream,
+) -> Result<()> {
     let mut socket = ws::accept(stream)?;
     let hello: Value = ws::receive(&mut socket)?;
     let role = hello["lane"].as_str();
     let parallel = hello["bulk_protocol"] == crate::bulk_sync::PROTOCOL;
     let bulk_lane: Option<crate::bulk_sync::Lane> =
         serde_json::from_value(hello["bulk_lane"].clone())?;
-    let verified = (|| -> Result<(Verifier, String, String)> {
+    let verified = (|| -> Result<(Verifier, String)> {
         ensure!(
             hello["op"] == "pair" && hello["version"] == 2,
             "INCOMPATIBLE_ORCHESTRATOR_PROTOCOL"
@@ -266,16 +308,19 @@ pub(crate) fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<
             .as_str()
             .context("INSTALLATION_REQUIRED")?
             .to_owned();
-        let s = lock(&shared);
-        let verifier = s.verifier()?;
+        let snapshot = ctx.catalog.snapshot();
+        let verifier = snapshot
+            .verifier
+            .clone()
+            .context("PAIRING_CODE_NOT_SET: reset-pairing-code first")?;
         ensure!(
             verifier.verify(hello["code"].as_str().context("PAIRING_CODE_REQUIRED")?),
             "INVALID_PAIRING_CODE"
         );
-        ensure!(peer != s.installation, "CANNOT_PAIR_WITH_SELF");
-        Ok((verifier, peer, s.installation.clone()))
+        ensure!(peer != ctx.installation, "CANNOT_PAIR_WITH_SELF");
+        Ok((verifier, peer))
     })();
-    let (verifier, peer, installation) = match verified {
+    let (verifier, peer) = match verified {
         Ok(v) => v,
         Err(error) => {
             ws::reply(&mut socket, Err(error))?;
@@ -285,69 +330,118 @@ pub(crate) fn serve_peer(shared: Shared, stream: std::net::TcpStream) -> Result<
     ws::reply(
         &mut socket,
         Ok(
-            json!({"installation":installation,"version":2,"lane":role,"bulk_protocol":if parallel { crate::bulk_sync::PROTOCOL } else { 0 },"bulk_lane":bulk_lane}),
+            json!({"installation":ctx.installation,"version":2,"lane":role,"bulk_protocol":if parallel { crate::bulk_sync::PROTOCOL } else { 0 },"bulk_lane":bulk_lane}),
         ),
     )?;
-    let mut workers = BTreeMap::<String, runtime::RpcLane>::new();
-    let mut summaries = BTreeMap::<String, DeadlineLane>::new();
+    let session = Hello {
+        peer,
+        role: role.map(str::to_owned),
+        parallel,
+        bulk_lane,
+    };
+    let (lane, lane_role) = session.lane();
+    bridge.inbound_session(ctx, &session.peer, lane, lane_role, true);
+    let served = serve_requests(bridge, ctx, &mut socket, &session, &verifier);
+    bridge.inbound_session(ctx, &session.peer, lane, lane_role, false);
+    served
+}
+
+fn serve_requests(
+    bridge: &LegacyBridge,
+    ctx: &Ctx,
+    socket: &mut ws::Socket,
+    session: &Hello,
+    verifier: &Verifier,
+) -> Result<()> {
+    let (lane, _) = session.lane();
+    let role = session.role.as_deref();
+    let parallel = session.parallel;
+    let mut workers = BTreeMap::<String, DeadlineLane>::new();
     loop {
-        let request: Value = ws::receive(&mut socket)?;
+        let request: Value = ws::receive(socket)?;
+        let started = Instant::now();
+        let mut exchanged: Option<(String, &'static str)> = None;
         let result = (|| -> Result<Value> {
-            {
-                let s = lock(&shared);
-                ensure!(!s.stopping.load(Ordering::Relaxed), "ORCHESTRATOR_STOPPING");
-                ensure!(s.verifier()?.hash == verifier.hash, "PAIRING_CODE_CHANGED");
-            }
-            match request["op"].as_str() {
-                Some("ping") => Ok(json!({"alive":true})),
-                Some("list") => Ok(json!(published(&shared, &mut summaries)?)),
+            ensure!(
+                !ctx.stopping.load(Ordering::Acquire),
+                "ORCHESTRATOR_STOPPING"
+            );
+            let snapshot = ctx.catalog.snapshot();
+            let current = snapshot
+                .verifier
+                .as_ref()
+                .context("PAIRING_CODE_NOT_SET: reset-pairing-code first")?;
+            ensure!(current.hash == verifier.hash, "PAIRING_CODE_CHANGED");
+            let (op, worker_op, page_repo, sender) = match request["op"].as_str() {
+                Some("ping") => return Ok(json!({"alive":true})),
+                Some("list") => return Ok(json!(published_list(ctx))),
                 Some("exchange") => {
                     ensure!(!parallel || role != Some("bulk"), "METADATA_ON_BULK_LANE");
                     let page: SyncPage = serde_json::from_value(request["page"].clone())?;
-                    let info = {
-                        let s = lock(&shared);
-                        let p = s
-                            .projects()?
-                            .into_iter()
-                            .find(|p| p.repo == page.repo)
-                            .context("REPOSITORY_NOT_MANAGED")?;
-                        s.discovery(&p.state)?
-                    };
-                    let binding = route(&info, &peer, &page.sender);
-                    workers.entry(info.state.clone()).or_default().call(
-                        &info,
-                        &id(),
-                        json!({"op":"published-exchange","route":binding,"page":page,"max_frame":4*1024*1024,"metadata_only":role == Some("control")}),
-                    )
+                    ("exchange", "published-exchange", page.repo, page.sender)
                 }
                 Some("objects") => {
                     ensure!(parallel && role == Some("bulk"), "BULK_ON_CONTROL_LANE");
                     let page: crate::bulk_sync::Page =
                         serde_json::from_value(request["page"].clone())?;
-                    ensure!(Some(page.lane) == bulk_lane, "BULK_LANE_MISMATCH");
-                    let info = {
-                        let s = lock(&shared);
-                        let project = s
-                            .projects()?
-                            .into_iter()
-                            .find(|p| p.repo == page.repo)
-                            .context("REPOSITORY_NOT_MANAGED")?;
-                        s.discovery(&project.state)?
-                    };
-                    let binding = route(&info, &peer, &page.sender);
-                    workers.entry(info.state.clone()).or_default().call(&info, &id(),
-                        json!({"op":"published-bulk-exchange","route":binding,"lane":page.lane,"page":page}))
+                    ensure!(Some(page.lane) == session.bulk_lane, "BULK_LANE_MISMATCH");
+                    ("objects", "published-bulk-exchange", page.repo, page.sender)
                 }
                 _ => bail!("UNKNOWN_PEER_OPERATION"),
+            };
+            let folder = snapshot
+                .folder_by_repo(&page_repo)
+                .context("REPOSITORY_NOT_MANAGED")?;
+            exchanged = Some((folder.repo.clone(), op));
+            ensure!(
+                folder.sync_enabled,
+                "FOLDER_SYNC_PAUSED: sync is paused for {}",
+                folder.label
+            );
+            let info = bridge
+                .discovery(ctx, folder)
+                .context("LOCAL_WORKER_UNAVAILABLE")?;
+            let binding = route(&info, &session.peer, &sender);
+            let mut payload = json!({"op":worker_op,"route":binding,"page":request["page"]});
+            if op == "exchange" {
+                payload["max_frame"] = json!(4 * 1024 * 1024);
+                payload["metadata_only"] = json!(role == Some("control"));
+            } else {
+                payload["lane"] = json!(session.bulk_lane);
             }
+            workers.entry(folder.state.clone()).or_default().call(
+                &info,
+                payload,
+                INBOUND_WORKER_DEADLINE,
+            )
         })();
-        ws::reply(&mut socket, result)?;
+        if let Some((repo, op)) = &exchanged {
+            // Seen from here: the peer's parts come down, the reply's go up.
+            let (bytes_down, objects_down) = lanes::part_stats(&request["page"]["object_parts"]);
+            let (bytes_up, objects_up) = result
+                .as_ref()
+                .map_or((0, 0), |reply| lanes::part_stats(&reply["object_parts"]));
+            ctx.status.record(lanes::exchange_event(
+                &session.peer,
+                repo,
+                lane,
+                op,
+                Direction::Inbound,
+                result.as_ref().err(),
+                None,
+                (bytes_up, bytes_down),
+                (objects_up, objects_down),
+                started.elapsed(),
+            ));
+        }
+        ws::reply(socket, result)?;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ipc::deadlines;
     use std::{
         net::TcpListener,
         sync::{
@@ -368,23 +462,36 @@ mod tests {
     }
 
     /// A worker stand-in: answers `published-summary` with `reply`, or never
-    /// answers when `reply` is `None`. Counts accepted connections.
-    fn worker(reply: Option<Result<Value, String>>) -> (Discovery, Arc<AtomicUsize>) {
+    /// answers when `reply` is `None`. Counts accepted connections and
+    /// remembers the request ids it saw.
+    fn worker(
+        reply: Option<Result<Value, String>>,
+    ) -> (
+        Discovery,
+        Arc<AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}", listener.local_addr().unwrap());
         let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let accepted = connections.clone();
+        let seen = requests.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 accepted.fetch_add(1, Ordering::Relaxed);
                 let reply = reply.clone();
+                let seen = seen.clone();
                 std::thread::spawn(move || {
                     let Ok(mut socket) = ws::accept(stream) else {
                         return;
                     };
                     while let Ok(request) = ws::receive::<Value>(&mut socket) {
                         assert_eq!(request["payload"]["op"], "published-summary");
+                        seen.lock()
+                            .unwrap()
+                            .push(request["request"].as_str().unwrap_or_default().into());
                         match &reply {
                             Some(reply) => {
                                 let reply = reply.clone().map_err(|e| anyhow::anyhow!(e));
@@ -398,12 +505,12 @@ mod tests {
                 });
             }
         });
-        (discovery(address), connections)
+        (discovery(address), connections, requests)
     }
 
     #[test]
     fn a_hung_worker_costs_one_deadline_and_its_connection() {
-        let (info, connections) = worker(None);
+        let (info, connections, _) = worker(None);
         let mut lane = DeadlineLane::default();
         for attempt in 1..=2 {
             let started = Instant::now();
@@ -431,7 +538,7 @@ mod tests {
 
     #[test]
     fn healthy_and_remote_error_replies_reuse_the_connection() {
-        let (info, connections) = worker(Some(Ok(json!({"repo":"repo"}))));
+        let (info, connections, _) = worker(Some(Ok(json!({"repo":"repo"}))));
         let mut lane = DeadlineLane::default();
         for _ in 0..3 {
             let reply = lane
@@ -444,7 +551,7 @@ mod tests {
             assert_eq!(reply["repo"], "repo");
         }
         assert_eq!(connections.load(Ordering::Relaxed), 1);
-        let (info, connections) = worker(Some(Err("WORKER_BUSY".into())));
+        let (info, connections, _) = worker(Some(Err("WORKER_BUSY".into())));
         let mut lane = DeadlineLane::default();
         for _ in 0..2 {
             let error = lane
@@ -473,5 +580,27 @@ mod tests {
                 .is_err()
         );
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    #[test]
+    fn call_as_keeps_the_callers_request_id() {
+        let (info, _, requests) = worker(Some(Ok(json!({"repo":"repo"}))));
+        let mut lane = DeadlineLane::default();
+        lane.call_as(
+            &info,
+            "my-request",
+            json!({"op":"published-summary"}),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        lane.call(
+            &info,
+            json!({"op":"published-summary"}),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(seen[0], "my-request");
+        assert_ne!(seen[1], "my-request");
     }
 }
