@@ -472,9 +472,11 @@ fn fits(queued: usize, bytes: usize, cap: usize) -> bool {
 }
 
 /// What a waiting call receives from the I/O thread. A stream chunk is a
-/// zero-copy slice of the received WebSocket message.
+/// zero-copy slice of the received WebSocket message, with what it was
+/// charged to receive-side flow control (`rx_buffered`: the whole frame plus
+/// a fixed overhead, so header-only chunks count too).
 pub(crate) enum Event {
-    Chunk(ChunkHeader, tungstenite::Bytes),
+    Chunk(ChunkHeader, tungstenite::Bytes, usize),
     /// PROGRESS frames received since the caller last looked (coalesced: one
     /// resets the idle deadline as well as many).
     Progress,
@@ -704,7 +706,8 @@ pub(crate) struct Shared {
     pub(crate) bytes_down: AtomicU64,
     /// `u64::MAX` until the first heartbeat echo.
     pub(crate) rtt_ms: AtomicU64,
-    /// Received stream bytes not yet taken by their callers.
+    /// Received stream chunks not yet taken by their callers, at their
+    /// charge to the receive bound (frame bytes plus a fixed overhead).
     pub(crate) rx_buffered: AtomicUsize,
     /// The I/O thread holds its reads: receivers are behind, or (server) the
     /// peer leaves our replies unread.
@@ -767,8 +770,8 @@ impl Shared {
     /// thread counted is always uncounted, even when the caller stopped early.
     fn release(&self, slot: &Slot) {
         for event in slot.drain() {
-            if let Event::Chunk(_, bytes) = event {
-                self.rx_consumed(bytes.len());
+            if let Event::Chunk(_, _, cost) = event {
+                self.rx_consumed(cost);
             }
         }
     }
@@ -1173,8 +1176,8 @@ impl Shared {
                 });
             };
             match event {
-                Event::Chunk(header, bytes) => {
-                    self.rx_consumed(bytes.len());
+                Event::Chunk(header, bytes, cost) => {
+                    self.rx_consumed(cost);
                     if let Err(error) = on_chunk(header, &bytes) {
                         guard.abandon();
                         return Err(CallError::Remote(error));
