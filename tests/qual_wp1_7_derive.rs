@@ -2,19 +2,54 @@
 //! REVAMP_PLAN §14.6; floors in §15 and `tests/qualification-floors.json`.
 //!
 //! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP1.7"]`.
-//! WP1.7 un-ignores and extends them (also run with `TKFS_CONFLICT_MODE=verify`).
+//! WP1.7 extends them: each scenario also records how its slow-path commits
+//! were derived (`append_commits`, `fallbacks`; append mode must never fall
+//! back on these workloads) and the 2K backlog ends with the oracle.
+//! The conflict mode follows `TKFS_CONFLICT_MODE` (default `append`); with
+//! `verify` every commit is also derived in full and compared (correctness
+//! evidence; the floors are for `append`).
 //! `cargo test --release --test qual_wp1_7_derive -- --ignored --test-threads=1 --nocapture`
 mod support;
 
 use serde_json::json;
 use support::*;
-use tkfs::core::{Store, id};
+use tkfs::core::{
+    Store,
+    derive::{DeriveCounters, conflict_mode, thread_derive_counters, thread_last_fallback},
+    id,
+};
 
 const FILE: &str = "qual_wp1_7_derive";
 
+/// Record how the measured commits were derived; append mode must not fall back.
+fn derivation(s: &mut Scenario, start: DeriveCounters) {
+    let now = thread_derive_counters();
+    let append = now.append - start.append;
+    let fallbacks = now.fallbacks - start.fallbacks;
+    let verified = now.verified - start.verified;
+    let full = now.full - start.full;
+    s.metric_with(
+        "append_commits",
+        append as f64,
+        "commits",
+        json!({"mode": conflict_mode().as_str(), "fallbacks": fallbacks,
+            "verified": verified, "full": full,
+            "restricted": now.restricted - start.restricted,
+            "last_fallback": thread_last_fallback()}),
+    );
+    s.metric("fallbacks", fallbacks as f64, "commits");
+    let commits = (append + fallbacks + verified + full).max(1);
+    s.metric(
+        "derive_ms_per_commit",
+        (now.commit_micros - start.commit_micros) as f64 / 1000.0 / commits as f64,
+        "ms",
+    );
+    s.check(fallbacks == 0, "no fallback to full derivation");
+}
+
 /// A streams `n` creates while B has one unseen local edit: every event is a
 /// two-way (slow path) activation on B.
-fn two_way_backlog_at(name: &str, n: usize) {
+fn two_way_backlog_at(name: &str, n: usize, oracle: bool) {
     let mut s = Scenario::new(FILE, name);
     let n = scaled(n);
     let dir = tempfile::tempdir().unwrap();
@@ -22,6 +57,7 @@ fn two_way_backlog_at(name: &str, n: usize) {
     let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
     let mut b = Store::open(&dir.path().join("b"), Some(&repo)).unwrap();
     let backlog = two_way_backlog(&mut a, &mut b, n).unwrap();
+    let start = thread_derive_counters();
     s.measure_from_now();
     let delivery = deliver_paced(&mut b, &backlog.bundle, &backlog.allowed, s.deadline()).unwrap();
     s.metric_with(
@@ -31,6 +67,7 @@ fn two_way_backlog_at(name: &str, n: usize) {
         json!({"events": n, "activated": delivery.delivered,
             "last_per_event_ms": delivery.per_event_ms.last()}),
     );
+    derivation(&mut s, start);
     if delivery.timed_out {
         s.timeout(format!("{} of {n} events activated", delivery.delivered));
     } else {
@@ -52,6 +89,13 @@ fn two_way_backlog_at(name: &str, n: usize) {
                 .all(|c| c.resolved_by.is_some()),
             "no spurious conflicts",
         );
+        if oracle {
+            // A full rebuild is quadratic; it runs after the measured phase.
+            // Every row is re-derived from no rows (the CCR-WP1.7-1 adapter).
+            let (diff, ms) = time_ms(|| b.verify_derived_state_strict().unwrap());
+            s.metric("oracle_ms", ms, "ms");
+            s.check(diff.is_empty(), format!("oracle empty: {diff:?}"));
+        }
     }
     s.finish();
 }
@@ -59,13 +103,13 @@ fn two_way_backlog_at(name: &str, n: usize) {
 #[test]
 #[ignore = "WP1.7"]
 fn two_way_backlog_2k() {
-    two_way_backlog_at("two_way_backlog_2k", 2000);
+    two_way_backlog_at("two_way_backlog_2k", 2000, true);
 }
 
 #[test]
 #[ignore = "WP1.7"]
 fn two_way_backlog_6400() {
-    two_way_backlog_at("two_way_backlog_6400", 6400);
+    two_way_backlog_at("two_way_backlog_6400", 6400, false);
 }
 
 /// 50 namespace operations from A, concurrent with one local namespace
@@ -94,6 +138,7 @@ fn concurrent_namespace_ops_5k() {
     let mut bundle = a.shared_bundle(&before).unwrap();
     causal_sort(&mut bundle.events);
     s.check(bundle.events.len() == 50, "50 namespace events");
+    let start = thread_derive_counters();
     s.measure_from_now();
     let mut samples = vec![];
     for event in bundle.events.clone() {
@@ -114,6 +159,7 @@ fn concurrent_namespace_ops_5k() {
     let summary = summarize(&samples);
     s.metric_with("max_op_ms", summary.max, "ms", summary.json());
     s.metric("p50_op_ms", summary.p50, "ms");
+    derivation(&mut s, start);
     if samples.len() == 50 {
         s.check(b.lookup("ns-dir-24/moved-24.txt").is_ok(), "moves visible");
         s.check(b.lookup("b-local-dir").is_ok(), "local op kept");
