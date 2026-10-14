@@ -466,6 +466,23 @@ fn control_connections_are_persistent_and_answer_unparsable_requests() {
         ws::call(&mut socket, &json!({"op":"peers"})).unwrap(),
         json!([])
     );
+    // A text frame that is not JSON at all is answered too (fix round 2),
+    // and the connection still serves the next request.
+    socket
+        .send(tungstenite::Message::Text("this is not json".into()))
+        .unwrap();
+    let answer: Value = ws::receive(&mut socket).unwrap();
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("INVALID_REQUEST")),
+        "{answer}"
+    );
+    assert_eq!(
+        ws::call(&mut socket, &json!({"op":"list"})).unwrap()["folders"],
+        json!([])
+    );
     // New variants are forwarded to manage_v2 (WP2.2's), not refused here.
     let v2 = ws::call(&mut socket, &json!({"op":"status"}));
     if let Err(error) = &v2 {

@@ -6,8 +6,10 @@
 //! * `control-accept` blocks in `accept` on the loopback control listener and
 //!   gives each connection its own thread (at most
 //!   `limits::MAX_CONTROL_CONNECTIONS`): a persistent `receive → manage →
-//!   reply` loop. A request that does not parse is answered
-//!   (`INVALID_REQUEST`) and the connection stays usable.
+//!   reply` loop. A complete frame that is not JSON, or JSON that is not a
+//!   valid action, is answered (`INVALID_REQUEST`) and the connection stays
+//!   usable; a transport failure (including a binary envelope the codec
+//!   rejects) closes the connection, as before.
 //! * `net-accept` blocks in `accept` on the peer listener and hands each
 //!   connection to `LegacyBridge::serve_inbound` on its own thread (at most
 //!   `limits::MAX_SESSIONS` at once; extra connections are closed at once).
@@ -384,11 +386,14 @@ fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, busy: &AtomicBool) {
         let _ = tcp.set_read_timeout(Some(CONTROL_IDLE));
     }
     loop {
-        let Ok(raw) = ws::receive::<Value>(&mut socket) else {
-            return;
+        let received = match receive_request(&mut socket) {
+            Ok(received) => received,
+            Err(_) => return,
         };
         busy.store(true, Ordering::Release);
-        let parsed = serde_json::from_value::<Action>(raw);
+        let parsed = received.and_then(|raw| {
+            serde_json::from_value::<Action>(raw).map_err(|error| error.to_string())
+        });
         let shutdown = matches!(parsed, Ok(Action::Shutdown));
         let result = match parsed {
             Ok(action) => catch_unwind(AssertUnwindSafe(|| manage(ctx, action)))
@@ -408,6 +413,22 @@ fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, busy: &AtomicBool) {
         if sent.is_err() {
             return;
         }
+    }
+}
+
+/// One control request. `Err` is a transport failure (the connection is
+/// done); `Ok(Err(detail))` is a complete frame that is not JSON: it was
+/// read in full, so the connection stays usable and the caller answers it
+/// `INVALID_REQUEST`.
+fn receive_request(socket: &mut ws::Socket) -> Result<Result<Value, String>> {
+    match ws::receive::<Value>(socket) {
+        Ok(raw) => Ok(Ok(raw)),
+        // `ws::receive` decodes only after the frame was read, so a JSON
+        // error never leaves a partial frame behind.
+        Err(error) => match error.downcast_ref::<serde_json::Error>() {
+            Some(syntax) => Ok(Err(syntax.to_string())),
+            None => Err(error),
+        },
     }
 }
 

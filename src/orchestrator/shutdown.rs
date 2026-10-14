@@ -289,34 +289,112 @@ mod platform {
     static PIPE: AtomicI32 = AtomicI32::new(-1);
 
     extern "C" fn on_signal(_: libc::c_int) {
-        let fd = PIPE.load(Ordering::Relaxed);
-        if fd >= 0 {
-            let byte = 1u8;
-            // SAFETY: write(2) is async-signal-safe; a full pipe drops the byte
-            // (a wake-up is already pending).
-            unsafe {
-                libc::write(fd, (&byte as *const u8).cast(), 1);
+        wake(PIPE.load(Ordering::Relaxed));
+    }
+
+    /// The signal handler's body: one byte into the self-pipe's write end.
+    /// Async-signal-safe: the write end is non-blocking, so a full pipe drops
+    /// the byte (a wake-up is already pending) instead of blocking the
+    /// interrupted thread, and the interrupted code's `errno` is restored.
+    fn wake(fd: libc::c_int) {
+        if fd < 0 {
+            return;
+        }
+        let saved = errno::get();
+        let byte = 1u8;
+        // SAFETY: write(2) is async-signal-safe, on a non-blocking descriptor
+        // with a one-byte buffer that lives for the call.
+        unsafe {
+            libc::write(fd, (&byte as *const u8).cast(), 1);
+        }
+        errno::set(saved);
+    }
+
+    /// `errno` of the calling thread, where the platform exposes it.
+    mod errno {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn location() -> Option<*mut libc::c_int> {
+            // SAFETY: returns the calling thread's errno slot.
+            Some(unsafe { libc::__errno_location() })
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        fn location() -> Option<*mut libc::c_int> {
+            // SAFETY: returns the calling thread's errno slot.
+            Some(unsafe { libc::__error() })
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd"
+        )))]
+        fn location() -> Option<*mut libc::c_int> {
+            None
+        }
+
+        pub(super) fn get() -> libc::c_int {
+            // SAFETY: a valid, thread-local errno slot.
+            location().map_or(0, |slot| unsafe { *slot })
+        }
+
+        pub(super) fn set(value: libc::c_int) {
+            if let Some(slot) = location() {
+                // SAFETY: a valid, thread-local errno slot.
+                unsafe { *slot = value }
             }
         }
     }
 
-    pub(super) fn install() {
+    /// The self-pipe: both ends close-on-exec (workers are spawned by this
+    /// process and must never inherit it), the write end non-blocking (the
+    /// signal handler must never block).
+    pub(super) fn signal_pipe() -> std::io::Result<[libc::c_int; 2]> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: pipe(2) on a valid two-element array.
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            crate::util::log::event!(warn, ORCHESTRATOR_STOPPING, {
-                "detail": "cannot create the signal pipe; signals end the daemon without the shutdown sequence",
-                "error": std::io::Error::last_os_error().to_string(),
-            });
-            return;
+            return Err(std::io::Error::last_os_error());
         }
+        let close = |fds: [libc::c_int; 2]| {
+            for fd in fds {
+                // SAFETY: closes descriptors this function created.
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        };
         for fd in fds {
-            // Workers are spawned by this process: never let them inherit it.
             // SAFETY: fcntl on a descriptor this function owns.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                let error = std::io::Error::last_os_error();
+                close(fds);
+                return Err(error);
             }
         }
+        // SAFETY: fcntl on a descriptor this function owns.
+        let flags = unsafe { libc::fcntl(fds[1], libc::F_GETFL) };
+        // SAFETY: as above.
+        if flags == -1
+            || unsafe { libc::fcntl(fds[1], libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            let error = std::io::Error::last_os_error();
+            close(fds);
+            return Err(error);
+        }
+        Ok(fds)
+    }
+
+    pub(super) fn install() {
+        let fds = match signal_pipe() {
+            Ok(fds) => fds,
+            Err(error) => {
+                crate::util::log::event!(warn, ORCHESTRATOR_STOPPING, {
+                    "detail": "cannot create the signal pipe; signals end the daemon without the shutdown sequence",
+                    "error": error.to_string(),
+                });
+                return;
+            }
+        };
         let read = fds[0];
         let watcher = std::thread::Builder::new()
             .name("shutdown-signal".into())
@@ -345,6 +423,56 @@ mod platform {
         unsafe {
             libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
             libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::{sync::mpsc, time::Duration};
+
+        #[test]
+        fn a_full_signal_pipe_never_blocks_the_handler() {
+            let [read, write] = signal_pipe().expect("pipe");
+            for fd in [read, write] {
+                // SAFETY: fcntl on descriptors this test owns.
+                let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                assert_ne!(flags & libc::FD_CLOEXEC, 0, "close-on-exec");
+            }
+            // SAFETY: as above.
+            let read_flags = unsafe { libc::fcntl(read, libc::F_GETFL) };
+            assert_eq!(read_flags & libc::O_NONBLOCK, 0, "the watcher blocks");
+            // Fill the pipe and then signal into it, on a thread: with a
+            // blocking write end this would hang, so the test waits ≤ 5 s.
+            let (done, finished) = mpsc::channel();
+            std::thread::spawn(move || {
+                let chunk = [1u8; 4096];
+                let mut full = false;
+                for _ in 0..4096 {
+                    // SAFETY: write(2) from a buffer that lives for the call.
+                    let n = unsafe { libc::write(write, chunk.as_ptr().cast(), chunk.len()) };
+                    if n < 0 {
+                        full = std::io::Error::last_os_error().kind()
+                            == std::io::ErrorKind::WouldBlock;
+                        break;
+                    }
+                }
+                errno::set(libc::EINTR);
+                wake(write);
+                let kept = errno::get();
+                let _ = done.send((full, kept));
+            });
+            let (full, kept) = finished
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the handler blocked on a full pipe");
+            assert!(full, "the pipe filled up with EAGAIN");
+            assert_eq!(kept, libc::EINTR, "the handler restores errno");
+            for fd in [read, write] {
+                // SAFETY: closes descriptors this test owns.
+                unsafe {
+                    libc::close(fd);
+                }
+            }
         }
     }
 }
