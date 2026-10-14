@@ -621,6 +621,9 @@ struct Fuzz {
     serial: usize,
     log: Vec<String>,
     totals: Activation,
+    /// Exchanging everything at the end: no concurrent local writes then
+    /// (they would leave new events behind the last round).
+    converging: bool,
 }
 
 impl Fuzz {
@@ -640,6 +643,7 @@ impl Fuzz {
             serial: 0,
             log: vec![],
             totals: Activation::default(),
+            converging: false,
         }
     }
 
@@ -777,6 +781,7 @@ impl Fuzz {
         let seed = self.rng.r#gen::<u64>();
         let mut rng = StdRng::seed_from_u64(seed);
         let mut serial = self.serial * 1000;
+        let quiet = self.converging;
         let replica = &mut self.replicas[r];
         let read = replica.read.take().unwrap();
         let store = replica.store.as_mut().unwrap();
@@ -784,7 +789,7 @@ impl Fuzz {
         let mut between = |_: &SlowTicket, store: &mut Store| -> Between {
             match rng.gen_range(0..100) {
                 0..=59 => Between::Compare,
-                60..=79 => Between::Nothing,
+                n if n <= 79 || quiet => Between::Nothing,
                 _ => {
                     serial += 1;
                     let what = local_op(&mut rng, store, serial);
@@ -810,6 +815,7 @@ impl Fuzz {
     /// Exchange everything until every replica holds the same events, then
     /// require identical projections and conflict rows everywhere.
     fn converge(&mut self) {
+        self.converging = true;
         for _ in 0..4 {
             for from in 0..self.replicas.len() {
                 for to in 0..self.replicas.len() {
@@ -848,9 +854,22 @@ impl Fuzz {
             match &reference {
                 None => reference = Some(state),
                 Some(reference) => {
-                    assert_eq!(reference.0, state.0, "replica {r} events");
-                    assert_eq!(reference.1, state.1, "replica {r} projection");
-                    assert_eq!(reference.2, state.2, "replica {r} conflict rows");
+                    let context = self.context();
+                    assert_eq!(
+                        reference.0, state.0,
+                        "replica {r} events
+{context}"
+                    );
+                    assert_eq!(
+                        reference.1, state.1,
+                        "replica {r} projection
+{context}"
+                    );
+                    assert_eq!(
+                        reference.2, state.2,
+                        "replica {r} conflict rows
+{context}"
+                    );
                 }
             }
         }
