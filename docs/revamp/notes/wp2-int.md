@@ -288,7 +288,8 @@ tkfs process ran on the machine during the suites.
 | `cargo build --all-targets` | pass, no warnings |
 | `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
 | `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` | **pass, SUITE_EXIT=0: 810 passed, 0 failed, 94 ignored** across 61 test binaries (`--no-fail-fast` so that a failure could not hide later binaries; with exit 0 it is the plain command's result) |
-| WSL `cargo check --all-targets` | pass (exit 0) |
+| Final tree (`3cd5520`, the merged evidence and these notes aside it is this commit's tree): `cargo fmt --check`, `cargo build --all-targets`, `cargo clippy --all-targets -- -D warnings`, then the plain `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **pass**: fmt, build and clippy exit 0; **SUITE_EXIT=0: 810 passed, 0 failed, 95 ignored** across 61 binaries (the 95th ignored test is the new `interop_wave_2_with_a_6298d0b_peer`) |
+| WSL `cargo check --all-targets` | pass (exit 0), on `7659915` and again on the final tree |
 | WSL `cargo clippy --all-targets -- -D warnings` (extra: `cfg(unix)` code, the `pipe2` change) | pass (exit 0) |
 | WSL `cargo test --all-targets --no-fail-fast` (the whole suite; it contains §13 rule 8.2's subset: `orchestrator` 15, `session_core` 59, `session_handshake` 21, `worker_lifecycle` 25, `mount_lifecycle` 17 with `/dev/fuse`) | **pass, exit 0: 815 passed, 0 failed, 95 ignored** across 61 binaries; also `orchestrator_runtime` 13 (with `sigterm_runs_the_shutdown_sequence`), `w2_integration` 11 (the attach test over FUSE), lib 71 + 2 ignored |
 | Legacy fixtures (§13 rule 8.3) | `harness_selftest` 18 + 2 ignored (legacy worker and data-dir fixtures, compat goldens), `catalog_actor` 19 (the legacy data directory opens and upgrades; the downgrade view through `legacy_oracle`), `w1_integration::revalidate_requeues_quarantined_rows_and_reactivates_them` (the 6298d0b worker fixture, now with WP2.3's activator): pass on Windows and WSL |
@@ -360,14 +361,15 @@ below). `ok: false`, `enforced_failures: [session_loopback_throughput]`.**
 | `idle_exchange_50k_cpu` / `_bytes` | ≤ 10 ms/side, ≤ 4 KiB | 1.56 ms, 1,593 B | |
 | `large_event_8mib` | completed | completed | |
 
-Wave 1 floors in the same run: `remote_linear_create_2k` 0.80 ms/event,
-`remote_linear_create_10k` 1.77, `local_create_after_resolved_conflict`
-p90 1.69, `two_way_backlog_2k` 62.4 ms/event (≤ 100), `two_way_backlog_6400`
+Wave 1 floors (the evidence's values; the three re-run files from the
+re-run): `remote_linear_create_2k` 0.94 ms/event (first run 0.80),
+`remote_linear_create_10k` 2.01 (1.77), `local_create_after_resolved_conflict`
+p90 2.53 (1.69), `two_way_backlog_2k` 62.4 ms/event (≤ 100), `two_way_backlog_6400`
 226.1 (≤ 300), `concurrent_namespace_ops_5k` max 408.7 ms (≤ 500),
 `restart_ready_20k_objects` 1,179 ms, `content_status_50k` 0.09 ms,
 `tiny_pending_objects_12k` completed, `watch_latency` 1,012 ms,
-`session_slow_does_not_block_fast` 0.26 ms, `session_control_under_queued_data`
-45.0 ms, `legacy_hung_repo_healthy_progress` 697 ms (the rewritten
+`session_slow_does_not_block_fast` 0.24 ms, `session_control_under_queued_data`
+43.7 ms, `legacy_hung_repo_healthy_progress` 697 ms (the rewritten
 scenario; ≤ 45,000), `legacy_interval_20s_reconnects` 0,
 `legacy_crash_backoff` 5 (≤ 5), and **`session_loopback_throughput` 273
 MiB/s (fails ≥ 300; first run 269)**.
