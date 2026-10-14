@@ -508,3 +508,98 @@ fn in_process_caught_up_ignores_quarantined_rows() {
     assert_eq!(s["incoming_active"], 1, "{s}");
     assert_eq!(s["caught_up"], false, "a row to activate is work left");
 }
+
+// ---------------------------------------------------------------------------
+// Review findings of packages not approved, fixed by WP2.INT
+
+type Rows = Vec<(i64, String)>;
+
+fn rows(db: &rusqlite::Connection, sql: &str) -> Rows {
+    db.prepare(sql)
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+const SHARED_JOURNAL: &str =
+    "SELECT s.seq,s.event FROM journal_sequence s JOIN events e ON e.id=s.event
+    JOIN branches b ON b.id=e.branch WHERE b.shared=1 ORDER BY s.seq";
+const FEED_JOURNAL: &str = "SELECT seq,event FROM feed_journal ORDER BY seq";
+
+fn config(db: &rusqlite::Connection, key: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    db.query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
+        .optional()
+        .unwrap()
+}
+
+/// WP2.5 review (major): the `feed_journal` build is a backfill (§9, I10,
+/// invariant 28): chunked, resumable and reporting startup progress. A build
+/// interrupted after some chunks resumes from its cursor (rows already built
+/// are not built again), private events stay out, the marker is set at the
+/// end, and a dropped table is rebuilt whole.
+#[test]
+fn the_feed_journal_backfill_resumes_from_its_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    {
+        let mut s = Store::open(root, Some("w2-backfill")).unwrap();
+        for i in 0..40 {
+            s.create(&format!("shared-{i}"), "file").unwrap();
+        }
+        s.fork("private", false).unwrap();
+        s.checkout("private").unwrap();
+        for i in 0..5 {
+            s.create(&format!("private-{i}"), "file").unwrap();
+        }
+        assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
+        assert_eq!(config(&s.db, "feed_journal_v1_cursor"), None);
+    }
+    // An interrupted build: the table exists, the rows up to the cursor are
+    // built (the first one marked), the rest are not, no marker.
+    let (expected, half) = {
+        let db = rusqlite::Connection::open(root.join("metadata.sqlite")).unwrap();
+        let expected = rows(&db, SHARED_JOURNAL);
+        let all = rows(&db, "SELECT seq,event FROM journal_sequence ORDER BY seq");
+        assert!(all.len() > expected.len(), "private events in the journal");
+        assert_eq!(rows(&db, FEED_JOURNAL), expected);
+        let half = expected[expected.len() / 2].0;
+        db.execute("DELETE FROM feed_journal WHERE seq>?1", [half])
+            .unwrap();
+        db.execute(
+            "UPDATE feed_journal SET event='built-before' WHERE seq=?1",
+            [expected[0].0],
+        )
+        .unwrap();
+        db.execute("DELETE FROM config WHERE key='feed_journal_v1'", [])
+            .unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO config(key,value) VALUES('feed_journal_v1_cursor',?1)",
+            [half.to_string()],
+        )
+        .unwrap();
+        (expected, half)
+    };
+    let s = Store::open(root, Some("w2-backfill")).unwrap();
+    let built = rows(&s.db, FEED_JOURNAL);
+    assert_eq!(built[0].1, "built-before", "resumed after {half}");
+    assert_eq!(built[1..], expected[1..]);
+    assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
+    assert_eq!(config(&s.db, "feed_journal_v1_cursor"), None);
+    drop(s);
+    // A dropped table is built again from the whole journal.
+    {
+        let db = rusqlite::Connection::open(root.join("metadata.sqlite")).unwrap();
+        db.execute_batch(
+            "DROP TRIGGER feed_journal_insert; DROP TRIGGER feed_journal_update;
+            DROP TRIGGER feed_journal_delete; DROP TRIGGER feed_journal_branch;
+            DROP TABLE feed_journal;",
+        )
+        .unwrap();
+    }
+    let s = Store::open(root, Some("w2-backfill")).unwrap();
+    assert_eq!(rows(&s.db, FEED_JOURNAL), expected);
+    assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
+}

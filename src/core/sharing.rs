@@ -162,8 +162,27 @@ fn take_offer(request: &str, repo: &str, peer: &str) -> Sent {
 /// maintain it, for writes by any executable; it is built from the journal
 /// when it is created. Reads still join the event's branch, so a row that
 /// were ever stale could not put a private event on the feed.
+///
+/// The build is a backfill (REVAMP_PLAN §9, I10, invariant 28; WP2.INT fixed
+/// the one-statement build of WP2.5's fix round 2): the table and its
+/// triggers first (they cover every row written from then on), then
+/// [`BACKFILL_CHUNK`] journal rows per transaction, resuming from the
+/// `feed_journal_v1_cursor` config key, with `startup_progress` from the
+/// opening thread after each chunk, and the `feed_journal_v1` marker at the
+/// end. A worker killed for silence mid-build resumes where it stopped.
 pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
-    let db = &store.db;
+    define_schema(&store.db)?;
+    backfill_feed_journal(store)
+}
+
+/// `feed_journal` rows built per transaction by its backfill.
+pub const BACKFILL_CHUNK: i64 = 10_000;
+/// Config key: the `feed_journal` backfill is complete.
+pub const FEED_JOURNAL_MARKER: &str = "feed_journal_v1";
+/// Config key: the last `journal_sequence.seq` the backfill covered.
+pub const FEED_JOURNAL_CURSOR: &str = "feed_journal_v1_cursor";
+
+fn define_schema(db: &Connection) -> Result<()> {
     db.execute_batch("SAVEPOINT sharing_schema")?;
     let result = (|| -> Result<()> {
         let built: bool = db.query_row(
@@ -217,9 +236,11 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
             END;",
         )?;
         if !built {
-            db.execute_batch(
-                "INSERT OR REPLACE INTO feed_journal(seq,event) SELECT s.seq,s.event FROM journal_sequence s
-                    JOIN events e ON e.id=s.event JOIN branches b ON b.id=e.branch WHERE b.shared=1",
+            // A new (or dropped) table: build it from the whole journal.
+            db.execute("DELETE FROM config WHERE key=?1", [FEED_JOURNAL_MARKER])?;
+            db.execute(
+                "INSERT INTO config(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
+                [FEED_JOURNAL_CURSOR],
             )?;
         }
         db.execute(
@@ -235,6 +256,53 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
             return Err(error);
         }
     }
+    Ok(())
+}
+
+/// The chunked, resumable `feed_journal` build ([`ensure_schema`]). A table
+/// without the marker and without a cursor was built whole by an earlier
+/// build of this module (WP2.5's one-statement build): it is complete.
+fn backfill_feed_journal(store: &mut Store) -> Result<()> {
+    let value = |db: &Connection, key: &str| -> Result<Option<String>> {
+        Ok(db
+            .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
+            .optional()?)
+    };
+    if value(&store.db, FEED_JOURNAL_MARKER)?.is_some() {
+        return Ok(());
+    }
+    if let Some(cursor) = value(&store.db, FEED_JOURNAL_CURSOR)? {
+        let mut cursor: i64 = cursor.parse().unwrap_or(0);
+        loop {
+            let upper: Option<i64> = store.db.query_row(
+                "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",
+                params![cursor, BACKFILL_CHUNK],
+                |r| r.get(0),
+            )?;
+            let Some(upper) = upper else { break };
+            let tx = store.db.savepoint()?;
+            tx.execute(
+                "INSERT OR REPLACE INTO feed_journal(seq,event) SELECT s.seq,s.event FROM journal_sequence s
+                    JOIN events e ON e.id=s.event JOIN branches b ON b.id=e.branch
+                    WHERE b.shared=1 AND s.seq>?1 AND s.seq<=?2",
+                params![cursor, upper],
+            )?;
+            tx.execute(
+                "UPDATE config SET value=?2 WHERE key=?1",
+                params![FEED_JOURNAL_CURSOR, upper.to_string()],
+            )?;
+            tx.commit()?;
+            cursor = upper;
+            crate::startup::progress("indexing the feed");
+        }
+    }
+    let tx = store.db.savepoint()?;
+    tx.execute(
+        "INSERT INTO config(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+        [FEED_JOURNAL_MARKER],
+    )?;
+    tx.execute("DELETE FROM config WHERE key=?1", [FEED_JOURNAL_CURSOR])?;
+    tx.commit()?;
     Ok(())
 }
 
