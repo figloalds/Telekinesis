@@ -1129,6 +1129,90 @@ fn a_hung_repository_never_delays_the_others() {
     lane.stop();
 }
 
+/// RC5 with a warm slot pool (fix round 2): when one turn dispatches more
+/// keys than there are idle slot threads, every key still gets a thread at
+/// once. Here one earlier exchange left one idle slot thread; then one
+/// catalog update makes two keys due in the same turn, and the first hangs.
+/// The second must not wait for the first one's deadline (5 s here, 30 s by
+/// default), and the view's `in_flight` counts only exchanges that really run.
+#[test]
+fn keys_due_in_one_turn_never_queue_behind_a_hung_one() {
+    let world = World::new();
+    world.put(folder("repo-a"));
+    world.put(folder("repo-b"));
+    let ctx = ctx(&world, 60_000);
+    let peer = peer_ctx(
+        &ctx,
+        vec![
+            entry("repo-a", EntryState::Running),
+            entry("repo-b", EntryState::Starting),
+        ],
+    );
+    let meta = MetaPeer::new();
+    let lane = start_control(
+        &ctx,
+        &peer,
+        &meta,
+        control_options(60_000, Duration::from_secs(5)),
+    );
+    // A exchanges once on its own: the lane now has one slot thread, idle.
+    assert!(wait_until(Duration::from_secs(3), || world
+        .finished_of("repo-a")
+        .len()
+        == 1));
+    sleep_ms(300);
+    assert_eq!(lane.view().in_flight, 0);
+    assert_eq!(lane.key("repo-b").readiness, Readiness::WaitingForRemote);
+
+    // From now on A hangs at the peer. One catalog update moves A's remote
+    // tip (a trigger) and makes B's entry Running (a reset): both keys are
+    // due in the same turn, A first.
+    meta.always("repo-a", Behave::Hang);
+    let changed = Instant::now();
+    peer.catalog.update(|catalog| {
+        let mut catalog = catalog.clone();
+        catalog.generation += 1;
+        for entry in &mut catalog.entries {
+            entry.state = EntryState::Running;
+            if entry.repo == "repo-a" {
+                entry.tip.as_mut().unwrap().seq += 1;
+            }
+        }
+        catalog
+    });
+    assert!(
+        wait_until(Duration::from_secs(8), || world
+            .worker
+            .count("feed-apply", "repo-b")
+            >= 1),
+        "repo B never exchanged"
+    );
+    let b_started = world.worker.calls("feed-offer", "repo-b")[0].at - changed;
+    assert!(
+        b_started < Duration::from_secs(1),
+        "repo B started {b_started:?} after it became due (behind the hung repo A)"
+    );
+    // A's second exchange really runs (it hangs at the peer), and it is the
+    // only exchange the view counts in flight once B has finished.
+    assert!(wait_until(Duration::from_secs(2), || meta
+        .seen("repo-a")
+        .len()
+        == 2));
+    assert!(
+        wait_until(Duration::from_secs(2), || {
+            let view = lane.view();
+            view.in_flight == 1
+                && view.finished == 2
+                && view.key("repo-a").map(|key| key.phase) == Some(KeyPhase::Running)
+        }),
+        "{:#?}",
+        lane.view()
+    );
+    assert_eq!(meta.active.load(Ordering::SeqCst), 1);
+    assert_eq!(lane.key("repo-b").failures, 0);
+    lane.stop();
+}
+
 /// Invariant 16: a request whose outcome is uncertain is never sent again;
 /// every attempt is a fresh offer with a new id.
 #[test]
@@ -1261,10 +1345,15 @@ fn a_lost_session_stops_the_lane_without_charging_the_key() {
 
 /// WaitingForWorker, WaitingForRemote, Paused and Contention are never
 /// counted as failures; a Transient failure after a Contention streak backs
-/// off from its first attempt.
+/// off from its first attempt. The real StatusHub shows none of the waiting
+/// answers as an error either: a local worker that cannot be reached while
+/// its folder still says Running (repo E) is reported without an error, and
+/// the remote's "starting" (repo B) is the pair's WaitingForRemote.
 #[test]
 fn waiting_states_and_contention_are_not_counted() {
     let world = World::new();
+    let hub = StatusHub::new(HubConfig::default(), Arc::new(SystemClock));
+    let _ = world.hub.set(hub.clone());
     let mut a = folder("repo-a");
     starting(&mut a);
     world.put(a);
@@ -1273,16 +1362,37 @@ fn waiting_states_and_contention_are_not_counted() {
     c.record.sync_enabled = false;
     world.put(c);
     world.put(folder("repo-d"));
+    world.put(folder("repo-e"));
+    for view in world.all() {
+        hub.record(StatusEvent::FolderLifecycle(Box::new((*view).clone())));
+    }
     let ctx = ctx(&world, 200);
-    let peer = peer_ctx(
-        &ctx,
-        vec![
-            entry("repo-a", EntryState::Running),
-            entry("repo-b", EntryState::Running),
-            entry("repo-c", EntryState::Running),
-            entry("repo-d", EntryState::Starting),
-        ],
-    );
+    let entries = vec![
+        entry("repo-a", EntryState::Running),
+        entry("repo-b", EntryState::Running),
+        entry("repo-c", EntryState::Running),
+        entry("repo-d", EntryState::Starting),
+        entry("repo-e", EntryState::Running),
+    ];
+    hub.record(StatusEvent::PeerConfigured {
+        installation: PEER.into(),
+        endpoint: "ws://peer.test".into(),
+    });
+    hub.record(StatusEvent::LaneState {
+        installation: PEER.into(),
+        lane: 0,
+        role: LaneRole::Control,
+        direction: Direction::Outbound,
+        state: LaneState::Ready,
+        error: None,
+        backoff_until_ms: None,
+        rtt_ms: Some(1),
+    });
+    hub.record(StatusEvent::PeerCatalog {
+        installation: PEER.into(),
+        entries: entries.clone(),
+    });
+    let peer = peer_ctx(&ctx, entries);
     let meta = MetaPeer::new();
     meta.always(
         "repo-b",
@@ -1292,6 +1402,12 @@ fn waiting_states_and_contention_are_not_counted() {
     {
         let busy = busy.clone();
         world.worker.script(move |op, payload| {
+            if payload["route"]["repo"] == "repo-e" {
+                // The folder view still says Running, but its worker is gone.
+                return Some(Err(CallError::Unavailable(
+                    "LOCAL_WORKER_UNAVAILABLE: worker gone".into(),
+                )));
+            }
             if op != "feed-offer" || payload["route"]["repo"] != "repo-a" {
                 return None;
             }
@@ -1386,6 +1502,42 @@ fn waiting_states_and_contention_are_not_counted() {
     assert!(offers[7].at - offers[6].at >= Duration::from_millis(750));
     // Only the Transient failure counted.
     assert_eq!(lane.key("repo-b").failures, 0);
+
+    // A local worker that cannot be reached (repo E): rechecked, never
+    // counted, and never an error at the hub however often it is rechecked
+    // (a Transient code would be shown from the 3rd consecutive failure on).
+    assert!(wait_until(Duration::from_secs(3), || world
+        .finished_of("repo-e")
+        .len()
+        >= 4));
+    let key_e = lane.key("repo-e");
+    assert_eq!(key_e.failures, 0, "{key_e:?}");
+    assert_eq!(
+        key_e.last_error.as_ref().unwrap().code,
+        "LOCAL_WORKER_UNAVAILABLE"
+    );
+    for fin in world.finished_of("repo-e") {
+        assert!(!fin.ok && fin.error.is_none(), "{fin:?}");
+    }
+    let snapshot = hub.snapshot_now();
+    let pair = |repo: &str| {
+        snapshot
+            .folders
+            .iter()
+            .find(|folder| folder.repo == repo)
+            .unwrap()
+            .sync
+            .peers
+            .iter()
+            .find(|pair| pair.installation == PEER)
+            .cloned()
+            .unwrap()
+    };
+    let e = pair("repo-e");
+    assert!(e.error.is_none(), "{e:#?}");
+    assert_ne!(e.state, FolderPeerState::Backoff, "{e:#?}");
+    let b = pair("repo-b");
+    assert_eq!(b.state, FolderPeerState::WaitingForRemote, "{b:#?}");
 
     // The remote entry becomes Running: it exchanges.
     set_entry(&peer, entry("repo-d", EntryState::Running));
