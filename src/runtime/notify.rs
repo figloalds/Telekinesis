@@ -438,14 +438,39 @@ pub fn spawn_notifier(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("notifier".into())
         .spawn(move || {
+            let mut errors = crate::util::backoff::Backoff::inbox();
             while !ctx.stopping.load(Ordering::Relaxed) {
                 queue.wait(NOTIFIER_TICK);
                 // Coalesce a burst (one activation slice queues many paths).
                 thread::sleep(NOTIFIER_COALESCE);
-                let attached = ctx.mount.status().state.is_attached();
-                // The engine only when a control request left notifications.
-                deliver_with(&ctx.engine, Some(&vitals), &queue, attached);
-                vitals.refresh_notify_queue(&queue);
+                // A panicking round never ends the thread (WP2.3 review
+                // minor, fixed by WP2.INT): the poison policy runs, it is
+                // logged, and the next round waits for a growing delay.
+                let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let attached = ctx.mount.status().state.is_attached();
+                    // The engine only when a control request left
+                    // notifications.
+                    deliver_with(&ctx.engine, Some(&vitals), &queue, attached);
+                    vitals.refresh_notify_queue(&queue);
+                }));
+                if round.is_err() {
+                    super::check_engine_poison(&ctx.engine);
+                    crate::util::log::event!(error, UNKNOWN_ERROR, {
+                        "site": "worker.notifier",
+                        "message": "a notification round panicked",
+                    });
+                    let until =
+                        std::time::Instant::now() + errors.failure(std::time::Instant::now());
+                    while !ctx.stopping.load(Ordering::Relaxed) {
+                        let left = until.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        thread::sleep(left.min(Duration::from_millis(100)));
+                    }
+                    continue;
+                }
+                errors.success(std::time::Instant::now());
                 if !queue.is_empty() {
                     // Retries wait for a mount transition: do not spin.
                     thread::sleep(NOTIFIER_RETRY);

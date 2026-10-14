@@ -1158,8 +1158,9 @@ fn a_failed_slow_preparation_requeues_only_its_event() {
         }
     }
     // Every preparation fails until the independent creates are in.
+    // The point is scoped to this worker's repository (WP2.INT).
     let armed = Armed::new(FaultConfig::new(
-        "worker.activator.prepare",
+        &format!("worker.activator.prepare.{}", w.ctx.repo),
         FaultAction::Fail,
     ));
     // The edit is staged first, so it is popped first.
@@ -1660,5 +1661,39 @@ fn a_panic_while_idle_is_contained() {
                 && !lock_engine(&w.engine).background_activation
         }),
         "the activator's flags outlived it"
+    );
+}
+
+/// WP2.3 review (minor), fixed by WP2.INT: a panic in a maintenance tick is
+/// contained like the activator's (and the recovery loop's before it): the
+/// thread lives on, and its next ticks still refresh the status cell's
+/// content members.
+#[test]
+fn a_panicking_maintenance_tick_is_contained() {
+    use tkfs::util::fault::{FaultAction, FaultConfig};
+    let p = pair(2);
+    let w = Worker::start(&p.state, false);
+    let point = format!("worker.maintenance.tick.{}", w.ctx.repo);
+    let content_at = |w: &Worker| w.ctx.status_cell.load()["cell"]["content_at_ms"].as_u64();
+    {
+        let _armed = Armed::new(FaultConfig {
+            count: Some(1),
+            ..FaultConfig::new(&point, FaultAction::Panic)
+        });
+        // Maintenance ticks every second: give it three to hit the point,
+        // then make sure it did (a hit left here would be the test's own).
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            tkfs::util::fault::hit(&point).is_none(),
+            "maintenance never ticked into the armed point"
+        );
+    }
+    let after_panic = content_at(&w).unwrap_or(0);
+    // The full refresh is spaced by its own cost; ticks resume after the
+    // first failure's 1 s backoff.
+    assert!(
+        wait_until(Duration::from_secs(15), || content_at(&w)
+            .is_some_and(|at| at > after_panic)),
+        "maintenance stopped after the panic"
     );
 }
