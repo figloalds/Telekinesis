@@ -34,12 +34,56 @@
 //! before WP1.6; remote ones share it now. An exact guard has to count the
 //! touched cones, which is the derivation the successor avoids;
 //! CCR-WP1.6-5 asks WP1.7 (append-mode counting, §5.2 (d)) for it.
-use super::derive::persist_projection;
+use super::derive::{persist_commit_records, persist_projection};
 use super::*;
 use std::{
     cell::{Cell, RefCell},
     sync::OnceLock,
 };
+
+/// The view of `branch` after a slow commit stored `projection` (`None` if a
+/// name cannot be keyed, which a committed projection never has).
+fn slow_commit_view(
+    branch: &str,
+    projection: Projection,
+    changes: u64,
+    data_version: i64,
+    transactional: bool,
+) -> Option<ViewCache> {
+    let slots = projection
+        .entries
+        .values()
+        .filter(|e| e.alive)
+        .map(|e| Ok(((e.parent.clone(), name_key(&e.name)?), e.id.clone())))
+        .collect::<Result<_>>()
+        .ok()?;
+    Some(ViewCache {
+        branch: branch.into(),
+        changes,
+        data_version,
+        transactional,
+        projection,
+        slots,
+    })
+}
+
+/// The head registers a `current_parts` row stores for its entity.
+const PART_FIELDS: [&str; 5] = ["kind", "location", "alive", "content", "basic"];
+
+/// Upserts the `current_parts` row of `entity` (its entry and its head
+/// registers) from projection `p`, which must hold the entry.
+fn write_part(tx: &Connection, branch: &str, entity: &str, p: &Projection) -> Result<()> {
+    let heads: BTreeMap<_, _> = PART_FIELDS
+        .into_iter()
+        .filter_map(|field| {
+            let key = register(entity, field);
+            p.heads.get(&key).map(|v| (key, v))
+        })
+        .collect();
+    tx.execute("INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads",
+        params![branch, entity, serde_json::to_string(&p.entries[entity])?, serde_json::to_string(&heads)?])?;
+    Ok(())
+}
 
 /// Commit cache: fast/slow commit counters (WP2.4 may add its event cache).
 #[derive(Default)]
@@ -241,6 +285,66 @@ impl Store {
         }
         Ok(fast)
     }
+    /// How a slow-path commit stores its projection `p` on `branch`
+    /// (WP1.INT fix round 1, CCR-WP1.INT-4): `Some(entities)` when writing
+    /// the `current_parts` rows of those entities makes the stored projection
+    /// (`snapshot::load_projection`: `current_state` overlaid with
+    /// `current_parts`) read exactly `p`; `None` for the full rewrite of
+    /// `current_state` (`persist_projection`).
+    ///
+    /// The full rewrite stores the whole projection (about 7 MB at 5K
+    /// entries) on every slow commit, as much again as the forced snapshot
+    /// seal, and that I/O made slow commits spike past the
+    /// `concurrent_namespace_ops_5k` floor. A delta is possible when the
+    /// stored projection (the connection's view, fresh by its own contract,
+    /// else loaded) differs from `p` only in entries and their head
+    /// registers, with no key removed, every changed register belonging to an
+    /// entry of `p` and to one of the [`PART_FIELDS`], and the same
+    /// `conflicts` and `pending`. Otherwise (no stored projection yet, any
+    /// other difference, or a read error), and whenever the branch's parts
+    /// would outnumber half of its entries, the full rewrite runs, which also
+    /// folds the parts back into `current_state` (`load_projection` cost
+    /// stays bounded; the rewrites happen as the entries double, so their
+    /// cost is amortized). The derived-state oracle (`verify_derived_state`)
+    /// compares exactly this stored projection with a rebuild.
+    fn projection_delta(&self, branch: &str, p: &Projection) -> Option<BTreeSet<String>> {
+        let view = self.view(branch).ok()?;
+        let stored = &view.projection;
+        if stored.conflicts != p.conflicts
+            || stored.pending != p.pending
+            || !stored.entries.keys().all(|id| p.entries.contains_key(id))
+            || !stored.heads.keys().all(|key| p.heads.contains_key(key))
+        {
+            return None;
+        }
+        let mut changed: BTreeSet<String> = p
+            .entries
+            .iter()
+            .filter(|(id, entry)| stored.entries.get(*id) != Some(*entry))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for (key, versions) in &p.heads {
+            if stored.heads.get(key) == Some(versions) {
+                continue;
+            }
+            let (entity, field) = key.rsplit_once('/')?;
+            if !PART_FIELDS.contains(&field) || !p.entries.contains_key(entity) {
+                return None;
+            }
+            changed.insert(entity.to_owned());
+        }
+        drop(view);
+        let parts: i64 = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM current_parts WHERE branch=?",
+                [branch],
+                |r| r.get(0),
+            )
+            .ok()?;
+        let parts = usize::try_from(parts).ok()?;
+        (parts.saturating_add(changed.len()) <= p.entries.len() / 2).then_some(changed)
+    }
     /// Writes a checked event: through `fast` (an incremental delta), or by
     /// full replay of the branch when `fast` is `None`.
     pub(super) fn commit_checked(
@@ -252,6 +356,13 @@ impl Store {
     ) -> Result<()> {
         let Checked { payload, objects } = checked;
         let incremental = fast.is_some();
+        // Another connection's commit after this point bumps it (see the
+        // view seeding below).
+        let base_version = if incremental {
+            None
+        } else {
+            self.data_version().ok()
+        };
         let events = if fast.is_none() {
             let mut events: Vec<_> = self
                 .events()?
@@ -274,6 +385,13 @@ impl Store {
         if crate::util::fault::hit(BUSY_FAULT).is_some() {
             return Err(injected_busy().into());
         }
+        // A slow commit stores its projection as a delta when it can (read
+        // before the savepoint: the stored projection this commit replaces).
+        let delta = if incremental {
+            None
+        } else {
+            self.projection_delta(&event.branch.id, &projection)
+        };
         fault("before_sql");
         let tx = self.db.savepoint()?;
         for object in &objects {
@@ -318,16 +436,16 @@ impl Store {
                 .map(|c| &c.entity)
                 .collect::<BTreeSet<_>>()
             {
-                let heads: BTreeMap<_, _> = ["kind", "location", "alive", "content", "basic"]
-                    .into_iter()
-                    .filter_map(|field| {
-                        let key = register(entity, field);
-                        projection.heads.get(&key).map(|v| (key, v))
-                    })
-                    .collect();
-                tx.execute("INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads",
-                    params![event.branch.id,entity,serde_json::to_string(&projection.entries[entity])?,serde_json::to_string(&heads)?])?;
+                write_part(&tx, &event.branch.id, entity, &projection)?;
             }
+        } else if let Some(changed) = &delta {
+            // The stored projection becomes `projection` through the rows of
+            // the entities that changed; then the records are derived as
+            // `persist_projection` would.
+            for entity in changed {
+                write_part(&tx, &event.branch.id, entity, &projection)?;
+            }
+            persist_commit_records(&tx, &event.branch.id, &projection, &events, &event.id)?;
         } else {
             persist_projection(&tx, &event.branch.id, &projection, &events, Some(&event.id))?;
         }
@@ -346,7 +464,13 @@ impl Store {
             params![event.branch.id, event.id],
         )?;
         // The forced seal after a slow-path commit is kept (REVAMP_PLAN P4).
-        snapshot::maybe_persist(&tx, &event.branch.id, !incremental)?;
+        // It seals the projection this commit holds (and has just stored).
+        snapshot::maybe_persist(
+            &tx,
+            &event.branch.id,
+            !incremental,
+            (!incremental).then_some(&projection),
+        )?;
         tx.commit()?;
         self.count_commit(&event.id, incremental);
         // Patch the view only if no other connection committed since it was
@@ -381,6 +505,18 @@ impl Store {
             view.projection.heads.extend(projection.heads);
             view.changes = self.db.total_changes();
             view.transactional = !self.db.is_autocommit();
+        } else if let Some(version) = base_version.filter(|base| Some(*base) == data_version) {
+            // A slow commit stored exactly `projection`, and no other
+            // connection committed since its history was read: it is the
+            // fresh view, so the next reader does not load and parse the
+            // whole projection again (WP1.INT fix round 1).
+            *cache = slow_commit_view(
+                &event.branch.id,
+                projection,
+                self.db.total_changes(),
+                version,
+                !self.db.is_autocommit(),
+            );
         } else {
             *cache = None;
         }
