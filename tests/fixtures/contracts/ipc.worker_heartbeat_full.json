@@ -90,5 +90,6 @@
       "caught_up": false,
       "last_exchange_ms": 1790000004500
     }
-  ]
+  ],
+  "mount_errors": 0
 }

@@ -34,5 +34,6 @@
   "activation": null,
   "content": null,
   "journal": null,
-  "peers": []
+  "peers": [],
+  "mount_errors": 0
 }

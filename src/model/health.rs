@@ -14,6 +14,12 @@ pub trait MountControl: Send + Sync {
     fn attach(&self, path: &Path) -> Result<MountStatus, ErrorWire>;
     fn detach(&self, force: bool) -> Result<MountStatus, ErrorWire>;
     fn status(&self) -> MountStatus;
+    /// Generation of the published [`MountStatus`]: bumps on every state
+    /// change (`WorkerHeartbeat.generations.mount`). Provided as 0 for
+    /// controllers that do not count (CCR-WP1.5-2).
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 /// What the controller wants the mount to be.

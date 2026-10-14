@@ -75,7 +75,8 @@
     "activation": null,
     "content": null,
     "journal": null,
-    "peers": []
+    "peers": [],
+    "mount_errors": 0
   },
   "last_error": null,
   "restarts": 1,

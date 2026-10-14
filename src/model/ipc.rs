@@ -393,6 +393,11 @@ pub struct WorkerHeartbeat {
     /// Per-peer feed counters, sorted by replica.
     #[serde(default)]
     pub peers: Vec<PeerFeedCounters>,
+    /// Mount-scoped callback failures since the worker started (the counter
+    /// that replaced the close path's engine-health write, §4.3;
+    /// CCR-WP1.5-1).
+    #[serde(default)]
+    pub mount_errors: u64,
 }
 
 /// `feed-offer{route}` → [`MetaExchangeRequest`].

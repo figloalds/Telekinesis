@@ -256,6 +256,10 @@ impl MountControl for MountController {
     fn status(&self) -> MountStatus {
         self.inner.current()
     }
+
+    fn generation(&self) -> u64 {
+        MountController::generation(self)
+    }
 }
 
 impl Inner {
