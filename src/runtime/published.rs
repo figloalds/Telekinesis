@@ -53,11 +53,13 @@ pub(super) fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
     };
     if !parts.is_empty() {
         let objects: Vec<_> = parts.keys().cloned().collect();
+        let deadline = std::time::Instant::now() + crate::bulk_sync::RECEIVE_BUDGET;
         let received =
-            transfer.receive_parts_data_locked(parts, &[], &BTreeSet::new(), Some(&lock));
-        let completed = match received {
-            Ok(completed) => completed,
+            transfer.receive_parts_until(parts, &[], &BTreeSet::new(), Some(&lock), Some(deadline));
+        let outcomes = match received {
+            Ok(outcomes) => outcomes,
             Err(error) => {
+                // Page-level failure: nothing was received.
                 let e = engine.lock().unwrap();
                 for object in objects {
                     e.store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", rusqlite::params![object, format!("{error:#}"), time()])?;
@@ -65,7 +67,20 @@ pub(super) fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
                 return Err(error);
             }
         };
-        engine.lock().unwrap().store.register_received(&completed)?;
+        let (completed, failed) = crate::core::transfer::split_outcomes(&outcomes);
+        {
+            // Completed objects are registered first, even when another part
+            // failed; then each failed object gets its error and backoff.
+            let e = engine.lock().unwrap();
+            e.store.register_received(&completed)?;
+            for (object, error) in &failed {
+                e.store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", rusqlite::params![object, error.message, time()])?;
+                e.store.record_object_failure(object, error)?;
+            }
+        }
+        if let Some((_, error)) = failed.into_iter().next() {
+            return Err(error.into_anyhow());
+        }
         if result.get("known_objects").is_some() {
             result["known_objects"] = json!(transfer.shared_object_inventory()?);
             result["partial_objects"] = json!(transfer.partial_objects()?);
