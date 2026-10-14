@@ -46,10 +46,11 @@
 //!   `LAST`. They are reassembled up to the per-op limit
 //!   (`protocol::max_body`, capped by `ConnOptions::max_body`).
 //! * **Streams.** A streamed response is CHUNK frames (`MORE`, each delivered
-//!   to the `call_streaming` callback) followed by the RESPONSE. A streamed
-//!   request is a REQUEST with `MORE` and no `total`, CHUNK frames with `MORE`
-//!   (delivered to [`Incoming::chunks`]), and an empty CHUNK without `MORE`
-//!   that ends the body.
+//!   to the `call_streaming` callback, which may hold the connection's reads
+//!   for at most `dead_after` without taking any) followed by the RESPONSE.
+//!   A streamed request is a REQUEST with `MORE` and no `total`, CHUNK frames
+//!   with `MORE` (delivered to [`Incoming::chunks`]), and an empty CHUNK
+//!   without `MORE` that ends the body.
 use crate::{
     model::{
         errors::ErrorWire,
@@ -75,7 +76,7 @@ use std::{
     net::TcpStream,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::Receiver,
     },
@@ -248,6 +249,12 @@ impl std::fmt::Debug for Conn {
 pub(crate) const RECHECK: Duration = wire::DEADLINE_SCAN;
 /// A stand-in for "no deadline" that cannot overflow `Instant`.
 const FAR: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Received chunk bodies at least this large are copied into recycled
+/// buffers of `wire::MAX_CHUNK` bytes (see `Shared::chunk_body`).
+const POOLED_CHUNK: usize = 512 * 1024;
+/// Recycled chunk buffers a connection keeps (at most 4 MiB, only once it
+/// has received large stream chunks).
+const POOL_BUFFERS: usize = 4;
 /// Longest error message carried in a RESPONSE or GOAWAY header.
 const MAX_ERROR_MESSAGE: usize = 4096;
 
@@ -471,17 +478,22 @@ fn fits(queued: usize, bytes: usize, cap: usize) -> bool {
     bytes == 0 || queued == 0 || queued + bytes <= cap
 }
 
-/// What a waiting call receives from the I/O thread. A stream chunk is a
-/// zero-copy slice of the received WebSocket message, with what it was
-/// charged to receive-side flow control (`rx_buffered`: the whole frame plus
-/// a fixed overhead, so header-only chunks count too).
+/// What a waiting call receives from the I/O thread. A stream chunk owns a
+/// copy of its body (a slice of the received message would pin tungstenite's
+/// read buffer; see `Shared::chunk_body`), with what it was charged to
+/// receive-side flow control (`rx_buffered`: the whole frame, or the copy's
+/// buffer if larger, plus a fixed overhead, so header-only chunks count too).
 pub(crate) enum Event {
-    Chunk(ChunkHeader, tungstenite::Bytes, usize),
+    Chunk(ChunkHeader, Vec<u8>, usize),
     /// PROGRESS frames received since the caller last looked (coalesced: one
     /// resets the idle deadline as well as many).
     Progress,
     Done(Result<Reply, ErrorWire>),
     Lost(String),
+    /// The I/O thread gave up on the call: its consumer took none of its
+    /// queued chunks for `dead_after` while they held the connection's reads
+    /// (see `io`). The caller reports `CallError::Timeout`.
+    Expired,
 }
 
 #[derive(Default)]
@@ -569,23 +581,42 @@ impl Slot {
         lock(&self.events).queue.drain(..).collect()
     }
 
-    /// Whether the call's outcome (`Done` or `Lost`) is queued. The I/O thread
-    /// pushes it while holding the state lock, in the same critical section
-    /// that removes the call from `State::pending`.
+    /// What the chunks queued and not yet taken were charged to receive-side
+    /// flow control (`Shared::rx_buffered`).
+    fn queued_cost(&self) -> usize {
+        lock(&self.events)
+            .queue
+            .iter()
+            .map(|event| match event {
+                Event::Chunk(_, _, cost) => *cost,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Whether the call's outcome (`Done`, `Lost` or `Expired`) is queued.
+    /// The I/O thread queues it once the call has left `State::pending`
+    /// (`Done` and `Lost` in the same critical section that removes it).
     fn has_outcome(&self) -> bool {
         lock(&self.events)
             .queue
             .iter()
-            .any(|event| matches!(event, Event::Done(_) | Event::Lost(_)))
+            .any(|event| matches!(event, Event::Done(_) | Event::Lost(_) | Event::Expired))
     }
 
-    /// The error an unfinished upload reports once its request has ended.
-    fn ended_error(&self) -> CallError {
+    /// The error an unfinished upload (started at `started`) reports once its
+    /// request has ended.
+    fn ended_error(&self, started: Instant) -> CallError {
         let events = lock(&self.events);
         for event in events.queue.iter() {
             match event {
                 Event::Done(Err(error)) => return CallError::Remote(error.clone()),
                 Event::Lost(detail) => return CallError::ConnectionLost(detail.clone()),
+                Event::Expired => {
+                    return CallError::Timeout {
+                        after_ms: ms(started.elapsed()),
+                    };
+                }
                 _ => {}
             }
         }
@@ -629,6 +660,11 @@ pub(crate) struct State {
     pub(crate) closed: Option<ErrorWire>,
     /// The I/O thread released the socket.
     pub(crate) finished: bool,
+    /// (Client.) Calls that ended (their outcome is queued) while chunks
+    /// their callers had not taken yet were still queued before it: those
+    /// still count against the receive bound until taken, so the hold bound
+    /// (`Shared::expire_heaviest`) must be able to free them too.
+    undrained: Vec<(u64, Weak<Slot>)>,
 }
 
 impl State {
@@ -709,9 +745,15 @@ pub(crate) struct Shared {
     /// Received stream chunks not yet taken by their callers, at their
     /// charge to the receive bound (frame bytes plus a fixed overhead).
     pub(crate) rx_buffered: AtomicUsize,
+    /// Chunks taken out of `rx_buffered` so far (by their callers, or freed
+    /// when a call ended): the I/O thread's evidence that consumers make
+    /// progress while it holds its reads.
+    pub(crate) rx_taken: AtomicU64,
     /// The I/O thread holds its reads: receivers are behind, or (server) the
     /// peer leaves our replies unread.
     pub(crate) rx_paused: AtomicBool,
+    /// (Client.) Recycled buffers for large chunk bodies.
+    chunk_pool: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Shared {
@@ -755,7 +797,38 @@ impl Shared {
         self.options.control_queue_bytes
     }
 
+    /// (Client, I/O thread.) A received stream chunk's body, copied out of
+    /// the message: a slice would pin tungstenite's read buffer. A large body
+    /// (from [`POOLED_CHUNK`]) goes into a recycled buffer of
+    /// `wire::MAX_CHUNK` bytes, which its charge counts: a fresh allocation
+    /// of that size per chunk maps fresh pages (on Windows each large
+    /// allocation is its own mapping), which cost about a third of the
+    /// streamed download rate where the copy itself costs little.
+    pub(crate) fn chunk_body(&self, body: &[u8]) -> Vec<u8> {
+        if body.len() < POOLED_CHUNK || body.len() > wire::MAX_CHUNK {
+            return body.to_vec();
+        }
+        let recycled = lock(&self.chunk_pool).pop();
+        let mut buffer = recycled.unwrap_or_else(|| Vec::with_capacity(wire::MAX_CHUNK));
+        buffer.clear();
+        buffer.extend_from_slice(body);
+        buffer
+    }
+
+    /// Returns a chunk body taken by its caller (or dropped) to the pool, if
+    /// it came from it and the pool has room.
+    pub(crate) fn recycle(&self, body: Vec<u8>) {
+        if body.capacity() < POOLED_CHUNK || body.capacity() > wire::MAX_CHUNK {
+            return;
+        }
+        let mut pool = lock(&self.chunk_pool);
+        if pool.len() < POOL_BUFFERS {
+            pool.push(body);
+        }
+    }
+
     fn rx_consumed(&self, bytes: usize) {
+        self.rx_taken.fetch_add(1, Ordering::AcqRel);
         let before = self.rx_buffered.fetch_sub(bytes, Ordering::AcqRel);
         if self.rx_paused.load(Ordering::Acquire)
             && before.saturating_sub(bytes) <= self.rx_cap() / 2
@@ -767,11 +840,13 @@ impl Shared {
     /// Drops whatever events a finished or abandoned call left in its slot,
     /// returning their stream bytes to receive-side flow control. Every way
     /// out of a call ends here (`PendingGuard`, `Upload`), so a chunk the I/O
-    /// thread counted is always uncounted, even when the caller stopped early.
+    /// thread counted is always uncounted, even when the caller stopped early
+    /// (or the I/O thread gave up on it: `expire_heaviest`).
     fn release(&self, slot: &Slot) {
         for event in slot.drain() {
-            if let Event::Chunk(_, _, cost) = event {
+            if let Event::Chunk(_, body, cost) = event {
                 self.rx_consumed(cost);
+                self.recycle(body);
             }
         }
     }
@@ -1115,6 +1190,62 @@ impl Shared {
         removed
     }
 
+    /// (Client, I/O thread, under the state lock.) Call `id` has just had
+    /// its outcome queued; if chunks its caller has not taken are queued
+    /// before it, it is remembered for [`Shared::expire_heaviest`].
+    pub(crate) fn track_undrained(&self, state: &mut State, id: u64, slot: &Arc<Slot>) {
+        state
+            .undrained
+            .retain(|(_, slot)| slot.upgrade().is_some_and(|slot| slot.queued_cost() > 0));
+        if slot.queued_cost() > 0 {
+            state.undrained.push((id, Arc::downgrade(slot)));
+        }
+    }
+
+    /// (Client, I/O thread.) Gives up on the call whose queued chunks cost
+    /// the most, and frees them; its caller gets `Event::Expired` (a
+    /// `Timeout`) once its callback returns. A pending call is abandoned
+    /// (CANCEL sent, its queued frames dropped); a call that has already
+    /// ended loses its queued outcome too, as its caller can no longer have
+    /// every chunk. The I/O thread does this when its reads have been held
+    /// for slow consumers and none of them took anything for `dead_after`, so
+    /// a stuck consumer cannot suspend liveness, and the idle limits of the
+    /// other calls, for longer than that. Returns whether a call was given up.
+    pub(crate) fn expire_heaviest(&self) -> bool {
+        let heaviest = {
+            let mut state = self.lock();
+            state.undrained.retain(|(_, slot)| slot.strong_count() > 0);
+            let pending = state
+                .pending
+                .iter()
+                .map(|(id, slot)| (*id, slot.clone(), true));
+            let ended = state
+                .undrained
+                .iter()
+                .filter_map(|(id, slot)| slot.upgrade().map(|slot| (*id, slot, false)));
+            pending
+                .chain(ended)
+                .map(|(id, slot, pending)| (slot.queued_cost(), id, slot, pending))
+                .filter(|(cost, ..)| *cost > 0)
+                .max_by_key(|(cost, id, ..)| (*cost, *id))
+        };
+        let Some((_, id, slot, pending)) = heaviest else {
+            return false;
+        };
+        if pending {
+            // `false`: the call ended meanwhile (it is then undrained, and a
+            // later turn can expire it).
+            if !self.abandon(id, &slot) {
+                return false;
+            }
+        } else {
+            self.lock().undrained.retain(|(other, _)| *other != id);
+            self.release(&slot);
+        }
+        slot.push(Event::Expired);
+        true
+    }
+
     /// Waits for the outcome of call `id`.
     fn await_reply(
         &self,
@@ -1176,9 +1307,11 @@ impl Shared {
                 });
             };
             match event {
-                Event::Chunk(header, bytes, cost) => {
+                Event::Chunk(header, body, cost) => {
                     self.rx_consumed(cost);
-                    if let Err(error) = on_chunk(header, &bytes) {
+                    let taken = on_chunk(header, &body);
+                    self.recycle(body);
+                    if let Err(error) = taken {
                         guard.abandon();
                         return Err(CallError::Remote(error));
                     }
@@ -1192,6 +1325,13 @@ impl Shared {
                 Event::Lost(detail) => {
                     guard.armed = false;
                     return Err(CallError::ConnectionLost(detail));
+                }
+                Event::Expired => {
+                    // Abandoned by the I/O thread (`Shared::expire_heaviest`).
+                    guard.armed = false;
+                    return Err(CallError::Timeout {
+                        after_ms: ms(started.elapsed()),
+                    });
                 }
             }
         }
@@ -1290,7 +1430,9 @@ impl Conn {
             bytes_down: AtomicU64::new(0),
             rtt_ms: AtomicU64::new(u64::MAX),
             rx_buffered: AtomicUsize::new(0),
+            rx_taken: AtomicU64::new(0),
             rx_paused: AtomicBool::new(false),
+            chunk_pool: Mutex::new(Vec::new()),
         });
         io::start(ws, shared.clone())?;
         Ok(Conn { inner: shared })
@@ -1329,7 +1471,14 @@ impl Conn {
     /// A request whose response streams CHUNK frames into `on_chunk` before the
     /// final RESPONSE. PROGRESS and chunks reset the `idle` deadline. An error
     /// from `on_chunk` cancels the request and is returned as
-    /// `CallError::Remote` (the connection stays usable).
+    /// `CallError::Remote` (the connection stays usable). Chunks the callback
+    /// has not taken yet count against the receive bound
+    /// (`ConnOptions::data_queue_bytes`); above it the connection holds its
+    /// reads until they are taken. If no stream callback of the connection
+    /// takes anything for `dead_after` during such a hold, the call with the
+    /// most chunks queued is cancelled and returns `CallError::Timeout`, so a
+    /// stuck callback never suspends the connection's liveness or the other
+    /// calls for longer than that.
     #[allow(clippy::too_many_arguments)]
     pub fn call_streaming(
         &self,
@@ -1408,6 +1557,9 @@ impl Conn {
     }
 
     /// No new requests; in-flight requests complete; close after idle or 5 s.
+    /// The peer closes once its own calls have ended; this side keeps reading
+    /// until then (or the 5 s grace), so requests the peer sent before it
+    /// read the GOAWAY are refused with `WS_CLOSED` rather than lost.
     pub fn goaway(&self, code: &str, message: &str) {
         let shared = &self.inner;
         let message = truncate(message.to_owned());
@@ -1572,7 +1724,7 @@ impl Upload {
             Room::Ready => {}
             Room::Stopped(()) => {
                 drop(state);
-                return Err(self.slot.ended_error());
+                return Err(self.slot.ended_error(self.started));
             }
             Room::Expired => {
                 drop(state);
@@ -1586,7 +1738,7 @@ impl Upload {
                 }
                 // The request ended as the wait expired: `finish` has its
                 // outcome.
-                return Err(self.slot.ended_error());
+                return Err(self.slot.ended_error(self.started));
             }
         }
         for (lane, frame) in frames {

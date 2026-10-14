@@ -2823,6 +2823,436 @@ fn goaway_closes_after_the_grace_period() {
 }
 
 // ---------------------------------------------------------------------------
+// WP1.INT post-integration re-review
+
+/// Requests the client sent before it read the server's GOAWAY reach a
+/// server that keeps reading: they are refused (`WS_CLOSED`, or locally
+/// once the GOAWAY arrived), never lost. Before the re-review fix the side
+/// that sent the GOAWAY closed as soon as it was idle and discarded the
+/// crossing requests while lingering, so their callers saw `ConnectionLost`
+/// (uncertain, invariant 16) for requests that never ran.
+#[test]
+fn requests_crossing_a_goaway_are_refused_not_lost() {
+    for round in 0..20 {
+        let (client, server) = session(Transport::Plain);
+        server.serve(echo());
+        let served = Arc::new(AtomicUsize::new(0));
+        let callers: Vec<_> = (0..8)
+            .map(|i| {
+                let client = client.clone();
+                let served = served.clone();
+                thread::spawn(move || {
+                    loop {
+                        match call(&client, "echo", json!({ "i": i })) {
+                            Ok(_) => served.fetch_add(1, Ordering::SeqCst),
+                            Err(error) => return error,
+                        };
+                    }
+                })
+            })
+            .collect();
+        // Calls are flowing in every direction before the GOAWAY.
+        wait_until("calls before the GOAWAY", Duration::from_secs(10), || {
+            served.load(Ordering::SeqCst) >= 64
+        });
+        server.goaway("PEER_REVOKED", "the peer was revoked");
+        for caller in callers {
+            let error = caller.join().unwrap();
+            match &error {
+                CallError::Unavailable(_) => assert_eq!(error.code(), "PEER_REVOKED"),
+                CallError::Remote(refusal) => assert_eq!(refusal.code, "WS_CLOSED", "{refusal}"),
+                other => panic!("round {round}: a request crossing the GOAWAY: {other:?}"),
+            }
+        }
+        for side in [&server, &client] {
+            let closed = side
+                .wait_closed(Duration::from_secs(7))
+                .unwrap_or_else(|| panic!("round {round}: still open"));
+            assert_eq!(closed.code, "PEER_REVOKED", "round {round}: {closed}");
+        }
+    }
+}
+
+/// A stream consumer that takes nothing while the client holds its reads
+/// (its queued chunks are over the receive bound) loses its call after
+/// `dead_after` (`Timeout`; CANCEL sent), so reading resumes: calls whose
+/// replies waited behind the hold complete, and a dead link is detected
+/// again. Before the re-review fix the hold lasted as long as the consumer
+/// stayed stuck: liveness and every other call's idle limit were suspended
+/// with it (a call with a 12 s deadline timed out instead of completing or
+/// failing with `TRANSPORT_DEAD`).
+#[test]
+fn a_stuck_stream_consumer_does_not_hold_the_connection() {
+    let held = ConnOptions {
+        data_queue_bytes: MIB,
+        ..fast_liveness()
+    };
+    // Starts a 64 MiB download whose callback blocks on its first chunk
+    // until `release` fires; returns once the callback is blocked.
+    let stuck = |client: &Conn| {
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let client = client.clone();
+        let call = thread::spawn(move || {
+            let mut first = true;
+            let mut on_chunk = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+                if first {
+                    first = false;
+                    blocked_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                }
+                Ok(())
+            };
+            client.call_streaming(
+                "download",
+                json!({ "count": 64, "size": MIB }),
+                vec![],
+                Priority::Control,
+                None,
+                Duration::from_secs(30),
+                &mut on_chunk,
+            )
+        });
+        blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The next chunks fill the 1 MiB receive bound: reads are held.
+        thread::sleep(Duration::from_millis(300));
+        (call, release_tx)
+    };
+    let deadline = Duration::from_secs(12);
+    // A healthy link: a call made during the hold completes once the stuck
+    // stream is cancelled, without waiting for its consumer.
+    {
+        let (client, server) = conns(ws_pair(Transport::Plain), held, fast_liveness());
+        server.serve(stream_service(Duration::ZERO));
+        let (stream, release) = stuck(&client);
+        let started = Instant::now();
+        let reply = client
+            .call(
+                "echo",
+                json!({ "x": 7 }),
+                vec![],
+                Priority::Control,
+                deadline,
+            )
+            .unwrap_or_else(|error| panic!("after {:?}: {error:?}", started.elapsed()));
+        assert_eq!(reply.header["x"], 7);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        release.send(()).unwrap();
+        let error = stream.join().unwrap().unwrap_err();
+        assert!(matches!(error, CallError::Timeout { .. }), "{error:?}");
+        assert_eq!(
+            call(&client, "echo", json!({ "after": 1 })).unwrap().header["after"],
+            1
+        );
+        assert!(client.closed().is_none() && server.closed().is_none());
+    }
+    // A link that goes silent during the hold: the client judges it dead
+    // within a few `dead_after`, and every waiter is woken. (The server is
+    // slow to judge, so the client's own detection is what is measured, not
+    // a reset from the server's.)
+    {
+        let (client_ws, server_ws, proxy) = ws_pair_proxied(Transport::Plain);
+        let patient = ConnOptions {
+            dead_after: Duration::from_secs(60),
+            ..fast_liveness()
+        };
+        let (client, server) = conns((client_ws, server_ws), held, patient);
+        server.serve(stream_service(Duration::ZERO));
+        let (stream, release) = stuck(&client);
+        proxy.blackhole(true);
+        let started = Instant::now();
+        let error = client
+            .call("echo", json!({}), vec![], Priority::Control, deadline)
+            .unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(error, CallError::ConnectionLost(_)), "{error:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+        let closed = client.wait_closed(Duration::from_secs(5)).unwrap();
+        assert_eq!(closed.code, "TRANSPORT_DEAD", "{closed}");
+        release.send(()).unwrap();
+        let error = stream.join().unwrap().unwrap_err();
+        assert!(error.is_uncertain(), "{error:?}");
+        server.close();
+        assert!(server.wait_closed(Duration::from_secs(5)).is_some());
+    }
+}
+
+/// The same bound covers a stream whose reply has already arrived: its
+/// callback is stuck on the first chunk, its other chunks (over half the
+/// receive bound) and its outcome wait queued, and another, slow stream
+/// pushes the client over the bound. Once that stream's callback has taken
+/// what it had, nothing moves (the hold ends only under half the bound);
+/// after `dead_after` the finished stream's chunks are dropped (its caller
+/// gets `Timeout`: it can no longer have every chunk), and the other stream
+/// completes.
+#[test]
+fn a_stuck_consumer_of_a_finished_stream_does_not_hold_the_connection() {
+    let options = ConnOptions {
+        data_queue_bytes: 4 * MIB,
+        ..fast_liveness()
+    };
+    let (client, server) = conns(ws_pair(Transport::Plain), options, fast_liveness());
+    server.serve(stream_service(Duration::ZERO));
+    let paced = |count: u64| json!({ "count": count, "size": MIB, "pace_ms": 0 });
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let stuck = {
+        let client = client.clone();
+        thread::spawn(move || {
+            let mut first = true;
+            let mut on_chunk = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+                if first {
+                    first = false;
+                    blocked_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                }
+                Ok(())
+            };
+            client.call_streaming(
+                "paced",
+                paced(3),
+                vec![],
+                Priority::Control,
+                None,
+                Duration::from_secs(30),
+                &mut on_chunk,
+            )
+        })
+    };
+    blocked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // Its two other chunks and its reply arrive (2 MiB and a bit: under the
+    // bound, over half of it).
+    wait_until("the stuck stream's reply", Duration::from_secs(5), || {
+        client.health().inflight == 0 && server.health().queued_bytes == 0
+    });
+    thread::sleep(Duration::from_millis(100));
+    // The other stream's callback is slower than the link, so its chunks pile
+    // up past the bound and the client holds its reads.
+    let started = Instant::now();
+    let mut parts = 0u64;
+    let mut count = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+        thread::sleep(Duration::from_millis(50));
+        parts += 1;
+        Ok(())
+    };
+    let reply = client.call_streaming(
+        "paced",
+        paced(16),
+        vec![],
+        Priority::Control,
+        Some(Duration::from_secs(8)),
+        Duration::from_secs(30),
+        &mut count,
+    );
+    let waited = started.elapsed();
+    reply.unwrap_or_else(|error| panic!("after {waited:?}: {error:?}"));
+    assert_eq!(parts, 16);
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+    release_tx.send(()).unwrap();
+    let error = stuck.join().unwrap().unwrap_err();
+    assert!(matches!(error, CallError::Timeout { .. }), "{error:?}");
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// Live heap bytes of this test process, counted by its global allocator
+/// (for [`stream_chunks_do_not_pin_received_messages`]).
+static LIVE_HEAP: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+struct CountingAllocator;
+
+// SAFETY: every call is forwarded to the system allocator unchanged; only
+// the live byte count is updated around it.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract is forwarded.
+        let ptr = unsafe { std::alloc::System.alloc(layout) };
+        if !ptr.is_null() {
+            LIVE_HEAP.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract is forwarded.
+        let ptr = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            LIVE_HEAP.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: the caller's contract is forwarded.
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+        LIVE_HEAP.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller's contract is forwarded.
+        let new = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            LIVE_HEAP.fetch_add(
+                new_size as isize - layout.size() as isize,
+                Ordering::Relaxed,
+            );
+        }
+        new
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// Child-process switch of the tests that must run alone in their process.
+const CHILD_ENV: &str = "TKFS_SESSION_CORE_CHILD";
+
+/// Two concurrent streams on one connection, interleaved on the wire: a big
+/// one (1 MiB chunks) consumed at once, and a small one (1 KiB chunks) whose
+/// callback blocks on its first chunk. The small stream's queued chunks are
+/// charged about 2.4 MiB, and that is about all they may hold: each chunk
+/// owns its bytes. Before the re-review fix a client chunk was a slice of the
+/// received message, sharing tungstenite's read buffer, so each blocked small
+/// chunk pinned the buffer a big chunk had been read into (the review
+/// measured +132 MiB of live heap for 2.4 MiB charged), unseen by the receive
+/// bound. Runs alone in a child process: it measures the live heap of the
+/// whole process.
+#[test]
+fn stream_chunks_do_not_pin_received_messages() {
+    const SMALL: u64 = 2000;
+    const BIG: u64 = 400;
+    if std::env::var(CHILD_ENV).as_deref() == Ok("heap") {
+        // The client's bound leaves room for the small stream plus the big
+        // stream's chunks in passing, so its reads are never held; the
+        // server's keeps its own queue small.
+        let bound = |bytes: usize| ConnOptions {
+            data_queue_bytes: bytes,
+            ..ConnOptions::default()
+        };
+        let (client, server) = conns(ws_pair(Transport::Plain), bound(8 * MIB), bound(4 * MIB));
+        server.serve(stream_service(Duration::ZERO));
+        // `paced` with no pause: cheap chunks, no digest.
+        let stream =
+            |count: u64, size: usize| json!({ "count": count, "size": size, "pace_ms": 0 });
+        // Warm up the buffers both ways.
+        let mut ignore = |_: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> { Ok(()) };
+        client
+            .call_streaming(
+                "paced",
+                stream(4, MIB),
+                vec![],
+                Priority::Control,
+                None,
+                Duration::from_secs(30),
+                &mut ignore,
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let baseline = LIVE_HEAP.load(Ordering::SeqCst);
+        let (started_tx, started_rx) = mpsc::channel();
+        let big = {
+            let client = client.clone();
+            thread::spawn(move || {
+                let mut parts = 0u64;
+                let mut on_chunk = |_: ChunkHeader, data: &[u8]| -> Result<(), ErrorWire> {
+                    assert_eq!(data.len(), MIB);
+                    parts += 1;
+                    if parts == 8 {
+                        started_tx.send(()).unwrap();
+                    }
+                    Ok(())
+                };
+                let reply = client.call_streaming(
+                    "paced",
+                    stream(BIG, MIB),
+                    vec![],
+                    Priority::Control,
+                    None,
+                    Duration::from_secs(60),
+                    &mut on_chunk,
+                );
+                (reply, parts)
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let small = {
+            let client = client.clone();
+            thread::spawn(move || {
+                let mut parts = 0u64;
+                let mut on_chunk = |_: ChunkHeader, data: &[u8]| -> Result<(), ErrorWire> {
+                    assert_eq!(data.len(), 1024);
+                    if parts == 0 {
+                        blocked_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                    parts += 1;
+                    Ok(())
+                };
+                let reply = client.call_streaming(
+                    "paced",
+                    stream(SMALL, 1024),
+                    vec![],
+                    Priority::Control,
+                    None,
+                    Duration::from_secs(60),
+                    &mut on_chunk,
+                );
+                (reply, parts)
+            })
+        };
+        blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (reply, parts) = big.join().unwrap();
+        reply.unwrap();
+        assert_eq!(parts, BIG);
+        // The rest of the small stream arrives and waits for its callback.
+        wait_until(
+            "the server to send the whole small stream",
+            Duration::from_secs(10),
+            || {
+                let health = server.health();
+                health.inflight == 0 && health.queued_bytes == 0
+            },
+        );
+        thread::sleep(Duration::from_millis(300));
+        let held = LIVE_HEAP.load(Ordering::SeqCst) - baseline;
+        release_tx.send(()).unwrap();
+        let (reply, parts) = small.join().unwrap();
+        reply.unwrap();
+        assert_eq!(parts, SMALL);
+        thread::sleep(Duration::from_millis(100));
+        let after = LIVE_HEAP.load(Ordering::SeqCst) - baseline;
+        println!("HEAP held={held} after={after}");
+        assert!(
+            held < 16 * MIB as isize,
+            "{SMALL} blocked 1 KiB chunks held {held} bytes of heap"
+        );
+        return;
+    }
+    if std::env::var(CHILD_ENV).is_ok() {
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "stream_chunks_do_not_pin_received_messages",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ENV, "heap")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stdout.contains("HEAP held="), "{stdout}");
+}
+
+// ---------------------------------------------------------------------------
 // Protocol violations close the connection (invariant 22)
 
 /// Sends `message` from a raw client to a `Conn` server, which must close with

@@ -16,7 +16,9 @@
 //!    250 ms scan of request deadlines, GOAWAY grace;
 //! 4. writes from the priority queues while tungstenite's buffer holds less
 //!    than 256 KiB, then flushes (`WouldBlock` arms writable interest);
-//! 5. closes gracefully once a GOAWAY is in effect and nothing is in flight;
+//! 5. closes gracefully once a GOAWAY it received is in effect and nothing is
+//!    in flight (the side that sent the GOAWAY waits for the peer's Close, or
+//!    the grace period: see `goaway_complete`);
 //! 6. waits for readiness, a producer's `notify()`, or the next timer.
 //!
 //! Liveness evidence is a received message or readable readiness of the
@@ -34,7 +36,13 @@
 //!   running consumers catch up. Liveness is not judged while this hold lasts
 //!   (the silence is ours), and neither are the idle limits of streams whose
 //!   data may wait unread behind it; the server tells their clients with
-//!   PROGRESS (`progress_held_streams`);
+//!   PROGRESS (`progress_held_streams`). A hold is bounded: on the server, a
+//!   handler that leaves its parts untaken for its stream's idle limit is
+//!   answered `REQUEST_TIMEOUT` and its parts dropped (`scan`); on the client,
+//!   once no stream callback has taken anything for `dead_after`, the call
+//!   with the most chunks queued is given up (`Timeout`, CANCEL sent:
+//!   `Shared::expire_heaviest`), so a stuck consumer suspends liveness and
+//!   the other calls' idle limits for at most `dead_after`;
 //! * (server) outgoing pressure: the control queue holds more than
 //!   `control_queue_bytes`, because the peer leaves our replies unread while
 //!   it keeps sending requests. Every request read produces a reply, so not
@@ -113,11 +121,14 @@ const PART_OVERHEAD: usize = 128;
 
 /// What one received stream part costs the receive bound
 /// (`data_queue_bytes`, invariant 22): its whole frame (prefix, header and
-/// body; a client-side chunk is a slice that keeps the whole message alive,
-/// a server-side part keeps its body and the parsed header, whose `hash` is
-/// at most the header's length) plus [`PART_OVERHEAD`]. Header-only parts
-/// therefore count like data, and every buffered part costs more than zero,
-/// so a count of zero always means nothing is buffered.
+/// body; a buffered part keeps a copy of its body and the parsed header,
+/// whose `hash` is at most the header's length) plus [`PART_OVERHEAD`]. A
+/// client chunk copied into a recycled buffer is charged that buffer's
+/// capacity if larger (`Shared::chunk_body`). Header-only parts therefore
+/// count like data, and every buffered part costs more than zero, so a count
+/// of zero always means nothing is buffered. Parts are copied out of the
+/// received message on both sides: a slice would keep tungstenite's whole
+/// read buffer alive, which the charge cannot see.
 fn part_cost(frame_len: usize) -> usize {
     frame_len.saturating_add(PART_OVERHEAD)
 }
@@ -264,6 +275,10 @@ struct Io {
     write_more: bool,
     /// Reading is held: received stream data waits for slow consumers.
     rx_held: bool,
+    /// (Client, while `rx_held`.) The last time a consumer was seen taking a
+    /// chunk, and the `Shared::rx_taken` reading of that time.
+    hold_progress: Instant,
+    hold_taken: u64,
     /// Reading is held (server): the peer leaves our replies unread.
     tx_held: bool,
     /// Last liveness evidence: a received message or readable readiness.
@@ -311,6 +326,8 @@ impl Io {
             read_more: true,
             write_more: false,
             rx_held: false,
+            hold_progress: now,
+            hold_taken: 0,
             tx_held: false,
             last_rx: now,
             last_tx: now,
@@ -456,12 +473,7 @@ impl Io {
             ),
             FrameKind::Request if side == Side::Server => self.on_request(frame),
             FrameKind::Response if side == Side::Client => self.on_response(frame),
-            FrameKind::Chunk => {
-                // The body is the tail of the message: hand it on without a copy.
-                let body = message.slice(message.len() - frame.body.len()..);
-                let cost = part_cost(message.len());
-                self.on_chunk(frame, body, cost)
-            }
+            FrameKind::Chunk => self.on_chunk(frame, message.len()),
             FrameKind::Progress if side == Side::Client => self.on_progress(frame),
             FrameKind::Cancel if side == Side::Server => self.on_cancel(frame),
             FrameKind::Heartbeat => self.on_heartbeat(frame),
@@ -898,6 +910,7 @@ impl Io {
             }))
         };
         slot.push(Event::Done(result));
+        shared.track_undrained(&mut state, id, &slot);
         Ok(())
     }
 
@@ -917,9 +930,8 @@ impl Io {
 
     // -- chunks (both sides) --------------------------------------------
 
-    /// A CHUNK frame; `cost` is its charge to the receive bound if it is
-    /// buffered as a stream part ([`part_cost`]).
-    fn on_chunk(&mut self, frame: FrameRef<'_>, body: Bytes, cost: usize) -> Result<(), Stop> {
+    /// A CHUNK frame of `frame_len` bytes.
+    fn on_chunk(&mut self, frame: FrameRef<'_>, frame_len: usize) -> Result<(), Stop> {
         let header: ChunkHeader = Self::header(&frame)?;
         let id = header.id;
         if id == 0 {
@@ -936,7 +948,7 @@ impl Io {
         match self.shared.side {
             Side::Server => {
                 if self.uploads.contains_key(&id) {
-                    self.on_upload_chunk(header, frame, cost)
+                    self.on_upload_chunk(header, frame, part_cost(frame_len))
                 } else {
                     Ok(()) // a cancelled or answered request
                 }
@@ -947,12 +959,26 @@ impl Io {
                         "PROTOCOL_VIOLATION: chunk for request {id}, which was never sent"
                     )));
                 }
+                // A copy, not a slice of the message: tungstenite reads into
+                // a shared buffer, and a slice would keep that whole
+                // allocation (with the data of every other frame read into
+                // it) alive for as long as the chunk waits for its consumer,
+                // far beyond its charge (WP1.INT re-review). Made before
+                // taking the state lock.
+                let body = self.shared.chunk_body(frame.body);
+                // Charged at its cost (the whole frame, or the buffer the copy
+                // holds if larger; a header-only chunk counts too), and
+                // uncharged by the same amount when the caller takes it or the
+                // call ends.
+                let cost = part_cost(frame_len.max(body.capacity()));
                 let state = self.shared.lock();
                 let Some(slot) = state.pending.get(&id) else {
                     // A late frame of a call its caller gave up on (a stream
                     // chunk, or a body continuation of a reply that crossed
                     // the CANCEL or whose reassembly was dropped): ids are
                     // never reused, so it is discarded whatever its flags.
+                    drop(state);
+                    self.shared.recycle(body);
                     return Ok(());
                 };
                 if !frame.more() {
@@ -960,9 +986,6 @@ impl Io {
                         "PROTOCOL_VIOLATION: stream chunk of request {id} without MORE"
                     )));
                 }
-                // Charged at its cost, header included (a header-only chunk
-                // still holds its message), and uncharged by the same amount
-                // when the caller takes it or the call ends.
                 self.shared.rx_buffered.fetch_add(cost, Ordering::AcqRel);
                 slot.push(Event::Chunk(header, body, cost));
                 Ok(())
@@ -1021,6 +1044,7 @@ impl Io {
                         header,
                         body: partial.body,
                     })));
+                    shared.track_undrained(&mut state, id, &slot);
                 }
             }
         }
@@ -1195,6 +1219,8 @@ impl Io {
         let rx_cap = shared.rx_cap();
         if !self.rx_held && buffered > rx_cap {
             self.rx_held = true;
+            self.hold_progress = Instant::now();
+            self.hold_taken = shared.rx_taken.load(Ordering::Acquire);
         } else if self.rx_held && buffered <= rx_cap / 2 {
             self.rx_held = false;
         }
@@ -1310,6 +1336,9 @@ impl Io {
                 ),
             )));
         }
+        if self.rx_held && self.shared.side == Side::Client {
+            self.bound_hold(now);
+        }
         if !self.heartbeat_queued
             && now.duration_since(self.last_tx.max(self.last_heartbeat)) >= options.heartbeat
         {
@@ -1331,6 +1360,25 @@ impl Io {
             return Err(Stop::Graceful(reason));
         }
         Ok(())
+    }
+
+    /// (Client.) Ends a hold in which no stream callback has taken anything
+    /// for `dead_after`: the call with the most chunks queued is given up
+    /// (`Shared::expire_heaviest`), which frees its chunks, and reading
+    /// resumes once the rest fits (`update_holds`). Without this, one stuck
+    /// callback would hold the reads, and so suspend liveness and every other
+    /// call's idle limit, for as long as it stays stuck (a silently dead peer
+    /// would then go unnoticed).
+    fn bound_hold(&mut self, now: Instant) {
+        let taken = self.shared.rx_taken.load(Ordering::Acquire);
+        if taken != self.hold_taken {
+            self.hold_taken = taken;
+            self.hold_progress = now;
+        } else if now.duration_since(self.hold_progress) >= self.shared.options.dead_after {
+            self.hold_progress = now;
+            self.shared.expire_heaviest();
+            self.update_holds();
+        }
     }
 
     /// The 250 ms deadline scan.
@@ -1485,7 +1533,14 @@ impl Io {
         }
     }
 
-    /// Closes gracefully once a GOAWAY is in effect and nothing is in flight.
+    /// Closes gracefully once a GOAWAY received from the peer is in effect and
+    /// nothing is in flight. The side that only sent one does not close on
+    /// idle: requests the peer sent before it read the GOAWAY may still be on
+    /// their way, and closing would turn them into uncertain failures
+    /// (`ConnectionLost`, invariant 16) of requests that never ran. It keeps
+    /// reading and refusing them (`WS_CLOSED`, see `dispatch`) until the
+    /// peer's Close (the peer closes once its own calls have ended, which
+    /// follows every request it sent) or the end of the grace period.
     fn goaway_complete(&self) -> Option<Stop> {
         if self.unflushed > 0
             || self.write_blocked
@@ -1495,6 +1550,7 @@ impl Io {
             return None;
         }
         let state = self.shared.lock();
+        state.goaway_received.as_ref()?;
         let reason = state
             .goaway_sent
             .clone()
