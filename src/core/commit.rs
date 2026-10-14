@@ -50,19 +50,32 @@
 //!
 //! # Event cache (`Cache::events`)
 //!
-//! One branch's committed events, parsed and in `id` order (exactly
-//! `Store::events()` filtered by branch, the slow path's historical input).
-//! It is keyed by the journal: `upto` (the global `max(seq)` it covers) and
+//! Per branch (the [`EVENT_CACHE_BRANCHES`] most recently used), the
+//! branch's events, parsed and in `id` order (exactly `Store::events()`
+//! filtered by branch, the slow path's historical input). Each entry is
+//! keyed by the journal: `upto` (the global `max(seq)` it covers) and
 //! `total` (the global journal row count then). A use reads both (one
 //! aggregate over `journal_sequence`), loads only the rows with a larger
 //! `seq` (a range scan; sequences grow and are never reused once committed)
 //! and checks that the row count grew by exactly those rows; any deletion
-//! breaks that equation and reloads the branch in full. Rows read inside a
-//! write transaction may still roll back and their sequence numbers be
-//! reused, so they are kept as *tentative* `(seq, id)` pairs and checked
-//! before every later use (a point query each); `settle_event_cache`
-//! promotes them once the transaction is over. A full reload inside a write
-//! transaction is not kept. Events are immutable (invariant 6), so a row
+//! breaks that equation and reloads the branch in full.
+//!
+//! Rows read inside a write transaction may still roll back, and a
+//! rolled-back sequence number is reused by the next insert (AUTOINCREMENT
+//! state rolls back with the transaction), which neither `upto` nor `total`
+//! can see. So every journal row an entry covers that is not known
+//! committed is kept as *tentative*: the exact `(seq, id)` list of the
+//! journal range `(after, upto]`, **every** row of it whatever its branch
+//! (a rolled-back row of another branch frees a sequence number that a row
+//! of this branch can take: WP2.4 fix round 1). Before every use the range
+//! is read again (one range scan) and must be exactly that list; once a use
+//! in autocommit (or `settle_event_cache`, after `with_write`'s transaction)
+//! finds it intact, it is committed and dropped. A full load inside a write
+//! transaction is kept the same way: every row above the newest journal
+//! sequence this connection last read in a committed state
+//! (`committed_tip`) is tentative (rows at or below it were committed then
+//! and stay so). Events are immutable (invariant 6), and a staged or
+//! committed id never carries another payload (`EVENT_ID_REUSED`), so a row
 //! known by `(seq, id)` never changes its payload.
 use super::derive::{self, DeriveInput, DeriveOutput, derive_conflicts};
 use super::*;
@@ -142,18 +155,31 @@ pub(crate) struct Cache {
     /// Commits made inside an enclosing transaction (event id → fast), not
     /// counted until that transaction is known to have committed them.
     pending: RefCell<BTreeMap<String, bool>>,
-    /// One branch's events (module docs, "Event cache").
-    events: RefCell<Option<EventCache>>,
-    /// A branch whose events were loaded in full inside a write transaction
-    /// (not kept): `settle_event_cache` loads it once the transaction is over.
-    wanted: RefCell<Option<String>>,
+    /// Per-branch events, least recently used first (module docs, "Event
+    /// cache").
+    events: RefCell<Vec<EventCache>>,
+    /// The newest journal sequence this connection read in a committed
+    /// state (autocommit, or a read transaction of its own): every row at
+    /// or below it was committed then, and so stays (module docs).
+    committed_tip: Cell<Option<i64>>,
+    /// Full loads of a branch into the event cache (tests).
+    event_loads: Cell<u64>,
     /// Namespace successor commits whose competing cuts were counted
     /// (CCR-WP1.6-5).
     successor_checks: Cell<u64>,
     /// Periodic seals of fast commits that serialized the patched view
     /// (CCR-WP1.6-1 adapter).
     known_seals: Cell<u64>,
+    /// Forced seals of prepared slow commits written from their off-lock
+    /// parts (`seal_prepared`; tests).
+    prepared_seals: Cell<u64>,
 }
+
+/// How many branches the event cache keeps (the least recently used is
+/// dropped first). The activator alternates between a few branches at most
+/// (shared branches with remote events, the active one with local
+/// operations); each entry holds its branch's parsed events.
+const EVENT_CACHE_BRANCHES: usize = 4;
 
 /// The cached events of one branch (module docs, "Event cache").
 struct EventCache {
@@ -164,13 +190,23 @@ struct EventCache {
     upto: i64,
     /// The global journal row count when `upto` was read.
     total: i64,
-    /// `(seq, id)` of the branch's rows read inside a write transaction:
-    /// checked before every use until `settle_event_cache` promotes them.
-    tentative: Vec<(i64, String)>,
+    /// The rows the cache covers that are not known committed (`None`: all
+    /// are).
+    tentative: Option<Tentative>,
     /// The startup-snapshot journal hash state over the branch's rows (in
     /// sequence order) and the last sequence number it covers (0: none),
     /// kept with the rows: the off-lock part of a prepared commit's seal.
     journal: (Sha256, i64),
+}
+
+/// Journal rows an event cache entry covers that may still roll back.
+struct Tentative {
+    /// Every row with a sequence number at or below `after` is known
+    /// committed.
+    after: i64,
+    /// Every journal row in `(after, upto]`, all branches, in `seq` order,
+    /// as read: `(seq, event id)`.
+    rows: Vec<(i64, String)>,
 }
 
 /// How many commits on this handle took an incremental successor (`fast`)
@@ -665,6 +701,15 @@ impl Store {
             "INSERT OR IGNORE INTO branches VALUES(?,?,?)",
             params![event.branch.id, event.branch.name, event.branch.shared],
         )?;
+        // A prepared seal checks the branch's journal against the one its
+        // hash covers (`seal_prepared`): the branch's newest sequence before
+        // this commit.
+        let prior = match &plan {
+            Plan::Slow(slow) if slow.json.is_some() && slow.journal.is_some() => {
+                Some(frontier_seq(&tx, &branch)?)
+            }
+            _ => None,
+        };
         tx.execute(
             "INSERT INTO events VALUES(?,?,?)",
             params![event.id, event.branch.id, payload],
@@ -748,12 +793,16 @@ impl Store {
                 // P4). It seals the projection this commit holds (and has just
                 // stored); a prepared commit brings its payload's expensive
                 // parts computed off-lock.
-                let sealed = match (&slow.json, &slow.journal) {
-                    (Some(json), Some(journal)) => {
-                        seal_prepared(&tx, &branch, &event, &payload, json, journal)?
+                let sealed = match (&slow.json, &slow.journal, prior) {
+                    (Some(json), Some(journal), Some(prior)) => {
+                        seal_prepared(&tx, &branch, &event, &payload, json, journal, prior)?
                     }
                     _ => false,
                 };
+                if sealed {
+                    let seals = &self.caches.commit.prepared_seals;
+                    seals.set(seals.get().saturating_add(1));
+                }
                 if !sealed {
                     snapshot::maybe_persist(&tx, &branch, true, Some(&slow.projection))?;
                 }
@@ -874,8 +923,8 @@ impl Store {
     /// when given, and the journal hash state over those rows (without
     /// `extra`), through the event cache (module docs). `committed_view`:
     /// the connection reads committed state only (a read transaction of its
-    /// own, as `prepare_slow` runs), so what it loads is kept as committed;
-    /// in autocommit that holds anyway.
+    /// own, as `prepare_slow` runs), so nothing it reads can roll back; in
+    /// autocommit that holds anyway.
     pub(super) fn with_branch_events<T>(
         &self,
         branch: &str,
@@ -888,48 +937,26 @@ impl Store {
             .db
             .prepare_cached("SELECT coalesce(max(seq),0),count(*) FROM journal_sequence")?
             .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        let cached = self.caches.commit.events.borrow_mut().take();
+        let cached = {
+            let mut caches = self.caches.commit.events.borrow_mut();
+            caches
+                .iter()
+                .position(|cache| cache.branch == branch)
+                .map(|at| caches.remove(at))
+        };
         let refreshed = match cached {
-            Some(cache) if cache.branch == branch && cache.upto <= tip => {
+            Some(cache) if cache.upto <= tip => {
                 self.extend_event_cache(cache, tip, total, committed)?
             }
             _ => None,
         };
         let (mut cache, keep) = match refreshed {
             Some(cache) => (cache, true),
-            None => {
-                let mut events: Vec<Event> = vec![];
-                let mut journal = (Sha256::new(), 0);
-                let mut statement = self.db.prepare_cached(
-                    "SELECT s.seq,e.id,e.payload FROM events e JOIN journal_sequence s ON s.event=e.id WHERE e.branch=? ORDER BY s.seq",
-                )?;
-                let mut rows = statement.query([branch])?;
-                while let Some(row) = rows.next()? {
-                    let seq: i64 = row.get(0)?;
-                    let id: String = row.get(1)?;
-                    let payload: String = row.get(2)?;
-                    journal_row(&mut journal.0, seq, &id, &payload);
-                    journal.1 = seq;
-                    events.push(serde_json::from_str(&payload)?);
-                }
-                // `Store::events()` order.
-                events.sort_by(|a, b| a.id.cmp(&b.id));
-                let cache = EventCache {
-                    branch: branch.to_owned(),
-                    events,
-                    upto: tip,
-                    total,
-                    tentative: vec![],
-                    journal,
-                };
-                // A full load inside a write transaction may hold rows that
-                // roll back; it is not kept (loaded again once settled).
-                if !committed {
-                    *self.caches.commit.wanted.borrow_mut() = Some(branch.to_owned());
-                }
-                (cache, committed)
-            }
+            None => self.load_event_cache(branch, tip, total, committed)?,
         };
+        if committed {
+            self.note_committed_tip(tip);
+        }
         if let Some(extra) = extra {
             cache.events.push(extra.clone());
         }
@@ -938,14 +965,84 @@ impl Store {
             cache.events.pop();
         }
         if keep {
-            *self.caches.commit.events.borrow_mut() = Some(cache);
+            let mut caches = self.caches.commit.events.borrow_mut();
+            caches.push(cache);
+            if caches.len() > EVENT_CACHE_BRANCHES {
+                caches.remove(0);
+            }
         }
         Ok(result)
     }
-    /// The cache brought up to `tip`: its tentative rows still in the
-    /// journal under the same sequence, the rows above `upto` loaded and
-    /// merged, the journal count grown by exactly those rows. `None` when any
-    /// check fails (the caller reloads).
+    /// `branch`'s events loaded in full at `(tip, total)`, and whether the
+    /// entry may be kept: always in a committed state; inside a write
+    /// transaction only with every row above the last committed tip this
+    /// connection read recorded as tentative (module docs). Without such a
+    /// tip (nothing read in a committed state yet) it is not kept.
+    fn load_event_cache(
+        &self,
+        branch: &str,
+        tip: i64,
+        total: i64,
+        committed: bool,
+    ) -> Result<(EventCache, bool)> {
+        let loads = &self.caches.commit.event_loads;
+        loads.set(loads.get().saturating_add(1));
+        let mut events: Vec<Event> = vec![];
+        let mut journal = (Sha256::new(), 0);
+        let mut statement = self.db.prepare_cached(
+            "SELECT s.seq,e.id,e.payload FROM events e JOIN journal_sequence s ON s.event=e.id WHERE e.branch=? ORDER BY s.seq",
+        )?;
+        let mut rows = statement.query([branch])?;
+        while let Some(row) = rows.next()? {
+            let seq: i64 = row.get(0)?;
+            let id: String = row.get(1)?;
+            let payload: String = row.get(2)?;
+            journal_row(&mut journal.0, seq, &id, &payload);
+            journal.1 = seq;
+            events.push(serde_json::from_str(&payload)?);
+        }
+        drop(rows);
+        // `Store::events()` order.
+        events.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut cache = EventCache {
+            branch: branch.to_owned(),
+            events,
+            upto: tip,
+            total,
+            tentative: None,
+            journal,
+        };
+        if committed {
+            return Ok((cache, true));
+        }
+        let Some(after) = self.caches.commit.committed_tip.get() else {
+            return Ok((cache, false));
+        };
+        let after = after.min(tip);
+        let rows = self.journal_range(after, tip)?;
+        cache.tentative = Some(Tentative { after, rows });
+        Ok((cache, true))
+    }
+    /// Every journal row in `(after, upto]`, in `seq` order.
+    fn journal_range(&self, after: i64, upto: i64) -> Result<Vec<(i64, String)>> {
+        Ok(self
+            .db
+            .prepare_cached(
+                "SELECT seq,event FROM journal_sequence WHERE seq>? AND seq<=? ORDER BY seq",
+            )?
+            .query_map(params![after, upto], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    /// Record a journal tip read in a committed state (module docs).
+    fn note_committed_tip(&self, tip: i64) {
+        let known = &self.caches.commit.committed_tip;
+        known.set(Some(known.get().map_or(tip, |known| known.max(tip))));
+    }
+    /// The cache brought up to `tip`: its tentative rows still exactly the
+    /// journal's, the rows above `upto` loaded and merged, the journal count
+    /// grown by exactly those rows. Outside a committed state every row read
+    /// (of any branch) becomes tentative. `None` when any check fails (the
+    /// caller reloads).
     fn extend_event_cache(
         &self,
         mut cache: EventCache,
@@ -957,7 +1054,7 @@ impl Store {
             return Ok(None);
         }
         if committed {
-            cache.tentative.clear();
+            cache.tentative = None;
         }
         if tip == cache.upto {
             return Ok((total == cache.total).then_some(cache));
@@ -968,23 +1065,37 @@ impl Store {
         let mut rows = statement.query(params![cache.branch, cache.upto])?;
         let mut count = 0i64;
         let mut added: Vec<Event> = vec![];
+        let mut read: Vec<(i64, String)> = vec![];
         while let Some(row) = rows.next()? {
             count += 1;
-            if !row.get::<_, bool>(2)? {
-                continue;
-            }
             let seq: i64 = row.get(0)?;
             let id: String = row.get(1)?;
-            let payload: String = row.get(3)?;
-            added.push(serde_json::from_str(&payload)?);
-            journal_row(&mut cache.journal.0, seq, &id, &payload);
-            cache.journal.1 = seq;
+            if row.get::<_, bool>(2)? {
+                let payload: String = row.get(3)?;
+                added.push(serde_json::from_str(&payload)?);
+                journal_row(&mut cache.journal.0, seq, &id, &payload);
+                cache.journal.1 = seq;
+            }
+            // Any row read here may roll back, and its sequence number then
+            // go to a row of this branch: all of them are tentative.
             if !committed {
-                cache.tentative.push((seq, id));
+                read.push((seq, id));
             }
         }
+        drop(rows);
         if cache.total + count != total {
             return Ok(None);
+        }
+        if !committed {
+            let after = cache.upto;
+            cache
+                .tentative
+                .get_or_insert_with(|| Tentative {
+                    after,
+                    rows: vec![],
+                })
+                .rows
+                .extend(read);
         }
         if !added.is_empty() {
             added.sort_by(|a, b| a.id.cmp(&b.id));
@@ -1009,40 +1120,53 @@ impl Store {
         cache.total = total;
         Ok(Some(cache))
     }
-    /// Whether every tentative row of `cache` is still in the journal under
-    /// the same sequence number.
+    /// Whether the journal range of `cache`'s tentative rows still holds
+    /// exactly those rows (same sequence numbers, same events, none more):
+    /// one range scan. A rollback since they were read removed some, or
+    /// removed them and gave their sequence numbers to other rows.
     fn tentative_rows_hold(&self, cache: &EventCache) -> Result<bool> {
-        let mut statement = self
-            .db
-            .prepare_cached("SELECT event FROM journal_sequence WHERE seq=?")?;
-        for (seq, id) in &cache.tentative {
-            let found: Option<String> = statement.query_row([seq], |r| r.get(0)).optional()?;
-            if found.as_deref() != Some(id.as_str()) {
+        let Some(tentative) = &cache.tentative else {
+            return Ok(true);
+        };
+        let mut statement = self.db.prepare_cached(
+            "SELECT seq,event FROM journal_sequence WHERE seq>? AND seq<=? ORDER BY seq",
+        )?;
+        let mut rows = statement.query(params![tentative.after, cache.upto])?;
+        let mut expected = tentative.rows.iter();
+        while let Some(row) = rows.next()? {
+            let Some((seq, id)) = expected.next() else {
+                return Ok(false);
+            };
+            if row.get::<_, i64>(0)? != *seq || row.get_ref(1)?.as_str()? != id {
                 return Ok(false);
             }
         }
-        Ok(true)
+        Ok(expected.next().is_none())
     }
-    /// After a write transaction (in autocommit): promote the event cache's
-    /// tentative rows if they all committed (else drop the cache), and load
-    /// a branch whose full load inside the transaction was not kept. Never
-    /// fails; a failure only drops the cache.
+    /// After a write transaction (in autocommit): an entry whose tentative
+    /// rows are all still in the journal had them committed (they become
+    /// known committed); any other entry is dropped. Then record the
+    /// committed journal tip, so a full load inside the next transaction can
+    /// be kept. Never fails; a failure only drops entries.
     pub(super) fn settle_event_cache(&self) {
         if !self.db.is_autocommit() {
             return;
         }
-        let cache = self.caches.commit.events.borrow_mut().take();
-        if let Some(mut cache) = cache
-            && self.tentative_rows_hold(&cache).unwrap_or(false)
-        {
-            cache.tentative.clear();
-            *self.caches.commit.events.borrow_mut() = Some(cache);
+        let caches = std::mem::take(&mut *self.caches.commit.events.borrow_mut());
+        let mut kept = Vec::with_capacity(caches.len());
+        for mut cache in caches {
+            if self.tentative_rows_hold(&cache).unwrap_or(false) {
+                cache.tentative = None;
+                kept.push(cache);
+            }
         }
-        let wanted = self.caches.commit.wanted.borrow_mut().take();
-        if let Some(branch) = wanted
-            && self.caches.commit.events.borrow().is_none()
-        {
-            let _ = self.with_branch_events(&branch, None, true, |_, _| ());
+        *self.caches.commit.events.borrow_mut() = kept;
+        let tip = self
+            .db
+            .prepare_cached("SELECT coalesce(max(seq),0) FROM journal_sequence")
+            .and_then(|mut statement| statement.query_row([], |r| r.get::<_, i64>(0)));
+        if let Ok(tip) = tip {
+            self.note_committed_tip(tip);
         }
     }
     /// The branch's events through the event cache (tests: the cache must
@@ -1051,11 +1175,46 @@ impl Store {
     pub fn cached_branch_events(&self, branch: &str) -> Result<Vec<Event>> {
         self.with_branch_events(branch, None, false, |events, _| events.to_vec())
     }
+    /// How many times this handle loaded a branch's events in full into
+    /// the event cache (tests).
+    #[doc(hidden)]
+    pub fn event_cache_loads(&self) -> u64 {
+        self.caches.commit.event_loads.get()
+    }
+    /// How many forced seals of prepared slow commits on this handle were
+    /// written from their off-lock parts rather than by `snapshot.rs` under
+    /// the lock (tests). A seal whose transaction rolled back counts too.
+    #[doc(hidden)]
+    pub fn prepared_seals(&self) -> u64 {
+        self.caches.commit.prepared_seals.get()
+    }
 }
 
 /// `snapshot::FORMAT`, which `seal_prepared` writes (a unit test pins the
 /// payload to `snapshot::persist`'s, byte for byte).
 const SEAL_FORMAT: u32 = 1;
+
+/// The newest journal sequence among `branch`'s frontier events (0: none):
+/// two index lookups per frontier event (`event_frontier`'s key, the
+/// journal's `event` index), whatever the journal's size or the distance
+/// from its tip to the branch's rows.
+///
+/// It is the branch's newest journal sequence: `write_commit` (the only
+/// journal insert) adds every event to its branch's frontier and removes
+/// only that branch's frontier entries the event names as parents, which
+/// committed before it, so the newest row of a branch stays in its
+/// frontier. (Only an open-time `rebuild_frontiers`, which drops any event
+/// another branch's event names, can leave it lower.) As a staleness token
+/// it is exact either way: every commit to the branch adds an event whose
+/// sequence is the journal's largest, so the value grows with each commit
+/// and changes with nothing else.
+pub(super) fn frontier_seq(db: &Connection, branch: &str) -> Result<i64> {
+    Ok(db
+        .prepare_cached(
+            "SELECT coalesce(max(s.seq),0) FROM event_frontier f JOIN journal_sequence s ON s.event=f.event WHERE f.branch=?",
+        )?
+        .query_row([branch], |r| r.get(0))?)
+}
 
 /// One journal row in the startup-snapshot journal hash.
 fn journal_row(digest: &mut Sha256, seq: i64, id: &str, payload: &str) {
@@ -1132,6 +1291,17 @@ fn seal_payload(
 /// read and the row written. `false` (nothing written; the caller seals
 /// normally) unless the branch's journal is exactly that prefix plus this
 /// event. Same fault points as `snapshot::persist`.
+///
+/// `prior` is [`frontier_seq`] of the branch just before this commit's
+/// journal row. The branch's journal is that prefix plus the event when the
+/// event's row is the journal's newest (so its branch's newest) and `prior`
+/// equals `through`, the newest branch row the hash covers: a branch row
+/// committed after the computation read the branch (above `through`) is a
+/// frontier event when it commits and leaves the frontier only for a newer
+/// branch row, so `prior` would be at least its sequence; and no row can
+/// appear at or below `through` afterwards (sequences above a committed tip
+/// only). A few index lookups, whatever the distance from the journal's tip
+/// to the branch's previous row.
 fn seal_prepared(
     tx: &Connection,
     branch: &str,
@@ -1139,22 +1309,19 @@ fn seal_prepared(
     payload: &str,
     projection_json: &str,
     (prefix, through): &(Sha256, i64),
+    prior: i64,
 ) -> Result<bool> {
-    let newest = |below: i64| -> Result<i64> {
-        Ok(tx
-            .prepare_cached(
-                "SELECT s.seq FROM journal_sequence s CROSS JOIN events e ON e.id=s.event WHERE e.branch=? AND s.seq<? ORDER BY s.seq DESC LIMIT 1",
-            )?
-            .query_row(params![branch, below], |r| r.get(0))
-            .optional()?
-            .unwrap_or(0))
-    };
     let seq: i64 = tx.query_row(
         "SELECT seq FROM journal_sequence WHERE event=?",
         [&event.id],
         |r| r.get(0),
     )?;
-    if newest(i64::MAX)? != seq || newest(seq)? != *through {
+    let tip: i64 = tx.query_row(
+        "SELECT coalesce(max(seq),0) FROM journal_sequence",
+        [],
+        |r| r.get(0),
+    )?;
+    if tip != seq || prior != *through {
         return Ok(false);
     }
     let mut digest = prefix.clone();

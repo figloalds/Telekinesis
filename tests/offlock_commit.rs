@@ -294,7 +294,69 @@ struct Activation {
     stale: usize,
     failed: usize,
     committed_slow: usize,
+    /// Waits for a `retry` row that was not due yet (a re-queued `Stale`
+    /// ticket behind a wall-clock step, or a transient backoff).
+    waits: usize,
 }
+
+impl Activation {
+    fn add(&mut self, other: &Activation) {
+        self.tickets += other.tickets;
+        self.computed += other.computed;
+        self.compared += other.compared;
+        self.stale += other.stale;
+        self.failed += other.failed;
+        self.committed_slow += other.committed_slow;
+        self.waits += other.waits;
+    }
+}
+
+/// Every inbox row of `s`, one per line (failure messages).
+fn inbox_dump(s: &Store) -> String {
+    let rows: Vec<String> = s
+        .db
+        .prepare(
+            "SELECT id,coalesce(state,'NULL'),coalesce(code,''),coalesce(error_class,''),coalesce(attempts,0),coalesce(retry_at_ms,0),coalesce(error,'') FROM incoming_events ORDER BY received_ms,rowid",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok(format!(
+                "{} state={} code={} class={} attempts={} retry_at_ms={} error={}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(6)?
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    format!(
+        "now_ms={} inbox ({} rows):\n  {}",
+        time(),
+        rows.len(),
+        rows.join("\n  ")
+    )
+}
+
+/// The `retry` rows of `s`: `(id, retry_at_ms, code, error_class)`, the
+/// earliest due first.
+fn retry_rows(s: &Store) -> Vec<(String, i64, String, String)> {
+    s.db.prepare(
+        "SELECT id,coalesce(retry_at_ms,0),coalesce(code,''),coalesce(error_class,'') FROM incoming_events WHERE state='retry' ORDER BY coalesce(retry_at_ms,0)",
+    )
+    .unwrap()
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+/// How long one activation may wait, in total, for `retry` rows to fall due.
+const RETRY_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What happened between `prepare_slow` and `commit_prepared`.
 enum Between {
@@ -311,24 +373,60 @@ enum Between {
 /// ready: slices of `SliceBudget::ACTIVATOR` under the "lock", slow events
 /// prepared off-lock on `read`, committed with `commit_prepared`, `Stale`
 /// re-queued. `between` runs between prepare and commit of each ticket.
+///
+/// A re-queued row (`requeue(.., 0)`) is due at once by the wall clock the
+/// store uses, which can step back (WSL resynchronizes it with the host):
+/// a `retry` row that is not due yet is waited for (fix round 1; the loop
+/// used to spin on it until its round cap). A transient backoff
+/// (`retry()`, `error_class = 'transient'`) is waited for too, except
+/// `CAUSAL_PREREQUISITES_PENDING`: in this single-branch fuzz every parent
+/// of an event is committed on its branch before it is ready, so a pending
+/// projection means the slow path's history was incomplete, a defect.
 fn activate(
     s: &mut Store,
     read: &Store,
     between: &mut dyn FnMut(&SlowTicket, &mut Store) -> Between,
 ) -> Activation {
     let mut stats = Activation::default();
+    let mut waited = std::time::Duration::ZERO;
     for round in 0.. {
-        assert!(round < 20_000, "activation does not converge: {stats:?}");
+        assert!(
+            round < 20_000,
+            "activation does not converge: {stats:?}\n{}",
+            inbox_dump(s)
+        );
         let slice = s.activate_slice(SliceBudget::ACTIVATOR).unwrap();
         let Some(ticket) = slice.slow_ticket else {
             if slice.more {
                 continue;
             }
-            // A re-queued row is due again at once (`requeue(.., 0)`).
-            if s.inbox_counts().unwrap().retry > 0 {
-                continue;
+            let retry = retry_rows(s);
+            let Some((_, due, _, _)) = retry.first() else {
+                return stats;
+            };
+            if let Some((id, ..)) = retry
+                .iter()
+                .find(|(_, _, code, _)| code == "CAUSAL_PREREQUISITES_PENDING")
+            {
+                panic!(
+                    "{id}: the slow path found its history incomplete (single branch, every parent committed)\n{}",
+                    inbox_dump(s)
+                );
             }
-            return stats;
+            let now = time() as i64;
+            if *due > now {
+                // Not due yet: wait for it (bounded).
+                let wait = std::time::Duration::from_millis((*due - now).min(2_000) as u64 + 1);
+                waited += wait;
+                assert!(
+                    waited <= RETRY_WAIT_BUDGET,
+                    "retry rows not due after {waited:?}: {stats:?}\n{}",
+                    inbox_dump(s)
+                );
+                stats.waits += 1;
+                std::thread::sleep(wait);
+            }
+            continue;
         };
         stats.tickets += 1;
         let prepared = Store::prepare_slow(read, &ticket).unwrap();
@@ -585,16 +683,19 @@ fn local_op(rng: &mut StdRng, s: &mut Store, serial: usize) -> Option<String> {
 }
 
 struct Replica {
-    dir: TempDir,
+    /// `None` once kept on disk for a post-mortem (`Fuzz`'s drop).
+    dir: Option<TempDir>,
     store: Option<Store>,
     /// The off-lock read handle, kept across preparations (its event cache).
     read: Option<Store>,
 }
 impl Replica {
-    fn new() -> Self {
+    /// A new replica with the given device id (from the seed).
+    fn new(device: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        drop(Store::initialize(dir.path(), REPO, device).unwrap());
         let mut replica = Self {
-            dir,
+            dir: Some(dir),
             store: None,
             read: None,
         };
@@ -604,7 +705,8 @@ impl Replica {
     fn restart(&mut self) {
         self.read = None;
         self.store = None;
-        let store = Store::open(self.dir.path(), Some(REPO)).unwrap();
+        let path = self.dir.as_ref().unwrap().path();
+        let store = Store::open(path, Some(REPO)).unwrap();
         self.read = Some(Store::open_secondary(&store.root, &store.repo, &store.device).unwrap());
         self.store = Some(store);
     }
@@ -613,11 +715,27 @@ impl Replica {
     }
 }
 
+/// A device id drawn from `rng`, shaped like `core::id()`'s.
+fn seeded_id(rng: &mut StdRng) -> String {
+    let hex = format!("{:032x}", rng.r#gen::<u128>());
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    )
+}
+
 struct Fuzz {
     seed: u64,
     rng: StdRng,
     replicas: Vec<Replica>,
     allowed: BTreeSet<String>,
+    /// One counter for every local operation of the seed, between
+    /// activations and between prepare and commit: names made from it
+    /// (`recovered-{serial}`) never repeat (fix round 1).
     serial: usize,
     log: Vec<String>,
     totals: Activation,
@@ -630,7 +748,13 @@ impl Fuzz {
     fn new(seed: u64) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let count = rng.gen_range(2..=4);
-        let mut replicas: Vec<_> = (0..count).map(|_| Replica::new()).collect();
+        // Device ids from the seed. (Event ids are `core::id()`'s random
+        // UUIDs, which a test cannot seed: a failing seed is not replayed
+        // exactly, so a failure keeps its replicas on disk instead.)
+        let mut ids = StdRng::seed_from_u64(seed ^ 0x0ff1_0c4c_0de5_eed5);
+        let mut replicas: Vec<_> = (0..count)
+            .map(|_| Replica::new(&seeded_id(&mut ids)))
+            .collect();
         let allowed = replicas
             .iter_mut()
             .map(|r| r.store().device.clone())
@@ -780,7 +904,10 @@ impl Fuzz {
     fn activate(&mut self, r: usize) {
         let seed = self.rng.r#gen::<u64>();
         let mut rng = StdRng::seed_from_u64(seed);
-        let mut serial = self.serial * 1000;
+        // The seed's one counter (not `serial * 1000`, which every call of
+        // one delivery restarted, so a between-operation `recover` reused
+        // `recovered-{serial}`: NAME_COLLISION).
+        let mut serial = self.serial;
         let quiet = self.converging;
         let replica = &mut self.replicas[r];
         let read = replica.read.take().unwrap();
@@ -800,15 +927,10 @@ impl Fuzz {
         };
         let stats = activate(store, &read, &mut between);
         replica.read = Some(read);
+        self.serial = serial;
         self.log.extend(writes);
         self.log.push(format!("activate {r}: {stats:?}"));
-        let t = &mut self.totals;
-        t.tickets += stats.tickets;
-        t.computed += stats.computed;
-        t.compared += stats.compared;
-        t.stale += stats.stale;
-        t.failed += stats.failed;
-        t.committed_slow += stats.committed_slow;
+        self.totals.add(&stats);
         self.check(r, "activation");
     }
 
@@ -881,6 +1003,25 @@ impl Fuzz {
     }
 }
 
+impl Drop for Fuzz {
+    /// A failing seed is not replayed exactly (its event ids are random):
+    /// keep its replicas' directories for a post-mortem.
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        for (r, replica) in self.replicas.iter_mut().enumerate() {
+            if let Some(dir) = replica.dir.take() {
+                eprintln!(
+                    "seed {}: replica {r} kept at {}",
+                    self.seed,
+                    dir.keep().display()
+                );
+            }
+        }
+    }
+}
+
 fn run_seed(seed: u64, steps: std::ops::RangeInclusive<usize>) -> Activation {
     let mode = if seed.is_multiple_of(3) {
         ConflictMode::Verify
@@ -903,13 +1044,7 @@ fn run_seeds(seeds: impl Iterator<Item = u64>, steps: std::ops::RangeInclusive<u
     let started = std::time::Instant::now();
     let mut count = 0;
     for seed in seeds {
-        let t = run_seed(seed, steps.clone());
-        total.tickets += t.tickets;
-        total.computed += t.computed;
-        total.compared += t.compared;
-        total.stale += t.stale;
-        total.failed += t.failed;
-        total.committed_slow += t.committed_slow;
+        total.add(&run_seed(seed, steps.clone()));
         count += 1;
     }
     println!(
@@ -935,11 +1070,21 @@ fn prepared_commits_equal_inline_commits_and_full_replay() {
 }
 
 /// The acceptance run: 300 seeds in release
-/// (`cargo test --release --test offlock_commit -- --ignored`).
+/// (`cargo test --release --test offlock_commit -- --ignored`), seeds
+/// 1000–1299. `TKFS_OFFLOCK_START` and `TKFS_OFFLOCK_COUNT` select a shard
+/// (for example four processes of 75 seeds each).
 #[test]
 #[ignore = "release: 300 seeds"]
 fn prepared_commits_300_seeds_release() {
-    run_seeds(1000..1300, 30..=90);
+    let env = |name: &str, default: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let start = env("TKFS_OFFLOCK_START", 1000);
+    let count = env("TKFS_OFFLOCK_COUNT", 300);
+    run_seeds(start..start + count, 30..=90);
 }
 
 /// A two-way edit on B: B's unseen local save and A's concurrent save of the
@@ -1253,6 +1398,371 @@ fn event_cache_equals_events_after_inserts_and_deletes() {
     check(&read, "read handle after a deletion");
     s.create("after-the-deletion", "file").unwrap();
     check(&s, "after a deletion and a commit");
+}
+
+/// `events()` filtered by branch: what the event cache must hold.
+fn branch_events(s: &Store, branch: &str) -> Vec<Event> {
+    s.events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.branch.id == branch)
+        .collect()
+}
+
+/// The journal's newest sequence number.
+fn journal_tip(s: &Store) -> i64 {
+    s.db.query_row(
+        "SELECT coalesce(max(seq),0) FROM journal_sequence",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// WP2.4 fix round 1 (blocker): a write transaction commits a row on another
+/// branch, uses `main`'s cache (which reads that row), and rolls back; the
+/// next commit, on `main`, takes the freed sequence number. The cache must
+/// see that commit (every row read inside a transaction is tentative,
+/// whatever its branch), and the slow commits computed from it must keep it:
+/// an inline slow commit of a concurrent remote event and a local one, also
+/// after a restart. Before the fix the cache missed `y.txt`: the remote
+/// event's slow commit stored and sealed a projection without it, and the
+/// local slow save failed with `CAUSAL_PREREQUISITES_PENDING`.
+#[test]
+fn event_cache_sees_a_sequence_reused_after_another_branchs_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
+    let file = a.create("base.txt", "file").unwrap();
+    let (mut a, mut b) = clone_replica(a, &dir.path().join("b")).unwrap();
+    let allowed = devices([&a, &b]);
+    let before = b.shared_event_inventory().unwrap();
+    a.create("remote.txt", "file").unwrap();
+    let remote = a.shared_bundle(&before).unwrap().events;
+    let main = b.active.clone();
+    b.fork("side", false).unwrap();
+    b.checkout("side").unwrap();
+    b.create("s1", "file").unwrap();
+    b.checkout(&main).unwrap();
+    assert_eq!(
+        b.cached_branch_events(&main).unwrap(),
+        branch_events(&b, &main)
+    );
+    // The transaction: a row of `side`, read by `main`'s cache, rolled back.
+    b.checkout("side").unwrap();
+    b.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    b.create("s2", "file").unwrap();
+    let freed = journal_tip(&b);
+    assert_eq!(
+        b.cached_branch_events(&main).unwrap(),
+        branch_events(&b, &main),
+        "inside the transaction"
+    );
+    b.db.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(journal_tip(&b), freed - 1);
+    b.checkout(&main).unwrap();
+    b.create("y.txt", "file").unwrap();
+    assert_eq!(
+        journal_tip(&b),
+        freed,
+        "y.txt took the freed sequence number"
+    );
+    assert_eq!(
+        b.cached_branch_events(&main).unwrap(),
+        branch_events(&b, &main),
+        "after the reused sequence number"
+    );
+    // An inline slow commit of A's concurrent create (B's y.txt is unseen).
+    let slow = b.commit_path_counters().slow;
+    b.receive(
+        Bundle {
+            repo: repo.clone(),
+            branches: vec![],
+            events: remote,
+            objects: BTreeMap::new(),
+        },
+        &allowed,
+    )
+    .unwrap();
+    assert_eq!(b.commit_path_counters().slow, slow + 1, "a slow commit");
+    b.lookup("y.txt").unwrap();
+    b.lookup("remote.txt").unwrap();
+    assert_oracle_empty(&mut b, "after the remote slow commit");
+    assert!(assert_snapshot_valid(&b, &main), "sealed at the tip");
+    // A local slow commit: two saves from one base.
+    let entry = b.entry(&file.id).unwrap();
+    let (content, alive) = (
+        entry.revisions.get("content").cloned(),
+        entry.revisions.get("alive").cloned(),
+    );
+    b.write_with_base(&file.id, content.clone(), alive.clone(), b"one")
+        .unwrap();
+    b.write_with_base(&file.id, content, alive, b"two").unwrap();
+    assert_eq!(
+        b.commit_path_counters().slow,
+        slow + 2,
+        "a local slow commit"
+    );
+    assert_eq!(
+        b.cached_branch_events(&main).unwrap(),
+        branch_events(&b, &main)
+    );
+    assert_oracle_empty(&mut b, "after the local slow commit");
+    // The sealed projection is the one a restart resumes.
+    let root = b.root.clone();
+    drop(b);
+    let mut b = Store::open(&root, Some(&repo)).unwrap();
+    b.lookup("y.txt").unwrap();
+    b.lookup("remote.txt").unwrap();
+    assert_oracle_empty(&mut b, "after a restart");
+}
+
+/// WP2.4 fix round 1: the event cache keeps several branches, and a branch
+/// loaded inside a write transaction is kept (its rows above the last
+/// committed tip are tentative), so alternating uses of two branches, inside
+/// and outside transactions, load each branch once. A rolled-back
+/// transaction whose sequence numbers are reused still reloads both.
+#[test]
+fn event_cache_keeps_branches_and_loads_made_inside_transactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), Some(REPO)).unwrap();
+    let main = s.active.clone();
+    for i in 0..5 {
+        s.create(&format!("m{i}"), "file").unwrap();
+    }
+    let side = s.fork("side", true).unwrap().id;
+    s.checkout(&side).unwrap();
+    for i in 0..5 {
+        s.create(&format!("s{i}"), "file").unwrap();
+    }
+    s.checkout(&main).unwrap();
+    // A fresh handle: empty caches.
+    let root = s.root.clone();
+    drop(s);
+    let mut s = Store::open(&root, Some(REPO)).unwrap();
+    let check = |s: &Store, branch: &str, step: &str| {
+        assert_eq!(
+            s.cached_branch_events(branch).unwrap(),
+            branch_events(s, branch),
+            "{step}: branch {branch}"
+        );
+    };
+    let loads = s.event_cache_loads();
+    // Loaded inside a transaction, then used alternately: one load each.
+    s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    check(&s, &main, "first use, in a transaction");
+    check(&s, &side, "first use, in a transaction");
+    for i in 0..4 {
+        s.create(&format!("t{i}"), "file").unwrap();
+        check(&s, &main, "in a transaction");
+        check(&s, &side, "in a transaction");
+    }
+    s.db.execute_batch("COMMIT").unwrap();
+    check(&s, &side, "after the commit");
+    check(&s, &main, "after the commit");
+    for round in 0..3 {
+        s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        s.create(&format!("r{round}"), "file").unwrap();
+        check(&s, &side, "in a later transaction");
+        check(&s, &main, "in a later transaction");
+        s.db.execute_batch("COMMIT").unwrap();
+        s.create(&format!("a{round}"), "file").unwrap();
+        check(&s, &main, "in autocommit");
+        check(&s, &side, "in autocommit");
+    }
+    assert_eq!(s.event_cache_loads() - loads, 2, "each branch loaded once");
+    // A rolled-back row of `side`, its sequence number reused on `main`.
+    s.checkout(&side).unwrap();
+    s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    s.create("rolled-back", "file").unwrap();
+    check(&s, &main, "before the rollback");
+    check(&s, &side, "before the rollback");
+    s.db.execute_batch("ROLLBACK").unwrap();
+    s.checkout(&main).unwrap();
+    s.create("reuses-the-sequence", "file").unwrap();
+    check(&s, &main, "after the rollback");
+    check(&s, &side, "after the rollback");
+    assert_eq!(
+        s.event_cache_loads() - loads,
+        4,
+        "the rollback reloads both branches"
+    );
+}
+
+/// WP2.4 fix round 1 (the reviewer's case): an activation slice commits
+/// remote namespace successors on two shared branches in turn, each
+/// counting its competing cuts over its branch's cached events, inside the
+/// slice's write transaction. Each branch is loaded once (kept across the
+/// transaction and the next slices), not twice per slice.
+#[test]
+fn activation_slices_alternating_branches_load_each_branch_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Store::open(&dir.path().join("a"), Some(REPO)).unwrap();
+    let main = a.active.clone();
+    for i in 0..10 {
+        a.create(&format!("m{i}"), "file").unwrap();
+    }
+    let side = a.fork("side", true).unwrap().id;
+    a.checkout(&side).unwrap();
+    for i in 0..10 {
+        a.create(&format!("s{i}"), "file").unwrap();
+    }
+    a.checkout(&main).unwrap();
+    let (mut a, mut b) = clone_replica(a, &dir.path().join("b")).unwrap();
+    let allowed = devices([&a, &b]);
+    let loads = b.event_cache_loads();
+    for round in 0..3 {
+        let before = b.shared_event_inventory().unwrap();
+        // Renames in place, alternating branches: namespace successors.
+        for i in 0..8 {
+            for (branch, prefix) in [(&main, "m"), (&side, "s")] {
+                a.checkout(branch).unwrap();
+                let name = format!("{prefix}{i}{}", "x".repeat(round));
+                let entry = a.lookup(&name).unwrap();
+                a.rename(&entry.id, &format!("{name}x"), false).unwrap();
+            }
+        }
+        let mut events = a.shared_bundle(&before).unwrap().events;
+        causal_sort(&mut events);
+        b.stage_incoming(events.into_iter().map(staged).collect(), &allowed)
+            .unwrap();
+        while b
+            .activate_slice(SliceBudget::ACTIVATOR)
+            .map(|slice| {
+                assert!(slice.slow_ticket.is_none(), "successors only");
+                slice.more
+            })
+            .unwrap()
+        {}
+        assert_eq!(b.inbox_counts().unwrap().pending_active(), 0);
+    }
+    for branch in [&main, &side] {
+        assert_eq!(
+            b.cached_branch_events(branch).unwrap(),
+            branch_events(&b, branch)
+        );
+    }
+    assert_eq!(
+        b.event_cache_loads() - loads,
+        2,
+        "one load per branch for 48 alternating successors"
+    );
+    assert_oracle_empty(&mut b, "after the slices");
+}
+
+/// WP2.4 fix round 1: a commit validation that refuses the event on the
+/// read store (a size recorded for its object after the ticket was issued
+/// and before the preparation) is decided by the re-run under the lock:
+/// `commit_prepared` quarantines the event at once instead of returning
+/// `Stale` (a wasted round and a backoff).
+#[test]
+fn validation_refused_off_lock_is_decided_under_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_a, mut b, event, allowed) = two_way(dir.path());
+    let read = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    let (object, size) = event.object_sizes.iter().next().expect("a sized save");
+    b.stage_incoming(vec![staged(event.clone())], &allowed)
+        .unwrap();
+    let ticket = b
+        .activate_slice(SliceBudget::ACTIVATOR)
+        .unwrap()
+        .slow_ticket
+        .expect("a slow event");
+    b.db.execute(
+        "INSERT INTO object_sizes VALUES(?,?)",
+        rusqlite::params![object, size + 1],
+    )
+    .unwrap();
+    let prepared = Store::prepare_slow(&read, &ticket).unwrap();
+    let Prepared::Computed(computed) = &prepared else {
+        panic!("prepare_slow computes off-lock");
+    };
+    assert!(!computed.is_computed(), "refused on the read store");
+    assert_eq!(computed.event(), Some(&event));
+    assert_refused(b.commit_prepared(prepared).unwrap(), "OBJECT_SIZE_CHANGED");
+    assert!(!b.events().unwrap().iter().any(|e| e.id == event.id));
+    assert_eq!(b.inbox_counts().unwrap().quarantined, 1);
+    assert_oracle_empty(&mut b, "after the refusal");
+}
+
+/// WP2.4 fix round 1: a slow event on a shared branch whose newest row is
+/// far below the journal's tip (other branches committed since). The
+/// ticket's `base_seq` is the branch's newest sequence (read from its
+/// frontier, without walking the journal from its tip); the commit is not
+/// stale, and its forced seal is written from the parts computed off-lock
+/// (the check that the branch's journal is the hashed prefix plus the event
+/// also reads the frontier). The seal is valid and the oracle empty.
+#[test]
+fn side_branch_slow_commit_far_below_the_tip_seals_from_prepared_parts() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = Store::initialize(&dir.path().join("a"), &repo, &id()).unwrap();
+    let mut b = Store::initialize(&dir.path().join("b"), &repo, &id()).unwrap();
+    let allowed = devices([&a, &b]);
+    let main = a.active.clone();
+    let side = a.fork("side", true).unwrap();
+    a.checkout(&side.id).unwrap();
+    a.create("side.txt", "file").unwrap();
+    let deliver = |from: &Store, to: &mut Store| {
+        to.receive(
+            Bundle {
+                repo: repo.clone(),
+                branches: vec![],
+                events: missing(from, to),
+                objects: BTreeMap::new(),
+            },
+            &allowed,
+        )
+        .unwrap();
+    };
+    deliver(&a, &mut b);
+    b.checkout(&side.id).unwrap();
+    // Concurrent saves of side.txt; B's stays unseen by A.
+    write(&mut a, "side.txt", b"from a");
+    write(&mut b, "side.txt", b"from b");
+    let event = missing(&a, &b).remove(0);
+    // Many rows of `main` above `side`'s newest.
+    b.checkout(&main).unwrap();
+    for i in 0..60 {
+        b.create(&format!("main-{i}"), "file").unwrap();
+    }
+    let newest: i64 =
+        b.db.query_row(
+            "SELECT max(s.seq) FROM journal_sequence s JOIN events e ON e.id=s.event WHERE e.branch=?",
+            [&side.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(journal_tip(&b) >= newest + 60);
+    let read = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    let (ticket, prepared) = prepare_one(&mut b, &read, &event, &allowed);
+    assert_eq!(ticket.base_seq, newest, "the ticket's branch sequence");
+    let Prepared::Computed(computed) = &prepared else {
+        unreachable!()
+    };
+    assert_eq!(
+        computed.base_seq(),
+        newest,
+        "the preparation's branch sequence"
+    );
+    let seals = b.prepared_seals();
+    assert_eq!(
+        b.commit_prepared(prepared).unwrap(),
+        CommitOutcome::Committed {
+            id: event.id.clone(),
+            slow: true
+        }
+    );
+    assert_eq!(
+        b.prepared_seals(),
+        seals + 1,
+        "sealed from the prepared parts"
+    );
+    assert!(
+        assert_snapshot_valid(&b, &side.id),
+        "sealed at the side's tip"
+    );
+    assert_oracle_empty(&mut b, "after the side commit");
 }
 
 /// The rows a slow commit leaves for its projection: `current_state`, how

@@ -177,9 +177,13 @@ pub struct PreparedCommit {
 /// What `prepare_slow` computed.
 #[derive(Debug)]
 enum Outcome {
-    /// The ticket did not apply on the read store (no ready row, links not
-    /// all committed, already committed, or a commit validation failed,
-    /// which `commit_prepared` repeats under the lock). Nothing computed.
+    /// Nothing computed. Either the ticket did not apply on the read store
+    /// (no ready row, links not all committed; `event` is `None` and the
+    /// ticket is `Stale`), or the read store found the event committed or
+    /// refused one of its commit validations: `commit_prepared` then re-runs
+    /// the validations under the lock, which decide (a refusal is applied
+    /// as the inline path applies it; committed is reported as committed;
+    /// a pass is `Stale`, to be prepared again).
     NotReady,
     /// A successor applies at `base_seq` (the branch moved after the
     /// ticket): its delta, with the competing cuts counted (CCR-WP1.6-5).
@@ -1315,20 +1319,15 @@ impl Store {
         )?;
         Ok(())
     }
-    /// The branch's latest journal sequence (0 when it has no events).
+    /// The branch's latest journal sequence (0 when it has no events): the
+    /// newest of its frontier events (`commit::frontier_seq`), a few index
+    /// lookups for any branch (a join over the events scanned every event
+    /// of the journal; walking the journal from its tip cost one lookup per
+    /// newer row of other branches, WP2.4 fix round 1). It grows with every
+    /// commit to the branch and changes with nothing else, which is what
+    /// the ticket's `base_seq` and the staleness check need.
     fn branch_seq(&self, branch: &str) -> Result<i64> {
-        Ok(self
-            .db
-            .query_row(
-                // CROSS JOIN keeps the journal as the outer loop: the newest
-                // rows first, so the active branch costs a few point lookups
-                // (a plain JOIN scanned every event of the branch).
-                "SELECT s.seq FROM journal_sequence s CROSS JOIN events e ON e.id=s.event WHERE e.branch=? ORDER BY s.seq DESC LIMIT 1",
-                [branch],
-                |r| r.get(0),
-            )
-            .optional()?
-            .unwrap_or(0))
+        commit::frontier_seq(&self.db, branch)
     }
     /// Run `f` in a write transaction: `BEGIN IMMEDIATE` from autocommit
     /// (CCR-WP0.INT-5: no deferred read-then-write upgrade that fails with
@@ -1456,6 +1455,9 @@ impl Store {
             return Ok(prepared);
         }
         prepared.base_seq = self.branch_seq(&event.branch.id)?;
+        // Committed already, or a commit validation refuses it here:
+        // nothing to compute; `commit_prepared` re-runs the validations
+        // under the lock, and they decide (`Outcome::NotReady`).
         if let Ok(Check::Ready(_)) = self.check_commit(&event, false) {
             prepared.outcome = match self.fast_successor_in(&event, false, committed_view) {
                 Err(error) => Outcome::Refused(error),
@@ -1563,15 +1565,15 @@ impl Store {
                 return Ok(CommitOutcome::Stale);
             }
         }
-        // The computation is for this event at this branch state, or stale.
-        if matches!(outcome, Outcome::NotReady)
-            || seen.as_ref() != Some(&event)
-            || self.branch_seq(&event.branch.id)? != base_seq
-        {
+        // The preparation is for this event at this branch state, or stale.
+        if seen.as_ref() != Some(&event) || self.branch_seq(&event.branch.id)? != base_seq {
             return Ok(CommitOutcome::Stale);
         }
         // Re-validated under the lock: the global tables may have changed
-        // since the read (I7).
+        // since the read (I7). This also decides a preparation whose own
+        // validation refused the event or found it committed (`NotReady`
+        // with the event seen): a refusal quarantines it now (or retries,
+        // if transient), as the inline path does, instead of a stale round.
         let checked = match self.check_commit(&event, false) {
             Ok(Check::Ready(checked)) => checked,
             Ok(Check::Committed) => {
@@ -1584,6 +1586,8 @@ impl Store {
             Err(error) => return self.failed(id, error),
         };
         let plan = match outcome {
+            // The read store refused (or found committed) what passes now:
+            // nothing was computed; prepare again.
             Outcome::NotReady => return Ok(CommitOutcome::Stale),
             Outcome::Pending => {
                 return Ok(match self.defer_pending(id)? {
