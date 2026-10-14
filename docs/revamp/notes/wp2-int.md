@@ -260,12 +260,55 @@ replaced the Supervisor has its own (`folder_controller`, `orchestrator_runtime`
 
 ## Interoperability with 6298d0b (§13 rule 8.4)
 
-(filled in below)
+Waves 1–2 stay wire-compatible: the daemon's only network path is still
+WP2.1's legacy bridge (v2 lanes, `published-*`, bulk protocol 1, the v2
+pairing exchange), and the v3 stack (WP2.5–2.8) is not wired.
+
+The baseline binary was built from `git archive 6298d0b` (no worktree
+added; the export is identical to WP1.INT's) in
+`C:/tkfs-build/wp2-int-baseline-src`, with
+`CARGO_TARGET_DIR=C:/tkfs-target/wp2-int-baseline` (debug).
+
+| Run | Result |
+|---|---|
+| `TKFS_BASELINE_BIN=… cargo test --test w1_integration -- --include-ignored` (WP1.INT's `interop_with_a_6298d0b_peer`: this build dials the old daemon and receives its folder, files both ways; the old daemon dials this build and receives, files both ways; both list each other as peers) | **pass, 4 of 4 runs** (5 of 5 tests each, 12–13 s) |
+| `TKFS_BASELINE_BIN=… cargo test --test w2_integration -- --ignored interop` (new, `interop_wave_2_with_a_6298d0b_peer`: what Wave 2 changed on the paths an old peer meets) | **pass, 4 of 4 runs** (12.3–12.5 s): the old dialer receives a folder this build serves; this build pauses it, so its inbound answers `FOLDER_SYNC_PAUSED` (a code 6298d0b does not know): nothing moves for 3 s, the old daemon's API answers meanwhile, and after resume the file arrives; the old side's writes come back. Then this build dials the old daemon, receives its folder, pauses it as the dialer (nothing moves), resumes (the file arrives). This build's CLI (`ControlClient`) lists the old daemon's folders; `manage status` is refused by it (non-zero exit) |
+
+The old worker answers `hello` with an error in the WP1.INT test, which
+proves the peer really runs the old build. Interop was run on Windows with
+headless folders and small files, debug builds, one old and one new daemon.
 
 ## Package status
 
-(filled in below)
+| Package | Review | Merged | Status in the merged tree | Open issues (owner) |
+|---|---|---|---|---|
+| WP2.1 orchestrator wiring | **not approved** (its review) | `41798b0` (+ `24ed304`, `c2e0379`, `669d80f`, `7054d7c`) | green: `orchestrator` 15, `orchestrator_runtime` 13, `legacy_stabilizers` 3 + 4 ignored, `w2_integration`'s daemon tests; the qualification below | **its blocker resolved** (CCR-WP2.1-2: the patch it prepared, plus the two qualification scenarios); its three minors fixed or ratified (signal pipe, hub test precondition, CCR-WP2.1-6). Remaining, from its notes: a blocked receive on a cancelled legacy lane is not woken on Windows (it ends at the 15 s socket timeout; v3 sessions are not affected); a dead catalog thread is not restarted (management writes answer `CATALOG_UNAVAILABLE`); the `folder-slots` safety net is a 2 s timer, not a `registry.rs` fix (WP1.2's file); an accept loop whose wake-up connection fails is left to the process exit. CCR-WP2.1-1 (WP3.1), -3 (WP4.1), -7 (WP3.4) deferred; -5 declined |
+| WP2.2 management API, CLI | approved | `68f4a19` | green: `management_api` 27; the CLI against the real daemon (`w2_integration`) | review minors: `default_deadline(Revalidate)` (60 s) is below the server's worst case (~61 s); a mutating action's `REQUEST_TIMEOUT` lacks the "may or may not have run" wording; `watch` retries forever on `INVALID_REPLY`, and a retried `subscribe` re-sends its full `wait_ms`; opposite concurrent pause/resume can leave the controller's intent different from the catalog's; `diagnostics` is not refused while stopping. CCR-WP2.2-2 declined |
+| WP2.3 worker activation | **not approved** (its review) | `03a5a06` (+ `2f64972`) | green: `worker_concurrency` 23, `worker_lifecycle` 25, `availability` 13, `w1_integration`, `w2_integration`; the qualification below | **its major (seal forecast) fixed**, three minors fixed. `fs_p99_during_catchup`: see *Qualification*. Remaining: CCR-WP2.3-2/-3/-5 deferred (seal off the commit lock, retried-row telemetry, seal cadence API), CCR-WP2.3-4 declined; the forecast's documented limitations (a seal of a branch not at the head, or of a large event, can fall inside a normal slice) |
+| WP2.4 off-lock slow path | approved | `a810831` | green: `offlock_commit` 20 + 1 ignored, `activation_inbox` 21, `derive_oracle` 11 + 2 ignored, `startup_snapshots` 8, `scalability` 5; the activator now commits `Prepared::Computed` (worker variants of its qualification run, below) | review minor: no test reaches `commit_computed`'s `Outcome::Fast` branch (a branch moved between ticket and preparation). CCR-WP2.4-1 ratified, -6 applied; -2/-3 deferred. Known: preparing is O(history); periodic seals of fast commits still hash and serialize under the lock |
+| WP2.5 feed (worker side) | **not approved** (its review) | `eaa8e64` (+ `894f8ea`) | green: `feed_v7` 37, the v3 end-to-end test; the qualification below | **its major (the `feed_journal` backfill) fixed**; `feed_150k_events`: see *Qualification*. Remaining: its notes say `feed-offer` refreshes `sync_obs`/the generation and pokes the activator, which it does not (an offer changes nothing; documentation only). CCR-WP2.5-2/-3/-4 deferred to WP3.1, -6 to Wave 3 |
+| WP2.6 peer supervisor | approved | `15cebb7` (+ `de69aa3`) | green: `peer_supervisor` 25 (with real WP2.7 runners now), the v3 end-to-end test | review minors: `LaneExit::drop` removes a panicked lane's `Conn` without closing it (its runner keeps the session until the supervisor stops); `spawn` records `PeerConfigured` and starts lanes outside the retire mute (a race with `shutdown`: a late event, unjoined threads that exit at once); retiring reports lanes `Closed` without an error, so after a pool shrink stale `Closed` lanes and their lane errors stay in the hub until `PeerRemoved`; `peer_meta.incompatible` is not cleared when a block changes to a non-Incompatible one; `pair` returns `Err` if a `RemovePeer` fails after the upsert stored the pairing. CCR-WP2.6-2 deferred (WP3.1) |
+| WP2.7 MetaScheduler | approved | `869b08e` | green: `meta_scheduler` 24 + 1 ignored, the v3 end-to-end test | review minors: a GOAWAY refusal ends the lane while the peer would still answer up to 3 in-flight exchanges (they end `CONNECTION_LOST`: uncertain, never replayed, recovered by the next cursor exchange); `Wake::Done` is not sent if a step after the inner `catch_unwind` panics (a status sink panic), which would freeze that key until the lane restarts |
+| WP2.8 inbound server | approved | `b8fa679` | green: `inbound_v3` 19, the v3 end-to-end test | review minors: `accept_error_is_per_connection` treats Windows `WSAENETDOWN`-class errors as per-connection, so a failed network subsystem makes `net-accept` spin until it recovers; `meta_exchange` keeps the request body alive during the worker call (up to ~2 GiB across 128 hung exchanges). CCR-WP2.8-4 deferred (WP3.1). Not wired until WP3.1 |
 
 ## Known limitations
 
-(filled in below)
+- **The v3 stack is still standalone.** The end-to-end test runs it in
+  process with the daemons' legacy bridges shut down; WP3.1 wires it (and
+  deletes the bridge, `lanes.rs`, `peering.rs`).
+- WP2.1's, WP2.3's and WP2.5's fixes here were checked only by their own
+  tests and this integration's runs, not by a package re-review.
+- The seal forecast reads at most 8 head rows and no payload above 64 KiB:
+  for a backlog of large events, or of several branches beyond the eighth
+  head row, a seal can fall inside a normal slice (one slice's hold, never
+  a run of short slices).
+- The `feed_journal` backfill's progress line is emitted per 10,000 rows,
+  as the objects backfill's is; no test runs a worker over a journal large
+  enough to see it (the resume test drives the cursor directly).
+- `Store::view` reads a one-row TEMP table once per call on a handle that
+  has committed (CCR-WP2.4-6, option (a)).
+- Deferred CCRs stay with their named owners (table above).
+- Build artefacts outside the repository: the 6298d0b export
+  `C:/tkfs-build/wp2-int-baseline-src` and its target
+  `C:/tkfs-target/wp2-int-baseline`; they only served the interop runs and
+  can be deleted.
