@@ -14,7 +14,7 @@
 //!   `FOLDER_SYNC_PAUSED`, a folder without a running worker
 //!   `LOCAL_WORKER_UNAVAILABLE`;
 //! * each worker call is bounded by [`INBOUND_WORKER_DEADLINE`].
-use super::{lanes, legacy_bridge::LegacyBridge, supervisor::Shared};
+use super::{lanes, legacy_bridge::LegacyBridge};
 use crate::{
     core::id,
     model::{
@@ -25,7 +25,6 @@ use crate::{
     paired_sync::{PublishedState, SyncPage, SyncRoute},
     pairing_code::Verifier,
     runtime::Discovery,
-    util::lock::lock,
     ws,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -97,22 +96,6 @@ pub(crate) fn remote_catalog(
         &mut socket,
         &json!({"op":"list"}),
     )?)?)
-}
-
-/// [`remote_catalog`] through the legacy `Supervisor` (the legacy
-/// `api::manage`, which stays compiled until WP2.INT).
-pub(crate) fn remote_list(shared: &Shared, endpoint: &str) -> Result<Vec<PublishedState>> {
-    let (p, installation) = {
-        let s = lock(shared);
-        (
-            s.peers()?
-                .into_iter()
-                .find(|p| p.endpoint == endpoint)
-                .context("PEER_NOT_PAIRED")?,
-            s.installation.clone(),
-        )
-    };
-    remote_catalog(&p.endpoint, &p.code, &installation, &p.installation)
 }
 
 /// A loopback worker connection with a hard per-call deadline. It mirrors

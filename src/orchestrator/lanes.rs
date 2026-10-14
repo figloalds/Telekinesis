@@ -17,11 +17,10 @@
 //!   LegacyLink}` into the hub, and `GateEvidence` to the folder controller
 //!   (the legacy gate rule, §3.3 Wave 2).
 //!
-//! `lane_role` and `link_key` keep their legacy signatures: the legacy
-//! `api::manage` and `supervisor.rs`, which stay compiled until WP2.INT, use
-//! them.
+//! `lane_role` keeps its legacy signature. The legacy `api::manage`,
+//! `supervisor.rs` and `catalog_db.rs` (and with them `link_key`) were
+//! deleted by WP2.INT (§14 WP2.INT task 1).
 use super::{
-    catalog_db::Peer,
     legacy_bridge::LegacyBridge,
     peering::{dial_role, route},
 };
@@ -61,12 +60,6 @@ pub(crate) fn lane_role(lane: usize) -> &'static str {
 /// The key of one lane's link status: `ENDPOINT:REVISION:LANE`.
 pub(crate) fn lane_key(endpoint: &str, revision: &str, lane: usize) -> String {
     format!("{endpoint}:{revision}:{lane}")
-}
-
-/// [`lane_key`] of a legacy `catalog_db::Peer` (the legacy `api::manage` and
-/// `supervisor.rs`; deleted with them).
-pub(crate) fn link_key(peer: &Peer, lane: usize) -> String {
-    lane_key(&peer.endpoint, &peer.revision, lane)
 }
 
 /// A paired peer as the lanes use it: the catalog's `PeerRecord`, with the

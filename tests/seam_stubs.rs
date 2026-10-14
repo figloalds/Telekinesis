@@ -3,8 +3,10 @@
 //! Only frozen behaviour is pinned here, so the owners can implement their
 //! stubs without editing this file: exact signatures, the `WorkerCtx` shape and
 //! its helpers (`SyncStorePool`, `EngineGaugeCell`), the new `Action` JSON, the
-//! legacy `manage` answer to it, the unknown-op convention of the worker RPC
-//! seams, and the mount invariants that hold for the stub and for WP1.5.
+//! unknown-op convention of the worker RPC seams, and the mount invariants
+//! that hold for the stub and for WP1.5. (The legacy `manage` answer to the
+//! new `Action`s was pinned here until WP2.INT deleted the legacy
+//! `Supervisor` and its `api::manage`, §14 WP2.INT task 1.)
 use serde_json::{Value, json};
 use std::{
     path::Path,
@@ -23,7 +25,7 @@ use tkfs::{
         orchestrator::{Ctx, PeerContext},
         protocol::LaneSpec,
     },
-    orchestrator::{self, Action, Config, Network, Supervisor},
+    orchestrator::{self, Action},
     runtime::{
         self, Engine, Shared,
         ctx::{EngineGaugeCell, ObjectLease, PooledStore, SyncStorePool, WorkerCtx},
@@ -195,59 +197,6 @@ fn action_v2_variants_parse_the_frozen_json() {
     );
     assert!(serde_json::from_value::<Action>(json!({"op":"attach"})).is_err());
     assert!(serde_json::from_value::<Action>(json!({"op":"subscribe"})).is_err());
-}
-
-#[test]
-fn legacy_manage_answers_v2_actions_not_implemented() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = Config {
-        format_version: 2,
-        data_directory: dir.path().join("data"),
-        default_mount_directory: dir.path().join("mounts"),
-        maximum_running: 8,
-        network: Network::default(),
-    };
-    let shared = Arc::new(Mutex::new(Supervisor::open(config).unwrap()));
-    let state = || "00000000-0000-4000-8000-000000000001".to_owned();
-    for action in [
-        Action::Status,
-        Action::Subscribe {
-            since: 0,
-            wait_ms: Some(10),
-        },
-        Action::Attach { state: state() },
-        Action::Detach {
-            state: state(),
-            force: true,
-        },
-        Action::PauseSync { state: state() },
-        Action::ResumeSync { state: state() },
-        Action::OverrideGate { state: state() },
-        Action::ForceStop { state: state() },
-        Action::Retry { state: state() },
-        Action::Revalidate {
-            state: state(),
-            ids: None,
-        },
-        Action::Diagnostics,
-    ] {
-        let op = serde_json::to_value(&action).unwrap()["op"].clone();
-        let error = orchestrator::manage(&shared, action).unwrap_err();
-        assert_eq!(code_of(&error), "NOT_IMPLEMENTED", "{op}: {error:#}");
-        assert!(error.to_string().contains(op.as_str().unwrap()));
-    }
-    // Legacy actions keep their behaviour; `wait` is accepted and ignored.
-    let list = orchestrator::manage(&shared, Action::List).unwrap();
-    assert_eq!(list["folders"], json!([]));
-    let error = orchestrator::manage(
-        &shared,
-        Action::Stop {
-            state: state(),
-            wait: Some(false),
-        },
-    )
-    .unwrap_err();
-    assert_ne!(code_of(&error), "NOT_IMPLEMENTED");
 }
 
 #[test]
