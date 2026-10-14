@@ -1,19 +1,22 @@
 //! Disposable startup snapshots. The semantic journal remains authoritative.
 use super::*;
+use std::borrow::Cow;
 
 // Bump when projection/validation semantics change, even without a SQL migration.
 const FORMAT: u32 = 1;
 const INTERVAL: i64 = 128;
 
+/// The sealed payload. `projection` is borrowed when the sealing commit holds
+/// it (the JSON is the same either way).
 #[derive(Serialize, Deserialize)]
-struct Snapshot {
+struct Snapshot<'a> {
     format: u32,
     repo: String,
     device: String,
     branch: Branch,
     cursor: i64,
     journal_hash: String,
-    projection: Projection,
+    projection: Cow<'a, Projection>,
     conflicts: Vec<Conflict>,
     frontier: Vec<String>,
 }
@@ -82,7 +85,17 @@ fn journal_hash(db: &Connection, branch: &str, cursor: i64) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
-pub(super) fn maybe_persist(db: &Connection, branch: &str, full: bool) -> Result<()> {
+/// Seals `branch` when `full` (a slow-path commit) or when the journal moved
+/// [`INTERVAL`] events past its last seal. A commit that holds the branch's
+/// whole projection as it has just stored it passes it as `known`: the seal
+/// serializes that instead of reading the ~7 MB (at 5K entries) back and
+/// parsing it (WP1.INT fix round 1, CCR-WP1.INT-4). The payload is the same.
+pub(super) fn maybe_persist(
+    db: &Connection,
+    branch: &str,
+    full: bool,
+    known: Option<&Projection>,
+) -> Result<()> {
     let saved: Option<i64> = db
         .query_row(
             "SELECT cursor FROM startup_snapshots WHERE branch=?",
@@ -98,14 +111,22 @@ pub(super) fn maybe_persist(db: &Connection, branch: &str, full: bool) -> Result
         |r| r.get(0),
     )?;
     if full || saved.is_none_or(|saved| tip - saved >= INTERVAL) {
-        persist(db, branch)?;
+        persist_with(db, branch, known)?;
     }
     Ok(())
 }
 
 pub(super) fn persist(db: &Connection, branch: &str) -> Result<()> {
+    persist_with(db, branch, None)
+}
+
+/// Seals `branch`; its projection is `known` when given, else the stored one.
+fn persist_with(db: &Connection, branch: &str, known: Option<&Projection>) -> Result<()> {
     let cursor = cursor(db, branch)?;
-    let projection = load_projection(db, branch)?;
+    let projection = match known {
+        Some(projection) => Cow::Borrowed(projection),
+        None => Cow::Owned(load_projection(db, branch)?),
+    };
     ensure!(projection.pending.is_empty(), "INCOMPLETE_SNAPSHOT");
     let mut conflicts = Vec::new();
     let mut statement =

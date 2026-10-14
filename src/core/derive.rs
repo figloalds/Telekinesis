@@ -375,6 +375,21 @@ pub(super) fn persist_projection(
     persist_commit(tx, branch, p, events, new_id)
 }
 
+/// `persist_projection` for a commit whose caller has already stored the
+/// projection `p` as `current_parts` rows (a slow commit's delta,
+/// `Store::projection_delta`, CCR-WP1.INT-4): the derived records only, in
+/// the configured mode, with no rewrite of `current_state`. Derivation reads
+/// neither table.
+pub(super) fn persist_commit_records(
+    tx: &Connection,
+    branch: &str,
+    p: &Projection,
+    events: &[Event],
+    new_id: &str,
+) -> Result<()> {
+    persist_commit(tx, branch, p, events, new_id)
+}
+
 /// A commit's records, in the configured mode, checked against the
 /// reference when the thread asks for it (`set_thread_commit_checks`).
 fn persist_commit(

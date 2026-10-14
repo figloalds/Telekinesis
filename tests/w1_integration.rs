@@ -9,12 +9,15 @@
 //!   hand the authenticated socket to a running `Conn` (WP1.9).
 //! - The worker `revalidate` RPC (WP1.4's arm, WP1.6's `Store::revalidate`,
 //!   wired by WP1.INT, task 1).
+//! - Slow-path commits store their projection as a delta (WP1.INT fix round
+//!   1, CCR-WP1.INT-4: WP1.6's commit path with WP1.7's derivation).
 //! - Interoperability with a 6298d0b peer (§13 rule 8.4): `#[ignore]`d, run
 //!   with `TKFS_BASELINE_BIN` pointing at a 6298d0b `tkfs` binary.
 mod support;
 
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs,
     io::{BufRead, BufReader},
     net::{SocketAddr, TcpListener},
@@ -25,11 +28,11 @@ use std::{
     time::{Duration, Instant},
 };
 use support::{
-    Control, Node, NodeConfig, WorkerProc, copy_legacy_worker, has_file, kill_pid, retry_busy,
-    state_id, tail, try_rpc, wait_until,
+    Control, Node, NodeConfig, WorkerProc, batched, causal_sort, clone_replica, copy_legacy_worker,
+    devices, has_file, kill_pid, linear_history, retry_busy, state_id, tail, try_rpc, wait_until,
 };
 use tkfs::{
-    core::{Store, id},
+    core::{Bundle, Store, id},
     model::{
         errors::ErrorWire,
         orchestrator::{
@@ -553,6 +556,118 @@ fn revalidate_requeues_quarantined_rows_and_reactivates_them() {
     // until its recovery commits; a force stop persists it and exits.
     worker.rpc(json!({"op":"stop","mode":"force"})).unwrap();
     assert!(worker.wait_exit(Duration::from_secs(15)).is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Slow commits store their projection as a delta (CCR-WP1.INT-4)
+
+/// `(current_state payload, current_parts rows, entities)` of the store's
+/// only branch: the stored projection's layout.
+fn stored_layout(store: &Store) -> (String, usize, usize) {
+    let states: Vec<(String, String)> = store
+        .db
+        .prepare("SELECT branch,payload FROM current_state")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(states.len(), 1, "one branch");
+    let (branch, payload) = states.into_iter().next().unwrap();
+    let parts: Vec<String> = store
+        .db
+        .prepare("SELECT entity FROM current_parts WHERE branch=?")
+        .unwrap()
+        .query_map([&branch], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let state: Value = serde_json::from_str(&payload).unwrap();
+    let mut entities: BTreeSet<String> = state["entries"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    let rows = parts.len();
+    entities.extend(parts);
+    (payload, rows, entities.len())
+}
+
+/// Concurrent remote namespace operations take the slow path on B. A slow
+/// commit used to rewrite the whole projection into `current_state` (as many
+/// bytes again as the forced snapshot seal); now it writes only the
+/// `current_parts` rows of the entities it changed, until the rows would
+/// outnumber half of the entities, when one full rewrite folds them back.
+/// After every commit the stored projection equals a rebuild (the oracle),
+/// and a restart (startup snapshot) reads the same state.
+#[test]
+fn slow_commits_store_their_projection_as_a_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
+    linear_history(&mut a, 60).unwrap();
+    let (mut a, mut b) = clone_replica(a, &dir.path().join("b")).unwrap();
+    let allowed = devices([&a, &b]);
+    // B's unseen local edit: every event from A is concurrent with it.
+    b.create("b-local-dir", "directory").unwrap();
+    let before = b.shared_event_inventory().unwrap();
+    batched(&mut a, |a| {
+        for i in 0..30 {
+            a.create(&format!("ns-dir-{i:02}"), "directory")?;
+            let file = a.lookup(&format!("lin-{i:06}.txt"))?;
+            a.rename(&file.id, &format!("ns-dir-{i:02}/moved-{i:02}.txt"), false)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let mut bundle = a.shared_bundle(&before).unwrap();
+    causal_sort(&mut bundle.events);
+    assert_eq!(bundle.events.len(), 60);
+    let (mut state, _, _) = stored_layout(&b);
+    let (mut deltas, mut rewrites) = (0, 0);
+    for event in bundle.events.clone() {
+        let slow = b.commit_path_counters().slow;
+        let page = Bundle {
+            repo: bundle.repo.clone(),
+            branches: vec![],
+            events: vec![event],
+            objects: Default::default(),
+        };
+        b.receive(page, &allowed).unwrap();
+        assert_eq!(b.commit_path_counters().slow, slow + 1, "a slow commit");
+        let (now, parts, entities) = stored_layout(&b);
+        if now == state {
+            deltas += 1;
+            assert!(parts > 0, "a delta writes parts");
+        } else {
+            rewrites += 1;
+            assert_eq!(parts, 0, "a full rewrite folds the parts back");
+            state = now;
+        }
+        assert!(
+            parts <= entities / 2,
+            "{parts} parts for {entities} entities"
+        );
+        let diff = b.verify_derived_state().unwrap();
+        assert!(diff.is_empty(), "oracle after a slow commit: {diff:?}");
+    }
+    eprintln!("{deltas} delta commits, {rewrites} full rewrites");
+    assert!(
+        deltas >= 40 && rewrites >= 1,
+        "{deltas} delta commits, {rewrites} full rewrites"
+    );
+    for i in [0, 17, 29] {
+        assert!(b.lookup(&format!("ns-dir-{i:02}/moved-{i:02}.txt")).is_ok());
+    }
+    assert!(b.lookup("b-local-dir").is_ok());
+    // A restart resumes from the startup snapshot and reads the same state.
+    let root = b.root.clone();
+    drop(b);
+    let mut b = Store::open(&root, Some(&repo)).unwrap();
+    assert!(b.lookup("ns-dir-29/moved-29.txt").is_ok());
+    assert!(b.verify_derived_state().unwrap().is_empty());
+    drop(a);
 }
 
 // ---------------------------------------------------------------------------
