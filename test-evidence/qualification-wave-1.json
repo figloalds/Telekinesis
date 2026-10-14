@@ -2,10 +2,10 @@
     "schema":  1,
     "kind":  "wave-1",
     "wave":  1,
-    "generated_at":  "2026-10-14T01:42:35.8811895-03:00",
-    "duration_s":  2121,
+    "generated_at":  "2026-10-14T01:48:03.2740043-03:00",
+    "duration_s":  129.6,
     "git":  {
-                "commit":  "65543f0b7ee14c2702433716bf318974f2e79835",
+                "commit":  "fb7275f606658e964662592bae97ce2c07ec4cc6",
                 "branch":  "revamp/wp1-int",
                 "dirty":  false,
                 "dirty_paths":  [
@@ -32,18 +32,17 @@
                     "ok":  false,
                     "scenarios":  29,
                     "by_status":  {
-                                      "pass":  27,
-                                      "fail":  2
+                                      "pass":  28,
+                                      "fail":  1
                                   },
                     "floors_evaluated":  16,
-                    "floors_passed":  14,
-                    "floors_failed":  2,
+                    "floors_passed":  15,
+                    "floors_failed":  1,
                     "floors_missing":  0,
                     "floors_not_run":  0,
                     "floors_incomplete":  0,
                     "enforced_failures":  [
-                                              "concurrent_namespace_ops_5k",
-                                              "legacy_crash_backoff"
+                                              "concurrent_namespace_ops_5k"
                                           ]
                 },
     "files":  [
@@ -749,18 +748,18 @@
                   {
                       "file":  "qual_wp1_12_legacy",
                       "wave":  1,
-                      "status":  "fail",
-                      "exit_code":  101,
+                      "status":  "pass",
+                      "exit_code":  0,
                       "duration_s":  127.2,
-                      "result":  "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 126.54s",
-                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_12_legacy.log",
+                      "result":  "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 126.50s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-014552\\qual_wp1_12_legacy.log",
                       "scenarios":  [
                                         {
                                             "scenario":  "qual_wp1_12_legacy::crash_backoff",
-                                            "status":  "fail",
-                                            "elapsed_ms":  20094,
+                                            "status":  "pass",
+                                            "elapsed_ms":  20102,
                                             "failures":  [
-                                                             "FLOOR legacy_crash_backoff: restarts_20s \u003c= 5 (measured Some(20.0))"
+
                                                          ],
                                             "notes":  [
 
@@ -771,12 +770,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "restarts_20s",
-                                                                "value":  20.0,
+                                                                "value":  4.0,
                                                                 "unit":  "count"
                                                             },
                                                             {
                                                                 "metric":  "list_p99_ms",
-                                                                "value":  6.2253,
+                                                                "value":  6.5533,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -784,7 +783,7 @@
                                         {
                                             "scenario":  "qual_wp1_12_legacy::hung_remote_repo_charged",
                                             "status":  "pass",
-                                            "elapsed_ms":  15078,
+                                            "elapsed_ms":  15066,
                                             "failures":  [
 
                                                          ],
@@ -797,7 +796,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "healthy_delay_ms",
-                                                                "value":  3072.4575999999997,
+                                                                "value":  3096.0818,
                                                                 "unit":  "ms"
                                                             },
                                                             {
@@ -831,7 +830,7 @@
                                         {
                                             "scenario":  "qual_wp1_12_legacy::worker_busy_not_counted",
                                             "status":  "pass",
-                                            "elapsed_ms":  20105,
+                                            "elapsed_ms":  20051,
                                             "failures":  [
 
                                                          ],
@@ -844,7 +843,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "busy_observed",
-                                                                "value":  124.0,
+                                                                "value":  138.0,
                                                                 "unit":  "samples"
                                                             },
                                                             {
@@ -854,7 +853,7 @@
                                                             },
                                                             {
                                                                 "metric":  "busy_retries_max",
-                                                                "value":  4.0,
+                                                                "value":  5.0,
                                                                 "unit":  "count"
                                                             }
                                                         ]
@@ -1040,7 +1039,7 @@
                        "op":  "\u003c=",
                        "floor":  45000,
                        "unit":  "ms",
-                       "measured":  3072.4575999999997,
+                       "measured":  3096.0818,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "lane-wide resets, 30 s backoff"
@@ -1066,12 +1065,23 @@
                        "op":  "\u003c=",
                        "floor":  5,
                        "unit":  "count",
-                       "measured":  20.0,
-                       "verdict":  "fail",
+                       "measured":  4.0,
+                       "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "restart every 2 s"
                    }
                ],
-    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713",
-    "merged_from":  null
+    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-014552",
+    "merged_from":  {
+                        "generated_at":  "2026-10-14T01:42:35.8811895-03:00",
+                        "git":  {
+                                    "commit":  "65543f0b7ee14c2702433716bf318974f2e79835",
+                                    "branch":  "revamp/wp1-int",
+                                    "dirty":  false,
+                                    "dirty_paths":  [
+
+                                                    ]
+                                },
+                        "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713"
+                    }
 }

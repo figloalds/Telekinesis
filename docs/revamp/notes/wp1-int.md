@@ -137,6 +137,9 @@ created: the coordinator does both after review (§13 rule 6 and rule 8 item 7).
    - `tests/legacy_stabilizers.rs` (WP1.12): the crash-loop test counts
      lines (skipping the `"level":` log event), not matches; the
      mount-failure test is un-ignored.
+   - `tests/qual_wp1_12_legacy.rs` (WP1.12, `crash_backoff`): the same
+     counting fix (`956c842`); found by the first wave 1 qualification run,
+     which measured 20 "restarts" for 5.
    - `tests/worker_lifecycle.rs` (WP1.4,
      `ready_worker_record_and_hello_describe_the_same_process`): pinned the
      `revalidate` stub (`UNSUPPORTED_OPERATION`); it now expects
@@ -178,11 +181,14 @@ old `TrackedGuard` drop order: checked), `log_rate_windows_are_bounded`
 
 ## VERIFY
 
-All on the merged tree after the last code change (`8841d4a`; later
-commits change only these notes and the evidence file). Windows
+All on the merged tree after the last product-code change (`8841d4a`).
+Later commits change only these notes, the evidence file and the restart
+counting of the ignored `qual_wp1_12_legacy::crash_backoff` scenario
+(`956c842`), after which fmt, build, clippy and the WSL check were run
+again (same results). Windows
 `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int`, WSL
-`CARGO_TARGET_DIR=$HOME/tkfs-target/wp1-int`. The machine was otherwise
-idle (no other agent's suite or build ran meanwhile).
+`CARGO_TARGET_DIR=$HOME/tkfs-target/wp1-int`. No other agent's cargo or
+tkfs process was running on the machine when I checked before the runs.
 
 | Check | Result |
 |---|---|
@@ -226,7 +232,69 @@ contracts +8 (31 → 39) and w1_integration 3. 199 + 384 = 583. Ignored:
 
 ## Qualification (`test-evidence/qualification-wave-1.json`)
 
-QUAL_PLACEHOLDER
+**Runs.** `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell -NoProfile -File
+scripts/qualify.ps1 -Wave 1 -BudgetS 2400 -FileTimeoutMin 150` (release, all
+seven wave 1 qual files, 2,121 s) on the clean tree `65543f0` (`dirty:
+false`). Its `qual_wp1_12_legacy::crash_backoff` failed on an integration
+breakage in the scenario (it counted `STATE_NOT_INITIALIZED` matches, 4 per
+failed start since WP1.4; fixed in `956c842` like the `legacy_stabilizers`
+test), so that file was re-run with `-Files qual_wp1_12_legacy -Merge` on
+`fb7275f` (`dirty: false`); the evidence keeps the other six files of the
+first run (`merged_from`). The budget is 2,400 s per scenario because the
+6.4K backlog alone takes about 24 minutes (WP1.7 used 1,800 s). Hardware:
+AMD Ryzen 9 7950X3D (16 cores, 32 threads), 127.7 GB, Windows 11 Pro
+10.0.26300, rustc 1.96.0; I ran nothing else on the machine during either
+run.
+
+**Result: 29 scenarios, 28 pass, 1 fail; 16 floors evaluated, 15 pass, 1
+fail (`concurrent_namespace_ops_5k`); `ok: false`.**
+
+| Floor (wave 1) | Floor | Measured | Verdict | Wave 0 (`qualification-wave-0.json`, 60 s budget) |
+|---|---|---|---|---|
+| `remote_linear_create_2k` | ≤ 5 ms/event | 0.68 | pass | 175 (incomplete) |
+| `remote_linear_create_10k` | ≤ 5 ms/event | 1.94 (10,000 fast, 0 slow) | pass | 166 (incomplete) |
+| `local_create_after_resolved_conflict` | p90 ≤ 10 ms | 1.68 | pass | 27,841 (incomplete) |
+| `two_way_backlog_2k` | ≤ 100 ms/event | 60.9 (2,000 append, 0 fallbacks; oracle empty) | pass | 197 (incomplete) |
+| `two_way_backlog_6400` | ≤ 300 ms/event | 221.4 (6,400 append, 0 fallbacks) | pass | 187 (incomplete) |
+| `concurrent_namespace_ops_5k` | max ≤ 500 ms | **721.2** (p50 311, p90 347; 50 append, 0 fallbacks; derivation 17.9 ms/commit) | **fail** | 200,294 (incomplete) |
+| `restart_ready_20k_objects` | ≤ 3,000 ms | 1,004 (first open after build 3,534) | pass | 3,855 (fail) |
+| `content_status_50k` | < 50 ms | 0.07 warm (cold 511) | pass | 8,499 (fail) |
+| `tiny_pending_objects_12k` | completes | yes (302 objects/s) | pass | no (fail) |
+| `watch_latency` | ≤ 1,500 ms | 1,000.3 | pass | missing |
+| `session_slow_does_not_block_fast` | p99 < 50 ms | 0.18 | pass | 2,900 (fail) |
+| `session_control_under_queued_data` (CCR-WP1.9-3, new) | p99 < 50 ms | 40.3 | pass | — |
+| `session_loopback_throughput` | ≥ 300 MiB/s | 651 (WSS 508, upload 380) | pass | 26 (fail) |
+| `legacy_hung_repo_healthy_progress` | ≤ 45,000 ms | 3,096 | pass | incomplete |
+| `legacy_interval_20s_reconnects` | 0 | 0 | pass | 9 (fail) |
+| `legacy_crash_backoff` | ≤ 5 restarts in 20 s | 4 (re-run); 20 in the first run = 5 restarts × 4 matches | pass | 11 (fail) |
+
+Scenarios without a floor all pass: `qual_wp1_4_worker` 5/5 (accept loop,
+mount failure, poison exit 70, RPC before mount), `qual_wp1_5_mount` 3/3 on
+Windows (attach/detach/attach on one pid, force detach persists dirty data,
+foreign mount untouched), `qual_wp1_6_activation::{quarantine_not_pending,
+transient_retry}`, `qual_wp1_8_objects::corrupt_mid_page_keeps_completed`,
+`qual_wp1_9_session::{dead_peer_detection (20.0 s), duplex_32mib, idle_60s}`,
+`qual_wp1_12_legacy::worker_busy_not_counted` (138 busy observed, 0
+counted). Extra, WSL release: `qual_wp1_5_mount` **4/4** including the
+Linux-only `stale_owned_mount_recovered_after_crash` (WP1.5's hand-off),
+and `qual_wp1_4_worker` 5/5.
+
+**The failing floor.** `concurrent_namespace_ops_5k` is a per-operation
+maximum. The merged tree is faster than WP1.7 measured alone (p50 311 ms
+against 374 ms: WP1.6's inbox no longer parses the journal per event), but
+1–3 of the 50 operations take 450–850 ms. A probe (the scenario's workload
+three times, per-op samples, not committed) showed the slow operations at
+random positions (not a warm-up): `[…, 451, …, 756, …, 564, …]`,
+`[…, 734, …, 685, …, 623, …]`, `[…, 456, …, 843, …, 587, …]`. With SQLite's
+WAL autocheckpoint disabled the median fell to ~250 ms but spikes of up to
+1.1 s remained, so they are not checkpoints alone: each slow-path commit
+rewrites `current_state` and, by design, force-seals the startup snapshot
+(both O(5K entries), `synchronous=FULL`), and the outliers track I/O
+latency. WP1.7's own review reproduced 546–579 ms before the merge. No
+derive.rs change helps (derivation is 18 ms of the 311); this stays an open
+acceptance item for the slow-path commit cost (CCR-WP1.6-1 seal cadence,
+WP2.4's off-lock prepare, and the O(N) `current_state` rewrite of slow
+commits).
 
 ## Interoperability with 6298d0b (§13 rule 8.4)
 
@@ -264,12 +332,12 @@ mounted folders.
 | WP1.4 worker lifecycle | approved | `decaef8` | green: `worker_lifecycle` 25, `worker_seams` 4; `revalidate` wired (task 1); CCR-WP1.4-1/-2 applied; the concurrent-beat ordering finding fixed with CCR-WP1.5-2 | minors: the supervised idle exit measures with the wall clock (`now_ms`), which a clock step can trip (a WSL flake of `unsupervised_worker_exits_when_idle_and_contact_keeps_it_alive` was reported; it did not recur here); a retried Linux signal refused with `BUSY_VIEW` is dropped without a log line; the accept-error exit retains only best-effort; `qual_wp1_4_worker` stays `#[ignore]` by the qualify convention |
 | WP1.5 mount controller | approved | `4a5fe6e` | green: `mount_lifecycle` 11 (WinFsp) / 17 (FUSE); qual run below; CCR-WP1.5-1/-2 applied | minors: the adoption branch of `Inner::attach` does not call `watch_lost()` (legacy `mount::start` path only); a FUSE checkout whose unmount is refused while the dispatch thread died leaves `Attached`; WinFsp `TK_HANDLE` contexts leak at detach (`native/mount.c`); a lazy external unmount with open files reads `Attached` until the next attach/detach |
 | WP1.6 inbox and fast paths | approved | `226fcb7` | green: `activation_inbox` 21 (also under the strict oracle of CCR-WP1.7-1); remote fast paths on by default | CCR-WP1.6-5 (successors do not count `NAMESPACE_HISTORY_LIMIT` cuts; invariant 11's "refused before ACK" not guaranteed for > 4,096 competing cuts); the `TKFS_REMOTE_FASTPATH=0` doc says "exactly" but gates on the event's branch; `core.commit.busy` ignores the fault action; CCR-WP1.6-1/-3/-4 deferred (above) |
-| WP1.7 append-mode derivation | approved | `63846e5` (+ `801ca56`) | green: `derive_oracle` 11; CCR-WP1.7-1 applied, which also resolves the review finding that the adapter's plain pass used a deferred savepoint | qualification below; minors: verify mode returns full's refusal without comparing it with append's (the fuzzer's commit checks do compare); `append_guard` scans the whole branch and two of its guards depend on peer-controlled data (a `,` in an entity id, > 16 multi-relocation events), after which every slow commit of that branch runs full mode (a CCR on `commit.rs` validation to reject `,` is suggested; Wave 2) |
+| WP1.7 append-mode derivation | approved | `63846e5` (+ `801ca56`) | green: `derive_oracle` 11; CCR-WP1.7-1 applied, which also resolves the review finding that the adapter's plain pass used a deferred savepoint; 2K and 6.4K backlog floors pass | **`concurrent_namespace_ops_5k` floor fails** (max 721 ms, p50 311; Qualification), owner: the slow-path commit cost (WP2.4, CCR-WP1.6-1); minors: verify mode returns full's refusal without comparing it with append's (the fuzzer's commit checks do compare); `append_guard` scans the whole branch and two of its guards depend on peer-controlled data (a `,` in an entity id, > 16 multi-relocation events), after which every slow commit of that branch runs full mode (a CCR on `commit.rs` validation to reject `,` is suggested; Wave 2) |
 | WP1.8 object indexes | approved | `c359811` | green: `availability_index` 21, `availability`, `partial_content`, `bulk_lanes`; CCR-WP1.8-1/-2 applied | minors: on Linux `scan_objects` fails the whole call when an entry vanishes between readdir and stat (ENOENT; skip it); the cached `objects/` listing has no maximum age (filesystems without directory mtime updates); `put_object`/`put_stream` add a separate durable commit per new local object (13–20 % slower local writes in `scalability`); a cold `content_status` costs ~0.7 s at 50K objects during active sync (WP2.3 status cell); CCR-WP1.8-3 deferred |
 | WP1.9 session core | **not approved** | `237a852` | green: `session_core` 52; a real `Conn` runs over the real handshake in `w1_integration`. Nothing blocked the merge, and no wire path uses v3 sessions until WP3.1 | **blockers (open):** (1) a zero-length streamed request part put in an upload's overflow is never delivered (`deliver_uploads`/`next_wake` key on `overflow_bytes`), so an upload ending with empty parts stalls to its idle timeout (0-byte files over `objects.push`); (2) receive-side flow control charges only body bytes, so empty or tiny parts with large headers grow memory without bound (invariant 22; the review measured +0.8–1.9 GiB). Minors: `control_call_is_fast_while_data_is_queued` checks every sample < 50 ms in release (1 in 12 runs fails; use p99); a residual cross-side idle case and up to 4 MiB uncounted per running stream (documented). **Needs a WP1.9 fix round before WP2.6/WP2.8 rely on the bounds** |
 | WP1.10 session handshake | approved | `963d478` | green: `session_handshake` 21; CCR-WP1.10-1/-2/-3 applied; its "accept either outcome" tests now reach a real `Conn` | minors: the distinct-nonce check compares hex strings (an upper-case echo passes; no exploit: proofs use different labels); peer-chosen text (serde error detail, GOAWAY message) reaches error messages unescaped; `ws::connect_any` keeps only the last address's error (an HTTP 401/403 can be reported as `WS_CONNECT_FAILED`). Optional: switch the private pre-auth frame codec to `session::frame` |
 | WP1.11 status hub | **not approved** | `a818984` | green: `status_hub` 74; used with a real registry in `w1_integration`. Not wired until WP2.1, so nothing blocked the merge | **major (open):** object transfer rates and ETA include metadata exchange bytes (the per-pair EWMAs add every op's bytes), so mixed traffic misreports object rate/ETA (the §14 "within 5 %" item) and an idle pair shows non-zero object rates. Minors: exchange activity entries coalesce only with the newest entry, so two concurrent transfers fill the 500-entry ring; inbound-incompatible notices whose code changes still fill the daemon history; CCR-WP1.11-1/-2 deferred to WP2.INT. **Needs a WP1.11 fix round before WP2.1 wires it** |
-| WP1.12 legacy stabilizers | approved | `d7b10f3` (+ `9b36508`) | green: `legacy_stabilizers` 7 (the mount-failure test un-ignored and passing with real WinFsp); CCR-WP1.12-2 applied | minors: `DeadlineLane`'s 3 s does not bound the WebSocket upgrade (a frozen worker costs ~15 s per `list` call; widen CCR-WP1.12-1 to a deadline-aware `ws::connect`); `LOCAL_WORKER_UNAVAILABLE` anywhere in a chain is Contention, which hides wrapped `WORKER_STATE_MISMATCH` and `runtime.json` errors (only `WORKER_NOT_RUNNING` should be); `WORKER_LIMIT` escalates the crash backoff (up to 60 s to start once a slot frees); `lane_active` retires lanes on a `peers()` error while `run.rs` keeps the list (lane churn); discovery runs under the supervisor mutex for backed-off repositories; the notes' VERIFY table names the wrong ignored `harness_selftest` tests |
+| WP1.12 legacy stabilizers | approved | `d7b10f3` (+ `9b36508`, `956c842`) | green: `legacy_stabilizers` 7 (the mount-failure test un-ignored and passing with real WinFsp); all four release scenarios pass their floors (crash backoff after the counting fix); CCR-WP1.12-2 applied | minors: `DeadlineLane`'s 3 s does not bound the WebSocket upgrade (a frozen worker costs ~15 s per `list` call; widen CCR-WP1.12-1 to a deadline-aware `ws::connect`); `LOCAL_WORKER_UNAVAILABLE` anywhere in a chain is Contention, which hides wrapped `WORKER_STATE_MISMATCH` and `runtime.json` errors (only `WORKER_NOT_RUNNING` should be); `WORKER_LIMIT` escalates the crash backoff (up to 60 s to start once a slot frees); `lane_active` retires lanes on a `peers()` error while `run.rs` keeps the list (lane churn); discovery runs under the supervisor mutex for backed-off repositories; the notes' VERIFY table names the wrong ignored `harness_selftest` tests |
 
 ## Known limitations
 
