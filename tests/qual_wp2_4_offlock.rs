@@ -233,7 +233,7 @@ fn max(samples: &[f64]) -> f64 {
 /// The engine lock is held < 50 ms while a slow-path event (two-way, 2K
 /// history) activates through the off-lock path.
 #[test]
-#[ignore = "WP2.4 qualification (release)"]
+#[ignore = "WP2.4"]
 fn lock_hold_slow_event_2k() {
     let mut s = Scenario::new(FILE, "lock_hold_slow_event_2k");
     let d = diverged(scaled(2000), 1);
@@ -335,7 +335,7 @@ fn lock_hold_slow_event_2k() {
 /// takes, without pause, starves slow events by design (§4.4: `Stale` is
 /// never committed inline; WP2.3 reports `activation.starved_since_ms`).
 #[test]
-#[ignore = "WP2.4 qualification (release)"]
+#[ignore = "WP2.4"]
 fn stale_convergence() {
     let mut s = Scenario::new(FILE, "stale_convergence");
     let d = diverged(scaled(2000), 200);
@@ -433,7 +433,7 @@ fn activates_in_background(worker: &WorkerProc) -> bool {
 /// engine-locked op (`branches`) every few ms while the slow-path event is
 /// delivered over the legacy lane; its worst latency bounds the hold.
 #[test]
-#[ignore = "WP2.4 qualification (release)"]
+#[ignore = "WP2.4"]
 fn lock_hold_slow_event_2k_worker() {
     let mut s = Scenario::new(FILE, "lock_hold_slow_event_2k_worker");
     let d = diverged(scaled(2000), 1);
@@ -503,7 +503,7 @@ fn lock_hold_slow_event_2k_worker() {
 /// `stale_convergence` from outside a real worker: local imports race the
 /// background activator's prepared commits over the legacy lane.
 #[test]
-#[ignore = "WP2.4 qualification (release)"]
+#[ignore = "WP2.4"]
 fn stale_convergence_worker() {
     let mut s = Scenario::new(FILE, "stale_convergence_worker");
     let d = diverged(scaled(2000), 200);

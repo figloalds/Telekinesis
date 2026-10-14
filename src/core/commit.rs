@@ -1199,7 +1199,9 @@ fn patch_view(view: &mut ViewCache, event: &Event, delta: Projection) -> Result<
         }
     }
     for entity in entities {
-        let entry = delta.entries.get(entity).context("INCOMPLETE_FAST_DELTA")?;
+        let Some(entry) = delta.entries.get(entity) else {
+            bail!("the fast commit's delta lacks the entry of {entity}");
+        };
         if entry.alive {
             view.slots.insert(
                 (entry.parent.clone(), name_key(&entry.name)?),
