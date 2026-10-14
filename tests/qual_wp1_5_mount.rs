@@ -2,8 +2,10 @@
 //! REVAMP_PLAN §14.6, §4.3. Needs WinFsp (Windows) or `/dev/fuse` (Linux);
 //! scenarios skip otherwise.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP1.5"]`.
-//! Written against the worker JSON ops `mount-attach`/`mount-detach`/`mount-status`.
+//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP1.5"]`;
+//! extended by WP1.5 (`stale_owned_mount_recovered_after_crash`).
+//! Written against the worker JSON ops `mount-attach`/`mount-detach`/`mount-status`
+//! (served from WP1.4; the in-process equivalents are `tests/mount_lifecycle.rs`).
 //! `cargo test --release --test qual_wp1_5_mount -- --ignored --test-threads=1 --nocapture`
 mod support;
 
@@ -188,5 +190,52 @@ fn foreign_mount_untouched() {
         fs::read_dir(&mount).unwrap().count() == 2,
         "no entries added or removed",
     );
+    s.finish();
+}
+
+/// A worker killed with its FUSE mount attached leaves a stale mount; the next
+/// worker on the same state proves it its own through the previous
+/// `worker.json` (source `tkfs-<instance>`), unmounts it and attaches again
+/// (invariant 27). Linux only: a WinFsp mount dies with its process.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "WP1.5"]
+fn stale_owned_mount_recovered_after_crash() {
+    let s = Scenario::new(FILE, "stale_owned_mount_recovered_after_crash");
+    if !mount_supported() {
+        return s.skip("no mount support");
+    }
+    let mut s = s;
+    let dir = tempfile::tempdir().unwrap();
+    let state = new_state(dir.path());
+    let mount = dir.path().join("mnt");
+    let path = mount.to_string_lossy().into_owned();
+    let mut worker = WorkerProc::spawn(&state, &[], &[]).unwrap();
+    worker.wait_ready(Duration::from_secs(60)).unwrap();
+    if let Err(e) = worker.rpc(json!({"op":"mount-attach","path":path})) {
+        s.unsupported(format!("mount-attach: {e:#}"));
+        return s.finish();
+    }
+    fs::write(mount.join("kept.txt"), b"before the crash").unwrap();
+    worker.kill();
+    let stale = wait_until(Duration::from_secs(10), || {
+        fs::metadata(&mount).is_err_and(|e| e.raw_os_error() == Some(libc::ENOTCONN))
+    });
+    s.check(stale, "the killed worker left a stale mount");
+    let mut again = WorkerProc::spawn(&state, &[], &[]).unwrap();
+    again.wait_ready(Duration::from_secs(60)).unwrap();
+    let (attach, ms) = time_ms(|| again.rpc(json!({"op":"mount-attach","path":path})));
+    s.metric("recover_attach_ms", ms, "ms");
+    s.check(
+        attach
+            .as_ref()
+            .is_ok_and(|a| mount_state(a).contains("attached")),
+        format!("re-attached over the stale mount: {attach:?}"),
+    );
+    s.check(
+        fs::read(mount.join("kept.txt")).ok().as_deref() == Some(b"before the crash".as_slice()),
+        "committed bytes visible after recovery",
+    );
+    let _ = again.rpc(json!({"op":"mount-detach","force":true}));
     s.finish();
 }

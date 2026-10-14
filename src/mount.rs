@@ -1,16 +1,38 @@
 //! Real WinFsp mount. Only the C shim touches WinFsp structures.
-use crate::{core::*, runtime::Shared};
+//!
+//! Re-attachable (REVAMP_PLAN §4.3, WP1.5): [`bind`] sets the engine the
+//! callbacks serve (idempotent for the same `Arc`, independent of any path
+//! check); every [`attach`] starts a fresh `FSP_FILE_SYSTEM`; [`detach`] runs
+//! fence → drain → [force: retain dirty] → stop → release → unfence (see
+//! `worker::mount_ctl`). Mount failures never write `Engine.health`: callback
+//! failures go to the mount-scoped error counter and a rate-limited log, and a
+//! failed checkout remount reports `Lost` to the controller.
+//!
+//! `MOUNT` is the transition lock: [`bind`], [`attach`], [`detach`] and
+//! [`checkout`] hold it across their mount I/O (so they wait for each other);
+//! a callback, [`attached`], [`serves`] and [`inflight`] never take it, and
+//! [`notify`] only tries it, so readers never wait for a transition.
+use crate::{
+    core::*,
+    model::ipc::timing::DETACH_DRAIN,
+    runtime::{Shared, lock_engine},
+    util::lock::lock,
+    worker::mount_ctl::adapter,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, PoisonError, RwLock},
 };
-static ENGINE: OnceLock<Shared> = OnceLock::new();
+/// The engine callbacks serve. Replaced only while nothing is attached.
+static ENGINE: RwLock<Option<Shared>> = RwLock::new(None);
 struct Mount {
     native: usize,
     path: PathBuf,
 }
+/// The attached native instance. Lock order: `MOUNT`, then `ENGINE`, then the
+/// engine lock; never taken by a callback.
 static MOUNT: Mutex<Option<Mount>> = Mutex::new(None);
 #[repr(C)]
 #[derive(Default)]
@@ -30,9 +52,18 @@ unsafe extern "C" {
     fn tk_mount_notify(native: usize, path: *const u16, action: u32) -> u32;
 }
 /// Called outside the engine mutex, using paths in their WinFsp-normalized form.
+/// Never waits for a mount transition (a detach can hold the adapter for its
+/// quiet wait and drain): `BUSY_VIEW`, and the caller keeps the notification
+/// for its next delivery.
 pub fn notify(path: &str, action: u32) -> Result<()> {
-    let guard = MOUNT.lock().unwrap();
-    let Some(m) = guard.as_ref() else {
+    let guard = match MOUNT.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            bail!("BUSY_VIEW: mount transition in progress")
+        }
+    };
+    let Some(m) = guard.as_ref().filter(|m| m.native != 0) else {
         return Ok(());
     };
     let path = path.to_uppercase();
@@ -56,7 +87,7 @@ fn wide(path: &Path) -> Vec<u16> {
         .chain(Some(0))
         .collect()
 }
-pub fn start(engine: Shared, path: &Path) -> Result<()> {
+fn load_runtime() -> Result<()> {
     let mut attempted = vec![0u16; 32768];
     let loaded = unsafe { tk_winfsp_load(attempted.as_mut_ptr(), attempted.len() as u32) };
     let length = attempted
@@ -69,50 +100,135 @@ pub fn start(engine: Shared, path: &Path) -> Result<()> {
         std::io::Error::from_raw_os_error(loaded as i32),
         String::from_utf16_lossy(&attempted[..length])
     );
-    ensure!(ENGINE.set(engine.clone()).is_ok(), "ONE_MOUNT_PER_RUNTIME");
-    ensure!(
-        !path.exists(),
-        "MOUNT_PATH_MUST_NOT_EXIST: {}",
-        path.display()
-    );
+    Ok(())
+}
+fn bound() -> Result<Shared> {
+    ENGINE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .context("ENGINE_NOT_READY: no engine bound to the mount")
+}
+/// Sets the engine the callbacks serve. Idempotent for the same `Arc`; a
+/// different engine replaces it only while nothing is attached
+/// (`ONE_MOUNT_PER_RUNTIME` otherwise). Performs no path check.
+pub fn bind(engine: &Shared) -> Result<()> {
+    let mount = lock(&MOUNT);
+    let mut slot = ENGINE.write().unwrap_or_else(PoisonError::into_inner);
+    if let Some(current) = slot.as_ref() {
+        if Arc::ptr_eq(current, engine) {
+            return Ok(());
+        }
+        ensure!(
+            mount.is_none(),
+            "ONE_MOUNT_PER_RUNTIME: another engine owns the attached mount"
+        );
+    }
+    *slot = Some(engine.clone());
+    Ok(())
+}
+/// `MOUNT_PATH_MUST_NOT_EXIST` unless nothing is at `path`.
+pub fn vacant(path: &Path) -> Result<()> {
+    adapter::vacant(path)
+}
+/// Whether `engine` is the engine the callbacks serve.
+pub fn serves(engine: &Shared) -> bool {
+    ENGINE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|bound| Arc::ptr_eq(bound, engine))
+}
+/// The path of the attached native instance, if any. Never waits for a
+/// transition in progress.
+pub fn attached() -> Option<PathBuf> {
+    adapter::attached_path()
+}
+/// Whether the attached instance was unmounted outside this process. Always
+/// `false` for WinFsp: the mount point lives as long as the native instance,
+/// which only `tk_mount_stop` ends (FUSE has a real probe).
+pub fn vanished() -> bool {
+    false
+}
+/// Callbacks currently running.
+pub fn inflight() -> usize {
+    adapter::inflight()
+}
+/// Mount-scoped callback failures since the process started.
+pub fn mount_errors() -> u64 {
+    adapter::mount_errors()
+}
+/// Starts a fresh WinFsp instance at `path` for the bound engine. The path
+/// must not exist (WinFsp creates and removes the mount point).
+pub fn attach(path: &Path) -> Result<()> {
+    let mut guard = lock(&MOUNT);
+    if let Some(mount) = guard.as_ref() {
+        bail!(
+            "ONE_MOUNT_PER_RUNTIME: already attached at {}",
+            mount.path.display()
+        );
+    }
+    let engine = bound()?;
+    load_runtime()?;
+    adapter::vacant(path)?;
     let mut native = 0;
     let status = unsafe { tk_mount_start(wide(path).as_ptr(), &mut native) };
     ensure!(status == 0, "WINFSP_MOUNT_FAILED: 0x{status:08x}");
-    *MOUNT.lock().unwrap() = Some(Mount {
+    *guard = Some(Mount {
         native,
         path: path.to_owned(),
     });
-    let mut e = engine.lock().unwrap();
-    e.mounted = true;
-    e.publish_observation();
+    adapter::set_attached_path(Some(path.to_owned()));
+    adapter::attached(&engine);
     Ok(())
 }
-/// Cooperative O1 stop. Never hold the engine mutex while stopping callbacks.
-pub fn stop(engine: &Shared) -> Result<()> {
-    let mut guard = MOUNT.lock().unwrap();
-    {
-        let mut e = engine
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("BUSY_VIEW: filesystem operation in progress"))?;
-        e.quiet()?;
-        e.switching = true;
+/// Stops the attached instance (no-op when nothing is attached): fence →
+/// drain (≤ `DETACH_DRAIN`) → [force: `retain_all_dirty`] → `tk_mount_stop`
+/// → release handles → unfence. A graceful detach is refused with
+/// `BUSY_VIEW` (and stays attached, unfenced) while handles are open, a
+/// session is dirty, or callbacks do not drain.
+pub fn detach(force: bool) -> Result<()> {
+    let mut guard = lock(&MOUNT);
+    let Some(mount) = guard.as_ref() else {
+        return Ok(());
+    };
+    let engine = bound()?;
+    adapter::fence(&engine, force)?;
+    if !adapter::drain(DETACH_DRAIN) && !force {
+        adapter::unfence(&engine);
+        bail!(
+            "BUSY_VIEW: {} filesystem callbacks still running",
+            adapter::inflight()
+        );
     }
-    if let Some(mount) = guard.take()
-        && mount.native != 0
-    {
+    if force {
+        adapter::persist_dirty(&engine);
+    }
+    // Never hold the engine mutex while stopping callbacks.
+    if mount.native != 0 {
         unsafe { tk_mount_stop(mount.native) };
     }
-    let mut e = engine.lock().unwrap();
-    e.mounted = false;
-    e.publish_observation();
-    // Remain fenced until process exit; no new opens in the shutdown gap.
+    *guard = None;
+    adapter::set_attached_path(None);
+    adapter::release(&engine);
     Ok(())
 }
+/// Legacy entry (`daemon --mount`): bind, then attach.
+pub fn start(engine: Shared, path: &Path) -> Result<()> {
+    bind(&engine)?;
+    attach(path)
+}
+/// Legacy `stop` op: refuses unless the engine is quiet, then detaches
+/// gracefully. The fence is lifted afterwards.
+pub fn stop(engine: &Shared) -> Result<()> {
+    lock_engine(engine).quiet()?;
+    detach(false)
+}
 pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value> {
-    let mut mount_guard = MOUNT.lock().unwrap();
+    let mut mount_guard = lock(&MOUNT);
     let mount = mount_guard.as_mut().context("MOUNT_NOT_RUNNING")?;
     {
-        let mut e = engine.lock().unwrap();
+        let mut e = lock_engine(engine);
         if let Some(result) = e.store.receipt(request, payload)? {
             return Ok(result);
         }
@@ -128,24 +244,36 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         e.switching = true;
     }
     // New opens fenced before stopping. No engine mutex during dispatcher stop.
+    adapter::drain(DETACH_DRAIN);
     unsafe { tk_mount_stop(mount.native) };
     mount.native = 0;
     let result = {
-        let mut e = engine.lock().unwrap();
+        let mut e = lock_engine(engine);
         e.mounted = false;
         e.quiet().and_then(|()| e.control(request, payload))
     };
-    let mut native = 0;
-    let status = unsafe { tk_mount_start(wide(&mount.path).as_ptr(), &mut native) };
-    let mut e = engine.lock().unwrap();
-    e.switching = false;
-    if status != 0 {
-        e.health = Some(format!("REMOUNT_FAILED: 0x{status:08x}; restart runtime"));
-        bail!("REMOUNT_FAILED: 0x{status:08x}");
+    let remount = crate::util::fault::fail("fs.remount").and_then(|()| {
+        let mut native = 0;
+        let status = unsafe { tk_mount_start(wide(&mount.path).as_ptr(), &mut native) };
+        ensure!(status == 0, "WINFSP_MOUNT_FAILED: 0x{status:08x}");
+        Ok(native)
+    });
+    match remount {
+        Ok(native) => {
+            mount.native = native;
+            adapter::attached(engine);
+            result
+        }
+        Err(error) => {
+            // The mount is gone: Lost (never `Engine.health`).
+            *mount_guard = None;
+            adapter::set_attached_path(None);
+            adapter::release(engine);
+            let error = anyhow::anyhow!("REMOUNT_FAILED: {error:#}");
+            adapter::report_lost(&error);
+            Err(error)
+        }
     }
-    mount.native = native;
-    e.mounted = true;
-    result
 }
 fn fill(info: &mut Info, entry: &Entry, size: usize) {
     info.size = size as u64;
@@ -186,16 +314,17 @@ pub unsafe extern "C" fn tk_call(
     info: *mut Info,
     transferred: *mut u32,
 ) -> u32 {
+    // Counted until return, so a detach can drain callbacks before stopping.
+    let _callback = adapter::callback();
     let run = std::panic::catch_unwind(|| -> Result<u32> {
-        let engine = ENGINE.get().context("ENGINE_NOT_READY")?;
+        let engine = bound()?;
+        let engine = &engine;
         let h = unsafe { *token };
         let path = unsafe { string(name) };
         if op == 4 || op == 5 || op == 6 && offset != 0 {
             crate::runtime::prepare_content(engine, h, std::time::Duration::from_secs(15))?;
         }
-        let mut e = engine
-            .lock()
-            .map_err(|_| anyhow::anyhow!("ENGINE_POISONED"))?;
+        let mut e = lock_engine(engine);
         let mut out = Info::default();
         let mut count = 0;
         match op {
@@ -258,7 +387,11 @@ pub unsafe extern "C" fn tk_call(
             7 => e.flush(h)?,
             8 => {}
             9 => e.cleanup(h, flags & 1 != 0)?,
-            10 => e.close(h)?,
+            10 => {
+                e.close(h)?;
+                // Qualification hook: a close-path failure after the handle closed.
+                crate::util::fault::fail("fs.close")?;
+            }
             11 => {
                 let s = e.session(h)?;
                 ensure!(
@@ -334,44 +467,53 @@ pub unsafe extern "C" fn tk_call(
     match run {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
-            let message = format!("{error:#}");
-            eprintln!("filesystem op={op}: {message}");
-            if [9, 10].contains(&op)
-                && let Some(engine) = ENGINE.get()
-                && let Ok(mut e) = engine.lock()
-            {
-                if e.health.is_none() {
-                    e.health = Some(message.clone());
-                }
-                e.publish_observation();
-            }
-            if message.contains("CONTENT_UNAVAILABLE") {
-                0xc0000267 // STATUS_FILE_IS_OFFLINE
-            } else if message.contains("FILE_NOT_FOUND") {
-                0xc0000034
-            } else if message.contains("NAME_COLLISION") {
-                0xc0000035
-            } else if message.contains("NOT_EMPTY") {
-                0xc0000101
-            } else if message.contains("NOT_DIRECTORY") {
-                0xc0000103
-            } else if message.contains("BUSY") {
-                0xc0000043
-            } else if message.contains("INVALID_NAME") {
-                0xc0000033
-            } else if message.contains("PERMISSION") || message.contains("ACCESS_DENIED") {
-                0xc0000022
-            } else if message.contains("UNSUPPORTED") {
-                0xc00000bb
-            } else if message.contains("INVALID_TIMESTAMP")
-                || message.contains("INVALID_ATTRIBUTES")
-                || message.contains("INVALID_PARAMETER")
-            {
-                0xc000000d
-            } else {
-                0xc0000185
-            }
+            let status = nt_status(&error);
+            // Mount-scoped: counted and logged at a bounded rate, never
+            // written to `Engine.health` (which would block stop, RC11).
+            adapter::fs_error(
+                op,
+                &error,
+                [9, 10].contains(&op) || status == STATUS_IO_DEVICE_ERROR,
+            );
+            status
         }
-        Err(_) => 0xc0000185,
+        Err(_) => {
+            adapter::fs_error(
+                op,
+                &anyhow::anyhow!("UNKNOWN_ERROR: filesystem callback panicked"),
+                true,
+            );
+            STATUS_IO_DEVICE_ERROR
+        }
+    }
+}
+const STATUS_IO_DEVICE_ERROR: u32 = 0xc0000185;
+fn nt_status(error: &anyhow::Error) -> u32 {
+    let message = format!("{error:#}");
+    if message.contains("CONTENT_UNAVAILABLE") {
+        0xc0000267 // STATUS_FILE_IS_OFFLINE
+    } else if message.contains("FILE_NOT_FOUND") {
+        0xc0000034
+    } else if message.contains("NAME_COLLISION") {
+        0xc0000035
+    } else if message.contains("NOT_EMPTY") {
+        0xc0000101
+    } else if message.contains("NOT_DIRECTORY") {
+        0xc0000103
+    } else if message.contains("BUSY") {
+        0xc0000043
+    } else if message.contains("INVALID_NAME") {
+        0xc0000033
+    } else if message.contains("PERMISSION") || message.contains("ACCESS_DENIED") {
+        0xc0000022
+    } else if message.contains("UNSUPPORTED") {
+        0xc00000bb
+    } else if message.contains("INVALID_TIMESTAMP")
+        || message.contains("INVALID_ATTRIBUTES")
+        || message.contains("INVALID_PARAMETER")
+    {
+        0xc000000d
+    } else {
+        STATUS_IO_DEVICE_ERROR
     }
 }
