@@ -3,7 +3,31 @@
 //! No writeback caching/mmap: direct I/O and zero lookup/attribute TTLs retain
 //! Engine's save boundaries and pinned writer ancestry. Unsupported POSIX kinds
 //! (symlinks, hardlinks, devices), ownership and privileged modes fail explicitly.
-use crate::{core::*, runtime::Shared};
+//!
+//! Re-attachable (REVAMP_PLAN §4.3, WP1.5), with the same names as the WinFsp
+//! adapter: [`bind`] sets the engine the callbacks serve, every attach starts a
+//! fresh connection and dispatch thread, and [`detach`] runs fence → drain →
+//! [force: retain dirty] → unmount (lazily when files are still open, then the
+//! dispatch thread is stopped so the connection aborts) → release → unfence.
+//! Managed mounts are named `tkfs-<instance>` (subtype `tkfs`) so a stale one
+//! can later be proven ours by the previous `worker.json` ([`recover_managed`],
+//! invariant 27). Mount failures never write `Engine.health`: a dispatch
+//! thread death (an error, or the connection ending because the mount was
+//! unmounted outside the worker) or a failed checkout remount reports `Lost`
+//! to the controller, and callback failures go to the mount-scoped error
+//! counter and log.
+//!
+//! `MOUNT` is the transition lock: [`bind`], [`attach`], [`detach`] and
+//! [`checkout`] hold it across their mount I/O (so they wait for each other);
+//! a callback, [`attached`], [`serves`] and [`inflight`] never take it, so
+//! readers never wait for a transition.
+use crate::{
+    core::*,
+    model::ipc::timing::DETACH_DRAIN,
+    runtime::{Shared, lock_engine},
+    util::lock::lock,
+    worker::mount_ctl::adapter,
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
 use std::{
@@ -14,17 +38,49 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread::JoinHandle,
 };
 
+/// The engine callbacks serve. Replaced only while nothing is attached.
+static ENGINE: Mutex<Option<Shared>> = Mutex::new(None);
+/// The attached instance. Lock order: `MOUNT`, then `ENGINE`, then the engine
+/// lock; never taken by a callback.
 static MOUNT: Mutex<Option<Mount>> = Mutex::new(None);
 const MAX_IO: usize = 1024 * 1024;
 struct Mount {
     path: PathBuf,
+    /// `path` as `/proc/self/mountinfo` names it (canonicalized at attach).
+    canonical: PathBuf,
     source: String,
+    /// The `/dev/fuse` dispatch thread.
     worker: Option<JoinHandle<()>>,
+    /// Writing to (or dropping) this end stops the dispatch thread.
+    wake: Option<UnixStream>,
+    /// Set before a detach or checkout ends the connection: the dispatch
+    /// thread's exit is then deliberate, not `Lost`.
+    stopping: Arc<AtomicBool>,
 }
+impl Mount {
+    /// Whether the dispatch thread still serves the connection.
+    fn serving(&self) -> bool {
+        self.worker.as_ref().is_some_and(|w| !w.is_finished())
+    }
+    /// Whether our mount is still at its path (`false` once it was unmounted
+    /// outside the worker). An unreadable mount table counts as present.
+    fn present(&self) -> bool {
+        mounts_at(&self.canonical).map_or(true, |mounts| {
+            mounts
+                .iter()
+                .any(|(fstype, source)| fstype == "fuse.tkfs" && *source == self.source)
+        })
+    }
+}
+/// A launched connection: the dispatch thread, its wake end, its stop flag.
+type Launched = (JoinHandle<()>, UnixStream, Arc<AtomicBool>);
 
 fn helper_mount(path: &Path, source: &str) -> Result<File> {
     let (parent, child) = UnixStream::pair()?;
@@ -80,151 +136,350 @@ fn helper_mount(path: &Path, source: &str) -> Result<File> {
         Ok(unsafe { File::from_raw_fd(fd) })
     })();
     if result.is_err() {
-        let _ = Command::new("fusermount3")
-            .args(["-u", "--"])
-            .arg(path)
-            .status();
+        let _ = unmount(path, false);
     }
     result
 }
-fn launch(engine: Shared, path: &Path, source: &str) -> Result<JoinHandle<()>> {
-    let device = helper_mount(path, source)?;
-    Ok(std::thread::spawn(move || {
-        if let Err(error) = serve(device, engine.clone()) {
-            let mut e = engine.lock().unwrap();
-            e.health = Some(format!("FUSE_DISPATCH_FAILED: {error:#}"));
-            e.mounted = false;
-            e.publish_observation();
-            eprintln!("FUSE_DISPATCH_FAILED: {error:#}");
-        }
-    }))
+/// `fusermount3 -u` (`-z` for a lazy unmount). A refusal is `BUSY_VIEW`.
+fn unmount(path: &Path, lazy: bool) -> Result<()> {
+    let mut command = Command::new("fusermount3");
+    command.arg("-u");
+    if lazy {
+        command.arg("-z");
+    }
+    let output = command.arg("--").arg(path).output()?;
+    ensure!(
+        output.status.success(),
+        "BUSY_VIEW: FUSE unmount refused: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
+/// Mounts `path` and starts its dispatch thread. The engine is marked attached
+/// (`adapter::attached`) before the thread starts, so a dispatch death always
+/// has the last word on `Engine.mounted`.
+fn launch(engine: Shared, path: &Path, source: &str) -> Result<Launched> {
+    let device = helper_mount(path, source)?;
+    let (wake, woken) = match UnixStream::pair() {
+        Ok(pair) => pair,
+        Err(error) => {
+            drop(device);
+            let _ = unmount(path, false);
+            return Err(error.into());
+        }
+    };
+    let stopping = Arc::new(AtomicBool::new(false));
+    adapter::attached(&engine);
+    let spawned = {
+        let engine = engine.clone();
+        let stopping = stopping.clone();
+        let path = path.to_owned();
+        std::thread::Builder::new()
+            .name("fuse-dispatch".into())
+            .spawn(move || {
+                let outcome = serve(device, engine.clone(), woken);
+                if stopping.load(Ordering::SeqCst) {
+                    return; // A detach or checkout ended the connection.
+                }
+                let error = match outcome {
+                    Ok(Exit::Woken) => return,
+                    Ok(Exit::DeviceGone) => anyhow::anyhow!(
+                        "MOUNT_NOT_RUNNING: the FUSE mount at {} was unmounted outside the worker",
+                        path.display()
+                    ),
+                    Err(error) => anyhow::anyhow!("FUSE_DISPATCH_FAILED: {error:#}"),
+                };
+                // Mount-scoped: `Lost`, never `Engine.health`. Dirty sessions
+                // go to `pending_saves` now (invariant 8): the dead
+                // connection's handles keep them referenced until a detach.
+                adapter::lost(&engine);
+                adapter::report_lost(&error);
+            })
+    };
+    match spawned {
+        Ok(worker) => Ok((worker, wake, stopping)),
+        Err(error) => {
+            // The device closed with the closure: the mount is stale.
+            let _ = unmount(path, false);
+            {
+                let mut e = lock_engine(&engine);
+                e.mounted = false;
+                e.publish_observation();
+            }
+            Err(error.into())
+        }
+    }
+}
+fn bound() -> Result<Shared> {
+    lock(&ENGINE)
+        .clone()
+        .context("ENGINE_NOT_READY: no engine bound to the mount")
+}
+/// Sets the engine the callbacks serve. Idempotent for the same `Arc`; a
+/// different engine replaces it only while nothing is attached
+/// (`ONE_MOUNT_PER_RUNTIME` otherwise). Performs no path check.
+pub fn bind(engine: &Shared) -> Result<()> {
+    let mount = lock(&MOUNT);
+    let mut slot = lock(&ENGINE);
+    if let Some(current) = slot.as_ref() {
+        if Arc::ptr_eq(current, engine) {
+            return Ok(());
+        }
+        ensure!(
+            mount.is_none(),
+            "ONE_MOUNT_PER_RUNTIME: another engine owns the attached mount"
+        );
+    }
+    *slot = Some(engine.clone());
+    Ok(())
+}
+/// `MOUNT_PATH_MUST_NOT_EXIST` unless nothing is at `path`, including a live
+/// or stale mount (which `stat` cannot see).
+pub fn vacant(path: &Path) -> Result<()> {
+    let mounts = mounts_at(path)?;
+    ensure!(
+        mounts.is_empty(),
+        "MOUNT_PATH_MUST_NOT_EXIST: {} is a mount point ({})",
+        path.display(),
+        mounts
+            .iter()
+            .map(|(fstype, source)| format!("{fstype} {source}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    adapter::vacant(path)
+}
+/// Whether `engine` is the engine the callbacks serve.
+pub fn serves(engine: &Shared) -> bool {
+    lock(&ENGINE)
+        .as_ref()
+        .is_some_and(|bound| Arc::ptr_eq(bound, engine))
+}
+/// The path of the attached instance, if any (also while it is lost). Never
+/// waits for a transition in progress.
+pub fn attached() -> Option<PathBuf> {
+    adapter::attached_path()
+}
+/// Whether the attached instance is no longer in the mount table: unmounted
+/// outside the worker, possibly lazily with files still open (the connection
+/// then lives on and the dispatch thread has not noticed). `false` while a
+/// transition runs. Never waits.
+pub fn vanished() -> bool {
+    MOUNT
+        .try_lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|mount| !mount.present()))
+        .unwrap_or(false)
+}
+/// Callbacks currently running.
+pub fn inflight() -> usize {
+    adapter::inflight()
+}
+/// Mount-scoped callback failures since the process started.
+pub fn mount_errors() -> u64 {
+    adapter::mount_errors()
+}
+/// Attaches an unmanaged mount (source `tkfs`) at `path` for the bound engine.
+pub fn attach(path: &Path) -> Result<()> {
+    attach_source(path, "tkfs")
+}
+/// Attaches a mount whose source `tkfs-<instance>` names this worker instance.
+pub fn attach_managed(path: &Path, instance: &str) -> Result<()> {
+    uuid::Uuid::parse_str(instance).context("INVALID_PARAMETER: worker instance")?;
+    attach_source(path, &format!("tkfs-{instance}"))
+}
+/// Legacy entry (`daemon --mount`): bind, then attach (source `tkfs`).
 pub fn start(engine: Shared, path: &Path) -> Result<()> {
-    start_source(engine, path, "tkfs")
+    bind(&engine)?;
+    attach(path)
 }
 pub fn start_managed(engine: Shared, path: &Path, instance: &str) -> Result<()> {
-    uuid::Uuid::parse_str(instance)?;
-    start_source(engine, path, &format!("tkfs-{instance}"))
+    bind(&engine)?;
+    attach_managed(path, instance)
 }
-fn start_source(engine: Shared, path: &Path, source: &str) -> Result<()> {
-    let mut guard = MOUNT.lock().unwrap();
-    ensure!(guard.is_none(), "ONE_MOUNT_PER_RUNTIME");
-    ensure!(
-        !path.exists(),
-        "MOUNT_PATH_MUST_NOT_EXIST: {}",
-        path.display()
-    );
+fn attach_source(path: &Path, source: &str) -> Result<()> {
+    let mut guard = lock(&MOUNT);
+    if let Some(mount) = guard.as_ref() {
+        bail!(
+            "ONE_MOUNT_PER_RUNTIME: already attached at {}",
+            mount.path.display()
+        );
+    }
+    let engine = bound()?;
+    vacant(path)?;
     std::fs::create_dir(path)?;
-    let worker = match launch(engine.clone(), path, source) {
-        Ok(w) => w,
-        Err(e) => {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let (worker, wake, stopping) = match launch(engine, path, source) {
+        Ok(launched) => launched,
+        Err(error) => {
             let _ = std::fs::remove_dir(path);
-            return Err(e);
+            return Err(error);
         }
     };
     *guard = Some(Mount {
         path: path.into(),
+        canonical,
         source: source.into(),
         worker: Some(worker),
+        wake: Some(wake),
+        stopping,
     });
-    let mut e = engine.lock().unwrap();
-    e.mounted = true;
-    e.publish_observation();
+    adapter::set_attached_path(Some(path.to_owned()));
     Ok(())
 }
-fn unmount(mount: &mut Mount) -> Result<()> {
-    let output = Command::new("fusermount3")
-        .args(["-u", "--"])
-        .arg(&mount.path)
-        .output()?;
-    ensure!(
-        output.status.success(),
-        "BUSY_VIEW: FUSE unmount refused: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+/// Stops the dispatch thread (after the unmount) and waits for it.
+fn stop_dispatch(mount: &mut Mount) {
+    mount.stopping.store(true, Ordering::SeqCst);
+    if let Some(mut wake) = mount.wake.take() {
+        let _ = wake.write_all(&[1]);
+    }
     if let Some(worker) = mount.worker.take() {
-        worker
-            .join()
-            .map_err(|_| anyhow::anyhow!("FUSE_WORKER_PANIC"))?;
+        let _ = worker.join();
     }
-    Ok(())
 }
-pub fn stop(engine: &Shared) -> Result<()> {
-    let mut guard = MOUNT.lock().unwrap();
-    {
-        let mut e = engine.lock().unwrap();
-        e.quiet()?;
-        e.switching = true;
-    }
-    if let Some(mount) = guard.as_mut() {
-        if let Err(error) = unmount(mount) {
-            engine.lock().unwrap().switching = false;
-            return Err(error);
-        }
-        std::fs::remove_dir(&mount.path)?;
-    }
-    *guard = None;
-    let mut e = engine.lock().unwrap();
-    e.mounted = false;
-    e.publish_observation();
-    Ok(())
-}
-/// Called only after verifying the persistent worker record and acquiring a free
-/// state ownership lock. Never detach a responding or unrelated filesystem.
-pub fn recover_managed(path: &Path, instance: &str) -> Result<()> {
-    uuid::Uuid::parse_str(instance)?;
-    let source = format!("tkfs-{instance}");
-    let decode = |value: &str| {
-        value
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\")
+/// Stops the attached instance (no-op when nothing is attached): fence →
+/// drain (≤ `DETACH_DRAIN`) → [force: `retain_all_dirty`] → unmount → stop the
+/// dispatch thread → remove our mount point → release handles → unfence.
+/// A graceful detach is refused with `BUSY_VIEW` (and stays attached,
+/// unfenced) while handles are open, a session is dirty, callbacks do not
+/// drain, or the kernel refuses the unmount. A force detach unmounts lazily
+/// when the kernel still has files open; stopping the dispatch thread then
+/// aborts the connection, so those files fail instead of hanging. A lost
+/// mount (its dispatch thread ended, or it was unmounted outside the worker)
+/// is always detached like a force detach, and one that is no longer in the
+/// mount table is not unmounted again.
+pub fn detach(force: bool) -> Result<()> {
+    let mut guard = lock(&MOUNT);
+    let Some(mount) = guard.as_mut() else {
+        return Ok(());
     };
+    let engine = bound()?;
+    let present = mount.present();
+    let force = force || !present || !mount.serving();
+    adapter::fence(&engine, force)?;
+    if !adapter::drain(DETACH_DRAIN) && !force {
+        adapter::unfence(&engine);
+        bail!(
+            "BUSY_VIEW: {} filesystem callbacks still running",
+            adapter::inflight()
+        );
+    }
+    if force {
+        adapter::persist_dirty(&engine);
+    }
+    if present {
+        // The connection ends with the unmount: deliberately, not `Lost`.
+        mount.stopping.store(true, Ordering::SeqCst);
+        if let Err(refused) = unmount(&mount.path, false) {
+            // A dispatch thread that died meanwhile makes the mount lost.
+            if !force && mount.serving() {
+                mount.stopping.store(false, Ordering::SeqCst);
+                adapter::unfence(&engine);
+                return Err(refused);
+            }
+            // The lazy unmount fails only if the mount is gone meanwhile.
+            if let Err(error) = unmount(&mount.path, true)
+                && mount.present()
+            {
+                mount.stopping.store(false, Ordering::SeqCst);
+                adapter::unfence(&engine);
+                return Err(error.context(format!("{refused:#}")));
+            }
+        }
+    }
+    stop_dispatch(mount);
+    // Our own mount point (created by attach); never removes content, and
+    // never a mount point (whatever was mounted there since is not ours).
+    let _ = std::fs::remove_dir(&mount.path);
+    *guard = None;
+    adapter::set_attached_path(None);
+    adapter::release(&engine);
+    Ok(())
+}
+/// Legacy `stop` op: refuses unless the engine is quiet, then detaches
+/// gracefully. The fence is lifted afterwards.
+pub fn stop(engine: &Shared) -> Result<()> {
+    lock_engine(engine).quiet()?;
+    detach(false)
+}
+fn decode_mountinfo(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+/// `(fstype, source)` of every mount at exactly `path` (`/proc/self/mountinfo`).
+fn mounts_at(path: &Path) -> Result<Vec<(String, String)>> {
+    let mut found = vec![];
     for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
-        if fields.len() < 10 || Path::new(&decode(fields[4])) != path {
+        if fields.len() < 10 || Path::new(&decode_mountinfo(fields[4])) != path {
             continue;
         }
         let separator = fields
             .iter()
             .position(|field| *field == "-")
             .context("INVALID_MOUNTINFO")?;
-        ensure!(
-            fields.get(separator + 1) == Some(&"fuse.tkfs")
-                && fields.get(separator + 2) == Some(&source.as_str()),
-            "WORKER_START: unrelated mount occupies reservation"
-        );
-        ensure!(
-            std::fs::metadata(path)
-                .is_err_and(|error| error.raw_os_error() == Some(libc::ENOTCONN)),
-            "WORKER_START: mount still responds"
-        );
-        let result = Command::new("fusermount3")
-            .args(["-u", "--"])
-            .arg(path)
-            .output()?;
-        ensure!(
-            result.status.success(),
-            "WORKER_START: disconnected owned FUSE unmount refused"
-        );
+        let field = |offset: usize| {
+            fields
+                .get(separator + offset)
+                .map(|value| decode_mountinfo(value))
+                .unwrap_or_default()
+        };
+        found.push((field(1), field(2)));
     }
-    if let Ok(metadata) = std::fs::symlink_metadata(path) {
-        ensure!(
-            metadata.is_dir()
-                && !metadata.file_type().is_symlink()
-                && std::fs::read_dir(path)?.next().is_none(),
-            "WORKER_START: mount directory occupied"
-        );
+    Ok(found)
+}
+/// Unmounts a stale mount of ours at `path` (type `fuse.tkfs`, source
+/// `tkfs-<instance>`, no longer responding) and removes its empty mount point.
+///
+/// Call only after the previous `worker.json` proved `instance` ours, while
+/// holding the folder's owner lock (so that worker is gone). Touches nothing
+/// when no mount is at `path`; refuses with `MOUNT_PATH_MUST_NOT_EXIST`, and
+/// touches nothing, when any mount there is unrelated or still responds
+/// (invariant 27).
+pub fn recover_managed(path: &Path, instance: &str) -> Result<()> {
+    uuid::Uuid::parse_str(instance).context("INVALID_PARAMETER: worker instance")?;
+    let source = format!("tkfs-{instance}");
+    let mounts = mounts_at(path)?;
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        mounts
+            .iter()
+            .all(|(fstype, owner)| fstype == "fuse.tkfs" && *owner == source),
+        "MOUNT_PATH_MUST_NOT_EXIST: an unrelated mount occupies {}",
+        path.display()
+    );
+    ensure!(
+        std::fs::metadata(path).is_err_and(|error| error.raw_os_error() == Some(libc::ENOTCONN)),
+        "MOUNT_PATH_MUST_NOT_EXIST: the mount at {} still responds",
+        path.display()
+    );
+    for _ in &mounts {
+        unmount(path, false).map_err(|error| {
+            anyhow::anyhow!(
+                "MOUNT_PATH_MUST_NOT_EXIST: the stale mount at {} was not unmounted: {error:#}",
+                path.display()
+            )
+        })?;
+    }
+    // The mount point the previous worker created, removed only when empty.
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && metadata.is_dir()
+        && std::fs::read_dir(path)?.next().is_none()
+    {
         std::fs::remove_dir(path)?;
     }
     Ok(())
 }
 pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value> {
-    let mut guard = MOUNT.lock().unwrap();
+    let mut guard = lock(&MOUNT);
     let mount = guard.as_mut().context("MOUNT_NOT_RUNNING")?;
     {
-        let mut e = engine.lock().unwrap();
+        let mut e = lock_engine(engine);
         if let Some(result) = e.store.receipt(request, payload)? {
             return Ok(result);
         }
@@ -244,29 +499,50 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         }
         e.switching = true;
     }
-    if let Err(error) = unmount(mount) {
-        engine.lock().unwrap().switching = false;
-        return Err(error);
+    adapter::drain(DETACH_DRAIN);
+    // Unmounted outside the worker: the checkout still runs, then the mount is
+    // reported lost instead of mounting again at a path that is no longer ours.
+    let present = mount.present();
+    if present {
+        mount.stopping.store(true, Ordering::SeqCst);
+        if let Err(error) = unmount(&mount.path, false) {
+            mount.stopping.store(false, Ordering::SeqCst);
+            adapter::unfence(engine);
+            return Err(error);
+        }
     }
+    stop_dispatch(mount);
     let result = {
-        let mut e = engine.lock().unwrap();
+        let mut e = lock_engine(engine);
         e.mounted = false;
         e.control(request, payload)
     };
-    let worker = launch(engine.clone(), &mount.path, &mount.source);
-    let mut e = engine.lock().unwrap();
-    e.switching = false;
-    match worker {
-        Ok(worker) => {
+    let relaunch = if present {
+        crate::util::fault::fail("fs.remount")
+            .and_then(|()| launch(engine.clone(), &mount.path, &mount.source))
+            .map_err(|error| anyhow::anyhow!("REMOUNT_FAILED: {error:#}"))
+    } else {
+        Err(anyhow::anyhow!(
+            "MOUNT_NOT_RUNNING: the FUSE mount at {} was unmounted outside the worker",
+            mount.path.display()
+        ))
+    };
+    match relaunch {
+        Ok((worker, wake, stopping)) => {
             mount.worker = Some(worker);
-            e.mounted = true;
-            e.publish_observation();
+            mount.wake = Some(wake);
+            mount.stopping = stopping;
             result
         }
         Err(error) => {
-            e.health = Some(format!("REMOUNT_FAILED: {error:#}; restart runtime"));
-            e.publish_observation();
-            Err(error.context("REMOUNT_FAILED"))
+            // The mount is gone: Lost (never `Engine.health`).
+            let path = mount.path.clone();
+            *guard = None;
+            adapter::set_attached_path(None);
+            let _ = std::fs::remove_dir(&path);
+            adapter::release(engine);
+            adapter::report_lost(&error);
+            Err(error)
         }
     }
 }
@@ -779,6 +1055,8 @@ impl Filesystem {
             }
             18 | 29 => {
                 e.close(u64_at(p, 0)?)?;
+                // Qualification hook: a close-path failure after the handle closed.
+                crate::util::fault::fail("fs.close")?;
                 Ok(vec![])
             }
             20 | 25 | 30 => {
@@ -816,17 +1094,72 @@ impl Filesystem {
         }
     }
 }
-fn serve(mut device: File, engine: Shared) -> Result<()> {
-    let fs = std::sync::Arc::new(std::sync::Mutex::new(Filesystem::new()));
-    let writer = std::sync::Arc::new(std::sync::Mutex::new(device.try_clone()?));
-    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+/// Failures on the close path (flush, release) and unexpected I/O errors are
+/// counted as mount errors; the rest are expected answers (`ENOENT`, …).
+fn counted(op: u32, error: &anyhow::Error) -> bool {
+    [18, 25, 29].contains(&op) || errno(error) == libc::EIO
+}
+/// Why the dispatch loop stopped.
+enum Exit {
+    /// The wake end was written or closed (a detach or checkout).
+    Woken,
+    /// The connection ended (`ENODEV` or end of file): the mount was
+    /// unmounted, by a detach or checkout or outside the worker.
+    DeviceGone,
+}
+fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
+    // Non-blocking reads after `poll`: a withdrawn request never blocks the
+    // loop, so a stop request is always seen.
+    let flags = unsafe { libc::fcntl(device.as_raw_fd(), libc::F_GETFL) };
+    ensure!(
+        flags >= 0
+            && unsafe { libc::fcntl(device.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                == 0,
+        "FUSE_DESCRIPTOR_INVALID: {}",
+        std::io::Error::last_os_error()
+    );
+    let fs = Arc::new(Mutex::new(Filesystem::new()));
+    let writer = Arc::new(Mutex::new(device.try_clone()?));
+    let content = Arc::new(AtomicUsize::new(0));
     let mut bytes = vec![0; MAX_IO + 4096];
     loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: device.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if fds[1].revents != 0 {
+            // Detach: the connection aborts once the device closes.
+            return Ok(Exit::Woken);
+        }
+        // Qualification hook: the dispatch thread dies (`Lost`).
+        crate::util::fault::fail("fs.dispatch")?;
         let count = match device.read(&mut bytes) {
-            Ok(0) => break,
+            Ok(0) => return Ok(Exit::DeviceGone),
             Ok(n) => n,
-            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => return Ok(Exit::DeviceGone),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
             Err(e) => return Err(e.into()),
         };
         let p = &bytes[..count];
@@ -838,6 +1171,8 @@ fn serve(mut device: File, engine: Shared) -> Result<()> {
         if [2, 42].contains(&op) {
             continue;
         }
+        // Counted until replied, so a detach can drain callbacks.
+        let callback = adapter::callback();
         let unique = u64_at(p, 8)?;
         let inode = u64_at(p, 16)?;
         // Content waits must not stop the single /dev/fuse reader from serving
@@ -845,8 +1180,8 @@ fn serve(mut device: File, engine: Shared) -> Result<()> {
         if [15, 16].contains(&op) {
             let body = p[40..].to_vec();
             let handle = u64_at(&body, 0)?;
-            if in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
-                in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if content.fetch_add(1, Ordering::Relaxed) >= 16 {
+                content.fetch_sub(1, Ordering::Relaxed);
                 write_reply(
                     &writer,
                     unique,
@@ -859,37 +1194,42 @@ fn serve(mut device: File, engine: Shared) -> Result<()> {
             let engine = engine.clone();
             let fs = fs.clone();
             let writer = writer.clone();
-            let in_flight = in_flight.clone();
+            let content = content.clone();
             std::thread::spawn(move || {
+                let _callback = callback;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     crate::runtime::prepare_content(
                         &engine,
                         handle,
                         std::time::Duration::from_secs(15),
                     )?;
-                    let mut e = engine.lock().unwrap();
-                    let result = fs.lock().unwrap().dispatch(&mut e, op, inode, &body);
+                    let mut e = lock_engine(&engine);
+                    let result = lock(&fs).dispatch(&mut e, op, inode, &body);
                     e.publish_observation();
                     result
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("FUSE_CALLBACK_PANIC")));
+                if let Err(error) = &result {
+                    adapter::fs_error(op, error, counted(op, error));
+                }
                 let _ = write_reply(&writer, unique, result);
-                in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                content.fetch_sub(1, Ordering::Relaxed);
             });
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut e = engine
-                .lock()
-                .map_err(|_| anyhow::anyhow!("ENGINE_POISONED"))?;
-            let result = fs.lock().unwrap().dispatch(&mut e, op, inode, &p[40..]);
+            let mut e = lock_engine(&engine);
+            let result = lock(&fs).dispatch(&mut e, op, inode, &p[40..]);
             e.publish_observation();
             result
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("FUSE_CALLBACK_PANIC")));
+        if let Err(error) = &result {
+            adapter::fs_error(op, error, counted(op, error));
+        }
         write_reply(&writer, unique, result)?;
+        drop(callback);
     }
-    Ok(())
 }
 fn write_reply(
     writer: &std::sync::Mutex<File>,
@@ -905,7 +1245,7 @@ fn write_reply(
     push32(&mut reply, error as u32);
     push64(&mut reply, unique);
     reply.extend(body);
-    if let Err(error) = writer.lock().unwrap().write_all(&reply) {
+    if let Err(error) = lock(writer).write_all(&reply) {
         if ![Some(libc::ENOENT), Some(libc::ENODEV)].contains(&error.raw_os_error()) {
             return Err(error.into());
         }
