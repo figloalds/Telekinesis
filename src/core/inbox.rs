@@ -829,7 +829,7 @@ impl Store {
             return self.retry(id, &error);
         }
         let wire = quarantine_wire(&error);
-        self.quarantine(id, &wire)?;
+        self.quarantine_event(id, &wire)?;
         Ok(Attempt::Quarantined(wire))
     }
     fn retry(&mut self, id: &str, error: &anyhow::Error) -> Result<Attempt> {
@@ -854,7 +854,7 @@ impl Store {
         Ok(Attempt::Retried(wire))
     }
     /// Quarantine row `id` and block every staged descendant on it.
-    fn quarantine(&self, id: &str, wire: &ErrorWire) -> Result<()> {
+    fn quarantine_event(&self, id: &str, wire: &ErrorWire) -> Result<()> {
         self.db.execute(
             "UPDATE incoming_events SET state='quarantined',error=?,code=?,error_class=?,blocked_on=NULL,retry_at_ms=NULL WHERE id=?",
             params![wire.message, wire.code, wire.class.as_str(), id],
@@ -967,7 +967,7 @@ impl Store {
                         message: format!("CAUSAL_CYCLE: {id} is its own causal ancestor"),
                         retry_after_ms: None,
                     };
-                    self.quarantine(id, &wire)?;
+                    self.quarantine_event(id, &wire)?;
                 }
             }
             Class::Blocked(root) => {
@@ -975,7 +975,7 @@ impl Store {
                 self.block_descendants(id, &root)?;
             }
             Class::Quarantined(error) => {
-                self.quarantine(id, &quarantine_wire(&error))?;
+                self.quarantine_event(id, &quarantine_wire(&error))?;
             }
         }
         Ok(())
