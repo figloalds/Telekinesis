@@ -1264,6 +1264,9 @@ struct LaneEntry {
     ever_ready: bool,
     backoff_until_ms: Option<u64>,
     rtt_ms: Option<u64>,
+    /// The negotiated protocol while `Ready` (`LaneState.protocol`,
+    /// CCR-WP1.11-2); cleared when the lane leaves `Ready`.
+    protocol: Option<String>,
     /// Open inbound sessions on this (inbound) lane.
     sessions: u32,
     exchanges: u64,
@@ -1288,6 +1291,7 @@ impl LaneEntry {
             ever_ready: false,
             backoff_until_ms: None,
             rtt_ms: None,
+            protocol: None,
             sessions: 0,
             exchanges: 0,
             last_success_ms: None,
@@ -1312,6 +1316,18 @@ impl LaneEntry {
         self.since_ms = Some(now);
         true
     }
+}
+
+/// The members of one `StatusEvent::LaneState`.
+struct LaneUpdate {
+    lane: u32,
+    role: LaneRole,
+    direction: Direction,
+    state: LaneState,
+    error: Option<ErrorWire>,
+    backoff_until_ms: Option<u64>,
+    rtt_ms: Option<u64>,
+    protocol: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1345,6 +1361,17 @@ impl PeerEntry {
             .filter(|(key, _)| key.inbound)
             .map(|(_, lane)| lane.sessions)
             .sum()
+    }
+
+    /// The negotiated protocol (CCR-WP1.11-2): the outbound control lane's
+    /// while it is `Ready`, else that of any `Ready` lane.
+    fn protocol(&self) -> Option<String> {
+        let ready = |lane: &&LaneEntry| lane.state == LaneState::Ready && lane.protocol.is_some();
+        self.lanes
+            .get(&LaneKey::outbound(0))
+            .filter(ready)
+            .or_else(|| self.lanes.values().find(ready))
+            .and_then(|lane| lane.protocol.clone())
     }
 
     fn catalog_entry(&self, repo: &str) -> Option<&PublishedEntry> {
@@ -1553,7 +1580,13 @@ impl HubState {
             StatusEvent::PeerConfigured {
                 installation,
                 endpoint,
+                display_name,
             } => {
+                // CCR-WP1.11-1: the catalog's display name labels the peer;
+                // `None` keeps a label set through `set_peer_label`.
+                if let Some(name) = display_name {
+                    self.labels.insert(installation.clone(), name);
+                }
                 let peer = self.peer_mut(&installation);
                 let new = !peer.outbound;
                 peer.outbound = true;
@@ -1578,15 +1611,19 @@ impl HubState {
                 error,
                 backoff_until_ms,
                 rtt_ms,
+                protocol,
             } => self.on_lane_state(
                 &installation,
-                lane,
-                role,
-                direction,
-                state,
-                error,
-                backoff_until_ms,
-                rtt_ms,
+                LaneUpdate {
+                    lane,
+                    role,
+                    direction,
+                    state,
+                    error,
+                    backoff_until_ms,
+                    rtt_ms,
+                    protocol,
+                },
                 now,
             ),
             StatusEvent::ExchangeStarted {
@@ -1595,13 +1632,25 @@ impl HubState {
                 lane,
                 op,
                 at_ms,
+                direction,
             } => {
+                // CCR-WP2.8-3: an acceptor's start is booked on its inbound
+                // lane and never makes the pair look outbound.
+                let inbound = direction == Direction::Inbound;
+                let lane_direction = if inbound {
+                    Direction::Inbound
+                } else {
+                    Direction::Outbound
+                };
                 let peer = self.peer_mut(&installation);
+                if inbound {
+                    peer.inbound = true;
+                }
                 let role = legacy_lane_role(lane);
                 let entry = peer
                     .lanes
-                    .entry(LaneKey::outbound(lane))
-                    .or_insert_with(|| LaneEntry::new(lane, role, Direction::Outbound));
+                    .entry(LaneKey::of(lane_direction, lane))
+                    .or_insert_with(|| LaneEntry::new(lane, role, lane_direction));
                 if entry.inflight.len() >= MAX_INFLIGHT {
                     entry.inflight.remove(0);
                 }
@@ -1611,7 +1660,15 @@ impl HubState {
                     since_ms: at_ms,
                     bytes: 0,
                 });
-                self.pair_mut(repo, installation, now).outbound_seen = true;
+                let pair = self.pair_mut(repo, installation, now);
+                match direction {
+                    Direction::Inbound => pair.inbound_seen = true,
+                    Direction::Outbound => pair.outbound_seen = true,
+                    Direction::Both => {
+                        pair.inbound_seen = true;
+                        pair.outbound_seen = true;
+                    }
+                }
             }
             StatusEvent::ExchangeFinished {
                 installation,
@@ -2098,19 +2155,17 @@ impl HubState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn on_lane_state(
-        &mut self,
-        installation: &str,
-        lane: u32,
-        role: LaneRole,
-        direction: Direction,
-        state: LaneState,
-        error: Option<ErrorWire>,
-        backoff_until_ms: Option<u64>,
-        rtt_ms: Option<u64>,
-        now: Now,
-    ) {
+    fn on_lane_state(&mut self, installation: &str, update: LaneUpdate, now: Now) {
+        let LaneUpdate {
+            lane,
+            role,
+            direction,
+            state,
+            error,
+            backoff_until_ms,
+            rtt_ms,
+            protocol,
+        } = update;
         let peer = self.peer_mut(installation);
         if direction == Direction::Inbound {
             peer.inbound = true;
@@ -2128,6 +2183,11 @@ impl HubState {
         entry.backoff_until_ms = backoff_until_ms;
         if rtt_ms.is_some() {
             entry.rtt_ms = rtt_ms;
+        }
+        if state != LaneState::Ready {
+            entry.protocol = None;
+        } else if protocol.is_some() {
+            entry.protocol = protocol;
         }
         let slot = if key.inbound { SLOT_IN } else { SLOT_OUT };
         let lane_scope = Scope::Lane {
@@ -3134,7 +3194,7 @@ impl HubState {
             label: self.labels.get(&peer.installation).cloned(),
             direction: peer.direction(),
             state: peer.conn,
-            protocol: None,
+            protocol: peer.protocol(),
             since_ms: peer.conn_since_ms,
             rtt_ms: peer.rtt_ms(),
             rate_up_bps: peer.up.short_bps(),

@@ -833,6 +833,7 @@ fn status_events() -> Vec<StatusEvent> {
         StatusEvent::PeerConfigured {
             installation: INSTALL_B.into(),
             endpoint: "wss://peer.example:43180".into(),
+            display_name: None,
         },
         StatusEvent::PeerRemoved {
             installation: INSTALL_B.into(),
@@ -846,6 +847,7 @@ fn status_events() -> Vec<StatusEvent> {
             error: Some(transient_error()),
             backoff_until_ms: Some(T0 + 12_000),
             rtt_ms: None,
+            protocol: None,
         },
         StatusEvent::ExchangeStarted {
             installation: INSTALL_B.into(),
@@ -853,6 +855,7 @@ fn status_events() -> Vec<StatusEvent> {
             lane: 0,
             op: "meta.exchange".into(),
             at_ms: T0 + 9900,
+            direction: Direction::Outbound,
         },
         StatusEvent::ExchangeFinished {
             installation: INSTALL_B.into(),
@@ -3763,4 +3766,24 @@ fn heartbeat_without_mount_errors_parses() {
     let parsed: WorkerHeartbeat = serde_json::from_value(value).unwrap();
     assert_eq!(parsed, heartbeat_full());
     assert_eq!(parsed.mount_errors, 0);
+}
+
+/// WP2.INT (CCR-WP1.11-1, CCR-WP1.11-2, CCR-WP2.8-3): events written
+/// without the members Wave 2 added still parse, with their defaults
+/// (`display_name` and `protocol` absent, an outbound start).
+#[test]
+fn status_events_without_the_wave_2_members_parse() {
+    for event in status_events() {
+        let mut value = serde_json::to_value(&event).unwrap();
+        let object = value.as_object_mut().unwrap();
+        let removed = match object["event"].as_str().unwrap() {
+            "peer_configured" => object.remove("display_name"),
+            "lane_state" => object.remove("protocol"),
+            "exchange_started" => object.remove("direction"),
+            _ => continue,
+        };
+        assert!(removed.is_some(), "{event:?}");
+        let parsed: StatusEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, event);
+    }
 }
