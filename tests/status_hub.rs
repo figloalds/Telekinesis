@@ -2352,6 +2352,106 @@ fn rate_and_eta_within_five_percent() {
     assert_eq!(pair.objects_down.eta_s, None);
 }
 
+/// Object rates and ETA count objects ops only (WP1.INT fix round 1): A
+/// moves objects at 1 MB/s while its metadata exchanges move another
+/// 1 MB/s, and B, which shares the folder, only exchanges metadata (2 MB/s).
+/// Before the fix every exchange fed the pair rates, so A's object rate read
+/// about 2 MB/s, B's 2 MB/s, and the ETA a quarter of the true one.
+#[test]
+fn object_rates_and_eta_exclude_metadata_exchanges() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.online_peer(PEER_B, ENDPOINT_B);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    fx.rec(meta(PEER_B, summary(0, 0)));
+    let rate: u64 = 1_000_000;
+    let mut remaining: u64 = 600_000_000;
+    fx.rec(heartbeat(1, Some(missing_bytes(remaining))));
+    fx.hub.tick();
+    let meta_exchange = |installation: &str, bytes_down: u64| {
+        finished(
+            installation,
+            0,
+            "meta.exchange",
+            Direction::Outbound,
+            None,
+            Some(summary(0, 0)),
+            bytes_down,
+            0,
+        )
+    };
+    for second in 0..30u64 {
+        for _ in 0..4 {
+            fx.rec(finished(
+                PEER_A,
+                1,
+                "objects.pull",
+                Direction::Outbound,
+                None,
+                None,
+                rate / 4,
+                1,
+            ));
+            fx.rec(meta_exchange(PEER_A, rate / 4));
+            fx.rec(meta_exchange(PEER_B, rate / 2));
+        }
+        remaining -= rate;
+        fx.rec(heartbeat(2 + second, Some(missing_bytes(remaining))));
+        fx.run(1);
+    }
+    let a = fx.pair(PEER_A);
+    assert!(
+        within(a.objects_down.rate_bps, rate, 5.0),
+        "A's object rate {}",
+        a.objects_down.rate_bps
+    );
+    let expected_eta = remaining / rate;
+    let eta = a.objects_down.eta_s.expect("eta");
+    assert!(
+        within(eta, expected_eta, 5.0),
+        "eta {eta} expected {expected_eta}"
+    );
+    // A's object requests (200 B each) are its only object upload bytes.
+    assert!(
+        within(a.objects_up.rate_bps, 4 * 200, 5.0),
+        "A's object up rate {}",
+        a.objects_up.rate_bps
+    );
+    let b = fx.pair(PEER_B);
+    assert_eq!(b.objects_down.rate_bps, 0, "a metadata-only pair");
+    assert_eq!(b.objects_up.rate_bps, 0, "a metadata-only pair");
+    assert_eq!(b.objects_down.eta_s, Some(eta), "the folder-level ETA");
+    let folder = fx.folder();
+    assert!(
+        folder.sync.summary.contains("ETA"),
+        "{}",
+        folder.sync.summary
+    );
+    // The peers' and lanes' rates still count every byte they moved.
+    let snap = fx.snap();
+    let peer = |installation: &str| {
+        snap.peers
+            .iter()
+            .find(|peer| peer.installation == installation)
+            .unwrap()
+            .clone()
+    };
+    let (peer_a, peer_b) = (peer(PEER_A), peer(PEER_B));
+    assert!(
+        within(peer_a.rate_down_bps, 2 * rate, 5.0),
+        "{}",
+        peer_a.rate_down_bps
+    );
+    assert!(
+        within(peer_b.rate_down_bps, 2 * rate, 5.0),
+        "{}",
+        peer_b.rate_down_bps
+    );
+    let control = peer_b.lanes.iter().find(|lane| lane.lane == 0).unwrap();
+    assert!(within(control.rate_down_bps, 2 * rate, 5.0));
+}
+
 #[test]
 fn transient_errors_show_after_three_attempts_then_clear_into_history() {
     let fx = Fx::new();
