@@ -34,12 +34,19 @@ fn repo_statuses(peers: &Value, repo: &str) -> Vec<Value> {
 
 /// A hung remote worker for repo X is charged to X and backed off; repo Y on
 /// the same peer keeps syncing within 45 s.
+///
+/// WP2.INT (CCR-WP2.1-2): the daemon no longer reads `runtime.json` to find a
+/// running worker (§14 WP2.1 task 4: the controller's endpoint), so the hang
+/// is X's worker `published-exchange` (fault point, scoped to X), as in
+/// `orchestrator_runtime::a_hung_remote_folder_is_charged_while_the_other_keeps_syncing`.
+/// The metrics and the floor are unchanged.
 #[test]
 #[ignore = "WP1.12"]
 fn hung_remote_repo_charged() {
     let mut s = Scenario::new(FILE, "hung_remote_repo_charged");
-    let a = Node::new();
+    let mut a = Node::new();
     let b = Node::start(NodeConfig::default().connections(2));
+    a.pin_endpoint();
     let px = a.create("Hung X", true);
     let py = a.create("Healthy Y", true);
     write_file(&px, "x.txt", b"x");
@@ -50,8 +57,20 @@ fn hung_remote_repo_charged() {
     b.wait_for("initial sync", Duration::from_secs(60), || {
         has_file(&bx, "x.txt", b"x") && has_file(&by, "y.txt", b"y")
     });
-    let hung = HungServer::start();
-    let redirect = redirect_runtime_json(&state_dir(&px), &hung.endpoint()).unwrap();
+    a.restart_with_env(vec![
+        (
+            "TKFS_FAULT_POINT".into(),
+            "worker.rpc.published-exchange".into(),
+        ),
+        ("TKFS_FAULT_ACTION".into(), "hang".into()),
+        ("TKFS_FAULT_SCOPE".into(), state_id(&px)),
+    ]);
+    for folder in [&px, &py] {
+        let state = state_id(folder);
+        a.wait_for("running", Duration::from_secs(60), || {
+            a.try_inspect(&state).is_ok_and(|p| p["running"] == true)
+        });
+    }
     s.measure_from_now();
     write_file(&py, "after-hang.txt", b"healthy progress");
     let x_repo = px["repo"].as_str().unwrap().to_owned();
@@ -70,7 +89,7 @@ fn hung_remote_repo_charged() {
         "healthy_delay_ms",
         if progressed { delay } else { f64::NAN },
         "ms",
-        json!({"hung_requests": hung.received()}),
+        json!({"hang": "worker.rpc.published-exchange"}),
     );
     if !progressed {
         s.timeout("healthy repository did not progress");
@@ -86,7 +105,6 @@ fn hung_remote_repo_charged() {
     });
     s.metric("hung_repo_charged", if charged { 1.0 } else { 0.0 }, "bool");
     s.check(charged, "the hung repository's failure is charged to it");
-    redirect.restore().unwrap();
     s.finish();
 }
 
@@ -194,37 +212,35 @@ fn worker_busy_not_counted() {
 
 /// A worker that exits immediately is restarted with backoff (1, 2, 4… s);
 /// `List` stays responsive.
+///
+/// WP2.INT (CCR-WP2.1-2): a deleted store is a Fatal `STATE_NOT_INITIALIZED`
+/// since WP1.4/WP1.2 (§3.3: `Failed` at once, never a loop), so the crasher
+/// is a worker that exits during startup (`TKFS_FAULT_POINT=worker.startup`,
+/// scoped), as in
+/// `orchestrator_runtime::a_crash_looping_folder_backs_off_and_blocks_nothing`;
+/// each start is its "opening state" progress line in `worker.log`. The
+/// metrics and the floor are unchanged.
 #[test]
 #[ignore = "WP1.12"]
 fn crash_backoff() {
     let mut s = Scenario::new(FILE, "crash_backoff");
-    let a = Node::new();
+    let mut a = Node::new();
     let p = a.create("Crasher", true);
     let state = state_id(&p);
-    // Delete the store only after the worker has exited.
-    a.stop_folder_exited(&p, STOP_EXIT_TIMEOUT).unwrap();
-    let dir = state_dir(&p);
-    for name in [
-        "metadata.sqlite",
-        "metadata.sqlite-wal",
-        "metadata.sqlite-shm",
-    ] {
-        let _ = fs::remove_file(dir.join(name));
-    }
-    let log = dir.join("worker.log");
-    // One failed start per line naming the code. WP1.INT: since WP1.4 a
-    // failed start writes its `FatalLine` (code and message) plus a `fatal`
-    // log event repeating it, so count lines, not matches, and skip the log
-    // event (`"level":`).
+    let log = state_dir(&p).join("worker.log");
     let count = || {
         fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
-            .filter(|line| line.contains("STATE_NOT_INITIALIZED") && !line.contains("\"level\":"))
+            .filter(|line| line.contains("opening state") && line.contains("startup_progress"))
             .count()
     };
     let before = count();
-    let _ = a.raw_call(json!({"op":"start","state":state}));
+    a.restart_with_env(vec![
+        ("TKFS_FAULT_POINT".into(), "worker.startup".into()),
+        ("TKFS_FAULT_ACTION".into(), "exit".into()),
+        ("TKFS_FAULT_SCOPE".into(), state.clone()),
+    ]);
     s.measure_from_now();
     let window = Duration::from_secs(20);
     let watch = Stopwatch::start();
