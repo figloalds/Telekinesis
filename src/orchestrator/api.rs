@@ -261,10 +261,13 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
             s.inspect(&state)
         }
         Action::Shutdown => {
-            let states: Vec<_> = s.workers.keys().cloned().collect();
-            for state in states { s.stop(&state)?; }
+            // `stopping` first: lanes, inbound requests and reconcile wind down
+            // while folders stop. A folder that fails to stop never aborts the
+            // others; it is left running and reported (WP1.12).
             s.stopping.store(true, Ordering::Relaxed);
-            Ok(json!({"stopped":true}))
+            let states: Vec<_> = s.workers.keys().cloned().collect();
+            let folders: Vec<_> = states.iter().map(|state| s.shutdown_folder(state)).collect();
+            Ok(json!({"stopped":true,"folders":folders}))
         }
         Action::ResetPairingCode => {
             let (code, verifier) = Verifier::generate();

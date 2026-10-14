@@ -1,4 +1,5 @@
 use super::{
+    api::Project,
     config::Config,
     lanes::{lane_role, link_key},
     lock_state,
@@ -6,8 +7,13 @@ use super::{
 };
 use crate::{
     core::{Store, id},
+    model::{
+        errors::ErrorWire,
+        orchestrator::{ShutdownOutcome, outcomes},
+    },
     paired_sync::PublishedState,
     runtime::{self, Discovery},
+    util::backoff::Backoff,
 };
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::Connection;
@@ -30,7 +36,32 @@ pub(crate) struct Worker {
     pub(crate) child: Child,
     pub(crate) messages: Receiver<Value>,
     pub(crate) startup: Option<crate::startup::Watchdog>,
+    /// Requested at launch; after Ready, the worker's actual mount state.
     pub(crate) mounted: bool,
+    /// A requested mount that failed (Ready with `mounted:false` and
+    /// `mount_error`): the worker keeps syncing headless and the folder
+    /// reports this error until it is restarted.
+    pub(crate) mount_error: Option<String>,
+}
+/// Per-folder restart backoff (WP1.12): a failed worker is restarted after
+/// 1 s, 2 s, 4 s … up to 60 s instead of on every reconcile.
+pub(crate) struct Restart {
+    pub(crate) backoff: Backoff,
+    pub(crate) not_before: Instant,
+}
+impl Restart {
+    fn new() -> Self {
+        Self {
+            // ±20 % jitter; the attempt counter resets after 60 s running.
+            backoff: Backoff::new(
+                Duration::from_secs(1),
+                Duration::from_secs(60),
+                0.2,
+                Duration::from_secs(60),
+            ),
+            not_before: Instant::now(),
+        }
+    }
 }
 pub struct Supervisor {
     pub config: Config,
@@ -41,6 +72,7 @@ pub struct Supervisor {
     pub(crate) publication_errors: BTreeMap<String, String>,
     pub(crate) links: BTreeMap<String, LinkStatus>,
     pub(crate) remote_catalogs: BTreeMap<String, Vec<PublishedState>>,
+    pub(crate) restarts: BTreeMap<String, Restart>,
     pub(crate) stopping: Arc<AtomicBool>,
     pub(crate) _lock: File,
 }
@@ -139,7 +171,13 @@ impl Supervisor {
         );
         Ok(info)
     }
+    /// An explicit start (Start, Create): a fresh attempt that forgets the
+    /// folder's crash backoff.
     pub(crate) fn start(&mut self, state: &str) -> Result<()> {
+        self.restarts.remove(state);
+        self.launch(state)
+    }
+    fn launch(&mut self, state: &str) -> Result<()> {
         if self.workers.contains_key(state) {
             return Ok(());
         }
@@ -149,7 +187,12 @@ impl Supervisor {
         );
         let p = self.project(state)?;
         // Discover an existing worker after daemon restart; do not start a duplicate.
-        if let Ok(bytes) = fs::read(p.directory.join("runtime.json"))
+        // Only a process holding `owner.lock` can be one: when the lock is free,
+        // a stale `runtime.json` (a crashed worker) needs no probe, which keeps
+        // a refused connect (1-2 s on Windows) out of this locked path.
+        let owner_running = lock_state(&p.directory).is_err();
+        if owner_running
+            && let Ok(bytes) = fs::read(p.directory.join("runtime.json"))
             && let Ok(info) = serde_json::from_slice::<Discovery>(&bytes)
             && info.repo == p.repo
             && info.device == p.device
@@ -207,6 +250,7 @@ impl Supervisor {
                 messages,
                 startup: Some(crate::startup::Watchdog::new(Instant::now())),
                 mounted,
+                mount_error: None,
             },
         );
         Ok(())
@@ -232,18 +276,24 @@ impl Supervisor {
                     );
                 }
                 if message["ready"] == true {
-                    ensure!(
-                        message["repo"] == p.repo
-                            && message["device"] == p.device
-                            && message["mounted"] == worker.mounted,
-                        "WORKER_STATE_MISMATCH"
-                    );
+                    let (mounted, mount_error) = ready_mount(&message, &p, worker.mounted)?;
+                    worker.mounted = mounted;
+                    worker.mount_error = mount_error;
                     worker.startup = None;
                 }
             }
         }
         if worker.startup.is_none() {
-            self.failures.remove(state);
+            // A failed mount stays the folder's error while its worker keeps
+            // syncing headless; it is never a reason to restart the worker.
+            match &worker.mount_error {
+                Some(error) => {
+                    self.failures.insert(state.into(), error.clone());
+                }
+                None => {
+                    self.failures.remove(state);
+                }
+            }
         }
         if let Some(startup) = &worker.startup {
             ensure!(
@@ -256,8 +306,37 @@ impl Supervisor {
         Ok(())
     }
     pub(crate) fn stop(&mut self, state: &str) -> Result<()> {
+        self.stop_outcome(state).map(|_| ())
+    }
+    /// Stops one folder for daemon Shutdown and reports the outcome (§3.6
+    /// `ShutdownOutcome`). A failure never aborts the caller: a worker that
+    /// cannot be stopped is left running for the next daemon to probe.
+    /// `desired_running` is never changed.
+    pub(crate) fn shutdown_folder(&mut self, state: &str) -> ShutdownOutcome {
+        let result = self.stop_outcome(state);
+        let outcome = match &result {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let alive = self
+                    .workers
+                    .get_mut(state)
+                    .is_some_and(|worker| worker.child.try_wait().ok().flatten().is_none());
+                if alive {
+                    outcomes::LEFT_RUNNING
+                } else {
+                    outcomes::NOT_RUNNING
+                }
+            }
+        };
+        ShutdownOutcome {
+            state: state.into(),
+            outcome: outcome.to_string(),
+            error: result.err().map(|error| ErrorWire::from_error(&error)),
+        }
+    }
+    fn stop_outcome(&mut self, state: &str) -> Result<&'static str> {
         if !self.workers.contains_key(state) {
-            return Ok(());
+            return Ok(outcomes::NOT_RUNNING);
         }
         // Drain readiness before deciding whether the worker can stop via RPC.
         let _ = self.poll_worker(state);
@@ -268,7 +347,7 @@ impl Supervisor {
             }
             worker.child.wait()?;
             self.workers.remove(state);
-            return Ok(());
+            return Ok(outcomes::KILLED);
         }
         let info = self.discovery(state)?;
         runtime::rpc(&info, &id(), json!({"op":"stop"}))?;
@@ -285,7 +364,7 @@ impl Supervisor {
             std::thread::sleep(Duration::from_millis(25));
         }
         self.workers.remove(state);
-        Ok(())
+        Ok(outcomes::STOPPED)
     }
     pub(crate) fn inspect(&self, state: &str) -> Result<Value> {
         let project = self.project(state)?;
@@ -327,13 +406,28 @@ impl Supervisor {
         Ok(value)
     }
     pub(crate) fn reconcile(&mut self) -> Result<()> {
+        // Shutdown owns the workers from the moment it sets `stopping`.
+        if self.stopping.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let now = Instant::now();
         let states: Vec<_> = self.workers.keys().cloned().collect();
         for state in states {
-            if let Err(error) = self.poll_worker(&state) {
-                let mut worker = self.workers.remove(&state).unwrap();
-                let _ = worker.child.kill();
-                let _ = worker.child.wait();
-                self.failures.insert(state, format!("{error:#}"));
+            match self.poll_worker(&state) {
+                Ok(()) => {
+                    if self.workers[&state].startup.is_none()
+                        && let Some(restart) = self.restarts.get_mut(&state)
+                    {
+                        restart.backoff.success(now);
+                    }
+                }
+                Err(error) => {
+                    let mut worker = self.workers.remove(&state).unwrap();
+                    let _ = worker.child.kill();
+                    let _ = worker.child.wait();
+                    self.failures.insert(state.clone(), format!("{error:#}"));
+                    self.defer_restart(&state, now);
+                }
             }
         }
         for p in self.projects()? {
@@ -372,11 +466,189 @@ impl Supervisor {
             }
             if p.desired_running
                 && !self.workers.contains_key(&p.state)
-                && let Err(error) = self.start(&p.state)
+                && self
+                    .restarts
+                    .get(&p.state)
+                    .is_none_or(|restart| now >= restart.not_before)
+                && let Err(error) = self.launch(&p.state)
             {
-                self.failures.insert(p.state, format!("{error:#}"));
+                self.failures.insert(p.state.clone(), format!("{error:#}"));
+                self.defer_restart(&p.state, now);
             }
         }
         Ok(())
+    }
+    /// Schedules the next restart of a folder whose worker failed (exited,
+    /// timed out, mismatched) or could not be launched.
+    fn defer_restart(&mut self, state: &str, now: Instant) {
+        let restart = self
+            .restarts
+            .entry(state.into())
+            .or_insert_with(Restart::new);
+        restart.not_before = now + restart.backoff.failure(now);
+    }
+    /// When the supervision loop should reconcile next: `fallback`, or
+    /// earlier when a backed-off restart falls due before it.
+    pub(crate) fn next_reconcile(&self, fallback: Instant) -> Instant {
+        let now = Instant::now();
+        self.restarts
+            .values()
+            .map(|restart| restart.not_before)
+            .filter(|at| *at > now)
+            .fold(fallback, Instant::min)
+    }
+}
+
+/// Checks a worker Ready line against its folder and the requested mount.
+/// Returns the actual mount state and, when a requested mount failed, the
+/// error the worker reported. A Ready line with `mounted:false` is accepted
+/// only together with its `mount_error` (WP1.4 legacy mode: mount failures
+/// are reported, never fatal).
+pub(crate) fn ready_mount(
+    message: &Value,
+    project: &Project,
+    requested: bool,
+) -> Result<(bool, Option<String>)> {
+    ensure!(
+        message["repo"] == project.repo && message["device"] == project.device,
+        "WORKER_STATE_MISMATCH"
+    );
+    match message["mounted"].as_bool() {
+        Some(mounted) if mounted == requested => Ok((mounted, None)),
+        Some(false) => {
+            let error = match &message["mount_error"] {
+                Value::Null => bail!("WORKER_STATE_MISMATCH: unmounted without a mount_error"),
+                Value::String(text) => text.clone(),
+                other => serde_json::from_value::<ErrorWire>(other.clone())
+                    .map(|wire| wire.to_string())
+                    .unwrap_or_else(|_| other.to_string()),
+            };
+            Ok((false, Some(error)))
+        }
+        _ => bail!("WORKER_STATE_MISMATCH"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::Network;
+    use std::sync::atomic::Ordering;
+
+    fn project() -> Project {
+        Project {
+            state: id(),
+            label: "Folder".into(),
+            repo: id(),
+            device: id(),
+            directory: PathBuf::from("state"),
+            mount: Some(PathBuf::from("mount")),
+            desired_running: true,
+        }
+    }
+
+    fn ready(p: &Project, mounted: bool, mount_error: Value) -> Value {
+        json!({"ready":true,"repo":p.repo,"device":p.device,"runtime":"runtime.json",
+            "mounted":mounted,"mount_error":mount_error})
+    }
+
+    #[test]
+    fn ready_line_with_a_failed_mount_keeps_the_worker() {
+        let p = project();
+        assert_eq!(
+            ready_mount(&ready(&p, true, Value::Null), &p, true).unwrap(),
+            (true, None)
+        );
+        assert_eq!(
+            ready_mount(&ready(&p, false, Value::Null), &p, false).unwrap(),
+            (false, None)
+        );
+        // WP1.4 legacy mode: Ready with `mounted:false` and a typed mount_error.
+        let wire = ErrorWire::new(
+            "MOUNT_PATH_MUST_NOT_EXIST",
+            "MOUNT_PATH_MUST_NOT_EXIST: mount",
+        );
+        let (mounted, error) = ready_mount(&ready(&p, false, json!(wire)), &p, true).unwrap();
+        assert!(!mounted);
+        assert!(error.unwrap().starts_with("MOUNT_PATH_MUST_NOT_EXIST"));
+        let (_, error) = ready_mount(
+            &ready(&p, false, json!("WINFSP_RUNTIME_UNAVAILABLE")),
+            &p,
+            true,
+        )
+        .unwrap();
+        assert_eq!(error.as_deref(), Some("WINFSP_RUNTIME_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn ready_line_mismatches_are_still_rejected() {
+        let p = project();
+        // Unmounted without saying why, or mounted although headless.
+        for (line, requested) in [
+            (ready(&p, false, Value::Null), true),
+            (ready(&p, true, Value::Null), false),
+            (json!({"ready":true,"repo":p.repo,"device":p.device}), true),
+        ] {
+            let error = ready_mount(&line, &p, requested).unwrap_err();
+            assert!(format!("{error:#}").contains("WORKER_STATE_MISMATCH"));
+        }
+        let mut other = ready(&p, true, Value::Null);
+        other["repo"] = json!(id());
+        assert!(ready_mount(&other, &p, true).is_err());
+        let mut other = ready(&p, true, Value::Null);
+        other["device"] = json!(id());
+        assert!(ready_mount(&other, &p, true).is_err());
+    }
+
+    fn supervisor(root: &Path) -> Supervisor {
+        Supervisor::open(Config {
+            format_version: 2,
+            data_directory: root.join("data"),
+            default_mount_directory: root.join("mounts"),
+            maximum_running: 1,
+            network: Network::default(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn failed_workers_restart_after_a_growing_delay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut s = supervisor(root.path());
+        let now = Instant::now();
+        let fallback = now + Duration::from_secs(600);
+        let mut delays = vec![];
+        for _ in 0..8 {
+            s.defer_restart("folder", now);
+            let due = s.restarts["folder"].not_before;
+            assert_eq!(s.next_reconcile(fallback), due);
+            delays.push(due - now);
+        }
+        for (attempt, delay) in delays.iter().enumerate() {
+            let nominal = Duration::from_secs((1u64 << attempt).min(60));
+            assert!(
+                *delay >= nominal.mul_f64(0.8) && *delay <= nominal.mul_f64(1.2),
+                "attempt {} waited {delay:?}",
+                attempt + 1
+            );
+        }
+        // An explicit Start is a fresh attempt.
+        assert!(s.start("folder").is_err(), "no such folder");
+        assert!(!s.restarts.contains_key("folder"));
+        assert_eq!(s.next_reconcile(fallback), fallback);
+    }
+
+    #[test]
+    fn reconcile_leaves_workers_alone_once_shutdown_began() {
+        let root = tempfile::tempdir().unwrap();
+        let mut s = supervisor(root.path());
+        s.stopping.store(true, Ordering::Relaxed);
+        // Even an unreadable catalog is not touched after Shutdown began.
+        s.db.execute_batch("DROP TABLE projects").unwrap();
+        s.reconcile().unwrap();
+        assert!(s.workers.is_empty());
+        let outcome = s.shutdown_folder("absent");
+        assert_eq!(outcome.outcome, outcomes::NOT_RUNNING);
+        assert!(outcome.error.is_none());
     }
 }
