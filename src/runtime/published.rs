@@ -39,15 +39,11 @@ pub(super) fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
         page["bundle"]["objects"] = json!({});
     }
     if parts.is_empty() {
-        let mut e = engine
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("WORKER_BUSY"))?;
+        let mut e = super::try_lock_engine(engine).ok_or_else(|| anyhow::anyhow!("WORKER_BUSY"))?;
         return crate::paired_sync::worker_control(&mut e, &metadata);
     }
     let (mut result, transfer, lock) = {
-        let mut e = engine
-            .try_lock()
-            .map_err(|_| anyhow::anyhow!("WORKER_BUSY"))?;
+        let mut e = super::try_lock_engine(engine).ok_or_else(|| anyhow::anyhow!("WORKER_BUSY"))?;
         let result = crate::paired_sync::worker_control(&mut e, &metadata)?;
         (result, e.store.transfer_view()?, e.transfers.clone())
     };
@@ -60,7 +56,7 @@ pub(super) fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
             Ok(outcomes) => outcomes,
             Err(error) => {
                 // Page-level failure: nothing was received.
-                let e = engine.lock().unwrap();
+                let e = super::lock_engine(engine);
                 for object in objects {
                     e.store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", rusqlite::params![object, format!("{error:#}"), time()])?;
                 }
@@ -71,7 +67,7 @@ pub(super) fn published_rpc(engine: &Shared, payload: &Value) -> Result<Value> {
         {
             // Completed objects are registered first, even when another part
             // failed; then each failed object gets its error and backoff.
-            let e = engine.lock().unwrap();
+            let e = super::lock_engine(engine);
             e.store.register_received(&completed)?;
             for (object, error) in &failed {
                 e.store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", rusqlite::params![object, error.message, time()])?;

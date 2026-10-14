@@ -11,7 +11,7 @@ pub(super) fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
         payload["directory"].as_str().context("MISSING_DIRECTORY")?,
     ))?;
     let (state, mount) = {
-        let e = engine.lock().unwrap();
+        let e = super::lock_engine(engine);
         let info: Discovery = serde_json::from_slice(&e.discovery)?;
         (e.store.root.clone(), info.mount)
     };
@@ -70,7 +70,7 @@ pub(super) fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
     let backend = DirectoryBackend::new(&destination)?;
     // Capture only authorized immutable data under the lock; backend I/O outside.
     let (repo, branches, events, objects) = {
-        let e = engine.lock().unwrap();
+        let e = super::lock_engine(engine);
         let events: Vec<_> = e
             .store
             .events()?
@@ -91,7 +91,7 @@ pub(super) fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
     };
     for object in &objects {
         let mut file = {
-            let e = engine.lock().unwrap();
+            let e = super::lock_engine(engine);
             e.store.open_object(object)?
         };
         ensure!(

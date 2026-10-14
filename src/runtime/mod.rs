@@ -117,10 +117,12 @@ fn elapsed_ms(since: Instant) -> u64 {
     u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Locks the engine under the process poison policy (§4.2). The signature is
-/// the Wave 0 seam and stays a plain `MutexGuard`; the wait is reported to the
-/// registered worker's gauges, but the hold is not (a `MutexGuard` cannot
-/// report its release). Prefer [`lock_engine_tracked`].
+/// Locks the engine under the process poison policy (§4.2). Since WP1.INT
+/// (CCR-WP1.4-2) it returns the tracked [`EngineGuard`], like
+/// [`lock_engine_tracked`]: the wait and the hold are reported to the
+/// registered worker's gauges, so filesystem callbacks (the main holders)
+/// count toward `engine.stalled`, and the guard's drop refreshes the
+/// engine's [`EngineVitals`].
 ///
 /// A poisoned engine (a thread panicked while holding it):
 /// * [`PoisonPolicy::Panic`] (the default; tests): panics with `ENGINE_POISONED`.
@@ -129,9 +131,8 @@ fn elapsed_ms(since: Instant) -> u64 {
 ///   `retain_all_dirty`), then a fatal `ENGINE_POISONED` log line, then
 ///   `exit(70)`. The recovered guard is held until the process exits, so no
 ///   other thread sees the inconsistent engine.
-pub fn lock_engine(e: &Shared) -> MutexGuard<'_, Engine> {
-    let worker = worker_of(e);
-    acquire(e, worker.as_deref())
+pub fn lock_engine(e: &Shared) -> EngineGuard<'_> {
+    lock_engine_tracked(e)
 }
 
 /// [`lock_engine`] plus hold gauges: the hold starts when the lock is taken
