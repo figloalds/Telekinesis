@@ -2488,10 +2488,17 @@ fn session_stubs_fail_closed_with_not_implemented() {
         }
         fn legacy_attempt(&self, _: std::net::SocketAddr, _: &Value) {}
     }
+    // WP1.10 implemented the handshake entry points (CCR-WP1.10-1); they
+    // still fail closed: a dialer that hangs up before the upgrade is refused,
+    // nothing listens on port 1, and `CodeAuth` derives the verifier key.
+    drop(client);
     let error = session::accept(server, Arc::new(Policy), ConnOptions::default()).unwrap_err();
-    assert_eq!(error.code, "NOT_IMPLEMENTED");
-    let error = session::accept_loopback(client, None, ConnOptions::default()).unwrap_err();
-    assert_eq!(error.code, "NOT_IMPLEMENTED");
+    assert_eq!(error.code, "WS_CLOSED");
+    let client = std::net::TcpStream::connect(address).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    drop(client);
+    let error = session::accept_loopback(server, None, ConnOptions::default()).unwrap_err();
+    assert_eq!(error.code, "WS_CLOSED");
     let hello = ClientHello {
         protocol: protocol::PROTOCOL_NAME.into(),
         versions: vec![3],
@@ -2512,12 +2519,12 @@ fn session_stubs_fail_closed_with_not_implemented() {
         ConnOptions::default(),
     )
     .unwrap_err();
-    assert_eq!(error.to_wire().code, "NOT_IMPLEMENTED");
+    assert_eq!(error.to_wire().code, "WS_CONNECT_FAILED");
     let error =
         session::dial_loopback("ws://127.0.0.1:1", None, ConnOptions::default()).unwrap_err();
-    assert_eq!(error.to_wire().code, "NOT_IMPLEMENTED");
+    assert_eq!(error.to_wire().code, "WS_CONNECT_FAILED");
     use session::ClientAuth;
-    assert_eq!(auth.key("salt").unwrap_err().code, "NOT_IMPLEMENTED");
+    assert_eq!(auth.key("salt").unwrap(), Verifier::derive_key("salt", "c"));
     let frame =
         session::frame::Frame::new(FrameKind::Cancel, 0, &CancelHeader { id: 1 }, vec![]).unwrap();
     assert_eq!(frame.header_as::<CancelHeader>().unwrap().id, 1);
