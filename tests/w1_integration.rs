@@ -43,7 +43,7 @@ use tkfs::{
         Config, Network,
         catalog::Catalog,
         hub::{HubConfig, StatusHub},
-        process::{LogPolicy, RealLauncher, process_identity},
+        process::{LogPolicy, RealLauncher, kill_verified, process_identity},
         published::PublishedCatalog,
         registry::{FolderRegistry, LifecycleLimits, RegistryDeps},
     },
@@ -179,14 +179,19 @@ fn run_child(test: &str, mode: &str, root: &Path) -> (ExitStatus, String, String
     (status, stdout, tail(&log, 16 * 1024))
 }
 
-/// Kills a worker left behind by a failed assertion.
-struct KillOnDrop(Option<u32>);
+/// Kills a worker left behind by a failed assertion: only the process seen
+/// when the guard was made (same pid, start time and executable, checked by
+/// `kill_verified`), never one that reused the pid after the worker exited.
+struct KillOnDrop(Option<(u32, u64, PathBuf)>);
+impl KillOnDrop {
+    fn new(pid: u32) -> Self {
+        Self(process_identity(pid).map(|(start, image)| (pid, start, image)))
+    }
+}
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if let Some(pid) = self.0
-            && process_identity(pid).is_some()
-        {
-            kill_pid(pid);
+        if let Some((pid, start, image)) = self.0.take() {
+            let _ = kill_verified(pid, start, &image);
         }
     }
 }
@@ -262,7 +267,7 @@ fn real_launcher_registry_and_adoption_after_a_daemon_crash() {
         .unwrap_or_else(|| panic!("first daemon failed ({status}):\n{stdout}\n{stderr}"));
     let fields: Vec<&str> = line.split_whitespace().collect();
     let (state, pid, instance) = (fields[1], fields[2].parse::<u32>().unwrap(), fields[3]);
-    let mut guard = KillOnDrop(Some(pid));
+    let mut guard = KillOnDrop::new(pid);
     assert!(
         status.success(),
         "first daemon exit {status}:\n{stdout}\n{stderr}"
@@ -493,11 +498,25 @@ fn session_dial_and_accept_run_a_real_conn() {
 // ---------------------------------------------------------------------------
 // revalidate (task 1)
 
+/// The worker's status as the store has it now. While the engine is busy
+/// the worker answers with its last observation marked `busy`/`stale`; such
+/// a reply could predate the last request, so it is retried.
 fn status(worker: &WorkerProc) -> Value {
-    retry_busy(Duration::from_secs(30), || {
-        worker.rpc(json!({"op":"status"}))
-    })
-    .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = retry_busy(Duration::from_secs(30), || {
+            worker.rpc(json!({"op":"status"}))
+        })
+        .unwrap();
+        if status["busy"] != json!(true) && status["stale"] != json!(true) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker's status stayed busy/stale: {status}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -522,6 +541,9 @@ fn revalidate_requeues_quarantined_rows_and_reactivates_them() {
     })
     .unwrap();
     assert_eq!(reply, json!({"requeued": 2}), "{}", worker.log_tail());
+    // A fresh read (`status` never returns the busy fallback's cached
+    // observation): `revalidate` clears the rows' errors, so without the
+    // activation pass this would read 0.
     assert_eq!(
         status(&worker)["incoming_quarantined"],
         2,

@@ -26,16 +26,22 @@ use std::{
 /// is read inside the snapshot update, so concurrent beats (the heartbeat
 /// thread and a mount transition) publish their `seq` in the order they read
 /// the mount: a later `seq` never carries an older mount state (WP1.4 review
-/// finding, fixed by WP1.INT). The status read is a lock-free snapshot load.
+/// finding, fixed by WP1.INT). The generation is read before the status, so
+/// the published status is always at least as new as the published
+/// generation: a transition between the two reads shows its new status at
+/// once and its generation on the next beat, never a new generation with
+/// the old status (which a consumer keying on `generations.mount` would
+/// take as seen). Both reads are lock-free snapshot loads.
 pub fn beat(ctx: &WorkerCtx, vitals: &EngineVitals) -> Arc<WorkerHeartbeat> {
     let engine = ctx.gauges.snapshot();
     let store_health = vitals.store_health();
     let mount_errors = crate::mount::mount_errors();
     let at_ms = now_ms();
     ctx.heartbeat.update(|previous| {
+        let counted = ctx.mount.generation();
         let mount = ctx.mount.status();
         let mut generations = previous.generations;
-        match ctx.mount.generation() {
+        match counted {
             0 if previous.seq > 0 && previous.mount != mount => generations.mount += 1,
             0 => {}
             counted => generations.mount = generations.mount.max(counted),
