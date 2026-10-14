@@ -18,9 +18,12 @@
 //!   leaves the connection usable (invariant 17).
 //! * **Serving.** [`Conn::serve`] starts the connection's handler pool
 //!   (`ConnOptions::handlers` threads). Requests wait in a bounded queue
-//!   (`ConnOptions::handler_queue`); a full queue answers `BUSY` (Contention)
-//!   at once. `ping` is answered by the I/O thread itself, so liveness checks
-//!   never wait behind busy handlers.
+//!   (`ConnOptions::handler_queue` requests beyond those idle handler threads
+//!   are about to take); a full queue answers `BUSY` (Contention) at once. A
+//!   streamed request waiting for a handler is also refused `BUSY` once its
+//!   parts no longer fit the receive bound (`data_queue_bytes`), so it never
+//!   holds the connection's reads. `ping` is answered by the I/O thread
+//!   itself, so liveness checks never wait behind busy handlers.
 //! * **Queues.** Outgoing frames wait in three queues, written in priority
 //!   order: control (header-only REQUEST/RESPONSE, PROGRESS, CANCEL,
 //!   HEARTBEAT, GOAWAY; ≤ `control_queue_bytes`), response bodies
@@ -33,9 +36,10 @@
 //!   wait: while the control queue is over its bound, the server's I/O thread
 //!   stops reading, so a peer that leaves our replies unread is held back by
 //!   TCP (and judged dead after `dead_after` without reading anything). An
-//!   empty queue admits one item of any size. All frames of one request id
-//!   stay in order: the final RESPONSE of a streamed reply follows its chunks
-//!   through the data queue.
+//!   empty queue admits one item of any size; producers waiting for room are
+//!   admitted in FIFO order per queue, so such an item is not starved. All
+//!   frames of one request id stay in order: the final RESPONSE of a streamed
+//!   reply follows its chunks through the data queue.
 //! * **Bodies** larger than one chunk (`max_chunk`, 1 MiB) are split: the
 //!   REQUEST/RESPONSE frame carries the first part with `MORE` and
 //!   `total`, CHUNK frames (`hash: None`) carry the rest, the last one with
@@ -108,7 +112,8 @@ pub struct ConnOptions {
     pub max_body: usize,
     /// Server handler threads for this connection.
     pub handlers: usize,
-    /// Queued requests per connection before `BUSY`.
+    /// Queued requests per connection before `BUSY` (beyond those idle
+    /// handler threads are about to take).
     pub handler_queue: usize,
     /// Control queue bound (16 MiB).
     pub control_queue_bytes: usize,
@@ -290,6 +295,16 @@ pub(crate) enum Lane {
     Data,
 }
 
+impl Lane {
+    fn index(self) -> usize {
+        match self {
+            Lane::Control => 0,
+            Lane::Response => 1,
+            Lane::Data => 2,
+        }
+    }
+}
+
 /// Per-request-id FIFO queues served round-robin.
 #[derive(Default)]
 pub(crate) struct RoundRobin {
@@ -327,6 +342,10 @@ impl RoundRobin {
             }
         }
         None
+    }
+
+    fn holds(&self, id: u64) -> bool {
+        self.streams.contains_key(&id)
     }
 
     fn purge(&mut self, id: u64) -> usize {
@@ -379,7 +398,7 @@ impl Queues {
     }
 
     /// Queues a PROGRESS frame of request `id` unless one is still queued.
-    fn push_progress(&mut self, id: u64, frame: Vec<u8>) -> bool {
+    pub(crate) fn push_progress(&mut self, id: u64, frame: Vec<u8>) -> bool {
         if !self.progress.insert(id) {
             return false;
         }
@@ -425,6 +444,13 @@ impl Queues {
         self.control_bytes
     }
 
+    /// Whether frames of request `id` are still waiting to be written.
+    fn holds(&self, id: u64) -> bool {
+        self.response.holds(id)
+            || self.data.holds(id)
+            || self.control.iter().any(|(other, _)| *other == id)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.control.is_empty() && self.response.is_empty() && self.data.is_empty()
     }
@@ -439,7 +465,8 @@ impl Queues {
 }
 
 /// Whether `bytes` more fit a queue holding `queued` under `cap`. An empty
-/// queue admits one item of any size.
+/// queue admits one item of any size (producers wait for room in FIFO order,
+/// so such an item is not starved by smaller ones: see `Shared::wait_room`).
 fn fits(queued: usize, bytes: usize, cap: usize) -> bool {
     bytes == 0 || queued == 0 || queued + bytes <= cap
 }
@@ -448,9 +475,19 @@ fn fits(queued: usize, bytes: usize, cap: usize) -> bool {
 /// zero-copy slice of the received WebSocket message.
 pub(crate) enum Event {
     Chunk(ChunkHeader, tungstenite::Bytes),
+    /// PROGRESS frames received since the caller last looked (coalesced: one
+    /// resets the idle deadline as well as many).
     Progress,
     Done(Result<Reply, ErrorWire>),
     Lost(String),
+}
+
+#[derive(Default)]
+struct SlotEvents {
+    /// Chunks and the outcome, in arrival order (PROGRESS is not queued).
+    queue: VecDeque<Event>,
+    /// PROGRESS frames received so far (wrapping).
+    progress: u64,
 }
 
 /// One pending client call. The I/O thread pushes events only while holding
@@ -460,7 +497,7 @@ pub(crate) enum Event {
 pub(crate) struct Slot {
     /// Reassembly limit of the response body.
     pub(crate) limit: usize,
-    events: Mutex<VecDeque<Event>>,
+    events: Mutex<SlotEvents>,
     ready: Condvar,
 }
 
@@ -468,23 +505,41 @@ impl Slot {
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            events: Mutex::new(VecDeque::new()),
+            events: Mutex::new(SlotEvents::default()),
             ready: Condvar::new(),
         }
     }
 
+    /// Queues a chunk or the outcome (a `Progress` event only counts, so a
+    /// peer's PROGRESS frames cannot pile up while nobody drains the slot).
     pub(crate) fn push(&self, event: Event) {
-        lock(&self.events).push_back(event);
+        {
+            let mut events = lock(&self.events);
+            match event {
+                Event::Progress => events.progress = events.progress.wrapping_add(1),
+                event => events.queue.push_back(event),
+            }
+        }
         self.ready.notify_one();
     }
 
+    /// PROGRESS frames received so far (compare two readings).
+    fn progress(&self) -> u64 {
+        lock(&self.events).progress
+    }
+
     /// The next event, waiting until `until` (`None`: no limit). `None` on
-    /// timeout.
-    fn next(&self, until: Option<Instant>) -> Option<Event> {
+    /// timeout. `seen` is the progress count the caller has already handled;
+    /// newer PROGRESS frames are reported as one `Event::Progress`.
+    fn next(&self, until: Option<Instant>, seen: &mut u64) -> Option<Event> {
         let mut events = lock(&self.events);
         loop {
-            if let Some(event) = events.pop_front() {
+            if let Some(event) = events.queue.pop_front() {
                 return Some(event);
+            }
+            if events.progress != *seen {
+                *seen = events.progress;
+                return Some(Event::Progress);
             }
             match until {
                 None => {
@@ -509,7 +564,7 @@ impl Slot {
     }
 
     fn drain(&self) -> Vec<Event> {
-        lock(&self.events).drain(..).collect()
+        lock(&self.events).queue.drain(..).collect()
     }
 
     /// Whether the call's outcome (`Done` or `Lost`) is queued. The I/O thread
@@ -517,6 +572,7 @@ impl Slot {
     /// that removes the call from `State::pending`.
     fn has_outcome(&self) -> bool {
         lock(&self.events)
+            .queue
             .iter()
             .any(|event| matches!(event, Event::Done(_) | Event::Lost(_)))
     }
@@ -524,7 +580,7 @@ impl Slot {
     /// The error an unfinished upload reports once its request has ended.
     fn ended_error(&self) -> CallError {
         let events = lock(&self.events);
-        for event in events.iter() {
+        for event in events.queue.iter() {
             match event {
                 Event::Done(Err(error)) => return CallError::Remote(error.clone()),
                 Event::Lost(detail) => return CallError::ConnectionLost(detail.clone()),
@@ -541,6 +597,8 @@ impl Slot {
 pub(crate) struct Serving {
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) deadline: Instant,
+    /// Set (under the state lock) when a handler thread takes the request.
+    pub(crate) started: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -554,7 +612,13 @@ pub(crate) struct State {
     pub(crate) incoming: VecDeque<Incoming>,
     pub(crate) handler: Option<Arc<dyn Handler>>,
     handler_threads: usize,
+    /// Handler threads running a request (the others take the next queued
+    /// ones as soon as they run: see [`State::idle_handlers`]).
+    busy_handlers: usize,
     pub(crate) space_waiters: usize,
+    /// Producers waiting for room, per lane, in arrival order (tickets).
+    room_waiters: [VecDeque<u64>; 3],
+    next_ticket: u64,
     pub(crate) close_request: Option<ErrorWire>,
     pub(crate) goaway_sent: Option<ErrorWire>,
     pub(crate) goaway_received: Option<ErrorWire>,
@@ -591,6 +655,31 @@ impl State {
         self.incoming = kept;
         taken
     }
+
+    /// Handler threads not running a request: waiting for one, or just
+    /// started by `serve` and about to look. The first `idle_handlers()`
+    /// entries of `incoming` are about to be taken.
+    pub(crate) fn idle_handlers(&self) -> usize {
+        self.handler_threads.saturating_sub(self.busy_handlers)
+    }
+
+    /// Ids of queued requests that idle handler threads are about to take.
+    pub(crate) fn starting(&self) -> impl Iterator<Item = u64> + '_ {
+        self.incoming
+            .iter()
+            .take(self.idle_handlers())
+            .map(|incoming| incoming.id)
+    }
+}
+
+/// How a wait for queue room ended.
+pub(crate) enum Room<E> {
+    /// The frames fit; the caller queues them under the same lock.
+    Ready,
+    /// The caller's stop condition fired.
+    Stopped(E),
+    /// The deadline passed without room.
+    Expired,
 }
 
 pub(crate) struct Shared {
@@ -730,6 +819,59 @@ impl Shared {
             .0;
         state.space_waiters -= 1;
         state
+    }
+
+    /// Waits until `frames` fit their queues. Producers that find no room
+    /// wait in FIFO order per lane (the lane of the first frame; every batch
+    /// uses one lane): while one waits, later batches for that lane queue
+    /// behind it, so a batch larger than the bound (admitted only by an empty
+    /// queue) is not starved by smaller ones. `stop` is checked first on
+    /// every wake-up (at least every [`RECHECK`]); `until` gives the current
+    /// deadline (it may move, e.g. when PROGRESS restarts an idle window).
+    /// On `Ready` the caller queues the frames under the returned guard.
+    pub(crate) fn wait_room<'a, E>(
+        &self,
+        mut state: MutexGuard<'a, State>,
+        frames: &[(Lane, Vec<u8>)],
+        mut stop: impl FnMut(&State) -> Option<E>,
+        mut until: impl FnMut() -> Instant,
+    ) -> (MutexGuard<'a, State>, Room<E>) {
+        let lane = frames.first().map_or(0, |(lane, _)| lane.index());
+        let mut ticket: Option<u64> = None;
+        let room = loop {
+            if let Some(error) = stop(&state) {
+                break Room::Stopped(error);
+            }
+            let waiters = &state.room_waiters[lane];
+            let turn = match ticket {
+                None => waiters.is_empty(),
+                Some(ticket) => waiters.front() == Some(&ticket),
+            };
+            if turn && self.room(&state, frames) {
+                break Room::Ready;
+            }
+            let until = until();
+            if Instant::now() >= until {
+                break Room::Expired;
+            }
+            if ticket.is_none() {
+                let next = state.next_ticket;
+                state.next_ticket = next.wrapping_add(1);
+                state.room_waiters[lane].push_back(next);
+                ticket = Some(next);
+            }
+            state = self.wait_space(state, until);
+        };
+        if let Some(ticket) = ticket {
+            let waiters = &mut state.room_waiters[lane];
+            let first = waiters.front() == Some(&ticket);
+            waiters.retain(|other| *other != ticket);
+            if first && !waiters.is_empty() {
+                // The next waiter's turn.
+                self.space.notify_all();
+            }
+        }
+        (state, room)
     }
 
     fn ensure_client(&self) -> Result<(), CallError> {
@@ -909,23 +1051,23 @@ impl Shared {
             .filter(|(lane, _)| *lane == Lane::Control)
             .map(|(_, frame)| frame.len())
             .sum();
-        let mut state = self.lock();
-        loop {
+        let state = self.lock();
+        let stop = |state: &State| {
             if let Some(reason) = state.refusal() {
-                return Err(CallError::Unavailable(reason));
+                return Some(CallError::Unavailable(reason));
             }
             // A full control queue refuses a request header at once; bodies
             // and data wait for room until `space_until`.
             if control > 0 && state.queues.control_bytes + control > self.tx_cap() {
-                return Err(CallError::Busy);
+                return Some(CallError::Busy);
             }
-            if self.room(&state, &frames) {
-                break;
-            }
-            if Instant::now() >= space_until {
-                return Err(CallError::Busy);
-            }
-            state = self.wait_space(state, space_until);
+            None
+        };
+        let (mut state, room) = self.wait_room(state, &frames, stop, || space_until);
+        match room {
+            Room::Ready => {}
+            Room::Stopped(error) => return Err(error),
+            Room::Expired => return Err(CallError::Busy),
         }
         state.pending.insert(id, slot.clone());
         for (lane, frame) in frames {
@@ -988,6 +1130,7 @@ impl Shared {
         };
         let mut active = Instant::now();
         let mut ended = false;
+        let mut seen = slot.progress();
         loop {
             let idle_at = idle.map(|idle| after(active, idle));
             let wait = if ended {
@@ -995,16 +1138,20 @@ impl Shared {
             } else {
                 earliest(until, idle_at)
             };
-            let Some(event) = slot.next(wait) else {
+            let Some(event) = slot.next(wait, &mut seen) else {
                 let now = Instant::now();
                 if idle_at.is_some_and(|at| now >= at)
                     && until.is_none_or(|until| now < until)
-                    && self.rx_paused.load(Ordering::Acquire)
+                    && (self.rx_paused.load(Ordering::Acquire) || self.lock().queues.holds(id))
                 {
-                    // This side holds its reads (some consumer is behind):
-                    // the stream's next frame may be waiting unread behind
-                    // the hold, so the idle deadline restarts. The absolute
-                    // deadline still applies.
+                    // The peer cannot be judged idle: this side holds its
+                    // reads (some consumer is behind), so the stream's next
+                    // frame may wait unread behind the hold; or part of the
+                    // request itself (e.g. an upload's end) has not been
+                    // written yet, typically because the peer holds its reads
+                    // and the socket is full. The idle deadline restarts; the
+                    // absolute deadline still applies, and a dead link is
+                    // caught by liveness (`dead_after`).
                     active = now;
                     continue;
                 }
@@ -1374,11 +1521,13 @@ pub struct Upload {
 
 impl Upload {
     /// Queues one part of the body (blocks while the data queue is full, at
-    /// most `idle`; then the request is cancelled and `Timeout` returned, here
-    /// and by every later call). `h.id` is set to this request's id. Fails
-    /// once the request has ended: `Remote` if the server answered with an
-    /// error, `Cancelled` if it answered early (call [`Upload::finish`] for
-    /// the reply), `ConnectionLost` if the connection failed.
+    /// most `idle` without a PROGRESS from the server; then the request is
+    /// cancelled and `Timeout` returned, here and by every later call). `h.id`
+    /// is set to this request's id. Fails once the request has ended:
+    /// `Remote` if the server answered with an error (`BUSY` when no handler
+    /// was free and the body did not fit its receive buffer meanwhile),
+    /// `Cancelled` if it answered early (call [`Upload::finish`] for the
+    /// reply), `ConnectionLost` if the connection failed.
     pub fn chunk(&mut self, h: ChunkHeader, bytes: &[u8]) -> Result<(), CallError> {
         if let Some(error) = &self.failed {
             return Err(error.clone());
@@ -1398,17 +1547,31 @@ impl Upload {
             shared.send_limits(),
         )
         .map_err(local_error)?;
-        let until = after(Instant::now(), self.idle);
-        let mut state = shared.lock();
-        loop {
-            if !state.pending.contains_key(&self.id) {
+        let frames = vec![(Lane::Data, frame)];
+        let (id, idle, slot) = (self.id, self.idle, self.slot.clone());
+        // The wait gives up after `idle` without room; a PROGRESS from the
+        // server (it is alive and working on this request, e.g. while it
+        // holds its reads for another stream) restarts the window.
+        let mut seen = slot.progress();
+        let mut until = after(Instant::now(), idle);
+        let deadline = || {
+            let progress = slot.progress();
+            if progress != seen {
+                seen = progress;
+                until = after(Instant::now(), idle);
+            }
+            until
+        };
+        let ended = |state: &State| (!state.pending.contains_key(&id)).then_some(());
+        let state = shared.lock();
+        let (mut state, room) = shared.wait_room(state, &frames, ended, deadline);
+        match room {
+            Room::Ready => {}
+            Room::Stopped(()) => {
                 drop(state);
                 return Err(self.slot.ended_error());
             }
-            if shared.data_room(&state, frame.len()) {
-                break;
-            }
-            if Instant::now() >= until {
+            Room::Expired => {
                 drop(state);
                 if shared.abandon(self.id, &self.slot) {
                     let error = CallError::Timeout {
@@ -1422,9 +1585,10 @@ impl Upload {
                 // outcome.
                 return Err(self.slot.ended_error());
             }
-            state = shared.wait_space(state, until);
         }
-        state.queues.push(Lane::Data, self.id, frame);
+        for (lane, frame) in frames {
+            state.queues.push(lane, id, frame);
+        }
         drop(state);
         shared.wake();
         self.sent += bytes.len() as u64;
@@ -1432,7 +1596,9 @@ impl Upload {
     }
 
     /// Ends the body and waits for the response (idle deadline; PROGRESS
-    /// resets it). After a `chunk` timeout it returns that `Timeout` at once.
+    /// resets it, and it does not run while part of the request is still
+    /// queued on this side). After a `chunk` timeout it returns that
+    /// `Timeout` at once.
     pub fn finish(mut self) -> Result<Reply, CallError> {
         self.done = true;
         if let Some(error) = self.failed.take() {
@@ -1543,20 +1709,27 @@ impl Responder {
             shared.send_limits(),
         )
         .map_err(local_error)?;
-        let mut state = shared.lock();
-        loop {
+        let frames = vec![(Lane::Data, frame)];
+        let stop = |state: &State| {
             if let Some(closed) = &state.closed {
-                return Err(CallError::ConnectionLost(closed.to_string()));
+                return Some(CallError::ConnectionLost(closed.to_string()));
             }
             if self.cancelled() || !state.serving.contains_key(&self.id) {
-                return Err(CallError::Cancelled);
+                return Some(CallError::Cancelled);
             }
-            if shared.data_room(&state, frame.len()) {
-                break;
-            }
-            state = shared.wait_space(state, after(Instant::now(), RECHECK));
+            None
+        };
+        let never = after(Instant::now(), FAR);
+        let state = shared.lock();
+        let (mut state, room) = shared.wait_room(state, &frames, stop, || never);
+        match room {
+            Room::Ready => {}
+            Room::Stopped(error) => return Err(error),
+            Room::Expired => return Err(CallError::Cancelled),
         }
-        state.queues.push(Lane::Data, self.id, frame);
+        for (lane, frame) in frames {
+            state.queues.push(lane, self.id, frame);
+        }
         drop(state);
         shared.wake();
         self.streamed.store(true, Ordering::Release);
@@ -1627,18 +1800,17 @@ impl Responder {
         let streamed = self.streamed.load(Ordering::Acquire);
         let frames = shared.response_frames(self.id, result, body, streamed);
         {
-            let mut state = shared.lock();
-            loop {
-                if state.closed.is_some()
+            let gone = |state: &State| {
+                (state.closed.is_some()
                     || self.cancelled()
-                    || !state.serving.contains_key(&self.id)
-                {
-                    return;
-                }
-                if shared.room(&state, &frames) {
-                    break;
-                }
-                state = shared.wait_space(state, after(Instant::now(), RECHECK));
+                    || !state.serving.contains_key(&self.id))
+                .then_some(())
+            };
+            let never = after(Instant::now(), FAR);
+            let state = shared.lock();
+            let (mut state, room) = shared.wait_room(state, &frames, gone, || never);
+            if !matches!(room, Room::Ready) {
+                return;
             }
             state.serving.remove(&self.id);
             for (lane, frame) in frames {
@@ -1665,11 +1837,26 @@ impl Drop for Responder {
 
 /// One thread of a connection's handler pool.
 fn handler_loop(shared: Arc<Shared>) {
+    // Every turn after the first follows a request this thread ran.
+    let mut ran = false;
     loop {
         let (incoming, handler) = {
             let mut state = shared.lock();
+            if ran {
+                state.busy_handlers -= 1;
+            }
+            ran = true;
             loop {
                 if let Some(incoming) = state.incoming.pop_front() {
+                    state.busy_handlers += 1;
+                    if let Some(serving) = state.serving.get(&incoming.id) {
+                        serving.started.store(true, Ordering::Release);
+                    }
+                    if incoming.chunks.is_some() {
+                        // Its buffered parts now count as a running
+                        // consumer's (receive-side flow control).
+                        shared.wake();
+                    }
                     break (incoming, state.handler.clone());
                 }
                 if state.closed.is_some() {
@@ -1690,5 +1877,35 @@ fn handler_loop(shared: Arc<Shared>) {
             }
             None => drop(incoming),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PROGRESS frames only count: a peer that sends them in a loop while
+    /// nobody drains the slot (an `Upload` still sending its parts) cannot
+    /// grow it, and the waiter sees them as one event.
+    #[test]
+    fn progress_events_are_coalesced() {
+        let slot = Slot::new(0);
+        let mut seen = slot.progress();
+        for _ in 0..100_000 {
+            slot.push(Event::Progress);
+        }
+        assert!(lock(&slot.events).queue.is_empty());
+        assert!(matches!(
+            slot.next(Some(Instant::now()), &mut seen),
+            Some(Event::Progress)
+        ));
+        assert!(slot.next(Some(Instant::now()), &mut seen).is_none());
+        // Chunks and the outcome keep their order; PROGRESS never displaces
+        // them.
+        slot.push(Event::Done(Ok(Reply::default())));
+        slot.push(Event::Progress);
+        assert!(matches!(slot.next(None, &mut seen), Some(Event::Done(_))));
+        assert!(matches!(slot.next(None, &mut seen), Some(Event::Progress)));
+        assert!(slot.next(Some(Instant::now()), &mut seen).is_none());
     }
 }

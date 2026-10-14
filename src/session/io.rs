@@ -25,9 +25,14 @@
 //! Reads are held in two cases, and TCP then pushes back on the peer:
 //! * receive-side flow control: more than `data_queue_bytes` of received
 //!   stream data waits for its consumers; reading resumes once they are back
-//!   under half of that. Liveness is not judged while this hold lasts (the
-//!   silence is ours), and neither are the idle limits of streams whose data
-//!   may wait unread behind it;
+//!   under half of that. Only consumers that run (or that idle handler
+//!   threads are about to start) can cause a hold: a streamed request still
+//!   waiting for a handler may buffer parts only while they fit the bound,
+//!   and is refused `BUSY` otherwise (`make_room`), so a hold always ends as
+//!   running consumers catch up. Liveness is not judged while this hold lasts
+//!   (the silence is ours), and neither are the idle limits of streams whose
+//!   data may wait unread behind it; the server tells their clients with
+//!   PROGRESS (`progress_held_streams`);
 //! * (server) outgoing pressure: the control queue holds more than
 //!   `control_queue_bytes`, because the peer leaves our replies unread while
 //!   it keeps sending requests. Every request read produces a reply, so not
@@ -56,7 +61,7 @@ use crate::{
 use polling::{Event as Readiness, Events};
 use serde_json::Value;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt, io,
     net::{Shutdown, TcpStream},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -186,13 +191,35 @@ enum PartialKind {
 
 /// A streamed request body being delivered to its handler.
 struct UploadIn {
-    tx: SyncSender<(ChunkHeader, Vec<u8>)>,
+    /// `None` once the body ended with nothing left to deliver (the handler's
+    /// channel then disconnects after its buffered parts).
+    tx: Option<SyncSender<(ChunkHeader, Vec<u8>)>>,
     cancel: Arc<AtomicBool>,
+    /// Set by the handler pool when a handler thread takes the request.
+    started: Arc<AtomicBool>,
+    /// This thread's view of `started`: a running stream's undelivered parts
+    /// count in `Io::overflow_bytes` (and may hold reads); a waiting stream's
+    /// parts, channel included, count in `Io::waiting_bytes` (and never hold
+    /// reads: see `Io::make_room`).
+    running: bool,
+    /// Bytes of this stream counted in `Io::waiting_bytes` (waiting only).
+    waiting: usize,
     overflow: VecDeque<(ChunkHeader, Vec<u8>)>,
     ended: bool,
     idle: Duration,
     /// Last progress: a part arrived, or the handler took one.
     active: Instant,
+}
+
+impl UploadIn {
+    fn overflow_len(&self) -> usize {
+        self.overflow.iter().map(|(_, bytes)| bytes.len()).sum()
+    }
+
+    /// Its running handler leaves parts untaken (its channel is full).
+    fn behind(&self) -> bool {
+        self.running && !self.overflow.is_empty()
+    }
 }
 
 struct Io {
@@ -228,7 +255,10 @@ struct Io {
     partial: HashMap<u64, Partial>,
     partial_bytes: usize,
     uploads: HashMap<u64, UploadIn>,
+    /// Parts of running streams waiting for room in their handler channels.
     overflow_bytes: usize,
+    /// Parts (channel and overflow) of streams no handler has taken yet.
+    waiting_bytes: usize,
 }
 
 impl Drop for Io {
@@ -265,6 +295,7 @@ impl Io {
             partial_bytes: 0,
             uploads: HashMap::new(),
             overflow_bytes: 0,
+            waiting_bytes: 0,
         }
     }
 
@@ -415,11 +446,20 @@ impl Io {
         frame.header_as().map_err(violation)
     }
 
+    /// Request ids start at 1; 0 keys this side's own HEARTBEAT and GOAWAY
+    /// frames in the outgoing queues, which a peer's id must never match.
+    fn reserved_id(what: &str) -> Stop {
+        violation(format!("PROTOCOL_VIOLATION: {what} with the reserved id 0"))
+    }
+
     // -- server side ----------------------------------------------------
 
     fn on_request(&mut self, frame: FrameRef<'_>) -> Result<(), Stop> {
         let request: RequestHeader = Self::header(&frame)?;
         let id = request.id;
+        if id == 0 {
+            return Err(Self::reserved_id("request"));
+        }
         if self.partial.contains_key(&id)
             || self.uploads.contains_key(&id)
             || self.shared.lock().serving.contains_key(&id)
@@ -516,7 +556,15 @@ impl Io {
                     "WS_CLOSED",
                     format!("the session is going away ({goaway})"),
                 ))
-            } else if state.incoming.len() >= shared.options.handler_queue {
+            } else if state.incoming.len()
+                >= shared
+                    .options
+                    .handler_queue
+                    .saturating_add(state.idle_handlers())
+            {
+                // `handler_queue` requests already wait beyond those idle
+                // handler threads are about to take (so `handler_queue: 0`
+                // still serves a request while a handler is idle).
                 Some(
                     ErrorWire::coded(
                         "BUSY",
@@ -543,13 +591,17 @@ impl Io {
                 .map_or(DEFAULT_DEADLINE, Duration::from_millis),
         );
         let cancel = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
         let chunks = streamed.then(|| {
             let (tx, rx) = sync_channel(UPLOAD_CHANNEL);
             self.uploads.insert(
                 id,
                 UploadIn {
-                    tx,
+                    tx: Some(tx),
                     cancel: cancel.clone(),
+                    started: started.clone(),
+                    running: false,
+                    waiting: 0,
                     overflow: VecDeque::new(),
                     ended: false,
                     idle: request
@@ -572,7 +624,14 @@ impl Io {
         };
         {
             let mut state = shared.lock();
-            state.serving.insert(id, Serving { cancel, deadline });
+            state.serving.insert(
+                id,
+                Serving {
+                    cancel,
+                    deadline,
+                    started,
+                },
+            );
             state.incoming.push_back(incoming);
         }
         shared.work.notify_one();
@@ -591,6 +650,9 @@ impl Io {
 
     fn on_cancel(&mut self, frame: FrameRef<'_>) -> Result<(), Stop> {
         let CancelHeader { id } = Self::header(&frame)?;
+        if id == 0 {
+            return Err(Self::reserved_id("cancel"));
+        }
         // Cancel first: a handler that sees its parts channel disconnect must
         // already see `cancelled()`.
         let taken = {
@@ -618,12 +680,117 @@ impl Io {
 
     fn drop_upload(&mut self, id: u64) {
         if let Some(upload) = self.uploads.remove(&id) {
-            self.overflow_bytes -= upload
-                .overflow
-                .iter()
-                .map(|(_, bytes)| bytes.len())
-                .sum::<usize>();
+            if upload.running {
+                self.overflow_bytes -= upload.overflow_len();
+            } else {
+                self.waiting_bytes -= upload.waiting;
+            }
         }
+    }
+
+    /// A handler took streamed request `id`: its undelivered parts now belong
+    /// to a running consumer. (The parts already in its channel leave the
+    /// count, as for every running stream.)
+    fn start_upload(&mut self, id: u64) {
+        let Some(upload) = self.uploads.get_mut(&id) else {
+            return;
+        };
+        if upload.running {
+            return;
+        }
+        upload.running = true;
+        upload.active = Instant::now();
+        self.waiting_bytes -= std::mem::take(&mut upload.waiting);
+        self.overflow_bytes += upload.overflow_len();
+        if upload.ended && upload.overflow.is_empty() {
+            self.uploads.remove(&id);
+        }
+    }
+
+    /// Notices streamed requests handler threads have taken.
+    fn sync_started(&mut self) {
+        let started: Vec<u64> = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| !upload.running && upload.started.load(Ordering::Acquire))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in started {
+            self.start_upload(id);
+        }
+    }
+
+    /// Received stream data not yet taken by its consumers.
+    fn rx_total(&self) -> usize {
+        self.shared.rx_buffered.load(Ordering::Acquire) + self.overflow_bytes + self.waiting_bytes
+    }
+
+    /// Keeps the receive side within `data_queue_bytes` without ever holding
+    /// reads for a stream no handler has taken: such a stream may wait for a
+    /// handler only while its parts fit. When the total is over the bound,
+    /// waiting streams are refused `BUSY` (newest first) and their parts
+    /// dropped, until it fits or only streams idle handler threads are about
+    /// to take are left. Reads are then held only for consumers that are
+    /// running or about to run (`update_holds`), so a hold always ends; were
+    /// a waiting stream's parts to hold reads, the running streams whose
+    /// handlers it waits for could starve behind the hold and never finish.
+    fn make_room(&mut self) {
+        let cap = self.shared.rx_cap();
+        while self.waiting_bytes > 0 && self.rx_total() > cap {
+            let starting: HashSet<u64> = self.shared.lock().starting().collect();
+            let newest = self
+                .uploads
+                .iter()
+                .filter(|(id, upload)| {
+                    !upload.running && upload.waiting > 0 && !starting.contains(id)
+                })
+                .map(|(id, _)| *id)
+                .max();
+            let Some(id) = newest else {
+                return;
+            };
+            if !self.refuse_waiting(id) {
+                // A handler took it meanwhile.
+                self.start_upload(id);
+            }
+        }
+    }
+
+    /// Refuses waiting streamed request `id` with `BUSY` (nothing ran: no
+    /// handler took it) and drops its parts. `false` if a handler took it
+    /// meanwhile.
+    fn refuse_waiting(&mut self, id: u64) -> bool {
+        let shared = self.shared.clone();
+        let error = ErrorWire::coded(
+            "BUSY",
+            format!(
+                "no handler is free for streamed request {id}, and its body does not fit the \
+                 {} byte receive buffer while it waits",
+                shared.rx_cap()
+            ),
+        )
+        .with_retry_after(50);
+        let frames = shared.response_frames(id, Err(error), &[], false);
+        let taken = {
+            let mut state = shared.lock();
+            let taken = state.take_incoming(|other| other == id);
+            if taken.is_empty() {
+                return false;
+            }
+            if let Some(serving) = state.serving.remove(&id) {
+                serving.cancel.store(true, Ordering::Release);
+            }
+            if state.queues.purge(id) > 0 && state.space_waiters > 0 {
+                shared.space.notify_all();
+            }
+            for (lane, frame) in frames {
+                state.queues.push(lane, id, frame);
+            }
+            taken
+        };
+        self.drop_upload(id);
+        drop(taken);
+        true
     }
 
     // -- client side ----------------------------------------------------
@@ -723,6 +890,9 @@ impl Io {
     fn on_chunk(&mut self, frame: FrameRef<'_>, body: Bytes) -> Result<(), Stop> {
         let header: ChunkHeader = Self::header(&frame)?;
         let id = header.id;
+        if id == 0 {
+            return Err(Self::reserved_id("chunk"));
+        }
         if header.last != frame.last() {
             return Err(violation(format!(
                 "PROTOCOL_VIOLATION: chunk of request {id} disagrees with its LAST flag"
@@ -826,6 +996,13 @@ impl Io {
 
     fn on_upload_chunk(&mut self, header: ChunkHeader, frame: FrameRef<'_>) -> Result<(), Stop> {
         let id = header.id;
+        if self
+            .uploads
+            .get(&id)
+            .is_some_and(|upload| !upload.running && upload.started.load(Ordering::Acquire))
+        {
+            self.start_upload(id);
+        }
         let Some(upload) = self.uploads.get_mut(&id) else {
             return Ok(());
         };
@@ -843,7 +1020,12 @@ impl Io {
             }
             upload.ended = true;
             if upload.overflow.is_empty() {
-                self.uploads.remove(&id); // disconnects the handler's channel
+                // Disconnects the handler's channel after its parts. A
+                // waiting stream stays listed: its parts still count.
+                upload.tx = None;
+                if upload.running {
+                    self.uploads.remove(&id);
+                }
             }
             return Ok(());
         }
@@ -852,28 +1034,42 @@ impl Io {
             return Ok(());
         }
         let item = (header, frame.body.to_vec());
-        if !upload.overflow.is_empty() {
-            self.overflow_bytes += item.1.len();
-            upload.overflow.push_back(item);
-            return Ok(());
-        }
-        match upload.tx.try_send(item) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(item)) => {
-                self.overflow_bytes += item.1.len();
+        let len = item.1.len();
+        let unsent = if !upload.overflow.is_empty() {
+            Some(item)
+        } else {
+            match upload.tx.as_ref().map(|tx| tx.try_send(item)) {
+                Some(Ok(())) => None,
+                Some(Err(TrySendError::Full(item))) => Some(item),
+                // The handler stopped reading parts: drop the rest of the
+                // body.
+                Some(Err(TrySendError::Disconnected(_))) | None => {
+                    self.drop_upload(id);
+                    return Ok(());
+                }
+            }
+        };
+        if upload.running {
+            if let Some(item) = unsent {
+                self.overflow_bytes += len;
                 upload.overflow.push_back(item);
-                Ok(())
             }
-            // The handler stopped reading parts: drop the rest of the body.
-            Err(TrySendError::Disconnected(_)) => {
-                self.drop_upload(id);
-                Ok(())
+        } else {
+            // No handler yet: everything it buffers counts, channel included.
+            if let Some(item) = unsent {
+                upload.overflow.push_back(item);
             }
+            upload.waiting += len;
+            self.waiting_bytes += len;
         }
+        self.make_room();
+        Ok(())
     }
 
-    /// Moves buffered parts into handler channels that have room again.
+    /// Moves buffered parts into the channels of running handlers that have
+    /// room again.
     fn deliver_uploads(&mut self) {
+        self.sync_started();
         if self.overflow_bytes == 0 {
             return;
         }
@@ -881,13 +1077,19 @@ impl Io {
         let mut abandoned = Vec::new();
         let now = Instant::now();
         for (id, upload) in &mut self.uploads {
+            if !upload.running {
+                continue;
+            }
             if upload.cancel.load(Ordering::Acquire) {
                 abandoned.push(*id);
                 continue;
             }
+            let Some(tx) = upload.tx.as_ref() else {
+                continue;
+            };
             while let Some(item) = upload.overflow.pop_front() {
                 let len = item.1.len();
-                match upload.tx.try_send(item) {
+                match tx.try_send(item) {
                     Ok(()) => {
                         // The handler took a part: it is making progress.
                         self.overflow_bytes -= len;
@@ -925,7 +1127,9 @@ impl Io {
                 self.uploads
                     .iter()
                     .filter(|(id, upload)| {
-                        !upload.overflow.is_empty() && !state.serving.contains_key(id)
+                        upload.running
+                            && !upload.overflow.is_empty()
+                            && !state.serving.contains_key(id)
                     })
                     .map(|(id, _)| *id)
                     .collect()
@@ -937,11 +1141,14 @@ impl Io {
     }
 
     /// Holds or resumes reading (see the module docs), with hysteresis: a
-    /// hold starts above a bound and ends at half of it.
+    /// hold starts above a bound and ends at half of it. Over the receive
+    /// bound, `make_room` has already refused every waiting stream that no
+    /// idle handler is about to take, so what remains belongs to consumers
+    /// that run (or are about to) and the hold ends as they catch up.
     fn update_holds(&mut self) {
         let was = self.paused();
         let shared = self.shared.clone();
-        let buffered = shared.rx_buffered.load(Ordering::Acquire) + self.overflow_bytes;
+        let buffered = self.rx_total();
         let rx_cap = shared.rx_cap();
         if !self.rx_held && buffered > rx_cap {
             self.rx_held = true;
@@ -1112,21 +1319,23 @@ impl Io {
                 }
             }
             Side::Server => {
+                self.sync_started();
                 // Streamed requests that stalled: answer and cancel. A body
                 // stalls when no part arrives for its idle limit; while reading
                 // is held, parts may wait unread in TCP, so only a request
-                // whose handler left parts untaken for that long (its own
-                // consumer is behind) is judged then.
+                // whose running handler left parts untaken for that long (its
+                // own consumer is behind) is judged then. A stream waiting for
+                // a handler is not judged once its body ended (it is a queued
+                // request; `make_room` refuses it if its parts are in the way).
                 let held = self.paused();
                 let stalled: Vec<(u64, Duration, bool)> = self
                     .uploads
                     .iter()
                     .filter(|(_, upload)| {
-                        let behind = !upload.overflow.is_empty();
-                        (behind || (!held && !upload.ended))
+                        (upload.behind() || (!held && !upload.ended))
                             && now.duration_since(upload.active) >= upload.idle
                     })
-                    .map(|(id, upload)| (*id, upload.idle, !upload.overflow.is_empty()))
+                    .map(|(id, upload)| (*id, upload.idle, upload.behind()))
                     .collect();
                 for (id, idle, behind) in stalled {
                     let detail = if behind {
@@ -1196,6 +1405,39 @@ impl Io {
                 for id in ended {
                     self.drop_upload(id);
                 }
+                if self.rx_held {
+                    self.progress_held_streams();
+                }
+            }
+        }
+    }
+
+    /// While this server holds its reads for slow consumers, the parts of
+    /// other streamed requests may wait unread in TCP, and their clients'
+    /// `Upload` idle windows would run although nothing is wrong with them.
+    /// Each scan queues one PROGRESS (at most one waits per request) for every
+    /// streamed request still receiving its body whose own handler is not
+    /// behind: the client restarts its idle window. A request whose handler is
+    /// behind gets none; it is judged here after its idle limit.
+    fn progress_held_streams(&mut self) {
+        let victims: Vec<u64> = self
+            .uploads
+            .iter()
+            .filter(|(_, upload)| !upload.ended && !upload.behind())
+            .map(|(id, _)| *id)
+            .collect();
+        if victims.is_empty() {
+            return;
+        }
+        let limits = self.shared.send_limits();
+        let mut state = self.shared.lock();
+        for id in victims {
+            if !state.serving.contains_key(&id) {
+                continue;
+            }
+            let progress = ProgressHeader { id, bytes: None };
+            if let Ok(frame) = encode_with(FrameKind::Progress, 0, &progress, &[], limits) {
+                state.queues.push_progress(id, frame);
             }
         }
     }
@@ -1396,6 +1638,7 @@ impl Io {
         self.uploads.clear();
         self.partial.clear();
         self.overflow_bytes = 0;
+        self.waiting_bytes = 0;
         self.partial_bytes = 0;
         shared.rx_paused.store(false, Ordering::Release);
         match &stop {
