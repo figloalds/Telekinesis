@@ -863,3 +863,197 @@ impl Drop for V3Cleanup {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Interoperability with a 6298d0b peer (§13 rule 8.4; waves 1-2 stay
+// wire-compatible). `w1_integration::interop_with_a_6298d0b_peer` covers
+// pairing, receiving and both directions in both dialing directions; this
+// adds what Wave 2 changed on the paths a 6298d0b peer meets.
+
+/// A 6298d0b daemon run from `TKFS_BASELINE_BIN`.
+struct Baseline {
+    root: tempfile::TempDir,
+    child: Option<std::process::Child>,
+}
+
+impl Baseline {
+    fn start() -> Self {
+        let bin = std::path::PathBuf::from(
+            std::env::var("TKFS_BASELINE_BIN").expect("TKFS_BASELINE_BIN: path of a 6298d0b tkfs"),
+        );
+        assert!(bin.is_file(), "{}", bin.display());
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("orchestrator.toml"),
+            support::NodeConfig::default().toml(),
+        )
+        .unwrap();
+        let log = fs::File::create(root.path().join("daemon.log")).unwrap();
+        let child = Command::new(bin)
+            .arg("-f")
+            .arg(root.path().join("orchestrator.toml"))
+            .arg("orchestrator")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let node = Self {
+            root,
+            child: Some(child),
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || node
+                .raw(json!({"op":"list"}))
+                .is_ok()),
+            "the baseline daemon did not start"
+        );
+        node
+    }
+    fn raw(&self, action: Value) -> anyhow::Result<Value> {
+        support::Control {
+            data_dir: self.root.path().join("data"),
+        }
+        .call(&action)
+    }
+    fn call(&self, action: Value) -> Value {
+        self.raw(action.clone())
+            .unwrap_or_else(|e| panic!("baseline {action} failed: {e:#}"))
+    }
+    fn endpoint(&self) -> String {
+        let discovery: Value = serde_json::from_slice(
+            &fs::read(self.root.path().join("data/orchestrator.json")).unwrap(),
+        )
+        .unwrap();
+        discovery["network"].as_str().unwrap().into()
+    }
+    fn code(&self) -> String {
+        self.call(json!({"op":"reset-pairing-code"}))["code"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    fn running(&self, state: &str) -> Value {
+        assert!(wait_until(START, || self
+            .raw(json!({"op":"inspect","state":state}))
+            .is_ok_and(|p| p["running"] == true)));
+        self.call(json!({"op":"inspect","state":state}))
+    }
+}
+
+impl Drop for Baseline {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = self.raw(json!({"op":"shutdown"}));
+            if !wait_until(Duration::from_secs(10), || {
+                child.try_wait().ok().flatten().is_some()
+            }) {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+/// Wave 2 against a 6298d0b daemon: pause and resume of a shared folder on
+/// either side of the legacy lanes (this build's acceptor answers a paused
+/// folder `FOLDER_SYNC_PAUSED`, a code the old dialer does not know; its
+/// lanes keep working), the old daemon keeps answering its API while it
+/// meets that answer, and this build's CLI (WP2.2's `ControlClient`) drives
+/// the old daemon's legacy actions. Run with `TKFS_BASELINE_BIN=<6298d0b tkfs>
+/// cargo test --test w2_integration -- --ignored interop`.
+#[test]
+#[ignore = "WP2.INT interop: needs TKFS_BASELINE_BIN (a 6298d0b tkfs binary)"]
+fn interop_wave_2_with_a_6298d0b_peer() {
+    let old = Baseline::start();
+    let new = Node::new();
+
+    // 1. The old daemon dials this build and receives its folder.
+    let (served, served_state) = running_folder(&new, "Served by wave 2");
+    write_file(&served, "w2-1.txt", b"wave 2, first");
+    old.call(json!({"op":"pair","endpoint":new.endpoint(),"code":new.code(),"connections":3}));
+    let received = old.call(json!({"op":"receive","endpoint":new.endpoint(),
+        "repo":served["repo"],"label":"From wave 2","mount":null,"headless":true}));
+    let received = old.running(received["state"].as_str().unwrap());
+    assert!(wait_until(START, || has_file(
+        &received,
+        "w2-1.txt",
+        b"wave 2, first"
+    )));
+
+    // This build pauses the folder it serves: the old dialer gets
+    // FOLDER_SYNC_PAUSED, nothing moves, and the old daemon stays usable.
+    new.call(json!({"op":"pause-sync","state":served_state}));
+    write_file(&served, "w2-2.txt", b"wave 2, second");
+    thread::sleep(Duration::from_secs(3));
+    assert!(!has_file(&received, "w2-2.txt", b"wave 2, second"));
+    assert!(old.raw(json!({"op":"peers"})).is_ok());
+    new.call(json!({"op":"resume-sync","state":served_state}));
+    assert!(wait_until(START, || has_file(
+        &received,
+        "w2-2.txt",
+        b"wave 2, second"
+    )));
+    // And the old side's writes still come back.
+    write_file(&received, "old-1.txt", b"6298d0b, first");
+    assert!(wait_until(START, || has_file(
+        &served,
+        "old-1.txt",
+        b"6298d0b, first"
+    )));
+
+    // 2. This build dials the old daemon, receives its folder, and pauses
+    // it as the dialer.
+    let old_folder =
+        old.call(json!({"op":"create","label":"Served by 6298d0b","mount":null,"headless":true}));
+    let old_folder = old.running(old_folder["state"].as_str().unwrap());
+    write_file(&old_folder, "old-2.txt", b"6298d0b, second");
+    new.call(json!({"op":"pair","endpoint":old.endpoint(),"code":old.code(),"connections":3}));
+    let mine = new.receive_from(&old.endpoint(), &old_folder);
+    let mine_state = state_id(&mine);
+    new.wait_for("received from 6298d0b", START, || {
+        new.try_inspect(&mine_state)
+            .is_ok_and(|p| p["running"] == true)
+    });
+    let mine = new.inspect(&mine_state);
+    assert!(wait_until(START, || has_file(
+        &mine,
+        "old-2.txt",
+        b"6298d0b, second"
+    )));
+    new.call(json!({"op":"pause-sync","state":mine_state}));
+    write_file(&old_folder, "old-3.txt", b"6298d0b, third");
+    thread::sleep(Duration::from_secs(3));
+    assert!(!has_file(&mine, "old-3.txt", b"6298d0b, third"));
+    new.call(json!({"op":"resume-sync","state":mine_state}));
+    assert!(wait_until(START, || has_file(
+        &mine,
+        "old-3.txt",
+        b"6298d0b, third"
+    )));
+
+    // 3. This build's CLI against the old daemon: the legacy actions work
+    // through the ControlClient (one request per connection there); the
+    // v2 `status` is refused by the old daemon, as an error.
+    let config = old.root.path().join("orchestrator.toml");
+    let list = Command::new(bin())
+        .arg("-f")
+        .arg(&config)
+        .args(["manage", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        list.status.success(),
+        "{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(listed["folders"].as_array().unwrap().len(), 2, "{listed}");
+    let status = Command::new(bin())
+        .arg("-f")
+        .arg(&config)
+        .args(["manage", "status"])
+        .output()
+        .unwrap();
+    assert!(!status.status.success(), "a 6298d0b daemon has no status");
+}
