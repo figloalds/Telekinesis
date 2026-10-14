@@ -18,29 +18,41 @@ use std::{
 };
 
 /// Publishes the next heartbeat (`seq` + 1) and returns it.
-/// `generations.mount` counts mount status changes between beats.
+///
+/// `generations.mount` is the mount controller's own status generation
+/// (`MountControl::generation`, CCR-WP1.5-2), so every state change counts,
+/// also several between two beats; a controller that does not count (0)
+/// falls back to counting the changes seen between beats. The mount status
+/// is read inside the snapshot update, so concurrent beats (the heartbeat
+/// thread and a mount transition) publish their `seq` in the order they read
+/// the mount: a later `seq` never carries an older mount state (WP1.4 review
+/// finding, fixed by WP1.INT). The status read is a lock-free snapshot load.
 pub fn beat(ctx: &WorkerCtx, vitals: &EngineVitals) -> Arc<WorkerHeartbeat> {
-    let mount = ctx.mount.status();
     let engine = ctx.gauges.snapshot();
     let store_health = vitals.store_health();
+    let mount_errors = crate::mount::mount_errors();
     let at_ms = now_ms();
     ctx.heartbeat.update(|previous| {
+        let mount = ctx.mount.status();
         let mut generations = previous.generations;
-        if previous.seq > 0 && previous.mount != mount {
-            generations.mount += 1;
+        match ctx.mount.generation() {
+            0 if previous.seq > 0 && previous.mount != mount => generations.mount += 1,
+            0 => {}
+            counted => generations.mount = generations.mount.max(counted),
         }
         WorkerHeartbeat {
             instance: ctx.instance.clone(),
             seq: previous.seq + 1,
             at_ms,
             uptime_ms: at_ms.saturating_sub(ctx.started_at_ms),
-            mount: mount.clone(),
+            mount,
             engine,
             store_health: store_health.clone(),
             pending_saves: vitals.pending_saves(),
             open_handles: vitals.open_handles(),
             unflushed_files: vitals.unflushed_files(),
             generations,
+            mount_errors,
             ..WorkerHeartbeat::default()
         }
     });

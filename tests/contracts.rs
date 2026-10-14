@@ -3749,3 +3749,18 @@ fn backoff_sanitizes_a_jitter_set_through_the_field() {
         }
     }
 }
+
+/// CCR-WP1.5-1: a heartbeat written before `mount_errors` existed (a worker
+/// of the previous build, an older fixture) still parses, with 0.
+#[test]
+fn heartbeat_without_mount_errors_parses() {
+    let mut value = serde_json::to_value(heartbeat_full()).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("mount_errors")
+        .unwrap();
+    let parsed: WorkerHeartbeat = serde_json::from_value(value).unwrap();
+    assert_eq!(parsed, heartbeat_full());
+    assert_eq!(parsed.mount_errors, 0);
+}
