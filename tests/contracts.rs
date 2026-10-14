@@ -2430,6 +2430,12 @@ fn model_helpers_follow_the_spec() {
     assert!(WantPriority::Current < WantPriority::History);
     assert!(Cursor::start("e").is_start());
     assert_eq!(protocol::max_body(protocol::ops::META_EXCHANGE), 16 << 20);
+    // CCR-WP2.7-1 / CCR-WP2.8-1 (WP2.INT): the interim bulk page.
+    assert_eq!(
+        protocol::max_body(protocol::ops::OBJECTS_EXCHANGE),
+        16 << 20
+    );
+    assert_eq!(protocol::max_body(protocol::ops::OBJECTS_PULL), 1 << 20);
     assert_eq!(protocol::max_body(protocol::ops::PING), 1 << 20);
     assert_eq!(
         protocol::op_deadline(protocol::ops::META_EXCHANGE),

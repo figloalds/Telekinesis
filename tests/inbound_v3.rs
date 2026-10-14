@@ -1861,9 +1861,11 @@ fn objects_exchange_serves_the_interim_bulk_path() {
         other => panic!("{other:#?}"),
     }
 
-    // An offer of 3 × 400 KiB (2.4 MB of hex) is trimmed under 1 MiB.
+    // An offer of 3 × 3 MiB (18 MiB of hex) is trimmed under the 16 MiB
+    // `objects.exchange` bound (WP2.INT: CCR-WP2.8-1 raised it from 1 MiB,
+    // where this case was 3 × 400 KiB trimmed to one part).
     *big.lock().unwrap() = (1..=3)
-        .map(|salt| (hash_on(lane, 10 + salt), part(0, 400 * 1024, 400 * 1024)))
+        .map(|salt| (hash_on(lane, 10 + salt), part(0, 3 * MIB as u64, 3 * MIB)))
         .collect();
     let page = bulk_page(lane, DEVICE_A, BTreeMap::new());
     let reply = bulk
@@ -1873,13 +1875,15 @@ fn objects_exchange_serves_the_interim_bulk_path() {
             serde_json::to_vec(&page).unwrap(),
         )
         .unwrap();
-    assert!(reply.body.len() <= MIB, "{} bytes", reply.body.len());
+    assert!(reply.body.len() <= 16 * MIB, "{} bytes", reply.body.len());
     let answered: Page = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(answered.object_parts.len(), 1, "one 800 KB part fits");
+    assert_eq!(answered.object_parts.len(), 2, "two 6 MiB parts fit");
     let first = hash_on(lane, 11);
     assert!(answered.object_parts.contains_key(&first));
     match node.recorder.finished().last() {
-        Some(StatusEvent::ExchangeFinished { bytes_up, .. }) => assert_eq!(*bytes_up, 400 * 1024),
+        Some(StatusEvent::ExchangeFinished { bytes_up, .. }) => {
+            assert_eq!(*bytes_up, 2 * 3 * MIB as u64)
+        }
         other => panic!("{other:#?}"),
     }
     // A page sent as the request header (no body) is accepted too.

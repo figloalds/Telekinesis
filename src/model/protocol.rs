@@ -151,9 +151,12 @@ pub fn op_allowed(op: &str, role: LaneRole) -> bool {
     }
 }
 
-/// Reassembled body limit per op: 16 MiB for `meta.exchange`, 1 MiB otherwise.
+/// Reassembled body limit per op: 16 MiB for `meta.exchange` and the interim
+/// `objects.exchange` (its legacy `bulk_sync::Page` carries up to 4 MiB of hex
+/// parts plus inventories; CCR-WP2.7-1 / CCR-WP2.8-1, applied by WP2.INT),
+/// 1 MiB otherwise.
 pub fn max_body(op: &str) -> usize {
-    if op == ops::META_EXCHANGE {
+    if op == ops::META_EXCHANGE || op == ops::OBJECTS_EXCHANGE {
         frame::MAX_BODY_META
     } else {
         frame::MAX_CHUNK
