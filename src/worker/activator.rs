@@ -23,10 +23,12 @@
 //!    events are not committed inline: the slice stops and returns a
 //!    `SlowTicket`), then `Engine::after_activation` (session refresh). The
 //!    commit that crosses the startup-snapshot interval seals the snapshot
-//!    (an O(history) hash plus a projection serialization, `core::snapshot`):
-//!    the activator commits that event alone, in its own slice, and stops the
-//!    slice before it short of that event ([`seal_distance`]), so no seal
-//!    hold also carries a slice's worth of other events. While mounted,
+//!    of its own event's branch (an O(history) hash plus a projection
+//!    serialization, `core::snapshot`): the activator commits that event
+//!    alone, in its own slice, and stops the slice before it short of that
+//!    event ([`seal_forecast`]: the branches of the rows the slice will pop,
+//!    each with its own sealed cursor), so no seal hold also carries a
+//!    slice's worth of other events. While mounted,
 //!    notifications are computed per batch of slices: the `before`
 //!    projection (entries only) is captured when a batch begins and diffed
 //!    against the view for every entity the batch activated when it ends
@@ -61,8 +63,10 @@
 //!
 //! While it runs (`ctx.activator_running`, and the engine's
 //! `background_activation`), legacy receives only stage. Errors are logged
-//! and retried with backoff; a panic is contained (a poisoned engine follows
-//! the poison policy). The loop ends when the worker is stopping.
+//! and retried with backoff; a panic in a cycle or an idle step is contained
+//! (a poisoned engine follows the poison policy), and both flags are cleared
+//! however the loop ends (a drop guard). The loop ends when the worker is
+//! stopping.
 use crate::{
     core::{
         Store,
@@ -82,6 +86,7 @@ use crate::{
     worker::{maintenance, status_cell},
 };
 use anyhow::Result;
+use rusqlite::OptionalExtension;
 use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -111,10 +116,15 @@ pub const BUSY_SLICE: SliceBudget = SliceBudget {
     max_ms: 25,
     inline_slow: false,
 };
-/// Journal sequences between two periodic startup-snapshot seals. Mirrors
-/// `core::snapshot::INTERVAL` (private to `core`, CCR-WP2.3-5): if the two
-/// ever differ, the seal is only no longer isolated in its own slice.
+/// Journal sequences between two periodic startup-snapshot seals of a
+/// branch. Mirrors `core::snapshot::INTERVAL` (private to `core`,
+/// CCR-WP2.3-5): if the two ever differ, the seal is only no longer isolated
+/// in its own slice.
 pub const SEAL_INTERVAL: i64 = 128;
+/// How long the activator's drop guard retries the engine to clear
+/// `background_activation` when the loop ends while the worker is still
+/// running (a panic outside a contained step).
+const RELEASE_PATIENCE: Duration = Duration::from_secs(1);
 /// The engine connection's `wal_autocheckpoint` (pages) while the activator
 /// runs: the activator and maintenance checkpoint off-lock, so SQLite's own
 /// checkpoint inside an engine commit is only a backstop (64 MiB of WAL at
@@ -161,13 +171,17 @@ pub fn try_spawn(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
 }
 
 fn run(ctx: &WorkerCtx) {
+    // Set before the engine's flag (a legacy page that finds the engine flag
+    // without this one clears it: `runtime::published`), and cleared with it
+    // however the loop ends.
+    ctx.activator_running.store(true, Ordering::SeqCst);
+    let _running = Running { ctx };
     let vitals = {
         let mut engine = lock_engine(&ctx.engine);
         engine.background_activation = true;
         tune_engine_connection(&engine.store, true);
         engine.vitals.clone()
     };
-    ctx.activator_running.store(true, Ordering::SeqCst);
     let mut activator = Activator::new(vitals);
     activator.counters.running = true;
     activator.publish(ctx);
@@ -184,7 +198,11 @@ fn run(ctx: &WorkerCtx) {
             // Idle: nothing ready, unclassified or due. A failed probe
             // falls through to a slice, which reports the failure.
             if matches!(has_work(ctx), Ok(false)) {
-                activator.idle(ctx);
+                // Contained as a cycle is: `idle` takes the engine to end a
+                // notification batch.
+                if catch_unwind(AssertUnwindSafe(|| activator.idle(ctx))).is_err() {
+                    panicked(ctx, &mut errors);
+                }
                 continue;
             }
         }
@@ -203,21 +221,61 @@ fn run(ctx: &WorkerCtx) {
                 pause(ctx, errors.failure(Instant::now()));
             }
             Err(_) => {
-                // A panic under the engine lock poisoned it: the policy runs.
-                check_engine_poison(&ctx.engine);
-                crate::util::log::event!(error, UNKNOWN_ERROR, {
-                    "site": "worker.activator",
-                    "message": "the activator panicked",
-                });
+                panicked(ctx, &mut errors);
                 more = false;
-                pause(ctx, errors.failure(Instant::now()));
             }
         }
     }
-    ctx.activator_running.store(false, Ordering::SeqCst);
-    if let Some(mut engine) = try_lock_engine(&ctx.engine) {
-        engine.background_activation = false;
-        tune_engine_connection(&engine.store, false);
+}
+
+/// After a contained panic: a panic under the engine lock poisoned it (the
+/// policy runs), else the loop backs off.
+fn panicked(ctx: &WorkerCtx, errors: &mut Backoff) {
+    check_engine_poison(&ctx.engine);
+    crate::util::log::event!(error, UNKNOWN_ERROR, {
+        "site": "worker.activator",
+        "message": "the activator panicked",
+    });
+    pause(ctx, errors.failure(Instant::now()));
+}
+
+/// Clears `ctx.activator_running` and the engine's `background_activation`
+/// (and restores the engine connection's tuning) when [`run`] ends, by a
+/// stop or by a panic outside its contained steps: with no activator thread
+/// left, legacy pages must activate inline again and `revalidate` must not
+/// wait for it. Never panics (it may run while unwinding).
+struct Running<'a> {
+    ctx: &'a WorkerCtx,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        let ctx = self.ctx;
+        ctx.activator_running.store(false, Ordering::SeqCst);
+        // While the worker runs on, the engine is retried for a bounded
+        // time (a filesystem callback may hold it); a stopping worker does
+        // not wait. A poisoned engine is left to the poison policy (its
+        // `try_lock` would run it here, a panic while unwinding aborts).
+        let patience = if ctx.stopping.load(Ordering::Relaxed) {
+            Duration::ZERO
+        } else {
+            RELEASE_PATIENCE
+        };
+        let until = Instant::now() + patience;
+        loop {
+            if ctx.engine.is_poisoned() {
+                return;
+            }
+            if let Some(mut engine) = try_lock_engine(&ctx.engine) {
+                engine.background_activation = false;
+                tune_engine_connection(&engine.store, false);
+                return;
+            }
+            if Instant::now() >= until {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
@@ -325,23 +383,145 @@ pub fn has_work(ctx: &WorkerCtx) -> Result<bool> {
         .query_row([now], |r| r.get(0))?)
 }
 
-/// Journal commits until (and including) the one that seals the active
-/// branch's startup snapshot (§4.4, `core::snapshot::maybe_persist`: a
-/// commit seals when the journal tip is [`SEAL_INTERVAL`] past the branch's
-/// sealed cursor, or when the branch has no snapshot yet). Read on the
-/// engine's own connection, under the engine lock: only the slice that
-/// follows can move the journal. `None` when it cannot be read.
-pub fn seal_distance(store: &Store) -> Option<i64> {
-    let (tip, saved): (i64, Option<i64>) = store
+/// What [`seal_forecast`] read before a slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SealForecast {
+    /// The journal tip before the slice: a startup snapshot whose cursor is
+    /// past it was sealed by the slice ([`sealed_past`]).
+    pub tip: i64,
+    /// The first attempt (1-based) that may seal: `Some(1)` when the
+    /// slice's first attempt seals if it commits; `Some(d)` when no attempt
+    /// before the `d`-th seals the branch of any head row; `None` when no
+    /// head row's branch is due within the lookahead (a branch due only
+    /// behind the head is not counted, see [`seal_forecast`]).
+    pub at: Option<i64>,
+}
+
+/// Forecasts the slice's sealing commit. `core::snapshot::maybe_persist`
+/// seals the startup snapshot of **the committing event's branch** when the
+/// journal tip, that commit included, is [`SEAL_INTERVAL`] past that
+/// branch's sealed cursor, or when the branch has no snapshot yet. The tip
+/// moves with every commit, whatever its branch, so a branch `b` sealed at
+/// `saved` seals at the slice's commit number `d(b) = SEAL_INTERVAL - (tip -
+/// saved)` if one of its events commits there, else at its first commit
+/// after it (`d(b) <= 0`: at its next commit; no snapshot counts as 0).
+///
+/// The branches that the slice commits are those of its head rows: the
+/// oldest `ready` and due `retry` rows (received order, then rowid, as
+/// `Store::slice` pops them; their staged descendants, released as they
+/// commit, are on the same branches), read with each row's branch through
+/// the state index, with one cursor read per branch. So (see
+/// [`forecast_at`]): the first row's branch due (`d <= 1`) → `Some(1)` (that
+/// row is the slice's first attempt: it seals if it commits, or it leaves the
+/// head); otherwise the smallest `d >= 2` among the head rows' branches (a
+/// cap of `d - 1` attempts commits at most `d - 1` events, so it never
+/// seals). A branch that is due but not at the head is left out: where its
+/// next commit falls is unknown, and capping every slice for it would cut
+/// them to one event until it commits. The first round read the active
+/// branch's cursor only: with the backlog on another shared branch (a peer
+/// working there) it predicted, after ~127 events, a seal on every slice
+/// that never came (review WP2.3 fix round 2).
+///
+/// Read on the engine's own connection under the engine lock, so only the
+/// slice that follows moves the journal. A forecast is exact for one
+/// branch's backlog; with several branches a seal can still fall inside a
+/// normal slice (a due branch not at the head, rows the slice itself
+/// classifies), which costs that slice's hold, never a run of short slices.
+/// `None` when it cannot be read (the slice then keeps its budget).
+pub fn seal_forecast(store: &Store, lookahead: usize) -> Option<SealForecast> {
+    forecast(store, lookahead).ok()
+}
+
+fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
+    let tip: i64 = store
+        .db
+        .prepare_cached("SELECT coalesce(max(seq),0) FROM journal_sequence")?
+        .query_row([], |r| r.get(0))?;
+    if lookahead == 0 {
+        return Ok(SealForecast { tip, at: None });
+    }
+    let limit = i64::try_from(lookahead).unwrap_or(i64::MAX);
+    let now = i64::try_from(now_ms()).unwrap_or(i64::MAX);
+    let key = |r: &rusqlite::Row<'_>| -> rusqlite::Result<(i64, i64, Option<String>)> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    };
+    // The slice's own window queries (`Store::slice`), with each row's branch.
+    let mut head: Vec<(i64, i64, Option<String>)> = store
         .db
         .prepare_cached(
-            "SELECT (SELECT coalesce(max(seq),0) FROM journal_sequence),
-                    (SELECT cursor FROM startup_snapshots WHERE branch=?1)",
-        )
-        .ok()?
-        .query_row([&store.active], |r| Ok((r.get(0)?, r.get(1)?)))
-        .ok()?;
-    Some(saved.map_or(1, |saved| SEAL_INTERVAL - (tip - saved)))
+            "SELECT coalesce(received_ms,0),rowid,json_extract(payload,'$.branch.id')
+             FROM incoming_events WHERE state='ready' ORDER BY received_ms,rowid LIMIT ?1",
+        )?
+        .query_map([limit], key)?
+        .collect::<rusqlite::Result<_>>()?;
+    head.extend(
+        store
+            .db
+            .prepare_cached(
+                "SELECT coalesce(received_ms,0),rowid,json_extract(payload,'$.branch.id')
+                 FROM incoming_events WHERE state='retry' AND coalesce(retry_at_ms,0)<=?1
+                 ORDER BY received_ms,rowid LIMIT ?2",
+            )?
+            .query_map(rusqlite::params![now, limit], key)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+    );
+    head.sort();
+    head.truncate(lookahead);
+    let mut cursor = store
+        .db
+        .prepare_cached("SELECT cursor FROM startup_snapshots WHERE branch=?1")?;
+    let mut distances: BTreeMap<String, i64> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(head.len());
+    for (_, _, branch) in head {
+        // A row without a branch is quarantined by its attempt: no commit.
+        let Some(branch) = branch else {
+            rows.push(None);
+            continue;
+        };
+        let distance = match distances.get(&branch) {
+            Some(distance) => *distance,
+            None => {
+                let saved: Option<i64> = cursor.query_row([&branch], |r| r.get(0)).optional()?;
+                let distance = saved.map_or(0, |saved| SEAL_INTERVAL - (tip - saved));
+                distances.insert(branch, distance);
+                distance
+            }
+        };
+        rows.push(Some(distance));
+    }
+    Ok(SealForecast {
+        tip,
+        at: forecast_at(rows),
+    })
+}
+
+/// [`SealForecast::at`] from the head rows in pop order, each with its
+/// branch's seal distance `d` (`None`: a row without a branch, which commits
+/// nothing). See [`seal_forecast`].
+pub fn forecast_at(rows: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    let mut at: Option<i64> = None;
+    for (index, distance) in rows.into_iter().enumerate() {
+        let Some(distance) = distance else { continue };
+        if index == 0 && distance <= 1 {
+            return Some(1);
+        }
+        if distance >= 2 {
+            at = Some(at.map_or(distance, |at| at.min(distance)));
+        }
+    }
+    at
+}
+
+/// Whether a startup snapshot was sealed since the journal tip was `tip`
+/// (its cursor, the sealed branch's last journal sequence, is past it).
+/// Read on the engine's own connection under the engine lock, right after a
+/// slice: exact, whichever branch sealed. `false` when it cannot be read.
+pub fn sealed_past(store: &Store, tip: i64) -> bool {
+    store
+        .db
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM startup_snapshots WHERE cursor>?1)")
+        .and_then(|mut statement| statement.query_row([tip], |r| r.get(0)))
+        .unwrap_or(false)
 }
 
 /// Sleeps `delay`, waking early when the worker stops.
@@ -441,24 +621,19 @@ impl Others {
     }
 }
 
-/// `budget`, bounded so that the slice never seals the startup snapshot
-/// together with other events: short of the sealing commit, or that commit
-/// alone. Returns the budget and whether the slice may seal.
-fn seal_budget(mut budget: SliceBudget, distance: Option<i64>) -> (SliceBudget, bool) {
-    match distance {
-        Some(distance) if distance <= 1 => {
-            budget.max_events = 1;
-            (budget, true)
-        }
-        Some(distance) => {
-            // Attempts bound commits (a quarantined or retried attempt
-            // commits nothing), so `distance - 1` attempts never seal.
-            let short = usize::try_from(distance - 1).unwrap_or(usize::MAX);
+/// `budget`, bounded so that the slice never seals a startup snapshot
+/// together with other events: short of the forecast sealing attempt `at`
+/// ([`SealForecast::at`]), or that attempt alone.
+pub fn seal_budget(mut budget: SliceBudget, at: Option<i64>) -> SliceBudget {
+    match at {
+        Some(at) if at <= 1 => budget.max_events = 1,
+        Some(at) => {
+            let short = usize::try_from(at - 1).unwrap_or(usize::MAX);
             budget.max_events = budget.max_events.min(short);
-            (budget, false)
         }
-        None => (budget, false),
+        None => {}
     }
+    budget
 }
 
 /// The notifications of a batch of slices (mounted only, see the module
@@ -513,6 +688,9 @@ impl Activator {
     /// Nothing to do: a notification batch still open (its last slice
     /// failed) is ended, so its notifications are not held back.
     fn idle(&mut self, ctx: &WorkerCtx) {
+        // Fault point `worker.activator.idle.<repo>` (tests: a panic while
+        // idle is contained; the repo keeps it to one in-process worker).
+        let _ = crate::util::fault::trigger(&format!("worker.activator.idle.{}", ctx.repo));
         if self.batch.is_some() {
             let mut engine = lock_engine(&ctx.engine);
             let _holding = engine.vitals.activator_hold();
@@ -524,14 +702,16 @@ impl Activator {
     /// work is (probably) ready.
     fn cycle(&mut self, ctx: &WorkerCtx) -> Result<bool> {
         // Counted finished on drop (`revalidate` waits for a cycle that
-        // began after its re-queue).
-        let _cycle = self.vitals.activator_cycle();
+        // began after its re-queue), unless abandoned (writer busy, below).
+        let cycle = self.vitals.activator_cycle();
         self.others.yield_to(&ctx.gauges, &self.vitals);
         let started = Instant::now();
-        let (slice, sealing) = {
+        let (slice, sealed) = {
             let mut engine = lock_engine(&ctx.engine);
             let _holding = engine.vitals.activator_hold();
-            let (budget, sealing) = seal_budget(self.others.budget(), seal_distance(&engine.store));
+            let budget = self.others.budget();
+            let forecast = seal_forecast(&engine.store, budget.max_events);
+            let budget = seal_budget(budget, forecast.and_then(|forecast| forecast.at));
             if !self.cache_raised {
                 set_cache_size(&engine.store, ENGINE_CACHE_KIB);
                 self.cache_raised = true;
@@ -550,7 +730,11 @@ impl Activator {
             if fail_fast {
                 let _ = engine.store.db.busy_handler(Some(poll_busy));
             }
+            let mut sealed = false;
             if let Ok(slice) = &slice {
+                // Exact, whichever branch sealed (the WAL checkpoint below).
+                sealed = slice.fast + slice.slow > 0
+                    && forecast.is_some_and(|forecast| sealed_past(&engine.store, forecast.tip));
                 self.activated(&mut engine, &slice.activated);
                 if !slice.more && slice.slow_ticket.is_none() {
                     // Drained: notifications out, the page cache back down.
@@ -559,12 +743,14 @@ impl Activator {
                     self.cache_raised = false;
                 }
             }
-            (slice, sealing)
+            (slice, sealed)
         };
         self.others.released(&ctx.gauges, &self.vitals);
         let slice = match slice {
             Err(error) if writer_busy(&error) => {
                 // Nothing was done: retry soon, without the engine meanwhile.
+                // Not an activation pass: `revalidate` keeps waiting.
+                cycle.abandon();
                 self.writer_busy_since.get_or_insert_with(Instant::now);
                 thread::sleep(WRITER_RETRY);
                 return Ok(true);
@@ -586,9 +772,8 @@ impl Activator {
             self.counters.last_activation_at_ms = Some(now_ms());
             self.counters.starved_since_ms = None;
         }
-        // Journal rows written: the sealing slice sealed.
         let journaled = slice.fast + slice.slow > 0;
-        self.sealed |= sealing && journaled;
+        self.sealed |= sealed;
         let mut more = slice.more;
         let mut slow_changed = false;
         if let Some(ticket) = slice.slow_ticket {
@@ -887,31 +1072,83 @@ mod tests {
     #[test]
     fn seal_budget_isolates_the_sealing_commit() {
         let full = SliceBudget::ACTIVATOR;
-        assert_eq!(seal_budget(full, None), (full, false));
-        assert_eq!(seal_budget(full, Some(SEAL_INTERVAL)).0.max_events, 64);
+        assert_eq!(seal_budget(full, None), full);
+        assert_eq!(seal_budget(full, Some(SEAL_INTERVAL)).max_events, 64);
         assert_eq!(
             seal_budget(full, Some(10)),
-            (
-                SliceBudget {
-                    max_events: 9,
-                    ..full
-                },
-                false
-            )
+            SliceBudget {
+                max_events: 9,
+                ..full
+            }
         );
-        assert_eq!(seal_budget(full, Some(2)).0.max_events, 1);
+        assert_eq!(seal_budget(full, Some(2)).max_events, 1);
         assert_eq!(
             seal_budget(full, Some(1)),
-            (
-                SliceBudget {
-                    max_events: 1,
-                    ..full
-                },
-                true
-            )
+            SliceBudget {
+                max_events: 1,
+                ..full
+            }
         );
-        // Overdue (a branch without a snapshot, or a missed seal).
-        assert_eq!(seal_budget(full, Some(-5)).0.max_events, 1);
-        assert!(seal_budget(full, Some(0)).1);
+        // Never below one attempt (a forecast is 1-based; defensive).
+        assert_eq!(seal_budget(full, Some(0)).max_events, 1);
+        assert_eq!(seal_budget(full, Some(-5)).max_events, 1);
+    }
+
+    /// The forecast follows the branches of the head rows, not the active
+    /// branch (review WP2.3 fix round 2): a due branch at the head seals the
+    /// first attempt; a due branch elsewhere does not cap the slice (its
+    /// next commit's place is unknown); otherwise the nearest seal among the
+    /// head rows' branches bounds it.
+    #[test]
+    fn forecast_at_follows_the_head_rows_branches() {
+        // One branch's backlog: its distance, then its sealing commit alone.
+        assert_eq!(forecast_at([Some(40)]), Some(40));
+        assert_eq!(forecast_at([Some(1)]), Some(1));
+        // Overdue (a missed seal) or no snapshot (0) at the head.
+        assert_eq!(forecast_at([Some(-300), Some(90)]), Some(1));
+        assert_eq!(forecast_at([Some(0)]), Some(1));
+        // Several branches: the nearest one bounds the slice.
+        assert_eq!(forecast_at([Some(90), Some(30), Some(60)]), Some(30));
+        // A due branch not at the head (here 0 and -5) caps nothing.
+        assert_eq!(forecast_at([Some(90), Some(0), Some(-5)]), Some(90));
+        assert_eq!(forecast_at([Some(127), Some(1)]), Some(127));
+        // A head row without a branch commits nothing.
+        assert_eq!(forecast_at([None, Some(1), Some(50)]), Some(50));
+        assert_eq!(forecast_at(Vec::<Option<i64>>::new()), None);
+        assert_eq!(forecast_at([None]), None);
+    }
+
+    /// An abandoned cycle (its slice found SQLite's writer busy and did
+    /// nothing) is not an activation pass: `revalidate`'s wait for a cycle
+    /// begun after its re-queue is satisfied only by one that ran, and an
+    /// abandoned cycle never delays a later wait (review WP2.3 fix round 2).
+    #[test]
+    fn an_abandoned_cycle_is_not_an_activation_pass() {
+        let vitals = Arc::new(EngineVitals::default());
+        let (begun, _) = vitals.activator_cycles();
+        vitals.activator_cycle().abandon();
+        vitals.activator_cycle().abandon();
+        assert!(
+            vitals.activator_cycles().1 <= begun,
+            "abandoned cycles counted"
+        );
+        drop(vitals.activator_cycle());
+        assert!(
+            vitals.activator_cycles().1 > begun,
+            "a pass was not counted"
+        );
+        // No drift: after abandoned cycles, the next pass alone satisfies a
+        // new wait.
+        let (begun, _) = vitals.activator_cycles();
+        vitals.activator_cycle().abandon();
+        drop(vitals.activator_cycle());
+        assert!(vitals.activator_cycles().1 > begun);
+        // A pass in progress when a wait begins does not satisfy it.
+        let running = vitals.activator_cycle();
+        let (begun, _) = vitals.activator_cycles();
+        drop(running);
+        assert!(vitals.activator_cycles().1 <= begun);
+        drop(vitals.activator_cycle());
+        assert!(vitals.activator_cycles().1 > begun);
     }
 }

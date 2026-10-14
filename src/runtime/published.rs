@@ -12,7 +12,9 @@
 //! * while the background activator runs, a page's events are only staged
 //!   (`Engine::background_activation`, budget 0) and the activator is poked;
 //!   without it (the in-process `start_rpc` wrapper) the legacy bounded
-//!   activation is unchanged (≤ 32 events per metadata exchange);
+//!   activation is unchanged (≤ 32 events per metadata exchange). An engine
+//!   flag left set by an activator thread that is gone (its drop guard could
+//!   not take the engine) is cleared here (`ctx.activator_running` is false);
 //! * every call that changed the store refreshes the status cell before it
 //!   replies (read-your-writes; `status_generation` is bumped, and the content
 //!   must catch up when the journal moved);
@@ -48,7 +50,12 @@ fn engine<'a>(ctx: &'a WorkerCtx, vitals: &EngineVitals) -> Result<EngineGuard<'
     let mut charged = Duration::ZERO;
     let mut last = started;
     loop {
-        if let Some(guard) = super::try_lock_engine(&ctx.engine) {
+        if let Some(mut guard) = super::try_lock_engine(&ctx.engine) {
+            // The activator sets `activator_running` before the engine flag
+            // and clears it first: the engine flag without it is stale.
+            if !ctx.activator_running.load(Ordering::SeqCst) {
+                guard.background_activation = false;
+            }
             return Ok(guard);
         }
         let now = Instant::now();

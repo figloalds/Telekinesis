@@ -34,6 +34,29 @@ use tkfs::{
     worker,
 };
 
+/// Serializes the tests that arm a fault point: the configuration is
+/// process-wide, and arming one replaces the other's.
+static FAULTS: Mutex<()> = Mutex::new(());
+
+/// Arms `config` until dropped, holding [`FAULTS`].
+struct Armed(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl Armed {
+    fn new(config: tkfs::util::fault::FaultConfig) -> Self {
+        let guard = FAULTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tkfs::util::fault::configure(Some(config));
+        Self(guard)
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        tkfs::util::fault::configure(None);
+    }
+}
+
 /// An in-process worker: context, server and threads. Dropping it stops the
 /// threads.
 struct Worker {
@@ -1098,7 +1121,7 @@ fn revalidate_only_requeues_while_the_activator_runs() {
 /// meanwhile (no head-of-line stall), and it commits once due.
 #[test]
 fn a_failed_slow_preparation_requeues_only_its_event() {
-    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    use tkfs::util::fault::{FaultAction, FaultConfig};
     let dir = tempfile::tempdir().unwrap();
     let repo = id();
     let state = dir.path().join("b");
@@ -1135,10 +1158,10 @@ fn a_failed_slow_preparation_requeues_only_its_event() {
         }
     }
     // Every preparation fails until the independent creates are in.
-    fault::configure(Some(FaultConfig::new(
+    let armed = Armed::new(FaultConfig::new(
         "worker.activator.prepare",
         FaultAction::Fail,
-    )));
+    ));
     // The edit is staged first, so it is popped first.
     let mut staged = edit.events.clone();
     staged.extend(creates.iter().cloned());
@@ -1161,7 +1184,7 @@ fn a_failed_slow_preparation_requeues_only_its_event() {
         creates.iter().all(|create| committed(&create.id))
     });
     let edit_committed = committed(&edit.events[0].id);
-    fault::configure(None);
+    drop(armed);
     assert!(
         created,
         "the events behind the failing preparation waited for it: {}",
@@ -1273,5 +1296,369 @@ fn the_activator_never_waits_for_another_writer_under_the_engine_lock() {
     assert!(
         longest < Duration::from_millis(250),
         "the engine was held {longest:?} while another connection held the writer"
+    );
+}
+
+/// One slice-by-slice drain of [`seal_forecast_follows_the_committing_branch`].
+#[derive(Debug, Default)]
+struct Drain {
+    /// Slices that committed at least one event.
+    slices: usize,
+    /// Periodic seals alone in their slice, as forecast (`at == Some(1)`).
+    isolated: usize,
+    /// Periodic seals inside a slice of several events (a forecast miss).
+    inside: usize,
+    /// Slow-path events (committed alone; they always seal).
+    slow: usize,
+    committed: usize,
+}
+
+impl Drain {
+    fn seals(&self) -> usize {
+        self.isolated + self.inside
+    }
+}
+
+/// Every branch's sealed startup-snapshot cursor.
+fn snapshot_cursors(store: &Store) -> std::collections::BTreeMap<String, i64> {
+    store
+        .db
+        .prepare("SELECT branch,cursor FROM startup_snapshots")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// Stages `events` on `store`, then drains them slice by slice as the
+/// activator does (`seal_budget` of `seal_forecast`; a time budget no slice
+/// reaches, so only the forecast cuts a slice short), checking the forecasts
+/// against the seals core actually made: a forecast seal (`Some(1)`) always
+/// happens, and `sealed_past` sees exactly the seals.
+fn drain_with_forecast(store: &mut Store, events: &[Event], allowed: &BTreeSet<String>) -> Drain {
+    use tkfs::{
+        core::inbox::SliceBudget,
+        worker::activator::{seal_budget, seal_forecast, sealed_past},
+    };
+    let outcome = store
+        .stage_incoming(
+            events
+                .iter()
+                .cloned()
+                .map(|event| StagedEvent {
+                    event,
+                    source: None,
+                })
+                .collect(),
+            allowed,
+        )
+        .unwrap();
+    assert!(outcome.rejected.is_empty(), "{outcome:?}");
+    let full = SliceBudget {
+        max_events: 64,
+        max_ms: 3_600_000,
+        inline_slow: false,
+    };
+    let mut drain = Drain::default();
+    loop {
+        let forecast = seal_forecast(store, full.max_events).expect("forecast");
+        let before = snapshot_cursors(store);
+        let slice = store
+            .activate_slice(seal_budget(full, forecast.at))
+            .unwrap();
+        assert!(slice.quarantined.is_empty(), "{:?}", slice.quarantined);
+        let after = snapshot_cursors(store);
+        let sealed: Vec<&String> = after
+            .iter()
+            .filter(|(branch, cursor)| before.get(*branch) != Some(*cursor))
+            .map(|(branch, _)| branch)
+            .collect();
+        assert_eq!(sealed_past(store, forecast.tip), !sealed.is_empty());
+        let commits = (slice.fast + slice.slow) as usize;
+        drain.committed += commits;
+        if commits > 0 {
+            drain.slices += 1;
+            if forecast.at == Some(1) {
+                assert_eq!(commits, 1, "{forecast:?}");
+                assert_eq!(
+                    sealed.len(),
+                    1,
+                    "the forecast seal did not happen: {forecast:?}, cursors {after:?}"
+                );
+                drain.isolated += 1;
+            } else {
+                assert!(sealed.len() <= 1, "{sealed:?}");
+                drain.inside += sealed.len();
+            }
+        }
+        if slice.slow_ticket.is_some() {
+            // A slow event (the fork's root here) commits alone, inline.
+            let slow = store
+                .activate_slice(SliceBudget {
+                    inline_slow: true,
+                    max_events: 1,
+                    ..full
+                })
+                .unwrap();
+            assert_eq!(slow.slow, 1, "{slow:?}");
+            drain.slow += 1;
+            drain.committed += 1;
+            continue;
+        }
+        if !slice.more {
+            break;
+        }
+    }
+    drain
+}
+
+/// Review WP2.3 fix round 2 (major): `core::snapshot::maybe_persist` seals
+/// the startup snapshot of the committing event's branch, and the
+/// activator's seal forecast follows it. A backlog on a shared branch the
+/// worker has not checked out (a peer working there), drained slice by slice
+/// with the activator's budget: every periodic seal happens alone in its
+/// slice, as forecast, and the slices stay near events / 64. The first
+/// round's forecast read the active branch's cursor, so after ~127 events
+/// of another branch it cut every slice to one event and none of them
+/// sealed. Then a backlog interleaving the active branch and that branch:
+/// every forecast seal happens, and the slices stay near events / 64 (a seal
+/// of the branch not at the head may fall inside a slice).
+#[test]
+fn seal_forecast_follows_the_committing_branch() {
+    let mut p = pair(2);
+    let main = p.a.active.clone();
+    let feature = p.a.fork("feature", true).unwrap();
+    p.a.checkout(&feature.id).unwrap();
+    linear_history_named(&mut p.a, "ft", 600).unwrap();
+    let mut b = Store::open_existing_with(
+        &p.state,
+        OpenOptions {
+            defer_activation: true,
+            verify: VerifyMode::Changed,
+        },
+    )
+    .unwrap();
+    assert_eq!(b.active, main);
+    let events = p.events_after(&b.shared_event_inventory().unwrap());
+    assert_eq!(events.len(), 601, "the fork's root and 600 creates");
+    let drain = drain_with_forecast(&mut b, &events, &p.allowed);
+    assert_eq!(drain.committed, 601, "{drain:?}");
+    assert_eq!(drain.slow, 1, "{drain:?}");
+    // One periodic seal per 128 journal sequences of the feature branch,
+    // each alone in its slice.
+    assert!((3..=6).contains(&drain.isolated), "{drain:?}");
+    assert_eq!(drain.inside, 0, "{drain:?}");
+    // Two slices per 128 events plus the seal's own.
+    assert!(
+        drain.slices <= drain.committed / 64 + 2 * drain.seals() + 2,
+        "{drain:?}"
+    );
+
+    // Interleaved: the active branch and the feature branch alternate.
+    p.a.checkout(&main).unwrap();
+    linear_history_named(&mut p.a, "mn", 300).unwrap();
+    p.a.checkout(&feature.id).unwrap();
+    linear_history_named(&mut p.a, "ft2", 300).unwrap();
+    let events = p.events_after(&b.shared_event_inventory().unwrap());
+    assert_eq!(events.len(), 600);
+    let (on_main, on_feature): (Vec<Event>, Vec<Event>) = events
+        .into_iter()
+        .partition(|event| event.branch.id == main);
+    assert_eq!((on_main.len(), on_feature.len()), (300, 300));
+    let interleaved: Vec<Event> = on_main
+        .into_iter()
+        .zip(on_feature)
+        .flat_map(|(a, b)| [a, b])
+        .collect();
+    let drain = drain_with_forecast(&mut b, &interleaved, &p.allowed);
+    assert_eq!(drain.committed, 600, "{drain:?}");
+    assert_eq!(drain.slow, 0, "{drain:?}");
+    // Both branches seal about every 128 journal sequences.
+    assert!((6..=12).contains(&drain.seals()), "{drain:?}");
+    assert!(drain.isolated >= 1, "{drain:?}");
+    assert!(
+        drain.slices <= drain.committed / 64 + 2 * drain.seals() + 2,
+        "{drain:?}"
+    );
+    eprintln!("interleaved: {drain:?}");
+}
+
+/// Review WP2.3 fix round 2 (major), through the activator thread: a
+/// backlog on a shared branch the worker has not checked out activates in
+/// full slices (the first round's forecast made 483 slices of 600 events
+/// there, one event each after the first ~127).
+#[test]
+fn a_backlog_on_another_shared_branch_activates_in_full_slices() {
+    let mut p = pair(2);
+    let feature = p.a.fork("feature", true).unwrap();
+    p.a.checkout(&feature.id).unwrap();
+    linear_history_named(&mut p.a, "ft", 600).unwrap();
+    let w = Worker::start(&p.state, true);
+    let committed = w.committed();
+    let events = p.events_after(
+        &w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .shared_event_inventory()
+            .unwrap(),
+    );
+    assert_eq!(events.len(), 601);
+    let slices = |status: &Value| status["activation"]["slices"].as_u64().unwrap();
+    let before = slices(&w.status());
+    w.stage(&events, &p.allowed);
+    w.wait_drained(Duration::from_secs(120));
+    assert_eq!(w.committed(), committed + 601);
+    let status = w.status();
+    let used = slices(&status) - before;
+    // 64 events or 25 ms per slice: at least 2 events per slice on average
+    // even on a slow debug build (the first round: about 1).
+    assert!(used <= 300, "{used} slices for 601 events: {status}");
+    eprintln!("feature backlog: {used} slices for 601 events");
+}
+
+/// Review WP2.3 fix round 2 (minor): a `revalidate` with the activator
+/// running waits for an activator cycle that ran its slice. While another
+/// connection holds SQLite's writer, the activator's slices give up at once
+/// and are retried; those cycles did nothing, so the reply still waits, and
+/// it reflects the pass that ran once the writer was released (the first
+/// round counted the abandoned cycles as finished and replied before the
+/// re-queued rows were activated).
+#[test]
+fn revalidate_waits_for_a_pass_that_ran_while_the_writer_is_busy() {
+    let mut p = pair(2);
+    linear_history_named(&mut p.a, "busy", 5).unwrap();
+    let w = Worker::start(&p.state, false);
+    // The activator's flags, before its thread runs.
+    lock_engine(&w.engine).background_activation = true;
+    w.ctx.activator_running.store(true, Ordering::SeqCst);
+    let committed = w.committed();
+    let events = p.events_after(
+        &w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .shared_event_inventory()
+            .unwrap(),
+    );
+    assert_eq!(events.len(), 5);
+    w.stage(&events, &p.allowed);
+    {
+        // Classified, then deferred, as after a transient failure (see
+        // `revalidate_only_requeues_while_the_activator_runs`).
+        let mut engine = lock_engine(&w.engine);
+        engine
+            .store
+            .activate_slice(tkfs::core::inbox::SliceBudget {
+                max_events: 0,
+                max_ms: 0,
+                inline_slow: false,
+            })
+            .unwrap();
+        for event in &events {
+            engine.store.requeue(&event.id, 3_600_000).unwrap();
+        }
+    }
+    let retrying = || -> i64 {
+        w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT count(*) FROM incoming_events WHERE state='retry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(retrying(), 1);
+    thread::scope(|scope| {
+        let revalidate = scope.spawn(|| {
+            let reply = w.rpc(json!({"op":"revalidate"})).unwrap();
+            (reply, w.committed())
+        });
+        // Once the request re-queued the row (and waits for a pass), another
+        // connection takes SQLite's writer and the activator starts.
+        assert!(wait_until(Duration::from_secs(10), || retrying() == 0));
+        let writer = w.ctx.sync_stores.checkout().unwrap();
+        writer.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        worker::activator::try_spawn(w.ctx.clone()).unwrap();
+        let held = Instant::now();
+        while held.elapsed() < Duration::from_millis(150) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let waiting = !revalidate.is_finished();
+        writer.db.execute_batch("COMMIT").unwrap();
+        drop(writer);
+        let (reply, after) = revalidate.join().unwrap();
+        assert_eq!(reply["requeued"], 1, "{reply}");
+        assert!(
+            waiting,
+            "revalidate replied while the writer was held, before any pass ran"
+        );
+        assert_eq!(
+            after,
+            committed + 5,
+            "the reply did not reflect the activator's pass"
+        );
+    });
+    w.wait_drained(Duration::from_secs(60));
+}
+
+/// Review WP2.3 fix round 2 (minor): a panic in the activator's idle step
+/// (which takes the engine to end a notification batch) is contained as a
+/// cycle's is: the activator backs off and goes on, so rows staged later
+/// still activate (the first round let it unwind out of the loop: no
+/// activator thread, yet `activator_running` and the engine's
+/// `background_activation` still set, so legacy pages only staged). When the
+/// worker stops, the activator's drop guard clears both flags.
+#[test]
+fn a_panic_while_idle_is_contained() {
+    use tkfs::util::fault::{FaultAction, FaultConfig};
+    let mut p = pair(2);
+    linear_history_named(&mut p.a, "idle", 20).unwrap();
+    let w = Worker::start(&p.state, true);
+    let committed = w.committed();
+    let point = format!("worker.activator.idle.{}", w.ctx.repo);
+    let armed = Armed::new(FaultConfig {
+        count: Some(1),
+        ..FaultConfig::new(&point, FaultAction::Panic)
+    });
+    // Nothing staged: a poke wakes the activator into its idle step.
+    w.ctx.activation.poke();
+    thread::sleep(Duration::from_millis(500));
+    w.ctx.activation.poke();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            // Consumes the one hit if the activator has not idled yet.
+            tkfs::util::fault::hit(&point).is_none()
+        }),
+        "the activator never idled"
+    );
+    drop(armed);
+    assert!(w.ctx.activator_running.load(Ordering::SeqCst));
+    let events = p.events_after(
+        &w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .shared_event_inventory()
+            .unwrap(),
+    );
+    assert_eq!(events.len(), 20);
+    w.stage(&events, &p.allowed);
+    w.wait_drained(Duration::from_secs(60));
+    assert_eq!(w.committed(), committed + 20);
+    // Stopped: no activator, so neither flag stays set.
+    w.ctx.stopping.store(true, Ordering::SeqCst);
+    w.ctx.activation.poke();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            !w.ctx.activator_running.load(Ordering::SeqCst)
+                && !lock_engine(&w.engine).background_activation
+        }),
+        "the activator's flags outlived it"
     );
 }
