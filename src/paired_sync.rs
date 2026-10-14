@@ -1,6 +1,7 @@
 //! Bounded replication pages, proxied by orchestrators to local workers.
 use crate::{
     core::*,
+    model::health::InboxCounts,
     runtime::{Engine, MAX_FRAME},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -178,11 +179,10 @@ fn offer_for_lane(
         object_parts: parts,
         bundle,
         ack: vec![],
-        pending_events: engine.store.db.query_row(
-            "SELECT count(*) FROM incoming_events",
-            [],
-            |row| row.get(0),
-        )?,
+        // Quarantined and blocked rows are reported separately, never as
+        // pending: one bad event must not hold `caught_up` false forever.
+        pending_events: usize::try_from(engine.store.inbox_counts()?.pending_active())
+            .unwrap_or(usize::MAX),
     })
 }
 pub fn receive(engine: &mut Engine, route: &SyncRoute, page: &SyncPage) -> Result<Vec<String>> {
@@ -318,21 +318,26 @@ fn receive_for_lane(
             .store
             .remember_peer_partials(&route.remote_replica, &page.partial_objects)?;
     }
-    let pending: i64 =
-        engine
-            .store
-            .db
-            .query_row("SELECT count(*) FROM incoming_events", [], |r| r.get(0))?;
+    let incoming = engine.store.inbox_counts()?;
     let caught_up = engine.store.shared_event_inventory()? == page.known
-        && pending == 0
+        && incoming.pending_active() == 0
         && page.pending_events == 0;
+    // No O(repository) content scan on the sync path (RC2): the observation
+    // carries O(1) inbox and outbox counters instead.
     let observation = json!({"caught_up":caught_up,"metadata_caught_up":caught_up,
-        "at":time(),"peer":route.peer,"replica":route.remote_replica,"content":engine.store.content_status()?});
+        "at":time(),"peer":route.peer,"replica":route.remote_replica,
+        "content":sync_counters(engine, &incoming)?});
     engine
         .peer_sync
         .insert(route.remote_replica.clone(), observation.clone());
     engine.last_sync = Some(observation);
     Ok(ack)
+}
+/// The O(1) counters a sync result carries as `content`: the local inbox by
+/// state and the unacknowledged outbox (REVAMP_PLAN WP1.6 task 6).
+fn sync_counters(engine: &Engine, incoming: &InboxCounts) -> Result<Value> {
+    Ok(json!({"incoming":incoming,
+        "outgoing_unacknowledged":engine.store.outgoing_unacknowledged()?}))
 }
 pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
     let op = payload["op"].as_str().context("INVALID_REQUEST")?;
@@ -391,17 +396,18 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
             let remote_before = engine.store.known_by_peer(&route.remote_replica)?;
             receive_for_lane(engine, &route, &page, metadata_only, bounded)?;
             engine.store.acknowledge(&page.ack)?;
-            let pending: i64 =
-                engine
-                    .store
-                    .db
-                    .query_row("SELECT count(*) FROM incoming_events", [], |row| row.get(0))?;
+            let incoming = engine.store.inbox_counts()?;
+            let pending = incoming.pending_active();
             let known = engine.store.shared_event_inventory()?;
             let progress = json!({"local_events":known.len(),"remote_events":page.known.len(),
                 "local_only_events":known.difference(&page.known).count(),
                 "remote_only_events":page.known.difference(&known).count(),
-                "local_pending":pending,"remote_pending":page.pending_events});
-            let status = json!({"caught_up":known==page.known&&pending==0&&page.pending_events==0&&engine.store.outgoing_unacknowledged()?==0&&engine.health.is_none()&&!engine.sessions.values().any(|session|session.dirty),"peer":route.peer,"replica":route.remote_replica,"metadata_caught_up":known==page.known&&pending==0&&page.pending_events==0,"metadata_progress":progress,"metadata_advanced":known != before || page.known.intersection(&known).any(|event| !remote_before.contains(event)),"content":engine.store.content_status()?,"durability":"metadata acknowledged independently; objects verified separately","at":time()});
+                "local_pending":pending,"remote_pending":page.pending_events,
+                "local_blocked":incoming.blocked,"local_quarantined":incoming.quarantined});
+            let metadata_caught_up =
+                known == page.known && pending == 0 && page.pending_events == 0;
+            let content = sync_counters(engine, &incoming)?;
+            let status = json!({"caught_up":metadata_caught_up&&content["outgoing_unacknowledged"]==0&&engine.health.is_none()&&!engine.sessions.values().any(|session|session.dirty),"peer":route.peer,"replica":route.remote_replica,"metadata_caught_up":metadata_caught_up,"metadata_progress":progress,"metadata_advanced":known != before || page.known.intersection(&known).any(|event| !remote_before.contains(event)),"content":content,"durability":"metadata acknowledged independently; objects verified separately","at":time()});
             engine.last_sync = Some(status.clone());
             Ok(status)
         }
