@@ -660,3 +660,206 @@ fn the_seal_forecast_never_parses_large_payloads() {
     stage_rows(&s, "small-branch", FORECAST_ROWS * 2, 100);
     assert_eq!(seal_forecast(&s, 64).expect("forecast").at, Some(1));
 }
+
+// ---------------------------------------------------------------------------
+// The v3 peer stack, end to end (not wired into the daemon until WP3.1)
+
+/// An in-process daemon context (WP2.1's `ctx::build_with`) whose workers are
+/// the real `tkfs` binary. `serve` is never called: the test decides who uses
+/// the network listener.
+fn v3_daemon() -> (tempfile::TempDir, tkfs::orchestrator::ctx::Daemon) {
+    use tkfs::orchestrator::{
+        Config, Network,
+        ctx::{BuildOptions, build_with},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network {
+            listen: Some("127.0.0.1:0".into()),
+            connections: 2,
+            sync_interval_ms: 200,
+        },
+    };
+    let daemon = build_with(
+        config,
+        BuildOptions {
+            executable: Some(bin()),
+            ..BuildOptions::default()
+        },
+    )
+    .unwrap();
+    (root, daemon)
+}
+
+fn running_view(ctx: &tkfs::model::orchestrator::Ctx, state: &str) -> bool {
+    ctx.folders.view(state).is_some_and(|view| {
+        matches!(
+            view.phase,
+            tkfs::model::orchestrator::FolderPhase::Running { .. }
+        )
+    })
+}
+
+/// WP2.5 (worker feed ops), WP2.6 (PeerManager and lanes), WP2.7
+/// (MetaScheduler and the interim bulk lane) and WP2.8 (the inbound server)
+/// together, over real v3 sessions between two in-process daemons with real
+/// workers: A pairs with B through a probe session, lists B's catalog, holds
+/// B's repository, and both directions sync (metadata through
+/// `meta.exchange`, objects through `objects.exchange`), dialer-driven. The
+/// hubs see the exchanges on both sides. WP3.1 wires this stack into the
+/// daemon; this proves the parts fit before it does.
+#[test]
+fn the_v3_stack_syncs_two_daemons_end_to_end() {
+    use tkfs::{
+        model::orchestrator::{CatalogCmd, FolderRecord, NetworkApi},
+        orchestrator::{Action, inbound, manage::manage, peer::PeerManager},
+        pairing_code::Verifier,
+    };
+    let (_root_a, a) = v3_daemon();
+    let (_root_b, mut b) = v3_daemon();
+    // The daemons' legacy bridges stay out of the way (WP3.1 deletes them):
+    // otherwise A's legacy lanes would also dial B, which the v3 server
+    // answers PEER_NEEDS_UPGRADE, and report lanes of the same installation.
+    a.bridge.shutdown(Duration::from_secs(5));
+    b.bridge.shutdown(Duration::from_secs(5));
+
+    // B: a pairing code, the v3 inbound server on its listener, a folder.
+    let (code, verifier) = Verifier::generate();
+    b.ctx
+        .catalog
+        .apply(CatalogCmd::SetVerifier { verifier })
+        .unwrap();
+    let server = inbound::start(b.ctx.clone(), b.network.take().unwrap());
+    let endpoint = format!("ws://{}", server.local_addr().unwrap());
+    let peers = PeerManager::start(a.ctx.clone());
+    // Whatever happens below, the peer stack and the workers are stopped
+    // (the workers would otherwise outlive the test process).
+    let _cleanup = V3Cleanup {
+        ctxs: vec![a.ctx.clone(), b.ctx.clone()],
+        peers: peers.clone(),
+        server: server.clone(),
+    };
+    let source = manage(
+        &b.ctx,
+        Action::Create {
+            label: "V3 source".into(),
+            mount: None,
+            headless: true,
+        },
+    )
+    .unwrap();
+    let source_state = state_id(&source);
+    assert!(wait_until(START, || running_view(&b.ctx, &source_state)));
+    write_file(&source, "from-b.txt", b"written at B");
+    let repo = source["repo"].as_str().unwrap().to_owned();
+
+    // A: pairs through a probe session and lists B's catalog.
+    let paired = peers.pair(&endpoint, &code, Some(2)).unwrap();
+    assert_eq!(paired.installation, b.ctx.installation);
+    assert!(
+        wait_until(START, || peers.remote_list(&endpoint).is_ok_and(
+            |entries| entries.iter().any(|entry| entry.repo == repo)
+        )),
+        "B's folder never appeared in its catalog"
+    );
+
+    // A holds B's repository (what Receive does, without the legacy
+    // RemoteList check): its controller starts it.
+    let state = id();
+    let directory = a.ctx.config.data_directory.join("states").join(&state);
+    let device = id();
+    drop(Store::initialize(&directory, &repo, &device).unwrap());
+    a.ctx
+        .catalog
+        .apply(CatalogCmd::CreateFolder {
+            record: FolderRecord {
+                state: state.clone(),
+                label: "V3 received".into(),
+                repo: repo.clone(),
+                device,
+                directory: directory.clone(),
+                mount: None,
+                desired_running: true,
+                sync_enabled: true,
+                mount_enabled: true,
+            },
+            gate: None,
+        })
+        .unwrap();
+    assert!(wait_until(START, || running_view(&a.ctx, &state)));
+    let received = json!({"state": state, "directory": directory});
+
+    // B → A: metadata and objects.
+    assert!(
+        wait_until(START, || has_file(&received, "from-b.txt", b"written at B")),
+        "metadata from B never reached A"
+    );
+    assert!(
+        wait_until(START, || support::content_complete(&received, 1)),
+        "objects from B never reached A: {}",
+        support::content_status(&received)
+    );
+    // A → B, still dialed by A.
+    write_file(&received, "from-a.txt", b"written at A");
+    assert!(
+        wait_until(START, || has_file(&source, "from-a.txt", b"written at A")),
+        "metadata from A never reached B"
+    );
+    assert!(
+        wait_until(START, || support::content_complete(&source, 2)),
+        "objects from A never reached B: {}",
+        support::content_status(&source)
+    );
+
+    // Both hubs saw it: A's v3 lanes and outbound exchanges, B's inbound
+    // sessions and served exchanges.
+    let a_status = a.hub.snapshot_now();
+    let peer = a_status
+        .peers
+        .iter()
+        .find(|peer| peer.installation == b.ctx.installation)
+        .expect("B in A's status");
+    assert_eq!(peer.protocol.as_deref(), Some("tkfs-peer/3"), "{peer:?}");
+    let b_status = b.hub.snapshot_now();
+    let dialer = b_status
+        .peers
+        .iter()
+        .find(|peer| peer.installation == a.ctx.installation)
+        .expect("A in B's status");
+    assert!(dialer.inbound_sessions >= 1, "{dialer:?}");
+    let served = b_status
+        .folders
+        .iter()
+        .find(|folder| folder.state == source_state)
+        .unwrap()
+        .sync
+        .peers
+        .iter()
+        .find(|pair| pair.installation == a.ctx.installation)
+        .cloned()
+        .expect("B's folder shows A");
+    assert!(served.metadata.last_exchange_ms.is_some(), "{served:?}");
+}
+
+/// Stops a v3 test's peer stack and daemons (and so their workers).
+struct V3Cleanup {
+    ctxs: Vec<std::sync::Arc<tkfs::model::orchestrator::Ctx>>,
+    peers: std::sync::Arc<tkfs::orchestrator::peer::PeerManager>,
+    server: std::sync::Arc<tkfs::orchestrator::inbound::InboundServer>,
+}
+
+impl Drop for V3Cleanup {
+    fn drop(&mut self) {
+        use tkfs::model::orchestrator::NetworkApi;
+        self.peers.shutdown(Duration::from_secs(5));
+        self.server.shutdown(Duration::from_secs(5));
+        for ctx in &self.ctxs {
+            tkfs::orchestrator::shutdown::run(ctx, Duration::from_secs(30));
+            ctx.shutdown.cancel();
+        }
+    }
+}
