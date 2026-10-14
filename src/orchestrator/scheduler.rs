@@ -44,6 +44,9 @@
 //! is ready again. Answers that say the same thing ([`WAITING_CODES`]:
 //! `REMOTE_WORKER_STARTING`, `FOLDER_SYNC_PAUSED`, a local worker that cannot
 //! be reached) are rechecked after `waiting_recheck`, again without counting.
+//! The StatusHub reads the remote ones as WaitingForRemote or Paused; a local
+//! one ([`LOCAL_WAITING_CODES`]) reaches it without an error, since the
+//! folder's lifecycle already says WaitingForWorker.
 //!
 //! # Failures (§8, by class)
 //!
@@ -141,6 +144,17 @@ pub const QUICK_LIMIT: u32 = 2;
 pub const WAITING_CODES: &[&str] = &[
     "REMOTE_WORKER_STARTING",
     "FOLDER_SYNC_PAUSED",
+    "LOCAL_WORKER_UNAVAILABLE",
+    "WORKER_NOT_RUNNING",
+    "WORKER_STOPPING",
+    "WORKER_EXITED",
+];
+/// The [`WAITING_CODES`] that say the *local* folder is not serving when a
+/// local worker call answers them: the folder's own WaitingForWorker state
+/// (§3.7), which its lifecycle shows. Such an exchange is reported to the
+/// StatusHub as not completed but without an error (see
+/// [`ExchangeError::local_waiting`]).
+pub const LOCAL_WAITING_CODES: &[&str] = &[
     "LOCAL_WORKER_UNAVAILABLE",
     "WORKER_NOT_RUNNING",
     "WORKER_STOPPING",
@@ -269,6 +283,16 @@ impl ExchangeError {
                 self.error,
                 CallError::ConnectionLost(_) | CallError::Unavailable(_)
             )
+    }
+
+    /// A local worker call answered that the local folder is not serving
+    /// ([`LOCAL_WAITING_CODES`]): WaitingForWorker, not a failure. The key
+    /// rechecks without counting it ([`FailureKind::Waiting`]), and the
+    /// StatusHub gets the exchange without an error, because the hub's
+    /// display policy would show these Transient codes as a failing pair
+    /// ("Backoff") from the third recheck on.
+    pub fn local_waiting(&self) -> bool {
+        self.step == Step::Local && LOCAL_WAITING_CODES.contains(&self.error.code().as_str())
     }
 
     pub fn wire(&self) -> ErrorWire {
@@ -682,7 +706,10 @@ impl<'a> Report<'a> {
     /// Records `ExchangeFinished`. A failure carries the delay before the
     /// key's next attempt as `retry_after_ms` (the hub's `backoff_until_ms`):
     /// the delay actually used, which already honours the peer's own
-    /// `retry_after_ms` up to [`MAX_RETRY_AFTER`].
+    /// `retry_after_ms` up to [`MAX_RETRY_AFTER`]. A local folder that is not
+    /// serving ([`ExchangeError::local_waiting`]) is reported as not
+    /// completed (`ok: false`) with no error: the hub records no failure for
+    /// it, and the folder's lifecycle shows why.
     pub fn finish(
         self,
         result: Result<&Finished, &ExchangeError>,
@@ -693,10 +720,12 @@ impl<'a> Report<'a> {
             Ok(done) => (true, None, done.clone()),
             Err(failure) => {
                 let mut error = failure.wire();
+                // Asked in every case: it decides the key's next attempt.
                 if let Some(delay) = retry_after(failure) {
                     error.retry_after_ms = Some(ms(delay));
                 }
-                (false, Some(error), Finished::default())
+                let error = (!failure.local_waiting()).then_some(error);
+                (false, error, Finished::default())
             }
         };
         self.ctx.status.record(StatusEvent::ExchangeFinished {
@@ -1555,11 +1584,23 @@ fn spawn_watcher(
 type Task = Box<dyn FnOnce() + Send>;
 
 /// The slot threads of one scheduler, started on demand (at most `max`).
+///
+/// A submitted task never waits behind another one (RC5): the pool counts
+/// its outstanding tasks (submitted and not yet finished, queued or running)
+/// and starts a thread whenever it has fewer threads than outstanding tasks.
+/// The engine never has more than `max` exchanges in flight, so every queued
+/// task has a thread that is not running another task. (Spawning by the
+/// count of idle threads is racy: a thread counts as idle until it has
+/// dequeued, so several submits in one turn could all see one idle thread,
+/// start none, and queue behind whichever task it took, a hung one too.)
+/// A task counts as finished only after it has returned, so a submit that
+/// races a task's end may start a thread more than needed, never fewer.
 struct Pool {
     tx: Option<mpsc::Sender<Task>>,
     rx: Arc<Mutex<mpsc::Receiver<Task>>>,
-    idle: Arc<AtomicUsize>,
+    outstanding: Arc<AtomicUsize>,
     threads: Vec<thread::JoinHandle<()>>,
+    spawned: usize,
     max: usize,
     name: String,
 }
@@ -1570,36 +1611,58 @@ impl Pool {
         Self {
             tx: Some(tx),
             rx: Arc::new(Mutex::new(rx)),
-            idle: Arc::new(AtomicUsize::new(0)),
+            outstanding: Arc::new(AtomicUsize::new(0)),
             threads: Vec::new(),
-            max,
+            spawned: 0,
+            max: max.max(1),
             name: name.to_owned(),
         }
     }
 
+    /// Hands `task` to a slot thread; `false` (nothing runs) if no thread is
+    /// free for it and none can be started.
     fn submit(&mut self, task: Task) -> bool {
-        if self.idle.load(Ordering::Acquire) == 0 && self.threads.len() < self.max {
-            let (rx, idle) = (self.rx.clone(), self.idle.clone());
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        // A slot thread ends only with the pool; one that ended anyway no
+        // longer serves.
+        self.threads.retain(|handle| !handle.is_finished());
+        let outstanding = self.outstanding.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.threads.len() < outstanding.min(self.max) {
+            let (rx, count) = (self.rx.clone(), self.outstanding.clone());
             let spawned = thread::Builder::new()
-                .name(format!("{}-s{}", self.name, self.threads.len()))
+                .name(format!("{}-s{}", self.name, self.spawned))
                 .spawn(move || {
                     loop {
-                        idle.fetch_add(1, Ordering::AcqRel);
                         let task = lock(&rx).recv();
-                        idle.fetch_sub(1, Ordering::AcqRel);
-                        match task {
-                            Ok(task) => task(),
-                            Err(_) => return,
-                        }
+                        let Ok(task) = task else {
+                            return;
+                        };
+                        // A task reports its own panics; this only keeps the
+                        // thread and the count right.
+                        let _ = catch_unwind(AssertUnwindSafe(task));
+                        count.fetch_sub(1, Ordering::AcqRel);
                     }
                 });
             match spawned {
-                Ok(handle) => self.threads.push(handle),
-                Err(_) if self.threads.is_empty() => return false,
-                Err(_) => {}
+                Ok(handle) => {
+                    self.spawned += 1;
+                    self.threads.push(handle);
+                }
+                Err(_) => {
+                    // Queued, the task would wait behind a running one.
+                    self.outstanding.fetch_sub(1, Ordering::AcqRel);
+                    return false;
+                }
             }
         }
-        self.tx.as_ref().is_some_and(|tx| tx.send(task).is_ok())
+        if tx.send(task).is_ok() {
+            true
+        } else {
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            false
+        }
     }
 
     /// Ends the slot threads: joins those that finish by `until`, leaves the
