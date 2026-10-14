@@ -53,7 +53,7 @@ pub fn deliver_notifications(engine: &Shared) {
     #[cfg(windows)]
     {
         let pending = {
-            let Ok(mut e) = engine.try_lock() else {
+            let Some(mut e) = super::try_lock_engine(engine) else {
                 return;
             };
             if !e.mounted || e.switching {
@@ -72,14 +72,14 @@ pub fn deliver_notifications(engine: &Shared) {
                 retry.push((path, action));
             }
         }
-        let mut e = engine.lock().unwrap();
+        let mut e = super::lock_engine(engine);
         e.notifications.extend(retry);
         e.notification_error = error;
     }
     #[cfg(target_os = "linux")]
     {
         // The Linux adapter uses zero entry/attribute TTLs and direct file I/O.
-        if let Ok(mut e) = engine.try_lock() {
+        if let Some(mut e) = super::try_lock_engine(engine) {
             e.notifications.clear();
             e.notification_error = None;
         }

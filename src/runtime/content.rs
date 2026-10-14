@@ -10,7 +10,7 @@ pub fn prepare_content(engine: &Shared, handle: u64, timeout: Duration) -> Resul
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let reference = {
-            let e = engine.lock().unwrap();
+            let e = super::lock_engine(engine);
             e.session(handle)?
                 .bytes
                 .reference()
@@ -20,7 +20,7 @@ pub fn prepare_content(engine: &Shared, handle: u64, timeout: Duration) -> Resul
             return Ok(());
         };
         let file = fetch_verified(engine, &object, deadline)?;
-        let e = engine.lock().unwrap();
+        let e = super::lock_engine(engine);
         let session = e.session(handle)?;
         if session
             .bytes
@@ -42,7 +42,7 @@ pub(super) fn fetch_verified(
     deadline: std::time::Instant,
 ) -> Result<std::fs::File> {
     let (path, size, lock, stopping) = {
-        let e = engine.lock().unwrap();
+        let e = super::lock_engine(engine);
         valid_object(object)?;
         (
             e.store.root.join("objects").join(object),
@@ -77,7 +77,7 @@ pub(super) fn fetch_verified(
             }
         }
         if !queued {
-            engine.lock().unwrap().store.request_object(object)?;
+            super::lock_engine(engine).store.request_object(object)?;
             queued = true;
         }
         ensure!(
