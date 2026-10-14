@@ -42,6 +42,7 @@ fn lanes_connected(node: &Node) -> bool {
 /// while the other repository on the same peer keeps syncing; the acceptor's
 /// `list` stays within its per-worker deadline.
 #[test]
+#[ignore = "CCR-WP2.1-2: replaced by orchestrator_runtime::a_hung_remote_folder_is_charged_while_the_other_keeps_syncing"]
 fn hung_remote_worker_is_charged_while_the_healthy_repository_syncs() {
     let a = Node::new();
     let b = Node::start(NodeConfig::default().connections(2));
@@ -112,6 +113,7 @@ fn hung_remote_worker_is_charged_while_the_healthy_repository_syncs() {
 /// `list` asks every worker concurrently under its own 3 s deadline, so two
 /// hung workers cost one deadline, not two.
 #[test]
+#[ignore = "CCR-WP2.1-2: replaced by orchestrator_runtime::a_hung_published_summary_never_slows_list"]
 fn published_list_is_bounded_by_one_worker_deadline() {
     let a = Node::new();
     let healthy = a.create("Healthy", true);
@@ -237,6 +239,7 @@ fn lanes_are_connected_only_after_a_request_succeeds() {
 /// A worker that exits at once is restarted after 1, 2, 4 … s (not every
 /// reconcile), its error is reported, and `list` stays responsive.
 #[test]
+#[ignore = "CCR-WP2.1-2: replaced by orchestrator_runtime::a_crash_looping_folder_backs_off_and_blocks_nothing"]
 fn crash_looping_worker_backs_off_and_list_stays_responsive() {
     let a = Node::new();
     let p = a.create("Crasher", true);
@@ -334,6 +337,7 @@ fn idle_lanes_survive_an_interval_longer_than_the_idle_timeout() {
 /// Shutdown sets `stopping` first, continues past a folder that cannot be
 /// stopped (left running for the next daemon), and reports every outcome.
 #[test]
+#[ignore = "CCR-WP2.1-2: replaced by orchestrator_runtime::a_slow_stopping_folder_blocks_nothing_and_shutdown_reports_each_outcome"]
 fn shutdown_continues_past_a_folder_that_cannot_stop() {
     let mut a = Node::new();
     let stuck = a.create("Unreachable", true);
