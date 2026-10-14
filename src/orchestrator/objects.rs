@@ -23,8 +23,8 @@
 //! Reply: the JSON page (`reply_to` = our request), as the body or streamed
 //! as body CHUNK frames (`hash: None`, in offset order) before the RESPONSE.
 //! A request body must fit the session's per-op body limit
-//! (`protocol::max_body`), which is 1 MiB for `objects.*` until CCR-WP2.7-1
-//! raises it for `objects.exchange`: a larger page fails its exchange with
+//! (`protocol::max_body`), 16 MiB for `objects.exchange` since WP2.INT
+//! applied CCR-WP2.7-1: a larger page fails its exchange with
 //! `WS_MESSAGE_TOO_LARGE`, charged to its key. A plain reply body has the
 //! same limit on the acceptor's side; a streamed reply does not.
 //!

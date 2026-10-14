@@ -24,11 +24,11 @@
 //! **Wire shape.** The request page is the JSON body (or, when the body is
 //! empty, the request header); the reply is the header `{repo}` and the
 //! worker's page as the JSON body. The session bounds an `objects.exchange`
-//! body at `protocol::max_body` (1 MiB), below the 4 MiB pages
-//! `published-bulk-*` may build, so a reply page above the bound is trimmed:
-//! object parts are dropped (the last ones first) until it fits. Offers are
-//! stateless, so a dropped part is simply offered again in a later round
-//! (CCR-WP2.8-1 asks for a larger bound).
+//! body at `protocol::max_body` (16 MiB since WP2.INT applied CCR-WP2.8-1;
+//! it was 1 MiB, below the 4 MiB pages `published-bulk-*` may build), so a
+//! reply page above the bound is trimmed: object parts are dropped (the last
+//! ones first) until it fits. Offers are stateless, so a dropped part is
+//! simply offered again in a later round.
 //!
 //! **Status.** Every exchange a worker served records `ExchangeFinished
 //! {op: objects.exchange, direction: inbound}`: the object bytes received

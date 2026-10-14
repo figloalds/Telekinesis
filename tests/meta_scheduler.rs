@@ -2866,14 +2866,15 @@ fn the_status_hub_reads_the_lane_reports() {
 }
 
 /// A reply streamed as body chunks has no body limit (a 1.5 MiB object);
-/// a request page over the op's 1 MiB body limit fails only its own key
-/// (`WS_MESSAGE_TOO_LARGE`) until CCR-WP2.7-1.
+/// a request page over the op's body limit fails only its own key
+/// (`WS_MESSAGE_TOO_LARGE`). The limit is 16 MiB since WP2.INT applied
+/// CCR-WP2.7-1 (it was 1 MiB, and this page 1.2 MB of hex).
 #[test]
 fn large_bulk_replies_stream_and_oversize_pages_fail_only_their_key() {
     let world = World::new();
     world.put(folder("repo-a"));
     world.put(folder("repo-big"));
-    let big_hex = "ab".repeat(600 * 1024);
+    let big_hex = "ab".repeat(8 * 1024 * 1024 + 64 * 1024);
     {
         let big_hex = big_hex.clone();
         world.worker.script(move |op, payload| {
@@ -2932,6 +2933,11 @@ fn large_bulk_replies_stream_and_oversize_pages_fail_only_their_key() {
         apply.payload["page"]["object_parts"][H_DOWN]["total"],
         json!(1536 * 1024)
     );
+    // A 16 MiB page takes a while to build and encode (debug build): wait
+    // for its exchange to end before judging it.
+    assert!(wait_until(Duration::from_secs(20), || !world
+        .finished_of("repo-big")
+        .is_empty()));
     let big = world.finished_of("repo-big");
     assert!(!big.is_empty());
     assert!(
