@@ -109,7 +109,13 @@ fn quarantine_not_pending() {
         &pb,
         json!({"op":"published-exchange","route":route,"page":page,"metadata_only":true}),
     );
-    let status = rpc(&pb, json!({"op":"status"}));
+    // WP2.INT: since WP2.3 a legacy page only stages while the background
+    // activator runs, and the activator classifies the row moments later.
+    let mut status = rpc(&pb, json!({"op":"status"}));
+    wait_until(Duration::from_secs(10), || {
+        status = rpc(&pb, json!({"op":"status"}));
+        status["incoming_quarantined"] == 1
+    });
     s.check(
         status["incoming_quarantined"] == 1,
         format!("one quarantined row: {}", status["incoming_quarantined"]),
