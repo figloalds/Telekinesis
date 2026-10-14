@@ -10,7 +10,8 @@
 //!   wins over the §7.1 precedence table; [`folder_summary`] is its text.
 //! * [`peer_conn_state`]: the connection badge of a peer ([`PeerConnState`]).
 //! * [`stall`]: the stall detector (§7.1 "Stall").
-//! * [`Ewma`] and [`eta`]: transfer rates (10 s and 60 s windows) and ETA.
+//! * [`Ewma`], [`TransferRate`] and [`eta`]: transfer rates (10 s and 60 s
+//!   windows, each transfer spread over its duration) and ETA.
 //! * [`dedupe`] and [`error_visible`]: error deduplication and the display
 //!   policy (§7.1 "Error display", §8).
 use crate::model::{
@@ -29,8 +30,12 @@ use std::time::Duration;
 pub const PAUSED_CODE: &str = "FOLDER_SYNC_PAUSED";
 /// The acceptor answers this while its folder is not Running (§3.8).
 pub const REMOTE_STARTING_CODE: &str = "REMOTE_WORKER_STARTING";
-/// An objects exchange that moved at least this many bytes counts as progress
-/// even if no object completed (a large object streams over many exchanges).
+/// An objects exchange in which the peer moved at least this many bytes to us
+/// (or a completed object) is evidence that the peer supplies objects
+/// ([`may_supply`]). It is not progress: only completed objects and the
+/// content counters are (partial progress on a large object shows as its
+/// spool growing), so a transfer that moves bytes but never completes or
+/// keeps anything still stalls.
 pub const PROGRESS_MIN_BYTES: u64 = 64 * 1024;
 
 /// Whether `code` says the remote *folder* is not serving
@@ -178,9 +183,11 @@ impl ErrorFlags {
 /// Inputs of [`peer_state`] for one (folder, peer) pair.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerInputs {
-    /// The peer shares the repo: its catalog lists it, or it exchanged the
-    /// repo with us (inbound-only peers have no catalog), or it is the gate
-    /// source of a received folder.
+    /// The peer shares the repo, or may: its catalog lists it (once known,
+    /// the catalog decides), or its catalog is unknown and it exchanged the
+    /// repo with us (inbound-only peers have no catalog) or, while it cannot
+    /// be reached, it is a configured peer (catalogs are not kept across
+    /// restarts), or it is the gate source of a received folder.
     pub shared: bool,
     /// The folder intent `sync_enabled`.
     pub sync_enabled: bool,
@@ -801,12 +808,24 @@ impl Ewma {
     /// pending. Once both rates decay below 1 B/s the stream is over and the
     /// next one is bias-corrected afresh.
     pub fn tick(&mut self, elapsed: Duration) {
-        let seconds = elapsed.as_secs_f64();
-        if seconds <= 0.0 {
+        if elapsed.is_zero() {
             return;
         }
-        let sample = self.pending as f64 / seconds;
+        let sample = self.pending as f64 / elapsed.as_secs_f64();
         self.pending = 0;
+        self.fold(sample, elapsed);
+    }
+
+    /// Folds in `elapsed` of a constant `rate` (bytes per second), as
+    /// [`tick`](Ewma::tick) does with its pending bytes. An idle EWMA stays
+    /// idle over a zero rate, so bias correction counts from the first
+    /// non-zero stretch, not from the tick it falls in.
+    pub fn fold(&mut self, rate: f64, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        if seconds <= 0.0 || !rate.is_finite() {
+            return;
+        }
+        let sample = rate.max(0.0);
         if sample == 0.0 && self.short_weight == 0.0 && self.long_weight == 0.0 {
             return;
         }
@@ -818,7 +837,10 @@ impl Ewma {
         fold(&mut self.short, &mut self.short_weight, policy::RATE_SHORT);
         fold(&mut self.long, &mut self.long_weight, policy::RATE_LONG);
         if self.short_bps() == 0 && self.long_bps() == 0 && sample == 0.0 {
-            *self = Self::default();
+            *self = Self {
+                pending: self.pending,
+                ..Self::default()
+            };
         }
     }
 
@@ -835,6 +857,111 @@ impl Ewma {
     /// No stream in progress and nothing pending.
     pub fn is_idle(&self) -> bool {
         self.pending == 0 && self.short_weight == 0.0 && self.long_weight == 0.0
+    }
+}
+
+/// Shortest stretch a reported transfer is spread over by [`TransferRate`]
+/// (one hub tick): a transfer shorter than that counts as the average of the
+/// tick it falls in, not as a burst rate.
+pub const MIN_RATE_SEGMENT: Duration = policy::TICK;
+
+/// A byte rate fed by finished transfers, whose bytes are only known when
+/// they end (an exchange reports `bytes` and `duration_ms` once it is over:
+/// §6.4 issues one `ExchangeFinished` per 16 MiB pull or push).
+///
+/// Each transfer is folded into an [`Ewma`] as a constant-rate segment of
+/// `bytes / duration` that starts when it is reported and lasts its duration
+/// (at least [`MIN_RATE_SEGMENT`]): the rate a transfer measured is shown
+/// over as long as it took. Back-to-back transfers (the next pull starts as
+/// the previous one ends) thus read their throughput continuously, and the
+/// bias correction starts with the first segment, so the first reading after
+/// idle is that transfer's rate. Folding a 16 MiB pull into the one tick in
+/// which it ended would read 16 MiB/s whatever the link, then swing with
+/// every pull. Times are milliseconds on the caller's (monotonic) timeline;
+/// nothing here reads a clock.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TransferRate {
+    ewma: Ewma,
+    /// Segments not folded in completely: `(start_ms, end_ms, bytes per
+    /// ms)`, `start_ms` advanced past what was folded.
+    segments: Vec<(u64, u64, f64)>,
+}
+
+impl TransferRate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A transfer of `bytes` that took `duration_ms` and was reported at
+    /// `at_ms`.
+    pub fn record(&mut self, bytes: u64, duration_ms: u64, at_ms: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let length = duration_ms.max(ms(MIN_RATE_SEGMENT));
+        self.segments.push((
+            at_ms,
+            at_ms.saturating_add(length),
+            bytes as f64 / length as f64,
+        ));
+    }
+
+    /// Folds in the stretch `(from_ms, to_ms]` (the time since the previous
+    /// call). A segment reported before `from_ms` (it was recorded as the
+    /// previous call ran) starts at `from_ms` instead, with its length.
+    pub fn advance(&mut self, from_ms: u64, to_ms: u64) {
+        if to_ms <= from_ms {
+            return;
+        }
+        for segment in &mut self.segments {
+            if segment.0 < from_ms {
+                let late = from_ms - segment.0;
+                segment.0 = from_ms;
+                segment.1 = segment.1.saturating_add(late);
+            }
+        }
+        // Every segment boundary inside the stretch splits it; within each
+        // piece the rate is constant.
+        let mut bounds = vec![from_ms, to_ms];
+        for &(start, end, _) in &self.segments {
+            bounds.extend(
+                [start, end]
+                    .into_iter()
+                    .filter(|t| *t > from_ms && *t < to_ms),
+            );
+        }
+        bounds.sort_unstable();
+        bounds.dedup();
+        for piece in bounds.windows(2) {
+            let (a, b) = (piece[0], piece[1]);
+            let per_ms: f64 = self
+                .segments
+                .iter()
+                .filter(|(start, end, _)| *start <= a && *end >= b)
+                .map(|(_, _, rate)| rate)
+                .sum();
+            self.ewma
+                .fold(per_ms * 1000.0, Duration::from_millis(b - a));
+        }
+        self.segments.retain(|(_, end, _)| *end > to_ms);
+        for segment in &mut self.segments {
+            segment.0 = segment.0.max(to_ms);
+        }
+    }
+
+    /// The 10 s rate in bytes per second.
+    pub fn short_bps(&self) -> u64 {
+        self.ewma.short_bps()
+    }
+
+    /// The 60 s rate in bytes per second.
+    pub fn long_bps(&self) -> u64 {
+        self.ewma.long_bps()
+    }
+
+    /// No transfer left to fold in and no rate shown.
+    pub fn is_idle(&self) -> bool {
+        self.segments.is_empty() && self.ewma.is_idle()
     }
 }
 

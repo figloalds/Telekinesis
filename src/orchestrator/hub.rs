@@ -23,10 +23,11 @@
 //!   see [`StatusHub::spawn_ticker`]) folds the EWMA rates (10 s and 60 s:
 //!   per lane and per peer from every exchange's bytes, per (repo, peer)
 //!   pair from objects ops only, as those are the object transfer rates and
-//!   ETA), runs the stall detector, applies the time-based error display
-//!   policy (Contention after 30 s), resolves pair errors whose work is gone,
-//!   expires stale inbound-incompatible notices and prunes state of folders
-//!   that were removed or never registered.
+//!   ETA; each exchange's bytes are spread over its duration,
+//!   `rules::TransferRate`), runs the stall detector, applies the time-based
+//!   error display policy (Contention after 30 s), resolves pair errors whose
+//!   work is gone, expires stale inbound-incompatible notices and prunes
+//!   state of folders that were removed or never registered.
 //! * **Two clocks.** Reported `*_ms` fields are wall-clock time; every
 //!   duration the hub measures (stall, Contention visibility, notice expiry,
 //!   orphan grace) runs on a monotonic timeline (`Clock::instant`), so a
@@ -52,8 +53,8 @@
 //! [`legacy_folder_sync`]: StatusHub::legacy_folder_sync
 //! [`legacy_peers`]: StatusHub::legacy_peers
 use super::hub_rules::{
-    self as rules, ErrorFlags, Ewma, FolderInputs, PeerInputs, StallInput, Streak, SummaryFacts,
-    Work,
+    self as rules, ErrorFlags, FolderInputs, PeerInputs, StallInput, Streak, SummaryFacts,
+    TransferRate, Work,
 };
 use crate::{
     model::{
@@ -1257,8 +1258,8 @@ struct LaneEntry {
     inflight: Vec<InflightOp>,
     bytes_up: u64,
     bytes_down: u64,
-    up: Ewma,
-    down: Ewma,
+    up: TransferRate,
+    down: TransferRate,
     reconnects: u32,
     ever_ready: bool,
     backoff_until_ms: Option<u64>,
@@ -1281,8 +1282,8 @@ impl LaneEntry {
             inflight: Vec::new(),
             bytes_up: 0,
             bytes_down: 0,
-            up: Ewma::new(),
-            down: Ewma::new(),
+            up: TransferRate::new(),
+            down: TransferRate::new(),
             reconnects: 0,
             ever_ready: false,
             backoff_until_ms: None,
@@ -1326,8 +1327,8 @@ struct PeerEntry {
     lanes: BTreeMap<LaneKey, LaneEntry>,
     conn: PeerConnState,
     conn_since_ms: Option<u64>,
-    up: Ewma,
-    down: Ewma,
+    up: TransferRate,
+    down: TransferRate,
 }
 
 impl PeerEntry {
@@ -1374,11 +1375,14 @@ struct PairEntry {
     outbound_seen: bool,
     inbound_seen: bool,
     summary: Option<ExchangeSummary>,
+    /// When the summary's exchange was recorded (its end), and when it began
+    /// (the end minus its duration), wall-clock.
     last_meta_exchange_ms: Option<u64>,
+    meta_exchange_started_ms: Option<u64>,
     /// Object transfer rates (bytes of objects ops only), shown as
     /// `objects_up`/`objects_down` rates and used for their ETA.
-    up: Ewma,
-    down: Ewma,
+    up: TransferRate,
+    down: TransferRate,
     /// Last progress (monotonic; reported by its age).
     last_progress: Option<u64>,
     last_down_ms: Option<u64>,
@@ -1416,6 +1420,9 @@ struct HubState {
     throttle: Throttle,
     rebuilds: u64,
     last_tick: Option<Instant>,
+    /// The monotonic time the rates were last folded up to (the previous
+    /// tick), so each tick folds exactly the stretch since.
+    rates_at: Option<u64>,
     daemon: DaemonStatus,
     daemon_errors: ErrorBook,
     folders: BTreeMap<String, FolderEntry>,
@@ -1459,6 +1466,7 @@ impl HubState {
             throttle: Throttle::new(),
             rebuilds: 0,
             last_tick: None,
+            rates_at: None,
             // The daemon sets its identity (installation, version, endpoints)
             // through `StatusHub::set_daemon`.
             daemon: DaemonStatus {
@@ -1835,7 +1843,13 @@ impl HubState {
                 &mut self.ring,
             );
         }
-        // Progress the worker made on its own: downloads and activation.
+        // Download progress the worker made on its own (objects completed,
+        // or a partial spool grew). Activation is not credited here: rows
+        // the worker activates count only for the pairs whose own backlog
+        // shrinks, which the tick sees as a decrease of their metadata work
+        // (their feed counters, or their next summary). Crediting any
+        // activation to every pair of the repo kept a pair whose own work
+        // never moved from ever stalling.
         let downloaded = match (previous.as_ref().and_then(|old| old.content), hb.content) {
             (Some(before), Some(after)) => {
                 let (bo, bb) = rules::missing(&before);
@@ -1844,15 +1858,8 @@ impl HubState {
             }
             _ => false,
         };
-        let activated = match (
-            previous.as_ref().and_then(|old| old.activation),
-            hb.activation,
-        ) {
-            (Some(before), Some(after)) => after.activated > before.activated,
-            _ => false,
-        };
         self.mirror_mount(state, now);
-        if (downloaded || activated)
+        if downloaded
             && let Some(repo) = self
                 .folders
                 .get(state)
@@ -1862,14 +1869,9 @@ impl HubState {
                 if *pair_repo != repo {
                     continue;
                 }
-                let work = pair.work.unwrap_or_default();
-                if (downloaded && (work.down_bytes > 0 || work.down_objects > 0))
-                    || (activated && work.meta > 0)
-                {
+                if pair.work.is_some_and(|work| work.has_down_work()) {
                     pair.last_progress = Some(now.mono);
-                    if downloaded {
-                        pair.last_down_ms = Some(now.ms);
-                    }
+                    pair.last_down_ms = Some(now.ms);
                 }
             }
         }
@@ -2025,7 +2027,20 @@ impl HubState {
             })
             .map(|entry| entry.repo.clone())
             .collect();
+        let listed: Vec<String> = entries.iter().map(|entry| entry.repo.clone()).collect();
         peer.catalog = Some(entries);
+        // A known catalog decides what the peer shares: a repo it no longer
+        // lists stops counting, whatever was exchanged before, and what was
+        // learnt about it (the last summary) goes with it, so it is not
+        // shown again if the peer publishes the repo later.
+        for ((repo, inst), pair) in self.pairs.iter_mut() {
+            if inst == installation && !listed.contains(repo) {
+                pair.inbound_seen = false;
+                pair.summary = None;
+                pair.last_meta_exchange_ms = None;
+                pair.meta_exchange_started_ms = None;
+            }
+        }
         for repo in started {
             let Some(state) = self.repos.get(&repo) else {
                 continue;
@@ -2164,8 +2179,8 @@ impl HubState {
                 peer.outbound = true;
             }
         }
-        peer.up.add(x.bytes_up);
-        peer.down.add(x.bytes_down);
+        peer.up.record(x.bytes_up, x.duration_ms, now.mono);
+        peer.down.record(x.bytes_down, x.duration_ms, now.mono);
         let remote_content = peer.catalog_entry(&x.repo).and_then(|entry| entry.content);
         let key = LaneKey::of(x.direction, x.lane);
         let role = legacy_lane_role(x.lane);
@@ -2182,8 +2197,8 @@ impl HubState {
         }
         lane.bytes_up = lane.bytes_up.saturating_add(x.bytes_up);
         lane.bytes_down = lane.bytes_down.saturating_add(x.bytes_down);
-        lane.up.add(x.bytes_up);
-        lane.down.add(x.bytes_down);
+        lane.up.record(x.bytes_up, x.duration_ms, now.mono);
+        lane.down.record(x.bytes_down, x.duration_ms, now.mono);
         lane.exchanges = lane.exchanges.saturating_add(1);
         if x.ok {
             lane.last_success_ms = Some(now.ms);
@@ -2202,24 +2217,31 @@ impl HubState {
                 pair.outbound_seen = true;
             }
         }
-        let mut progress = x.objects_up > 0 || x.objects_down > 0;
+        // Progress is a completed object (of a successful exchange), not
+        // bytes on the wire: a pull that times out mid-stream, or whose
+        // writes the worker rejects, moves bytes and keeps nothing. Partial
+        // progress on a large object shows in the content counters (its spool
+        // grows, `on_heartbeat`; a peer's published counters, `tick`).
+        let completed_down = x.ok && x.objects_down > 0;
+        let completed_up = x.ok && x.objects_up > 0;
+        let mut progress = completed_down || completed_up;
         if objects_op {
             // The pair's rates are its object transfer rates (and ETA): only
             // objects ops feed them. Metadata exchange bytes count in the
             // peer's and the lane's rates above.
-            pair.up.add(x.bytes_up);
-            pair.down.add(x.bytes_down);
+            pair.up.record(x.bytes_up, x.duration_ms, now.mono);
+            pair.down.record(x.bytes_down, x.duration_ms, now.mono);
             pair.down_episode = pair.down_episode.saturating_add(x.bytes_down);
             pair.up_episode = pair.up_episode.saturating_add(x.bytes_up);
             if x.bytes_down >= rules::PROGRESS_MIN_BYTES || x.objects_down > 0 {
-                pair.last_down_ms = Some(now.ms);
                 // Evidence that the peer supplies objects (`rules::may_supply`).
                 pair.supplied = Some(now.mono);
-                progress = true;
             }
-            if x.bytes_up >= rules::PROGRESS_MIN_BYTES || x.objects_up > 0 {
+            if completed_down {
+                pair.last_down_ms = Some(now.ms);
+            }
+            if completed_up {
                 pair.last_up_ms = Some(now.ms);
-                progress = true;
             }
         }
         if let Some(summary) = &x.summary {
@@ -2233,6 +2255,7 @@ impl HubState {
             progress |= moved || before.is_some_and(|before| after < before);
             pair.summary = Some(summary.clone());
             pair.last_meta_exchange_ms = Some(now.ms);
+            pair.meta_exchange_started_ms = Some(now.ms.saturating_sub(x.duration_ms));
         }
         // A failed metadata exchange withdraws the caught-up claim until the
         // next success, except under Contention, which never resets it (§8).
@@ -2413,10 +2436,15 @@ impl HubState {
 
     fn tick(&mut self, now: Now, elapsed: Duration, cfg: &HubConfig) -> bool {
         let mut changed = false;
-        let mut fold = |ewma: &mut Ewma| {
-            let before = (ewma.short_bps(), ewma.long_bps());
-            ewma.tick(elapsed);
-            changed |= before != (ewma.short_bps(), ewma.long_bps());
+        let from = self
+            .rates_at
+            .unwrap_or_else(|| now.mono.saturating_sub(rules::ms(elapsed)))
+            .min(now.mono);
+        self.rates_at = Some(now.mono);
+        let mut fold = |rate: &mut TransferRate| {
+            let before = (rate.short_bps(), rate.long_bps());
+            rate.advance(from, now.mono);
+            changed |= before != (rate.short_bps(), rate.long_bps());
         };
         for peer in self.peers.values_mut() {
             fold(&mut peer.up);
@@ -2460,8 +2488,17 @@ impl HubState {
                     before.down_objects = 0;
                 }
                 if rules::progressed(&before, &work) {
-                    // Shown as the pair's `last_progress_ms`.
+                    // Shown as the pair's `last_progress_ms`, and per
+                    // direction as the transfers' `last_progress_ms`.
                     pair.last_progress = Some(now.mono);
+                    if work.down_bytes < before.down_bytes
+                        || work.down_objects < before.down_objects
+                    {
+                        pair.last_down_ms = Some(now.ms);
+                    }
+                    if work.up_bytes < before.up_bytes || work.up_objects < before.up_objects {
+                        pair.last_up_ms = Some(now.ms);
+                    }
                     changed = true;
                 }
             }
@@ -2621,18 +2658,16 @@ impl HubState {
     ) -> PairFacts {
         let repo = &view.record.repo;
         let entry = peer.catalog_entry(repo);
-        let gate_source = match &view.gate {
-            GateState::Awaiting { source, .. } | GateState::Blocked { source, .. } => {
-                Some(source.as_str())
-            }
-            _ => None,
-        };
+        let gate_source = gate_source(&view.gate);
         let inbound_seen = pair.is_some_and(|pair| pair.inbound_seen);
         let outbound_seen = pair.is_some_and(|pair| pair.outbound_seen);
-        let shared = entry.is_some()
-            || inbound_seen
-            || (peer.catalog.is_none() && outbound_seen)
-            || gate_source == Some(peer.installation.as_str());
+        // A configured peer whose catalog is unknown (catalogs are not kept
+        // across restarts, §3.7) may share the repo: while it cannot be
+        // reached it counts, so the folder waits for it (Offline, Backoff…)
+        // instead of reading "not shared". Once online, its catalog (listed
+        // every 2 s) decides.
+        let maybe = peer.outbound && peer.catalog.is_none() && peer.conn != PeerConnState::Online;
+        let shared = shares(peer, pair, repo, gate_source) || maybe;
         let scope = Scope::FolderPeer {
             state: state.to_owned(),
             installation: peer.installation.clone(),
@@ -2651,7 +2686,11 @@ impl HubState {
                 )
             });
         // Metadata: the last exchange summary, refreshed by the worker's
-        // per-peer feed counters when they are at least as recent.
+        // per-peer feed counters when they are at least as recent: the
+        // worker stamps them (`last_exchange_ms`) when it applies an
+        // exchange, which is before the orchestrator records that exchange's
+        // summary, so counters stamped at or after the summary's exchange
+        // began reflect it (or a later one).
         let mut meta = MetaProgress::default();
         let mut meta_known = false;
         if let Some(summary) = pair.and_then(|pair| pair.summary.as_ref()) {
@@ -2673,20 +2712,26 @@ impl HubState {
                 .as_ref()
                 .and_then(|hb| hb.peers.iter().find(|c| c.replica == entry.replica))
         });
-        if let Some(c) = counters
-            && c.last_exchange_ms >= meta.last_exchange_ms
-        {
-            meta_known = true;
-            meta.to_send = c.to_send;
-            meta.to_receive = c.to_receive;
-            meta.local_pending = c.staged_pending;
-            meta.blocked = c.blocked;
-            meta.quarantined = c.quarantined;
+        let summary_began = pair.and_then(|pair| {
+            pair.summary
+                .as_ref()
+                .and(pair.meta_exchange_started_ms.or(pair.last_meta_exchange_ms))
+        });
+        if let Some(c) = counters {
+            // Only the counters know rejected events.
             meta.rejected = c.rejected;
-            meta.caught_up = c.caught_up;
-            meta.cursor_seq = c.cursor_seq;
-            meta.remote_tip = c.remote_tip;
-            meta.last_exchange_ms = c.last_exchange_ms;
+            if c.last_exchange_ms >= summary_began {
+                meta_known = true;
+                meta.to_send = c.to_send;
+                meta.to_receive = c.to_receive;
+                meta.local_pending = c.staged_pending;
+                meta.blocked = c.blocked;
+                meta.quarantined = c.quarantined;
+                meta.caught_up = c.caught_up;
+                meta.cursor_seq = c.cursor_seq;
+                meta.remote_tip = c.remote_tip;
+                meta.last_exchange_ms = c.last_exchange_ms;
+            }
         }
         if meta.remote_tip == 0
             && let Some(tip) = entry.and_then(|entry| entry.tip.as_ref())
@@ -3069,6 +3114,8 @@ impl HubState {
                 )
             })
             .map(|open| open.record.clone());
+        // Folders it is known to share (the rule of `pair_facts`, without the
+        // configured peer whose catalog is unknown, which only may).
         let shared_folders = self
             .folders
             .values()
@@ -3077,10 +3124,7 @@ impl HubState {
                 let pair = self
                     .pairs
                     .get(&(view.record.repo.clone(), peer.installation.clone()));
-                peer.catalog_entry(&view.record.repo).is_some()
-                    || pair.is_some_and(|pair| {
-                        pair.inbound_seen || (peer.catalog.is_none() && pair.outbound_seen)
-                    })
+                shares(peer, pair, &view.record.repo, gate_source(&view.gate))
             })
             .map(|view| view.record.repo.clone())
             .collect();
@@ -3152,6 +3196,32 @@ fn lifecycle_status(
             _ => None,
         },
     }
+}
+
+/// The source of a folder's initial-sync gate, if it has one.
+fn gate_source(gate: &GateState) -> Option<&str> {
+    match gate {
+        GateState::Awaiting { source, .. } | GateState::Blocked { source, .. } => {
+            Some(source.as_str())
+        }
+        _ => None,
+    }
+}
+
+/// Whether `peer` is known to share `repo`: its catalog lists it (a known
+/// catalog decides, whatever was exchanged before), or, with no catalog (an
+/// inbound-only peer, or one not listed yet), it exchanged the repo with us;
+/// or it is the source of the folder's initial-sync gate.
+fn shares(
+    peer: &PeerEntry,
+    pair: Option<&PairEntry>,
+    repo: &str,
+    gate_source: Option<&str>,
+) -> bool {
+    let exchanged = pair.is_some_and(|pair| pair.inbound_seen || pair.outbound_seen);
+    peer.catalog_entry(repo).is_some()
+        || (peer.catalog.is_none() && exchanged)
+        || gate_source == Some(peer.installation.as_str())
 }
 
 /// The folder entry a folder-scoped event (heartbeat, error) applies to:

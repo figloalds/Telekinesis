@@ -46,7 +46,7 @@ use tkfs::{
         },
         hub_rules::{
             self as rules, ErrorFlags, Ewma, FolderInputs, PeerInputs, StallInput, Streak,
-            SummaryFacts, Work,
+            SummaryFacts, TransferRate, Work,
         },
     },
     util::time::{Clock, ManualClock, SystemClock},
@@ -977,6 +977,49 @@ fn ewma_keeps_bytes_pending_over_a_zero_elapsed_tick() {
     assert!(!ewma.is_idle());
     ewma.tick(Duration::from_secs(2));
     assert_eq!(ewma.short_bps(), 2_000);
+}
+
+/// WP1.INT re-review: a transfer is folded in over its duration, starting
+/// when it is reported; its first reading is its own rate (the bias
+/// correction starts with it, not with the tick it falls in); one shorter
+/// than a tick counts as that tick's average; one reported before the stretch
+/// being folded starts with it; and it ends, then decays to idle.
+#[test]
+fn transfer_rate_spreads_each_transfer_over_its_duration() {
+    let mut rate = TransferRate::new();
+    assert!(rate.is_idle());
+    // 16 MiB in 16 s, reported 400 ms into a tick.
+    rate.record(16 << 20, 16_000, 10_400);
+    assert!(!rate.is_idle());
+    rate.advance(10_000, 11_000);
+    assert_eq!(rate.short_bps(), 1 << 20);
+    assert_eq!(rate.long_bps(), 1 << 20);
+    for second in 11..26 {
+        rate.advance(second * 1000, (second + 1) * 1000);
+        assert!(within(rate.short_bps(), 1 << 20, 0.1), "{second} s");
+    }
+    // It ended at 26.4 s: the rate decays from there, then goes idle.
+    rate.advance(26_000, 36_000);
+    assert!(rate.short_bps() < (1 << 20) / 2, "{}", rate.short_bps());
+    let mut at = 36_000;
+    while !rate.is_idle() {
+        rate.advance(at, at + 1000);
+        at += 1000;
+        assert!(at < 4_000_000, "never went idle");
+    }
+    // 3,000 bytes in 35 ms: the average of its tick, not 85 KB/s.
+    rate.record(3_000, 35, at);
+    rate.advance(at, at + 1000);
+    assert_eq!(rate.short_bps(), 3_000);
+    // Reported as the previous stretch was folded: it starts with the next.
+    let mut late = TransferRate::new();
+    late.record(2_000_000, 2_000, 4_900);
+    late.advance(5_000, 6_000);
+    assert_eq!(late.short_bps(), 1_000_000);
+    late.advance(6_000, 7_000);
+    assert_eq!(late.short_bps(), 1_000_000);
+    late.advance(7_000, 7_000);
+    assert!(!late.is_idle());
 }
 
 #[test]
@@ -3569,6 +3612,399 @@ fn legacy_link_passthrough_is_kept_verbatim() {
         value: value.clone(),
     });
     assert_eq!(fx.hub.legacy_links()["ws://peer:43180:r1:0"], value);
+}
+
+// ===========================================================================
+// Hub: WP1.INT post-integration re-review
+
+/// A worker heartbeat built by `f` (instance 1, sequence `seq`).
+fn heartbeat_with(seq: u64, f: impl FnOnce(&mut WorkerHeartbeat)) -> StatusEvent {
+    let mut hb = WorkerHeartbeat {
+        instance: "instance-1".into(),
+        seq,
+        at_ms: T0,
+        ..WorkerHeartbeat::default()
+    };
+    f(&mut hb);
+    StatusEvent::WorkerHeartbeat {
+        state: STATE.into(),
+        hb: Arc::new(hb),
+    }
+}
+
+/// A successful `objects.pull` from A that moved `bytes_down` bytes and
+/// `objects_down` completed objects in `duration_ms`.
+fn pulled(bytes_down: u64, objects_down: u64, duration_ms: u64) -> StatusEvent {
+    StatusEvent::ExchangeFinished {
+        installation: PEER_A.into(),
+        repo: REPO.into(),
+        lane: 1,
+        op: "objects.pull".into(),
+        direction: Direction::Outbound,
+        ok: true,
+        error: None,
+        summary: None,
+        bytes_up: 200,
+        bytes_down,
+        objects_up: 0,
+        objects_down,
+        duration_ms,
+    }
+}
+
+/// A peer that exchanged the repo both ways and then stops publishing it no
+/// longer shares it: its catalog is authoritative once known. Before the
+/// re-review fix the inbound exchange made it count for good, with the last
+/// summary frozen: "Syncing metadata · 3 events left", then a permanent false
+/// "Stalled" (precedence 5), and the repo stayed in its `shared_folders`.
+#[test]
+fn a_peer_seen_both_ways_that_unshares_the_repo_stops_counting() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(StatusEvent::InboundSession {
+        installation: PEER_A.into(),
+        lane: 0,
+        role: LaneRole::Control,
+        opened: true,
+    });
+    fx.rec(finished(
+        PEER_A,
+        0,
+        "meta.exchange",
+        Direction::Inbound,
+        None,
+        Some(summary(3, 0)),
+        100,
+        0,
+    ));
+    fx.hub.tick();
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.state, FolderPeerState::Metadata);
+    assert_eq!(pair.direction, Direction::Both);
+    // A's catalog stops listing the repo.
+    fx.rec(catalog(PEER_A, &[entry("repo-other", EntryState::Running)]));
+    fx.run(1);
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::NotShared);
+    assert_eq!(folder.sync.summary, "Not shared with any peer");
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::NotShared);
+    assert!(fx.snap().peers[0].shared_folders.is_empty());
+    fx.run(70);
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::NotShared);
+    assert_eq!(folder.sync.peers[0].stalled_since_ms, None);
+    // It publishes the repo again: the old summary is gone with the sharing,
+    // so nothing is known until the next exchange.
+    fx.rec(catalog(PEER_A, &[entry(REPO, EntryState::Running)]));
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.state, FolderPeerState::Metadata);
+    assert_eq!(pair.metadata.to_send, 0);
+    assert_eq!(fx.folder().sync.summary, "Syncing metadata · 1 of 1 peer");
+    assert_eq!(fx.snap().peers[0].shared_folders, vec![REPO.to_owned()]);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::UpToDate);
+}
+
+/// Objects exchanges that move bytes but complete nothing are not progress:
+/// a download whose pulls succeed with no object, or keep failing, stalls
+/// while content stays flat. Partial progress counts through the content
+/// counters (a spool that grows), and a completed object clears the stall.
+/// Before the re-review fix every objects exchange of at least 64 KiB counted
+/// as progress, so such a download read "Downloading … ETA 2 h" (or
+/// "Retrying") for ever and never stalled.
+#[test]
+fn objects_exchanges_that_complete_nothing_are_not_progress() {
+    const MISSING: u64 = 500_000_000;
+    // `ok`: the pulls succeed; `grows`: the partial spool grows (durable
+    // progress on a large object).
+    for (ok, grows) in [(true, false), (false, false), (true, true)] {
+        let what = format!("ok {ok}, spool grows {grows}");
+        let fx = Fx::new();
+        fx.running_folder();
+        fx.online_peer(PEER_A, ENDPOINT_A);
+        fx.rec(meta(PEER_A, summary(0, 0)));
+        fx.rec(heartbeat(1, Some(missing_bytes(MISSING))));
+        fx.hub.tick();
+        for second in 0..65u64 {
+            if second % 10 == 0 {
+                let error = (!ok).then(|| wire("REQUEST_TIMEOUT"));
+                fx.rec(finished(
+                    PEER_A,
+                    1,
+                    "objects.pull",
+                    Direction::Outbound,
+                    error,
+                    None,
+                    1 << 20,
+                    0,
+                ));
+            }
+            let content = ContentCounters {
+                partial_bytes: if grows { second << 20 } else { 0 },
+                ..missing_bytes(MISSING)
+            };
+            fx.rec(heartbeat(2 + second, Some(content)));
+            fx.run(1);
+        }
+        let folder = fx.folder();
+        let pair = &folder.sync.peers[0];
+        if grows {
+            assert_eq!(pair.state, FolderPeerState::Downloading, "{what}");
+            assert_eq!(pair.stalled_since_ms, None, "{what}");
+            continue;
+        }
+        assert_eq!(pair.state, FolderPeerState::Stalled, "{what}");
+        assert_eq!(folder.sync.state, FolderSyncState::Stalled, "{what}");
+        assert!(
+            folder
+                .sync
+                .summary
+                .starts_with("Stalled 1 min · 1 of 1 peer"),
+            "{what}: {}",
+            folder.sync.summary
+        );
+        // A completed object is progress.
+        fx.rec(pulled(1 << 20, 1, 35));
+        let pair = fx.pair(PEER_A);
+        assert_eq!(pair.state, FolderPeerState::Downloading, "{what}");
+        assert_eq!(pair.stalled_since_ms, None, "{what}");
+    }
+}
+
+/// Rates follow a transfer's duration: each 16 MiB pull (the §6.4 budget) at
+/// 1 or 2 MB/s is folded in over the time it took, so the first reading is
+/// the link's rate and the rate and ETA stay within 5 % (the WP1.11
+/// criterion) from then on, for the pair, the peer and the lane. Before the
+/// re-review fix each pull's bytes landed in the one tick in which it
+/// finished: the first reading was 16 MiB/s whatever the link, and the ETA
+/// swung between 50 % and 253 % of the true one.
+#[test]
+fn rates_of_large_pulls_follow_their_duration() {
+    const PULL: u64 = 16 << 20;
+    const TOTAL: u64 = 2_000_000_000;
+    for rate in [1_000_000u64, 2_000_000] {
+        let fx = Fx::new();
+        fx.running_folder();
+        fx.online_peer(PEER_A, ENDPOINT_A);
+        fx.rec(meta(PEER_A, summary(0, 0)));
+        fx.rec(heartbeat(1, Some(missing_bytes(TOTAL))));
+        fx.hub.tick();
+        // Back-to-back pulls: each one starts when the previous one ends.
+        let pull_ms = PULL * 1000 / rate;
+        let (mut at, mut last, mut next) = (0u64, 0u64, pull_ms);
+        let mut readings = 0;
+        for second in 1..=240u64 {
+            let tick = second * 1000;
+            while next <= tick {
+                fx.advance(next - at);
+                at = next;
+                fx.rec(pulled(PULL, 1, next - last));
+                last = next;
+                next += pull_ms;
+            }
+            fx.advance(tick - at);
+            at = tick;
+            let remaining = TOTAL - rate * second;
+            fx.rec(heartbeat(1 + second, Some(missing_bytes(remaining))));
+            fx.hub.tick();
+            let pair = fx.pair(PEER_A);
+            let shown = pair.objects_down.rate_bps;
+            if shown == 0 {
+                assert_eq!(readings, 0, "{rate} B/s: the rate fell to 0 at {second} s");
+                continue;
+            }
+            readings += 1;
+            assert!(
+                within(shown, rate, 5.0),
+                "{rate} B/s: reading {readings} at {second} s shows {shown} B/s"
+            );
+            let eta = pair.objects_down.eta_s.expect("eta");
+            assert!(
+                within(eta, remaining / rate, 5.0),
+                "{rate} B/s at {second} s: ETA {eta} s for {} s",
+                remaining / rate
+            );
+            // The bulk lane carries only the pulls; the peer's rate also
+            // counts the metadata exchange at 0 s, so it reads the average
+            // since then until its 10 s window has moved past the idle gap.
+            let snap = fx.snap();
+            let peer = &snap.peers[0];
+            let bulk = peer.lanes.iter().find(|lane| lane.lane == 1).unwrap();
+            assert!(
+                within(bulk.rate_down_bps, rate, 5.0),
+                "{rate} B/s at {second} s: lane {}",
+                bulk.rate_down_bps
+            );
+            if second >= 60 {
+                assert!(
+                    within(peer.rate_down_bps, rate, 5.0),
+                    "{rate} B/s at {second} s: peer {}",
+                    peer.rate_down_bps
+                );
+            }
+        }
+        assert!(readings > 200, "{rate} B/s: {readings} readings");
+        assert!(
+            fx.folder().sync.summary.contains("ETA"),
+            "{}",
+            fx.folder().sync.summary
+        );
+    }
+}
+
+/// The worker activating rows is progress only for the pairs whose own
+/// backlog shrinks: a pair whose metadata work never moves stalls while other
+/// rows activate. Before the re-review fix any growth of the activation
+/// counter was credited to every pair of the repo with metadata work.
+#[test]
+fn activation_elsewhere_is_not_progress_for_a_stuck_pair() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(5, 0)));
+    fx.hub.tick();
+    let activated = |seq: u64| {
+        heartbeat_with(seq, |hb| {
+            hb.activation = Some(tkfs::model::health::ActivationCounters {
+                running: true,
+                activated: seq * 10,
+                ..Default::default()
+            });
+        })
+    };
+    for second in 0..65u64 {
+        fx.rec(activated(1 + second));
+        fx.run(1);
+    }
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.state, FolderPeerState::Stalled);
+    assert_eq!(fx.folder().sync.state, FolderSyncState::Stalled);
+    // Its own backlog shrinking (the worker's counters for this peer) is
+    // progress.
+    let backlog = |seq: u64, staged: u64| {
+        heartbeat_with(seq, |hb| {
+            hb.peers = vec![tkfs::model::health::PeerFeedCounters {
+                replica: "device-remote".into(),
+                cursor_seq: 40,
+                remote_tip: 40,
+                to_send: 5,
+                staged_pending: staged,
+                last_exchange_ms: Some(T0),
+                ..Default::default()
+            }];
+        })
+    };
+    fx.rec(backlog(100, 9));
+    fx.run(1);
+    fx.rec(backlog(101, 8));
+    fx.run(1);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.state, FolderPeerState::Metadata);
+    assert_eq!(pair.stalled_since_ms, None);
+}
+
+/// The worker stamps its per-peer counters when it applies an exchange,
+/// before the orchestrator records that exchange's summary: counters of the
+/// same exchange (or a later one) are at least as fresh as the summary and
+/// win. `rejected`, which only the counters carry, is always theirs, so
+/// "only rejected work remains" reads Blocked. Before the re-review fix the
+/// summary won whenever it was recorded after the counters' stamp, which is
+/// every time, and `rejected` read 0.
+#[test]
+fn worker_counters_of_the_same_exchange_win_over_its_summary() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    let counters = |seq: u64, staged: u64, rejected: u64, stamp: u64| {
+        heartbeat_with(seq, |hb| {
+            hb.peers = vec![tkfs::model::health::PeerFeedCounters {
+                replica: "device-remote".into(),
+                cursor_seq: 40,
+                remote_tip: 40,
+                staged_pending: staged,
+                rejected,
+                last_exchange_ms: Some(stamp),
+                ..Default::default()
+            }];
+        })
+    };
+    // The worker applies the exchange at `applied`; the summary (no work,
+    // 35 ms long) is recorded 5 ms later; the next heartbeat brings the
+    // counters of that same exchange.
+    let applied = fx.now();
+    fx.advance(5);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    fx.advance(995);
+    fx.rec(counters(1, 7, 4, applied));
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.metadata.local_pending, 7);
+    assert_eq!(pair.metadata.rejected, 4);
+    assert_eq!(pair.metadata.last_exchange_ms, Some(applied));
+    assert_eq!(pair.state, FolderPeerState::Metadata);
+    // The staged rows activate; only rejected work is left.
+    fx.advance(1000);
+    fx.rec(counters(2, 0, 4, applied));
+    let folder = fx.folder();
+    assert_eq!(folder.sync.peers[0].state, FolderPeerState::Blocked);
+    assert_eq!(folder.sync.state, FolderSyncState::Blocked);
+    assert_eq!(folder.sync.summary, "Blocked — 4 events rejected");
+    // A newer exchange whose counters have not arrived yet: its summary wins,
+    // and `rejected` still comes from the counters.
+    fx.advance(1000);
+    fx.rec(meta(PEER_A, summary(2, 0)));
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.metadata.to_send, 2);
+    assert_eq!(pair.metadata.local_pending, 0);
+    assert_eq!(pair.metadata.rejected, 4);
+    assert_eq!(pair.metadata.last_exchange_ms, Some(fx.now()));
+    assert_eq!(pair.state, FolderPeerState::Metadata);
+}
+
+/// Remote catalogs are not kept across restarts (§3.7): until a configured
+/// peer's catalog is listed, it may share the folder, so while it cannot be
+/// reached the folder waits for it (Backoff, Offline) instead of reading "Not
+/// shared with any peer" as if the pairing were lost. Its catalog decides
+/// once listed. Before the re-review fix the folder read NotShared.
+#[test]
+fn a_configured_peer_whose_catalog_is_unknown_may_share() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+    });
+    fx.rec(lane(
+        PEER_A,
+        0,
+        LaneState::Backoff,
+        Some(wire("WS_CONNECT_FAILED")),
+    ));
+    fx.run(5);
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::Backoff);
+    assert_eq!(folder.sync.summary, "Retrying · 1 of 1 peer in backoff");
+    assert_eq!(folder.sync.peers[0].state, FolderPeerState::Backoff);
+    // Not claimed as shared in the peer row: it is not known yet.
+    assert!(fx.snap().peers[0].shared_folders.is_empty());
+    fx.rec(lane(PEER_A, 0, LaneState::Closed, None));
+    let folder = fx.folder();
+    assert_eq!(folder.sync.state, FolderSyncState::Offline);
+    assert_eq!(
+        folder.sync.summary,
+        "Waiting for peers · 1 of 1 peer unreachable"
+    );
+    // Online, its catalog decides: it does not list the folder.
+    fx.rec(lane(PEER_A, 0, LaneState::Ready, None));
+    fx.rec(catalog(PEER_A, &[entry("repo-other", EntryState::Running)]));
+    assert_eq!(fx.folder().sync.state, FolderSyncState::NotShared);
+    // The last good catalog survives the next outage: still not shared.
+    fx.rec(lane(PEER_A, 0, LaneState::Closed, None));
+    fx.run(5);
+    assert_eq!(fx.folder().sync.state, FolderSyncState::NotShared);
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::NotShared);
+    fx.run(120);
+    assert_eq!(fx.pair(PEER_A).stalled_since_ms, None);
 }
 
 // ===========================================================================
