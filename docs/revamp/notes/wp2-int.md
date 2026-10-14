@@ -66,8 +66,9 @@ created: the coordinator does both after review (§13 rule 6, rule 8 item 7).
    blocker (CCR-WP2.1-2) and its two minors (the signal pipe, the hub
    latency test's precondition); WP2.3's major (seal forecast under the
    engine lock) and three minors (panic containment, revalidate wait, fault
-   point scope); WP2.5's major (the `feed_journal` backfill). Each fix has a
-   test that fails without it. What remains open is in *Package status*.
+   point scope); WP2.5's major (the `feed_journal` backfill). Their tests
+   are in the table below (the majors' and the panic containment's fail
+   without their fix). What remains open is in *Package status*.
 
 5. **The v3 peer stack end to end.** WP2.6's notes asked WP2.INT to recheck
    the lanes once WP2.7's real runners merged.
@@ -189,6 +190,8 @@ pins backward parsing.
      unchanged. WP2.1's full suite failed once on that precondition (32
      rebuilds) under load.
    - `tests/fixtures/contracts/status.status_event.json`: re-blessed.
+   - `tests/qual_wp1_6_activation.rs`, `tests/qual_wp2_4_offlock.rs`:
+     deviation 6.
 4. **The legacy floors keep their scenarios** (CCR-WP2.1-2 asked to re-point
    `legacy_hung_repo_healthy_progress` and `legacy_crash_backoff` to
    `qual_wp2_1_lifecycle`). Those scenarios emit other metrics, so
@@ -199,28 +202,48 @@ pins backward parsing.
    is unchanged.
 5. **Review findings of approved packages** (WP2.2, WP2.4, WP2.6, WP2.7,
    WP2.8) are not fixed here, as the brief says; they are listed as open
-   issues. Two are by-products of fixes above: none.
+   issues (*Package status*).
+6. **Two qualification scenarios changed** because WP2.3 and WP2.4 now run
+   together (`d2f0fa8`; found by the first wave 2 qualification run):
+   - `qual_wp1_6_activation::quarantine_not_pending` read the worker status
+     right after delivering an invalid event over the legacy op. Since
+     WP2.3 that op only stages while the background activator runs, and
+     the activator quarantines the row moments later, so the check read 0.
+     It now waits up to 10 s for the row to be classified; the check is
+     unchanged.
+   - `qual_wp2_4_offlock::stale_convergence_worker` skipped until WP2.3's
+     activator existed. Running now, its writer (a local commit every 50 ms
+     for the whole run) makes every prepared ticket Stale, which §4.4 never
+     commits inline, so the slow events starved until the 2,400 s budget
+     (`QUAL_TIMEOUT`). It uses `stale_convergence`'s bursty writer (WP2.4
+     deviation 7) and converges in 65 s.
+7. **The `lock_hold_slow_event_2k` floor stays on the store-level
+   scenario.** WP2.4 suggested moving it to the `_worker` variant once
+   WP2.3 merged. That variant (max 56 ms, p99 20 ms) probes the engine
+   while a legacy `published-exchange` builds its page under the engine
+   lock (CCR-WP2.3-4, `fs_p99_during_legacy_catchup`), so it measures the
+   legacy op, not the off-lock slow path. Both are recorded.
 
 ## Fixes of review findings (packages not approved)
 
-| Package / finding | Fix | Test (fails without the fix) |
+| Package / finding | Fix | Test |
 |---|---|---|
 | WP2.1 **blocker**: four `legacy_stabilizers` tests fail (the full suite exits 101) | CCR-WP2.1-2 applied | the full suite (VERIFY) |
 | WP2.1 minor: the signal self-pipe is not close-on-exec atomically | Linux/Android `pipe2(O_CLOEXEC)`; elsewhere `pipe` + `FD_CLOEXEC` as before | `shutdown::platform::tests::a_full_signal_pipe_never_blocks_the_handler` (WSL) checks the flags |
 | WP2.1 minor: `watch_hang` acceptance | CCR-WP2.1-6 ratified | — |
 | WP2.1 minor (WP1.11's file): the hub latency test's precondition fails under load | deviation 3 | — |
 | WP2.3 **major**: `seal_forecast` parses up to 2 × 64 head payloads (peer events up to 8 MiB) under the engine lock before every slice | at most `FORECAST_ROWS` (8) head rows, and a payload is parsed only when `octet_length(payload) <= FORECAST_PAYLOAD` (64 KiB): `octet_length` reads no payload, and a larger event's branch counts as unknown (it caps nothing, so its seal may fall inside a normal slice, the documented cost of a branch not at the head). 64 × 1 MiB head rows: about 0.4 ms instead of about 90 ms (debug) | `w2_integration::the_seal_forecast_never_parses_large_payloads` (best of three < 25 ms; small rows are still read: a due branch at the head gives a one-event slice); `worker_concurrency` 22 unchanged and green |
-| WP2.3 **major**: `fs_p99_during_catchup` floor | qualification run below | — |
+| WP2.3 **major**: `fs_p99_during_catchup` floor not met on the shared machine | nothing to fix in code: the floor is **met** in the release qualification, 17.4 ms < 50 (*Qualification*) | the qualification scenario |
 | WP2.3 minor: maintenance and notifier threads end on a panic | each tick/round in `catch_unwind`: poison policy, log, a growing stop-aware delay (`Backoff::inbox`); fault point `worker.maintenance.tick.<repo>` | `worker_concurrency::a_panicking_maintenance_tick_is_contained` (checked failing with the containment removed) |
 | WP2.3 minor: `revalidate` waits 1 s for a pass that already ran | the wait also ends (polled every 10 ms) once no row is left to activate | existing `worker_concurrency` revalidate tests, `w1_integration` |
 | WP2.3 minor: `worker.activator.prepare` is process-global | scoped `worker.activator.prepare.<repo>` | `a_failed_slow_preparation_requeues_only_its_event` arms the scoped name |
 | WP2.5 **major**: the `feed_journal` build is one statement over the whole journal, without progress or a resume point (§9, I10, invariant 28) | table and triggers first; then `BACKFILL_CHUNK` (10,000) journal rows per transaction from the `feed_journal_v1_cursor` key, `startup_progress("indexing the feed")` per chunk, the `feed_journal_v1` marker at the end (the pattern of `objects::ensure_schema`). A table WP2.5's build made whole (no marker, no cursor) counts as complete; a new or dropped table starts from 0 | `w2_integration::the_feed_journal_backfill_resumes_from_its_cursor` (an interrupted build resumes from its cursor, rows built before are not rebuilt, private events stay out; a dropped table is rebuilt) |
-| WP2.5 minor: `feed_150k_events` not confirmed on a quiet machine | qualification run below | — |
+| WP2.5 minor: `feed_150k_events` not confirmed on a quiet machine | completed in the release qualification, at 951 events/s (158 s): within the 2,400 s scenario budget, not within the 120 s default (*Qualification*) | the qualification scenario |
 | WP2.5 minor: notes misdescribe `feed-offer` | not a code issue; left in the package notes (open issue) | — |
 
 ## Tests added
 
-`tests/w2_integration.rs` (new, 11 tests):
+`tests/w2_integration.rs` (new, 11 tests and 1 ignored interop test):
 
 | Test | What it checks |
 |---|---|
@@ -235,6 +258,7 @@ pins backward parsing.
 | `the_feed_journal_backfill_resumes_from_its_cursor` | WP2.5 major (fails on WP2.5's build) |
 | `the_seal_forecast_never_parses_large_payloads` | WP2.3 major |
 | `the_v3_stack_syncs_two_daemons_end_to_end` | Summary 5 |
+| `interop_wave_2_with_a_6298d0b_peer` (ignored; `TKFS_BASELINE_BIN`) | *Interoperability* |
 
 Elsewhere: `contracts::status_events_without_the_wave_2_members_parse`;
 `status_hub::{the_catalogs_display_name_labels_the_peer,
@@ -252,11 +276,132 @@ replaced the Supervisor has its own (`folder_controller`, `orchestrator_runtime`
 
 ## VERIFY
 
-(filled in below)
+Run on the tree of `7659915` (the product code and tests of every change
+above; later commits add the ignored interop test, the two qualification
+scenario fixes and these notes). Windows `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int`,
+WSL `CARGO_TARGET_DIR=$HOME/tkfs-target/wp2-int`. No other cargo, test or
+tkfs process ran on the machine during the suites.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo build --all-targets` | pass, no warnings |
+| `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` | **pass, SUITE_EXIT=0: 810 passed, 0 failed, 94 ignored** across 61 test binaries (`--no-fail-fast` so that a failure could not hide later binaries; with exit 0 it is the plain command's result) |
+| WSL `cargo check --all-targets` | pass (exit 0) |
+| WSL `cargo clippy --all-targets -- -D warnings` (extra: `cfg(unix)` code, the `pipe2` change) | pass (exit 0) |
+| WSL `cargo test --all-targets --no-fail-fast` (the whole suite; it contains §13 rule 8.2's subset: `orchestrator` 15, `session_core` 59, `session_handshake` 21, `worker_lifecycle` 25, `mount_lifecycle` 17 with `/dev/fuse`) | **pass, exit 0: 815 passed, 0 failed, 95 ignored** across 61 binaries; also `orchestrator_runtime` 13 (with `sigterm_runs_the_shutdown_sequence`), `w2_integration` 11 (the attach test over FUSE), lib 71 + 2 ignored |
+| Legacy fixtures (§13 rule 8.3) | `harness_selftest` 18 + 2 ignored (legacy worker and data-dir fixtures, compat goldens), `catalog_actor` 19 (the legacy data directory opens and upgrades; the downgrade view through `legacy_oracle`), `w1_integration::revalidate_requeues_quarantined_rows_and_reactivates_them` (the 6298d0b worker fixture, now with WP2.3's activator): pass on Windows and WSL |
+| Interoperability (§13 rule 8.4) | see *Interoperability*: 4 of 4 and 4 of 4 runs pass |
+
+**Per binary (Windows / WSL):** lib 65+2i / 71+2i, bin 4 / 0,
+acknowledgements 3, activation_inbox 21, additional 5, availability 13 /
+10, availability_index 21, basic_metadata 4, bulk_lanes 3, catalog_actor
+19, contracts 40, control_transactions 4, core 16, derive_oracle 11+2i,
+directory_progress 3, feed_v7 37, folder_controller 50, harness_selftest
+18+2i, inbound_v3 19, legacy_stabilizers 3+4i, management_api 27,
+meta_scheduler 24+1i, mount_lifecycle 11 / 17, offlock_commit 20+1i,
+oracle_smoke 4, orchestrator 15, orchestrator_runtime 13, paired_sync 9,
+partial_content 8, peer_supervisor 25, posix_metadata 3, recovery 6,
+replication_regressions 9, runtime_lanes 3, scalability 5, seam_stubs 7,
+session_core 59, session_handshake 21, startup_snapshots 8, status_hub 85,
+w1_integration 4+1i, w2_integration 11 (+1 ignored interop since
+`359355b`), worker_concurrency 23, worker_lifecycle 25, worker_process 22,
+worker_seams 4, and 15 qual binaries with 81 ignored scenarios on Windows
+(82 in WSL).
+
+**Count reconciliation.** WP1.INT's final tree: 599 passed, 84 ignored, 52
+binaries. Wave 2 adds 9 binaries: `orchestrator_runtime` 13,
+`management_api` 27, `worker_concurrency` 23 (22 + 1 here),
+`offlock_commit` 20, `feed_v7` 37, `peer_supervisor` 25, `meta_scheduler`
+24, `inbound_v3` 19, `w2_integration` 11 = 199; lib 52 → 65 (+13: WP2.1
++8, WP2.3 +5, WP2.4 +3, WP2.8 +1, minus the 4 `supervisor.rs` tests);
+`contracts` +1, `status_hub` +3, `seam_stubs` −1, `legacy_stabilizers` −4
+(ignored). 599 + 199 + 13 + 1 + 3 − 1 − 4 = **810**. Ignored: 84 +
+`legacy_stabilizers` 4 + `offlock_commit` 1 + `meta_scheduler` 1 + qual
+scenarios 4 (`qual_wp2_1_lifecycle` +1, `qual_wp2_3_worker` +1,
+`qual_wp2_4_offlock` +2) = **94**.
+
+**Stability.** `w2_integration` ran 3 times in a row on Windows (11/11 each,
+~7.6 s) and once in WSL; `peer_supervisor` 5 + 3 times after the merge fix
+and the protocol assertion; `meta_scheduler` 3 times after the `max_body`
+change; `worker_concurrency`'s new test was checked failing without its fix.
 
 ## Qualification (`test-evidence/qualification-wave-2.json`)
 
-(filled in below)
+**Runs.** `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int powershell -NoProfile
+-File scripts/qualify.ps1 -Wave 2 -BudgetS 2400 -FileTimeoutMin 150`
+(release; every wave 1 and wave 2 qual file; 5,303 s) on the clean tree
+`359355b` (the product code of `7659915`; its evidence was committed as
+`d1f7a31`). Three files were then
+re-run with `-Merge` on `d1f7a31` (clean; `dirty: false`) after the two
+scenario fixes of `d2f0fa8` (*Deviations* 6): `qual_wp1_6_activation`,
+`qual_wp1_9_session`, `qual_wp2_4_offlock`. The evidence is the merged
+file (`merged_from` names the first run). Hardware: AMD Ryzen 9 7950X3D
+(16 cores, 32 threads), 127.7 GB, Windows 11 Pro 10.0.26300. No other
+cargo, test or tkfs process ran; the machine was not idle, though (another
+user process held about one core throughout; see the A/B below).
+
+**Result: 51 scenarios: 49 pass, 1 skipped (`sigterm_matches_shutdown`,
+Unix-only: it passes in WSL, below), 1 fail; 27 floors evaluated, 26 pass,
+1 fails: `session_loopback_throughput` (a wave 1 floor; environmental, see
+below). `ok: false`, `enforced_failures: [session_loopback_throughput]`.**
+
+| Floor (wave 2) | Floor | Measured | Notes |
+|---|---|---|---|
+| `api_p99_under_churn` | List p99 < 100 ms | 2.33 | A crash-looping folder and a StopBlocked one |
+| `subscribe_latency` | ≤ 1,000 ms | 62.5 | measured against the real `subscribe` (WP2.1's branch reported `UNSUPPORTED` without WP2.2) |
+| `shutdown_busy_folder` | ≤ 30,000 ms | 100.3 | `left_running`, then adopted |
+| `fs_p99_during_catchup` | < 50 ms | **17.4** | WP2.3's open floor: met here, with WP2.4 merged (the review measured 55–62 ms on WP2.3's branch alone, under load). Not waived |
+| `status_latency_during_activation` | < 20 ms | 3.34 | |
+| `startup_with_5k_staged` | < 3,000 ms | 234 | drain 8.6 s, heartbeat `activated` 5,000 |
+| `lock_hold_slow_event_2k` | < 50 ms | 14.8 (first run 12.3) | `commit_prepared` 15.9 ms; the same event inline 107.8 ms |
+| `feed_150k_events` | completed | completed | **951 events/s** (158 s). WP2.5's notes read the floor against the default 120 s budget, which needs about 1,250 events/s: at this run's rate it would not finish in 120 s. The A/B below shows the machine about 1.8× slower than at WP1.INT's run |
+| `idle_exchange_50k_cpu` / `_bytes` | ≤ 10 ms/side, ≤ 4 KiB | 1.56 ms, 1,593 B | |
+| `large_event_8mib` | completed | completed | |
+
+Wave 1 floors in the same run: `remote_linear_create_2k` 0.80 ms/event,
+`remote_linear_create_10k` 1.77, `local_create_after_resolved_conflict`
+p90 1.69, `two_way_backlog_2k` 62.4 ms/event (≤ 100), `two_way_backlog_6400`
+226.1 (≤ 300), `concurrent_namespace_ops_5k` max 408.7 ms (≤ 500),
+`restart_ready_20k_objects` 1,179 ms, `content_status_50k` 0.09 ms,
+`tiny_pending_objects_12k` completed, `watch_latency` 1,012 ms,
+`session_slow_does_not_block_fast` 0.26 ms, `session_control_under_queued_data`
+45.0 ms, `legacy_hung_repo_healthy_progress` 697 ms (the rewritten
+scenario; ≤ 45,000), `legacy_interval_20s_reconnects` 0,
+`legacy_crash_backoff` 5 (≤ 5), and **`session_loopback_throughput` 273
+MiB/s (fails ≥ 300; first run 269)**.
+
+**The failing floor is the machine, not Wave 2.** Wave 2 does not change
+`src/session` (only `max_body`'s `objects.exchange` arm, which the
+streamed download does not use). A/B on the same machine, minutes apart,
+release, alternating: the wave 2 base (`ca7d8a9`, exported with `git
+archive`, its own target directory) measured 263 and 242 MiB/s (upload
+239/241, WSS 453/456); this tree 241 and 250 (upload 255/224, WSS
+453/444). WP1.INT measured 578/567 on the same base code. The derive floors
+show the same environment shift: `two_way_backlog_2k` measured 77.8
+ms/event on the base and 70.0 on this tree back to back (WP1.INT: 42.6),
+so the integration is not slower than its base, and the machine is about
+1.8× slower than during WP1.INT's run. The floor is **not waived**: it
+should be re-measured on a quiet machine before the wave 2 release point.
+
+Scenarios without a floor: `qual_wp1_4_worker` 5/5, `qual_wp1_5_mount` 3/3,
+`qual_wp1_6_activation::{quarantine_not_pending, transient_retry}`,
+`qual_wp1_8_objects::corrupt_mid_page_keeps_completed`,
+`qual_wp1_9_session::{dead_peer_detection, duplex_32mib, idle_60s}`,
+`qual_wp1_12_legacy::worker_busy_not_counted` (0 counted),
+`qual_wp2_1_lifecycle::{crash_loop_reaches_failed (17.4 s),
+adoption_after_daemon_kill (resumed 1.9 ms after Running),
+hung_worker_restarted (11.2 s), watch_hang_alone_is_not_unresponsive,
+mount_failure_end_to_end}`, `qual_wp2_3_worker::fs_p99_during_legacy_catchup`
+(382 ms, no floor: the legacy op's O(history) page build under the engine,
+CCR-WP2.3-4), `qual_wp2_4_offlock::{stale_convergence (41.4 s, 85 stale
+tickets), lock_hold_slow_event_2k_worker (max 56 ms, p99 20 ms: it probes
+during a legacy `published-exchange`, whose page build holds the engine;
+the floor stays on the store-level scenario, which isolates the slow
+path), stale_convergence_worker (65.4 s)}`, `qual_wp2_5_feed::{peer_restore,
+staged_events_not_resent}`. WSL, debug:
+`qual_wp2_1_lifecycle::sigterm_matches_shutdown` passes.
 
 ## Interoperability with 6298d0b (§13 rule 8.4)
 
@@ -312,3 +457,28 @@ headless folders and small files, debug builds, one old and one new daemon.
   `C:/tkfs-build/wp2-int-baseline-src` and its target
   `C:/tkfs-target/wp2-int-baseline`; they only served the interop runs and
   can be deleted.
+
+## Commits
+
+- merges: `41798b0` (WP2.1), `68f4a19` (WP2.2), `03a5a06` (WP2.3),
+  `a810831` (WP2.4), `eaa8e64` (WP2.5), `15cebb7` (WP2.6), `869b08e`
+  (WP2.7), `b8fa679` (WP2.8)
+- `24ed304` CCR-WP2.1-2 (`legacy_stabilizers` ignores)
+- `de69aa3` `peer_supervisor` waits for `PeerRemoved` (merge breakage)
+- `b28ebaf` task 1 (Supervisor and catalog_db deleted), CCR-WP2.2-1
+- `31c6e86` CCR-WP1.11-1, CCR-WP1.11-2, CCR-WP2.8-3
+- `3c35345` CCR-WP2.7-1 / CCR-WP2.8-1
+- `db73bb5` CCR-WP2.5-5
+- `761ea7f`, `4e36642` task 2 (`w2_integration`), CCR-WP2.3-1,
+  CCR-WP2.4-6, CCR-WP2.5-1
+- `894f8ea` WP2.5 review major (backfill)
+- `2f64972` WP2.3 review findings
+- `669d80f` WP2.1 review minor (signal pipe)
+- `7054d7c` `status_hub` latency precondition
+- `c2e0379` CCR-WP2.1-2 (qualification scenarios)
+- `583ee91` spec ratifications in REVAMP_PLAN
+- `7659915` the v3 stack end to end
+- `359355b` wave 2 interoperability test
+- `d2f0fa8` two qualification scenarios (deviation 6)
+- `d1f7a31` first qualification evidence and notes draft
+- the final commit: merged qualification evidence and these notes
