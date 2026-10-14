@@ -483,4 +483,4 @@ headless folders and small files, debug builds, one old and one new daemon.
 - `359355b` wave 2 interoperability test
 - `d2f0fa8` two qualification scenarios (deviation 6)
 - `d1f7a31` first qualification evidence and notes draft
-- the final commit: merged qualification evidence and these notes
+- `3cd5520` merged qualification evidence and these notes; then notes-only commits (the final VERIFY)
