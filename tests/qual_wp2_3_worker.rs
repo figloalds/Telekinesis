@@ -1,9 +1,13 @@
 //! Qualification scenarios for WP2.3 (background activation, status cell,
 //! maintenance, notifier). REVAMP_PLAN §14.6, §4.2, §4.4, §4.5.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP2.3"]`.
+//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP2.3"]`
+//! (kept ignored: `qualify.ps1` runs ignored scenarios only; WP2.3 makes them
+//! pass, release).
 //! Events reach the worker through its legacy `published-exchange` op (the path
-//! the bridged legacy lanes use in Wave 2).
+//! the bridged legacy lanes use in Wave 2). With the background activator the
+//! op only stages; the scenarios also check that it never answers
+//! `WORKER_BUSY` (WP2.3 acceptance).
 //! `cargo test --release --test qual_wp2_3_worker -- --ignored --test-threads=1 --nocapture`
 mod support;
 
@@ -20,7 +24,7 @@ use std::{
     time::Duration,
 };
 use support::*;
-use tkfs::core::{Event, Store, id};
+use tkfs::core::{Event, Store, id, inbox::StagedEvent};
 
 const FILE: &str = "qual_wp2_3_worker";
 
@@ -33,6 +37,11 @@ struct CatchUp {
     b_device: String,
     a_device: String,
     events: Vec<Event>,
+    /// A's committed shared inventory: what A's pages advertise as `known`,
+    /// as a real legacy lane's pages do (WP2.3: with `known` empty, every
+    /// exchange made B re-offer its whole history under the engine lock,
+    /// which measured the page builder, not activation).
+    known: BTreeSet<String>,
 }
 
 fn catch_up(n: usize) -> CatchUp {
@@ -55,30 +64,39 @@ fn catch_up(n: usize) -> CatchUp {
     sync_into(&a, &mut b, &allowed).unwrap();
     linear_history_named(&mut a, "catchup", n).unwrap();
     let events = metadata_bundle(&a, &b).unwrap().events;
+    let known = a.shared_event_inventory().unwrap();
     CatchUp {
         state,
         repo: repo.clone(),
         b_device: b.device.clone(),
         a_device: a.device.clone(),
         events,
+        known,
         _dir: dir,
     }
 }
 
-/// Progress of `deliver`: events in pages the worker accepted, and pages it
-/// refused (after retrying `BUSY` for 120 s) with the last error.
+/// Progress of `deliver`: events in pages the worker accepted, pages it
+/// refused (after retrying `BUSY` for 120 s) with the last error, and every
+/// `WORKER_BUSY` answer (retried, but counted: WP2.3 requires none while the
+/// activator runs).
 #[derive(Default)]
 struct Delivery {
     delivered: AtomicUsize,
     failed_pages: AtomicUsize,
+    busy_replies: AtomicUsize,
     last_error: Mutex<Option<String>>,
 }
 impl Delivery {
     fn delivered(&self) -> usize {
         self.delivered.load(Ordering::Relaxed)
     }
-    /// Every page accepted; otherwise the failure count and last error. A
-    /// refused page means the measured phase had less (or nothing) to activate.
+    fn busy(&self) -> usize {
+        self.busy_replies.load(Ordering::Relaxed)
+    }
+    /// Every page accepted and none answered `WORKER_BUSY`; otherwise the
+    /// counts and last error. A refused page means the measured phase had less
+    /// (or nothing) to activate.
     fn check(&self, s: &mut Scenario) {
         let failed = self.failed_pages.load(Ordering::Relaxed);
         let last = self.last_error.lock().unwrap().clone();
@@ -86,6 +104,28 @@ impl Delivery {
             failed == 0,
             format!("{failed} pages refused by published-exchange, last: {last:?}"),
         );
+        let busy = self.busy();
+        s.check(
+            busy == 0,
+            format!("{busy} published-exchange replies were WORKER_BUSY"),
+        );
+    }
+}
+
+/// One `published-exchange`, retrying `WORKER_BUSY` (counted) for up to 120 s.
+fn exchange(state: &Path, payload: &Value, progress: &Delivery) -> anyhow::Result<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        match rpc_at(state, payload.clone()) {
+            Err(e) if format!("{e:#}").contains("WORKER_BUSY") => {
+                progress.busy_replies.fetch_add(1, Ordering::Relaxed);
+                if std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            other => return other,
+        }
     }
 }
 
@@ -98,13 +138,12 @@ fn deliver(state: &Path, c: &CatchUp, stop: &AtomicBool, progress: &Delivery) {
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let body = legacy_page(&c.repo, &c.a_device, &c.b_device, page, &BTreeSet::new());
-        let reply = retry_busy(Duration::from_secs(120), || {
-            rpc_at(
-                state,
-                json!({"op":"published-exchange","route":route,"page":body,"metadata_only":true}),
-            )
-        });
+        let body = legacy_page(&c.repo, &c.a_device, &c.b_device, page, &c.known);
+        let reply = exchange(
+            state,
+            &json!({"op":"published-exchange","route":route,"page":body,"metadata_only":true}),
+            progress,
+        );
         match reply {
             Ok(_) => {
                 progress.delivered.fetch_add(page.len(), Ordering::Relaxed);
@@ -122,20 +161,84 @@ fn deliver(state: &Path, c: &CatchUp, stop: &AtomicBool, progress: &Delivery) {
         if pending == Some(0) {
             return;
         }
-        let body = legacy_page(&c.repo, &c.a_device, &c.b_device, &[], &BTreeSet::new());
-        let _ = rpc_at(
+        let body = legacy_page(&c.repo, &c.a_device, &c.b_device, &[], &c.known);
+        let _ = exchange(
             state,
-            json!({"op":"published-exchange","route":route,"page":body,"metadata_only":true}),
+            &json!({"op":"published-exchange","route":route,"page":body,"metadata_only":true}),
+            progress,
         );
         thread::sleep(Duration::from_millis(20));
     }
 }
 
-/// Filesystem operations on the mount stay fast while 2K remote events activate.
+/// Stage `events` on a secondary connection to B's store in pages of 64, the
+/// way feed exchanges stage (§6.3, WP2.5: `stage_incoming` on a pooled store,
+/// no engine lock), waking the activator after each page (`revalidate` with
+/// no ids only pokes it), then wait until nothing is pending.
+fn stage(state: &Path, c: &CatchUp, stop: &AtomicBool, progress: &Delivery) {
+    let store = Store::open_secondary(state, &c.repo, &c.b_device).unwrap();
+    let allowed: BTreeSet<String> = [c.a_device.clone(), c.b_device.clone()].into();
+    for page in c.events.chunks(64) {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let staged = store.stage_incoming(
+            page.iter()
+                .cloned()
+                .map(|event| StagedEvent {
+                    event,
+                    source: Some((c.a_device.clone(), 0)),
+                })
+                .collect(),
+            &allowed,
+        );
+        match staged {
+            Ok(outcome) if outcome.rejected.is_empty() => {
+                progress.delivered.fetch_add(page.len(), Ordering::Relaxed);
+            }
+            other => {
+                progress.failed_pages.fetch_add(1, Ordering::Relaxed);
+                *progress.last_error.lock().unwrap() = Some(format!("{other:?}"));
+            }
+        }
+        let _ = rpc_at(state, json!({"op":"revalidate","ids":[]}));
+    }
+    while !stop.load(Ordering::Relaxed) {
+        let pending = rpc_at(state, json!({"op":"status"}))
+            .ok()
+            .and_then(|s| s["incoming_pending"].as_i64());
+        if pending == Some(0) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Filesystem operations on the mount stay fast while 2K remote events
+/// activate (floor `fs_p99_during_catchup`). The events are staged the way
+/// Wave 2+ deliveries reach the activator, without the engine lock (`stage`):
+/// the legacy `published-exchange` builds its whole reply page under the
+/// engine lock (O(history) per call, §4.2 "unchanged semantics"; about 40 ms
+/// per call at 2K events), so a legacy-fed catch-up measures that page
+/// builder rather than activation. That variant is reported, without a
+/// floor, by `fs_p99_during_legacy_catchup`.
 #[test]
 #[ignore = "WP2.3"]
 fn fs_p99_during_catchup() {
-    let s = Scenario::new(FILE, "fs_p99_during_catchup");
+    fs_scenario("fs_p99_during_catchup", "fs_p99_ms", false);
+}
+
+/// The same catch-up fed through the legacy lanes' `published-exchange` (one
+/// page of 64 events per call, then empty exchanges until drained). Evidence
+/// only (no floor): the legacy op holds the engine for its page build.
+#[test]
+#[ignore = "WP2.3"]
+fn fs_p99_during_legacy_catchup() {
+    fs_scenario("fs_p99_during_legacy_catchup", "fs_p99_legacy_ms", true);
+}
+
+fn fs_scenario(name: &str, metric: &str, legacy_lane: bool) {
+    let s = Scenario::new(FILE, name);
     if !mount_supported() {
         return s.skip("no mount support");
     }
@@ -154,7 +257,13 @@ fn fs_p99_during_catchup() {
     s.measure_from_now();
     let feeder = {
         let (stop, progress, c) = (stop.clone(), progress.clone(), c.clone());
-        thread::spawn(move || deliver(&c.state.clone(), &c, &stop, &progress))
+        thread::spawn(move || {
+            if legacy_lane {
+                deliver(&c.state.clone(), &c, &stop, &progress)
+            } else {
+                stage(&c.state.clone(), &c, &stop, &progress)
+            }
+        })
     };
     let mut samples = vec![];
     let mut fs_errors = 0usize;
@@ -187,15 +296,20 @@ fn fs_p99_during_catchup() {
     let timed_out = !feeder.is_finished();
     stop.store(true, Ordering::Relaxed);
     let _ = feeder.join();
+    // The engine-lock gauges of the worker's heartbeat (longest hold, wait p99).
+    let engine = worker
+        .rpc(json!({"op":"watch","after_seq":0,"wait_ms":0}))
+        .map(|hb| hb["engine"].clone())
+        .unwrap_or(Value::Null);
     // Only successful operations are timed: with none (mount not attached,
     // files unreadable) the p99 is NaN and fails its floor; errors fail too.
     let summary = summarize(&samples);
     s.metric_with(
-        "fs_p99_ms",
+        metric,
         summary.p99,
         "ms",
         json!({"fs": summary.json(), "fs_errors": fs_errors, "delivered": progress.delivered(),
-            "events": c.events.len()}),
+            "busy_replies": progress.busy(), "events": c.events.len(), "engine": engine}),
     );
     s.check(!samples.is_empty(), "at least one FS operation measured");
     s.check(
@@ -225,17 +339,25 @@ fn status_latency_during_activation() {
         let (stop, progress, c) = (stop.clone(), progress.clone(), c.clone());
         thread::spawn(move || deliver(&c.state.clone(), &c, &stop, &progress))
     };
+    // One persistent connection, as the orchestrator's pooled worker client
+    // calls (a new WebSocket per call would time the handshake).
+    let info: tkfs::runtime::Discovery =
+        serde_json::from_slice(&fs::read(c.state.join("runtime.json")).unwrap()).unwrap();
+    let mut lane = tkfs::runtime::RpcLane::default();
     let mut samples = vec![];
+    let mut slowest: Vec<(f64, f64)> = vec![];
     let mut busy = 0;
     let mut missing_counts = 0;
     let mut status_errors = 0usize;
     let mut last_status_error = None;
     // At least one status call, even if the feeder finishes first.
     while samples.len() + status_errors == 0 || (!feeder.is_finished() && !s.over_budget()) {
-        let (r, ms) = time_ms(|| worker.rpc(json!({"op":"status"})));
+        let offset = s.started.elapsed().as_secs_f64() * 1000.0;
+        let (r, ms) = time_ms(|| lane.call(&info, &id(), json!({"op":"status"})));
         match r {
             Ok(status) => {
                 samples.push(ms);
+                slowest.push((ms, offset));
                 if status["busy"] == true || status["stale"] == true {
                     busy += 1;
                 }
@@ -256,12 +378,18 @@ fn status_latency_during_activation() {
     // Only answered calls are timed: with none the p99 is NaN and fails its
     // floor; errors fail too.
     let summary = summarize(&samples);
+    // The three slowest replies, `(ms, at_ms)` from the start of the phase.
+    slowest.sort_by(|a, b| b.0.total_cmp(&a.0));
+    slowest.truncate(3);
     s.metric_with(
         "status_p99_ms",
         summary.p99,
         "ms",
-        json!({"status": summary.json(), "busy_replies": busy, "missing_counts": missing_counts,
-            "status_errors": status_errors, "delivered": progress.delivered()}),
+        // Not `status`: that key marks a scenario's status line in QUAL output.
+        json!({"status_rpc": summary.json(), "slowest_ms_at_ms": slowest,
+            "busy_status_replies": busy,
+            "missing_counts": missing_counts, "status_errors": status_errors,
+            "delivered": progress.delivered(), "busy_exchange_replies": progress.busy()}),
     );
     s.check(!samples.is_empty(), "at least one status reply measured");
     s.check(
@@ -323,5 +451,22 @@ fn startup_with_5k_staged() {
             pending(&worker)
         ));
     }
+    // The drain is the background activator's: its heartbeat counters moved.
+    let mut after = 0;
+    let mut activated = 0;
+    let moved = wait_until(Duration::from_secs(10), || {
+        let Ok(hb) = worker.rpc(json!({"op":"watch","after_seq":after,"wait_ms":2000})) else {
+            return false;
+        };
+        after = hb["seq"].as_u64().unwrap_or(after);
+        activated = hb["activation"]["activated"].as_u64().unwrap_or(0);
+        activated >= n as u64 && hb["inbox"]["ready"] == 0
+    });
+    s.metric("heartbeat_activated", activated as f64, "events");
+    s.check(
+        moved,
+        format!("heartbeat activation counters: {activated} of {n}"),
+    );
+    let _ = worker.stop();
     s.finish();
 }

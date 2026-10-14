@@ -1,7 +1,23 @@
 //! Engine state: open sessions and handles, pending-save recovery, and the
 //! filesystem/session operations used by the mount adapters and peer receive.
-use super::notify::namespace_notifications;
-use crate::core::*;
+//!
+//! WP2.3 (§4.4, §4.5):
+//! * [`Engine::after_activation`] runs after every activation (the background
+//!   activator's slices and slow commits, a legacy receive, `revalidate`): it
+//!   refreshes only the clean, non-writer sessions whose entity's content
+//!   revision changed, so a verified read handle survives unrelated receives
+//!   (the old receive path re-referenced every clean session, which re-hashed
+//!   it on its next read); and, while mounted, it queues the filesystem
+//!   notifications of the activated entities, computed from the `before`
+//!   projection (captured only while mounted, on Windows).
+//! * While a background activator runs (`background_activation`), a legacy
+//!   receive only stages (budget 0); the activator commits.
+//! * [`EngineVitals`] carries everything the lock-free status reply and the
+//!   heartbeat need from the engine: handles, dirty sessions, health,
+//!   notification state, the last sync observations, and a store revision
+//!   that moves whenever the engine's connection changed the database.
+use super::notify::{NotifyQueue, delta_notifications};
+use crate::core::{inbox::SliceBudget, *};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -9,8 +25,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 pub struct Session {
@@ -59,10 +76,51 @@ pub struct Engine {
     pub notification_error: Option<String>,
     /// Counters readable without the engine lock (heartbeat, status).
     pub vitals: Arc<EngineVitals>,
+    /// Set while a background activator runs (WP2.3): a legacy receive then
+    /// stages only (budget 0) and the activator commits.
+    pub background_activation: bool,
+    /// The bounded, coalescing queue the notifier thread delivers (§4.4,
+    /// WP2.3 task 7). [`Engine::queue_notifications`] fills it while mounted.
+    pub notify_queue: Arc<NotifyQueue>,
+    /// Per-entity backoff of [`Engine::retry_pending_due`].
+    retry_state: BTreeMap<String, RetryState>,
 }
 
+/// What one activation committed, for [`Engine::after_activation`].
+#[derive(Debug, Clone, Default)]
+pub struct ActivatedDelta {
+    /// Committed (or found already committed) event ids, in order.
+    pub ids: Vec<String>,
+    /// Every entity those events change.
+    pub entities: BTreeSet<String>,
+    /// Some event changes an entity's `location`, `alive` or `kind`.
+    pub namespace_changed: bool,
+    /// The active projection before the activation; captured only while
+    /// mounted (and only where notifications are delivered: Windows).
+    pub before: Option<Projection>,
+}
+
+/// The last sync observations of the legacy lanes (`Engine::last_sync`,
+/// `peer_sync`, `sync_peers`), published for the lock-free status reply.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SyncObservation {
+    pub last_sync: Option<Value>,
+    pub peers: BTreeMap<String, Value>,
+    pub sync_peers: BTreeSet<String>,
+}
+
+/// Per-entity retry backoff of a pending save (1 s → 60 s).
+#[derive(Debug, Clone, Copy)]
+struct RetryState {
+    failures: u32,
+    next_at: Instant,
+}
+/// Pending-save retry backoff (WP2.3 task 5).
+const RETRY_BASE: Duration = Duration::from_secs(1);
+const RETRY_CAP: Duration = Duration::from_secs(60);
+
 /// Engine counters published for readers that must not take the engine lock
-/// (the heartbeat and the busy `status` fallback, §4.5). Refreshed by
+/// (the heartbeat and the lock-free `status` reply, §4.5). Refreshed by
 /// `publish_observation`, by every tracked engine guard on release
 /// (`runtime::lock_engine_tracked`), and, for `pending_saves`, whenever a
 /// `pending_saves` row is written or deleted.
@@ -73,7 +131,41 @@ pub struct EngineVitals {
     pending_saves: AtomicU32,
     mounted: AtomicBool,
     health: Mutex<Option<String>>,
+    /// The engine connection's `total_changes` at the last refresh.
+    store_changes: AtomicU64,
+    /// Bumped whenever a refresh sees `total_changes` moved.
+    store_revision: AtomicU64,
+    /// Queued filesystem notifications (engine list plus notifier queue).
+    pending_notifications: AtomicU32,
+    notification_error: Mutex<Option<String>>,
+    /// The last sync observations and a cheap fingerprint of them.
+    sync: Mutex<(SyncFingerprint, Arc<SyncObservation>)>,
+    /// Clean sessions whose bytes were re-referenced after an activation
+    /// changed their content (each one is verified again on its next read).
+    session_reloads: AtomicU64,
+    /// The background activator holds the engine (a bounded slice).
+    activator_holding: AtomicBool,
+    /// `Engine::notifications` (control requests' notifications not yet
+    /// moved to the notifier's queue): the notifier takes the engine only
+    /// when some are waiting.
+    control_notifications: AtomicU32,
+    /// Completed engine holds of the worker's own background threads
+    /// (maintenance, notifier), marked by [`EngineVitals::background_hold`]:
+    /// the activator does not mistake them for filesystem or RPC load.
+    background_holds: AtomicU64,
+    /// A background thread holds the engine right now.
+    background_holding: AtomicBool,
+    /// `before` projections captured for notifications (an O(entries) clone
+    /// under the engine lock; only while mounted, on Windows).
+    captures: AtomicU64,
+    /// Background activator cycles (slice plus slow commit) begun (each
+    /// numbered by it; a cycle begins before it takes the engine), and the
+    /// number of the latest one that finished as an activation pass.
+    activator_cycles_begun: AtomicU64,
+    activator_cycles_finished: AtomicU64,
 }
+/// `(last_sync.at, last_sync.caught_up, peers, Σ peers.at, sync peers)`.
+type SyncFingerprint = (Option<u64>, bool, usize, u64, usize);
 impl EngineVitals {
     pub fn open_handles(&self) -> u32 {
         self.open_handles.load(Ordering::Relaxed)
@@ -101,6 +193,159 @@ impl EngineVitals {
                 error: ErrorWire::from_error(&anyhow::anyhow!(message)),
             },
         }
+    }
+    /// Moves (by at least one) whenever the engine's connection changed the
+    /// database since the previous refresh: activation, local writes through
+    /// the mount, control requests, receives. Feeds `generations.sync`.
+    pub fn store_revision(&self) -> u64 {
+        self.store_revision.load(Ordering::Relaxed)
+    }
+    /// Filesystem notifications not yet delivered.
+    pub fn pending_notifications(&self) -> u32 {
+        self.pending_notifications.load(Ordering::Relaxed)
+    }
+    /// The last notification delivery failure, if any.
+    pub fn notification_error(&self) -> Option<String> {
+        crate::util::lock::lock(&self.notification_error).clone()
+    }
+    /// The last sync observations of the legacy lanes.
+    pub fn sync_observation(&self) -> Arc<SyncObservation> {
+        crate::util::lock::lock(&self.sync).1.clone()
+    }
+    /// Sessions re-referenced (and so re-verified on their next read) after
+    /// an activation changed their entity's content.
+    pub fn session_reloads(&self) -> u64 {
+        self.session_reloads.load(Ordering::Relaxed)
+    }
+    /// Whether the background activator holds the engine right now (one
+    /// bounded slice or slow commit).
+    pub fn activator_holding(&self) -> bool {
+        self.activator_holding.load(Ordering::Relaxed)
+    }
+    /// Marks the activator's hold until the returned guard drops.
+    pub fn activator_hold(self: &Arc<Self>) -> ActivatorHold {
+        self.activator_holding.store(true, Ordering::Relaxed);
+        ActivatorHold {
+            vitals: self.clone(),
+        }
+    }
+    /// Control requests' notifications waiting in `Engine::notifications`.
+    pub fn control_notifications(&self) -> u32 {
+        self.control_notifications.load(Ordering::Relaxed)
+    }
+    /// Completed holds marked by [`EngineVitals::background_hold`].
+    pub fn background_holds(&self) -> u64 {
+        self.background_holds.load(Ordering::Relaxed)
+    }
+    /// Whether a background thread (maintenance, notifier) holds the engine.
+    pub fn background_holding(&self) -> bool {
+        self.background_holding.load(Ordering::Relaxed)
+    }
+    /// Marks a hold of the engine by one of the worker's own background
+    /// threads (maintenance, notifier) until the returned guard drops. Take
+    /// it right after the engine and drop it **before** the engine guard: a
+    /// hold is then counted here before the lock gauges count it, so
+    /// `gauges.holds - background_holds` never moves for it (the activator's
+    /// measure of other users, `worker::activator`).
+    pub fn background_hold(self: &Arc<Self>) -> BackgroundHold {
+        self.background_holding.store(true, Ordering::Relaxed);
+        BackgroundHold {
+            vitals: self.clone(),
+        }
+    }
+    /// `before` projections captured so far ([`Engine::capture_before`]).
+    pub fn captures(&self) -> u64 {
+        self.captures.load(Ordering::Relaxed)
+    }
+    /// Begins a background activator cycle, numbered one past every cycle
+    /// begun before it; it finishes when the returned guard drops, unless
+    /// [`ActivatorCycle::abandon`]ed. Begun before the cycle takes the engine,
+    /// so a cycle numbered past [`EngineVitals::activator_cycles`]`().0` sees
+    /// every row committed before that read.
+    pub fn activator_cycle(self: &Arc<Self>) -> ActivatorCycle {
+        let number = self.activator_cycles_begun.fetch_add(1, Ordering::SeqCst) + 1;
+        ActivatorCycle {
+            vitals: self.clone(),
+            number,
+            pass: true,
+        }
+    }
+    /// `(begun, finished)`: the background activator cycles begun, and the
+    /// number of the latest cycle that finished as an activation pass. A
+    /// cycle that began after a read of `begun` ran a whole pass once
+    /// `finished > begun` (cycles run one at a time, on the activator
+    /// thread); an abandoned cycle never satisfies that, nor delays it.
+    pub fn activator_cycles(&self) -> (u64, u64) {
+        (
+            self.activator_cycles_begun.load(Ordering::SeqCst),
+            self.activator_cycles_finished.load(Ordering::SeqCst),
+        )
+    }
+    /// After a notifier round, which no longer takes the engine when no
+    /// control notification waits: the queue's length and delivery error
+    /// (`Engine::notification_error` is only ever cleared, so the queue's
+    /// error is the whole of it).
+    pub fn refresh_notify_queue(&self, queue: &NotifyQueue) {
+        self.pending_notifications.store(
+            count(self.control_notifications() as usize + queue.len()),
+            Ordering::Relaxed,
+        );
+        let error = queue.error();
+        let mut current = crate::util::lock::lock(&self.notification_error);
+        if *current != error {
+            *current = error;
+        }
+    }
+}
+
+/// Returned by [`EngineVitals::activator_cycle`]: records the cycle as the
+/// latest finished pass on drop (also on an error or a panic), unless it was
+/// abandoned.
+pub struct ActivatorCycle {
+    vitals: Arc<EngineVitals>,
+    number: u64,
+    pass: bool,
+}
+impl ActivatorCycle {
+    /// The cycle did nothing (its slice found SQLite's writer held by
+    /// another connection and is retried): it is not an activation pass, so
+    /// a `revalidate` waiting for one keeps waiting.
+    pub fn abandon(mut self) {
+        self.pass = false;
+    }
+}
+impl Drop for ActivatorCycle {
+    fn drop(&mut self) {
+        if self.pass {
+            self.vitals
+                .activator_cycles_finished
+                .fetch_max(self.number, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Returned by [`EngineVitals::background_hold`]: counts the hold on drop.
+pub struct BackgroundHold {
+    vitals: Arc<EngineVitals>,
+}
+impl Drop for BackgroundHold {
+    fn drop(&mut self) {
+        self.vitals.background_holds.fetch_add(1, Ordering::Relaxed);
+        self.vitals
+            .background_holding
+            .store(false, Ordering::Relaxed);
+    }
+}
+
+/// Returned by [`EngineVitals::activator_hold`]: clears the mark on drop.
+pub struct ActivatorHold {
+    vitals: Arc<EngineVitals>,
+}
+impl Drop for ActivatorHold {
+    fn drop(&mut self) {
+        self.vitals
+            .activator_holding
+            .store(false, Ordering::Relaxed);
     }
 }
 fn count(n: usize) -> u32 {
@@ -142,6 +387,9 @@ impl Engine {
             notifications: vec![],
             notification_error: None,
             vitals: Arc::new(EngineVitals::default()),
+            background_activation: false,
+            notify_queue: Arc::new(NotifyQueue::default()),
+            retry_state: BTreeMap::new(),
         };
         if let Err(error) = engine.load_pending() {
             engine.health = Some(format!("RECOVERY_REQUIRED: {error:#}"));
@@ -157,7 +405,9 @@ impl Engine {
             "open_handles":self.handles.len(),"unflushed_files":self.sessions.values().filter(|s|s.dirty).count(),
             "health":self.health,"sampled_at_ms":time(),"caught_up":false});
     }
-    /// Copies the cheap counters into [`EngineVitals`] (no SQL).
+    /// Copies the cheap counters into [`EngineVitals`] (no SQL: the store
+    /// revision compares the connection's `total_changes`, the sync
+    /// observations are cloned only when their fingerprint moved).
     pub fn refresh_vitals(&self) {
         let v = &self.vitals;
         v.open_handles
@@ -167,10 +417,223 @@ impl Engine {
             Ordering::Relaxed,
         );
         v.mounted.store(self.mounted, Ordering::Relaxed);
-        let mut health = crate::util::lock::lock(&v.health);
-        if *health != self.health {
-            health.clone_from(&self.health);
+        {
+            let mut health = crate::util::lock::lock(&v.health);
+            if *health != self.health {
+                health.clone_from(&self.health);
+            }
         }
+        let changes = self.store.db.total_changes();
+        if v.store_changes.swap(changes, Ordering::Relaxed) != changes {
+            v.store_revision.fetch_add(1, Ordering::Relaxed);
+        }
+        v.pending_notifications.store(
+            count(self.notifications.len() + self.notify_queue.len()),
+            Ordering::Relaxed,
+        );
+        v.control_notifications
+            .store(count(self.notifications.len()), Ordering::Relaxed);
+        {
+            let error = self
+                .notification_error
+                .clone()
+                .or_else(|| self.notify_queue.error());
+            let mut current = crate::util::lock::lock(&v.notification_error);
+            if *current != error {
+                *current = error;
+            }
+        }
+        let fingerprint: SyncFingerprint = (
+            self.last_sync.as_ref().and_then(|s| s["at"].as_u64()),
+            self.last_sync
+                .as_ref()
+                .is_some_and(|s| s["caught_up"] == true),
+            self.peer_sync.len(),
+            self.peer_sync
+                .values()
+                .filter_map(|s| s["at"].as_u64())
+                .fold(0u64, u64::wrapping_add),
+            self.sync_peers.len(),
+        );
+        let mut sync = crate::util::lock::lock(&v.sync);
+        if sync.0 != fingerprint {
+            *sync = (
+                fingerprint,
+                Arc::new(SyncObservation {
+                    last_sync: self.last_sync.clone(),
+                    peers: self.peer_sync.clone(),
+                    sync_peers: self.sync_peers.clone(),
+                }),
+            );
+        }
+    }
+    /// The active projection before an activation, when notifications will
+    /// be computed from it: mounted, on Windows (FUSE serves with zero TTLs
+    /// and needs none, §4.4). Only its entries are captured (all the
+    /// notification diff reads).
+    pub fn capture_before(&self) -> Option<Projection> {
+        if !(cfg!(windows) && self.mounted) {
+            return None;
+        }
+        self.vitals.captures.fetch_add(1, Ordering::Relaxed);
+        self.store.entries_snapshot().ok()
+    }
+    /// The [`ActivatedDelta`] of `ids` (point lookups of the committed
+    /// payloads; ids not in the journal are skipped).
+    pub fn activation_delta(
+        &self,
+        ids: &[String],
+        before: Option<Projection>,
+    ) -> Result<ActivatedDelta> {
+        #[derive(Deserialize)]
+        struct Light {
+            changes: Vec<LightChange>,
+        }
+        #[derive(Deserialize)]
+        struct LightChange {
+            entity: String,
+            field: String,
+        }
+        let mut delta = ActivatedDelta {
+            ids: ids.to_vec(),
+            before,
+            ..ActivatedDelta::default()
+        };
+        let mut statement = self
+            .store
+            .db
+            .prepare_cached("SELECT payload FROM events WHERE id=?")?;
+        for id in ids {
+            let payload: Option<String> =
+                rusqlite::OptionalExtension::optional(statement.query_row([id], |r| r.get(0)))?;
+            let Some(payload) = payload else { continue };
+            let light: Light = serde_json::from_str(&payload)?;
+            for change in light.changes {
+                delta.namespace_changed |=
+                    matches!(change.field.as_str(), "location" | "alive" | "kind");
+                delta.entities.insert(change.entity);
+            }
+        }
+        Ok(delta)
+    }
+    /// After an activation (WP2.3 task 3): refresh only the clean, non-writer
+    /// sessions whose entity's content revision changed (metadata follows the
+    /// canonical register for every activated entity's session); while
+    /// mounted, queue the notifications of the activated entities, computed
+    /// from `delta.before`. Never fails: the events are already committed, so
+    /// a session that cannot be re-referenced keeps its pinned bytes and the
+    /// failure is logged.
+    pub fn after_activation(&mut self, delta: &ActivatedDelta) {
+        if delta.entities.is_empty() {
+            return;
+        }
+        // Existing writer and mapping bases are deliberately pinned. Even a
+        // clean writer may have kernel-buffered writes not yet delivered here.
+        let writers: BTreeSet<&String> = self
+            .handles
+            .values()
+            .filter(|h| h.writable)
+            .map(|h| &h.entity)
+            .collect();
+        for entity in &delta.entities {
+            let Some(session) = self.sessions.get_mut(entity) else {
+                continue;
+            };
+            let Ok(entry) = self.store.entry(entity) else {
+                continue;
+            };
+            if !entry.alive {
+                continue;
+            }
+            // Metadata follows the canonical register without rebasing a
+            // writer's pinned content buffer or existence/content ancestry.
+            session.entry.basic = entry.basic;
+            if session.dirty || writers.contains(entity) {
+                continue;
+            }
+            let content = entry.revisions.get("content").cloned();
+            if content != session.content_base {
+                match crate::staging::Staged::from_object(&self.store, entry.content.as_deref()) {
+                    Ok(bytes) => {
+                        session.bytes = bytes;
+                        session.content_base = content;
+                        self.vitals.session_reloads.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        let wire = crate::model::errors::ErrorWire::from_error(&error);
+                        crate::util::log::event!(warn, (wire.code.as_str()), {
+                            "site": "engine.after_activation",
+                            "entity": entity,
+                            "message": wire.message,
+                        });
+                        continue;
+                    }
+                }
+            }
+            session.alive_base = entry.revisions.get("alive").cloned();
+        }
+        if let Some(before) = &delta.before {
+            self.notify_activation(before, &delta.entities, delta.namespace_changed);
+        }
+    }
+    /// Queues the notifications of activated `entities` while mounted,
+    /// computed from `before` (the active projection before those
+    /// activations; its entries are all that is read) and the current view.
+    pub fn notify_activation(
+        &mut self,
+        before: &Projection,
+        entities: &BTreeSet<String>,
+        namespace_changed: bool,
+    ) {
+        if !self.mounted || entities.is_empty() {
+            return;
+        }
+        let notifications = delta_notifications(before, &self.store, entities, namespace_changed);
+        self.queue_notifications(notifications);
+    }
+    /// Queues filesystem notifications for the notifier (coalesced, bounded;
+    /// overflow becomes one root invalidation). Dropped while not mounted.
+    pub fn queue_notifications(&mut self, notifications: Vec<(String, u32)>) {
+        if notifications.is_empty() {
+            return;
+        }
+        if self.mounted && !self.switching {
+            self.notify_queue.push(notifications);
+        }
+    }
+    /// Activates ready inbox rows under the caller's lock in bounded slices
+    /// (`max_events` attempts, `max_ms` in total; slow events inline), then
+    /// runs [`Engine::after_activation`]. Returns the activated ids. Used by
+    /// `revalidate`, which re-queues and then activates what is ready in the
+    /// same request (the legacy receive budget, WP1.INT task 1).
+    pub fn activate_bounded(&mut self, max_events: usize, max_ms: u64) -> Result<Vec<String>> {
+        let before = self.capture_before();
+        let started = Instant::now();
+        let mut activated = vec![];
+        let mut attempts = 0usize;
+        loop {
+            let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let slice = self.store.activate_slice(SliceBudget {
+                max_events: max_events.saturating_sub(attempts),
+                max_ms: max_ms.saturating_sub(spent),
+                inline_slow: true,
+            })?;
+            let tried = slice.activated.len() + slice.quarantined.len();
+            attempts += tried;
+            activated.extend(slice.activated);
+            if !slice.more
+                || tried == 0
+                || attempts >= max_events
+                || started.elapsed() >= Duration::from_millis(max_ms)
+            {
+                break;
+            }
+        }
+        if !activated.is_empty() {
+            let delta = self.activation_delta(&activated, before)?;
+            self.after_activation(&delta);
+        }
+        Ok(activated)
     }
     fn refresh_pending_saves(&self) {
         count_pending_saves(&self.store, &self.vitals);
@@ -409,6 +872,53 @@ impl Engine {
             self.sessions.remove(&entity);
         }
         Ok(())
+    }
+    /// [`Engine::retry_pending`] with a per-entity backoff (1 s → 60 s, WP2.3
+    /// task 5): each dirty, unreferenced session is tried when it is due; a
+    /// failure (the session stays retained) delays only that entity, and the
+    /// others are still tried. Returns how many were committed.
+    pub fn retry_pending_due(&mut self, now: Instant) -> usize {
+        self.retry_state
+            .retain(|entity, _| self.sessions.get(entity).is_some_and(|s| s.dirty));
+        let due: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.dirty && s.references == 0)
+            .map(|(id, _)| id.clone())
+            .filter(|id| self.retry_state.get(id).is_none_or(|s| s.next_at <= now))
+            .collect();
+        let mut committed = 0;
+        for entity in due {
+            match self.flush_entity(&entity) {
+                Ok(()) => {
+                    self.sessions.remove(&entity);
+                    self.retry_state.remove(&entity);
+                    committed += 1;
+                }
+                Err(error) => {
+                    let state = self
+                        .retry_state
+                        .entry(entity.clone())
+                        .or_insert(RetryState {
+                            failures: 0,
+                            next_at: now,
+                        });
+                    state.failures = state.failures.saturating_add(1);
+                    let delay = RETRY_BASE
+                        .saturating_mul(1u32 << state.failures.saturating_sub(1).min(6))
+                        .min(RETRY_CAP);
+                    state.next_at = now + delay;
+                    crate::util::log::event!(warn, PENDING_SAVE, {
+                        "site": "engine.retry_pending",
+                        "entity": entity,
+                        "failures": state.failures,
+                        "retry_in_ms": delay.as_millis() as u64,
+                        "message": format!("{error:#}"),
+                    });
+                }
+            }
+        }
+        committed
     }
     pub fn open(
         &mut self,
@@ -694,40 +1204,33 @@ impl Engine {
     ) -> Result<Vec<String>> {
         self.receive_peer_budget(bundle, allowed, None)
     }
+    /// A legacy receive: stage the bundle, activate up to `budget` events
+    /// (`None`: until nothing is ready), then [`Engine::after_activation`] for
+    /// what was activated. While a background activator runs
+    /// (`background_activation`), it only stages (budget 0): the activator
+    /// commits, off this caller's request (WP2.3 task 8).
     pub(crate) fn receive_peer_budget(
         &mut self,
         bundle: Bundle,
         allowed: &BTreeSet<String>,
         budget: Option<usize>,
     ) -> Result<Vec<String>> {
-        let before = self.store.projection(&self.store.active)?;
+        let budget = if self.background_activation {
+            Some(0)
+        } else {
+            budget
+        };
+        let before = if budget == Some(0) {
+            None
+        } else {
+            self.capture_before()
+        };
         let accepted = self.store.receive_with_budget(bundle, allowed, budget)?;
-        let after = self.store.projection(&self.store.active)?;
-        self.notifications
-            .extend(namespace_notifications(&before, &after));
-        // Existing writer and mapping bases are deliberately pinned. Even a
-        // clean writer may have kernel-buffered writes not yet delivered here.
-        let writers: BTreeSet<_> = self
-            .handles
-            .values()
-            .filter(|h| h.writable)
-            .map(|h| h.entity.clone())
-            .collect();
-        for (entity, session) in &mut self.sessions {
-            if let Some(entry) = after.entries.get(entity).filter(|e| e.alive) {
-                // Metadata follows the canonical register without rebasing a
-                // writer's pinned content buffer or existence/content ancestry.
-                session.entry.basic = entry.basic;
-            }
-            if !session.dirty
-                && !writers.contains(entity)
-                && let Some(entry) = after.entries.get(entity).filter(|e| e.alive)
-            {
-                session.bytes =
-                    crate::staging::Staged::from_object(&self.store, entry.content.as_deref())?;
-                session.content_base = entry.revisions.get("content").cloned();
-                session.alive_base = entry.revisions.get("alive").cloned();
-            }
+        // Staging alone commits nothing: the accepted ids are then only the
+        // events that were already committed, and no session can change.
+        if budget != Some(0) && !accepted.is_empty() {
+            let delta = self.activation_delta(&accepted, before)?;
+            self.after_activation(&delta);
         }
         Ok(accepted)
     }
