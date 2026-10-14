@@ -212,10 +212,15 @@ fn crash_backoff() {
         let _ = fs::remove_file(dir.join(name));
     }
     let log = dir.join("worker.log");
+    // One failed start per line naming the code. WP1.INT: since WP1.4 a
+    // failed start writes its `FatalLine` (code and message) plus a `fatal`
+    // log event repeating it, so count lines, not matches, and skip the log
+    // event (`"level":`).
     let count = || {
         fs::read_to_string(&log)
             .unwrap_or_default()
-            .matches("STATE_NOT_INITIALIZED")
+            .lines()
+            .filter(|line| line.contains("STATE_NOT_INITIALIZED") && !line.contains("\"level\":"))
             .count()
     };
     let before = count();
