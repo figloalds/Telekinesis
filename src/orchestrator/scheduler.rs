@@ -54,12 +54,21 @@
 //! | NeedsUserAction | recheck after 60 s, or on a reset | yes |
 //! | Incompatible, Fatal | recheck after 10 min, or on a reset | yes |
 //!
-//! A remote `retry_after_ms` lengthens the delay. A `Timeout` is uncertain:
+//! A remote `retry_after_ms` lengthens the delay, but only up to
+//! [`MAX_RETRY_AFTER`] (60 s, the Transient cap): a peer's hint never holds a
+//! key longer than that or the key's own recheck. A `Timeout` is uncertain:
 //! the next attempt is a fresh request, because the worker builds a new
 //! offer with a new id, and a request id is never sent twice (invariant 16).
 //! A session that is lost or going away (`ConnectionLost`, or the session
 //! refusing a call) charges no key. The scheduler then stops, and the
 //! PeerSupervisor redials.
+//!
+//! # Stopping
+//!
+//! While the daemon stops (`ctx.stopping`) nothing new is dispatched. A
+//! cancelled lane returns within [`EXIT_WAIT`] (+ ~50 ms), well inside the
+//! PeerSupervisor's 1 s runner join; exchanges still blocked in a worker call
+//! then end on their own and release their keys themselves.
 use super::{
     Config,
     meta_exchange::{self, ExchangeOptions},
@@ -112,9 +121,18 @@ pub const RECHECK_INCOMPATIBLE: Duration = limits::INCOMPATIBLE_RECHECK;
 /// of the key, such as a new worker or a new remote replica, retries sooner).
 pub const RECHECK_FATAL: Duration = limits::INCOMPATIBLE_RECHECK;
 /// How long a stopping scheduler waits for its exchanges in flight before it
-/// leaves them to finish on their own (the PeerSupervisor joins its lanes
-/// within `limits::PEER_JOIN`).
-pub const EXIT_WAIT: Duration = Duration::from_secs(3);
+/// leaves them to finish on their own. A closed session fails peer calls at
+/// once, so this only matters for a worker call in flight (up to 10 s, or
+/// 30 s on a bulk lane), which cannot be interrupted. The PeerSupervisor
+/// (WP2.6) joins a lane runner for 1 s after cancelling it and then detaches
+/// it, so the whole exit (this wait, plus the slot and watcher joins, which
+/// overlap it) stays well inside that (CCR-WP2.7-4).
+pub const EXIT_WAIT: Duration = Duration::from_millis(500);
+/// The longest delay a peer's `retry_after_ms` can impose on a key: the cap
+/// of the Transient backoff (§8). A larger (or absurd) value is clamped: the
+/// Contention, Backoff and Parked holds ignore triggers, so an unbounded hint
+/// could keep a key from running until a reset.
+pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Immediate re-runs in a row of exchanges that moved nothing (cursor
 /// recoveries) before the key waits for its interval.
 pub const QUICK_LIMIT: u32 = 2;
@@ -353,6 +371,8 @@ pub struct DriveOptions {
     pub recheck_fatal: Duration,
     /// See [`EXIT_WAIT`].
     pub exit_wait: Duration,
+    /// See [`MAX_RETRY_AFTER`].
+    pub max_retry_after: Duration,
     /// Where to publish the [`SchedulerView`] (none by default).
     pub view: Option<Arc<Snapshot<SchedulerView>>>,
 }
@@ -368,6 +388,7 @@ impl DriveOptions {
             recheck_incompatible: RECHECK_INCOMPATIBLE,
             recheck_fatal: RECHECK_FATAL,
             exit_wait: EXIT_WAIT,
+            max_retry_after: MAX_RETRY_AFTER,
             view: None,
         }
     }
@@ -378,6 +399,7 @@ impl DriveOptions {
             user_action: self.recheck_user_action,
             incompatible: self.recheck_incompatible,
             fatal: self.recheck_fatal,
+            max_asked: self.max_retry_after,
         }
     }
 }
@@ -658,7 +680,9 @@ impl<'a> Report<'a> {
     }
 
     /// Records `ExchangeFinished`. A failure carries the delay before the
-    /// key's next attempt as `retry_after_ms` (the hub's `backoff_until_ms`).
+    /// key's next attempt as `retry_after_ms` (the hub's `backoff_until_ms`):
+    /// the delay actually used, which already honours the peer's own
+    /// `retry_after_ms` up to [`MAX_RETRY_AFTER`].
     pub fn finish(
         self,
         result: Result<&Finished, &ExchangeError>,
@@ -670,9 +694,7 @@ impl<'a> Report<'a> {
             Err(failure) => {
                 let mut error = failure.wire();
                 if let Some(delay) = retry_after(failure) {
-                    let delay = ms(delay);
-                    error.retry_after_ms =
-                        Some(error.retry_after_ms.map_or(delay, |r| r.max(delay)));
+                    error.retry_after_ms = Some(ms(delay));
                 }
                 (false, Some(error), Finished::default())
             }
@@ -804,6 +826,8 @@ struct Policy {
     user_action: Duration,
     incompatible: Duration,
     fatal: Duration,
+    /// The bound of a peer's `retry_after_ms`.
+    max_asked: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -847,7 +871,9 @@ impl Retry {
     }
 
     fn verdict(&mut self, error: &ErrorWire, now: Instant, policy: &Policy) -> Verdict {
-        let asked = Duration::from_millis(error.retry_after_ms.unwrap_or(0));
+        // A peer's hint lengthens the delay, within bounds: holds other than
+        // Due, Idle and Waiting ignore triggers until they expire.
+        let asked = Duration::from_millis(error.retry_after_ms.unwrap_or(0)).min(policy.max_asked);
         match failure_kind(error) {
             FailureKind::Contention => Verdict::Contention(self.contention.failure(now).max(asked)),
             FailureKind::Waiting => Verdict::Waiting(policy.waiting.max(asked)),
@@ -976,6 +1002,8 @@ enum Wake {
 
 struct Done {
     repo: String,
+    /// The incarnation of the key that ran (`Key::order`).
+    order: u64,
     result: Result<Next, ExchangeError>,
     retry: Retry,
     verdict: Option<Verdict>,
@@ -1026,6 +1054,9 @@ impl Engine {
             let absorb = self.options.absorb;
             match self.keys.get_mut(&remote.repo) {
                 None => {
+                    // A new key (or one removed and back) starts afresh, even
+                    // if an exchange of its previous incarnation still runs.
+                    job.forget(&remote.repo);
                     self.order += 1;
                     self.keys.insert(
                         remote.repo.clone(),
@@ -1101,6 +1132,7 @@ impl Engine {
                 continue;
             };
             let activity = ActivityGuard::begin(activity_key);
+            let order = key.order;
             let target = key.target.clone();
             let retry = key.retry.clone();
             let policy = self.policy;
@@ -1141,6 +1173,7 @@ impl Engine {
                 drop(claim);
                 let _ = task_tx.send(Wake::Done(Box::new(Done {
                     repo: target.repo.clone(),
+                    order,
                     result,
                     retry,
                     verdict,
@@ -1162,7 +1195,17 @@ impl Engine {
     fn finish(&mut self, done: Done, now: Instant) {
         self.in_flight = self.in_flight.saturating_sub(1);
         self.finished += 1;
-        let Some(key) = self.keys.get_mut(&done.repo) else {
+        if done.result.as_ref().is_err_and(ExchangeError::session_lost) {
+            // Whichever key it was: no request can go out on this session.
+            self.session_gone = true;
+        }
+        // An exchange of a key that went away (or of an earlier incarnation of
+        // a key that came back) has nothing left to update.
+        let Some(key) = self
+            .keys
+            .get_mut(&done.repo)
+            .filter(|key| key.order == done.order)
+        else {
             return;
         };
         key.running = false;
@@ -1205,7 +1248,6 @@ impl Engine {
                 key.last_error = Some(error.clone());
                 if failure.session_lost() {
                     // Not the key's failure; the next session starts afresh.
-                    self.session_gone = true;
                     key.due = now;
                     key.hold = Hold::Due;
                     return;
@@ -1410,11 +1452,19 @@ pub(crate) fn drive(
         }
         let now = Instant::now();
         engine.refresh(ctx, peer, &*job, now);
-        if !ctx.stopping.load(Ordering::Relaxed) {
+        let stopping = ctx.stopping.load(Ordering::Relaxed);
+        if !stopping {
             engine.dispatch(&job, &mut pool, &tx, now);
         }
         engine.publish(now, false);
-        match rx.recv_timeout(engine.next_wake(Instant::now())) {
+        // While the daemon stops nothing is dispatched, so a due key must not
+        // shorten the wait (it would spin): wait for a wake-up or `MAX_WAIT`.
+        let wait = if stopping {
+            MAX_WAIT
+        } else {
+            engine.next_wake(Instant::now())
+        };
+        match rx.recv_timeout(wait) {
             Ok(Wake::Done(done)) => engine.finish(*done, Instant::now()),
             Ok(Wake::Changed) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Ok(Wake::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1424,7 +1474,8 @@ pub(crate) fn drive(
     // closed session fails them at once), then leave the rest to end on
     // their own (they release their claims themselves).
     watching.store(false, Ordering::Release);
-    let until = Instant::now() + options.exit_wait;
+    let stop_at = Instant::now();
+    let until = stop_at + options.exit_wait;
     while engine.in_flight > 0 {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -1438,7 +1489,9 @@ pub(crate) fn drive(
     }
     pool.stop(until.max(Instant::now() + Duration::from_millis(50)));
     if let Some(watcher) = watcher {
-        let until = Instant::now() + WATCH_SLICE * 2;
+        // It ends within one slice of `watching` going false; this wait
+        // overlaps the exit wait above.
+        let until = stop_at + WATCH_SLICE * 2;
         while !watcher.is_finished() && Instant::now() < until {
             thread::sleep(Duration::from_millis(5));
         }

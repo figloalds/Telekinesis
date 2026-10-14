@@ -165,6 +165,9 @@ impl FakeWorker {
                     serde_json::from_value(payload["lane"].clone()).unwrap();
                 let inventory: Option<Page> =
                     serde_json::from_value(payload["inventory"].clone()).unwrap();
+                if let Some(inventory) = &inventory {
+                    check_route(inventory, &route, lane)?;
+                }
                 let installed = self.installed.lock().unwrap().contains(&route.repo);
                 let mut page = page(
                     &route.repo,
@@ -181,7 +184,10 @@ impl FakeWorker {
                 Ok(json!(page))
             }
             "published-bulk-apply" => {
+                let lane: bulk_sync::Lane =
+                    serde_json::from_value(payload["lane"].clone()).unwrap();
                 let reply: Page = serde_json::from_value(payload["page"].clone()).unwrap();
+                check_route(&reply, &route, lane)?;
                 assert_eq!(payload["request"], json!(reply.reply_to.clone().unwrap()));
                 if reply.object_parts.contains_key(H_DOWN) {
                     self.installed.lock().unwrap().insert(route.repo.clone());
@@ -232,6 +238,36 @@ impl WorkerClient for FakeWorker {
             "BINARY_OPS_REQUIRE_SESSION: {op}"
         )))
     }
+}
+
+/// The real worker's check of a peer page (an inventory or a reply) against
+/// the route and lane of the call (`bulk_sync::Page::validate`): it comes
+/// from the remote replica, to us. `BULK_ROUTE_MISMATCH` is Fatal.
+fn check_route(page: &Page, route: &SyncRoute, lane: bulk_sync::Lane) -> Result<(), CallError> {
+    if page.lane != lane {
+        return Err(CallError::Remote(ErrorWire::coded(
+            "INCOMPATIBLE_BULK_LANE",
+            format!("page lane {:?}, call lane {lane:?}", page.lane),
+        )));
+    }
+    if page.repo != route.repo
+        || page.sender != route.remote_replica
+        || page.receiver != route.local_replica
+    {
+        return Err(CallError::Remote(ErrorWire::coded(
+            "BULK_ROUTE_MISMATCH",
+            format!(
+                "page {} -> {} for {}, route {} -> {} for {}",
+                page.sender,
+                page.receiver,
+                page.repo,
+                route.remote_replica,
+                route.local_replica,
+                route.repo
+            ),
+        )));
+    }
+    Ok(())
 }
 
 fn offer(route: &SyncRoute, request: &str) -> MetaExchangeRequest {
@@ -306,6 +342,8 @@ struct World {
     commands: Mutex<Vec<(String, FolderCmd)>>,
     /// A real StatusHub the events are also recorded into, when set.
     hub: OnceLock<Arc<StatusHub>>,
+    /// `FolderDirectory::by_repo` calls (one per key per scheduler turn).
+    lookups: AtomicUsize,
 }
 
 impl World {
@@ -316,6 +354,7 @@ impl World {
             events: Mutex::new(Vec::new()),
             commands: Mutex::new(Vec::new()),
             hub: OnceLock::new(),
+            lookups: AtomicUsize::new(0),
         })
     }
 
@@ -437,6 +476,7 @@ impl FolderDirectory for World {
         self.folders.load().get(state).cloned()
     }
     fn by_repo(&self, repo: &str) -> Option<Arc<FolderView>> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
         self.folders
             .load()
             .values()
@@ -1356,6 +1396,84 @@ fn waiting_states_and_contention_are_not_counted() {
     lane.stop();
 }
 
+/// A peer's `retry_after_ms` lengthens a key's delay only up to
+/// `DriveOptions::max_retry_after` (`MAX_RETRY_AFTER`, 60 s): an absurd value
+/// on a Contention, Transient or Fatal answer cannot hold the key for an hour
+/// (those holds ignore triggers). The reported `retry_after_ms` is the delay
+/// actually used.
+#[test]
+fn a_peer_retry_after_is_bounded() {
+    assert_eq!(scheduler::MAX_RETRY_AFTER, Duration::from_secs(60));
+    assert_eq!(
+        DriveOptions::new(4, Duration::from_secs(1)).max_retry_after,
+        scheduler::MAX_RETRY_AFTER
+    );
+    let world = World::new();
+    let repos = ["repo-a", "repo-b", "repo-c"];
+    for repo in repos {
+        world.put(folder(repo));
+    }
+    let ctx = ctx(&world, 60_000);
+    let peer = peer_ctx(
+        &ctx,
+        repos
+            .iter()
+            .map(|repo| entry(repo, EntryState::Running))
+            .collect(),
+    );
+    let meta = MetaPeer::new();
+    meta.always(
+        "repo-a",
+        Behave::Fail(ErrorWire::coded("BUSY", "handler queue full").with_retry_after(3_600_000)),
+    );
+    meta.always(
+        "repo-b",
+        Behave::Fail(
+            ErrorWire::coded("SQLITE_BUSY", "database is locked").with_retry_after(u64::MAX),
+        ),
+    );
+    meta.always(
+        "repo-c",
+        Behave::Fail(
+            ErrorWire::coded("UNBOUND_PEER_RESPONSE", "stale reply").with_retry_after(u64::MAX),
+        ),
+    );
+    let mut options = control_options(60_000, Duration::from_secs(2));
+    options.drive.max_retry_after = Duration::from_millis(300);
+    options.drive.recheck_fatal = Duration::from_millis(500);
+    let lane = start_control(&ctx, &peer, &meta, options);
+    assert!(wait_until(Duration::from_secs(3), || {
+        world.finished_of("repo-a").len() >= 4
+            && world.finished_of("repo-b").len() >= 2
+            && world.finished_of("repo-c").len() >= 3
+    }));
+    let retry = |fin: &Fin| fin.error.as_ref().unwrap().retry_after_ms.unwrap();
+    // Contention: max(backoff 50 ms → 1 s, the 300 ms bound).
+    let a = world.finished_of("repo-a");
+    assert_eq!(
+        a[..3].iter().map(retry).collect::<Vec<_>>(),
+        [300, 300, 300],
+        "{a:#?}"
+    );
+    assert!(a.iter().all(|fin| (300..=1_000).contains(&retry(fin))));
+    // Transient: the first backoff (1 s ± 20 %).
+    let b = world.finished_of("repo-b");
+    assert!((800..=1_200).contains(&retry(&b[0])), "{b:#?}");
+    let gap = b[1].at - b[0].at;
+    assert!(
+        gap >= Duration::from_millis(700) && gap < Duration::from_millis(1_600),
+        "{gap:?}"
+    );
+    // Fatal: parked for its recheck (here 500 ms), not for the peer's value.
+    let c = world.finished_of("repo-c");
+    assert!(c.iter().all(|fin| retry(fin) == 500), "{c:#?}");
+    assert_eq!(lane.key("repo-a").failures, 0);
+    assert!(lane.key("repo-a").contention >= 3);
+    assert!(lane.key("repo-b").failures >= 1);
+    assert!(lane.key("repo-c").failures >= 2);
+    lane.stop();
+}
+
 /// ≤ 4 exchanges in flight per peer, ≤ 1 per repository.
 #[test]
 fn at_most_four_exchanges_run_at_once_and_one_per_repo() {
@@ -1508,6 +1626,83 @@ fn the_own_echo_of_an_exchange_is_absorbed() {
         .count("feed-offer", "repo-a")
         == 3));
     lane.stop();
+}
+
+/// The trigger latency with the default `ABSORB` (3 s), pinned as the notes
+/// state it: a `generations.sync` bump on a repository with no local exchange
+/// in the last 3 s triggers within 100 ms; a bump inside the window (with the
+/// default 500 ms interval every bump is: an anti-entropy exchange ended less
+/// than 500 ms before) is taken for an echo, and the next anti-entropy
+/// exchange carries it, within the interval.
+#[test]
+fn with_the_default_absorb_window_a_bump_triggers_only_on_a_quiet_repository() {
+    assert_eq!(scheduler::ABSORB, Duration::from_secs(3));
+    // Quiet: one exchange at the start, then nothing (interval 60 s).
+    let quiet_world = World::new();
+    quiet_world.put(folder("repo-a"));
+    let quiet_ctx = ctx(&quiet_world, 60_000);
+    let quiet_peer = peer_ctx(&quiet_ctx, vec![entry("repo-a", EntryState::Running)]);
+    let quiet_meta = MetaPeer::new();
+    let options = control_options(60_000, Duration::from_secs(5));
+    assert_eq!(options.drive.absorb, scheduler::ABSORB);
+    let quiet = start_control(&quiet_ctx, &quiet_peer, &quiet_meta, options);
+    // Busy: the default configuration (`sync_interval_ms` 500).
+    let busy_world = World::new();
+    busy_world.put(folder("repo-a"));
+    let busy_ctx = ctx(&busy_world, Network::default().sync_interval_ms);
+    let busy_peer = peer_ctx(&busy_ctx, vec![entry("repo-a", EntryState::Running)]);
+    let busy_meta = MetaPeer::new();
+    let mut options = ControlOptions::for_config(&busy_ctx.config);
+    assert_eq!(options.drive.interval, Duration::from_millis(500));
+    assert_eq!(options.drive.absorb, scheduler::ABSORB);
+    options.drive.view = Some(Arc::new(Snapshot::new(SchedulerView::default())));
+    let busy = start_control(&busy_ctx, &busy_peer, &busy_meta, options);
+    let state = state_of("repo-a");
+
+    // Busy, three rounds: a bump right after an exchange ends waits for the
+    // next anti-entropy exchange.
+    for round in 0..3 {
+        let done = busy_world.finished_of("repo-a").len();
+        assert!(wait_until(Duration::from_secs(2), || busy_world
+            .finished_of("repo-a")
+            .len()
+            > done));
+        let ended = busy_world.finished_of("repo-a")[done].at;
+        busy_world.bump_sync(&state);
+        let bumped = Instant::now();
+        assert!(wait_until(Duration::from_secs(2), || busy_world
+            .worker
+            .count("feed-offer", "repo-a")
+            >= done + 2));
+        let next = busy_world.worker.calls("feed-offer", "repo-a")[done + 1].at;
+        assert!(
+            next - bumped >= Duration::from_millis(300),
+            "round {round}: the echo window let the bump trigger after {:?}",
+            next - bumped
+        );
+        assert!(
+            next - ended < Duration::from_millis(800),
+            "round {round}: anti-entropy came {:?} after the exchange",
+            next - ended
+        );
+    }
+
+    // Quiet: more than ABSORB after its only exchange, a bump triggers at once.
+    assert_eq!(quiet_world.finished_of("repo-a").len(), 1);
+    let ended = quiet_world.finished_of("repo-a")[0].at;
+    let calm = ended + scheduler::ABSORB + Duration::from_millis(200);
+    thread::sleep(calm.saturating_duration_since(Instant::now()));
+    assert_eq!(quiet_world.worker.count("feed-offer", "repo-a"), 1);
+    let bumped = Instant::now();
+    quiet_world.bump_sync(&state);
+    assert!(wait_until(Duration::from_secs(1), || quiet_world
+        .worker
+        .count("feed-offer", "repo-a")
+        == 2));
+    let latency = quiet_world.worker.calls("feed-offer", "repo-a")[1].at - bumped;
+    assert!(latency < Duration::from_millis(100), "{latency:?}");
+    quiet.stop();
+    busy.stop();
 }
 
 /// An idle key exchanges once per `sync_interval_ms`.
@@ -1782,6 +1977,89 @@ fn a_cancelled_lane_stops_promptly_and_its_successor_waits_for_the_old_exchange(
     lane2.stop();
 }
 
+/// While the daemon stops (`ctx.stopping`), nothing new is dispatched, and
+/// the loop sleeps instead of spinning on its due keys; cancellation still
+/// ends it at once.
+#[test]
+fn a_stopping_daemon_dispatches_nothing_and_the_lane_does_not_spin() {
+    let world = World::new();
+    world.put(folder("repo-a"));
+    world.put(folder("repo-b"));
+    let ctx = ctx(&world, 100);
+    ctx.stopping.store(true, Ordering::SeqCst);
+    let peer = peer_ctx(
+        &ctx,
+        vec![
+            entry("repo-a", EntryState::Running),
+            entry("repo-b", EntryState::Running),
+        ],
+    );
+    let meta = MetaPeer::new();
+    let mut lane = start_control(
+        &ctx,
+        &peer,
+        &meta,
+        control_options(100, Duration::from_secs(5)),
+    );
+    sleep_ms(1_200);
+    assert!(world.worker.calls.lock().unwrap().is_empty());
+    assert!(meta.seen("repo-a").is_empty() && meta.seen("repo-b").is_empty());
+    assert_eq!(lane.key("repo-a").phase, KeyPhase::Due);
+    // Each turn reads both folders once. A turn per second (and per change)
+    // is a few lookups; a spinning loop makes hundreds of thousands.
+    let lookups = world.lookups.load(Ordering::SeqCst);
+    assert!(lookups <= 20, "{lookups} folder lookups in 1.2 s");
+    let took = lane.cancel_and_join(Duration::from_secs(3));
+    assert!(
+        took < Duration::from_secs(1),
+        "the lane took {took:?} to stop"
+    );
+    lane.client.close();
+    lane.server.close();
+}
+
+/// CCR-WP2.7-4: with the default exit wait, a cancelled lane returns within
+/// WP2.6's 1 s runner join even while a worker call (which cannot be
+/// interrupted) is in flight. That exchange then ends on its own.
+#[test]
+fn a_cancelled_lane_returns_within_the_supervisor_join_budget() {
+    assert!(scheduler::EXIT_WAIT <= Duration::from_millis(500));
+    let world = World::new();
+    world.put(folder("repo-a"));
+    world.worker.script(|op, payload| {
+        if op == "feed-offer" && payload["route"]["repo"] == "repo-a" {
+            sleep_ms(2_000);
+        }
+        None
+    });
+    let ctx = ctx(&world, 60_000);
+    let peer = peer_ctx(&ctx, vec![entry("repo-a", EntryState::Running)]);
+    let meta = MetaPeer::new();
+    let options = control_options(60_000, Duration::from_secs(5));
+    assert_eq!(options.drive.exit_wait, scheduler::EXIT_WAIT);
+    let mut lane = start_control(&ctx, &peer, &meta, options);
+    assert!(wait_until(Duration::from_secs(2), || world
+        .worker
+        .count("feed-offer", "repo-a")
+        == 1));
+    let took = lane.cancel_and_join(Duration::from_secs(5));
+    assert!(
+        took < Duration::from_millis(900),
+        "the lane took {took:?} to stop"
+    );
+    assert!(lane.view().stopped);
+    // The supervisor closes the session; the detached exchange ends on its
+    // own once its worker call returns, without reaching the peer.
+    lane.client.close();
+    lane.server.close();
+    assert!(wait_until(Duration::from_secs(4), || world
+        .finished_of("repo-a")
+        .len()
+        == 1));
+    assert!(!world.finished_of("repo-a")[0].ok);
+    assert!(meta.seen("repo-a").is_empty());
+}
+
 /// A lane checks its session: the authenticated peer, the role, the bulk lane.
 #[test]
 fn lanes_refuse_a_session_of_the_wrong_role_or_peer() {
@@ -1908,6 +2186,10 @@ struct BulkPeer {
     down_hex: Mutex<Option<String>>,
     /// Stream the reply as 64 KiB body chunks instead of one body.
     stream: AtomicBool,
+    /// While set, requests wait (until cleared or cancelled) before replying.
+    hold: AtomicBool,
+    /// Requests waiting on `hold` now.
+    holding: AtomicUsize,
 }
 
 impl Handler for BulkPeer {
@@ -1918,6 +2200,13 @@ impl Handler for BulkPeer {
             .lock()
             .unwrap()
             .push((req.header.clone(), page.clone()));
+        if self.hold.load(Ordering::SeqCst) {
+            self.holding.fetch_add(1, Ordering::SeqCst);
+            while self.hold.load(Ordering::SeqCst) && !req.responder.cancelled() {
+                sleep_ms(5);
+            }
+            self.holding.fetch_sub(1, Ordering::SeqCst);
+        }
         let mut holds = self.holds_up.lock().unwrap();
         if page.object_parts.contains_key(H_UP) {
             holds.insert(page.repo.clone());
@@ -2142,6 +2431,176 @@ fn a_failing_bulk_repository_never_stalls_the_others() {
     );
     cancel.cancel();
     handle.join().unwrap();
+    client.close();
+    server.close();
+}
+
+/// A key reset while its exchange runs (the peer's replica changed) drops the
+/// cached inventory: the running exchange does not put the old replica's
+/// inventory back, so the next offer, to the new replica, is never refused
+/// (`BULK_ROUTE_MISMATCH` is Fatal and would park the key for 10 min). A
+/// repository removed and re-added while its exchange runs starts without an
+/// inventory as well. The fake worker checks every inventory and reply
+/// against the call's route, as `bulk_sync::worker_control` does.
+#[test]
+fn a_key_reset_during_a_bulk_exchange_drops_the_stale_inventory() {
+    let world = World::new();
+    world.put(folder("repo-a"));
+    let ctx = ctx(&world, 300);
+    let peer = peer_ctx(&ctx, vec![entry("repo-a", EntryState::Running)]);
+    let lane = LaneSpec::new(1, 2);
+    let bulk = Arc::new(BulkPeer::default());
+    bulk.hold.store(true, Ordering::SeqCst);
+    let (client, server) = session(
+        &ctx.installation,
+        PEER,
+        LaneRole::Bulk,
+        Some(lane),
+        bulk.clone(),
+    );
+    let mut options = BulkOptions::for_config(&ctx.config);
+    let view = Arc::new(Snapshot::new(SchedulerView::default()));
+    options.drive.view = Some(view.clone());
+    let cancel = Cancel::new();
+    let handle = {
+        let (ctx, peer, client, cancel) =
+            (ctx.clone(), peer.clone(), client.clone(), cancel.clone());
+        thread::spawn(move || objects::run_bulk_lane_with(ctx, peer, lane, client, cancel, options))
+    };
+    let offers = || world.worker.calls("published-bulk-offer", "repo-a");
+    let key = || view.load().key("repo-a").cloned();
+
+    // 1. The peer's replica changes while the first exchange (to the first
+    //    replica) is in flight.
+    assert!(wait_until(Duration::from_secs(2), || bulk
+        .holding
+        .load(Ordering::SeqCst)
+        == 1));
+    let replica2 = "remote-replica-2";
+    let mut moved = entry("repo-a", EntryState::Running);
+    moved.replica = replica2.into();
+    set_entry(&peer, moved.clone());
+    // The lane samples the catalog every 250 ms.
+    sleep_ms(700);
+    assert_eq!(key().unwrap().phase, KeyPhase::Running);
+    bulk.hold.store(false, Ordering::SeqCst);
+    // At once a fresh offer to the new replica, without the old replica's
+    // inventory (it learns the new one), then after the interval an offer
+    // with the new replica's inventory, which uploads `H_UP`, then idle.
+    assert!(wait_until(Duration::from_secs(5), || world
+        .finished_of("repo-a")
+        .len()
+        >= 4));
+    let fins = world.finished_of("repo-a");
+    assert!(fins.iter().all(|fin| fin.ok), "{fins:#?}");
+    let moved_objects: Vec<(u64, u64)> = fins[..4]
+        .iter()
+        .map(|fin| (fin.objects_down, fin.objects_up))
+        .collect();
+    assert_eq!(moved_objects, [(1, 0), (0, 0), (0, 1), (0, 0)]);
+    let sent = offers();
+    assert_eq!(
+        sent[0].payload["route"]["remote_replica"],
+        json!(replica_of("repo-a"))
+    );
+    for offer in &sent[1..] {
+        assert_eq!(offer.payload["route"]["remote_replica"], json!(replica2));
+    }
+    assert_eq!(
+        sent[1].payload["inventory"],
+        Value::Null,
+        "the old replica's inventory was reused"
+    );
+    let inventory: Page = serde_json::from_value(sent[2].payload["inventory"].clone()).unwrap();
+    assert_eq!(inventory.sender, replica2);
+    let receivers: Vec<String> = bulk
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, page)| page.receiver.clone())
+        .collect();
+    assert_eq!(receivers[0], replica_of("repo-a"));
+    assert!(receivers[1..].iter().all(|receiver| receiver == replica2));
+    assert_eq!(key().unwrap().failures, 0);
+
+    // 2. The repository is removed and re-added (same replica) while an
+    //    exchange runs: the re-added key starts without an inventory.
+    bulk.hold.store(true, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(2), || bulk
+        .holding
+        .load(Ordering::SeqCst)
+        == 1));
+    let held = offers().len();
+    assert!(!offers()[held - 1].payload["inventory"].is_null());
+    peer.catalog.update(|catalog| {
+        let mut catalog = catalog.clone();
+        catalog.generation += 1;
+        catalog.entries.retain(|entry| entry.repo != "repo-a");
+        catalog
+    });
+    assert!(wait_until(Duration::from_secs(2), || key().is_none()));
+    set_entry(&peer, moved.clone());
+    assert!(wait_until(Duration::from_secs(2), || key().is_some()));
+    // The old exchange still holds the repository: no second one at once.
+    sleep_ms(200);
+    assert_eq!(offers().len(), held);
+    bulk.hold.store(false, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(3), || offers().len() > held));
+    assert_eq!(
+        offers()[held].payload["inventory"],
+        Value::Null,
+        "the removed key's exchange put its inventory back"
+    );
+    sleep_ms(200);
+    let fins = world.finished_of("repo-a");
+    assert!(fins.iter().all(|fin| fin.ok), "{fins:#?}");
+    assert_eq!(key().unwrap().failures, 0);
+    cancel.cancel();
+    handle.join().unwrap();
+
+    // 3. The exchange itself never hands the worker an inventory of another
+    //    route or lane, whatever its caller passes.
+    let route = SyncRoute {
+        peer: PEER.into(),
+        repo: "repo-a".into(),
+        local_replica: device_of("repo-a"),
+        remote_replica: replica2.into(),
+    };
+    let page_lane = objects::page_lane(lane);
+    assert!(objects::fits(&inventory, &route, page_lane));
+    let stale = Page {
+        sender: replica_of("repo-a"),
+        ..inventory.clone()
+    };
+    assert!(!objects::fits(&stale, &route, page_lane));
+    let reversed = Page {
+        receiver: replica2.into(),
+        ..inventory.clone()
+    };
+    assert!(!objects::fits(&reversed, &route, page_lane));
+    let other_repo = Page {
+        repo: "repo-b".into(),
+        ..inventory.clone()
+    };
+    assert!(!objects::fits(&other_repo, &route, page_lane));
+    let other_lane = bulk_sync::Lane { index: 0, count: 2 };
+    assert!(!objects::fits(&inventory, &route, other_lane));
+    let before = offers().len();
+    let view_a = world.view(&state_of("repo-a")).unwrap();
+    objects::bulk_exchange(
+        &ctx,
+        &client,
+        &peer,
+        lane,
+        &view_a,
+        &moved,
+        Some(&stale),
+        &BulkOptions::for_config(&ctx.config),
+        &mut |_| None,
+    )
+    .unwrap();
+    assert_eq!(offers()[before].payload["inventory"], Value::Null);
     client.close();
     server.close();
 }
