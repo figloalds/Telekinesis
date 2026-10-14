@@ -1182,3 +1182,56 @@ fn a_received_mount_attaches_in_place_once_its_gate_is_satisfied() {
     assert!(alive(pid));
     assert!(mount.join("parent/child").is_dir());
 }
+
+/// A peer's `list` never waits for a worker: it is the published-catalog
+/// cache (§3.5, §3.8). With one folder's `published-summary` hung, `list`
+/// answers at once without that folder, and the folder reports
+/// `PUBLISHED_SUMMARY_FAILED` (`REQUEST_TIMEOUT`). Replaces WP1.12's timing of
+/// the `list` fan-out over hung workers (one 3 s deadline), which no longer
+/// exists.
+#[test]
+fn a_hung_published_summary_never_slows_list() {
+    let _serial = serial();
+    let mut a = Node::new();
+    let hung = a.create("Hung summary", true);
+    let healthy = a.create("Healthy", true);
+    a.restart_with_env(vec![
+        (
+            "TKFS_FAULT_POINT".into(),
+            "worker.rpc.published-summary".into(),
+        ),
+        ("TKFS_FAULT_ACTION".into(), "hang".into()),
+        ("TKFS_FAULT_SCOPE".into(), state_id(&hung)),
+    ]);
+    let hung_state = state_id(&hung);
+    a.wait_for("publication error", Duration::from_secs(30), || {
+        a.try_inspect(&hung_state).is_ok_and(|p| {
+            p["publication_error"].as_str().is_some_and(|e| {
+                e.contains("PUBLISHED_SUMMARY_FAILED") && e.contains("REQUEST_TIMEOUT")
+            })
+        })
+    });
+    assert_eq!(a.inspect(&hung_state)["running"], true);
+    let code = a.code();
+    let mut socket = ws::connect(&a.endpoint()).unwrap();
+    ws::call(
+        &mut socket,
+        &json!({"op":"pair","version":2,"code":code,"installation":tkfs::core::id(),"lane":"control"}),
+    )
+    .unwrap();
+    let mut samples = vec![];
+    for _ in 0..20 {
+        let (listed, ms) = time_ms(|| ws::call(&mut socket, &json!({"op":"list"})));
+        let repos: Vec<Value> = listed
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["repo"].clone())
+            .collect();
+        assert_eq!(repos, vec![healthy["repo"].clone()]);
+        samples.push(ms);
+    }
+    let summary = summarize(&samples);
+    assert!(summary.p99 < 250.0, "list p99 {} ms", summary.p99);
+}

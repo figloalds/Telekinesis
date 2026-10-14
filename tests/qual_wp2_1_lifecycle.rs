@@ -438,11 +438,18 @@ fn mount_failure_end_to_end() {
         s.timeout("folder never ran headless after the mount failure");
         return s.finish();
     }
+    // The status member follows the hub, which may still hold the heartbeat
+    // taken before the attach result for a moment (CCR-WP2.1-7).
+    let attach_failed = wait_until(Duration::from_secs(10), || {
+        a.try_inspect(&state).is_ok_and(|p| {
+            p["status"]["mount"]["state"]
+                .to_string()
+                .contains("attach_failed")
+        })
+    });
     let inspect = a.inspect(&state);
     s.check(
-        inspect["status"]["mount"]["state"]
-            .to_string()
-            .contains("attach_failed"),
+        attach_failed,
         format!("status.mount.state: {}", inspect["status"]["mount"]),
     );
     s.check(inspect["mounted"] == false, "not mounted");

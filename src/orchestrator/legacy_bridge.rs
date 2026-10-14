@@ -104,6 +104,14 @@ impl Drop for ActivityGuard {
     }
 }
 
+/// One running lane: its token and its thread (a thread that ended without
+/// being retired, for example by a panic, is reaped and the lane respawned,
+/// as the legacy run loop did).
+struct Lane {
+    cancel: Cancel,
+    thread: Option<JoinHandle<()>>,
+}
+
 /// The legacy network: `NetworkApi` (v2 pair, remote list, unpair) and the
 /// legacy JSON views. Create it with [`LegacyBridge::start`].
 pub struct LegacyBridge {
@@ -112,8 +120,8 @@ pub struct LegacyBridge {
     installation: String,
     links: Tracked<BTreeMap<String, LinkStatus>>,
     catalogs: Tracked<BTreeMap<String, Vec<PublishedState>>>,
-    /// Running lanes by link key, each with its own token.
-    lanes: Tracked<BTreeMap<String, Cancel>>,
+    /// Running lanes by link key, each with its own token and thread.
+    lanes: Tracked<BTreeMap<String, Lane>>,
     /// Configured peers (installation → endpoint), for `PeerConfigured` and
     /// `PeerRemoved`.
     configured: Tracked<BTreeMap<String, String>>,
@@ -225,7 +233,11 @@ impl LegacyBridge {
             };
             let catalog: Arc<dyn CatalogApi> = ctx.catalog.clone();
             let snapshot = catalog.snapshot();
-            if generation != Some(snapshot.generation) || self.dirty.swap(false, Ordering::AcqRel) {
+            let reaped = self.reap_finished();
+            if generation != Some(snapshot.generation)
+                || self.dirty.swap(false, Ordering::AcqRel)
+                || reaped
+            {
                 self.reconcile(&ctx, &snapshot);
                 generation = Some(snapshot.generation);
             }
@@ -233,6 +245,14 @@ impl LegacyBridge {
             catalog.wait_newer(snapshot.generation, WATCH_SLICE);
         }
         self.retire_all();
+    }
+
+    /// Drops lanes whose thread ended without being retired; `true` if any.
+    fn reap_finished(&self) -> bool {
+        let mut lanes = self.lanes.lock();
+        let before = lanes.len();
+        lanes.retain(|_, lane| lane.thread.as_ref().is_none_or(|t| !t.is_finished()));
+        lanes.len() != before
     }
 
     /// Spawns the lanes the catalog wants and cancels the others.
@@ -257,12 +277,22 @@ impl LegacyBridge {
                 .filter(|key| !wanted.contains_key(*key))
                 .cloned()
                 .collect();
-            let retired: Vec<Cancel> = gone.iter().filter_map(|key| lanes.remove(key)).collect();
+            let retired: Vec<Cancel> = gone
+                .iter()
+                .filter_map(|key| lanes.remove(key))
+                .map(|lane| lane.cancel)
+                .collect();
             let mut spawn: Vec<(String, LanePeer, usize, Cancel)> = Vec::new();
             for (key, (peer, lane)) in &wanted {
                 if !lanes.contains_key(key) {
                     let cancel = self.cancel.child();
-                    lanes.insert(key.clone(), cancel.clone());
+                    lanes.insert(
+                        key.clone(),
+                        Lane {
+                            cancel: cancel.clone(),
+                            thread: None,
+                        },
+                    );
                     spawn.push((key.clone(), peer.clone(), *lane, cancel));
                 }
             }
@@ -281,13 +311,20 @@ impl LegacyBridge {
                     let _guard = guard;
                     lanes::run_lane(bridge, lane_ctx, peer, lane, cancel);
                 });
-            if let Err(error) = spawned {
-                self.lanes.lock().remove(&key);
-                event!(error, NETWORK_NOT_READY, {
-                    "detail": "cannot start a legacy lane thread",
-                    "lane": key,
-                    "error": error.to_string(),
-                });
+            match spawned {
+                Ok(handle) => {
+                    if let Some(slot) = self.lanes.lock().get_mut(&key) {
+                        slot.thread = Some(handle);
+                    }
+                }
+                Err(error) => {
+                    self.lanes.lock().remove(&key);
+                    event!(error, NETWORK_NOT_READY, {
+                        "detail": "cannot start a legacy lane thread",
+                        "lane": key,
+                        "error": error.to_string(),
+                    });
+                }
             }
         }
         self.sync_configured(ctx, snapshot, live);
@@ -333,6 +370,7 @@ impl LegacyBridge {
     fn retire_all(&self) {
         let retired: Vec<Cancel> = std::mem::take(&mut *self.lanes.lock())
             .into_values()
+            .map(|lane| lane.cancel)
             .collect();
         for cancel in retired {
             cancel.cancel();
