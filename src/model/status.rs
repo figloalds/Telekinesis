@@ -37,7 +37,8 @@ pub mod policy {
     pub const ERROR_HISTORY: usize = 50;
     /// Activity ring entries.
     pub const ACTIVITY_RING: usize = 500;
-    /// The snapshot is rebuilt lazily at most this often.
+    /// The snapshot is rebuilt lazily at most 4 times in any 1 s window (this
+    /// interval on average); 2 rebuilds may be back to back. CCR-WP1.11-4.
     pub const SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_millis(250);
     /// Hub tick (rates, ETA, stall detection).
     pub const TICK: Duration = Duration::from_secs(1);

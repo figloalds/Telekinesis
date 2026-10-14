@@ -836,6 +836,11 @@ pub enum ProcessEvent {
 pub type ProcessSink = Arc<dyn Fn(ProcessEvent) + Send + Sync>;
 
 /// A launched or adopted worker process.
+///
+/// Dropping a `Box<dyn WorkerProcess>` never kills the process and never
+/// waits for it: workers outlive the daemon (invariant 8), Shutdown's
+/// `left_running` workers and abandoned adoption handles rely on it. Only
+/// [`WorkerProcess::kill`] ends a process (CCR-WP1.2-3).
 pub trait WorkerProcess: Send {
     fn pid(&self) -> u32;
     /// Kills the process after re-verifying its identity.
