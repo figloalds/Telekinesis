@@ -672,7 +672,7 @@ off len  field
 8+n m    body: raw bytes (≤ 1 MiB; 0 for HELLO/AUTH/HEARTBEAT/GOAWAY/CANCEL/PROGRESS)
 ```
 
-- Bodies larger than 1 MiB are sent as REQUEST/RESPONSE with `MORE`, followed by CHUNK frames, and reassembled up to the per-op `max_body`: 16 MiB for `meta.exchange`, 1 MiB for others.
+- Bodies larger than 1 MiB are sent as REQUEST/RESPONSE with `MORE`, followed by CHUNK frames, and reassembled up to the per-op `max_body`: 16 MiB for `meta.exchange` and the interim `objects.exchange` (CCR-WP2.7-1 / CCR-WP2.8-1, applied in WP2.INT), 1 MiB for others.
 - Streaming ops (`objects.pull` responses, `objects.push` requests) deliver CHUNK frames to callbacks instead of reassembling them.
 - Trailing bytes, unknown kinds, oversize headers and bodies, and a non-zero reserved field are protocol errors and close the connection.
 
@@ -722,6 +722,11 @@ The code never crosses the wire, and replaying a captured proof fails because th
 | `objects.wants` | bulk | 10 s | `ObjectsWantsRequest` | `[WantItem]` |
 | `objects.push` | bulk | idle 30 s | `ObjectsPush` header + CHUNK stream | `ObjectsResult` |
 | `objects.report` | bulk | 10 s | `ObjectsReport{repo, sender, hash, code}` | `{}` |
+
+**Framing** (CCR-WP2.6-1, CCR-WP2.7-2, CCR-WP2.8-2; ratified in WP2.INT). Readers parse a non-empty body before the header.
+- `catalog.list`: the request is the header. The reply is the header; when it would not fit a response header (above 63 KiB) it is the JSON body, with the header `{generation, unchanged:false, in_body:true}` and no `entries`, so a header-only reader fails instead of reading an empty catalog.
+- `meta.exchange`: request header `{repo}`, body the JSON `MetaExchangeRequest`; reply header `{repo}`, body the JSON `MetaExchangeReply`.
+- `objects.exchange` (interim): request header `{repo, lane}`, body the JSON page (the header is accepted when the body is empty); reply header `{repo}`, body the JSON page, or the page streamed as body CHUNK frames before the RESPONSE.
 
 ### 6.3 Metadata feed, format 7 (`model::protocol::feed`, WP2.5 worker side, WP2.7 orchestrator side)
 
@@ -828,7 +833,7 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 #### 6.3.6 Caught-up and gate view (per peer P)
 
 - **`metadata.caught_up`:** `feed_in(P).seq == P.tip && !more` and no inbox rows sourced from P in `ready|waiting|retry|unclassified`.
-- **`gate.caught_up`:** the above, plus no `blocked|quarantined` rows from P, no `feed_rejected` rows from P, and `P.state.pending_active == 0`.
+- **`gate.caught_up`:** the above, plus no `blocked|quarantined` rows from P, no `feed_rejected` rows from P, and `P.state.pending_active == 0`. `GateView.caught_up` is this full gate claim, and `GateView.blocked` means blocked, quarantined or rejected rows from P exist (CCR-WP2.7-5, ratified in WP2.INT): the FolderController reads `caught_up && !blocked` as satisfied and `caught_up && blocked` as the Blocked gate.
 - **`waiting_on`:** human-readable reasons, for example `"412 events remaining at source"`, `"3 events waiting for missing parents"`, `"source has 1 unactivated event"`, `"2 events quarantined"`.
 
 #### 6.3.7 Cost
@@ -947,10 +952,14 @@ pub struct LaneStatus { pub lane: u32, pub role: LaneRole, pub direction: Direct
 pub struct ActivityEntry { pub at_ms: u64, pub kind: String, pub folder: Option<String>, pub peer: Option<String>, pub message: String }
 pub enum StatusEvent {
     FolderLifecycle(Box<FolderView>), WorkerHeartbeat { state: String, hb: Arc<WorkerHeartbeat> }, FolderRemoved { state: String },
-    PeerConfigured { installation: String, endpoint: String }, PeerRemoved { installation: String },
+    PeerConfigured { installation: String, endpoint: String,
+                     #[serde(default)] display_name: Option<String> },        // CCR-WP1.11-1 (WP2.INT)
+    PeerRemoved { installation: String },
     LaneState { installation: String, lane: u32, role: LaneRole, direction: Direction, state: LaneState,
-                error: Option<ErrorWire>, backoff_until_ms: Option<u64>, rtt_ms: Option<u64> },
-    ExchangeStarted { installation: String, repo: String, lane: u32, op: String, at_ms: u64 },
+                error: Option<ErrorWire>, backoff_until_ms: Option<u64>, rtt_ms: Option<u64>,
+                #[serde(default)] protocol: Option<String> },              // CCR-WP1.11-2 (WP2.INT): tkfs-peer/N while Ready
+    ExchangeStarted { installation: String, repo: String, lane: u32, op: String, at_ms: u64,
+                      #[serde(default)] direction: Direction },            // CCR-WP2.8-3 (WP2.INT): inbound starts on the inbound lane
     ExchangeFinished { installation: String, repo: String, lane: u32, op: String, direction: Direction, ok: bool,
                        error: Option<ErrorWire>, summary: Option<ExchangeSummary>, bytes_up: u64, bytes_down: u64,
                        objects_up: u64, objects_down: u64, duration_ms: u64 },
@@ -970,7 +979,7 @@ pub enum StatusEvent {
 | 1 | `Stopped` | lifecycle stopped and not desired |
 | 2 | `NeedsAttention` | NeedsUserAction or Fatal folder errors; mount `AttachFailed` NeedsUserAction; lifecycle `Failed` |
 | 3 | `Paused` | sync disabled |
-| 4 | `NotShared` | no peer's catalog lists the repo |
+| 4 | `NotShared` | no peer's catalog lists the repo. A configured outbound peer whose catalog has not been listed since the daemon started (catalogs are not persisted, §3.7) counts as possibly sharing while it is not Online (CCR-WP1.INT-5, ratified in WP2.INT) |
 | 5 | `Stalled` | any sharing peer is stalled |
 | 6 | `InitialSync` | gate awaiting |
 | 7 | transfer states | `Metadata`, `Downloading`, `Uploading`, or `Syncing` if mixed; summary "N of M peers" |
@@ -999,7 +1008,7 @@ Peers that do not share the repo are ignored.
 
 ### 7.3 Legacy compatibility projection (frozen semantics; goldens from WP0.5)
 
-List, Inspect and Peers keep their exact shapes and add a typed `status: FolderStatus` member to List and Inspect.
+List, Inspect and Peers keep their exact shapes and add a typed `status: FolderStatus` member to List and Inspect. That member describes the folder now: its `errors` are the open ones only; resolved history stays in `Status` (CCR-WP2.1-4, ratified in WP2.INT).
 
 | Field | Rule |
 |---|---|
@@ -2280,7 +2289,7 @@ The wire stays v2-compatible this wave: the bridged legacy lanes are the only ne
     - A reaches `Failed{CRASH_LOOP}` (status member);
     - Shutdown with B busy returns within 30 s with outcome `left_running`, exit 0, `desired_running` unchanged; the next start **adopts** B (same pid);
     - kill -9 the daemon → restart adopts the running worker, and sync resumes;
-    - `worker.watch_hang` → Unresponsive → restart, other folder unaffected;
+    - a frozen worker (`watch` and `hello` stall) → Unresponsive → restart, other folder unaffected; `worker.watch_hang` alone keeps the folder Running, because a worker that answers the `hello` probe is never killed (§3.3, invariant 8) (CCR-WP2.1-6, ratified in WP2.INT);
     - a pre-created non-empty mount path → folder Running headless, `mount.state=attach_failed`, sync works;
     - `received_mount_waits_for_complete_metadata_across_daemon_restart` passes with **in-place attach** (worker pid unchanged);
     - SIGTERM (WSL) and the Shutdown action produce identical outcomes, and `orchestrator.json` is removed;
