@@ -344,26 +344,30 @@ old `TrackedGuard` drop order: checked), `log_rate_windows_are_bounded`
 
 ## VERIFY
 
-All on the merged tree after the last product-code change (`8841d4a`).
-Later commits change only these notes, the evidence file and the restart
-counting of the ignored `qual_wp1_12_legacy::crash_backoff` scenario
-(`956c842`), after which fmt, build, clippy and the WSL check were run
-again (same results). Windows
+**Fix round 1** (final tree; the product code is that of `4e8faee`; later
+commits change only these notes and the evidence file). Windows
 `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int`, WSL
-`CARGO_TARGET_DIR=$HOME/tkfs-target/wp1-int`. No other agent's cargo or
-tkfs process was running on the machine when I checked before the runs.
+`CARGO_TARGET_DIR=$HOME/tkfs-target/wp1-int`. Before the timing-sensitive
+runs (the full suite, the qualification) I checked that no other cargo,
+test or tkfs process was running on the machine.
 
 | Check | Result |
 |---|---|
 | `cargo fmt --check` | pass (exit 0) |
 | `cargo build --all-targets` | pass, no warnings |
 | `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
-| `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **pass, SUITE_EXIT=0: 583 passed, 0 failed, 84 ignored** across 52 test binaries; no failing test, no retry |
-| WSL `cargo check --all-targets` | pass, no warnings |
-| WSL `cargo clippy --all-targets -- -D warnings` (extra: `cfg(unix)` code, `fuse_linux.rs`) | pass |
-| WSL `cargo test --all-targets --no-fail-fast` (the whole suite; it contains §13 rule 8's subset `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle`) | **pass, exit 0: 586 passed, 0 failed, 85 ignored** across 52 binaries. `/dev/fuse` and `fusermount3` present, so every FUSE scenario ran (`mount_lifecycle` 17) |
-| Legacy fixtures (§13 rule 8.3) | `harness_selftest::legacy_worker_fixture_opens_with_current_build`, `legacy_datadir_fixture_opens_with_current_build` and `compat_goldens_recapture_identically` pass on Windows and WSL; `catalog_actor::legacy_datadir_opens_equal_to_the_legacy_supervisor_view` passes; `w1_integration::revalidate_…` runs a real worker on the legacy worker fixture |
-| Interoperability (§13 rule 8.4) | pass, see below |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **pass, SUITE_EXIT=0: 588 passed, 0 failed, 84 ignored** across 52 test binaries (583 before the round + the 5 new tests) |
+| WSL `cargo check --all-targets` | pass (exit 0), no warnings |
+| WSL `cargo clippy --all-targets -- -D warnings` (extra: `cfg(unix)` code) | pass (exit 0) |
+| WSL `cargo test --all-targets --no-fail-fast` (the whole suite; it contains §13 rule 8.2's subset) | **pass, exit 0: 591 passed, 0 failed, 85 ignored** across 52 binaries (586 before the round + 5); `orchestrator` 15, `session_core` 55, `session_handshake` 21, `worker_lifecycle` 25, `mount_lifecycle` 17 (`/dev/fuse` present), `status_hub` 75, `w1_integration` 4 + 1 ignored, `activation_inbox` 21, `startup_snapshots` 8. The subset was also run once before the core change was committed, green |
+| Release fuzzers (CCR-WP1.INT-4 touches the commit path) | `derive_oracle::fuzz_300_seeds_release` (seeds 1000–1299): **pass** (2,592 s): 23,162 append, 11,841 verified, 29,410 restricted, 15 fallbacks (all "a touched cone lost a relevant event"), 35,018 commits checked, 0 refusals. `fuzz_stress_release` with WP1.7's seeds 5100–5103: **pass** (2,086 s): 674 append, 585 verified, 32 full, 0 fallbacks, 1,326 checked, 32 receiver-side `NAMESPACE_HISTORY_LIMIT` refusals each reproduced by full mode, 3 local refusals |
+| Legacy fixtures (§13 rule 8.3) | `harness_selftest` (legacy worker and datadir fixtures, compat goldens) 18 + 2 ignored, `catalog_actor` 19, `w1_integration::revalidate_…` on the legacy worker fixture: pass |
+| Interoperability (§13 rule 8.4) | `TKFS_BASELINE_BIN=C:/tkfs-target/wp1-int-baseline/debug/tkfs.exe cargo test --test w1_integration -- --include-ignored`: **5 of 5 pass** (11.7 s) on the final product code; no tkfs process left |
+
+Before fix round 1 (`8841d4a`'s product code): fmt, build and clippy
+passed; the full suite ran 583 passed, 0 failed, 84 ignored; WSL ran
+`cargo check` and the whole suite (586 passed, 85 ignored, `mount_lifecycle`
+17 with `/dev/fuse`) green.
 
 **Per binary (Windows / WSL):** lib 52+2i / 56+2i, bin 4 / 0,
 acknowledgements 3, activation_inbox 21, additional 5, availability 13 / 10,
@@ -373,8 +377,8 @@ directory_progress 3, folder_controller 50, harness_selftest 18+2i,
 legacy_stabilizers 7, mount_lifecycle 11 / 17, oracle_smoke 4,
 orchestrator 15, paired_sync 9, partial_content 8, posix_metadata 3,
 recovery 6, replication_regressions 9, runtime_lanes 3, scalability 5,
-seam_stubs 8, session_core 52, session_handshake 21, startup_snapshots 8,
-status_hub 74, w1_integration 3+1i, worker_lifecycle 25, worker_process 22,
+seam_stubs 8, session_core 55, session_handshake 21, startup_snapshots 8,
+status_hub 75, w1_integration 4+1i, worker_lifecycle 25, worker_process 22,
 worker_seams 4, and 15 qual binaries with 77 ignored scenarios on Windows
 (78 in WSL: `qual_wp1_5_mount::stale_owned_mount_recovered_after_crash` is
 Linux-only).
@@ -388,76 +392,66 @@ activation_inbox 21, derive_oracle 11, availability_index 21, session_core
 un-ignored mount-failure test), lib unit tests +38 (14 → 52), and WP1.INT's
 contracts +8 (31 → 39) and w1_integration 3. 199 + 384 = 583. Ignored:
 80 + derive_oracle 2 + lib 1 (WP1.7's memory probe) + w1_integration 1
-(interop) = 84.
+(interop) = 84. Fix round 1 adds session_core 3, status_hub 1 and
+w1_integration 1: 588 passed, 84 ignored (WSL 591 and 85).
 
 **Stability of the new tests.** `w1_integration` ran 5 times on Windows
 (3 of them with the interop test), all green.
 
 ## Qualification (`test-evidence/qualification-wave-1.json`)
 
-**Runs.** `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell -NoProfile -File
-scripts/qualify.ps1 -Wave 1 -BudgetS 2400 -FileTimeoutMin 150` (release, all
-seven wave 1 qual files, 2,121 s) on the clean tree `65543f0` (`dirty:
-false`). Its `qual_wp1_12_legacy::crash_backoff` failed on an integration
-breakage in the scenario (it counted `STATE_NOT_INITIALIZED` matches, 4 per
-failed start since WP1.4; fixed in `956c842` like the `legacy_stabilizers`
-test), so that file was re-run with `-Files qual_wp1_12_legacy -Merge` on
-`fb7275f` (`dirty: false`); the evidence keeps the other six files of the
-first run (`merged_from`). The budget is 2,400 s per scenario because the
-6.4K backlog alone takes about 24 minutes (WP1.7 used 1,800 s). Hardware:
-AMD Ryzen 9 7950X3D (16 cores, 32 threads), 127.7 GB, Windows 11 Pro
-10.0.26300, rustc 1.96.0; I ran nothing else on the machine during either
-run.
+**Run (fix round 1).** `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell
+-NoProfile -File scripts/qualify.ps1 -Wave 1 -BudgetS 2400 -FileTimeoutMin
+150` (release, all seven wave 1 qual files, one run, no merge, 1,543 s) on
+the clean tree `8b7bf02` (`dirty: false`; its code is that of `4e8faee`).
+Hardware: AMD Ryzen 9 7950X3D (16 cores, 32 threads), 127.7 GB, Windows 11
+Pro 10.0.26300, rustc 1.96.0; I checked that nothing else ran on the
+machine before it started and ran nothing during it. The evidence replaces
+the pre-round file (which `merged_from` an earlier run); `QUALIFY_EXIT=0`.
 
-**Result: 29 scenarios, 28 pass, 1 fail; 16 floors evaluated, 15 pass, 1
-fail (`concurrent_namespace_ops_5k`); `ok: false`.**
+**Result: 29 scenarios, 29 pass; 16 floors evaluated, 16 pass;
+`ok: true`, `enforced_failures: []`.**
 
-| Floor (wave 1) | Floor | Measured | Verdict | Wave 0 (`qualification-wave-0.json`, 60 s budget) |
+| Floor (wave 1) | Floor | Fix round 1 | Before the round | Wave 0 (60 s budget) |
 |---|---|---|---|---|
-| `remote_linear_create_2k` | ≤ 5 ms/event | 0.68 | pass | 175 (incomplete) |
-| `remote_linear_create_10k` | ≤ 5 ms/event | 1.94 (10,000 fast, 0 slow) | pass | 166 (incomplete) |
-| `local_create_after_resolved_conflict` | p90 ≤ 10 ms | 1.68 | pass | 27,841 (incomplete) |
-| `two_way_backlog_2k` | ≤ 100 ms/event | 60.9 (2,000 append, 0 fallbacks; oracle empty) | pass | 197 (incomplete) |
-| `two_way_backlog_6400` | ≤ 300 ms/event | 221.4 (6,400 append, 0 fallbacks) | pass | 187 (incomplete) |
-| `concurrent_namespace_ops_5k` | max ≤ 500 ms | **721.2** (p50 311, p90 347; 50 append, 0 fallbacks; derivation 17.9 ms/commit) | **fail** | 200,294 (incomplete) |
-| `restart_ready_20k_objects` | ≤ 3,000 ms | 1,004 (first open after build 3,534) | pass | 3,855 (fail) |
-| `content_status_50k` | < 50 ms | 0.07 warm (cold 511) | pass | 8,499 (fail) |
-| `tiny_pending_objects_12k` | completes | yes (302 objects/s) | pass | no (fail) |
-| `watch_latency` | ≤ 1,500 ms | 1,000.3 | pass | missing |
-| `session_slow_does_not_block_fast` | p99 < 50 ms | 0.18 | pass | 2,900 (fail) |
-| `session_control_under_queued_data` (CCR-WP1.9-3, new) | p99 < 50 ms | 40.3 | pass | — |
-| `session_loopback_throughput` | ≥ 300 MiB/s | 651 (WSS 508, upload 380) | pass | 26 (fail) |
-| `legacy_hung_repo_healthy_progress` | ≤ 45,000 ms | 3,096 | pass | incomplete |
-| `legacy_interval_20s_reconnects` | 0 | 0 | pass | 9 (fail) |
-| `legacy_crash_backoff` | ≤ 5 restarts in 20 s | 4 (re-run); 20 in the first run = 5 restarts × 4 matches | pass | 11 (fail) |
+| `remote_linear_create_2k` | ≤ 5 ms/event | 0.59 | 0.68 | 175 (incomplete) |
+| `remote_linear_create_10k` | ≤ 5 ms/event | 1.64 | 1.94 | 166 (incomplete) |
+| `local_create_after_resolved_conflict` | p90 ≤ 10 ms | 1.97 | 1.68 | 27,841 (incomplete) |
+| `two_way_backlog_2k` | ≤ 100 ms/event | 42.6 (2,000 append, 0 fallbacks; strict oracle empty) | 60.9 | 197 (incomplete) |
+| `two_way_backlog_6400` | ≤ 300 ms/event | 157.1 (6,400 append, 0 fallbacks) | 221.4 | 187 (incomplete) |
+| `concurrent_namespace_ops_5k` | max ≤ 500 ms | **311.6** (p50 225; 50 append, 0 fallbacks) | **721.2 (fail)** | 200,294 (incomplete) |
+| `restart_ready_20k_objects` | ≤ 3,000 ms | 972 (first open after build 3,445) | 1,004 | 3,855 (fail) |
+| `content_status_50k` | < 50 ms | 0.05 warm (cold 417) | 0.07 | 8,499 (fail) |
+| `tiny_pending_objects_12k` | completes | yes (321 objects/s) | yes (302) | no (fail) |
+| `watch_latency` | ≤ 1,500 ms | 1,000.5 | 1,000.3 | missing |
+| `session_slow_does_not_block_fast` | p99 < 50 ms | 0.15 | 0.18 | 2,900 (fail) |
+| `session_control_under_queued_data` | p99 < 50 ms | 38.1 | 40.3 | — |
+| `session_loopback_throughput` | ≥ 300 MiB/s | 697 (WSS 492, upload 597) | 651 | 26 (fail) |
+| `legacy_hung_repo_healthy_progress` | ≤ 45,000 ms | 3,034 | 3,096 | incomplete |
+| `legacy_interval_20s_reconnects` | 0 | 0 | 0 | 9 (fail) |
+| `legacy_crash_backoff` | ≤ 5 restarts in 20 s | 5 | 4 | 11 (fail) |
 
-Scenarios without a floor all pass: `qual_wp1_4_worker` 5/5 (accept loop,
-mount failure, poison exit 70, RPC before mount), `qual_wp1_5_mount` 3/3 on
-Windows (attach/detach/attach on one pid, force detach persists dirty data,
-foreign mount untouched), `qual_wp1_6_activation::{quarantine_not_pending,
+The two backlog floors, which run thousands of slow commits, also got
+faster (−30 %, −29 %): CCR-WP1.INT-4 removed a 7 MB write per slow commit at
+5K entries. `legacy_crash_backoff` measured 5, at its floor (4 before):
+with WP1.12's 1, 2, 4, 8 s backoff five starts fit in 20 s (at about 0, 1,
+3, 7 and 15 s), four when the window opens just after the first; the
+scenario and the supervisor are untouched by this round.
+
+Scenarios without a floor all pass: `qual_wp1_4_worker` 5/5,
+`qual_wp1_5_mount` 3/3 on Windows, `qual_wp1_6_activation::{quarantine_not_pending,
 transient_retry}`, `qual_wp1_8_objects::corrupt_mid_page_keeps_completed`,
 `qual_wp1_9_session::{dead_peer_detection (20.0 s), duplex_32mib, idle_60s}`,
-`qual_wp1_12_legacy::worker_busy_not_counted` (138 busy observed, 0
-counted). Extra, WSL release: `qual_wp1_5_mount` **4/4** including the
-Linux-only `stale_owned_mount_recovered_after_crash` (WP1.5's hand-off),
-and `qual_wp1_4_worker` 5/5.
+`qual_wp1_12_legacy::worker_busy_not_counted` (117 busy observed, 0
+counted).
 
-**The failing floor.** `concurrent_namespace_ops_5k` is a per-operation
-maximum. The merged tree is faster than WP1.7 measured alone (p50 311 ms
-against 374 ms: WP1.6's inbox no longer parses the journal per event), but
-1–3 of the 50 operations take 450–850 ms. A probe (the scenario's workload
-three times, per-op samples, not committed) showed the slow operations at
-random positions (not a warm-up): `[…, 451, …, 756, …, 564, …]`,
-`[…, 734, …, 685, …, 623, …]`, `[…, 456, …, 843, …, 587, …]`. With SQLite's
-WAL autocheckpoint disabled the median fell to ~250 ms but spikes of up to
-1.1 s remained, so they are not checkpoints alone: each slow-path commit
-rewrites `current_state` and, by design, force-seals the startup snapshot
-(both O(5K entries), `synchronous=FULL`), and the outliers track I/O
-latency. WP1.7's own review reproduced 546–579 ms before the merge. No
-derive.rs change helps (derivation is 18 ms of the 311); this stays an open
-acceptance item for the slow-path commit cost (CCR-WP1.6-1 seal cadence,
-WP2.4's off-lock prepare, and the O(N) `current_state` rewrite of slow
-commits).
+**Before the round** (`65543f0`, with `qual_wp1_12_legacy` re-run on
+`fb7275f`): 29 scenarios, 28 pass; 15 of 16 floors; `concurrent_namespace_ops_5k`
+failed at 721 ms (p50 311). The reason and the fix are in *Fix round 1*.
+Extra runs then (WSL release `qual_wp1_5_mount` 4/4 including the
+Linux-only `stale_owned_mount_recovered_after_crash`, and
+`qual_wp1_4_worker` 5/5) were not repeated: this round does not touch the
+mount or worker lifecycle code beyond the heartbeat's read order.
 
 ## Interoperability with 6298d0b (§13 rule 8.4)
 
@@ -535,4 +529,9 @@ mounted folders.
   (deviation 5); WP2.x can drop it once its tests call the plain oracle.
 - Build artefacts outside the repository: the 6298d0b source export
   `C:/tkfs-build/wp1-int-baseline-src` and its target
-  `C:/tkfs-target/wp1-int-baseline` (no git worktree was added).
+  `C:/tkfs-target/wp1-int-baseline` (no git worktree was added). Fix round 1
+  added the release targets `C:/tkfs-target/wp1-int-pre` (this branch before
+  the core change, `git archive` into the session scratchpad),
+  `C:/tkfs-target/wp1-int-wp17` (WP1.7's branch tip alone) and
+  `C:/tkfs-target/wp1-int-stress` (the stress fuzzer run beside the 300-seed
+  one); they only served the comparisons above and can be deleted.
