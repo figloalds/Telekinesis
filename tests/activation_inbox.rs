@@ -564,7 +564,9 @@ fn slow_events_yield_tickets_and_commit_prepared_commits_them() {
     assert_eq!(state_of(&b, &event.id).0.as_deref(), Some("ready"));
     let read = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
     let prepared = Store::prepare_slow(&read, &ticket).unwrap();
-    assert!(matches!(prepared, Prepared::Inline(_)));
+    // WP2.4 (CCR-WP2.4-1): the slow path is computed off-lock; this pinned
+    // the Wave 1 stub's `Prepared::Inline`.
+    assert!(matches!(&prepared, Prepared::Computed(p) if p.is_computed()));
     assert_eq!(
         b.commit_prepared(prepared).unwrap(),
         CommitOutcome::Committed {
