@@ -1,13 +1,224 @@
-//! Owned by WP2.5 — stub landed by WP0.INT
+//! Owned by WP2.5.
 //!
 //! Worker `feed-offer`, `feed-exchange` and `feed-apply` (REVAMP_PLAN §6.1,
-//! §6.3), served on pooled secondary stores without the engine lock. Until
-//! WP2.5 lands every op is `UNSUPPORTED_OPERATION`.
-use super::ctx::WorkerCtx;
-use anyhow::{Result, bail};
-use serde_json::Value;
+//! §6.3.5): the worker half of the format 7 metadata feed. Each op checks the
+//! route against this worker (codes as in `paired_sync::binding`), runs on a
+//! pooled secondary store (`ctx.sync_stores`) and never waits for the engine
+//! lock; afterwards it refreshes the peer's `ctx.sync_obs` counters, bumps
+//! `ctx.status_generation` and pokes `ctx.activation`.
+//!
+//! Replies are the typed `model` messages as JSON, with the `"event": null`
+//! and `"large": null` members of feed entries left out (both are
+//! `#[serde(default)]`): an elided entry is then about 90 bytes (seq, id and
+//! digest) instead of about 115 (CCR-WP2.5-3 asks the model to skip them).
+//!
+//! **Stand-in activation.** Staging never activates; WP2.3's background
+//! activator does, and sets `ctx.activator_running`. While no activator runs
+//! (a Wave 1 worker, or the in-process `start_rpc` wrapper), a feed exchange
+//! that left activatable rows, and nothing more to receive from the peer for
+//! now, activates them in one bounded pass, as the legacy lanes do: only if
+//! the engine lock is free (`try_lock_engine`, never a wait), at most
+//! [`STAND_IN_BUDGET`], and paused like the activator while its fault point
+//! (`worker.activator.slice`) is armed.
+use super::{ctx::WorkerCtx, try_lock_engine};
+use crate::{
+    core::{Bundle, Store, time},
+    model::{
+        errors::code_of,
+        ipc::{FeedApplyRequest, FeedExchangeReply, FeedExchangeRequest, FeedOfferRequest, ops},
+        protocol::feed::FeedApplyResult,
+    },
+    paired_sync::SyncRoute,
+    util::{fault, lock::lock},
+};
+use anyhow::{Result, anyhow, bail, ensure};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeSet,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
+
+/// The activator's fault point (named by WP2.3); armed, it also pauses the
+/// stand-in activation.
+const ACTIVATOR_POINT: &str = "worker.activator.slice";
+/// Activation work one feed RPC may do while no activator runs.
+pub const STAND_IN_BUDGET: Duration = Duration::from_millis(100);
+/// Attempts per stand-in slice (the legacy lanes' bound).
+const STAND_IN_SLICE: usize = 64;
 
 pub fn dispatch(ctx: &WorkerCtx, op: &str, payload: &Value) -> Result<Value> {
-    let _ = (ctx, payload);
-    bail!("UNSUPPORTED_OPERATION: {op}")
+    match op {
+        ops::FEED_OFFER => {
+            let FeedOfferRequest { route } = request(op, payload)?;
+            bind(ctx, &route)?;
+            let store = ctx.sync_stores.checkout()?;
+            wire(&store.build_exchange_request(&route)?)
+        }
+        ops::FEED_EXCHANGE => {
+            let FeedExchangeRequest { route, request } = request(op, payload)?;
+            bind(ctx, &route)?;
+            let (reply, local) = {
+                let store = ctx.sync_stores.checkout()?;
+                let result = store.handle_exchange_request(&route, &request)?;
+                observe(ctx, &store, &route, &result.1);
+                result
+            };
+            after_exchange(ctx, &local);
+            wire(&FeedExchangeReply { reply, local })
+        }
+        ops::FEED_APPLY => {
+            let FeedApplyRequest {
+                route,
+                request_id,
+                reply,
+            } = request(op, payload)?;
+            bind(ctx, &route)?;
+            let result = {
+                let store = ctx.sync_stores.checkout()?;
+                let result = store.apply_exchange_reply(&route, &request_id, &reply)?;
+                observe(ctx, &store, &route, &result);
+                result
+            };
+            after_exchange(ctx, &result);
+            Ok(json!(result))
+        }
+        _ => bail!("UNSUPPORTED_OPERATION: {op}"),
+    }
+}
+
+/// The op's typed request. A payload that does not parse is answered
+/// `UNSUPPORTED_OPERATION` (the answer the Wave 0 stub gave every feed op,
+/// which `tests/worker_lifecycle.rs` still pins for a route-less
+/// `feed-offer`; CCR-WP2.5-1 asks for `INVALID_REQUEST` instead).
+fn request<'a, T: Deserialize<'a>>(op: &str, payload: &'a Value) -> Result<T> {
+    T::deserialize(payload)
+        .map_err(|error| anyhow!("UNSUPPORTED_OPERATION: {op}: malformed request: {error}"))
+}
+
+/// The route must name this worker (`paired_sync::binding`'s codes).
+fn bind(ctx: &WorkerCtx, route: &SyncRoute) -> Result<()> {
+    ensure!(route.repo == ctx.repo, "REPOSITORY_MISMATCH");
+    ensure!(
+        route.local_replica == ctx.device,
+        "LOCAL_REPLICA_BINDING_MISMATCH"
+    );
+    ensure!(
+        route.local_replica != route.remote_replica,
+        "DUPLICATE_REPLICA_IDENTITY"
+    );
+    Ok(())
+}
+
+/// `value` as JSON with null `event`/`large` entry members left out.
+pub fn wire<T: Serialize>(value: &T) -> Result<Value> {
+    let mut value = serde_json::to_value(value)?;
+    compact(&mut value);
+    Ok(value)
+}
+
+/// Drops `"event": null` and `"large": null` from the feed entries of an
+/// exchange message: a request (`page`), a reply (`page`) or a
+/// `feed-exchange` answer (`reply.page`). Both members default to `None`.
+pub fn compact(value: &mut Value) {
+    compact_page(value.get_mut("page"));
+    compact_page(value.pointer_mut("/reply/page"));
+}
+
+fn compact_page(page: Option<&mut Value>) {
+    let Some(entries) = page
+        .and_then(|page| page.get_mut("entries"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in entries.iter_mut().filter_map(Value::as_object_mut) {
+        for key in ["event", "large"] {
+            if entry.get(key).is_some_and(Value::is_null) {
+                entry.remove(key);
+            }
+        }
+    }
+}
+
+/// Refresh the peer's counters in `ctx.sync_obs` (from the exchange result,
+/// stamped now) and mark the status cell stale. A failure here never fails
+/// the exchange.
+fn observe(ctx: &WorkerCtx, store: &Store, route: &SyncRoute, result: &FeedApplyResult) {
+    match store.feed_counters_after(&route.remote_replica, result) {
+        Ok(mut counters) => {
+            counters.last_exchange_ms = Some(time());
+            lock(&ctx.sync_obs).insert(route.remote_replica.clone(), counters);
+        }
+        Err(error) => {
+            crate::util::log::event!(warn, (code_of(&error).as_str()), {
+                "site": "worker.feed.counters",
+                "peer": route.remote_replica,
+                "message": format!("{error:#}"),
+            });
+        }
+    }
+    ctx.status_generation.fetch_add(1, Ordering::SeqCst);
+}
+
+fn after_exchange(ctx: &WorkerCtx, result: &FeedApplyResult) {
+    ctx.activation.poke();
+    // While the peer's feed still streams (a multi-page catch-up), staging
+    // goes first; the stand-in activates once nothing is left to receive.
+    if !ctx.activator_running.load(Ordering::SeqCst) && result.summary.to_receive == 0 {
+        stand_in_activation(ctx, result.summary.staged > 0);
+    }
+}
+
+/// Activate ready rows while no background activator runs (module docs):
+/// slices of [`STAND_IN_SLICE`] attempts through the engine (which also
+/// refreshes clean sessions and queues namespace notifications), for at
+/// most [`STAND_IN_BUDGET`].
+fn stand_in_activation(ctx: &WorkerCtx, staged: bool) {
+    if !staged && !activatable(ctx) {
+        return;
+    }
+    if fault::hit(ACTIVATOR_POINT).is_some() {
+        return;
+    }
+    let Some(mut engine) = try_lock_engine(&ctx.engine) else {
+        return;
+    };
+    let deadline = Instant::now() + STAND_IN_BUDGET;
+    loop {
+        let empty = Bundle {
+            repo: engine.store.repo.clone(),
+            branches: vec![],
+            events: vec![],
+            objects: Default::default(),
+        };
+        match engine.receive_peer_budget(empty, &BTreeSet::new(), Some(STAND_IN_SLICE)) {
+            Ok(activated) if !activated.is_empty() && Instant::now() < deadline => {}
+            Ok(_) => break,
+            Err(error) => {
+                crate::util::log::event!(warn, (code_of(&error).as_str()), {
+                    "site": "worker.feed.activation",
+                    "message": format!("{error:#}"),
+                });
+                break;
+            }
+        }
+    }
+}
+
+/// Whether a ready (or due retry) inbox row exists (a point query).
+fn activatable(ctx: &WorkerCtx) -> bool {
+    let Ok(store) = ctx.sync_stores.checkout() else {
+        return false;
+    };
+    store
+        .db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM incoming_events WHERE state='ready')
+                OR EXISTS(SELECT 1 FROM incoming_events WHERE state='retry' AND retry_at_ms<=?)",
+            [time() as i64],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
 }
