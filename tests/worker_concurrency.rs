@@ -1211,3 +1211,51 @@ fn status_follows_writes_through_the_mount() {
     }
     ctx.stopping.store(true, Ordering::SeqCst);
 }
+
+/// While another connection holds SQLite's writer (a feed exchange staging a
+/// page, its fsync on a busy disk), the activator does not wait for it under
+/// the engine lock: its slice gives up at once and is retried, so the
+/// filesystem keeps getting the engine (review WP2.3 fix round 1). The
+/// backlog activates once the writer is released.
+#[test]
+fn the_activator_never_waits_for_another_writer_under_the_engine_lock() {
+    let mut p = pair(2);
+    linear_history_named(&mut p.a, "writer", 40).unwrap();
+    let w = Worker::start(&p.state, false);
+    let committed = w.committed();
+    let events = p.events_after(
+        &w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .shared_event_inventory()
+            .unwrap(),
+    );
+    w.stage(&events, &p.allowed);
+    let writer = w.ctx.sync_stores.checkout().unwrap();
+    writer.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    worker::activator::try_spawn(w.ctx.clone()).unwrap();
+    // Engine waits, as a filesystem callback sees them, while the writer is
+    // held for 600 ms.
+    let held = Instant::now();
+    let mut longest = Duration::ZERO;
+    while held.elapsed() < Duration::from_millis(600) {
+        let asked = Instant::now();
+        drop(lock_engine(&w.engine));
+        longest = longest.max(asked.elapsed());
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        w.committed(),
+        committed,
+        "nothing commits behind the writer"
+    );
+    writer.db.execute_batch("COMMIT").unwrap();
+    drop(writer);
+    w.wait_drained(Duration::from_secs(60));
+    assert_eq!(w.committed(), committed + 40);
+    assert!(
+        longest < Duration::from_millis(250),
+        "the engine was held {longest:?} while another connection held the writer"
+    );
+}
