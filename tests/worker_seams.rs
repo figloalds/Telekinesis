@@ -74,7 +74,12 @@ fn retain_all_dirty_persists_every_dirty_session() {
             .unwrap()
             .starts_with("PENDING_SAVE: ")
     );
-    assert!(engine.quiet().is_err());
+    // The view stays busy because of the retained sessions themselves: five
+    // open handles, three unsaved files, and the retention health message.
+    assert_eq!(
+        engine.quiet().unwrap_err().to_string(),
+        "BUSY_VIEW: 5 open contexts, 3 unsaved files; PENDING_SAVE: DIRTY_SESSION_RETAINED"
+    );
     assert_eq!(content(&engine, "edited.txt"), b"committed v1");
     // Idempotent: a second pass rewrites the same rows.
     assert_eq!(engine.retain_all_dirty().unwrap(), 3);
@@ -111,6 +116,54 @@ fn retain_all_dirty_without_dirty_sessions_is_a_no_op() {
     assert!(pending_entities(&engine).is_empty());
     engine.close(h).unwrap();
     engine.quiet().unwrap();
+}
+
+/// `retain_all_dirty` attempts every dirty session even when some fail, keeps
+/// the ones it could retain, and reports `k of n` with the first failure.
+#[test]
+fn retain_all_dirty_reports_k_of_n_and_retains_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path(), Some("worker-seams")).unwrap());
+    let mut ids = Vec::new();
+    for (name, bytes) in [
+        ("a.txt", b"first" as &[u8]),
+        ("b.txt", b"second"),
+        ("c.txt", b"third"),
+    ] {
+        let (h, entry) = engine.open(name, Some("file"), true).unwrap();
+        engine.write(h, 0, bytes, false, false).unwrap();
+        ids.push(entry.id);
+    }
+    ids.sort();
+    // The session that sorts first fails, so a stop at the first failure
+    // would retain nothing.
+    let refused = ids[0].clone();
+    engine
+        .store
+        .db
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse_one BEFORE INSERT ON pending_saves WHEN NEW.entity='{refused}'              BEGIN SELECT RAISE(ABORT, 'refused by test'); END;"
+        ))
+        .unwrap();
+    let error = engine.retain_all_dirty().unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        message.starts_with("PENDING_SAVE_PERSIST_FAILED: 1 of 3 dirty sessions not retained"),
+        "{message}"
+    );
+    assert!(message.contains("refused by test"), "{message}");
+    assert_eq!(pending_entities(&engine), ids[1..].to_vec());
+    for id in &ids {
+        assert!(engine.sessions[id].dirty, "never committed");
+    }
+    // Once the cause is gone a second pass retains all three.
+    engine
+        .store
+        .db
+        .execute_batch("DROP TRIGGER refuse_one")
+        .unwrap();
+    assert_eq!(engine.retain_all_dirty().unwrap(), 3);
+    assert_eq!(pending_entities(&engine), ids);
 }
 
 #[test]

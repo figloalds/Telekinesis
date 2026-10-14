@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
 };
 
 pub struct Session {
@@ -54,6 +57,69 @@ pub struct Engine {
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
     pub notifications: Vec<(String, u32)>,
     pub notification_error: Option<String>,
+    /// Counters readable without the engine lock (heartbeat, status).
+    pub vitals: Arc<EngineVitals>,
+}
+
+/// Engine counters published for readers that must not take the engine lock
+/// (the heartbeat and the busy `status` fallback, §4.5). Refreshed by
+/// `publish_observation`, by every tracked engine guard on release
+/// (`runtime::lock_engine_tracked`), and, for `pending_saves`, whenever a
+/// `pending_saves` row is written or deleted.
+#[derive(Debug, Default)]
+pub struct EngineVitals {
+    open_handles: AtomicU32,
+    unflushed_files: AtomicU32,
+    pending_saves: AtomicU32,
+    mounted: AtomicBool,
+    health: Mutex<Option<String>>,
+}
+impl EngineVitals {
+    pub fn open_handles(&self) -> u32 {
+        self.open_handles.load(Ordering::Relaxed)
+    }
+    pub fn unflushed_files(&self) -> u32 {
+        self.unflushed_files.load(Ordering::Relaxed)
+    }
+    pub fn pending_saves(&self) -> u32 {
+        self.pending_saves.load(Ordering::Relaxed)
+    }
+    pub fn mounted(&self) -> bool {
+        self.mounted.load(Ordering::Relaxed)
+    }
+    /// The engine's `health` string (`None` when healthy).
+    pub fn health(&self) -> Option<String> {
+        crate::util::lock::lock(&self.health).clone()
+    }
+    /// Typed store health: any engine health message (a pending save that
+    /// could not be committed or recovered) degrades the store.
+    pub fn store_health(&self) -> crate::model::health::StoreHealth {
+        use crate::model::{errors::ErrorWire, health::StoreHealth};
+        match self.health() {
+            None => StoreHealth::Healthy,
+            Some(message) => StoreHealth::Degraded {
+                error: ErrorWire::from_error(&anyhow::anyhow!(message)),
+            },
+        }
+    }
+}
+fn count(n: usize) -> u32 {
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+/// Re-counts `pending_saves` rows into [`EngineVitals`]; called after every
+/// write or delete of a row. A failed count keeps the last value.
+fn count_pending_saves(store: &Store, vitals: &EngineVitals) {
+    if let Ok(rows) = store
+        .db
+        .query_row("SELECT count(*) FROM pending_saves", [], |row| {
+            row.get::<_, i64>(0)
+        })
+    {
+        vitals.pending_saves.store(
+            u32::try_from(rows.max(0)).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 impl Engine {
     pub fn new(store: Store) -> Self {
@@ -75,6 +141,7 @@ impl Engine {
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             notifications: vec![],
             notification_error: None,
+            vitals: Arc::new(EngineVitals::default()),
         };
         if let Err(error) = engine.load_pending() {
             engine.health = Some(format!("RECOVERY_REQUIRED: {error:#}"));
@@ -83,11 +150,30 @@ impl Engine {
         engine
     }
     pub fn publish_observation(&self) {
+        self.refresh_vitals();
         let branch = self.store.branch(&self.store.active).ok();
-        *self.observation.lock().unwrap() = json!({"repo":self.store.repo,"device":self.store.device,
+        *crate::util::lock::lock(&self.observation) = json!({"repo":self.store.repo,"device":self.store.device,
             "branch":branch,"generation":self.store.generation,"mounted":self.mounted,
             "open_handles":self.handles.len(),"unflushed_files":self.sessions.values().filter(|s|s.dirty).count(),
             "health":self.health,"sampled_at_ms":time(),"caught_up":false});
+    }
+    /// Copies the cheap counters into [`EngineVitals`] (no SQL).
+    pub fn refresh_vitals(&self) {
+        let v = &self.vitals;
+        v.open_handles
+            .store(count(self.handles.len()), Ordering::Relaxed);
+        v.unflushed_files.store(
+            count(self.sessions.values().filter(|s| s.dirty).count()),
+            Ordering::Relaxed,
+        );
+        v.mounted.store(self.mounted, Ordering::Relaxed);
+        let mut health = crate::util::lock::lock(&v.health);
+        if *health != self.health {
+            health.clone_from(&self.health);
+        }
+    }
+    fn refresh_pending_saves(&self) {
+        count_pending_saves(&self.store, &self.vitals);
     }
     fn load_pending(&mut self) -> Result<()> {
         self.store.db.execute_batch("CREATE TABLE IF NOT EXISTS pending_saves(entity TEXT PRIMARY KEY,payload TEXT NOT NULL)")?;
@@ -97,8 +183,11 @@ impl Engine {
             .prepare("SELECT payload FROM pending_saves")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        self.refresh_pending_saves();
         for record in records {
             crate::startup::progress("recovering pending saves");
+            // Qualification: slows recovery down to observe its progress.
+            crate::util::fault::hang("engine.recover_pending");
             let pending: PendingSave = serde_json::from_str(&record)?;
             ensure!(
                 pending.branch == self.store.active,
@@ -144,6 +233,7 @@ impl Engine {
         };
         self.store.db.execute("INSERT INTO pending_saves VALUES(?,?) ON CONFLICT(entity) DO UPDATE SET payload=excluded.payload",
             rusqlite::params![entity,serde_json::to_string(&record)?])?;
+        self.refresh_pending_saves();
         Ok(())
     }
     /// Persist every dirty session into `pending_saves` without committing it,
@@ -178,6 +268,57 @@ impl Engine {
             None => Ok(retained),
         }
     }
+    /// The poison hook (`runtime::lock_engine` under `PoisonPolicy::Exit`):
+    /// a thread panicked while holding the engine, possibly inside a
+    /// transaction. First roll back whatever transaction the connection still
+    /// has open (and every savepoint in it), so the `pending_saves` rows below
+    /// commit on their own instead of joining a transaction nobody will commit;
+    /// then [`Engine::retain_all_dirty`] (invariant 8).
+    ///
+    /// If that `ROLLBACK` fails, the half-done work of the panicked request is
+    /// never committed (it may break the store's own invariants): the
+    /// connection is closed instead, which discards its transaction, and a
+    /// fresh connection to the same database writes the rows. The rollback
+    /// failure is logged, and reported with any later failure. Only when no
+    /// usable connection remains is nothing retained (rows written into the
+    /// open transaction would be rolled back at exit anyway).
+    pub fn persist_after_poison(&mut self) -> Result<usize> {
+        let mut failed_rollback = None;
+        if !self.store.db.is_autocommit() {
+            let rolled_back = crate::util::fault::fail("engine.poison_rollback")
+                .and_then(|()| Ok(self.store.db.execute_batch("ROLLBACK")?));
+            if let Err(error) = rolled_back {
+                let error = error.context("cannot roll back the open transaction");
+                let wire = crate::model::errors::ErrorWire::from_error(&error);
+                crate::util::log::event!(warn, (wire.code.as_str()), {
+                    "site": "engine.poison",
+                    "message": wire.message,
+                });
+                self.replace_connection().with_context(|| {
+                    format!("PENDING_SAVE_PERSIST_FAILED: after a failed rollback ({error:#})")
+                })?;
+                failed_rollback = Some(error);
+            }
+        }
+        let retained = self.retain_all_dirty();
+        match failed_rollback {
+            Some(rollback) => {
+                retained.with_context(|| format!("after a failed rollback ({rollback:#})"))
+            }
+            None => retained,
+        }
+    }
+    /// Swaps the store's connection for a fresh one to the same database and
+    /// closes the old one, which rolls back whatever transaction it had open.
+    fn replace_connection(&mut self) -> Result<()> {
+        let fresh = rusqlite::Connection::open(self.store.root.join("metadata.sqlite"))?;
+        fresh.busy_timeout(std::time::Duration::from_secs(5))?;
+        fresh.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        let old = std::mem::replace(&mut self.store.db, fresh);
+        old.close()
+            .map_err(|(_, error)| error)
+            .context("cannot close the connection")
+    }
     fn flush_entity(&mut self, entity: &str) -> Result<()> {
         let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
         if !session.dirty {
@@ -188,9 +329,17 @@ impl Engine {
             [entity],
             |r| r.get(0),
         )?;
-        if pending {
-            self.store.db.execute_batch("SAVEPOINT staged_save")?;
-        }
+        // A retained save commits its write and the removal of its row
+        // together. From autocommit that transaction begins IMMEDIATE, taking
+        // SQLite's writer slot before the write reads the projection (as
+        // `Engine::control` does): a deferred read-then-write transaction fails
+        // at once with SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT when another connection
+        // (the bulk transfer view, a pooled secondary store) writes meanwhile.
+        let outer = if pending {
+            Some(begin_staged_save(&self.store.db)?)
+        } else {
+            None
+        };
         let result = (|| {
             let revision = match &mut session.bytes {
                 crate::staging::Staged::Memory(bytes) => self.store.write_with_base_and_times(
@@ -211,16 +360,21 @@ impl Engine {
                     )?
                 }
             };
-            if pending {
+            if let Some(outer) = outer {
                 self.store
                     .db
                     .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
-                self.store.db.execute_batch("RELEASE staged_save")?;
+                commit_staged_save(&self.store.db, outer)?;
             }
             Ok(revision)
         })();
+        // `pending_saves` is re-counted once the transaction is resolved
+        // (committed here, rolled back below), never inside it.
         match result {
             Ok(revision) => {
+                if pending {
+                    count_pending_saves(&self.store, &self.vitals);
+                }
                 session.content_base = Some(revision.clone());
                 session.alive_base = Some(revision);
                 session.dirty = false;
@@ -233,11 +387,9 @@ impl Engine {
                 Ok(())
             }
             Err(error) => {
-                if pending {
-                    let _ = self
-                        .store
-                        .db
-                        .execute_batch("ROLLBACK TO staged_save; RELEASE staged_save");
+                if let Some(outer) = outer {
+                    rollback_staged_save(&self.store.db, outer);
+                    count_pending_saves(&self.store, &self.vitals);
                 }
                 self.retain_pending(entity, &error)
                     .context("PENDING_SAVE_PERSIST_FAILED")?;
@@ -578,5 +730,44 @@ impl Engine {
             }
         }
         Ok(accepted)
+    }
+}
+
+/// Opens the transaction that commits a retained save (`SAVEPOINT staged_save`)
+/// and reports whether it is the outermost one: from autocommit it begins with
+/// `BEGIN IMMEDIATE` (CCR-WP0.INT-5). Inside a caller's transaction only the
+/// savepoint is opened, as before.
+fn begin_staged_save(db: &rusqlite::Connection) -> Result<bool> {
+    let outer = db.is_autocommit();
+    if outer {
+        db.execute_batch("BEGIN IMMEDIATE")?;
+    }
+    if let Err(error) = db.execute_batch("SAVEPOINT staged_save") {
+        if outer {
+            let _ = db.execute_batch("ROLLBACK");
+        }
+        return Err(error.into());
+    }
+    Ok(outer)
+}
+
+/// Commits the save and the removal of its `pending_saves` row together.
+fn commit_staged_save(db: &rusqlite::Connection, outer: bool) -> Result<()> {
+    db.execute_batch("RELEASE staged_save")?;
+    if outer {
+        db.execute_batch("COMMIT")?;
+    }
+    Ok(())
+}
+
+/// Discards the save's writes, including after a failed `COMMIT`; the caller
+/// then retains the session again.
+fn rollback_staged_save(db: &rusqlite::Connection, outer: bool) {
+    if !outer {
+        let _ = db.execute_batch("ROLLBACK TO staged_save; RELEASE staged_save");
+    } else if !db.is_autocommit() {
+        // SQLite may already have rolled the transaction back (for example
+        // after an I/O error); then there is nothing left to discard.
+        let _ = db.execute_batch("ROLLBACK");
     }
 }
