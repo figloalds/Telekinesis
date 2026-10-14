@@ -143,7 +143,7 @@ impl<T> Tracked<T> {
         TrackedGuard {
             owner: self,
             since: Instant::now(),
-            guard,
+            guard: Some(guard),
         }
     }
 
@@ -224,7 +224,8 @@ impl<T> fmt::Debug for Tracked<T> {
 pub struct TrackedGuard<'a, T> {
     owner: &'a Tracked<T>,
     since: Instant,
-    guard: MutexGuard<'a, T>,
+    /// `Some` until `drop`, which releases it before reporting.
+    guard: Option<MutexGuard<'a, T>>,
 }
 
 impl<T> TrackedGuard<'_, T> {
@@ -237,20 +238,27 @@ impl<T> TrackedGuard<'_, T> {
 impl<T> Deref for TrackedGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.guard
+        self.guard
+            .as_deref()
+            .expect("a TrackedGuard holds its lock until drop")
     }
 }
 
 impl<T> DerefMut for TrackedGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
+        self.guard
+            .as_deref_mut()
+            .expect("a TrackedGuard holds its lock until drop")
     }
 }
 
 impl<T> Drop for TrackedGuard<'_, T> {
     fn drop(&mut self) {
-        // Measured before the inner guard is released; reporting happens while
-        // still holding it, which keeps the accounting race-free and cheap.
-        self.owner.released(self.since.elapsed());
+        // Measured before the inner guard is released, reported after it
+        // (CCR-WP0.INT-4 item 4): the accounting is atomics plus the violation
+        // ring and a log line, none of which may run under the tracked lock.
+        let held = self.since.elapsed();
+        drop(self.guard.take());
+        self.owner.released(held);
     }
 }

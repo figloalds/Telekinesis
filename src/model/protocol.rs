@@ -125,14 +125,29 @@ pub fn op_deadline(op: &str) -> Option<Duration> {
     }
 }
 
-/// The role an op requires (`None`: any role; `Probe` sessions may also use
-/// `catalog.list`).
+/// The role an op requires (`None`: any role). `catalog.list` names
+/// `Control`, but `Probe` sessions may use it too: check permissions with
+/// [`op_allowed`], not by comparing with this value.
 pub fn op_role(op: &str) -> Option<LaneRole> {
     match op {
         ops::PING => None,
         ops::CATALOG_LIST | ops::META_EXCHANGE => Some(LaneRole::Control),
         _ if op.starts_with("objects.") => Some(LaneRole::Bulk),
         _ => None,
+    }
+}
+
+/// Whether a session of `role` may send `op` (§6.2 op table): ops without a
+/// role (`ping`, unknown ops, which the server answers itself) on any
+/// session; `catalog.list` on control **or** probe sessions; `meta.exchange`
+/// on control sessions; `objects.*` on bulk sessions. (CCR-WP0.INT-4 item 2.)
+pub fn op_allowed(op: &str, role: LaneRole) -> bool {
+    match op_role(op) {
+        None => true,
+        Some(_) if op == ops::CATALOG_LIST => {
+            matches!(role, LaneRole::Control | LaneRole::Probe)
+        }
+        Some(required) => required == role,
     }
 }
 
@@ -231,6 +246,8 @@ pub mod frame {
         "PEER_REVOKED",
         "PEER_PROTOCOL_UNSUPPORTED",
         "INVALID_PAIRING_CODE",
+        // The verifier rotated between HELLO_ACK and AUTH (CCR-WP1.10-2).
+        "PAIRING_CODE_CHANGED",
     ];
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -472,8 +489,15 @@ pub mod feed {
     pub const LARGE_EVENT_BYTES: usize = 256 * 1024;
     /// Ids per `need` list.
     pub const MAX_NEED: usize = 256;
-    /// Total payload bytes of `need_served`.
-    pub const MAX_NEED_BYTES: usize = 16 * 1024 * 1024;
+    /// Total payload bytes of `need_served`. A `meta.exchange` reply carries
+    /// `need_served` plus a page (≤ [`MAX_PAGE_BYTES`]) plus JSON overhead in
+    /// one body of at most `frame::MAX_BODY_META` (16 MiB), so the need budget
+    /// leaves room for both: 12 MiB (one 8 MiB event still fits). Was 16 MiB,
+    /// which could make a reply serving two 8 MiB events exceed the body
+    /// limit forever (CCR-WP0.INT-4 item 1).
+    pub const MAX_NEED_BYTES: usize = 12 * 1024 * 1024;
+    const _: () =
+        assert!(MAX_NEED_BYTES + MAX_PAGE_BYTES + 2 * 1024 * 1024 <= super::frame::MAX_BODY_META);
     /// Rejections shown in a reply (the full set is durable in `feed_rejected`).
     pub const MAX_REJECTED_SHOWN: usize = 256;
     /// Hex characters of an entry digest.

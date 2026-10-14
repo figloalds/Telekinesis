@@ -5,6 +5,16 @@
 //! for example to shut down a socket a blocked reader is parked on. `child()`
 //! derives a token that is cancelled with its parent but can also be
 //! cancelled on its own.
+//!
+//! Cancelling a token cancels its children (and their hooks run) **before**
+//! its own hooks run, so a parent's hook never observes a live child.
+//!
+//! Hooks cannot be deregistered: they live as long as the token they were
+//! registered on. Register per-connection or per-request killers on a
+//! `child()` token that is dropped when that connection or request ends
+//! (a parent keeps only a weak reference to its children), never directly on
+//! a long-lived token, where they would accumulate. A hook should not hold a
+//! clone of the token it is registered on (that is a reference cycle).
 use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -40,9 +50,9 @@ impl Cancel {
         Self::default()
     }
 
-    /// Cancels this token and its children. The first call runs every
-    /// registered hook (a panicking hook does not stop the others); later
-    /// calls do nothing.
+    /// Cancels this token and its children. The first call cancels the
+    /// children first, then runs every hook registered on this token (a
+    /// panicking hook does not stop the others); later calls do nothing.
     pub fn cancel(&self) {
         Inner::cancel(&self.inner);
     }
@@ -83,6 +93,8 @@ impl Cancel {
 
     /// Registers a hook that runs once when the token is cancelled. If it is
     /// already cancelled, the hook runs immediately on the calling thread.
+    /// The hook is kept until the token is dropped: register short-lived
+    /// killers on a `child()` token (see the module docs).
     pub fn on_cancel(&self, hook: Hook) {
         let mut state = self.lock();
         if !self.is_cancelled() {
@@ -126,11 +138,13 @@ impl Inner {
         let children = std::mem::take(&mut state.children);
         this.changed.notify_all();
         drop(state);
-        for hook in &hooks {
-            run_hook(hook);
-        }
+        // Children first (CCR-WP0.INT-4 item 3): a hook of this token may
+        // rely on everything derived from it being cancelled already.
         for child in children.iter().filter_map(Weak::upgrade) {
             Inner::cancel(&child);
+        }
+        for hook in &hooks {
+            run_hook(hook);
         }
     }
 }

@@ -354,6 +354,9 @@ pub const TRANSIENT_DEFAULT_CODES: &[&str] = &[
     "UNSUPPORTED_POSIX_OPERATION",
     "UNSUPPORTED_POSIX_OWNERSHIP",
     "UNSUPPORTED_RENAME_FLAGS",
+    // A handshake watchdog could not shut its socket down (WP1.10, logged
+    // only; found by CCR-WP0.INT-4 item 7's `event!` identifier scan).
+    "WATCHDOG_SHUTDOWN_FAILED",
     "WINFSP_MOUNT_FAILED",
     "WORKER_LIMIT",
     "WORKER_START",
