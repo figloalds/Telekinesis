@@ -28,13 +28,19 @@
 use super::ctx;
 use crate::{
     model::orchestrator::{Ctx, ShutdownOutcome, limits},
-    util::{cancel::Cancel, lock::lock, log::event},
+    util::{cancel::Cancel, fault, lock::lock, log::event},
 };
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, Condvar, Mutex, Once, atomic::Ordering},
     time::{Duration, Instant},
 };
+
+/// Fault points of the shutdown sequence (`util::fault`).
+pub mod faults {
+    /// After step 1 (`stopping` is set), before the network and the folders.
+    pub const SEQUENCE: &str = "orchestrator.shutdown";
+}
 
 /// The once-per-daemon shutdown result.
 #[derive(Default)]
@@ -89,6 +95,31 @@ impl Latch {
     }
 }
 
+/// Finishes a latch whose sequence unwound (a panic) so later callers do not
+/// wait for a result that never comes; disarmed by a normal finish.
+struct FinishOnUnwind<'a> {
+    latch: &'a Latch,
+    armed: bool,
+}
+
+impl Drop for FinishOnUnwind<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            event!(error, UNKNOWN_ERROR, {
+                "detail": "the shutdown sequence panicked; the daemon still exits",
+            });
+            self.latch.finish(json!({
+                "stopped": true,
+                "folders": [],
+                "error": {
+                    "code": "UNKNOWN_ERROR",
+                    "message": "the shutdown sequence panicked",
+                },
+            }));
+        }
+    }
+}
+
 /// The Shutdown reply for a set of outcomes.
 pub fn reply(outcomes: &[ShutdownOutcome]) -> Value {
     json!({ "stopped": true, "folders": outcomes })
@@ -106,6 +137,10 @@ pub fn run(ctx: &Arc<Ctx>, deadline: Duration) -> Value {
             .wait(patience)
             .unwrap_or_else(|| json!({ "stopped": true, "folders": [] }));
     }
+    let mut unwinding = FinishOnUnwind {
+        latch: &extras.shutdown,
+        armed: true,
+    };
     let started = Instant::now();
     // 1. stopping: every new action is refused.
     ctx.stopping.store(true, Ordering::Release);
@@ -115,6 +150,12 @@ pub fn run(ctx: &Arc<Ctx>, deadline: Duration) -> Value {
     event!(info, ORCHESTRATOR_STOPPING, {
         "detail": "shutdown started",
     });
+    if let Err(error) = fault::trigger(faults::SEQUENCE) {
+        event!(warn, ORCHESTRATOR_STOPPING, {
+            "detail": "fault injected into the shutdown sequence",
+            "error": error.to_string(),
+        });
+    }
     // 2. the network: lanes and inbound sessions.
     if let Ok(network) = ctx.network() {
         network.shutdown(limits::SHUTDOWN_NETWORK);
@@ -138,6 +179,7 @@ pub fn run(ctx: &Arc<Ctx>, deadline: Duration) -> Value {
         "folders": outcomes.len(),
         "elapsed_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
     });
+    unwinding.armed = false;
     extras.shutdown.finish(reply.clone());
     reply
 }
@@ -310,4 +352,48 @@ mod platform {
 #[cfg(not(any(windows, unix)))]
 mod platform {
     pub(super) fn install() {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn a_sequence_that_unwinds_still_finishes_the_latch() {
+        let latch = Latch::default();
+        assert!(latch.begin());
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = FinishOnUnwind {
+                latch: &latch,
+                armed: true,
+            };
+            panic!("the sequence panicked");
+        }));
+        assert!(unwound.is_err());
+        // A later caller gets a result at once instead of its full patience.
+        let reply = latch.wait(Duration::from_millis(100)).expect("finished");
+        assert_eq!(reply["stopped"], true);
+        assert_eq!(reply["error"]["code"], "UNKNOWN_ERROR");
+        assert!(!latch.begin(), "the sequence runs once");
+    }
+
+    #[test]
+    fn a_disarmed_guard_leaves_the_result_to_finish() {
+        let latch = Latch::default();
+        assert!(latch.begin());
+        {
+            let mut guard = FinishOnUnwind {
+                latch: &latch,
+                armed: true,
+            };
+            guard.armed = false;
+        }
+        assert!(latch.wait(Duration::from_millis(20)).is_none());
+        latch.finish(reply(&[]));
+        assert_eq!(
+            latch.wait(Duration::from_millis(20)),
+            Some(json!({"stopped": true, "folders": []}))
+        );
+    }
 }

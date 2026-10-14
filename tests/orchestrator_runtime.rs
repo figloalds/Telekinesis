@@ -37,9 +37,12 @@ use tkfs::{
         Config, Network,
         ctx::{BuildOptions, build_with},
         manage::{self, PHASE_ATTACHING, PHASE_GATED},
-        serve_with,
+        serve_with, shutdown,
     },
-    util::lock::hold_violations,
+    util::{
+        fault::{self, FaultAction, FaultConfig},
+        lock::hold_violations,
+    },
     ws,
 };
 
@@ -364,6 +367,11 @@ struct InProcess {
 
 impl InProcess {
     fn start(maximum_running: usize) -> Self {
+        Self::start_listening(maximum_running, "127.0.0.1:0")
+    }
+
+    /// An in-process daemon whose peer listener binds `listen`.
+    fn start_listening(maximum_running: usize, listen: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
         let config = Config {
             format_version: 2,
@@ -371,7 +379,7 @@ impl InProcess {
             default_mount_directory: root.path().join("mounts"),
             maximum_running,
             network: Network {
-                listen: Some("127.0.0.1:0".into()),
+                listen: Some(listen.into()),
                 connections: 2,
                 sync_interval_ms: 500,
             },
@@ -533,16 +541,10 @@ fn a_folder_stuck_starting_blocks_nothing_and_shutdown_kills_it() {
     let outcomes = reply["folders"].as_array().unwrap();
     assert_eq!(outcomes.len(), 2, "{reply}");
     assert!(outcomes.iter().all(|o| o["outcome"] == "killed"), "{reply}");
+    // Either refused (stopping) or the connection was closed at exit; never
+    // answered.
     let refused = ws::call(&mut late, &json!({"op":"list"}));
-    if let Err(error) = refused {
-        // Either refused (stopping) or the connection was closed at exit.
-        let text = format!("{error:#}");
-        assert!(
-            text.contains("ORCHESTRATOR_STOPPING")
-                || error.downcast_ref::<ws::RemoteError>().is_none(),
-            "{text}"
-        );
-    }
+    assert_refused_while_stopping(refused);
     daemon.join(Duration::from_secs(10));
     assert!(!daemon.data.join("orchestrator.json").exists());
     // The orchestrator's own locks were never held across I/O.
@@ -561,15 +563,80 @@ fn shutdown_runs_once_and_a_second_request_is_refused() {
     let mut second = daemon.socket();
     let reply = ws::call(&mut first, &json!({"op":"shutdown"})).unwrap();
     assert_eq!(reply, json!({"stopped":true,"folders":[]}));
-    if let Err(error) = ws::call(&mut second, &json!({"op":"shutdown"})) {
-        let text = format!("{error:#}");
+    // The sequence runs once: a second Shutdown is refused (stopping) or
+    // finds the daemon gone, never answered.
+    assert_refused_while_stopping(ws::call(&mut second, &json!({"op":"shutdown"})));
+    daemon.join(Duration::from_secs(10));
+}
+
+/// A Shutdown whose sequence panics still ends the daemon: the request is
+/// answered `UNKNOWN_ERROR`, the main thread is released anyway (no wedge on
+/// a latch that never finishes) and `orchestrator.json` is removed.
+#[test]
+fn a_shutdown_sequence_that_panics_still_ends_the_daemon() {
+    let _serial = serial();
+    let mut daemon = InProcess::start(8);
+    fault::configure(Some(FaultConfig::new(
+        shutdown::faults::SEQUENCE,
+        FaultAction::Panic,
+    )));
+    let answered = daemon.call(json!({"op":"shutdown"}));
+    fault::configure(None);
+    let error = answered.expect_err("the sequence panicked");
+    assert!(
+        error.downcast_ref::<ws::RemoteError>().is_some()
+            && error.to_string().contains("UNKNOWN_ERROR"),
+        "{error:#}"
+    );
+    daemon.join(Duration::from_secs(10));
+    assert!(!daemon.data.join("orchestrator.json").exists());
+}
+
+/// A request sent after the Shutdown reply: either refused with
+/// `ORCHESTRATOR_STOPPING`, or a transport error (the daemon closed the
+/// connection). An answer fails the test.
+fn assert_refused_while_stopping(result: anyhow::Result<Value>) {
+    let error = match result {
+        Ok(answer) => panic!("answered after the Shutdown reply: {answer}"),
+        Err(error) => error,
+    };
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("ORCHESTRATOR_STOPPING") || error.downcast_ref::<ws::RemoteError>().is_none(),
+        "{text}"
+    );
+}
+
+/// `network.listen` on every interface (`0.0.0.0`, and `[::]` where the host
+/// has IPv6): Shutdown still ends the daemon. Stopping a blocking accept
+/// must not depend on connecting to the unspecified address (Windows refuses
+/// that connect, `WSAEADDRNOTAVAIL`).
+#[test]
+fn shutdown_ends_a_daemon_listening_on_every_interface() {
+    let _serial = serial();
+    let mut listens = vec!["0.0.0.0:0"];
+    if std::net::TcpListener::bind("[::]:0").is_ok() {
+        listens.push("[::]:0");
+    }
+    for listen in listens {
+        let mut daemon = InProcess::start_listening(8, listen);
+        let reply = daemon.call(json!({"op":"shutdown"})).unwrap();
+        assert_eq!(reply["stopped"], true, "{listen}: {reply}");
+        let server = daemon.server.take().unwrap();
         assert!(
-            text.contains("ORCHESTRATOR_STOPPING")
-                || error.downcast_ref::<ws::RemoteError>().is_none(),
-            "{text}"
+            wait_until(Duration::from_secs(5), || server.is_finished()),
+            "{listen}: the daemon did not end after Shutdown"
+        );
+        server.join().unwrap().unwrap();
+        assert!(
+            !daemon.data.join("orchestrator.json").exists(),
+            "{listen}: orchestrator.json left behind"
+        );
+        assert!(
+            !daemon.data.join("orchestrator.json.tmp").exists(),
+            "{listen}"
         );
     }
-    daemon.join(Duration::from_secs(10));
 }
 
 // ---------------------------------------------------------------------------

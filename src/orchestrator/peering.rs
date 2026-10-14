@@ -268,8 +268,10 @@ struct Hello {
 impl Hello {
     fn lane(&self) -> (u32, LaneRole) {
         match (self.role.as_deref(), self.bulk_lane) {
+            // The index comes from the peer unchecked: saturate, never
+            // overflow (a panic in debug, lane 0 in release).
             (Some("bulk"), Some(lane)) => (
-                u32::try_from(lane.index + 1).unwrap_or(u32::MAX),
+                u32::try_from(lane.index.saturating_add(1)).unwrap_or(u32::MAX),
                 LaneRole::Bulk,
             ),
             (Some("bulk"), None) => (1, LaneRole::Bulk),
@@ -602,5 +604,20 @@ mod tests {
         let seen = requests.lock().unwrap().clone();
         assert_eq!(seen[0], "my-request");
         assert_ne!(seen[1], "my-request");
+    }
+
+    /// The bulk lane index of a pairing hello comes from the peer unchecked:
+    /// the largest index saturates instead of overflowing (a panic of the
+    /// connection thread in debug builds, lane 0 in release).
+    #[test]
+    fn a_hello_with_the_largest_bulk_index_saturates() {
+        let hello = |index: usize| Hello {
+            peer: "peer".into(),
+            role: Some("bulk".into()),
+            parallel: true,
+            bulk_lane: Some(crate::bulk_sync::Lane { index, count: 2 }),
+        };
+        assert_eq!(hello(0).lane(), (1, LaneRole::Bulk));
+        assert_eq!(hello(usize::MAX).lane(), (u32::MAX, LaneRole::Bulk));
     }
 }
