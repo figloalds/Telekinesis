@@ -27,10 +27,11 @@
 //! reviewed cuts, `namespace_history(N)` and the register pairs of `E`
 //! (deduplicated by id).
 //!
-//! **Induction hypothesis (H):** `S` is what a rebuild of `O` derives (the
-//! oracle, `Store::verify_derived_state`, is exactly this check). In
-//! particular the rebuild of `O` succeeds, so every computation over `O`
-//! alone succeeds and stays within `MAX_NAMESPACE_CUTS`.
+//! **Induction hypothesis (H):** `S` is what a rebuild of `O` from no rows
+//! derives (`Store::verify_derived_state_strict` is exactly this check; the
+//! plain oracle misses excess rows). In particular the rebuild of `O`
+//! succeeds, so every computation over `O` alone (every antichain cut's
+//! projection included) succeeds and stays within `MAX_NAMESPACE_CUTS`.
 //!
 //! **Facts used:**
 //! 1. `E` is a sink of the causal DAG: every committed event's parents were
@@ -83,10 +84,32 @@
 //!     cover) or stored and still derived by full mode (old cover).
 //!
 //!   Hence `namespace_history(O)`'s records are a subset of
-//!   `namespace_history(N)`'s, full mode's DELETE removes nothing, and full
-//!   mode's refusal (`NAMESPACE_HISTORY_LIMIT`) happens in append mode at the
-//!   same cone: the untouched old cones' counts are unchanged and within the
-//!   limit (H); every other cone is counted in full.
+//!   `namespace_history(N)`'s, and full mode's refusal
+//!   (`NAMESPACE_HISTORY_LIMIT`) happens in append mode at the same cone: the
+//!   untouched old cones' counts are unchanged and within the limit (H);
+//!   every other cone is counted in full.
+//! - *The old projection's records (checked).* `S` also holds the namespace
+//!   records of the old current projection (`p_O.conflicts`, a source of the
+//!   rebuild of `O`). These are not always records of a namespace-history
+//!   cut: TRUE presence compression keeps each group's rank extrema, not the
+//!   head of a presence chain, so the whole history can hold an alive state
+//!   that no antichain cut has (`tests::current_record_outside_history`:
+//!   a stale-base save on one entity and a presence chain across devices on
+//!   its slot competitor). Such a row stays only while the projection holds
+//!   it; when `E` takes it out, full mode's DELETE removes it. So:
+//!   - an entity outside the cones that contain an entity `E` touches keeps
+//!     its records (`p_O`'s equal `p_N`'s): a cone's records read only its
+//!     members' kind, location and alive registers, and `E` changes none;
+//!   - for the members of those cones (`AppendPlan::members`), every record
+//!     of `project(O)` that append mode does not derive (`p_N`'s records are
+//!     part of `D_append`) must be a record of its old cone's maximal
+//!     antichain cut, which full mode re-derives (previous step); otherwise
+//!     append falls back (`NsContext::current_records_survive`). Both are
+//!     computed from the members' registers (`namespace_records`), exact
+//!     because `O` and each antichain cut of `O` project (H).
+//!
+//!   Hence every namespace row of `S` is derived by full mode again, and its
+//!   DELETE removes nothing.
 //! - *Reviews of `E`* are validated against the derived list; a reviewed row
 //!   is either stored (and loaded in both modes) or newly derived (derived in
 //!   both modes, since everything full mode derives beyond append's list is
@@ -96,14 +119,20 @@
 //! `D_full`) row for row, with the same `resolved_by` updates, and the result
 //! again satisfies (H) for `N`. When a
 //! check fails, append mode derives in full instead, which keeps (H) by
-//! definition. The executable check of (H) is the oracle; `verify` mode and
-//! `tests/derive_oracle.rs` check the equality itself.
+//! definition. The executable check of (H) is the oracle (with every row
+//! re-derived from no rows: `Store::verify_derived_state_strict`); `verify`
+//! mode, `set_thread_commit_checks` and `tests/derive_oracle.rs` check the
+//! equality itself, and the unit test
+//! `append_commit_equals_full_commit_with_delete_on_every_prefix` checks it as
+//! a pure function, the DELETE included.
 //!
 //! ## Memoization
 //!
 //! Within one derivation (both modes) the causal closures of events are
-//! bitsets computed once, the per-entity alive-register analysis is computed
-//! once per entity, and each distinct antichain's cut is projected once.
+//! bitsets computed once (up to `CLOSURE_MEMO_BYTES`), the per-entity
+//! alive-register analysis is computed once per entity, and each distinct
+//! antichain's cut is projected once (up to `CUT_MEMO_BYTES` of retained
+//! records; past it, a recurring cut is projected again).
 //!
 //! ## Append-mode shortcuts (exact; full mode, the oracle's reference, keeps
 //! the plain computation)
@@ -117,7 +146,8 @@
 //!   fail to project (`projection_cannot_fail`); otherwise the whole cut is
 //!   projected. The only influence other entities have on a cone's records
 //!   is such a failure.
-//! - Slot keys (`name_key`) are memoized process-wide (`slot_key`).
+//! - Slot keys (`name_key`) are memoized process-wide (`slot_key`), up to
+//!   `SLOT_KEY_MEMO_BYTES`.
 use super::*;
 use std::{
     cell::Cell,
@@ -174,6 +204,21 @@ thread_local! {
     static THREAD_COUNTERS: Cell<DeriveCounters> = const { Cell::new(DeriveCounters::ZERO) };
     static LAST_FALLBACK: Cell<Option<&'static str>> = const { Cell::new(None) };
     static FALLBACK_REASONS: RefCell<BTreeMap<&'static str, u64>> = const { RefCell::new(BTreeMap::new()) };
+    static COMMIT_CHECKS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Check every commit on the calling thread (any mode) against the
+/// reference, inside the commit's transaction (rolled back): the branch's
+/// conflict rows must equal a derivation from no rows (what the oracle's
+/// rebuild derives), and a refused commit must be refused by full mode with
+/// the same error. A failed check fails the commit with
+/// `CONFLICT_MODE_MISMATCH` (the §8 code for a derivation that differs from
+/// the reference). Returns the previous setting. For fuzzers: a delivery can
+/// commit several events, and the store-level oracle only runs between
+/// deliveries.
+#[doc(hidden)]
+pub fn set_thread_commit_checks(enabled: bool) -> bool {
+    COMMIT_CHECKS.with(|cell| cell.replace(enabled))
 }
 
 /// The conflict derivation mode: a thread override (tests), else
@@ -222,8 +267,10 @@ pub struct DeriveCounters {
     /// (`projection_cannot_fail`) rather than from the whole cut.
     pub restricted: u64,
     /// Time spent deriving conflict records for commits (all modes; not
-    /// rebuilds), in microseconds.
+    /// rebuilds, not the commit checks), in microseconds.
     pub commit_micros: u64,
+    /// Commits checked against the reference (`set_thread_commit_checks`).
+    pub checked: u64,
 }
 impl DeriveCounters {
     const ZERO: Self = Self {
@@ -234,6 +281,7 @@ impl DeriveCounters {
         verified: 0,
         restricted: 0,
         commit_micros: 0,
+        checked: 0,
     };
 }
 
@@ -246,8 +294,9 @@ enum Count {
     Verified,
     Restricted,
     CommitMicros,
+    Checked,
 }
-static COUNTERS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static COUNTERS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn count(kind: Count) {
     add(kind, 1);
@@ -265,6 +314,7 @@ fn add(kind: Count, amount: u64) {
             Count::Verified => c.verified += amount,
             Count::Restricted => c.restricted += amount,
             Count::CommitMicros => c.commit_micros += amount,
+            Count::Checked => c.checked += amount,
         }
         cell.set(c);
     });
@@ -287,6 +337,7 @@ pub fn derive_counters() -> DeriveCounters {
         verified: get(Count::Verified),
         restricted: get(Count::Restricted),
         commit_micros: get(Count::CommitMicros),
+        checked: get(Count::Checked),
     }
 }
 
@@ -321,14 +372,69 @@ pub(super) fn persist_projection(
         count(Count::Rebuild);
         return persist_full(tx, branch, p, events, None);
     };
-    let started = std::time::Instant::now();
-    let result = persist_commit(tx, branch, p, events, new_id);
-    add(Count::CommitMicros, started.elapsed().as_micros() as u64);
-    result
+    persist_commit(tx, branch, p, events, new_id)
+}
+
+/// A commit's records, in the configured mode, checked against the
+/// reference when the thread asks for it (`set_thread_commit_checks`).
+fn persist_commit(
+    tx: &Connection,
+    branch: &str,
+    p: &Projection,
+    events: &[Event],
+    new_id: &str,
+) -> Result<()> {
+    // The derivation's own time (not the checks').
+    let timed = || {
+        let started = std::time::Instant::now();
+        let result = persist_in_mode(tx, branch, p, events, new_id);
+        add(Count::CommitMicros, started.elapsed().as_micros() as u64);
+        result
+    };
+    if !COMMIT_CHECKS.with(Cell::get) {
+        return timed();
+    }
+    count(Count::Checked);
+    // In a savepoint, so that a refusal leaves the transaction as it was for
+    // the full-mode retry.
+    let outcome = in_savepoint(tx, "tkfs_derive_commit", true, timed);
+    let mode = conflict_mode().as_str();
+    if let Err(refused) = outcome {
+        let full = in_savepoint(tx, "tkfs_derive_check", false, || {
+            persist_full(tx, branch, p, events, Some(new_id))
+        });
+        return match full {
+            Ok(()) => bail!(
+                "CONFLICT_MODE_MISMATCH: {mode} refused {new_id} ({refused:#}), full accepted it"
+            ),
+            Err(full) if format!("{full:#}") != format!("{refused:#}") => bail!(
+                "CONFLICT_MODE_MISMATCH: {mode} refused {new_id} ({refused:#}), full refused it with {full:#}"
+            ),
+            Err(_) => Err(refused),
+        };
+    }
+    let (stored, rebuilt) = in_savepoint(tx, "tkfs_derive_check", false, || {
+        let stored = capture_conflicts(tx, branch)?;
+        tx.execute("DELETE FROM conflicts WHERE branch=?", [branch])?;
+        persist_full(tx, branch, p, events, None)?;
+        Ok((stored, capture_conflicts(tx, branch)?))
+    })
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "CONFLICT_MODE_MISMATCH: {mode} committed {new_id}, a derivation from no rows fails: {error:#}"
+        )
+    })?;
+    let differences = row_differences(&stored, &rebuilt, ["stored", "rebuilt"]);
+    ensure!(
+        differences.is_empty(),
+        "CONFLICT_MODE_MISMATCH: {mode} commit of {new_id} differs from a derivation from no rows: {}",
+        differences.join("; ")
+    );
+    Ok(())
 }
 
 /// A commit's records, in the configured mode.
-fn persist_commit(
+fn persist_in_mode(
     tx: &Connection,
     branch: &str,
     p: &Projection,
@@ -687,30 +793,95 @@ enum Plan {
     Fallback(&'static str),
 }
 
-/// `name_key`, memoized process-wide: a pure function of the name, needed for
-/// every location change of the branch on every append. Errors keep their
-/// text.
+/// Bound on the process-wide slot-key memo (`slot_key`), in estimated bytes.
+const SLOT_KEY_MEMO_BYTES: usize = 16 * 1024 * 1024;
+
+/// A slot key, or the text of the error `name_key` raises for the name.
+type SlotKey = std::result::Result<Arc<str>, Arc<str>>;
+
+/// A memo of slot keys bounded by an estimate of the bytes it holds, in two
+/// generations of at most half the budget each: a hit in the older one moves
+/// the entry to the current one, and a current generation that would outgrow
+/// its half becomes the older one (the previous older one is dropped). Names
+/// used on every commit stay; a branch with more distinct names than the
+/// budget holds recomputes some keys instead of growing the memo.
+struct SlotKeys {
+    current: HashMap<String, SlotKey>,
+    older: HashMap<String, SlotKey>,
+    current_bytes: usize,
+    older_bytes: usize,
+    budget: usize,
+}
+impl SlotKeys {
+    fn new(budget: usize) -> Self {
+        Self {
+            current: HashMap::new(),
+            older: HashMap::new(),
+            current_bytes: 0,
+            older_bytes: 0,
+            budget,
+        }
+    }
+    /// The heap an entry holds: the name, the key or error text, the
+    /// `String` and `Arc` headers and the table slot.
+    fn entry_bytes(name: &str, key: &SlotKey) -> usize {
+        let text = match key {
+            Ok(key) | Err(key) => key.len(),
+        };
+        name.len() + text + 96
+    }
+    fn get(&mut self, name: &str) -> Option<SlotKey> {
+        if let Some(key) = self.current.get(name) {
+            return Some(key.clone());
+        }
+        let key = self.older.remove(name)?;
+        self.older_bytes -= Self::entry_bytes(name, &key);
+        self.insert(name, key.clone());
+        Some(key)
+    }
+    fn insert(&mut self, name: &str, key: SlotKey) {
+        let bytes = Self::entry_bytes(name, &key);
+        if bytes > self.budget / 2 {
+            return;
+        }
+        if self.current_bytes + bytes > self.budget / 2 {
+            self.older = std::mem::take(&mut self.current);
+            self.older_bytes = self.current_bytes;
+            self.current_bytes = 0;
+        }
+        // Another thread may have inserted it since this one looked.
+        if let Some(previous) = self.current.insert(name.to_owned(), key) {
+            self.current_bytes -= Self::entry_bytes(name, &previous);
+        }
+        self.current_bytes += bytes;
+    }
+    /// Estimated bytes held (at most the budget).
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.current_bytes + self.older_bytes
+    }
+}
+
+/// `name_key`, memoized process-wide (bounded, see `SlotKeys`): a pure
+/// function of the name, needed for every location change of the branch on
+/// every append. Errors keep their text.
 fn slot_key(name: &str) -> Result<Arc<str>> {
-    type Keys = HashMap<String, std::result::Result<Arc<str>, Arc<str>>>;
-    static KEYS: OnceLock<Mutex<Keys>> = OnceLock::new();
-    let keys = KEYS.get_or_init(Default::default);
+    static KEYS: OnceLock<Mutex<SlotKeys>> = OnceLock::new();
+    let keys = KEYS.get_or_init(|| Mutex::new(SlotKeys::new(SLOT_KEY_MEMO_BYTES)));
     let found = keys
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .get(name)
-        .cloned();
+        .get(name);
     let key = match found {
         Some(key) => key,
         None => {
-            let key = match name_key(name) {
+            let key: SlotKey = match name_key(name) {
                 Ok(key) => Ok(Arc::from(key)),
                 Err(error) => Err(Arc::from(format!("{error:#}"))),
             };
-            let mut keys = keys.lock().unwrap_or_else(PoisonError::into_inner);
-            if keys.len() >= 1 << 18 {
-                keys.clear();
-            }
-            keys.insert(name.to_owned(), key.clone());
+            keys.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(name, key.clone());
             key
         }
     };
@@ -1005,7 +1176,17 @@ fn derive_append(
     }
     conflicts.extend(ns.derive_planned(&plan, restricted)?);
     conflicts.extend(register_pairs(branch, p, events, Some(new_id)));
-    Ok(Plan::Derived(conflicts))
+    // Nothing above can fail on accepted history; a failure here is left to
+    // full mode, which raises or derives whatever the reference does.
+    match ns.current_records_survive(new, &plan, &conflicts) {
+        Ok(true) => Ok(Plan::Derived(conflicts)),
+        Ok(false) => Ok(Plan::Fallback(
+            "a current namespace record is not derived from history",
+        )),
+        Err(_) => Ok(Plan::Fallback(
+            "the current namespace records failed to project",
+        )),
+    }
 }
 
 /// Structural preconditions of append mode (facts 1 and 3 of the module
@@ -1142,7 +1323,7 @@ fn persist_verified(
     });
     match (append, full) {
         (Ok(append), Ok(full)) => {
-            let differences = conflict_differences(&append, &full);
+            let differences = row_differences(&append, &full, ["append", "full"]);
             ensure!(
                 differences.is_empty(),
                 "CONFLICT_MODE_MISMATCH: append and full derivation differ for {new_id}: {}",
@@ -1201,25 +1382,27 @@ fn capture_conflicts(tx: &Connection, branch: &str) -> Result<ConflictRows> {
     Ok(rows)
 }
 
-fn conflict_differences(append: &ConflictRows, full: &ConflictRows) -> Vec<String> {
+/// The differences between two captures, named `[left, right]` in the text.
+fn row_differences(left: &ConflictRows, right: &ConflictRows, names: [&str; 2]) -> Vec<String> {
+    let [l, r] = names;
     let mut out = vec![];
-    for (id, (conflict, resolved)) in append {
-        match full.get(id) {
-            None => out.push(format!("{id}: only in append")),
+    for (id, (conflict, resolved)) in left {
+        match right.get(id) {
+            None => out.push(format!("{id}: only in {l}")),
             Some((other, other_resolved)) => {
                 if conflict != other {
                     out.push(format!("{id}: payload differs"));
                 }
                 if resolved != other_resolved {
                     out.push(format!(
-                        "{id}: resolved_by append {resolved:?} full {other_resolved:?}"
+                        "{id}: resolved_by {l} {resolved:?} {r} {other_resolved:?}"
                     ));
                 }
             }
         }
     }
-    for id in full.keys().filter(|id| !append.contains_key(*id)) {
-        out.push(format!("{id}: only in full"));
+    for id in right.keys().filter(|id| !left.contains_key(*id)) {
+        out.push(format!("{id}: only in {r}"));
     }
     if out.len() > 8 {
         let more = out.len() - 8;
@@ -1227,6 +1410,107 @@ fn conflict_differences(append: &ConflictRows, full: &ConflictRows) -> Vec<Strin
         out.push(format!("{more} more"));
     }
     out
+}
+
+/// Every branch's conflict rows: (branch, id) -> (payload with `resolved_by`
+/// cleared, `resolved_by` column).
+type AllConflictRows = BTreeMap<(String, String), (Conflict, Option<String>)>;
+
+fn capture_all_conflicts(db: &Connection) -> Result<AllConflictRows> {
+    let mut rows = BTreeMap::new();
+    let mut statement = db.prepare("SELECT branch,id,payload,resolved_by FROM conflicts")?;
+    let mut query = statement.query([])?;
+    while let Some(row) = query.next()? {
+        let mut conflict: Conflict = serde_json::from_str(&row.get::<_, String>(2)?)?;
+        conflict.resolved_by = None;
+        rows.insert((row.get(0)?, row.get(1)?), (conflict, row.get(3)?));
+    }
+    Ok(rows)
+}
+
+impl Store {
+    /// `verify_derived_state` with every conflict row re-derived from no rows
+    /// (CCR-WP1.7-1 asks for this in `verify_derived_state` itself; until the
+    /// integrator applies it, this adapter adds the check on WP1.7's side).
+    ///
+    /// The plain oracle rebuilds over the stored rows, and a rebuild's upsert
+    /// keeps rows it does not derive (it deletes only stale namespace rows)
+    /// and keeps a stored `resolved_by` larger than any review's. Here the
+    /// rows are also compared with a rebuild that starts from an empty
+    /// conflict table, so excess derived state is reported too: a fabricated
+    /// or stale row is `conflicts_extra`, an inflated or invented
+    /// `resolved_by` is `resolved_by_mismatch`. Same text as the plain
+    /// oracle; a row both report is listed once. No side effects: the
+    /// rebuild is rolled back (the whole transaction outside a caller's,
+    /// taken with `BEGIN IMMEDIATE` so a concurrent writer cannot break it
+    /// between its reads and writes; a savepoint inside one).
+    #[doc(hidden)]
+    pub fn verify_derived_state_strict(&mut self) -> Result<DerivedDiff> {
+        let mut diff = self.verify_derived_state()?;
+        let branches = self.branches()?;
+        let outer = self.db.is_autocommit();
+        self.db.execute_batch(if outer {
+            "BEGIN IMMEDIATE"
+        } else {
+            "SAVEPOINT tkfs_derive_oracle"
+        })?;
+        let result = (|| -> Result<(AllConflictRows, AllConflictRows)> {
+            let stored = capture_all_conflicts(&self.db)?;
+            self.db.execute("DELETE FROM conflicts", [])?;
+            self.rebuild_frontiers()?;
+            for branch in &branches {
+                self.rebuild(&branch.id)?;
+            }
+            Ok((stored, capture_all_conflicts(&self.db)?))
+        })();
+        let rollback = self.db.execute_batch(if outer {
+            "ROLLBACK"
+        } else {
+            "ROLLBACK TO tkfs_derive_oracle; RELEASE tkfs_derive_oracle"
+        });
+        self.view_cache.borrow_mut().take();
+        // The rebuild's own failure is the finding; a failed rollback after
+        // it must not hide it.
+        let (stored, rebuilt) = result?;
+        rollback?;
+        let add = |list: &mut Vec<String>, key: &str, text: String| {
+            let listed = list
+                .iter()
+                .any(|item| item == key || item.starts_with(&format!("{key}: ")));
+            if !listed {
+                list.push(text);
+            }
+        };
+        for ((branch, id), (conflict, resolved)) in &stored {
+            let key = format!("{branch}/{id}");
+            match rebuilt.get(&(branch.clone(), id.clone())) {
+                None => add(&mut diff.conflicts_extra, &key, key.clone()),
+                Some((derived, derived_resolved)) => {
+                    if conflict != derived {
+                        add(
+                            &mut diff.conflicts_extra,
+                            &key,
+                            format!("{key}: payload differs"),
+                        );
+                    }
+                    if resolved != derived_resolved {
+                        add(
+                            &mut diff.resolved_by_mismatch,
+                            &key,
+                            format!("{key}: stored {resolved:?} rebuilt {derived_resolved:?}"),
+                        );
+                    }
+                }
+            }
+        }
+        for (branch, id) in rebuilt.keys() {
+            if !stored.contains_key(&(branch.clone(), id.clone())) {
+                let key = format!("{branch}/{id}");
+                add(&mut diff.conflicts_missing, &key, key.clone());
+            }
+        }
+        Ok(diff)
+    }
 }
 
 fn ancestors(version: &Version, versions: &[Version]) -> BTreeSet<String> {
@@ -1434,8 +1718,49 @@ fn children_of(parents: &[Vec<usize>]) -> Vec<Vec<usize>> {
 /// Memoized closures are bounded so a very long history cannot exhaust
 /// memory; past the budget, closures are recomputed on demand.
 const CLOSURE_MEMO_BYTES: usize = 64 * 1024 * 1024;
-/// Bound on memoized cut projections (namespace records only, usually few).
-const CUT_MEMO_ENTRIES: usize = 65_536;
+/// Bound on memoized cut projections, in estimated bytes (`conflict_bytes`).
+/// A cut's namespace records are all of the cut's, not only the cone's, so
+/// with many unresolved collisions they grow with the cut: unbounded, the
+/// memo would hold (cuts × records per cut). Past the budget, cuts are
+/// projected again when they recur.
+const CUT_MEMO_BYTES: usize = 16 * 1024 * 1024;
+
+/// The estimated heap a JSON value holds (map nodes at 64 bytes per entry).
+fn value_bytes(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::String(s) => s.len(),
+            Value::Array(items) => items.iter().map(value_bytes).sum(),
+            Value::Object(map) => map.iter().map(|(k, v)| 64 + k.len() + value_bytes(v)).sum(),
+            _ => 0,
+        }
+}
+
+/// The estimated heap a conflict record holds (strings, versions, values).
+fn conflict_bytes(c: &Conflict) -> usize {
+    let version = |v: &Version| {
+        std::mem::size_of::<Version>()
+            + v.revision.len()
+            + v.device.len()
+            + v.parents
+                .iter()
+                .map(|p| std::mem::size_of::<String>() + p.len())
+                .sum::<usize>()
+            + value_bytes(&v.value)
+    };
+    std::mem::size_of::<Conflict>()
+        + c.id.len()
+        + c.branch.len()
+        + c.entity.len()
+        + c.field.len()
+        + c.reason.len()
+        + c.resolved_by.as_ref().map_or(0, String::len)
+        + c.alternatives
+            .iter()
+            .chain(&c.bases)
+            .map(version)
+            .sum::<usize>()
+}
 
 /// One alive register analysed for TRUE presence compression: its versions,
 /// the causal context of each tombstone and the unbranched segments, all over
@@ -1453,6 +1778,9 @@ struct Memo<'a> {
     closure_bytes: usize,
     registers: RegisterMemo<'a>,
     cuts: BTreeMap<Vec<usize>, Rc<Vec<Conflict>>>,
+    /// Estimated bytes `cuts` holds, and its budget (`CUT_MEMO_BYTES`).
+    cut_bytes: usize,
+    cut_budget: usize,
 }
 
 /// Namespace-history derivation over one branch's events (both modes), with
@@ -1486,6 +1814,14 @@ struct AppendPlan<'a> {
     /// Old cones that grew into a covering cone (checked, not derived).
     #[cfg_attr(not(test), allow(dead_code))]
     covered: usize,
+    /// The members of every cone (with the new event) that contains an
+    /// entity the new event touches: the only entities whose records in the
+    /// current projection the new event can change. Closed under parents
+    /// and slot competitors (a union of cones).
+    members: BTreeSet<&'a str>,
+    /// The old cone (without the new event) of every entity that reaches a
+    /// touched entity and existed before.
+    before: BTreeMap<&'a str, BTreeSet<&'a str>>,
 }
 
 /// Memoized alive-register analyses, by (entity, excluded event).
@@ -1529,6 +1865,7 @@ impl<'a> NsContext<'a> {
         let memo = Memo {
             ancestors: vec![None; events.len()],
             descendants: vec![None; events.len()],
+            cut_budget: CUT_MEMO_BYTES,
             ..Default::default()
         };
         Self {
@@ -1778,7 +2115,9 @@ impl<'a> NsContext<'a> {
         })
     }
 
-    /// The namespace records of one antichain's cut (memoized per antichain).
+    /// The namespace records of one antichain's cut (memoized per antichain,
+    /// within `Memo::cut_budget`: an antichain recurs across the cones that
+    /// share its events, such as the cones of a directory's entries).
     fn cut_conflicts(
         &self,
         selected: &[usize],
@@ -1802,8 +2141,12 @@ impl<'a> NsContext<'a> {
                 .filter(|c| c.field == "namespace")
                 .collect(),
         );
+        let bytes = 64
+            + key.len() * std::mem::size_of::<usize>()
+            + conflicts.iter().map(conflict_bytes).sum::<usize>();
         let mut memo = self.memo.borrow_mut();
-        if memo.cuts.len() < CUT_MEMO_ENTRIES {
+        if memo.cut_bytes + bytes <= memo.cut_budget {
+            memo.cut_bytes += bytes;
             memo.cuts.insert(key, conflicts.clone());
         }
         Ok(conflicts)
@@ -1994,10 +2337,76 @@ impl<'a> NsContext<'a> {
                 return Ok(Err("a grown cone lost a relevant event"));
             }
         }
+        let covered = seen.len();
+        let members = after
+            .values()
+            .filter(|cone| cone.iter().any(|m| touched.contains(m)))
+            .flatten()
+            .copied()
+            .collect();
         Ok(Ok(AppendPlan {
             cones,
-            covered: seen.len(),
+            covered,
+            members,
+            before,
         }))
+    }
+
+    /// The step the namespace history alone does not give (module docs,
+    /// "current records"): every namespace record of the old current
+    /// projection that the new event takes out of the projection must still
+    /// be derived, or full mode's DELETE would remove it. `derived` is
+    /// everything append mode derives (the new projection's records
+    /// included). A record that is neither derived nor a record of its old
+    /// cone's maximal cut (an antichain cut of the old namespace history,
+    /// which full mode re-derives) fails the check.
+    ///
+    /// Records of entities outside `plan.members` are unchanged (their cones
+    /// contain no entity the new event touches). Both projections over the
+    /// members are computed from the members' registers: the old history and
+    /// every antichain cut of it project (the rebuild succeeded), so the
+    /// restricted records equal the projection's (`namespace_records`).
+    fn current_records_survive(
+        &self,
+        new: usize,
+        plan: &AppendPlan<'a>,
+        derived: &[Conflict],
+    ) -> Result<bool> {
+        if plan.members.is_empty() {
+            return Ok(true);
+        }
+        let mut old = Bits::new(self.events.len());
+        for i in (0..self.events.len()).filter(|&i| i != new) {
+            old.insert(i);
+        }
+        let derived: BTreeSet<&str> = derived.iter().map(|c| c.id.as_str()).collect();
+        let mut maximal: BTreeMap<&BTreeSet<&str>, BTreeSet<String>> = BTreeMap::new();
+        for record in self.namespace_records(&plan.members, &old)? {
+            if derived.contains(record.id.as_str()) {
+                continue;
+            }
+            let entity = record.entity.split(',').next().unwrap_or_default();
+            let Some(cone) = plan.before.get(entity) else {
+                return Ok(false);
+            };
+            if !maximal.contains_key(cone) {
+                let mut cut = Bits::new(self.events.len());
+                for i in self.relevant(cone, Some(new)) {
+                    cut.union_with(&self.closure(i, false));
+                    cut.insert(i);
+                }
+                let ids = self
+                    .namespace_records(cone, &cut)?
+                    .into_iter()
+                    .map(|c| c.id)
+                    .collect();
+                maximal.insert(cone, ids);
+            }
+            if !maximal[cone].contains(&record.id) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Append mode: the planned cones' records.
@@ -3479,6 +3888,256 @@ mod tests {
         events
     }
 
+    /// A random history as replicas make it: each event depends on its
+    /// device's frontier and parents the heads of every register it changes,
+    /// as that device sees them; devices sync now and then. So devices build
+    /// long TRUE presence chains (saves) concurrent with tombstones, edit
+    /// deleted directories, resurrect, and rename into occupied slots.
+    fn device_history(rng: &mut StdRng, len: usize) -> Vec<Event> {
+        device_history_with(rng, len, false)
+    }
+
+    /// `focused`: five devices and two files competing for one slot, mostly
+    /// saves and deletes: TRUE chains that span devices around concurrent
+    /// tombstones (compressed presence with rank orders that differ from
+    /// chain order).
+    fn device_history_with(rng: &mut StdRng, len: usize, focused: bool) -> Vec<Event> {
+        let devices: &[&str] = if focused {
+            &["dev-a", "dev-b", "dev-c", "dev-d", "dev-e"]
+        } else {
+            &["dev-a", "dev-b", "dev-c"]
+        };
+        let entities: &[(&str, &str)] = if focused {
+            &[("f1", "file"), ("f2", "file"), ("d1", "directory")]
+        } else {
+            &[
+                ("d1", "directory"),
+                ("d2", "directory"),
+                ("f1", "file"),
+                ("f2", "file"),
+                ("f3", "file"),
+            ]
+        };
+        let mut events: Vec<Event> = vec![];
+        let mut seen: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); devices.len()];
+        let mut serial = 0;
+        while events.len() < len && serial < len * 4 {
+            serial += 1;
+            let d = rng.gen_range(0..devices.len());
+            if rng.gen_bool(if focused { 0.35 } else { 0.2 }) {
+                let other = seen[rng.gen_range(0..devices.len())].clone();
+                seen[d].extend(other);
+            }
+            let view = &seen[d];
+            let heads = |entity: &str, field: &str| -> Vec<String> {
+                let versions: Vec<&Event> = view
+                    .iter()
+                    .map(|&i| &events[i])
+                    .filter(|e| {
+                        e.changes
+                            .iter()
+                            .any(|c| c.entity == entity && c.field == field)
+                    })
+                    .collect();
+                let dominated: BTreeSet<&str> = versions
+                    .iter()
+                    .flat_map(|e| &e.changes)
+                    .filter(|c| c.entity == entity && c.field == field)
+                    .flat_map(|c| c.parents.iter().map(String::as_str))
+                    .collect();
+                versions
+                    .iter()
+                    .filter(|e| !dominated.contains(e.id.as_str()))
+                    .map(|e| e.id.clone())
+                    .collect()
+            };
+            let change = |entity: &str, field: &str, value: Value| Change {
+                entity: entity.into(),
+                field: field.into(),
+                parents: heads(entity, field),
+                value,
+            };
+            let (entity, kind) = entities[rng.gen_range(0..entities.len())];
+            let parent = if kind == "file" && rng.gen_bool(0.5) {
+                ["d1", "d2"][rng.gen_range(0..2)]
+            } else {
+                ROOT
+            };
+            let name = if focused && rng.gen_bool(0.8) {
+                "a"
+            } else {
+                ["a", "A", "b"][rng.gen_range(0..3)]
+            };
+            let location = json!({"parent": parent, "name": name});
+            let content = json!(hash(&rng.r#gen::<u64>().to_le_bytes()));
+            let changes = if heads(entity, "kind").is_empty() {
+                if !rng.gen_bool(0.6) {
+                    continue;
+                }
+                vec![
+                    change(entity, "kind", json!(kind)),
+                    change(entity, "location", location),
+                    change(entity, "alive", json!(true)),
+                ]
+            } else {
+                match rng.gen_range(0..10) {
+                    // A save (resurrects over a tombstone).
+                    n if n <= 4 || (focused && n <= 6) => {
+                        let mut changes = vec![change(entity, "alive", json!(true))];
+                        if kind == "file" {
+                            changes.push(change(entity, "content", content));
+                        }
+                        changes
+                    }
+                    n if n <= 6 || (focused && n <= 8) => {
+                        vec![change(entity, "alive", json!(false))]
+                    }
+                    _ => vec![change(entity, "location", location)],
+                }
+            };
+            let referenced: BTreeSet<&str> = view
+                .iter()
+                .flat_map(|&i| {
+                    events[i]
+                        .dependencies
+                        .iter()
+                        .chain(events[i].changes.iter().flat_map(|c| c.parents.iter()))
+                        .map(String::as_str)
+                })
+                .collect();
+            let dependencies: Vec<String> = view
+                .iter()
+                .map(|&i| events[i].id.clone())
+                .filter(|id| !referenced.contains(id.as_str()))
+                .collect();
+            let id = format!("{:04x}-{:03}", rng.gen_range(0..0x10000), events.len());
+            seen[d].insert(events.len());
+            events.push(Event {
+                id,
+                repo: "repo".into(),
+                branch: Branch {
+                    id: BRANCH.into(),
+                    name: "main".into(),
+                    shared: true,
+                },
+                device: devices[d].into(),
+                created_ms: serial as u64,
+                changes,
+                dependencies,
+                reviewed: vec![],
+                object_sizes: BTreeMap::new(),
+            });
+        }
+        events
+    }
+
+    /// The rows a commit leaves: `stored` upserted with `derived` (the last
+    /// record of an id wins), after full mode's DELETE of the namespace rows
+    /// `derived` lacks when `delete`.
+    fn committed(
+        stored: &BTreeMap<String, Conflict>,
+        derived: &[Conflict],
+        delete: bool,
+    ) -> BTreeMap<String, Conflict> {
+        let derived = by_id(derived);
+        let mut rows = stored.clone();
+        if delete {
+            rows.retain(|id, c| c.field != "namespace" || derived.contains_key(id));
+        }
+        rows.extend(derived);
+        rows
+    }
+
+    /// The whole commit, not only the namespace history: with the stored rows
+    /// of a rebuild of `events[..k]` from no rows (location pairs, reviewed
+    /// cuts, the current projection's records, namespace history, register
+    /// pairs), appending `events[k]` leaves exactly the rows of a full-mode
+    /// commit, whose namespace DELETE is applied; refusals happen in both or
+    /// neither, with the same error. Every prefix of random histories from
+    /// three generators (`TKFS_DERIVE_PREFIX_SEEDS`, default 90; release runs
+    /// take more), and the crafted `current_record_outside_history`, which
+    /// must fall back.
+    #[test]
+    fn append_commit_equals_full_commit_with_delete_on_every_prefix() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);")
+            .unwrap();
+        let mut appended = 0;
+        let mut fallbacks: BTreeMap<&str, usize> = BTreeMap::new();
+        let seeds: u64 = std::env::var("TKFS_DERIVE_PREFIX_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+        let histories = (0..seeds)
+            .map(|seed| {
+                let mut rng = StdRng::seed_from_u64(7000 + seed);
+                let events = match seed % 3 {
+                    0 => {
+                        let len = rng.gen_range(4..=16);
+                        history(&mut rng, len)
+                    }
+                    1 => {
+                        let len = rng.gen_range(8..=24);
+                        device_history(&mut rng, len)
+                    }
+                    _ => {
+                        let len = rng.gen_range(8..=20);
+                        device_history_with(&mut rng, len, true)
+                    }
+                };
+                (format!("seed {seed}"), events)
+            })
+            .chain([("crafted".to_string(), current_record_outside_history())]);
+        for (name, events) in histories {
+            for k in 1..events.len() {
+                let (old, new) = (&events[..k], &events[..=k]);
+                let (Ok(p_old), Ok(p_new)) = (project(BRANCH, old), project(BRANCH, new)) else {
+                    continue;
+                };
+                if !p_new.pending.is_empty() {
+                    continue;
+                }
+                // Only accepted (rebuildable) histories have stored rows.
+                let Ok(stored) = derive_full(&db, BRANCH, &p_old, old, None) else {
+                    continue;
+                };
+                let stored = committed(&BTreeMap::new(), &stored, true);
+                let id = new[k].id.as_str();
+                let full = derive_full(&db, BRANCH, &p_new, new, Some(id));
+                match (full, derive_append(&db, BRANCH, &p_new, new, id)) {
+                    (_, Ok(Plan::Fallback(reason))) => {
+                        *fallbacks.entry(reason).or_default() += 1;
+                    }
+                    (Ok(full), Ok(Plan::Derived(append))) => {
+                        assert_eq!(
+                            committed(&stored, &append, false),
+                            committed(&stored, &full, true),
+                            "{name} k {k}"
+                        );
+                        appended += 1;
+                    }
+                    (Err(full), Err(append)) => {
+                        assert_eq!(format!("{full:#}"), format!("{append:#}"), "{name} k {k}");
+                    }
+                    (full, append) => panic!(
+                        "{name} k {k}: refusal parity: full {:?} append {:?}",
+                        full.err(),
+                        append.err()
+                    ),
+                }
+            }
+        }
+        println!("{appended} appended, fallbacks {fallbacks:?}");
+        assert!(
+            appended > 400,
+            "{appended} appended, fallbacks {fallbacks:?}"
+        );
+        assert!(
+            fallbacks.contains_key("a current namespace record is not derived from history"),
+            "{fallbacks:?}"
+        );
+    }
+
     fn same<T: PartialEq + std::fmt::Debug>(a: &Result<T>, b: &Result<T>) -> bool {
         match (a, b) {
             (Ok(a), Ok(b)) => a == b,
@@ -3723,6 +4382,310 @@ current {current:#?}"
             compared > 2000 && unsafe_histories > 0,
             "{compared} {unsafe_histories}"
         );
+    }
+
+    /// A history whose current projection holds a namespace record that no
+    /// cut of the namespace history derives (TRUE presence compression keeps
+    /// rank extrema, not the chain's head), and a last event that takes the
+    /// record out of the projection: full mode's DELETE removes it.
+    ///
+    /// `f` and `y` compete for slot `x`. `f`'s presence chain `e1 -> a5 ->
+    /// c1` (saves on three devices, concurrent with `f`'s tombstone `b1`) is
+    /// one compressed group whose witnesses are the rank extrema `a5` and
+    /// `e1`, so its head `c1` is in no cut. `y` was deleted (`a3`) and moved
+    /// into `x` (`a4`); `d1` saves `y` on a stale base (concurrent with `a3`)
+    /// after seeing `a5` and `b1`. In the whole history both are alive (`c1`
+    /// beats `b1`, `d1` beats `a3`): record `f,y`. In every cut where `y` is
+    /// alive in `x` (it needs `d1`), `f`'s head is `a5`, which loses to `b1`.
+    /// The last event (`c2`, from `c1`'s device) moves `y` out of `x`.
+    fn current_record_outside_history() -> Vec<Event> {
+        let event = |id: &str, deps: &[&str], changes: Vec<Change>| Event {
+            id: id.into(),
+            repo: "repo".into(),
+            branch: Branch {
+                id: BRANCH.into(),
+                name: "main".into(),
+                shared: true,
+            },
+            device: id[..1].into(),
+            created_ms: 1,
+            changes,
+            dependencies: deps.iter().map(|d| d.to_string()).collect(),
+            reviewed: vec![],
+            object_sizes: BTreeMap::new(),
+        };
+        let change = |entity: &str, field: &str, parents: &[&str], value: Value| Change {
+            entity: entity.into(),
+            field: field.into(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            value,
+        };
+        let place = |name: &str| json!({"parent": ROOT, "name": name});
+        vec![
+            event(
+                "a1",
+                &[],
+                vec![
+                    change("f", "kind", &[], json!("file")),
+                    change("f", "location", &[], place("x")),
+                    change("f", "alive", &[], json!(true)),
+                ],
+            ),
+            event(
+                "a2",
+                &["a1"],
+                vec![
+                    change("y", "kind", &[], json!("file")),
+                    change("y", "location", &[], place("z")),
+                    change("y", "alive", &[], json!(true)),
+                ],
+            ),
+            event(
+                "a3",
+                &["a2"],
+                vec![change("y", "alive", &["a2"], json!(false))],
+            ),
+            event(
+                "a4",
+                &["a3"],
+                vec![change("y", "location", &["a2"], place("x"))],
+            ),
+            event(
+                "e1",
+                &["a4"],
+                vec![change("f", "alive", &["a1"], json!(true))],
+            ),
+            event(
+                "a5",
+                &["e1"],
+                vec![change("f", "alive", &["e1"], json!(true))],
+            ),
+            event(
+                "b1",
+                &["a4"],
+                vec![change("f", "alive", &["a1"], json!(false))],
+            ),
+            event(
+                "c1",
+                &["a5"],
+                vec![change("f", "alive", &["a5"], json!(true))],
+            ),
+            event(
+                "d1",
+                &["a5", "b1"],
+                vec![change("y", "alive", &["a2"], json!(true))],
+            ),
+            event(
+                "c2",
+                &["c1"],
+                vec![change("y", "location", &["a4"], place("w"))],
+            ),
+        ]
+    }
+
+    /// Full mode's DELETE removes the record when `c2` moves `y` out of `x`;
+    /// append mode falls back instead of keeping it.
+    #[test]
+    fn current_record_outside_history_falls_back() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);")
+            .unwrap();
+        let events = current_record_outside_history();
+        let (old, new) = (&events[..events.len() - 1], &events[..]);
+        let (p_old, p_new) = (project(BRANCH, old).unwrap(), project(BRANCH, new).unwrap());
+        let record = p_old
+            .conflicts
+            .iter()
+            .find(|c| c.entity == "f,y")
+            .expect("f and y collide in the current projection")
+            .clone();
+        let mut history_only = p_old.clone();
+        history_only.conflicts.clear();
+        let history = by_id(&derive_full(&db, BRANCH, &history_only, old, None).unwrap());
+        assert!(
+            !history.contains_key(&record.id),
+            "the record is in no history cut"
+        );
+        let stored = committed(
+            &BTreeMap::new(),
+            &derive_full(&db, BRANCH, &p_old, old, None).unwrap(),
+            true,
+        );
+        let full = derive_full(&db, BRANCH, &p_new, new, Some("c2")).unwrap();
+        let full_rows = committed(&stored, &full, true);
+        assert!(stored.contains_key(&record.id) && !full_rows.contains_key(&record.id));
+        assert!(!p_new.conflicts.iter().any(|c| c.id == record.id));
+        // The cone precondition holds (every old antichain survives); only
+        // the current-records check sees that append mode, which never
+        // deletes, would keep the row.
+        let locations = Locations::new(new);
+        let ctx = NsContext::new(BRANCH, new);
+        let plan = match ctx.append_plan(new.len() - 1, &locations) {
+            Ok(Ok(plan)) => plan,
+            _ => panic!("the cone precondition holds"),
+        };
+        assert!(plan.members.contains("f") && plan.members.contains("y"));
+        assert!(matches!(
+            derive_append(&db, BRANCH, &p_new, new, "c2"),
+            Ok(Plan::Fallback(
+                "a current namespace record is not derived from history"
+            ))
+        ));
+    }
+
+    /// Two devices that never sync each create the same `n` names: `n`
+    /// unresolved collisions, and the records of a cut grow with the cut, so
+    /// an unbounded cut memo would retain about n²/2 records.
+    fn collisions(n: usize) -> Vec<Event> {
+        let mut events = vec![];
+        for (d, device) in ["dev-a", "dev-b"].into_iter().enumerate() {
+            let mut previous: Option<String> = None;
+            for i in 0..n {
+                let id = format!("{d}-{i:04}");
+                let entity = format!("e{d}-{i:04}");
+                let change = |field: &str, value: Value| Change {
+                    entity: entity.clone(),
+                    field: field.into(),
+                    parents: vec![],
+                    value,
+                };
+                events.push(Event {
+                    id: id.clone(),
+                    repo: "repo".into(),
+                    branch: Branch {
+                        id: BRANCH.into(),
+                        name: "main".into(),
+                        shared: true,
+                    },
+                    device: device.into(),
+                    created_ms: i as u64,
+                    changes: vec![
+                        change("kind", json!("file")),
+                        change(
+                            "location",
+                            json!({"parent": ROOT, "name": format!("n{i:04}")}),
+                        ),
+                        change("alive", json!(true)),
+                    ],
+                    dependencies: previous.into_iter().collect(),
+                    reviewed: vec![],
+                    object_sizes: BTreeMap::new(),
+                });
+                previous = Some(id);
+            }
+        }
+        events
+    }
+
+    /// The cut memo stops at its byte budget (the estimate covers at least
+    /// the retained records' JSON size), and the derivation is unchanged:
+    /// equal to the Wave 0 code and to an unbounded memo.
+    #[test]
+    fn cut_memo_is_bounded_by_retained_bytes() {
+        let events = collisions(150);
+        let reference = by_id(&legacy::namespace_history(BRANCH, &events).unwrap());
+        let unbounded = NsContext::new(BRANCH, &events);
+        unbounded.memo.borrow_mut().cut_budget = usize::MAX;
+        assert_eq!(by_id(&unbounded.full().unwrap()), reference);
+        let budget = 256 * 1024;
+        let bounded = NsContext::new(BRANCH, &events);
+        bounded.memo.borrow_mut().cut_budget = budget;
+        assert_eq!(by_id(&bounded.full().unwrap()), reference);
+        let (all, kept) = (unbounded.memo.borrow(), bounded.memo.borrow());
+        let records = |memo: &Memo| memo.cuts.values().map(|c| c.len()).sum::<usize>();
+        let json = |memo: &Memo| {
+            memo.cuts
+                .values()
+                .flat_map(|c| c.iter())
+                .map(|c| serde_json::to_vec(c).unwrap().len())
+                .sum::<usize>()
+        };
+        println!(
+            "unbounded: {} records, {} estimated bytes, {} JSON bytes; bounded: {} records, {} bytes",
+            records(&all),
+            all.cut_bytes,
+            json(&all),
+            records(&kept),
+            kept.cut_bytes
+        );
+        // About n²/2 records without a bound (each pair's cut holds all the
+        // collisions below it).
+        assert!(records(&all) > 150 * 150 / 2, "{}", records(&all));
+        assert!(all.cut_bytes > 20 * budget && json(&all) <= all.cut_bytes);
+        assert!(kept.cut_bytes <= budget && kept.cut_bytes > budget / 2);
+        assert!(json(&kept) <= kept.cut_bytes);
+    }
+
+    /// Probe (ignored): one full derivation over `TKFS_DERIVE_PROBE_N`
+    /// (default 1,200) collisions, or the Wave 0 code with
+    /// `TKFS_DERIVE_PROBE_LEGACY=1`; run under `/usr/bin/time -v` for the
+    /// peak resident set. The memo never exceeds its budget.
+    #[test]
+    #[ignore = "WP1.7 memory probe"]
+    fn cut_memo_probe_n_collisions() {
+        let n = std::env::var("TKFS_DERIVE_PROBE_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1200);
+        let events = collisions(n);
+        let started = std::time::Instant::now();
+        if std::env::var("TKFS_DERIVE_PROBE_LEGACY").is_ok_and(|v| v == "1") {
+            let records = legacy::namespace_history(BRANCH, &events).unwrap().len();
+            println!("legacy: {records} records in {:?}", started.elapsed());
+            return;
+        }
+        let ctx = NsContext::new(BRANCH, &events);
+        let records = ctx.full().unwrap().len();
+        let memo = ctx.memo.borrow();
+        println!(
+            "memoized: {records} records in {:?}; memo {} cuts, {} retained records, {} estimated bytes",
+            started.elapsed(),
+            memo.cuts.len(),
+            memo.cuts.values().map(|c| c.len()).sum::<usize>(),
+            memo.cut_bytes
+        );
+        assert!(memo.cut_bytes <= CUT_MEMO_BYTES);
+    }
+
+    /// The slot-key memo stays within its byte budget whatever the names,
+    /// keeps a name used on every pass, and returns `name_key`'s keys and
+    /// error texts.
+    #[test]
+    fn slot_key_memo_is_bounded_by_bytes() {
+        let budget = 64 * 1024;
+        let mut keys = SlotKeys::new(budget);
+        let computed = Cell::new(0);
+        let lookup = |keys: &mut SlotKeys, name: &str| -> SlotKey {
+            if let Some(key) = keys.get(name) {
+                return key;
+            }
+            computed.set(computed.get() + 1);
+            let key: SlotKey = name_key(name)
+                .map(Arc::from)
+                .map_err(|error| Arc::from(format!("{error:#}")));
+            keys.insert(name, key.clone());
+            key
+        };
+        // Maximum-length names, 1,000 per pass: far more than the budget.
+        let long = |i: usize| format!("{i:06}{}", "é".repeat(124));
+        for _ in 0..3 {
+            for i in 0..1000 {
+                let name = long(i);
+                let key = lookup(&mut keys, &name);
+                assert_eq!(key.as_deref().ok(), name_key(&name).ok().as_deref());
+                assert!(keys.bytes() <= budget, "{}", keys.bytes());
+                // A hot name, used between every cold one, stays memoized.
+                assert_eq!(
+                    lookup(&mut keys, "Hot.TXT").as_deref().ok(),
+                    Some("hot.txt")
+                );
+            }
+        }
+        // 3,000 cold lookups plus the hot name's first one.
+        assert_eq!(computed.get(), 3001);
+        let error = lookup(&mut keys, "a/b").unwrap_err();
+        assert_eq!(&*error, format!("{:#}", name_key("a/b").unwrap_err()));
+        assert_eq!(lookup(&mut keys, "a/b").unwrap_err(), error);
     }
 
     /// A TRUE presence assertion extending a compressed segment past its rank

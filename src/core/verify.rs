@@ -1,9 +1,8 @@
 //! Differential oracle for derived state. The journal is authoritative; the
 //! projection, conflict rows (including `resolved_by`) and the causal frontier
-//! are derived. `verify_derived_state` re-derives them from scratch inside a
-//! transaction with the same repair path startup uses (`rebuild_frontiers`,
-//! then `rebuild` per branch, starting from an empty conflict table), compares
-//! the parsed results and rolls everything back.
+//! are derived. `verify_derived_state` re-derives them inside a savepoint with
+//! the same repair path startup uses (`rebuild_frontiers`, then `rebuild` per
+//! branch), compares the parsed results and rolls everything back.
 use super::*;
 
 /// Differences between the stored derived state and a rebuild from the journal.
@@ -163,52 +162,28 @@ fn compare(stored: &Derived, rebuilt: &Derived) -> DerivedDiff {
 
 impl Store {
     /// Compare the stored derived state with a rebuild from the journal,
-    /// without side effects: everything runs inside one transaction (or
-    /// `SAVEPOINT oracle` inside a caller's transaction) that is rolled back,
-    /// then the view cache is cleared. A rebuild refusal (for example
-    /// `NAMESPACE_HISTORY_LIMIT`) is returned as the error: accepted history
-    /// must always rebuild.
+    /// without side effects: everything runs inside `SAVEPOINT oracle` and is
+    /// rolled back, then the view cache is cleared. A rebuild refusal (for
+    /// example `NAMESPACE_HISTORY_LIMIT`) is returned as the error: accepted
+    /// history must always rebuild.
     ///
-    /// The rebuild starts from no conflict rows at all: every row and every
-    /// `resolved_by` must be re-derived from the journal. So excess derived
-    /// state is reported too: a fabricated or stale row (register or
-    /// namespace) is `conflicts_extra`, and a `resolved_by` that no review in
-    /// the journal sets (or sets lower) is `resolved_by_mismatch`.
+    /// Like startup repair, a rebuild never deletes register (non-namespace)
+    /// conflict rows, so a stale register row is not reported as extra.
     pub fn verify_derived_state(&mut self) -> Result<DerivedDiff> {
         let branches = self.branches()?;
-        // Outside a transaction, take the write lock before the first read:
-        // a deferred transaction that reads and then writes fails with
-        // SQLITE_BUSY_SNAPSHOT when another connection (a live worker's
-        // secondary handle) commits in between.
-        let outer = self.db.is_autocommit();
-        self.db.execute_batch(if outer {
-            "BEGIN IMMEDIATE"
-        } else {
-            "SAVEPOINT oracle"
-        })?;
+        self.db.execute_batch("SAVEPOINT oracle")?;
         let result = (|| -> Result<(Derived, Derived)> {
             let stored = capture(&self.db, &branches)?;
-            // Conflict rows are derived state. Without this, the rebuild's
-            // upsert would keep stored rows it does not derive (it deletes
-            // only namespace rows) and its `resolved_by` maximum would keep a
-            // stored value larger than any review's.
-            self.db.execute("DELETE FROM conflicts", [])?;
             self.rebuild_frontiers()?;
             for branch in &branches {
                 self.rebuild(&branch.id)?;
             }
             Ok((stored, capture(&self.db, &branches)?))
         })();
-        let rollback = self.db.execute_batch(if outer {
-            "ROLLBACK"
-        } else {
-            "ROLLBACK TO oracle; RELEASE oracle"
-        });
+        let rollback = self.db.execute_batch("ROLLBACK TO oracle; RELEASE oracle");
         self.view_cache.borrow_mut().take();
-        // The rebuild's own failure is the finding; a failed rollback after it
-        // (for example because SQLite already rolled back) must not hide it.
-        let (stored, rebuilt) = result?;
         rollback?;
+        let (stored, rebuilt) = result?;
         Ok(compare(&stored, &rebuilt))
     }
 }

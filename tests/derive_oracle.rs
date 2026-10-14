@@ -5,8 +5,12 @@
 //!   saves (`alive:true`), stale-base saves, metadata changes, temp
 //!   replacements, resolutions and recoveries, and exchange events in random
 //!   delivery orders (subsets, shuffles, duplicates, children before parents)
-//!   with random restarts. After every committed local operation, delivery
-//!   page and restart the oracle (`verify_derived_state`, a from-scratch rebuild) must be
+//!   with random restarts. Every commit is checked inside its transaction
+//!   (`set_thread_commit_checks`): the branch's conflict rows equal a
+//!   derivation from no rows, and a refused commit is refused by full mode
+//!   with the same error (local operations and deliveries alike). After
+//!   every local operation, delivery page and restart the oracle (with every
+//!   row re-derived from no rows, `verify_derived_state_strict`) must be
 //!   empty, which also proves the history still rebuilds (refusal parity
 //!   with startup repair). Finally every replica converges to identical rows.
 //!   Seeds run in append mode (append's own output feeds later appends) and,
@@ -16,15 +20,16 @@
 //!   append-mode and a full-mode receiver must leave identical rows after
 //!   every delivery.
 //! - Refusal parity at `MAX_NAMESPACE_CUTS`, append usage on the workloads
-//!   the package exists for, and the oracle's excess-state detection.
+//!   the package exists for, the fallbacks of crafted histories, and the
+//!   oracle's excess-state detection.
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use tempfile::TempDir;
 use tkfs::core::{
     derive::{
-        ConflictMode, DeriveCounters, set_thread_conflict_mode, thread_derive_counters,
-        thread_fallback_reasons, thread_last_fallback,
+        ConflictMode, DeriveCounters, set_thread_commit_checks, set_thread_conflict_mode,
+        thread_derive_counters, thread_fallback_reasons, thread_last_fallback,
     },
     *,
 };
@@ -45,6 +50,26 @@ impl Drop for ModeGuard {
     }
 }
 
+/// Checks every commit of the calling thread against the reference;
+/// restores the previous setting on drop.
+struct ChecksGuard(bool);
+impl ChecksGuard {
+    fn new() -> Self {
+        Self(set_thread_commit_checks(true))
+    }
+}
+impl Drop for ChecksGuard {
+    fn drop(&mut self) {
+        set_thread_commit_checks(self.0);
+    }
+}
+
+/// The oracle with every conflict row re-derived from no rows (the adapter
+/// for CCR-WP1.7-1).
+fn oracle(s: &mut Store) -> anyhow::Result<DerivedDiff> {
+    s.verify_derived_state_strict()
+}
+
 fn counters_since(start: DeriveCounters) -> DeriveCounters {
     let now = thread_derive_counters();
     DeriveCounters {
@@ -55,6 +80,7 @@ fn counters_since(start: DeriveCounters) -> DeriveCounters {
         verified: now.verified - start.verified,
         restricted: now.restricted - start.restricted,
         commit_micros: now.commit_micros - start.commit_micros,
+        checked: now.checked - start.checked,
     }
 }
 
@@ -233,10 +259,10 @@ impl Fuzz {
     }
 
     /// The oracle is empty, and nothing was quarantined except a budget
-    /// refusal (which is checked for parity in verify mode).
+    /// refusal that full mode also makes (or a descendant of one).
     fn check(&mut self, r: usize, after: &str) {
         let started = std::time::Instant::now();
-        let diff = self.replicas[r].store().verify_derived_state();
+        let diff = oracle(self.replicas[r].store());
         *self.stats.entry("oracle_ms".into()).or_default() +=
             started.elapsed().as_millis() as usize;
         let diff = match diff {
@@ -254,6 +280,10 @@ impl Fuzz {
         let rows: BTreeMap<String, String> =
             quarantined(self.replicas[r].store()).into_iter().collect();
         for (id, error) in &rows {
+            // A failed commit check quotes the refusal it compared.
+            if error.contains("CONFLICT_MODE_MISMATCH") {
+                self.fail(format!("replica {r} after {after}: {id}: {error}"));
+            }
             if error.contains("NAMESPACE_HISTORY_LIMIT") {
                 if self.parity_checked.insert(format!("{r}/{id}")) {
                     if !full_mode_refuses(self.replicas[r].store(), id) {
@@ -480,7 +510,12 @@ all quarantined rows: {rows:#?}"
             }
             Err(error) => {
                 let text = format!("{error:#}");
+                if text.contains("CONFLICT_MODE_MISMATCH") {
+                    self.log.push(format!("[{r}] {what}"));
+                    self.fail(format!("replica {r}: {what}: {text}"));
+                }
                 if text.contains("NAMESPACE_HISTORY_LIMIT") {
+                    // The commit check made full mode refuse it too.
                     self.refusals += 1;
                 } else if !expected.iter().any(|code| text.contains(code)) {
                     self.log.push(format!("[{r}] {what}"));
@@ -612,6 +647,7 @@ fn run_seed(
         ConflictMode::Append
     };
     let _mode = ModeGuard::new(mode);
+    let _checks = ChecksGuard::new();
     let start = thread_derive_counters();
     let mut fuzz = Fuzz::with(seed, mode, stress);
     let steps = fuzz.rng.gen_range(steps);
@@ -634,11 +670,12 @@ fn run_seeds(
         let started = std::time::Instant::now();
         let (c, r, seed_stats) = run_seed(seed, steps.clone(), stress);
         eprintln!(
-            "DERIVE_SEED {seed}: {} ms, {} append, {} verified, {} fallbacks, {} refused deliveries",
+            "DERIVE_SEED {seed}: {} ms, {} append, {} verified, {} fallbacks, {} checked, {} refused deliveries",
             started.elapsed().as_millis(),
             c.append,
             c.verified,
             c.fallbacks,
+            c.checked,
             seed_stats.get("refused_deliveries").copied().unwrap_or(0)
         );
         for (k, v) in seed_stats {
@@ -651,6 +688,7 @@ fn run_seeds(
         total.rebuilds += c.rebuilds;
         total.restricted += c.restricted;
         total.commit_micros += c.commit_micros;
+        total.checked += c.checked;
         refusals += r;
     }
     println!(
@@ -658,11 +696,16 @@ fn run_seeds(
         json!({"counters": total, "refusals": refusals, "stats": stats,
             "fallback_reasons": thread_fallback_reasons()})
     );
-    // The fuzzer must actually exercise append mode, and verify mode must
-    // have compared real commits.
+    // The fuzzer must actually exercise append mode, verify mode must have
+    // compared real commits, and every slow-path commit must have been
+    // checked (a refused one is checked but not counted by mode).
     assert!(total.append > 0, "{total:?}");
     assert!(total.verified > 0, "{total:?}");
     assert!(total.restricted > 0, "{total:?}");
+    assert!(
+        total.checked >= total.append + total.fallbacks + total.verified + total.full,
+        "{total:?}"
+    );
 }
 
 /// Steps per seed in the debug suite (the oracle runs after every one, and a
@@ -797,7 +840,7 @@ fn append_and_full_receivers_store_identical_rows() {
             }
             appended += counters_since(start).append;
             for receiver in [&mut append, &mut full] {
-                let diff = receiver.store().verify_derived_state().unwrap();
+                let diff = oracle(receiver.store()).unwrap();
                 assert!(diff.is_empty(), "seed {seed} order {order}: {diff:#?}");
             }
         }
@@ -874,7 +917,7 @@ fn history_limit_refused_at_the_same_event_in_every_mode() {
             let acked = r.receive(bundle(vec![event.clone()]), &allowed).unwrap();
             deliveries.push((acked, quarantined(r)));
         }
-        let diff = r.verify_derived_state().unwrap();
+        let diff = oracle(r).unwrap();
         assert!(diff.is_empty(), "{mode:?}: {diff:#?}");
         (deliveries, conflict_rows(r))
     };
@@ -962,7 +1005,7 @@ fn common_remote_workloads_take_the_append_path() {
     for event in events {
         let b = b.store();
         b.receive(bundle(vec![event]), &allowed).unwrap();
-        let diff = b.verify_derived_state().unwrap();
+        let diff = oracle(b).unwrap();
         assert!(diff.is_empty(), "{diff:#?}");
     }
     let used = counters_since(start);
@@ -1067,7 +1110,7 @@ fn fallback_when_a_presence_witness_is_displaced() {
             let acked = r.receive(bundle(vec![event.clone()]), &allowed).unwrap();
             assert_eq!(acked, vec![event.id.clone()], "{mode:?}");
             let used = counters_since(start);
-            let diff = r.verify_derived_state().unwrap();
+            let diff = oracle(r).unwrap();
             assert!(diff.is_empty(), "{mode:?} after {}: {diff:#?}", event.id);
             match (mode, event.id.as_str()) {
                 (ConflictMode::Full, _) => assert_eq!(used.full, 1, "{used:?}"),
@@ -1088,10 +1131,163 @@ fn fallback_when_a_presence_witness_is_displaced() {
     assert!(rows.windows(2).all(|w| w[0] == w[1]));
 }
 
-/// The oracle starts its rebuild from no conflict rows, so excess derived
-/// state is reported: a fabricated register record, an inflated or invented
-/// `resolved_by`, a stale namespace record. It also works inside a caller's
-/// transaction and leaves it open.
+/// The current projection can hold a namespace record that no cut of the
+/// namespace history derives (TRUE presence compression keeps rank extrema,
+/// not a presence chain's head); full mode deletes it when an event takes it
+/// out of the projection. Append mode cannot delete, so it must fall back
+/// there ("a current namespace record is not derived from history"); rows
+/// stay identical in every mode and the oracle stays empty.
+///
+/// `f` and `y` compete for slot `x`. `f`'s presence chain `e1 -> a5 -> c1`
+/// (saves on three devices, concurrent with `f`'s tombstone `b1`) is one
+/// compressed group with witnesses `a5` and `e1`; `y` is deleted (`a3`),
+/// moved into `x` (`a4`) and saved on a stale base (`d1`, after `a5` and
+/// `b1`). Both are alive in the whole history, so `f,y` is recorded, but in
+/// every cut where `y` is alive in `x`, `f`'s head is `a5`, which loses to
+/// `b1`. `c2` moves `y` out of `x`.
+#[test]
+fn fallback_when_a_current_record_is_not_derived_from_history() {
+    let crafted = |id: &str, deps: &[&str], changes: Vec<Change>| Event {
+        id: id.into(),
+        repo: REPO.into(),
+        branch: Branch {
+            id: hash(format!("tkfs-v1/{REPO}/main").as_bytes()),
+            name: "main".into(),
+            shared: true,
+        },
+        device: format!("dev-{}", &id[..1]),
+        created_ms: 1,
+        changes,
+        dependencies: deps.iter().map(|d| d.to_string()).collect(),
+        reviewed: vec![],
+        object_sizes: BTreeMap::new(),
+    };
+    let change = |entity: &str, field: &str, parents: &[&str], value| Change {
+        entity: entity.into(),
+        field: field.into(),
+        parents: parents.iter().map(|p| p.to_string()).collect(),
+        value,
+    };
+    let place = |name: &str| json!({"parent": ROOT, "name": name});
+    let events = vec![
+        crafted(
+            "a1",
+            &[],
+            vec![
+                change("f", "kind", &[], json!("file")),
+                change("f", "location", &[], place("x")),
+                change("f", "alive", &[], json!(true)),
+            ],
+        ),
+        crafted(
+            "a2",
+            &["a1"],
+            vec![
+                change("y", "kind", &[], json!("file")),
+                change("y", "location", &[], place("z")),
+                change("y", "alive", &[], json!(true)),
+            ],
+        ),
+        crafted(
+            "a3",
+            &["a2"],
+            vec![change("y", "alive", &["a2"], json!(false))],
+        ),
+        crafted(
+            "a4",
+            &["a3"],
+            vec![change("y", "location", &["a2"], place("x"))],
+        ),
+        crafted(
+            "e1",
+            &["a4"],
+            vec![change("f", "alive", &["a1"], json!(true))],
+        ),
+        crafted(
+            "a5",
+            &["e1"],
+            vec![change("f", "alive", &["e1"], json!(true))],
+        ),
+        crafted(
+            "b1",
+            &["a4"],
+            vec![change("f", "alive", &["a1"], json!(false))],
+        ),
+        crafted(
+            "c1",
+            &["a5"],
+            vec![change("f", "alive", &["a5"], json!(true))],
+        ),
+        crafted(
+            "d1",
+            &["a5", "b1"],
+            vec![change("y", "alive", &["a2"], json!(true))],
+        ),
+        crafted(
+            "c2",
+            &["c1"],
+            vec![change("y", "location", &["a4"], place("w"))],
+        ),
+    ];
+    let allowed: BTreeSet<String> = ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .map(|d| format!("dev-{d}"))
+        .collect();
+    let collision = |r: &Store| {
+        r.conflicts()
+            .unwrap()
+            .iter()
+            .any(|c| c.field == "namespace" && c.entity == "f,y")
+    };
+    let mut rows = vec![];
+    for mode in [
+        ConflictMode::Append,
+        ConflictMode::Verify,
+        ConflictMode::Full,
+    ] {
+        let _mode = ModeGuard::new(mode);
+        let _checks = ChecksGuard::new();
+        let mut receiver = Replica::new();
+        let r = receiver.store();
+        for event in &events {
+            let start = thread_derive_counters();
+            let acked = r.receive(bundle(vec![event.clone()]), &allowed).unwrap();
+            assert_eq!(
+                acked,
+                vec![event.id.clone()],
+                "{mode:?}: {:?}",
+                quarantined(r)
+            );
+            let used = counters_since(start);
+            let diff = oracle(r).unwrap();
+            assert!(diff.is_empty(), "{mode:?} after {}: {diff:#?}", event.id);
+            if event.id == "d1" {
+                assert!(collision(r), "{mode:?}: f,y recorded");
+            }
+            if event.id == "c2" {
+                assert!(!collision(r), "{mode:?}: f,y deleted");
+                match mode {
+                    ConflictMode::Full => assert_eq!(used.full, 1, "{used:?}"),
+                    _ => {
+                        assert_eq!(used.fallbacks, 1, "{used:?}");
+                        assert_eq!(
+                            thread_last_fallback(),
+                            Some("a current namespace record is not derived from history")
+                        );
+                    }
+                }
+            }
+        }
+        rows.push(conflict_rows(r));
+    }
+    assert!(rows.windows(2).all(|w| w[0] == w[1]));
+}
+
+/// The oracle adapter (`verify_derived_state_strict`, CCR-WP1.7-1) starts
+/// its rebuild from no conflict rows, so excess derived state is reported: a
+/// fabricated register record, an inflated or invented `resolved_by`, a
+/// stale namespace record. It also works inside a caller's transaction and
+/// leaves it open.
 #[test]
 fn oracle_reports_excess_derived_state() {
     let fixture = || {
@@ -1131,7 +1327,7 @@ fn oracle_reports_excess_derived_state() {
         a.store()
             .resolve(std::slice::from_ref(&content.id), &selected)
             .unwrap();
-        let diff = a.store().verify_derived_state().unwrap();
+        let diff = oracle(a.store()).unwrap();
         assert!(diff.is_empty(), "{diff:#?}");
         (a, b)
     };
@@ -1152,7 +1348,7 @@ fn oracle_reports_excess_derived_state() {
         rusqlite::params![fake.id, s.active, serde_json::to_string(&fake).unwrap()],
     )
     .unwrap();
-    let diff = s.verify_derived_state().unwrap();
+    let diff = oracle(s).unwrap();
     assert_eq!(
         diff.conflicts_extra,
         vec![format!("{}/{}", s.active, fake.id)]
@@ -1172,7 +1368,7 @@ fn oracle_reports_excess_derived_state() {
         )
         .unwrap();
     }
-    let diff = s.verify_derived_state().unwrap();
+    let diff = oracle(s).unwrap();
     assert_eq!(diff.resolved_by_mismatch.len(), 2, "{diff:#?}");
     assert!(diff.conflicts_extra.is_empty() && diff.conflicts_missing.is_empty());
 
@@ -1191,7 +1387,7 @@ fn oracle_reports_excess_derived_state() {
         rusqlite::params![serde_json::to_string(&altered).unwrap(), altered.id],
     )
     .unwrap();
-    let diff = s.verify_derived_state().unwrap();
+    let diff = oracle(s).unwrap();
     assert_eq!(
         diff.conflicts_extra,
         vec![format!("{}/{}: payload differs", s.active, altered.id)]
@@ -1210,9 +1406,9 @@ fn oracle_reports_excess_derived_state() {
     let (mut a, _b) = fixture();
     let s = a.store();
     s.db.execute_batch("BEGIN").unwrap();
-    assert!(s.verify_derived_state().unwrap().is_empty());
+    assert!(oracle(s).unwrap().is_empty());
     assert!(!s.db.is_autocommit());
     s.db.execute_batch("ROLLBACK").unwrap();
-    assert!(s.verify_derived_state().unwrap().is_empty());
+    assert!(oracle(s).unwrap().is_empty());
     assert!(s.db.is_autocommit());
 }

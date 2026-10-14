@@ -91,7 +91,8 @@ fn two_way_backlog_at(name: &str, n: usize, oracle: bool) {
         );
         if oracle {
             // A full rebuild is quadratic; it runs after the measured phase.
-            let (diff, ms) = time_ms(|| b.verify_derived_state().unwrap());
+            // Every row is re-derived from no rows (the CCR-WP1.7-1 adapter).
+            let (diff, ms) = time_ms(|| b.verify_derived_state_strict().unwrap());
             s.metric("oracle_ms", ms, "ms");
             s.check(diff.is_empty(), format!("oracle empty: {diff:?}"));
         }
