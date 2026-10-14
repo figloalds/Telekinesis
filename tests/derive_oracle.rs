@@ -1107,11 +1107,25 @@ fn fallback_when_a_presence_witness_is_displaced() {
         let r = receiver.store();
         for event in &events {
             let start = thread_derive_counters();
+            let paths = r.commit_path_counters();
             let acked = r.receive(bundle(vec![event.clone()]), &allowed).unwrap();
             assert_eq!(acked, vec![event.id.clone()], "{mode:?}");
             let used = counters_since(start);
+            let fast = r.commit_path_counters().fast - paths.fast;
             let diff = oracle(r).unwrap();
             assert!(diff.is_empty(), "{mode:?} after {}: {diff:#?}", event.id);
+            // WP1.INT: since WP1.6, remote events may commit through a
+            // successor (§5.1 remote fast paths), which derives nothing. The
+            // event under test (`w3`) must still take the slow path.
+            if fast == 1 {
+                assert_ne!(event.id, "w3", "{mode:?}: w3 took a fast path");
+                assert_eq!(
+                    used.full + used.append + used.fallbacks + used.verified,
+                    0,
+                    "{mode:?} {used:?}"
+                );
+                continue;
+            }
             match (mode, event.id.as_str()) {
                 (ConflictMode::Full, _) => assert_eq!(used.full, 1, "{used:?}"),
                 (_, "w3") => {
