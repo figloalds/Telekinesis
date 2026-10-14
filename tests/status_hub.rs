@@ -1300,6 +1300,7 @@ impl Fx {
         self.rec(StatusEvent::PeerConfigured {
             installation: installation.into(),
             endpoint: endpoint.into(),
+            display_name: None,
         });
         self.rec(lane(installation, 0, LaneState::Ready, None));
         self.rec(catalog(installation, &[entry(REPO, EntryState::Running)]));
@@ -1353,6 +1354,7 @@ fn lane(installation: &str, lane: u32, state: LaneState, error: Option<ErrorWire
         error,
         backoff_until_ms: None,
         rtt_ms: Some(12),
+        protocol: None,
     }
 }
 
@@ -1556,6 +1558,7 @@ fn non_sharing_offline_peer_is_ignored() {
     fx.rec(StatusEvent::PeerConfigured {
         installation: PEER_B.into(),
         endpoint: ENDPOINT_B.into(),
+        display_name: None,
     });
     fx.rec(lane(
         PEER_B,
@@ -2012,6 +2015,7 @@ fn gate_paused_blocked_and_remote_waiting() {
     fx.rec(StatusEvent::PeerConfigured {
         installation: PEER_A.into(),
         endpoint: ENDPOINT_A.into(),
+        display_name: None,
     });
     fx.rec(lane(PEER_A, 0, LaneState::Ready, None));
     let folder = fx.folder();
@@ -2704,6 +2708,7 @@ fn objects_op_errors_resolve_when_their_work_is_gone() {
         lane: 1,
         op: "objects.pull".into(),
         at_ms: fx.now(),
+        direction: Direction::Outbound,
     });
     fx.rec(heartbeat(4, Some(missing_bytes(0))));
     fx.run(grace + 5);
@@ -2953,6 +2958,7 @@ fn lanes_peers_and_reconnects() {
     fx.rec(StatusEvent::PeerConfigured {
         installation: PEER_A.into(),
         endpoint: ENDPOINT_A.into(),
+        display_name: None,
     });
     let peer = |fx: &Fx| fx.snap().peers[0].clone();
     assert_eq!(peer(&fx).state, PeerConnState::Offline);
@@ -2969,6 +2975,7 @@ fn lanes_peers_and_reconnects() {
         lane: 0,
         op: "meta.exchange".into(),
         at_ms: T0,
+        direction: Direction::Outbound,
     });
     assert_eq!(peer(&fx).lanes[0].inflight.len(), 1);
     // The lane drops with a transient error and backs off.
@@ -2982,6 +2989,7 @@ fn lanes_peers_and_reconnects() {
             error: Some(wire("WS_CONNECT_FAILED")),
             backoff_until_ms: Some(fx.now() + 4000),
             rtt_ms: None,
+            protocol: None,
         });
     }
     let p = peer(&fx);
@@ -3417,6 +3425,7 @@ fn in_flight_counts_follow_the_lanes() {
         lane: 1,
         op: op.into(),
         at_ms: T0,
+        direction: Direction::Outbound,
     };
     fx.rec(started("objects.pull"));
     fx.rec(started("objects.push"));
@@ -3500,6 +3509,7 @@ fn non_sharing_rows_show_no_transfer_work() {
     fx.rec(StatusEvent::PeerConfigured {
         installation: PEER_B.into(),
         endpoint: ENDPOINT_B.into(),
+        display_name: None,
     });
     fx.rec(lane(PEER_B, 0, LaneState::Ready, None));
     fx.rec(catalog(PEER_B, &[entry("repo-other", EntryState::Running)]));
@@ -3973,6 +3983,7 @@ fn a_configured_peer_whose_catalog_is_unknown_may_share() {
     fx.rec(StatusEvent::PeerConfigured {
         installation: PEER_A.into(),
         endpoint: ENDPOINT_A.into(),
+        display_name: None,
     });
     fx.rec(lane(
         PEER_A,
@@ -4195,6 +4206,7 @@ fn measure_record_latency() -> (Duration, Duration, u64) {
         hub.record(StatusEvent::PeerConfigured {
             installation: installation.into(),
             endpoint: endpoint.into(),
+            display_name: None,
         });
         hub.record(lane(installation, 0, LaneState::Ready, None));
         hub.record(catalog(installation, &[entry(REPO, EntryState::Running)]));
@@ -4369,6 +4381,7 @@ fn large_hub(folders: usize, peers: usize) -> Arc<StatusHub> {
         hub.record(StatusEvent::PeerConfigured {
             installation: peer_of(p),
             endpoint: format!("ws://127.0.0.1:{}", 44_000 + p),
+            display_name: None,
         });
         for lane_index in 0..3 {
             hub.record(lane(&peer_of(p), lane_index, LaneState::Ready, None));
@@ -4567,6 +4580,7 @@ fn legacy_fixture(caught_up: bool) -> Fx {
     fx.rec(StatusEvent::PeerConfigured {
         installation: PEER_A.into(),
         endpoint: ENDPOINT_A.into(),
+        display_name: None,
     });
     for index in 0..3 {
         fx.rec(lane(PEER_A, index, LaneState::Ready, None));
@@ -4767,4 +4781,137 @@ fn status_redacts_pairing_code() {
         assert!(!output.contains(CODE), "{output}");
         assert!(output.contains("<redacted>"), "{output}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// WP2.INT: CCR-WP1.11-1 (`PeerConfigured.display_name`), CCR-WP1.11-2
+// (`LaneState.protocol`) and CCR-WP2.8-3 (`ExchangeStarted.direction`).
+
+#[test]
+fn the_catalogs_display_name_labels_the_peer() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: Some("laptop".into()),
+    });
+    fx.rec(lane(PEER_A, 0, LaneState::Ready, None));
+    fx.rec(catalog(PEER_A, &[entry(REPO, EntryState::Running)]));
+    assert_eq!(fx.snap().peers[0].label.as_deref(), Some("laptop"));
+    assert_eq!(fx.pair(PEER_A).label.as_deref(), Some("laptop"));
+    // A respawn without a name keeps the label; a new name replaces it.
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: None,
+    });
+    assert_eq!(fx.snap().peers[0].label.as_deref(), Some("laptop"));
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: Some("desktop".into()),
+    });
+    assert_eq!(fx.snap().peers[0].label.as_deref(), Some("desktop"));
+    // `set_peer_label` (the adapter) still works, and a nameless
+    // PeerConfigured does not undo it.
+    fx.hub.set_peer_label(PEER_A, Some("renamed".into()));
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: None,
+    });
+    assert_eq!(fx.snap().peers[0].label.as_deref(), Some("renamed"));
+}
+
+#[test]
+fn a_ready_lanes_protocol_is_the_peers_protocol() {
+    let fx = Fx::new();
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: None,
+    });
+    let ready = |lane_no: u32, protocol: Option<&str>| StatusEvent::LaneState {
+        installation: PEER_A.into(),
+        lane: lane_no,
+        role: if lane_no == 0 {
+            LaneRole::Control
+        } else {
+            LaneRole::Bulk
+        },
+        direction: Direction::Outbound,
+        state: LaneState::Ready,
+        error: None,
+        backoff_until_ms: None,
+        rtt_ms: Some(5),
+        protocol: protocol.map(str::to_owned),
+    };
+    assert_eq!(fx.snap().peers[0].protocol, None);
+    fx.rec(ready(1, Some("tkfs-peer/3")));
+    assert_eq!(
+        fx.snap().peers[0].protocol.as_deref(),
+        Some("tkfs-peer/3"),
+        "any Ready lane's protocol while the control lane is not Ready"
+    );
+    fx.rec(ready(0, Some("tkfs-peer/2")));
+    assert_eq!(
+        fx.snap().peers[0].protocol.as_deref(),
+        Some("tkfs-peer/2"),
+        "the control lane's protocol first"
+    );
+    // A Ready re-emission without a protocol (an RTT update) keeps it.
+    fx.rec(ready(0, None));
+    assert_eq!(fx.snap().peers[0].protocol.as_deref(), Some("tkfs-peer/2"));
+    // Lanes that leave Ready forget their protocol.
+    fx.rec(lane(PEER_A, 0, LaneState::Backoff, Some(wire("WS_CLOSED"))));
+    assert_eq!(fx.snap().peers[0].protocol.as_deref(), Some("tkfs-peer/3"));
+    fx.rec(lane(PEER_A, 1, LaneState::Closed, None));
+    assert_eq!(fx.snap().peers[0].protocol, None);
+}
+
+#[test]
+fn an_inbound_exchange_start_is_booked_on_the_inbound_lane() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.rec(StatusEvent::InboundSession {
+        installation: PEER_A.into(),
+        lane: 0,
+        role: LaneRole::Control,
+        opened: true,
+    });
+    fx.rec(StatusEvent::ExchangeStarted {
+        installation: PEER_A.into(),
+        repo: REPO.into(),
+        lane: 0,
+        op: "meta.exchange".into(),
+        at_ms: fx.now(),
+        direction: Direction::Inbound,
+    });
+    let peer = fx.snap().peers[0].clone();
+    assert_eq!(peer.direction, Direction::Inbound, "never made outbound");
+    assert_eq!(peer.lanes.len(), 1);
+    assert_eq!(peer.lanes[0].direction, Direction::Inbound);
+    assert_eq!(peer.lanes[0].inflight.len(), 1);
+    assert_eq!(peer.lanes[0].inflight[0].op, "meta.exchange");
+    assert_eq!(fx.pair(PEER_A).direction, Direction::Inbound);
+    // The served exchange ends it.
+    fx.rec(StatusEvent::ExchangeFinished {
+        installation: PEER_A.into(),
+        repo: REPO.into(),
+        lane: 0,
+        op: "meta.exchange".into(),
+        direction: Direction::Inbound,
+        ok: true,
+        error: None,
+        summary: None,
+        bytes_up: 10,
+        bytes_down: 10,
+        objects_up: 0,
+        objects_down: 0,
+        duration_ms: 5,
+    });
+    let peer = fx.snap().peers[0].clone();
+    assert!(peer.lanes[0].inflight.is_empty());
+    assert_eq!(peer.direction, Direction::Inbound);
 }

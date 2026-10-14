@@ -818,7 +818,7 @@ fn all_lanes_reach_ready_with_their_roles_and_lanes() {
     assert_eq!(
         node.recorder.count(|event| matches!(
             event,
-            StatusEvent::PeerConfigured { installation, endpoint }
+            StatusEvent::PeerConfigured { installation, endpoint, .. }
                 if installation == SERVER && *endpoint == server.endpoint
         )),
         1
@@ -836,6 +836,16 @@ fn all_lanes_reach_ready_with_their_roles_and_lanes() {
             .iter()
             .any(|peer| peer.installation == SERVER && peer.rtt_ms.is_some())),
         "RTT reported"
+    );
+    // WP2.INT (CCR-WP1.11-2): the negotiated protocol reaches the hub.
+    assert!(
+        node.hub
+            .snapshot_now()
+            .peers
+            .iter()
+            .any(|peer| peer.installation == SERVER
+                && peer.protocol.as_deref() == Some("tkfs-peer/3")),
+        "protocol reported"
     );
 
     // Lane 0 recorded the peer as seen (off the lane thread) and listed its

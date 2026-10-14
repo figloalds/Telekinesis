@@ -426,6 +426,7 @@ fn fixture(gate: Option<GateRecord>, view_gate: GateState) -> Fx {
     hub.record(StatusEvent::PeerConfigured {
         installation: PEER.into(),
         endpoint: "ws://10.0.0.2:43180".into(),
+        display_name: None,
     });
     let config = Config {
         format_version: 2,

@@ -61,6 +61,9 @@ use std::{
 /// The lane manager re-reads the catalog at least this often (it wakes at
 /// once on a new generation).
 const WATCH_SLICE: Duration = Duration::from_millis(250);
+/// The protocol a connected legacy lane reports (`LaneState.protocol`,
+/// CCR-WP1.11-2): the v2 pairing protocol (`"version": 2`).
+const LEGACY_PROTOCOL: &str = "tkfs-peer/2";
 
 /// Threads of one kind (lanes, inbound connections) and a wake-up when one
 /// ends, so shutdown can wait for them with a deadline.
@@ -401,9 +404,15 @@ impl LegacyBridge {
             (added, removed)
         };
         for (installation, endpoint) in added {
+            // CCR-WP1.11-1: the catalog's display name, if any.
+            let display_name = snapshot
+                .peer_meta
+                .get(&installation)
+                .and_then(|meta| meta.display_name.clone());
             ctx.status.record(StatusEvent::PeerConfigured {
                 installation,
                 endpoint,
+                display_name,
             });
         }
         for installation in removed {
@@ -495,6 +504,9 @@ impl LegacyBridge {
             error,
             backoff_until_ms,
             rtt_ms: None,
+            // CCR-WP1.11-2: a connected legacy lane speaks the v2 pairing
+            // protocol (`"version": 2`).
+            protocol: (state == LaneState::Ready).then(|| LEGACY_PROTOCOL.to_owned()),
         });
     }
 

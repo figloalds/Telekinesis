@@ -206,7 +206,8 @@
   {
     "event": "peer_configured",
     "installation": "inst-bbbb-2222",
-    "endpoint": "wss://peer.example:43180"
+    "endpoint": "wss://peer.example:43180",
+    "display_name": null
   },
   {
     "event": "peer_removed",
@@ -226,7 +227,8 @@
       "retry_after_ms": 2000
     },
     "backoff_until_ms": 1790000012000,
-    "rtt_ms": null
+    "rtt_ms": null,
+    "protocol": null
   },
   {
     "event": "exchange_started",
@@ -234,7 +236,8 @@
     "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
     "lane": 0,
     "op": "meta.exchange",
-    "at_ms": 1790000009900
+    "at_ms": 1790000009900,
+    "direction": "outbound"
   },
   {
     "event": "exchange_finished",

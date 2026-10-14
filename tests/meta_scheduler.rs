@@ -1377,6 +1377,7 @@ fn waiting_states_and_contention_are_not_counted() {
     hub.record(StatusEvent::PeerConfigured {
         installation: PEER.into(),
         endpoint: "ws://peer.test".into(),
+        display_name: None,
     });
     hub.record(StatusEvent::LaneState {
         installation: PEER.into(),
@@ -1387,6 +1388,7 @@ fn waiting_states_and_contention_are_not_counted() {
         error: None,
         backoff_until_ms: None,
         rtt_ms: Some(1),
+        protocol: None,
     });
     hub.record(StatusEvent::PeerCatalog {
         installation: PEER.into(),
@@ -2777,6 +2779,7 @@ fn the_status_hub_reads_the_lane_reports() {
     hub.record(StatusEvent::PeerConfigured {
         installation: PEER.into(),
         endpoint: "ws://peer.test".into(),
+        display_name: None,
     });
     hub.record(StatusEvent::LaneState {
         installation: PEER.into(),
@@ -2787,6 +2790,7 @@ fn the_status_hub_reads_the_lane_reports() {
         error: None,
         backoff_until_ms: None,
         rtt_ms: Some(1),
+        protocol: None,
     });
     hub.record(StatusEvent::PeerCatalog {
         installation: PEER.into(),

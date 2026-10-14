@@ -692,6 +692,7 @@ impl<'a> Report<'a> {
             lane,
             op: op.to_owned(),
             at_ms: ctx.clock.now_ms(),
+            direction: Direction::Outbound,
         });
         Self {
             ctx,

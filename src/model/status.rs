@@ -403,6 +403,11 @@ pub enum StatusEvent {
     PeerConfigured {
         installation: String,
         endpoint: String,
+        /// The catalog's `peer_meta.display_name` (CCR-WP1.11-1, applied by
+        /// WP2.INT): shown as the peer's `label`. `None` leaves a label set
+        /// before (`StatusHub::set_peer_label`) in place.
+        #[serde(default)]
+        display_name: Option<String>,
     },
     PeerRemoved {
         installation: String,
@@ -419,6 +424,10 @@ pub enum StatusEvent {
         backoff_until_ms: Option<u64>,
         #[serde(default)]
         rtt_ms: Option<u64>,
+        /// The negotiated protocol of a `Ready` lane, `tkfs-peer/N`
+        /// (CCR-WP1.11-2, applied by WP2.INT): `PeerStatus.protocol`.
+        #[serde(default)]
+        protocol: Option<String>,
     },
     ExchangeStarted {
         installation: String,
@@ -426,6 +435,11 @@ pub enum StatusEvent {
         lane: u32,
         op: String,
         at_ms: u64,
+        /// Which side started it (CCR-WP2.8-3, applied by WP2.INT): an
+        /// inbound start is booked on the inbound lane. Defaults to
+        /// `Outbound`, so older producers are unchanged.
+        #[serde(default)]
+        direction: Direction,
     },
     ExchangeFinished {
         installation: String,

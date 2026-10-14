@@ -532,9 +532,18 @@ impl PeerManager {
                 },
             );
         }
+        // CCR-WP1.11-1: the catalog's display name, if any.
+        let display_name = self
+            .ctx
+            .catalog
+            .snapshot()
+            .peer_meta
+            .get(&installation)
+            .and_then(|meta| meta.display_name.clone());
         self.ctx.status.record(StatusEvent::PeerConfigured {
             installation,
             endpoint,
+            display_name,
         });
         supervisor.start_lanes();
     }
@@ -1056,9 +1065,14 @@ impl Supervisor {
                     .collect()
             };
             for lane in &running {
-                self.ctx
-                    .status
-                    .record(self.lane_event(*lane, LaneState::Closed, None, None, None));
+                self.ctx.status.record(self.lane_event(
+                    *lane,
+                    LaneState::Closed,
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
             }
             *retired = true;
             running
@@ -1114,6 +1128,7 @@ impl Supervisor {
         error: Option<ErrorWire>,
         backoff_until_ms: Option<u64>,
         rtt_ms: Option<u64>,
+        protocol: Option<String>,
     ) -> StatusEvent {
         StatusEvent::LaneState {
             installation: self.record.installation.clone(),
@@ -1124,6 +1139,7 @@ impl Supervisor {
             error,
             backoff_until_ms,
             rtt_ms,
+            protocol,
         }
     }
 
@@ -1140,6 +1156,9 @@ impl Supervisor {
         // Held across the view update and the record: `retire` sees either
         // both or neither.
         let retired = self.reporting();
+        // CCR-WP1.11-2: a `Ready` lane reports the protocol its session
+        // negotiated (set on the view before `serve`).
+        let mut protocol = None;
         {
             let mut lanes = self.lanes.lock();
             if let Some(view) = lanes.get_mut(lane as usize) {
@@ -1158,12 +1177,18 @@ impl Supervisor {
                 if state != LaneState::Ready {
                     view.protocol = None;
                 }
+                protocol = view.protocol.clone();
             }
         }
         if !*retired {
-            self.ctx
-                .status
-                .record(self.lane_event(lane, state, error, backoff_until_ms, rtt_ms));
+            self.ctx.status.record(self.lane_event(
+                lane,
+                state,
+                error,
+                backoff_until_ms,
+                rtt_ms,
+                protocol,
+            ));
         }
     }
 
