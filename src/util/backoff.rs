@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 pub struct Backoff {
     pub base: Duration,
     pub cap: Duration,
-    /// Fraction in `[0, 1]`; 0.2 means ±20 %.
+    /// Fraction in `[0, 1]`; 0.2 means ±20 %. A value set directly is
+    /// sanitized when used (NaN or infinite → 0, else clamped to `[0, 1]`).
     pub jitter: f64,
     pub reset_after: Duration,
     attempt: u32,
@@ -24,11 +25,7 @@ impl Backoff {
         Self {
             base,
             cap: cap.max(base),
-            jitter: if jitter.is_finite() {
-                jitter.clamp(0.0, 1.0)
-            } else {
-                0.0
-            },
+            jitter: sanitize_jitter(jitter),
             reset_after,
             attempt: 0,
             healthy_since: None,
@@ -151,9 +148,10 @@ impl Backoff {
     /// Inclusive bounds of a sampled delay for a 1-based attempt number.
     pub fn bounds(&self, attempt: u32) -> (Duration, Duration) {
         let nominal = self.nominal(attempt);
+        let jitter = sanitize_jitter(self.jitter);
         (
-            scale(nominal, 1.0 - self.jitter, self.cap),
-            scale(nominal, 1.0 + self.jitter, self.cap),
+            scale(nominal, 1.0 - jitter, self.cap),
+            scale(nominal, 1.0 + jitter, self.cap),
         )
     }
 
@@ -163,7 +161,19 @@ impl Backoff {
     }
 }
 
+/// `jitter` as a usable fraction: NaN or infinite → 0, else clamped to
+/// `[0, 1]` (CCR-WP0.INT-4 item 6: the field is public, so `new` alone
+/// cannot guarantee it, and `gen_range` panics on a NaN or empty range).
+fn sanitize_jitter(jitter: f64) -> f64 {
+    if jitter.is_finite() {
+        jitter.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn sample(nominal: Duration, cap: Duration, jitter: f64) -> Duration {
+    let jitter = sanitize_jitter(jitter);
     if jitter <= 0.0 || nominal.is_zero() {
         return nominal;
     }

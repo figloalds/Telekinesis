@@ -2106,9 +2106,10 @@ fn classify_matches_the_section_8_table() {
 }
 
 /// Literal fragments matched by `"[A-Z][A-Z_]{3,}` that are not error codes:
-/// SQL keywords, an OS environment variable, and substrings that error mappers
-/// look for inside messages. `TKFS_*` environment variable names are skipped
-/// by prefix.
+/// SQL keywords, an OS environment variable, substrings that error mappers
+/// look for inside messages, and the `CODE` placeholder of the `event!` docs.
+/// `TKFS_*` and `CARGO_*` environment variable names are skipped by prefix
+/// (`CARGO_`: CCR-WP1.2-1, CCR-WP1.4-3, CCR-WP1.11-3).
 const NOT_CODES: &[&str] = &[
     "ALTER",
     "BEGIN",
@@ -2132,6 +2133,7 @@ const NOT_CODES: &[&str] = &[
     "INVALID",
     "PERMISSION",
     "UNSUPPORTED",
+    "CODE",
 ];
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -2146,7 +2148,9 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Every `"[A-Z][A-Z_]{3,}` literal in `src/`, extended over trailing
-/// `[A-Z0-9_]` (so `CONFIG_VERSION_2_REQUIRED` is one code).
+/// `[A-Z0-9_]` (so `CONFIG_VERSION_2_REQUIRED` is one code), plus every code
+/// passed to `event!` as a bare identifier (`event!(fatal, LOCK_POISONED, …)`,
+/// CCR-WP0.INT-4 item 7).
 fn code_literals() -> BTreeMap<String, String> {
     let mut files = Vec::new();
     rust_files(
@@ -2183,8 +2187,65 @@ fn code_literals() -> BTreeMap<String, String> {
                     .or_insert_with(|| file.display().to_string());
             }
         }
+        for token in event_identifier_codes(&text) {
+            found
+                .entry(token)
+                .or_insert_with(|| file.display().to_string());
+        }
     }
     found
+}
+
+/// The codes of `event!(level, CODE …)` calls whose code is a bare
+/// SCREAMING_CASE identifier (whitespace and line breaks allowed).
+fn event_identifier_codes(text: &str) -> Vec<String> {
+    let mut codes = vec![];
+    for (index, _) in text.match_indices("event!(") {
+        let rest = text[index + "event!(".len()..].trim_start();
+        let level = rest.bytes().take_while(u8::is_ascii_lowercase).count();
+        if level == 0 {
+            continue;
+        }
+        let Some(rest) = rest[level..].trim_start().strip_prefix(',') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let len = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
+            .count();
+        let next = rest[len..].trim_start();
+        if len > 0
+            && rest.as_bytes()[0].is_ascii_uppercase()
+            && (next.starts_with(',') || next.starts_with(')'))
+        {
+            codes.push(rest[..len].to_owned());
+        }
+    }
+    codes
+}
+
+#[test]
+fn event_identifier_codes_are_scanned() {
+    let text = [
+        "event!(fatal, ENGINE_POISONED);",
+        "crate::util::log::event!(",
+        "    warn,",
+        "    LOCK_HOLD_EXCEEDED,",
+        "    { \"k\": 1 }",
+        ");",
+        "event!(info, (code.as_str()), { k: v });",
+        "event!(warn, \"QUOTED_CODE\");",
+    ]
+    .join("\n");
+    let text = text.as_str();
+    assert_eq!(
+        event_identifier_codes(text),
+        ["ENGINE_POISONED", "LOCK_HOLD_EXCEEDED"]
+    );
+    let literals = code_literals();
+    // Only ever passed to `event!` as an identifier (ws.rs, WP1.10).
+    assert!(literals.contains_key("WATCHDOG_SHUTDOWN_FAILED"));
 }
 
 #[test]
@@ -2195,6 +2256,7 @@ fn classify_covers_every_code_literal_in_src() {
         .iter()
         .filter(|(code, _)| {
             !code.starts_with("TKFS_")
+                && !code.starts_with("CARGO_")
                 && !NOT_CODES.contains(&code.as_str())
                 && !errors::is_known(code)
         })
@@ -2469,7 +2531,7 @@ fn upgrade_kind_reads_the_sync_header() {
 }
 
 #[test]
-fn session_stubs_fail_closed_with_not_implemented() {
+fn session_entry_points_fail_closed() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let client = std::net::TcpStream::connect(address).unwrap();
@@ -3446,4 +3508,244 @@ fn tracked_violation_is_logged_in_debug_builds() {
         .any(|event| event["code"] == "LOCK_HOLD_EXCEEDED" && event["lock"] == "contracts.logged");
     assert_eq!(logged, cfg!(debug_assertions));
     assert_eq!(tracked.violations(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// CCR-WP0.INT-4 (applied by WP1.INT): frozen util/model fixes.
+// ---------------------------------------------------------------------------
+
+/// Item 1: a `meta.exchange` reply (need budget, one page, JSON overhead)
+/// fits the reassembled body limit, and one 8 MiB event is still served.
+#[test]
+fn need_budget_fits_the_meta_exchange_body() {
+    assert_eq!(MAX_NEED_BYTES, 12 * 1024 * 1024);
+    const { assert!(MAX_NEED_BYTES + MAX_PAGE_BYTES + 2 * 1024 * 1024 <= MAX_BODY_META) };
+    const { assert!(MAX_NEED_BYTES >= 8 * 1024 * 1024) };
+    assert_eq!(
+        protocol::max_body(protocol::ops::META_EXCHANGE),
+        MAX_BODY_META
+    );
+}
+
+/// Item 2: `catalog.list` is allowed on control and probe sessions; the
+/// other ops follow `op_role`.
+#[test]
+fn op_allowed_follows_the_op_table() {
+    use protocol::{op_allowed, ops};
+    let roles = [LaneRole::Control, LaneRole::Bulk, LaneRole::Probe];
+    for role in roles {
+        assert!(op_allowed(ops::PING, role), "{role:?}");
+        assert!(op_allowed("future.op", role), "{role:?}");
+    }
+    let allowed = |op: &str| -> Vec<LaneRole> {
+        roles
+            .into_iter()
+            .filter(|role| op_allowed(op, *role))
+            .collect()
+    };
+    assert_eq!(
+        allowed(ops::CATALOG_LIST),
+        [LaneRole::Control, LaneRole::Probe]
+    );
+    assert_eq!(allowed(ops::META_EXCHANGE), [LaneRole::Control]);
+    for op in [
+        ops::OBJECTS_EXCHANGE,
+        ops::OBJECTS_PULL,
+        ops::OBJECTS_WANTS,
+        ops::OBJECTS_PUSH,
+        ops::OBJECTS_REPORT,
+    ] {
+        assert_eq!(allowed(op), [LaneRole::Bulk], "{op}");
+    }
+}
+
+/// Item 3: cancelling a token cancels its children (running their hooks)
+/// before its own hooks run, and a dropped child's hooks are freed.
+#[test]
+fn cancel_runs_children_before_the_parents_hooks() {
+    let parent = Cancel::new();
+    let child = parent.child();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let child_seen = Arc::new(AtomicBool::new(false));
+    {
+        let order = order.clone();
+        let seen = child_seen.clone();
+        let child = child.clone();
+        parent.on_cancel(Box::new(move || {
+            seen.store(child.is_cancelled(), Ordering::SeqCst);
+            order.lock().unwrap().push("parent");
+        }));
+    }
+    {
+        let order = order.clone();
+        child.on_cancel(Box::new(move || order.lock().unwrap().push("child")));
+    }
+    parent.cancel();
+    assert!(child_seen.load(Ordering::SeqCst));
+    assert_eq!(*order.lock().unwrap(), ["child", "parent"]);
+
+    let parent = Cancel::new();
+    let token = Arc::new(());
+    {
+        let child = parent.child();
+        let held = token.clone();
+        child.on_cancel(Box::new(move || {
+            let _ = &held;
+        }));
+        assert_eq!(Arc::strong_count(&token), 2);
+    }
+    assert_eq!(
+        Arc::strong_count(&token),
+        1,
+        "a dropped child token frees its hooks"
+    );
+    parent.cancel();
+}
+
+/// A log sink that, for lines naming `marker`, checks from another thread
+/// (bounded by 2 s) that neither the tracked lock nor the logger is held
+/// while the line is written.
+struct ProbeSink {
+    marker: &'static str,
+    tracked: Arc<Tracked<()>>,
+    results: Arc<Mutex<Vec<(bool, bool)>>>,
+}
+
+impl std::io::Write for ProbeSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if String::from_utf8_lossy(bytes).contains(self.marker) {
+            let free = |probe: Box<dyn FnOnce() + Send>| {
+                let (tx, rx) = mpsc::channel();
+                thread::spawn(move || {
+                    probe();
+                    let _ = tx.send(());
+                });
+                rx.recv_timeout(Duration::from_secs(2)).is_ok()
+            };
+            let tracked = self.tracked.clone();
+            let tracked_free = free(Box::new(move || drop(tracked.lock())));
+            let logger_free = free(Box::new(|| {
+                let _ = log::tracked_codes();
+            }));
+            self.results
+                .lock()
+                .unwrap()
+                .push((tracked_free, logger_free));
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Item 4: a `Tracked` hold is reported after its lock is released, and a
+/// log line is written after the logger's lock is released.
+#[test]
+fn tracked_reports_after_release_and_log_writes_after_unlock() {
+    let _serial = log_lock();
+    let tracked = Arc::new(Tracked::with_limit(
+        "contracts.release_first",
+        (),
+        Duration::from_millis(1),
+    ));
+    let results = Arc::new(Mutex::new(Vec::new()));
+    log::set_sink(Some(Box::new(ProbeSink {
+        marker: "contracts.release_first",
+        tracked: tracked.clone(),
+        results: results.clone(),
+    })));
+    {
+        let _guard = tracked.lock();
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(log::event!(warn, CONTRACTS_PROBE, { "lock": "contracts.release_first" }));
+    log::set_sink(None);
+    let results = results.lock().unwrap().clone();
+    // Debug builds log the violation itself; the explicit event always logs.
+    assert_eq!(
+        results.len(),
+        if cfg!(debug_assertions) { 2 } else { 1 },
+        "{results:?}"
+    );
+    assert!(
+        results.iter().all(|(tracked, logger)| *tracked && *logger),
+        "a lock was held while the line was written: {results:?}"
+    );
+    assert_eq!(tracked.violations(), 1);
+}
+
+/// Item 5 (child process: it fills the process-wide rate-limit map): codes
+/// beyond `MAX_TRACKED_CODES` share one window, so the map stays bounded and
+/// a flood of distinct codes is rate limited as a whole.
+#[test]
+fn log_rate_windows_are_bounded() {
+    if std::env::var(CHILD_ENV).as_deref() == Ok("log_codes") {
+        let sink = MemorySink::new();
+        log::set_sink(Some(Box::new(sink.clone())));
+        let flood = log::MAX_TRACKED_CODES + 500;
+        let written = (0..flood)
+            .filter(|n| log::event!(info, (format!("CONTRACTS_FLOOD_{n}"))))
+            .count();
+        let tracked = log::tracked_codes();
+        log::flush_suppressed();
+        log::set_sink(None);
+        let summary = sink
+            .events()
+            .into_iter()
+            .find(|event| event["code"] == log::OTHER_CODES)
+            .map(|event| event["suppressed"].clone());
+        println!("FLOOD written={written} tracked={tracked} summary={summary:?}");
+        return;
+    }
+    if std::env::var(CHILD_ENV).is_ok() {
+        return;
+    }
+    let output = run_child("log_rate_windows_are_bounded", "log_codes", &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    // `--nocapture` prints the line after the test's name.
+    let line = stdout
+        .lines()
+        .find_map(|line| line.find("FLOOD ").map(|at| &line[at..]))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    // The first MAX codes get their own window; the other 500 share one:
+    // RATE_LIMIT lines written, the rest suppressed and summarized.
+    let max = log::MAX_TRACKED_CODES;
+    let rate = log::RATE_LIMIT as usize;
+    assert_eq!(
+        line,
+        format!(
+            "FLOOD written={} tracked={} summary=Some(Number({}))",
+            max + rate,
+            max + 1,
+            500 - rate
+        ),
+        "{stdout}"
+    );
+}
+
+/// Item 6: a jitter set through the public field is sanitized when used.
+#[test]
+fn backoff_sanitizes_a_jitter_set_through_the_field() {
+    let now = Instant::now();
+    for jitter in [f64::NAN, f64::INFINITY, -1.0, 7.5] {
+        let mut backoff = Backoff::transient();
+        backoff.jitter = jitter;
+        let delay = backoff.failure(now);
+        let (low, high) = backoff.bounds(1);
+        assert!(
+            low <= delay && delay <= high,
+            "{jitter}: {delay:?} not in {low:?}..={high:?}"
+        );
+        assert!(high <= backoff.cap, "{jitter}");
+        if jitter.is_finite() && jitter > 1.0 {
+            assert_eq!((low, high), (Duration::ZERO, Duration::from_secs(2)));
+        } else {
+            assert_eq!(
+                (low, high),
+                (Duration::from_secs(1), Duration::from_secs(1))
+            );
+        }
+    }
 }

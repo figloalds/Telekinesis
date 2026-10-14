@@ -14,6 +14,18 @@
 //! `{"code":…,"suppressed":N}` line when the next window opens (or on
 //! [`flush_suppressed`]). `fatal` events are never suppressed. Field values
 //! are serialized with serde; a value that fails to serialize becomes `null`.
+//!
+//! At most [`MAX_TRACKED_CODES`] codes have their own rate window. When a new
+//! code would exceed that, windows whose period has ended are pruned first
+//! (their pending `suppressed` summaries are written); if every window is
+//! still current, the new code shares the [`OTHER_CODES`] window, so dynamic
+//! codes (for example peer-supplied `ErrorWire` codes) cannot grow the map
+//! (CCR-WP0.INT-4 item 5). Each line still carries its own code.
+//!
+//! Lines are formatted under the logger's lock and written after it is
+//! released, under the sink's own lock (CCR-WP0.INT-4 item 4): a slow sink
+//! never holds up the rate-limit bookkeeping, and every line is written
+//! whole. Lines of concurrent events may reach the sink in either order.
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -27,6 +39,11 @@ pub use crate::__tkfs_log_event as event;
 
 pub const RATE_LIMIT: u32 = 20;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Codes with a rate window of their own (see the module docs).
+pub const MAX_TRACKED_CODES: usize = 1024;
+/// The shared rate window of codes beyond [`MAX_TRACKED_CODES`]; its
+/// `suppressed` summary line carries this as its code.
+pub const OTHER_CODES: &str = "*";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Level {
@@ -58,8 +75,10 @@ struct Window {
     level: Level,
 }
 
+type Sink = Arc<Mutex<Box<dyn Write + Send>>>;
+
 struct Logger {
-    sink: Option<Box<dyn Write + Send>>,
+    sink: Option<Sink>,
     min_level: Level,
     windows: HashMap<String, Window>,
 }
@@ -77,7 +96,7 @@ fn logger() -> &'static Mutex<Logger> {
 
 /// Replaces the process sink (`None` restores stderr).
 pub fn set_sink(sink: Option<Box<dyn Write + Send>>) {
-    crate::util::lock::lock(logger()).sink = sink;
+    crate::util::lock::lock(logger()).sink = sink.map(|sink| Arc::new(Mutex::new(sink)));
 }
 
 /// Events below this level are dropped (default `Info`).
@@ -93,81 +112,126 @@ pub fn field<T: Serialize + ?Sized>(key: &'static str, value: &T) -> (&'static s
 /// Writes one event unless filtered by level or rate limit; returns whether a
 /// line for this event was written.
 pub fn emit(level: Level, code: &str, fields: &[(&'static str, Value)]) -> bool {
-    let mut logger = crate::util::lock::lock(logger());
-    if level < logger.min_level {
-        return false;
-    }
-    let now = Instant::now();
-    let mut pending = None;
-    let window = logger
-        .windows
-        .entry(code.to_owned())
-        .or_insert_with(|| Window {
-            started: now,
-            written: 0,
-            suppressed: 0,
-            level,
-        });
-    if now.saturating_duration_since(window.started) >= RATE_WINDOW {
-        if window.suppressed > 0 {
-            pending = Some((window.level, window.suppressed));
+    let (sink, out, allowed) = {
+        let mut guard = crate::util::lock::lock(logger());
+        let logger = &mut *guard;
+        if level < logger.min_level {
+            return false;
         }
-        *window = Window {
-            started: now,
-            written: 0,
-            suppressed: 0,
-            level,
+        let now = Instant::now();
+        let mut out = String::new();
+        let key = if logger.windows.contains_key(code) || logger.windows.len() < MAX_TRACKED_CODES {
+            code
+        } else {
+            prune_expired(&mut logger.windows, now, &mut out);
+            if logger.windows.len() < MAX_TRACKED_CODES {
+                code
+            } else {
+                OTHER_CODES
+            }
         };
-    }
-    let allowed = level == Level::Fatal || window.written < RATE_LIMIT;
-    if allowed {
-        window.written = window.written.saturating_add(1);
-    } else {
-        window.suppressed += 1;
-        window.level = window.level.max(level);
-    }
-    let mut out = String::new();
-    if let Some((level, suppressed)) = pending {
-        out.push_str(&line(
-            level,
-            code,
-            &[("suppressed", Value::from(suppressed))],
-        ));
-    }
-    if allowed {
-        out.push_str(&line(level, code, fields));
-    }
+        let mut pending = None;
+        let window = logger
+            .windows
+            .entry(key.to_owned())
+            .or_insert_with(|| Window {
+                started: now,
+                written: 0,
+                suppressed: 0,
+                level,
+            });
+        if now.saturating_duration_since(window.started) >= RATE_WINDOW {
+            if window.suppressed > 0 {
+                pending = Some((window.level, window.suppressed));
+            }
+            *window = Window {
+                started: now,
+                written: 0,
+                suppressed: 0,
+                level,
+            };
+        }
+        let allowed = level == Level::Fatal || window.written < RATE_LIMIT;
+        if allowed {
+            window.written = window.written.saturating_add(1);
+        } else {
+            window.suppressed += 1;
+            window.level = window.level.max(level);
+        }
+        if let Some((level, suppressed)) = pending {
+            out.push_str(&line(
+                level,
+                key,
+                &[("suppressed", Value::from(suppressed))],
+            ));
+        }
+        if allowed {
+            out.push_str(&line(level, code, fields));
+        }
+        (logger.sink.clone(), out, allowed)
+    };
     if !out.is_empty() {
-        write(&mut logger, &out);
+        write(sink.as_ref(), &out);
     }
     allowed
 }
 
-/// Writes a `suppressed` summary line for every code with suppressed events in
-/// its current window, and resets those counters.
-pub fn flush_suppressed() {
-    let mut logger = crate::util::lock::lock(logger());
-    let mut out = String::new();
-    let mut codes: Vec<_> = logger
-        .windows
-        .iter_mut()
-        .filter(|(_, window)| window.suppressed > 0)
-        .map(|(code, window)| {
-            let summary = (code.clone(), window.level, window.suppressed);
-            window.suppressed = 0;
-            summary
-        })
-        .collect();
-    codes.sort();
-    for (code, level, suppressed) in codes {
+/// Drops every window whose period has ended, appending the `suppressed`
+/// summary of those that still had one to `out`.
+fn prune_expired(windows: &mut HashMap<String, Window>, now: Instant, out: &mut String) {
+    let mut summaries = vec![];
+    windows.retain(|code, window| {
+        let current = now.saturating_duration_since(window.started) < RATE_WINDOW;
+        if !current && window.suppressed > 0 {
+            summaries.push((code.clone(), window.level, window.suppressed));
+        }
+        current
+    });
+    summaries.sort();
+    for (code, level, suppressed) in summaries {
         out.push_str(&line(
             level,
             &code,
             &[("suppressed", Value::from(suppressed))],
         ));
     }
+}
+
+/// How many codes currently have a rate window (at most
+/// [`MAX_TRACKED_CODES`] plus the shared [`OTHER_CODES`] window).
+pub fn tracked_codes() -> usize {
+    crate::util::lock::lock(logger()).windows.len()
+}
+
+/// Writes a `suppressed` summary line for every code with suppressed events in
+/// its current window, and resets those counters.
+pub fn flush_suppressed() {
+    let (sink, out) = {
+        let mut guard = crate::util::lock::lock(logger());
+        let logger = &mut *guard;
+        let mut out = String::new();
+        let mut codes: Vec<_> = logger
+            .windows
+            .iter_mut()
+            .filter(|(_, window)| window.suppressed > 0)
+            .map(|(code, window)| {
+                let summary = (code.clone(), window.level, window.suppressed);
+                window.suppressed = 0;
+                summary
+            })
+            .collect();
+        codes.sort();
+        for (code, level, suppressed) in codes {
+            out.push_str(&line(
+                level,
+                &code,
+                &[("suppressed", Value::from(suppressed))],
+            ));
+        }
+        (logger.sink.clone(), out)
+    };
     if !out.is_empty() {
-        write(&mut logger, &out);
+        write(sink.as_ref(), &out);
     }
 }
 
@@ -188,9 +252,12 @@ fn line(level: Level, code: &str, fields: &[(&'static str, Value)]) -> String {
     out
 }
 
-fn write(logger: &mut Logger, text: &str) {
-    match logger.sink.as_mut() {
+/// Writes `text` to `sink` (stderr when `None`) under the sink's own lock,
+/// never under the logger's.
+fn write(sink: Option<&Sink>, text: &str) {
+    match sink {
         Some(sink) => {
+            let mut sink = crate::util::lock::lock(sink);
             let _ = sink.write_all(text.as_bytes());
             let _ = sink.flush();
         }
