@@ -77,11 +77,11 @@ fn tip(engine: &Engine) -> Result<i64> {
 
 /// After a call that may have staged or committed: wake the activator, then
 /// refresh the status cell (the content too when the journal moved).
-fn changed(ctx: &WorkerCtx, journal_moved: bool) {
+fn changed(ctx: &WorkerCtx, vitals: &EngineVitals, journal_moved: bool) {
     if ctx.activator_running.load(Ordering::SeqCst) {
         ctx.activation.poke();
     }
-    crate::worker::status_cell::note_mutation(ctx, journal_moved);
+    crate::worker::status_cell::note_mutation(ctx, vitals, journal_moved);
 }
 
 /// Metadata commits and acknowledgements never wait for object installation.
@@ -130,7 +130,7 @@ pub(super) fn published_rpc(
         if parts.is_empty() {
             drop(e);
             if writes {
-                changed(ctx, moved);
+                changed(ctx, vitals, moved);
             }
             return result;
         }
@@ -139,7 +139,7 @@ pub(super) fn published_rpc(
     };
     // The metadata is applied: visible to `status` before the (possibly
     // long) object installation below.
-    changed(ctx, moved);
+    changed(ctx, vitals, moved);
     let objects: Vec<_> = parts.keys().cloned().collect();
     let deadline = std::time::Instant::now() + crate::bulk_sync::RECEIVE_BUDGET;
     let received =
@@ -168,7 +168,7 @@ pub(super) fn published_rpc(
     }
     // Installed objects reach the content counters at the next maintenance
     // refresh (no content scan per page, RC2); the counters move now.
-    crate::worker::status_cell::note_mutation(ctx, false);
+    crate::worker::status_cell::note_mutation(ctx, vitals, false);
     if let Some((_, error)) = failed.into_iter().next() {
         return Err(error.into_anyhow());
     }

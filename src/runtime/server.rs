@@ -69,6 +69,9 @@ const EXIT_RETAIN_WAIT: Duration = Duration::from_secs(2);
 /// lane receive budget, WP1.INT task 1).
 const REVALIDATE_ACTIVATION_EVENTS: usize = 32;
 const REVALIDATE_ACTIVATION_MS: u64 = 50;
+/// How long `revalidate` waits for the background activator's pass over the
+/// rows it re-queued (the request holds no engine lock meanwhile).
+pub const REVALIDATE_WAIT: Duration = Duration::from_secs(1);
 /// `Engine::control` ops that change nothing (no status refresh after them).
 const READ_ONLY_CONTROL_OPS: &[&str] = &[
     "status",
@@ -448,7 +451,7 @@ impl Core {
                 } else {
                     self.engine()?.control(request, payload)
                 };
-                crate::worker::status_cell::note_mutation(&self.ctx, true);
+                crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
                 result
             }
             op => {
@@ -456,7 +459,7 @@ impl Core {
                 if !READ_ONLY_CONTROL_OPS.contains(&op) {
                     // Journaled mutations, demand (`request-object`) and
                     // anything unknown: refreshed before the reply.
-                    crate::worker::status_cell::note_mutation(&self.ctx, true);
+                    crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
                 }
                 result
             }
@@ -658,18 +661,27 @@ impl Core {
     /// `revalidate{ids?}` (§6.1, wired by WP1.INT): re-queue quarantined,
     /// blocked and retry inbox rows (all, or `ids` and the rows blocked on
     /// them) through `Store::revalidate`, then activate what is now ready in
-    /// one bounded pass, as a legacy lane's receive does (≤ 32 events,
-    /// ≤ 50 ms, with the engine's namespace notifications and session
-    /// refresh). Whatever is left activates on the next receive (or WP2.3's
-    /// activator, which `ctx.activation` wakes). The rows are re-queued
-    /// durably before the activation, so an activation failure is logged,
-    /// not returned.
+    /// one bounded pass, as a legacy lane's receive does, so the reply
+    /// reflects that pass. While the background activator runs, the pass is
+    /// the activator's: the request wakes it and waits (without the engine,
+    /// at most [`REVALIDATE_WAIT`]) for one activator cycle that began after
+    /// the re-queue (re-queued rows keep their arrival order, so they are at
+    /// the head of that cycle's slice), and nothing is activated under the
+    /// request's own engine hold (§4.4: a slow event is prepared off-lock,
+    /// never committed inline on a request). Without the activator (the
+    /// in-process `start_rpc` wrapper) the request activates inline (≤ 32
+    /// events, ≤ 50 ms, with the engine's namespace notifications and
+    /// session refresh); whatever is left activates on the next receive. The
+    /// rows are re-queued durably before the activation, so an activation
+    /// failure (or a wait that ran out) is logged, not returned.
     fn revalidate(&self, payload: &Value) -> Result<Value> {
         let RevalidateRequest { ids } = serde_json::from_value(payload.clone())?;
+        let background = self.ctx.activator_running.load(Ordering::SeqCst);
         let requeued = {
             let mut engine = self.engine()?;
             let requeued = engine.store.revalidate(ids.as_deref())?;
             if requeued > 0
+                && !background
                 && let Err(error) =
                     engine.activate_bounded(REVALIDATE_ACTIVATION_EVENTS, REVALIDATE_ACTIVATION_MS)
             {
@@ -681,10 +693,29 @@ impl Core {
             }
             requeued
         };
-        if requeued > 0 {
-            crate::worker::status_cell::note_mutation(&self.ctx, true);
-        }
+        // Read after the re-queue committed: a cycle numbered past `begun`
+        // loads its slice after it.
+        let (begun, _) = self.vitals.activator_cycles();
         self.ctx.activation.poke();
+        if requeued > 0 && background {
+            let deadline = Instant::now() + REVALIDATE_WAIT;
+            while self.vitals.activator_cycles().1 <= begun
+                && self.ctx.activator_running.load(Ordering::SeqCst)
+            {
+                if Instant::now() >= deadline {
+                    crate::util::log::event!(info, REQUEST_TIMEOUT, {
+                        "site": "worker.revalidate",
+                        "requeued": requeued,
+                        "message": "the activator has not activated the re-queued rows yet",
+                    });
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if requeued > 0 {
+            crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+        }
         Ok(json!(RevalidateReply {
             requeued: requeued as u64
         }))

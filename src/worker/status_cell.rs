@@ -21,10 +21,16 @@
 //! store; a merge never replaces newer data with an older computation. A
 //! mutating path bumps `status_generation` *before* replying, so a `status`
 //! call that follows it finds the cell older and recomputes first
-//! (read-your-writes). A mutation that changed the journal or the demand also
-//! records that the content must catch up ([`note_mutation`] with `content`).
-//! Background changes (activator commits, object installs, writes through the
-//! mount) reach the content at the next maintenance refresh.
+//! (read-your-writes). A refresh that knows the engine vitals also records
+//! the engine's store revision it read before the store
+//! (`CellMeta::store_revision`): writes through the mount move that
+//! revision, not `status_generation`, so a `status` call that finds the
+//! revision moved recomputes the cheap counters too (the outbox of a file
+//! just written and closed is never reported acknowledged). A mutation that
+//! changed the journal or the demand also records that the content must
+//! catch up ([`note_mutation`] with `content`). Background changes
+//! (activator commits, object installs, writes through the mount) reach the
+//! content at the next maintenance refresh.
 //!
 //! [`reply`] composes the `status` reply: the cell, plus the engine's
 //! lock-free vitals (`mounted`, `open_handles`, `unflushed_files`, `health`,
@@ -32,7 +38,9 @@
 //! them at reply time (`caught_up`, `metadata_caught_up`, `content_complete`,
 //! `upload_state`). `caught_up` follows the legacy rule except that staged
 //! rows count through `incoming_active` (`pending_active`): quarantined and
-//! blocked rows no longer hold it false forever (CCR-WP1.6-3). It never sets
+//! blocked rows no longer hold it false forever (CCR-WP1.6-3). Its per-peer
+//! inventory match is recomputed when an exchange was observed or the
+//! journal tip moved since it was computed. It never sets
 //! `busy`; `stale` only when the cell is older than `STATUS_CELL_STALE` and
 //! could not be refreshed.
 use crate::{
@@ -61,6 +69,7 @@ const SYNC_FRESH_MS: u64 = 15_000;
 
 /// The cell's own bookkeeping, stored under `"cell"` (stripped from replies).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CellMeta {
     /// The `status_generation` the counters reflect.
     pub generation: u64,
@@ -79,6 +88,15 @@ pub struct CellMeta {
     pub full_ms: u64,
     /// When the per-peer inventory match was computed.
     pub inventory_at_ms: u64,
+    /// The journal tip the per-peer inventory match was computed at (read
+    /// before it): a new committed event can change the match.
+    pub inventory_tip: i64,
+    /// The engine's store revision (`EngineVitals::store_revision`, read
+    /// before the store) that the cheap counters reflect at least; `None`
+    /// when the refresh did not know it. A `status` reply recomputes the
+    /// counters when the engine's connection changed the database since
+    /// (writes through the mount move no `status_generation`).
+    pub store_revision: Option<u64>,
 }
 
 impl CellMeta {
@@ -129,17 +147,20 @@ pub fn sync_generation(ctx: &WorkerCtx, vitals: &EngineVitals) -> u64 {
 /// The cheap part of a refresh.
 struct Cheap {
     target: u64,
+    /// The engine's store revision read before the store, if known.
+    revision: Option<u64>,
     identity: Value,
     counters: StatusCounters,
     branches_hash: String,
 }
 
-fn compute_cheap(store: &Store, target: u64) -> Result<Cheap> {
+fn compute_cheap(store: &Store, target: u64, revision: Option<u64>) -> Result<Cheap> {
     let identity = store.status_identity()?;
     let counters = store.status_counters()?;
     let branches_hash = crate::core::hash(&serde_json::to_vec(&store.branches()?)?);
     Ok(Cheap {
         target,
+        revision,
         identity,
         counters,
         branches_hash,
@@ -174,13 +195,22 @@ fn compute_full(store: &Store) -> Result<Full> {
 /// Recomputes the per-peer inventory match (`caught_up`'s last check).
 fn refresh_inventory(ctx: &WorkerCtx) -> Result<()> {
     let at_ms = now_ms();
-    let inventory = ctx.sync_stores.checkout()?.inventory_match()?;
+    let (tip, inventory) = {
+        let store = ctx.sync_stores.checkout()?;
+        // The tip first: an event committed meanwhile leaves it older.
+        let tip: i64 = store
+            .db
+            .prepare_cached("SELECT coalesce(max(seq),0) FROM journal_sequence")?
+            .query_row([], |r| r.get(0))?;
+        (tip, store.inventory_match()?)
+    };
     ctx.status_cell.update(|prev| {
         let mut next = object_or_empty(prev);
         let mut meta = CellMeta::of(prev);
         if at_ms >= meta.inventory_at_ms {
             next["inventory"] = json!(inventory);
             meta.inventory_at_ms = at_ms;
+            meta.inventory_tip = tip;
         }
         next["cell"] = json!(meta);
         next
@@ -221,14 +251,22 @@ fn merge_cheap(next: &mut Value, meta: &mut CellMeta, cheap: &Cheap) {
         meta.branches_hash.clone_from(&cheap.branches_hash);
     }
     meta.generation = cheap.target;
+    // Unknown resets it: the next reply then recomputes rather than trust
+    // counters that may be older than the revision recorded before.
+    meta.store_revision = cheap.revision;
     meta.refreshed_at_ms = now_ms();
 }
 
-fn refresh_cheap_with(ctx: &WorkerCtx, activation: Option<ActivationCounters>) -> Result<()> {
+fn refresh_cheap_with(
+    ctx: &WorkerCtx,
+    vitals: Option<&EngineVitals>,
+    activation: Option<ActivationCounters>,
+) -> Result<()> {
     let target = ctx.status_generation.load(Ordering::SeqCst);
+    let revision = vitals.map(EngineVitals::store_revision);
     let cheap = {
         let store = ctx.sync_stores.checkout()?;
-        compute_cheap(&store, target)?
+        compute_cheap(&store, target, revision)?
     };
     ctx.status_cell.update(|prev| {
         let mut next = object_or_empty(prev);
@@ -245,16 +283,31 @@ fn refresh_cheap_with(ctx: &WorkerCtx, activation: Option<ActivationCounters>) -
 
 /// Refreshes the cheap members (module docs) on a pooled secondary store.
 pub fn refresh_cheap(ctx: &WorkerCtx) -> Result<()> {
-    refresh_cheap_with(ctx, None)
+    refresh_cheap_with(ctx, None, None)
+}
+
+/// [`refresh_cheap`], recording the engine's store revision it reflects.
+pub fn refresh_cheap_at(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<()> {
+    refresh_cheap_with(ctx, Some(vitals), None)
 }
 
 /// Refreshes every member (module docs) on a pooled secondary store.
 pub fn refresh_full(ctx: &WorkerCtx) -> Result<()> {
+    refresh_full_with(ctx, None)
+}
+
+/// [`refresh_full`], recording the engine's store revision it reflects
+/// when `vitals` are given.
+pub fn refresh_full_with(ctx: &WorkerCtx, vitals: Option<&EngineVitals>) -> Result<()> {
     let target = ctx.status_generation.load(Ordering::SeqCst);
+    let revision = vitals.map(EngineVitals::store_revision);
     let started = Instant::now();
     let (cheap, full) = {
         let store = ctx.sync_stores.checkout()?;
-        (compute_cheap(&store, target)?, compute_full(&store)?)
+        (
+            compute_cheap(&store, target, revision)?,
+            compute_full(&store)?,
+        )
     };
     let full_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     ctx.status_cell.update(|prev| {
@@ -282,6 +335,7 @@ pub fn refresh_full(ctx: &WorkerCtx) -> Result<()> {
             next["journal"] = json!(journal);
             next["inventory"] = json!(full.inventory);
             meta.inventory_at_ms = full.inventory_at_ms;
+            meta.inventory_tip = cheap.counters.tip;
             meta.content_generation = target;
             meta.content_at_ms = now_ms();
             meta.full_ms = full_ms;
@@ -293,8 +347,12 @@ pub fn refresh_full(ctx: &WorkerCtx) -> Result<()> {
 }
 
 /// Records the activator's counters and refreshes the cheap members.
-pub fn record_activation(ctx: &WorkerCtx, counters: ActivationCounters) -> Result<()> {
-    refresh_cheap_with(ctx, Some(counters))
+pub fn record_activation(
+    ctx: &WorkerCtx,
+    vitals: &EngineVitals,
+    counters: ActivationCounters,
+) -> Result<()> {
+    refresh_cheap_with(ctx, Some(vitals), Some(counters))
 }
 
 /// A mutating path changed the store (WP2.3 task 4): bump
@@ -302,7 +360,7 @@ pub fn record_activation(ctx: &WorkerCtx, counters: ActivationCounters) -> Resul
 /// journal or the demand changed (`content`), and refresh the cheap members
 /// synchronously. A refresh failure is logged: the next `status` call sees
 /// the cell behind and recomputes.
-pub fn note_mutation(ctx: &WorkerCtx, content: bool) {
+pub fn note_mutation(ctx: &WorkerCtx, vitals: &EngineVitals, content: bool) {
     let generation = ctx.status_generation.fetch_add(1, Ordering::SeqCst) + 1;
     if content {
         ctx.status_cell.update(|prev| {
@@ -313,7 +371,7 @@ pub fn note_mutation(ctx: &WorkerCtx, content: bool) {
             next
         });
     }
-    if let Err(error) = refresh_cheap(ctx) {
+    if let Err(error) = refresh_cheap_at(ctx, vitals) {
         let wire = crate::model::errors::ErrorWire::from_error(&error);
         crate::util::log::event!(warn, (wire.code.as_str()), {
             "site": "worker.status_cell",
@@ -352,26 +410,29 @@ pub fn activator_idle(ctx: &WorkerCtx, quiet: Duration) -> bool {
 }
 
 /// The `status` RPC reply (module docs). Recomputes first when the cell is
-/// behind a mutation, when a mutation asked for the content, or when the cell
-/// is older than `STATUS_CELL_STALE`.
+/// behind a mutation (`status_generation`) or behind the engine's store
+/// revision (writes through the mount), when a mutation asked for the
+/// content, or when the cell is older than `STATUS_CELL_STALE`.
 pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
     let target = ctx.status_generation.load(Ordering::SeqCst);
+    let revision = vitals.store_revision();
     let mut cell = ctx.status_cell.load();
     let mut meta = CellMeta::of(&cell);
     let stale_ms = u64::try_from(STATUS_CELL_STALE.as_millis()).unwrap_or(u64::MAX);
     let mut failure = None;
     if !cell.is_object()
         || meta.generation < target
+        || meta.store_revision != Some(revision)
         || now_ms().saturating_sub(meta.refreshed_at_ms) > stale_ms
     {
-        if let Err(error) = refresh_cheap(ctx) {
+        if let Err(error) = refresh_cheap_at(ctx, vitals) {
             failure = Some(error);
         }
         cell = ctx.status_cell.load();
         meta = CellMeta::of(&cell);
     }
     if meta.content_generation < meta.content_wanted || cell.get("content").is_none() {
-        if let Err(error) = refresh_full(ctx) {
+        if let Err(error) = refresh_full_with(ctx, Some(vitals)) {
             failure.get_or_insert(error);
         }
         cell = ctx.status_cell.load();
@@ -381,8 +442,9 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
         return Err(failure.unwrap_or_else(|| anyhow::anyhow!("ENGINE_NOT_READY: no status yet")));
     }
     // `caught_up`'s inventory check reads `peer_known`, which only an
-    // exchange changes: recompute it when every cheaper condition holds and
-    // an exchange was observed since it was computed.
+    // exchange changes, and the shared committed events: recompute it when
+    // every cheaper condition holds and an exchange was observed or the
+    // journal moved since it was computed.
     let sync = vitals.sync_observation();
     let latest_exchange = sync
         .last_sync
@@ -391,7 +453,10 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
         .filter_map(|observation| observation["at"].as_u64())
         .max()
         .unwrap_or(0);
-    if latest_exchange >= meta.inventory_at_ms && cheap_caught_up(&cell, vitals) {
+    let tip = cell["tip"]["seq"].as_i64().unwrap_or(0);
+    if (latest_exchange >= meta.inventory_at_ms || tip != meta.inventory_tip)
+        && cheap_caught_up(&cell, vitals)
+    {
         if let Err(error) = refresh_inventory(ctx) {
             failure.get_or_insert(error);
         }

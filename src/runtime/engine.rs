@@ -145,6 +145,23 @@ pub struct EngineVitals {
     session_reloads: AtomicU64,
     /// The background activator holds the engine (a bounded slice).
     activator_holding: AtomicBool,
+    /// `Engine::notifications` (control requests' notifications not yet
+    /// moved to the notifier's queue): the notifier takes the engine only
+    /// when some are waiting.
+    control_notifications: AtomicU32,
+    /// Completed engine holds of the worker's own background threads
+    /// (maintenance, notifier), marked by [`EngineVitals::background_hold`]:
+    /// the activator does not mistake them for filesystem or RPC load.
+    background_holds: AtomicU64,
+    /// A background thread holds the engine right now.
+    background_holding: AtomicBool,
+    /// `before` projections captured for notifications (an O(entries) clone
+    /// under the engine lock; only while mounted, on Windows).
+    captures: AtomicU64,
+    /// Background activator cycles (slice plus slow commit) begun and
+    /// finished; a cycle begins before it takes the engine.
+    activator_cycles_begun: AtomicU64,
+    activator_cycles_finished: AtomicU64,
 }
 /// `(last_sync.at, last_sync.caught_up, peers, Σ peers.at, sync peers)`.
 type SyncFingerprint = (Option<u64>, bool, usize, u64, usize);
@@ -210,6 +227,92 @@ impl EngineVitals {
         ActivatorHold {
             vitals: self.clone(),
         }
+    }
+    /// Control requests' notifications waiting in `Engine::notifications`.
+    pub fn control_notifications(&self) -> u32 {
+        self.control_notifications.load(Ordering::Relaxed)
+    }
+    /// Completed holds marked by [`EngineVitals::background_hold`].
+    pub fn background_holds(&self) -> u64 {
+        self.background_holds.load(Ordering::Relaxed)
+    }
+    /// Whether a background thread (maintenance, notifier) holds the engine.
+    pub fn background_holding(&self) -> bool {
+        self.background_holding.load(Ordering::Relaxed)
+    }
+    /// Marks a hold of the engine by one of the worker's own background
+    /// threads (maintenance, notifier) until the returned guard drops. Take
+    /// it right after the engine and drop it **before** the engine guard: a
+    /// hold is then counted here before the lock gauges count it, so
+    /// `gauges.holds - background_holds` never moves for it (the activator's
+    /// measure of other users, `worker::activator`).
+    pub fn background_hold(self: &Arc<Self>) -> BackgroundHold {
+        self.background_holding.store(true, Ordering::Relaxed);
+        BackgroundHold {
+            vitals: self.clone(),
+        }
+    }
+    /// `before` projections captured so far ([`Engine::capture_before`]).
+    pub fn captures(&self) -> u64 {
+        self.captures.load(Ordering::Relaxed)
+    }
+    /// Marks a background activator cycle as begun until the returned guard
+    /// drops (finished). Begun before the cycle takes the engine, so a cycle
+    /// numbered past [`EngineVitals::activator_cycles`]`().0` sees every row
+    /// committed before that read.
+    pub fn activator_cycle(self: &Arc<Self>) -> ActivatorCycle {
+        self.activator_cycles_begun.fetch_add(1, Ordering::SeqCst);
+        ActivatorCycle {
+            vitals: self.clone(),
+        }
+    }
+    /// `(begun, finished)` background activator cycles.
+    pub fn activator_cycles(&self) -> (u64, u64) {
+        (
+            self.activator_cycles_begun.load(Ordering::SeqCst),
+            self.activator_cycles_finished.load(Ordering::SeqCst),
+        )
+    }
+    /// After a notifier round, which no longer takes the engine when no
+    /// control notification waits: the queue's length and delivery error
+    /// (`Engine::notification_error` is only ever cleared, so the queue's
+    /// error is the whole of it).
+    pub fn refresh_notify_queue(&self, queue: &NotifyQueue) {
+        self.pending_notifications.store(
+            count(self.control_notifications() as usize + queue.len()),
+            Ordering::Relaxed,
+        );
+        let error = queue.error();
+        let mut current = crate::util::lock::lock(&self.notification_error);
+        if *current != error {
+            *current = error;
+        }
+    }
+}
+
+/// Returned by [`EngineVitals::activator_cycle`]: counts the cycle finished
+/// on drop (also on an error or a panic).
+pub struct ActivatorCycle {
+    vitals: Arc<EngineVitals>,
+}
+impl Drop for ActivatorCycle {
+    fn drop(&mut self) {
+        self.vitals
+            .activator_cycles_finished
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Returned by [`EngineVitals::background_hold`]: counts the hold on drop.
+pub struct BackgroundHold {
+    vitals: Arc<EngineVitals>,
+}
+impl Drop for BackgroundHold {
+    fn drop(&mut self) {
+        self.vitals.background_holds.fetch_add(1, Ordering::Relaxed);
+        self.vitals
+            .background_holding
+            .store(false, Ordering::Relaxed);
     }
 }
 
@@ -307,6 +410,8 @@ impl Engine {
             count(self.notifications.len() + self.notify_queue.len()),
             Ordering::Relaxed,
         );
+        v.control_notifications
+            .store(count(self.notifications.len()), Ordering::Relaxed);
         {
             let error = self
                 .notification_error
@@ -349,6 +454,7 @@ impl Engine {
         if !(cfg!(windows) && self.mounted) {
             return None;
         }
+        self.vitals.captures.fetch_add(1, Ordering::Relaxed);
         self.store.entries_snapshot().ok()
     }
     /// The [`ActivatedDelta`] of `ids` (point lookups of the committed

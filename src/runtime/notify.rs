@@ -8,14 +8,17 @@
 //! outside the engine lock, only while the mount is attached. While detached
 //! it drops what is queued and remembers to invalidate the root on the next
 //! attach (`needs_refresh`). Control requests still append to
-//! `Engine::notifications`; the notifier moves those into the queue.
+//! `Engine::notifications`; the notifier moves those into the queue, taking
+//! the engine (a `try_lock`, marked as a background hold) only when the
+//! engine vitals show some waiting, so an idle worker's notifier never
+//! touches the engine.
 //!
 //! After an activation, [`delta_notifications`] computes the notifications of
 //! the activated entities only (plus the descendants of directories whose
 //! location changed), from the `before` projection and the store's current
 //! view: the same `(path, action)` pairs [`namespace_notifications`] yields
 //! for those paths, without building every visible path of both projections.
-use super::{Shared, ctx::WorkerCtx};
+use super::{EngineVitals, Shared, ctx::WorkerCtx};
 use crate::core::*;
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -336,10 +339,27 @@ impl NotifyQueue {
 /// invalidation on the next attach). Linux and other platforms drop
 /// everything (FUSE serves with zero TTLs). Never waits for the engine.
 pub fn deliver(engine: &Shared, queue: &NotifyQueue, attached: bool) {
-    if let Some(mut e) = super::try_lock_engine(engine) {
+    deliver_with(engine, None, queue, attached);
+}
+
+/// [`deliver`], taking the engine only when `vitals` (when given) show
+/// control notifications waiting in `Engine::notifications`; that hold is
+/// marked as a background hold ([`EngineVitals::background_hold`]), so the
+/// activator does not take the notifier for filesystem load.
+pub fn deliver_with(
+    engine: &Shared,
+    vitals: Option<&Arc<EngineVitals>>,
+    queue: &NotifyQueue,
+    attached: bool,
+) {
+    let waiting = vitals.is_none_or(|vitals| vitals.control_notifications() > 0);
+    if waiting && let Some(mut e) = super::try_lock_engine(engine) {
+        let hold = vitals.map(|vitals| vitals.background_hold());
         let legacy = std::mem::take(&mut e.notifications);
         let mounted = e.mounted && !e.switching;
         e.notification_error = None;
+        // The background mark is dropped first (EngineVitals::background_hold).
+        drop(hold);
         drop(e);
         if attached && mounted {
             queue.push(legacy);
@@ -411,7 +431,10 @@ pub fn deliver_notifications(engine: &Shared) {
 /// the mount is attached, drops it while detached, until the worker stops.
 /// On platforms without notifications it only keeps the queues empty.
 pub fn spawn_notifier(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
-    let queue = super::lock_engine(&ctx.engine).notify_queue.clone();
+    let (queue, vitals) = {
+        let engine = super::lock_engine(&ctx.engine);
+        (engine.notify_queue.clone(), engine.vitals.clone())
+    };
     thread::Builder::new()
         .name("notifier".into())
         .spawn(move || {
@@ -420,7 +443,9 @@ pub fn spawn_notifier(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
                 // Coalesce a burst (one activation slice queues many paths).
                 thread::sleep(NOTIFIER_COALESCE);
                 let attached = ctx.mount.status().state.is_attached();
-                deliver(&ctx.engine, &queue, attached);
+                // The engine only when a control request left notifications.
+                deliver_with(&ctx.engine, Some(&vitals), &queue, attached);
+                vitals.refresh_notify_queue(&queue);
                 if !queue.is_empty() {
                     // Retries wait for a mount transition: do not spin.
                     thread::sleep(NOTIFIER_RETRY);
