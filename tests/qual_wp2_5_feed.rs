@@ -1,11 +1,17 @@
 //! Qualification scenarios for WP2.5 (metadata feed, format 7, worker side).
 //! REVAMP_PLAN §14.6, §6.3.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP2.5"]`.
+//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP2.5"]`;
+//! WP2.5 implements the feed ops they drive. They stay `#[ignore]` because the
+//! release qualification runner (`scripts/qualify.ps1`) runs ignored scenarios
+//! only; the same behaviours run in the default suite as `tests/feed_v7.rs`.
 //! Two real worker processes are driven like a dialer and an acceptor through
 //! the worker JSON ops `feed-offer` → `feed-exchange` → `feed-apply` (§6.1,
 //! §6.3.5). The baseline has no feed ops: where §15 lists a baseline number the
 //! scenario also measures the legacy v6 path (`published-*`) for the record.
+//! Until WP2.3's activator runs in workers, a feed exchange that leaves
+//! nothing to receive activates what it staged (`runtime::sync_rpc`'s
+//! stand-in), and `ACTIVATOR_PAUSE` pauses that stand-in as well.
 //! `cargo test --release --test qual_wp2_5_feed -- --ignored --test-threads=1 --nocapture`
 mod support;
 
