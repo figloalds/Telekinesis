@@ -25,8 +25,10 @@
 //! Reads are held in two cases, and TCP then pushes back on the peer:
 //! * receive-side flow control: more than `data_queue_bytes` of received
 //!   stream data waits for its consumers; reading resumes once they are back
-//!   under half of that. Only consumers that run (or that idle handler
-//!   threads are about to start) can cause a hold: a streamed request still
+//!   under half of that. Each buffered part counts its whole frame plus a
+//!   fixed overhead (`part_cost`), so empty or header-only parts count too.
+//!   Only consumers that run (or that idle handler threads are about to
+//!   start) can cause a hold: a streamed request still
 //!   waiting for a handler may buffer parts only while they fit the bound,
 //!   and is refused `BUSY` otherwise (`make_room`), so a hold always ends as
 //!   running consumers catch up. Liveness is not judged while this hold lasts
@@ -105,6 +107,20 @@ const LINGER: Duration = Duration::from_millis(1000);
 const DEFAULT_DEADLINE: Duration = Duration::from_secs(24 * 3600);
 /// Expiry of a response reassembly (the scan drops it once its call ends).
 const NEVER: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Memory a buffered stream part holds beyond its frame bytes (its queue
+/// entry and the parsed header's fixed fields).
+const PART_OVERHEAD: usize = 128;
+
+/// What one received stream part costs the receive bound
+/// (`data_queue_bytes`, invariant 22): its whole frame (prefix, header and
+/// body; a client-side chunk is a slice that keeps the whole message alive,
+/// a server-side part keeps its body and the parsed header, whose `hash` is
+/// at most the header's length) plus [`PART_OVERHEAD`]. Header-only parts
+/// therefore count like data, and every buffered part costs more than zero,
+/// so a count of zero always means nothing is buffered.
+fn part_cost(frame_len: usize) -> usize {
+    frame_len.saturating_add(PART_OVERHEAD)
+}
 
 /// The TCP socket under the WebSocket (and TLS) layers.
 fn tcp(ws: &Socket) -> io::Result<&TcpStream> {
@@ -189,6 +205,15 @@ enum PartialKind {
     Response(Value),
 }
 
+/// A part of a streamed request body that waits for room in its handler's
+/// channel.
+struct Part {
+    header: ChunkHeader,
+    body: Vec<u8>,
+    /// Its charge to the receive bound ([`part_cost`]).
+    cost: usize,
+}
+
 /// A streamed request body being delivered to its handler.
 struct UploadIn {
     /// `None` once the body ended with nothing left to deliver (the handler's
@@ -200,11 +225,12 @@ struct UploadIn {
     /// This thread's view of `started`: a running stream's undelivered parts
     /// count in `Io::overflow_bytes` (and may hold reads); a waiting stream's
     /// parts, channel included, count in `Io::waiting_bytes` (and never hold
-    /// reads: see `Io::make_room`).
+    /// reads: see `Io::make_room`). Parts count at their [`part_cost`].
     running: bool,
-    /// Bytes of this stream counted in `Io::waiting_bytes` (waiting only).
+    /// Cost of this stream's parts counted in `Io::waiting_bytes` (waiting
+    /// only).
     waiting: usize,
-    overflow: VecDeque<(ChunkHeader, Vec<u8>)>,
+    overflow: VecDeque<Part>,
     ended: bool,
     idle: Duration,
     /// Last progress: a part arrived, or the handler took one.
@@ -212,8 +238,9 @@ struct UploadIn {
 }
 
 impl UploadIn {
+    /// Cost of the parts waiting for room in the channel.
     fn overflow_len(&self) -> usize {
-        self.overflow.iter().map(|(_, bytes)| bytes.len()).sum()
+        self.overflow.iter().map(|part| part.cost).sum()
     }
 
     /// Its running handler leaves parts untaken (its channel is full).
@@ -255,9 +282,11 @@ struct Io {
     partial: HashMap<u64, Partial>,
     partial_bytes: usize,
     uploads: HashMap<u64, UploadIn>,
-    /// Parts of running streams waiting for room in their handler channels.
+    /// Cost of the parts of running streams waiting for room in their
+    /// handler channels.
     overflow_bytes: usize,
-    /// Parts (channel and overflow) of streams no handler has taken yet.
+    /// Cost of the parts (channel and overflow) of streams no handler has
+    /// taken yet.
     waiting_bytes: usize,
 }
 
@@ -430,7 +459,8 @@ impl Io {
             FrameKind::Chunk => {
                 // The body is the tail of the message: hand it on without a copy.
                 let body = message.slice(message.len() - frame.body.len()..);
-                self.on_chunk(frame, body)
+                let cost = part_cost(message.len());
+                self.on_chunk(frame, body, cost)
             }
             FrameKind::Progress if side == Side::Client => self.on_progress(frame),
             FrameKind::Cancel if side == Side::Server => self.on_cancel(frame),
@@ -887,7 +917,9 @@ impl Io {
 
     // -- chunks (both sides) --------------------------------------------
 
-    fn on_chunk(&mut self, frame: FrameRef<'_>, body: Bytes) -> Result<(), Stop> {
+    /// A CHUNK frame; `cost` is its charge to the receive bound if it is
+    /// buffered as a stream part ([`part_cost`]).
+    fn on_chunk(&mut self, frame: FrameRef<'_>, body: Bytes, cost: usize) -> Result<(), Stop> {
         let header: ChunkHeader = Self::header(&frame)?;
         let id = header.id;
         if id == 0 {
@@ -904,7 +936,7 @@ impl Io {
         match self.shared.side {
             Side::Server => {
                 if self.uploads.contains_key(&id) {
-                    self.on_upload_chunk(header, frame)
+                    self.on_upload_chunk(header, frame, cost)
                 } else {
                     Ok(()) // a cancelled or answered request
                 }
@@ -928,10 +960,11 @@ impl Io {
                         "PROTOCOL_VIOLATION: stream chunk of request {id} without MORE"
                     )));
                 }
-                self.shared
-                    .rx_buffered
-                    .fetch_add(frame.body.len(), Ordering::AcqRel);
-                slot.push(Event::Chunk(header, body));
+                // Charged at its cost, header included (a header-only chunk
+                // still holds its message), and uncharged by the same amount
+                // when the caller takes it or the call ends.
+                self.shared.rx_buffered.fetch_add(cost, Ordering::AcqRel);
+                slot.push(Event::Chunk(header, body, cost));
                 Ok(())
             }
         }
@@ -994,7 +1027,12 @@ impl Io {
         Ok(())
     }
 
-    fn on_upload_chunk(&mut self, header: ChunkHeader, frame: FrameRef<'_>) -> Result<(), Stop> {
+    fn on_upload_chunk(
+        &mut self,
+        header: ChunkHeader,
+        frame: FrameRef<'_>,
+        cost: usize,
+    ) -> Result<(), Stop> {
         let id = header.id;
         if self
             .uploads
@@ -1033,14 +1071,14 @@ impl Io {
             self.drop_upload(id);
             return Ok(());
         }
-        let item = (header, frame.body.to_vec());
-        let len = item.1.len();
+        let body = frame.body.to_vec();
+        // Parts stay in order: while some wait, a new one waits behind them.
         let unsent = if !upload.overflow.is_empty() {
-            Some(item)
+            Some(Part { header, body, cost })
         } else {
-            match upload.tx.as_ref().map(|tx| tx.try_send(item)) {
+            match upload.tx.as_ref().map(|tx| tx.try_send((header, body))) {
                 Some(Ok(())) => None,
-                Some(Err(TrySendError::Full(item))) => Some(item),
+                Some(Err(TrySendError::Full((header, body)))) => Some(Part { header, body, cost }),
                 // The handler stopped reading parts: drop the rest of the
                 // body.
                 Some(Err(TrySendError::Disconnected(_))) | None => {
@@ -1050,27 +1088,33 @@ impl Io {
             }
         };
         if upload.running {
-            if let Some(item) = unsent {
-                self.overflow_bytes += len;
-                upload.overflow.push_back(item);
+            if let Some(part) = unsent {
+                self.overflow_bytes += part.cost;
+                upload.overflow.push_back(part);
             }
         } else {
             // No handler yet: everything it buffers counts, channel included.
-            if let Some(item) = unsent {
-                upload.overflow.push_back(item);
+            if let Some(part) = unsent {
+                upload.overflow.push_back(part);
             }
-            upload.waiting += len;
-            self.waiting_bytes += len;
+            upload.waiting += cost;
+            self.waiting_bytes += cost;
         }
         self.make_room();
         Ok(())
+    }
+
+    /// Some running handler leaves parts untaken (they wait in its stream's
+    /// overflow). Delivery is driven by this, not by `overflow_bytes`.
+    fn any_behind(&self) -> bool {
+        self.uploads.values().any(UploadIn::behind)
     }
 
     /// Moves buffered parts into the channels of running handlers that have
     /// room again.
     fn deliver_uploads(&mut self) {
         self.sync_started();
-        if self.overflow_bytes == 0 {
+        if !self.any_behind() {
             return;
         }
         let mut finished = Vec::new();
@@ -1087,24 +1131,23 @@ impl Io {
             let Some(tx) = upload.tx.as_ref() else {
                 continue;
             };
-            while let Some(item) = upload.overflow.pop_front() {
-                let len = item.1.len();
-                match tx.try_send(item) {
+            while let Some(Part { header, body, cost }) = upload.overflow.pop_front() {
+                match tx.try_send((header, body)) {
                     Ok(()) => {
                         // The handler took a part: it is making progress.
-                        self.overflow_bytes -= len;
+                        self.overflow_bytes -= cost;
                         upload.active = now;
                     }
-                    Err(TrySendError::Full(item)) => {
-                        upload.overflow.push_front(item);
+                    Err(TrySendError::Full((header, body))) => {
+                        upload.overflow.push_front(Part { header, body, cost });
                         break;
                     }
                     Err(TrySendError::Disconnected(_)) => {
-                        self.overflow_bytes -= len;
+                        self.overflow_bytes -= cost;
                         let rest = upload
                             .overflow
                             .drain(..)
-                            .map(|(_, bytes)| bytes.len())
+                            .map(|part| part.cost)
                             .sum::<usize>();
                         self.overflow_bytes -= rest;
                     }
@@ -1120,7 +1163,7 @@ impl Io {
         for id in abandoned {
             self.drop_upload(id);
         }
-        if self.overflow_bytes > 0 {
+        if self.any_behind() {
             // A handler that answered stops reading its parts: drop them.
             let answered: Vec<u64> = {
                 let state = self.shared.lock();
@@ -1561,7 +1604,7 @@ impl Io {
         }
         // Consumers taking buffered parts do not notify this thread. (A hold
         // for outgoing pressure ends through our own writes.)
-        if self.rx_held || self.overflow_bytes > 0 {
+        if self.rx_held || self.any_behind() {
             wake = wake.min(now + RETRY);
         }
         if let Some(deadline) = self.shared.lock().goaway_deadline {

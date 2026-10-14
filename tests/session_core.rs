@@ -2506,6 +2506,253 @@ fn responder_is_send_and_sync() {
 }
 
 // ---------------------------------------------------------------------------
+// Empty and header-only stream parts (WP1.INT fix round 1; invariant 22)
+
+/// A header-only stream part whose header carries `pad` bytes of `hash`.
+fn padded_part(pad: usize) -> ChunkHeader {
+    ChunkHeader {
+        id: 0,
+        hash: Some("h".repeat(pad)),
+        offset: 0,
+        total: 0,
+        last: false,
+    }
+}
+
+/// Four 1 KiB parts, then six empty ones, then the end of the body.
+fn data_then_empty_parts(
+    mut upload: tkfs::session::Upload,
+) -> Result<tkfs::session::Reply, CallError> {
+    let part = |offset: u64| ChunkHeader {
+        id: 0,
+        hash: None,
+        offset,
+        total: 0,
+        last: false,
+    };
+    for i in 0..4u64 {
+        upload.chunk(part(i * 1024), &[7u8; 1024])?;
+    }
+    for _ in 0..6 {
+        upload.chunk(part(4 * 1024), &[])?;
+    }
+    upload.finish()
+}
+
+/// Empty parts that find the handler's channel full wait behind the other
+/// parts and are delivered in order, so the body ends and the handler
+/// answers. Before WP1.INT fix round 1 they were counted as 0 bytes, the
+/// delivery that keyed on the byte count never ran, and the upload stalled
+/// until its idle limit (`REQUEST_TIMEOUT`), whether its handler was running
+/// or still had to start.
+#[test]
+fn empty_parts_behind_a_full_channel_are_delivered() {
+    let idle = Duration::from_secs(3);
+    // Running: the handler took the request and reads late, so the four data
+    // parts fill its channel and the empty ones wait in the overflow.
+    {
+        let (client, server) = session(Transport::Plain);
+        server.serve(stream_service(Duration::ZERO));
+        let upload = client
+            .upload(
+                "late_reader",
+                json!({ "delay_ms": 500 }),
+                Priority::Data,
+                idle,
+            )
+            .unwrap();
+        wait_until(
+            "the handler to take the request",
+            Duration::from_secs(5),
+            || server.health().inflight == 1,
+        );
+        let begun = Instant::now();
+        let reply = data_then_empty_parts(upload).unwrap();
+        assert_eq!(reply.header["parts"], 10);
+        assert_eq!(reply.header["bytes"], 4 * 1024);
+        assert!(
+            begun.elapsed() < idle,
+            "answered after {:?}",
+            begun.elapsed()
+        );
+    }
+    // Waiting: the only handler is busy, so the parts wait with the request
+    // (the empty ones in its overflow) until a handler takes it.
+    {
+        let one_handler = ConnOptions {
+            handlers: 1,
+            ..ConnOptions::default()
+        };
+        let (client, server) = conns(
+            ws_pair(Transport::Plain),
+            ConnOptions::default(),
+            one_handler,
+        );
+        server.serve(stream_service(Duration::ZERO));
+        let busy = client
+            .upload(
+                "late_reader",
+                json!({ "delay_ms": 800 }),
+                Priority::Data,
+                idle,
+            )
+            .unwrap();
+        let busy = thread::spawn(move || busy.finish());
+        wait_until(
+            "the handler to take the first request",
+            Duration::from_secs(5),
+            || server.health().inflight == 1,
+        );
+        let upload = client
+            .upload("late_reader", json!({}), Priority::Data, idle)
+            .unwrap();
+        wait_until(
+            "the second request to wait for the handler",
+            Duration::from_secs(5),
+            || server.health().inflight == 2,
+        );
+        let begun = Instant::now();
+        let reply = data_then_empty_parts(upload).unwrap();
+        assert_eq!(reply.header["parts"], 10);
+        assert_eq!(reply.header["bytes"], 4 * 1024);
+        assert!(
+            begun.elapsed() < idle,
+            "answered after {:?}",
+            begun.elapsed()
+        );
+        assert_eq!(busy.join().unwrap().unwrap().header["parts"], 0);
+        assert!(client.closed().is_none() && server.closed().is_none());
+    }
+}
+
+/// Header-only parts are charged to the receive bound like data (frame
+/// bytes plus a fixed overhead): a peer streaming them to a handler that
+/// takes none is held back by TCP once the bound is reached, the stream is
+/// judged stalled, and the connection keeps serving. Before WP1.INT fix round
+/// 1 they were charged nothing and the server read and buffered them without
+/// limit (the WP1.9 review measured +0.8–1.9 GiB).
+#[test]
+fn header_only_parts_are_charged_to_the_receive_bound() {
+    let small = ConnOptions {
+        data_queue_bytes: MIB,
+        ..ConnOptions::default()
+    };
+    let (client, server) = conns(ws_pair(Transport::Plain), small, small);
+    server.serve(stream_service(Duration::ZERO));
+    let before = server.health().bytes_down;
+    let mut upload = client
+        .upload(
+            "late_reader",
+            json!({ "delay_ms": 5000 }),
+            Priority::Data,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    wait_until(
+        "the handler to take the request",
+        Duration::from_secs(5),
+        || server.health().inflight == 1,
+    );
+    // 4,096 parts of ~16 KiB headers: 64 MiB if nothing held them back.
+    const PARTS: usize = 4096;
+    let sent = Arc::new(AtomicUsize::new(0));
+    let sender = {
+        let sent = sent.clone();
+        thread::spawn(move || {
+            let header = padded_part(16 * 1024);
+            for _ in 0..PARTS {
+                upload.chunk(header.clone(), &[])?;
+                sent.fetch_add(1, Ordering::SeqCst);
+            }
+            upload.finish()
+        })
+    };
+    // Before the stream's 3 s idle limit can end the hold.
+    thread::sleep(Duration::from_secs(2));
+    let received = server.health().bytes_down - before;
+    let accepted = sent.load(Ordering::SeqCst);
+    assert!(
+        received < 4 * MIB as u64,
+        "the server read {received} bytes of header-only parts ({accepted} parts queued)"
+    );
+    assert!(accepted < PARTS, "the sender was never held back");
+    // The handler takes nothing for the idle limit: the stream ends with an
+    // error on one side or the other, and that ends the hold.
+    match sender.join().unwrap() {
+        Err(CallError::Timeout { .. }) => {}
+        Err(CallError::Remote(error)) if error.code == "REQUEST_TIMEOUT" => {}
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+    assert_eq!(
+        call(&client, "echo", json!({ "after": 1 })).unwrap().header["after"],
+        1
+    );
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+/// The client side charges header-only reply chunks the same way: a slow
+/// callback holds the client's reads instead of buffering them without
+/// limit, and every chunk is delivered once it catches up.
+#[test]
+fn header_only_stream_chunks_are_charged_to_the_receive_bound() {
+    const CHUNKS: u64 = 1024;
+    let small = ConnOptions {
+        data_queue_bytes: MIB,
+        ..ConnOptions::default()
+    };
+    let (client, server) = conns(ws_pair(Transport::Plain), small, ConnOptions::default());
+    server.serve(handler(|req| {
+        let header = padded_part(16 * 1024);
+        for _ in 0..CHUNKS {
+            if req.responder.chunk(header.clone(), &[]).is_err() {
+                return;
+            }
+        }
+        req.responder.reply(json!({ "chunks": CHUNKS }), vec![]);
+    }));
+    let before = client.health().bytes_down;
+    let (sleeping, asleep) = mpsc::channel();
+    let caller = {
+        let client = client.clone();
+        thread::spawn(move || {
+            let mut seen = 0u64;
+            let reply = {
+                let mut on_chunk = |_: ChunkHeader, body: &[u8]| -> Result<(), ErrorWire> {
+                    assert!(body.is_empty());
+                    if seen == 0 {
+                        sleeping.send(()).unwrap();
+                        thread::sleep(Duration::from_millis(2000));
+                    }
+                    seen += 1;
+                    Ok(())
+                };
+                client.call_streaming(
+                    "flood",
+                    json!({}),
+                    vec![],
+                    Priority::Control,
+                    None,
+                    Duration::from_secs(10),
+                    &mut on_chunk,
+                )
+            };
+            (reply, seen)
+        })
+    };
+    asleep.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread::sleep(Duration::from_millis(1000));
+    let received = client.health().bytes_down - before;
+    assert!(
+        received < 4 * MIB as u64,
+        "the client read {received} bytes of header-only chunks behind a sleeping callback"
+    );
+    let (reply, seen) = caller.join().unwrap();
+    assert_eq!(reply.unwrap().header["chunks"], CHUNKS);
+    assert_eq!(seen, CHUNKS);
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+// ---------------------------------------------------------------------------
 // GOAWAY
 
 #[test]
