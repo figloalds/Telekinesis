@@ -251,10 +251,15 @@ fn crash_looping_worker_backs_off_and_list_stays_responsive() {
         let _ = fs::remove_file(dir.join(name));
     }
     let log = dir.join("worker.log");
+    // One failed start per line naming the code. WP1.INT: since WP1.4 a
+    // failed start writes its `FatalLine` (code and message) plus a `fatal`
+    // log event repeating it, so count lines, not matches, and skip the log
+    // event (`"level":`).
     let count = || {
         fs::read_to_string(&log)
             .unwrap_or_default()
-            .matches("STATE_NOT_INITIALIZED")
+            .lines()
+            .filter(|line| line.contains("STATE_NOT_INITIALIZED") && !line.contains("\"level\":"))
             .count()
     };
     let before = count();
@@ -371,7 +376,6 @@ fn shutdown_continues_past_a_folder_that_cannot_stop() {
 /// with `mounted:false` and `mount_error` (WP1.4), the supervisor keeps it
 /// running headless, reports the error and keeps syncing.
 #[test]
-#[ignore = "WP1.12: needs the WP1.4 Ready line (mounted:false + mount_error); WP1.INT un-ignores"]
 fn mount_failure_keeps_the_folder_syncing_headless() {
     if !mount_supported() {
         return;
