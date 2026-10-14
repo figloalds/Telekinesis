@@ -67,11 +67,19 @@
 //! **Stopping** (unpair, respawn, shutdown): the supervisor's token is
 //! cancelled, whose per-session hooks send `GOAWAY` at once (`PEER_NOT_PAIRED`,
 //! `WS_CLOSED` for a respawn, `ORCHESTRATOR_STOPPING`). A v3 server closes a
-//! session once it is idle after a GOAWAY, which ends the lane; sessions
-//! still open one second before the deadline are closed outright. Lane
-//! threads that have not ended by the deadline (a lane inside a dial, which
-//! cannot be interrupted, CCR-WP2.6-2) are detached and logged; they close
-//! their new session as soon as the dial returns.
+//! session once it is idle after a GOAWAY, which ends the lane. Every
+//! supervisor stopped together shares one deadline and the stop runs in
+//! phases across all of them: wait for their lanes until one second before
+//! the deadline, close every session still open, wait until the deadline,
+//! then *retire* each supervisor. Retiring reports `Closed` for every lane
+//! still running and mutes the supervisor: no status event of it is recorded
+//! afterwards. A reconciler retires a supervisor before it records
+//! `PeerRemoved` or spawns the replacement, so a late lane can neither
+//! recreate an unpaired peer in the hub nor overwrite its successor's lanes.
+//! Lane threads that have not ended by the deadline (a lane inside a dial,
+//! which cannot be interrupted, CCR-WP2.6-2) are detached, counted
+//! ([`PeerManager::detached_lanes`]) and logged; they close their new
+//! session as soon as the dial returns.
 //!
 //! Invariants: 16 (a probe and every lane session are fresh requests, nothing
 //! is replayed), 20 (a legacy endpoint is `Incompatible`, the code is never
@@ -106,7 +114,7 @@ use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, Weak,
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         mpsc,
     },
@@ -122,6 +130,17 @@ const CATALOG_WAIT: Duration = Duration::from_millis(500);
 const IDLE_WAIT: Duration = Duration::from_secs(3600);
 /// RTT changes smaller than this are not re-reported.
 const RTT_MIN_DELTA_MS: u64 = 5;
+/// The furthest deadline [`deadline_in`] computes (a year): a caller's
+/// `Duration::MAX` means "no practical limit", not an overflow.
+const FAR_FUTURE: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// `now + after`, capped at [`FAR_FUTURE`] instead of overflowing `Instant`.
+fn deadline_in(after: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(after.min(FAR_FUTURE))
+        .or_else(|| now.checked_add(after.min(Duration::from_secs(3600))))
+        .unwrap_or(now)
+}
 
 /// Timing of the peer stack. [`Default`] is the §3.7 policy; tests shorten it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -231,16 +250,31 @@ pub struct PeerManager {
     cancel: Cancel,
     /// Set by `shutdown`; nothing is spawned afterwards.
     closed: AtomicBool,
-    peers: Tracked<BTreeMap<String, PeerHandle>>,
+    peers: Tracked<Peers>,
     /// Serializes reconcilers (they may wait up to `options.join` for lanes).
     reconciling: Mutex<()>,
+    /// Serializes `pair`'s catalog writes (its record and the removal of the
+    /// installation's other endpoints), so two concurrent pairs of one
+    /// installation leave exactly one record.
+    pairing: Mutex<()>,
     /// The catalog generation last reconciled.
     reconciled: AtomicU64,
+    /// Lane threads detached at a stop deadline, in total.
+    detached: AtomicU64,
     watcher: Mutex<Option<JoinHandle<()>>>,
     /// Poked when the `peer-manager` thread ends.
     watcher_done: Arc<Notify>,
     /// `peer_meta` writes, off the lane threads.
     meta: Arc<MetaWriter>,
+}
+
+#[derive(Default)]
+struct Peers {
+    /// The supervised peers, by installation.
+    active: BTreeMap<String, PeerHandle>,
+    /// Supervisors a reconciler took out of `active` and is stopping; they
+    /// leave this list once retired. `shutdown` stops and waits for them too.
+    stopping: Vec<Arc<Supervisor>>,
 }
 
 struct PeerHandle {
@@ -285,9 +319,11 @@ impl PeerManager {
             options,
             cancel,
             closed: AtomicBool::new(false),
-            peers: Tracked::new("peer-manager.peers", BTreeMap::new()),
+            peers: Tracked::new("peer-manager.peers", Peers::default()),
             reconciling: Mutex::new(()),
+            pairing: Mutex::new(()),
             reconciled: AtomicU64::new(0),
+            detached: AtomicU64::new(0),
             watcher: Mutex::new(None),
             watcher_done: Arc::new(Notify::new()),
             meta: MetaWriter::start(ctx_catalog),
@@ -324,6 +360,7 @@ impl PeerManager {
     pub fn context(&self, installation: &str) -> Option<Arc<PeerContext>> {
         self.peers
             .lock()
+            .active
             .get(installation)
             .map(|handle| handle.supervisor.context.clone())
     }
@@ -333,6 +370,7 @@ impl PeerManager {
         let supervisors: Vec<Arc<Supervisor>> = self
             .peers
             .lock()
+            .active
             .values()
             .map(|handle| handle.supervisor.clone())
             .collect();
@@ -344,6 +382,7 @@ impl PeerManager {
         let supervisor = self
             .peers
             .lock()
+            .active
             .get(installation)
             .map(|handle| handle.supervisor.clone())?;
         Some(supervisor.view())
@@ -354,8 +393,40 @@ impl PeerManager {
         self.reconciled.load(Ordering::Acquire)
     }
 
+    /// Lane threads that had not ended by their stop deadline and were
+    /// detached (a lane inside a dial, CCR-WP2.6-2), since the start. A lane
+    /// that ended in time was joined and is not counted.
+    pub fn detached_lanes(&self) -> u64 {
+        self.detached.load(Ordering::Acquire)
+    }
+
     fn stopping_error() -> ErrorWire {
         ErrorWire::coded("ORCHESTRATOR_STOPPING", "the peer stack is shut down")
+    }
+
+    /// Stops `supervisors` (already cancelled) under one `deadline`, in
+    /// phases across all of them, so one slow supervisor never eats another
+    /// one's time: wait for every lane until `force_close_margin` before the
+    /// deadline, close every session still open, wait until the deadline,
+    /// then retire each supervisor (lanes still running are reported
+    /// `Closed`, detached and muted).
+    fn stop_all(&self, supervisors: &[Arc<Supervisor>], deadline: Instant) {
+        let force_at = deadline
+            .checked_sub(self.options.force_close_margin)
+            .unwrap_or(deadline);
+        for supervisor in supervisors {
+            supervisor.wait_lanes(force_at);
+        }
+        for supervisor in supervisors {
+            supervisor.force_close();
+        }
+        for supervisor in supervisors {
+            supervisor.wait_lanes(deadline);
+        }
+        for supervisor in supervisors {
+            let detached = supervisor.retire();
+            self.detached.fetch_add(detached, Ordering::AcqRel);
+        }
     }
 
     /// Brings the supervisors in line with the catalog and returns the
@@ -370,35 +441,49 @@ impl PeerManager {
         let (stopping, starting) = {
             let mut peers = self.peers.lock();
             let mut stopping: Vec<(PeerHandle, StopReason)> = Vec::new();
-            let current: Vec<String> = peers.keys().cloned().collect();
+            let current: Vec<String> = peers.active.keys().cloned().collect();
             for installation in current {
                 let reason = match desired.get(&installation) {
                     None => StopReason::Removed,
-                    Some(record) if *record != peers[&installation].record => {
+                    Some(record) if *record != peers.active[&installation].record => {
                         StopReason::Reconfigured
                     }
                     Some(_) => continue,
                 };
-                if let Some(handle) = peers.remove(&installation) {
+                if let Some(handle) = peers.active.remove(&installation) {
+                    // Visible to `shutdown` until retired.
+                    peers.stopping.push(handle.supervisor.clone());
                     stopping.push((handle, reason));
                 }
             }
             let starting: Vec<PeerRecord> = desired
                 .values()
-                .filter(|record| !peers.contains_key(&record.installation))
+                .filter(|record| !peers.active.contains_key(&record.installation))
                 .cloned()
                 .collect();
             (stopping, starting)
         };
         // Stop every outgoing supervisor first (their sessions wind down in
-        // parallel), then wait for them under one deadline.
-        let deadline = Instant::now() + self.options.join;
-        for (handle, reason) in &stopping {
-            handle.supervisor.begin_stop(*reason);
+        // parallel), then wait for them under one deadline. They are retired
+        // (muted) before `PeerRemoved` is recorded or a successor is spawned.
+        if !stopping.is_empty() {
+            let deadline = deadline_in(self.options.join);
+            for (handle, reason) in &stopping {
+                handle.supervisor.begin_stop(*reason, deadline);
+            }
+            let supervisors: Vec<Arc<Supervisor>> = stopping
+                .iter()
+                .map(|(handle, _)| handle.supervisor.clone())
+                .collect();
+            self.stop_all(&supervisors, deadline);
+            self.peers.lock().stopping.retain(|supervisor| {
+                !supervisors
+                    .iter()
+                    .any(|stopped| Arc::ptr_eq(stopped, supervisor))
+            });
         }
         let mut previous: BTreeMap<String, Arc<RemoteCatalog>> = BTreeMap::new();
         for (handle, reason) in stopping {
-            handle.supervisor.finish_stop(deadline);
             let installation = handle.record.installation.clone();
             if reason == StopReason::Removed {
                 self.ctx
@@ -439,7 +524,7 @@ impl PeerManager {
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
-            peers.insert(
+            peers.active.insert(
                 installation.clone(),
                 PeerHandle {
                     record,
@@ -511,25 +596,32 @@ impl NetworkApi for PeerManager {
                 "the endpoint is this installation",
             ));
         }
-        let snapshot = self.ctx.catalog.apply(CatalogCmd::UpsertPeer {
-            record: PeerRecord {
-                endpoint: endpoint.to_owned(),
-                code: code.to_owned(),
-                installation: installation.clone(),
-                connections: count,
-                revision: uuid::Uuid::new_v4().to_string(),
-            },
-        })?;
-        let replaced: Vec<String> = snapshot
-            .peers
-            .iter()
-            .filter(|peer| peer.installation == installation && peer.endpoint != endpoint)
-            .map(|peer| peer.endpoint.clone())
-            .collect();
-        for old in replaced {
-            self.ctx
-                .catalog
-                .apply(CatalogCmd::RemovePeer { endpoint: old })?;
+        {
+            // The record and the removal of the installation's other
+            // endpoints are one step for concurrent pairs: without this, two
+            // pairs of one installation at two endpoints could each remove
+            // the other's fresh record and leave none. The last pair wins.
+            let _pairing = lock(&self.pairing);
+            let snapshot = self.ctx.catalog.apply(CatalogCmd::UpsertPeer {
+                record: PeerRecord {
+                    endpoint: endpoint.to_owned(),
+                    code: code.to_owned(),
+                    installation: installation.clone(),
+                    connections: count,
+                    revision: uuid::Uuid::new_v4().to_string(),
+                },
+            })?;
+            let replaced: Vec<String> = snapshot
+                .peers
+                .iter()
+                .filter(|peer| peer.installation == installation && peer.endpoint != endpoint)
+                .map(|peer| peer.endpoint.clone())
+                .collect();
+            for old in replaced {
+                self.ctx
+                    .catalog
+                    .apply(CatalogCmd::RemovePeer { endpoint: old })?;
+            }
         }
         self.reconcile();
         Ok(PairResult {
@@ -586,6 +678,7 @@ impl NetworkApi for PeerManager {
         let supervisors: Vec<Arc<Supervisor>> = self
             .peers
             .lock()
+            .active
             .values()
             .map(|handle| handle.supervisor.clone())
             .collect();
@@ -595,20 +688,26 @@ impl NetworkApi for PeerManager {
     }
 
     /// GOAWAY to every session, cancel every lane, join within `deadline`.
+    /// Supervisors a concurrent `pair`/`unpair`/catalog reconcile is still
+    /// stopping are waited for as well (under this deadline).
     fn shutdown(&self, deadline: Duration) {
-        let until = Instant::now() + deadline;
+        let until = deadline_in(deadline);
         self.closed.store(true, Ordering::Release);
-        let handles: Vec<PeerHandle> = {
+        let (handles, stopping): (Vec<PeerHandle>, Vec<Arc<Supervisor>>) = {
             let mut peers = self.peers.lock();
-            std::mem::take(&mut *peers).into_values().collect()
+            let active = std::mem::take(&mut peers.active);
+            (active.into_values().collect(), peers.stopping.clone())
         };
         for handle in &handles {
-            handle.supervisor.begin_stop(StopReason::Shutdown);
+            handle.supervisor.begin_stop(StopReason::Shutdown, until);
         }
         self.cancel.cancel();
-        for handle in handles {
-            handle.supervisor.finish_stop(until);
-        }
+        let mut supervisors: Vec<Arc<Supervisor>> = handles
+            .iter()
+            .map(|handle| handle.supervisor.clone())
+            .collect();
+        supervisors.extend(stopping);
+        self.stop_all(&supervisors, until);
         self.meta.close();
         let watcher = lock(&self.watcher).take();
         if let Some(watcher) = watcher {
@@ -634,7 +733,10 @@ impl std::fmt::Debug for PeerManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerManager")
             .field("installation", &self.ctx.installation)
-            .field("peers", &self.peers.lock().keys().collect::<Vec<_>>())
+            .field(
+                "peers",
+                &self.peers.lock().active.keys().cloned().collect::<Vec<_>>(),
+            )
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
@@ -707,8 +809,10 @@ struct Block {
 #[derive(Debug, Default)]
 struct Gate {
     block: Option<Block>,
-    /// A lane is re-dialing after the block expired.
-    probing: bool,
+    /// The lane re-dialing after the block expired (the probe). A lane
+    /// thread that ends while it holds the probe releases it (`LaneExit`),
+    /// so a lane that dies mid-probe never leaves the others parked.
+    probe: Option<u32>,
     generation: u64,
 }
 
@@ -745,15 +849,23 @@ struct Supervisor {
     pool: u32,
     cancel: Cancel,
     stop_reason: Tracked<StopReason>,
+    /// The earliest stop deadline this supervisor was given.
+    stop_deadline: Tracked<Option<Instant>>,
     gate: Tracked<Gate>,
     gate_changed: Notify,
     lanes: Tracked<Vec<LaneView>>,
     conns: Tracked<BTreeMap<u32, Conn>>,
     live: AtomicU32,
     exited: Notify,
-    threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Each lane thread, by lane.
+    threads: Mutex<Vec<(u32, JoinHandle<()>)>>,
     /// Whether this supervisor has emitted a `PeerCatalog` yet.
     catalog_emitted: AtomicBool,
+    /// `true` once retired: nothing of this supervisor reaches
+    /// `ctx.status` any more. Every status event is recorded under the read
+    /// side and `retire` flips it under the write side, so no event recorded
+    /// after the retirement can slip in (see [`Supervisor::retire`]).
+    retired: RwLock<bool>,
     meta: Arc<MetaWriter>,
 }
 
@@ -799,6 +911,7 @@ impl Supervisor {
             pool,
             cancel,
             stop_reason: Tracked::new("peer.stop_reason", StopReason::Shutdown),
+            stop_deadline: Tracked::new("peer.stop_deadline", None),
             gate: Tracked::new("peer.gate", Gate::default()),
             gate_changed: Notify::new(),
             lanes: Tracked::new("peer.lanes", lanes),
@@ -807,6 +920,7 @@ impl Supervisor {
             exited: Notify::new(),
             threads: Mutex::new(Vec::new()),
             catalog_emitted: AtomicBool::new(false),
+            retired: RwLock::new(false),
             meta,
         });
         // Lanes parked on the gate wake when the supervisor is cancelled. The
@@ -837,7 +951,7 @@ impl Supervisor {
                 .name(name)
                 .spawn(move || run_lane(supervisor, lane))
             {
-                Ok(handle) => lock(&self.threads).push(handle),
+                Ok(handle) => lock(&self.threads).push((lane, handle)),
                 Err(error) => {
                     self.live.fetch_sub(1, Ordering::AcqRel);
                     self.exited.poke();
@@ -870,30 +984,93 @@ impl Supervisor {
         }
     }
 
-    /// Cancels every lane; the per-session hooks send `GOAWAY{reason}`.
-    fn begin_stop(&self, reason: StopReason) {
+    /// Cancels every lane; the per-session hooks send `GOAWAY{reason}`. The
+    /// lanes close their sessions themselves `force_close_margin` before
+    /// `deadline` if the peer has not closed them by then.
+    fn begin_stop(&self, reason: StopReason, deadline: Instant) {
         *self.stop_reason.lock() = reason;
+        {
+            let mut stop = self.stop_deadline.lock();
+            if stop.is_none_or(|current| deadline < current) {
+                *stop = Some(deadline);
+            }
+        }
         self.cancel.cancel();
     }
 
-    /// Waits for the lanes to end by `deadline`, closing sessions outright
-    /// `force_close_margin` before it; detaches lanes still running then.
-    fn finish_stop(&self, deadline: Instant) {
-        let force_at = deadline
-            .checked_sub(self.options.force_close_margin)
-            .unwrap_or(deadline);
-        self.wait_lanes(force_at);
-        if self.live.load(Ordering::Acquire) > 0 {
-            let conns: Vec<Conn> = self.conns.lock().values().cloned().collect();
-            for conn in conns {
-                conn.close();
-            }
-            self.wait_lanes(deadline);
+    /// When a stopping lane stops waiting for the peer to close its session:
+    /// `force_close_margin` before the stop deadline (`None` when the token
+    /// was cancelled without a stop, e.g. by `ctx.shutdown`).
+    fn force_close_at(&self) -> Option<Instant> {
+        let deadline = (*self.stop_deadline.lock())?;
+        Some(
+            deadline
+                .checked_sub(self.options.force_close_margin)
+                .unwrap_or(deadline),
+        )
+    }
+
+    /// Closes every session still open (a lane in a call the peer never
+    /// answers, a peer that does not close after GOAWAY).
+    fn force_close(&self) {
+        if self.live.load(Ordering::Acquire) == 0 {
+            return;
         }
-        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *lock(&self.threads));
-        let mut detached = 0;
-        for handle in handles {
-            if handle.is_finished() {
+        let conns: Vec<Conn> = self.conns.lock().values().cloned().collect();
+        for conn in conns {
+            conn.close();
+        }
+    }
+
+    /// Ends this supervisor's reporting, once; returns how many lane
+    /// threads were detached. Every lane not yet `Closed` (it is still
+    /// running: inside a dial, CCR-WP2.6-2, or finishing at the deadline) is
+    /// reported `Closed` now, then the supervisor is muted: those lanes'
+    /// later transitions (`Handshaking` from a dial, their own `Closed`,
+    /// a catalog listing) never reach `ctx.status`. The manager calls this
+    /// before it records `PeerRemoved` or spawns a successor, so a late lane
+    /// can neither recreate an unpaired peer in the hub nor overwrite the
+    /// lanes of its successor for the same installation. Lane threads that
+    /// ended are joined; the others are detached and logged.
+    fn retire(&self) -> u64 {
+        let running: Vec<u32> = {
+            let mut retired = self.retired.write().unwrap_or_else(PoisonError::into_inner);
+            if *retired {
+                return 0;
+            }
+            let now_ms = self.ctx.clock.now_ms();
+            let running: Vec<u32> = {
+                let mut lanes = self.lanes.lock();
+                lanes
+                    .iter_mut()
+                    .filter(|view| view.state != LaneState::Closed)
+                    .map(|view| {
+                        view.state = LaneState::Closed;
+                        view.since_ms = now_ms;
+                        view.error = None;
+                        view.backoff_until_ms = None;
+                        view.rtt_ms = None;
+                        view.protocol = None;
+                        view.lane
+                    })
+                    .collect()
+            };
+            for lane in &running {
+                self.ctx
+                    .status
+                    .record(self.lane_event(*lane, LaneState::Closed, None, None, None));
+            }
+            *retired = true;
+            running
+        };
+        // Outside the write side: a lane that recorded its own `Closed` is
+        // past its last status event and only returns, so joining it is
+        // short; joining under the write side could wait for a lane that
+        // waits for the read side.
+        let handles: Vec<(u32, JoinHandle<()>)> = std::mem::take(&mut *lock(&self.threads));
+        let mut detached = 0u64;
+        for (lane, handle) in handles {
+            if !running.contains(&lane) || handle.is_finished() {
                 let _ = handle.join();
             } else {
                 detached += 1;
@@ -906,6 +1083,12 @@ impl Supervisor {
                 "lanes": detached,
             });
         }
+        detached
+    }
+
+    /// The read side of `retired`: hold it across a status record.
+    fn reporting(&self) -> RwLockReadGuard<'_, bool> {
+        self.retired.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn wait_lanes(&self, until: Instant) {
@@ -924,7 +1107,27 @@ impl Supervisor {
 
     // -- lane state ---------------------------------------------------------
 
-    /// Records a lane transition and emits `LaneState`.
+    fn lane_event(
+        &self,
+        lane: u32,
+        state: LaneState,
+        error: Option<ErrorWire>,
+        backoff_until_ms: Option<u64>,
+        rtt_ms: Option<u64>,
+    ) -> StatusEvent {
+        StatusEvent::LaneState {
+            installation: self.record.installation.clone(),
+            lane,
+            role: role_of(lane),
+            direction: Direction::Outbound,
+            state,
+            error,
+            backoff_until_ms,
+            rtt_ms,
+        }
+    }
+
+    /// Records a lane transition and emits `LaneState` (unless retired).
     fn set_lane(
         &self,
         lane: u32,
@@ -934,7 +1137,9 @@ impl Supervisor {
         rtt_ms: Option<u64>,
     ) {
         let now_ms = self.ctx.clock.now_ms();
-        let role = role_of(lane);
+        // Held across the view update and the record: `retire` sees either
+        // both or neither.
+        let retired = self.reporting();
         {
             let mut lanes = self.lanes.lock();
             if let Some(view) = lanes.get_mut(lane as usize) {
@@ -955,16 +1160,11 @@ impl Supervisor {
                 }
             }
         }
-        self.ctx.status.record(StatusEvent::LaneState {
-            installation: self.record.installation.clone(),
-            lane,
-            role,
-            direction: Direction::Outbound,
-            state,
-            error,
-            backoff_until_ms,
-            rtt_ms,
-        });
+        if !*retired {
+            self.ctx
+                .status
+                .record(self.lane_event(lane, state, error, backoff_until_ms, rtt_ms));
+        }
     }
 
     fn update_lane(&self, lane: u32, update: impl FnOnce(&mut LaneView)) {
@@ -975,33 +1175,33 @@ impl Supervisor {
 
     // -- the peer-level gate ------------------------------------------------
 
-    /// Waits until `lane` may dial: `Some(false)` with no block, `Some(true)`
-    /// when this lane probes an expired block, `None` when cancelled. While
-    /// it waits, the lane shows the block's state once per block.
-    fn admit(&self, lane: u32, announced: &mut Option<u64>) -> Option<bool> {
+    /// Waits until `lane` may dial: `true` with no block, or when this lane
+    /// takes the probe of an expired block; `false` when cancelled. While it
+    /// waits, the lane shows the block's state once per block.
+    fn admit(&self, lane: u32, announced: &mut Option<u64>) -> bool {
         loop {
             if self.cancel.is_cancelled() {
-                return None;
+                return false;
             }
             let seen = self.gate_changed.count();
             let (block, probing) = {
                 let gate = self.gate.lock();
-                (gate.block.clone(), gate.probing)
+                (gate.block.clone(), gate.probe.is_some())
             };
             let Some(block) = block else {
-                return Some(false);
+                return true;
             };
             let now = Instant::now();
             if now >= block.until && !probing {
                 let mut gate = self.gate.lock();
-                if !gate.probing
+                if gate.probe.is_none()
                     && gate
                         .block
                         .as_ref()
                         .is_some_and(|current| current.generation == block.generation)
                 {
-                    gate.probing = true;
-                    return Some(true);
+                    gate.probe = Some(lane);
+                    return true;
                 }
                 continue;
             }
@@ -1028,9 +1228,9 @@ impl Supervisor {
     fn gate_success(&self) {
         let changed = {
             let mut gate = self.gate.lock();
-            let changed = gate.block.is_some() || gate.probing;
+            let changed = gate.block.is_some() || gate.probe.is_some();
             gate.block = None;
-            gate.probing = false;
+            gate.probe = None;
             if changed {
                 gate.generation += 1;
             }
@@ -1041,8 +1241,9 @@ impl Supervisor {
         }
     }
 
-    /// A lane met a peer-level refusal: block every lane until the recheck.
-    fn gate_block(&self, state: LaneState, error: ErrorWire, probe: bool) {
+    /// `lane` met a peer-level refusal: block every lane until the recheck
+    /// (and release the probe if `lane` held it).
+    fn gate_block(&self, lane: u32, state: LaneState, error: ErrorWire) {
         let recheck = if state == LaneState::Incompatible {
             self.options.incompatible_recheck
         } else {
@@ -1063,12 +1264,12 @@ impl Supervisor {
             gate.block = Some(Block {
                 state,
                 error: error.clone(),
-                until: Instant::now() + recheck,
+                until: deadline_in(recheck),
                 until_ms,
                 generation: gate.generation,
             });
-            if probe {
-                gate.probing = false;
+            if gate.probe == Some(lane) {
+                gate.probe = None;
             }
             newly
         };
@@ -1090,7 +1291,7 @@ impl Supervisor {
         let now_ms = self.ctx.clock.now_ms();
         let expired = {
             let mut gate = self.gate.lock();
-            let probing = gate.probing;
+            let probing = gate.probe.is_some();
             match gate.block.as_mut() {
                 Some(block) if !probing => {
                     block.until = Instant::now();
@@ -1105,25 +1306,43 @@ impl Supervisor {
         }
     }
 
-    /// A probe failed transiently: the peer's class is unknown again, so each
-    /// lane falls back to its own backoff.
-    fn gate_transient(&self, probe: bool) {
-        if !probe {
-            return;
-        }
+    /// A dial of `lane` failed transiently. When `lane` was the probe, the
+    /// peer's class is unknown again: the block is dropped and each lane
+    /// falls back to its own backoff.
+    fn gate_transient(&self, lane: u32) {
         {
             let mut gate = self.gate.lock();
+            if gate.probe != Some(lane) {
+                return;
+            }
             gate.block = None;
-            gate.probing = false;
+            gate.probe = None;
             gate.generation += 1;
+        }
+        self.gate_changed.poke();
+    }
+
+    /// `lane` ends: if it held the probe (it was cancelled or panicked
+    /// mid-probe), another lane may take it.
+    fn release_probe(&self, lane: u32) {
+        {
+            let mut gate = self.gate.lock();
+            if gate.probe != Some(lane) {
+                return;
+            }
+            gate.probe = None;
         }
         self.gate_changed.poke();
     }
 
     /// `peer_meta`: seen now; `incompatible` replaces the stored code.
     /// Queued for the `peer-meta` thread: the lane never waits for the
-    /// catalog.
+    /// catalog. A stopping supervisor records nothing (its peer may be
+    /// unpaired by now).
     fn record_seen(&self, incompatible: Option<String>) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         self.meta.record(PeerSeen {
             installation: self.record.installation.clone(),
             at_ms: self.ctx.clock.now_ms(),
@@ -1193,9 +1412,14 @@ impl Supervisor {
         };
         session_cancel.cancel();
         if ended.is_none() {
-            // Stopping: the peer closes once idle after our GOAWAY; the
-            // manager closes sessions that outlast the join deadline.
-            if conn.wait_closed(self.options.join).is_none() {
+            // Stopping: the peer closes once idle after our GOAWAY. The lane
+            // closes the session itself `force_close_margin` before the stop
+            // deadline (the manager does too, for a lane stuck in a call).
+            let wait = match self.force_close_at() {
+                Some(at) => at.saturating_duration_since(Instant::now()),
+                None => self.options.join,
+            };
+            if conn.wait_closed(wait).is_none() {
                 conn.close();
             }
         }
@@ -1276,7 +1500,7 @@ impl Supervisor {
         let mut since: Option<u64> = None;
         let mut failures = 0u32;
         let mut next_poll = Instant::now();
-        let mut next_rtt = Instant::now() + self.options.rtt_refresh;
+        let mut next_rtt = deadline_in(self.options.rtt_refresh);
         let mut rtt = conn.health().rtt_ms;
         loop {
             if cancel.is_cancelled() {
@@ -1287,11 +1511,11 @@ impl Supervisor {
             }
             if Instant::now() >= next_poll {
                 self.poll_catalog(conn, &mut since, &mut failures);
-                next_poll = Instant::now() + self.options.catalog_poll;
+                next_poll = deadline_in(self.options.catalog_poll);
             }
             if Instant::now() >= next_rtt {
                 self.refresh_rtt(lane, conn, &mut rtt);
-                next_rtt = Instant::now() + self.options.rtt_refresh;
+                next_rtt = deadline_in(self.options.rtt_refresh);
             }
             let wait = next_poll
                 .min(next_rtt)
@@ -1378,10 +1602,13 @@ impl Supervisor {
             });
         }
         if changed || first {
-            self.ctx.status.record(StatusEvent::PeerCatalog {
-                installation: self.record.installation.clone(),
-                entries: reply.entries,
-            });
+            let retired = self.reporting();
+            if !*retired {
+                self.ctx.status.record(StatusEvent::PeerCatalog {
+                    installation: self.record.installation.clone(),
+                    entries: reply.entries,
+                });
+            }
         }
     }
 }
@@ -1468,7 +1695,8 @@ impl ClientAuth for AnnounceHandshake<'_> {
     }
 }
 
-/// Ends a lane thread: `Closed`, one less live lane.
+/// Ends a lane thread (also when it panics): the probe released, `Closed`,
+/// one less live lane.
 struct LaneExit {
     supervisor: Arc<Supervisor>,
     lane: u32,
@@ -1478,6 +1706,7 @@ impl Drop for LaneExit {
     fn drop(&mut self) {
         let supervisor = &self.supervisor;
         supervisor.conns.lock().remove(&self.lane);
+        supervisor.release_probe(self.lane);
         supervisor.set_lane(self.lane, LaneState::Closed, None, None, None);
         supervisor.live.fetch_sub(1, Ordering::AcqRel);
         supervisor.exited.poke();
@@ -1493,9 +1722,9 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
     let mut backoff = supervisor.options.lane_backoff();
     let mut announced: Option<u64> = None;
     loop {
-        let Some(probe) = supervisor.admit(lane, &mut announced) else {
+        if !supervisor.admit(lane, &mut announced) {
             return;
-        };
+        }
         supervisor.set_lane(lane, LaneState::Dialing, None, None, None);
         let dialed = supervisor.dial(lane);
         if supervisor.cancel.is_cancelled() {
@@ -1518,11 +1747,11 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
             }
             Err(error) => match classify_dial(&error) {
                 Failure::Block(state, wire) => {
-                    supervisor.gate_block(state, wire, probe);
+                    supervisor.gate_block(lane, state, wire);
                     continue;
                 }
                 Failure::Retry(wire) => {
-                    supervisor.gate_transient(probe);
+                    supervisor.gate_transient(lane);
                     wire
                 }
             },
