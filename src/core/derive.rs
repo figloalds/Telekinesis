@@ -1629,6 +1629,97 @@ pub(super) fn successor_may_add_cuts(events: &[Event], new: usize) -> bool {
     false
 }
 
+/// Whether every cone `check_successor_cuts` would count is certainly within
+/// `MAX_NAMESPACE_CUTS`, by a cheap sound bound: a cone with `r` relevant
+/// events has at most `2^r - 1 - r` competing cuts (its antichains of two or
+/// more events), which is 4,083 for `r = 12`. The cones that contain an
+/// entity the event touches are the cones of the entities that reach one
+/// (`ConeGraph::reaching`: the closure over children and slot sharers), and
+/// each lies in the closure of those over parents and slot sharers
+/// (`NamespaceCones::cone`); every relevant event of such a cone changes a
+/// member's kind, location or presence. So at most 12 such events among the
+/// members of that closure means no count can exceed the limit. Gives up
+/// (`false`) as soon as the closure grows past a small size.
+fn successor_cones_are_small<'a>(events: &'a [Event], new: usize) -> bool {
+    const SMALL: usize = 12;
+    const MEMBERS: usize = 64;
+    let rows: Vec<(&'a str, &'a str, &'a str)> = events
+        .iter()
+        .flat_map(|e| e.changes.iter().filter(|c| c.field == "location"))
+        .filter_map(|c| {
+            Some((
+                c.entity.as_str(),
+                c.value["parent"].as_str()?,
+                c.value["name"].as_str()?,
+            ))
+        })
+        .collect();
+    // Two names share a slot (conservatively `true` for a name that cannot
+    // be keyed).
+    let same_slot = |a: &str, b: &str| {
+        if a.is_ascii() && b.is_ascii() {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            match (slot_key(a), slot_key(b)) {
+                (Ok(a), Ok(b)) => a == b,
+                _ => true,
+            }
+        }
+    };
+    // Close `set` over slot sharers and, `up`, parents (else children).
+    let close = |set: &mut BTreeSet<&'a str>, up: bool| -> bool {
+        loop {
+            if set.len() > MEMBERS {
+                return false;
+            }
+            let slots: Vec<(&str, &str)> = rows
+                .iter()
+                .filter(|(e, _, _)| set.contains(e))
+                .map(|&(_, p, n)| (p, n))
+                .collect();
+            let mut grew = false;
+            for &(entity, parent, name) in &rows {
+                if set.contains(entity) {
+                    if up && parent != ROOT && set.insert(parent) {
+                        grew = true;
+                    }
+                    continue;
+                }
+                let joins = (!up && set.contains(parent))
+                    || slots
+                        .iter()
+                        .any(|&(p, n)| p == parent && same_slot(n, name));
+                if joins {
+                    set.insert(entity);
+                    grew = true;
+                }
+            }
+            if !grew {
+                return true;
+            }
+        }
+    };
+    let mut members: BTreeSet<&'a str> = events[new]
+        .changes
+        .iter()
+        .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
+        .map(|c| c.entity.as_str())
+        .collect();
+    if !close(&mut members, false) || !close(&mut members, true) {
+        return false;
+    }
+    let candidates = events
+        .iter()
+        .filter(|e| {
+            e.changes.iter().any(|c| {
+                ["kind", "location", "alive"].contains(&c.field.as_str())
+                    && members.contains(c.entity.as_str())
+            })
+        })
+        .count();
+    candidates <= SMALL
+}
+
 /// CCR-WP1.6-5: the `NAMESPACE_HISTORY_LIMIT` count that full replay makes
 /// when `events[new]` is committed, for a successor commit (which derives
 /// no record and so never counted before). Counts the competing cuts of
@@ -1638,8 +1729,12 @@ pub(super) fn successor_may_add_cuts(events: &[Event], new: usize) -> bool {
 /// Every other cone of the branch is a cone of the history without the
 /// event, with the same relevant events (`successor_may_add_cuts`), whose
 /// count the accepted history already bounds. Pure; only the counting, no
-/// cut is projected.
+/// cut is projected, and nothing at all when a bound shows every count is
+/// within the limit (`successor_cones_are_small`).
 pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -> Result<()> {
+    if successor_cones_are_small(events, new) {
+        return Ok(());
+    }
     let locations = Locations::new(events);
     locations.first_error()?;
     let graph = ConeGraph::new(events, &locations, new);
@@ -5231,6 +5326,7 @@ current {current:#?}"
         let mut flagged = 0;
         let mut unflagged_cones = 0;
         let mut refusals = 0;
+        let mut small = 0;
         for seed in 0..160u64 {
             let mut rng = StdRng::seed_from_u64(9000 + seed);
             let events = match seed % 3 {
@@ -5256,6 +5352,15 @@ current {current:#?}"
                 new.push(successor_shaped(old, &events[k]));
                 let full = NsContext::new(BRANCH, &new).full();
                 let check = check_successor_cuts(BRANCH, &new, k);
+                if successor_cones_are_small(&new, k) {
+                    small += 1;
+                    assert!(
+                        !full
+                            .as_ref()
+                            .is_err_and(|e| format!("{e:#}").contains("NAMESPACE_HISTORY_LIMIT")),
+                        "seed {seed} k {k}: a small cone was refused"
+                    );
+                }
                 let limit =
                     |e: &anyhow::Error| format!("{e:#}").contains("NAMESPACE_HISTORY_LIMIT");
                 match (&full, &check) {
@@ -5312,7 +5417,7 @@ current {current:#?}"
             }
         }
         println!(
-            "{compared} compared, {flagged} flagged, {unflagged_cones} unflagged cones, {refusals} refusals"
+            "{compared} compared, {flagged} flagged, {unflagged_cones} unflagged cones, {refusals} refusals, {small} small"
         );
         assert!(
             compared > 1000 && flagged > 200 && unflagged_cones > 1000,
