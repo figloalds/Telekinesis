@@ -497,53 +497,93 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
 
 #[test]
 fn unavailable_worker_does_not_fail_remote_discovery_and_reports_its_error() {
-    let a = Node::new();
+    let mut a = Node::new();
     let b = Node::new();
+    // Keep A's peer endpoint across the daemon restarts below.
+    a.config.network.listen = Some(a.endpoint().trim_start_matches("ws://").into());
+    fs::write(
+        a.root.path().join("orchestrator.toml"),
+        toml::to_string(&a.config).unwrap(),
+    )
+    .unwrap();
     let unavailable = a.create("A unavailable", true);
     let healthy = a.create("Z healthy", true);
     b.pair(&a, &a.code());
-    let path = Path::new(unavailable["directory"].as_str().unwrap()).join("runtime.json");
-    let original = fs::read(&path).unwrap();
-    let mut discovery = info(&unavailable);
-    discovery.address = "ws://127.0.0.1:0".into();
-    fs::write(&path, serde_json::to_vec(&discovery).unwrap()).unwrap();
-    let result = b.try_call(Action::RemoteList {
-        endpoint: a.endpoint(),
-    });
-    let inspected = a.call(Action::Inspect {
-        state: unavailable["state"].as_str().unwrap().into(),
-    });
-    fs::write(&path, original).unwrap();
-    let published = result.unwrap();
-    assert!(
+    // Published entries come from each folder's controller (its
+    // `published-summary` on Ready), so a `runtime.json` redirect no longer
+    // reaches them (WP2.1): the worker fails that call instead. The daemon
+    // restarts with the fault armed for one folder (workers inherit its
+    // environment), and that folder is restarted.
+    let state = unavailable["state"].as_str().unwrap().to_owned();
+    fn restart(node: &mut Node, state: &str, fault: bool) {
+        node.stop();
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(node.root.path().join("daemon.log"))
+            .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tkfs"));
+        command
+            .arg("-f")
+            .arg(node.root.path().join("orchestrator.toml"))
+            .arg("orchestrator")
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log);
+        if fault {
+            command
+                .env("TKFS_FAULT_POINT", "worker.rpc.published-summary")
+                .env("TKFS_FAULT_ACTION", "fail")
+                .env("TKFS_FAULT_SCOPE", state);
+        }
+        node.child = Some(command.spawn().unwrap());
+        wait_for(|| node.try_call(Action::List).is_ok());
+        node.call(Action::Stop {
+            state: state.into(),
+            wait: None,
+        });
+        node.call(Action::Start {
+            state: state.into(),
+        });
+    }
+    let inspect = |node: &Node| {
+        node.call(Action::Inspect {
+            state: state.clone(),
+        })
+    };
+    let listed = |published: &Value, folder: &Value| {
         published
             .as_array()
             .unwrap()
             .iter()
-            .any(|p| p["repo"] == healthy["repo"])
-    );
+            .any(|p| p["repo"] == folder["repo"])
+    };
+    restart(&mut a, &state, true);
+    wait_for(|| {
+        inspect(&a)["publication_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("PUBLISHED_SUMMARY_FAILED"))
+    });
+    let mut published = Value::Null;
+    wait_for(|| {
+        published = b.call(Action::RemoteList {
+            endpoint: a.endpoint(),
+        });
+        listed(&published, &healthy)
+    });
+    assert!(!listed(&published, &unavailable), "{published}");
     assert!(
-        !published
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|p| p["repo"] == unavailable["repo"])
-    );
-    assert!(
-        inspected["publication_error"]
+        inspect(&a)["publication_error"]
             .as_str()
             .unwrap()
             .contains("PUBLISHED_SUMMARY_FAILED")
     );
+    restart(&mut a, &state, false);
     wait_for(|| {
         let published = b.call(Action::RemoteList {
             endpoint: a.endpoint(),
         });
-        published.as_array().unwrap().len() == 2
-            && a.call(Action::Inspect {
-                state: unavailable["state"].as_str().unwrap().into(),
-            })["publication_error"]
-                .is_null()
+        published.as_array().unwrap().len() == 2 && inspect(&a)["publication_error"].is_null()
     });
 }
 
@@ -676,8 +716,8 @@ fn large_pages_resume_after_daemon_crash_and_server_restart_keeps_its_verifier()
     let mut child = b.child.take().unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
-    // The surviving worker still holds its state. Startup must stop/restart
-    // that exact worker and recover the persistent outbound pool.
+    // The surviving worker still holds its state. Startup must adopt that
+    // exact worker and recover the persistent outbound pool.
     b.start();
     wait_for(|| has(&pb, "large.bin", &bytes));
     assert_eq!(

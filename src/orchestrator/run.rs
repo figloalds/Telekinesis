@@ -1,108 +1,535 @@
+//! Owned by WP2.1 (WP1.12 in Wave 1).
+//!
+//! The daemon's main loop (REVAMP_PLAN §2.5, §3.5, §3.6, §14 WP2.1 task 2),
+//! with no global lock and no polling loop:
+//!
+//! * `control-accept` blocks in `accept` on the loopback control listener and
+//!   gives each connection its own thread (at most
+//!   `limits::MAX_CONTROL_CONNECTIONS`): a persistent `receive → manage →
+//!   reply` loop. A request that does not parse is answered
+//!   (`INVALID_REQUEST`) and the connection stays usable.
+//! * `net-accept` blocks in `accept` on the peer listener and hands each
+//!   connection to `LegacyBridge::serve_inbound` on its own thread (at most
+//!   `limits::MAX_SESSIONS` at once; extra connections are closed at once).
+//! * `orchestrator.json` (`{format:3, pid, version, installation, control,
+//!   network, started_at_ms}`) is written atomically and removed by a drop
+//!   guard.
+//! * The main thread waits on `ctx.shutdown`. The `Shutdown` action runs the
+//!   sequence (`shutdown::run`) on its control thread, flushes the reply, then
+//!   cancels `ctx.shutdown`; a signal cancels it directly and the main thread
+//!   runs the sequence. Either way the main thread then stops accepting, lets
+//!   requests in flight finish, closes the control connections and joins
+//!   their threads (2 s), and removes `orchestrator.json`.
+//!
+//! On Windows the daemon first makes its own standard handles
+//! non-inheritable (CCR-WP1.INT-1): a worker it spawns must not inherit the
+//! pipe or file its parent gave the daemon (a reader waiting for the end of
+//! that pipe would wait for every worker).
 use super::{
-    api::manage,
+    api::Action,
     config::Config,
-    lanes::{link_key, run_lane},
-    peering::serve_peer,
-    supervisor::Supervisor,
+    ctx::{self, Daemon},
+    legacy_bridge::LegacyBridge,
+    manage::manage,
+    shutdown,
 };
 use crate::{
-    util::{lock::lock, log::event},
+    model::orchestrator::{Ctx, limits},
+    util::{lock::Tracked, log::event, notify::Notify},
     ws,
 };
-use anyhow::Result;
-use serde_json::json;
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
-    net::TcpListener,
-    sync::{Arc, Mutex, atomic::Ordering},
+    io::Write,
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
-/// Supervision cadence: worker exits and Ready lines are noticed within this,
-/// and backed-off restarts (1 s → 60 s) run when due (WP1.12).
-const RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
+/// `orchestrator.json` format written by this build.
+pub const DISCOVERY_FORMAT: u32 = 3;
+/// A persistent control connection idle this long is closed.
+pub const CONTROL_IDLE: Duration = Duration::from_secs(300);
 
+/// Runs the daemon until a `Shutdown` action or a signal (§3.6).
 pub fn run(config: Config) -> Result<()> {
-    let supervisor = Supervisor::open(config)?;
-    let stop = supervisor.stopping.clone();
-    let control = TcpListener::bind("127.0.0.1:0")?;
-    control.set_nonblocking(true)?;
-    let network = supervisor
-        .config
-        .network
-        .listen
-        .as_ref()
-        .map(TcpListener::bind)
-        .transpose()?;
-    if let Some(listener) = &network {
-        listener.set_nonblocking(true)?;
+    #[cfg(windows)]
+    keep_inherited_handles_private();
+    serve(ctx::build(config)?)
+}
+
+/// Serves a built daemon until it shuts down (the body of [`run`]), with
+/// the signal handlers installed.
+pub fn serve(daemon: Daemon) -> Result<()> {
+    serve_with(daemon, true)
+}
+
+/// [`serve`]; `signals: false` leaves the process's signal handling alone
+/// (tests run daemons in-process, and Ctrl-C must still end the test run).
+pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
+    let Daemon {
+        ctx,
+        control,
+        network,
+        bridge,
+        catalog,
+        ..
+    } = daemon;
+    if signals {
+        shutdown::install(&ctx);
     }
-    let discovery = json!({"format":2,"installation":supervisor.installation,"control":format!("ws://{}",control.local_addr()?),"network":network.as_ref().map(|l|l.local_addr().map(|a|format!("ws://{a}"))).transpose()?});
-    let discovery_path = supervisor.config.data_directory.join("orchestrator.json");
-    fs::write(&discovery_path, serde_json::to_vec_pretty(&discovery)?)?;
-    let shared = Arc::new(Mutex::new(supervisor));
-    println!("{discovery}");
-    let mut lanes = BTreeMap::<String, std::thread::JoinHandle<()>>::new();
-    let mut controls = Vec::new();
-    let mut reconcile = Instant::now();
-    // The last peer list read from the catalog. A failed read keeps it: one
-    // SQLite error must not end the daemon and orphan its workers.
-    let mut peers = Vec::new();
-    while !stop.load(Ordering::Relaxed) {
-        if let Ok((stream, _)) = control.accept() {
-            let shared = shared.clone();
-            controls.push(std::thread::spawn(move || {
-                let _ = (|| -> Result<()> {
-                    let mut socket = ws::accept(stream)?;
-                    let action = ws::receive(&mut socket)?;
-                    ws::reply(&mut socket, manage(&shared, action))
-                })();
-            }));
+    let endpoints = ctx.endpoints.load();
+    let discovery = json!({
+        "format": DISCOVERY_FORMAT,
+        "pid": std::process::id(),
+        "version": crate::worker::version(),
+        "installation": ctx.installation,
+        "control": endpoints.control,
+        "network": endpoints.network,
+        "started_at_ms": ctx.started_at_ms,
+    });
+    let file = DiscoveryFile::write(
+        &ctx.config.data_directory.join("orchestrator.json"),
+        &discovery,
+    )?;
+    // A closed stdout (a launcher that went away) must not end the daemon.
+    let _ = writeln!(std::io::stdout(), "{discovery}");
+    let controls = ControlServer::start(ctx.clone(), control)?;
+    let inbound = network
+        .map(|listener| InboundServer::start(bridge.clone(), listener))
+        .transpose()?;
+    ctx.shutdown.wait();
+    // The signal path runs the sequence here; after the Shutdown action this
+    // returns the result it already has.
+    let _ = shutdown::run(&ctx, limits::SHUTDOWN_FOLDERS);
+    if let Some(inbound) = inbound {
+        inbound.stop();
+    }
+    controls.stop(limits::SHUTDOWN_CONTROL_JOIN);
+    catalog.close_within(Duration::from_secs(1));
+    drop(file);
+    shutdown::completed();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// orchestrator.json
+
+/// `orchestrator.json`, removed when dropped.
+struct DiscoveryFile(PathBuf);
+
+impl DiscoveryFile {
+    /// Writes `value` atomically (a temporary file, then a rename).
+    fn write(path: &Path, value: &Value) -> Result<Self> {
+        let temporary = path.with_extension("json.tmp");
+        fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
+        fs::rename(&temporary, path)?;
+        Ok(Self(path.to_owned()))
+    }
+}
+
+impl Drop for DiscoveryFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Accept loops
+
+/// Stops a blocking accept loop: sets its flag and wakes `accept` with a
+/// connection of its own.
+fn wake_accept(stop: &AtomicBool, address: SocketAddr) {
+    stop.store(true, Ordering::Release);
+    let _ = TcpStream::connect_timeout(&address, Duration::from_secs(1));
+}
+
+/// Pause after an accept error (for example a full descriptor table), so a
+/// persistent error cannot spin.
+const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
+
+/// One control connection: its socket (to close it at shutdown) and whether
+/// it is handling a request.
+struct Connection {
+    killer: Option<TcpStream>,
+    busy: Arc<AtomicBool>,
+}
+
+/// The control listener and its connections.
+struct ControlServer {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    connections: Arc<Connections>,
+    accept: Option<thread::JoinHandle<()>>,
+}
+
+struct Connections {
+    next: AtomicU64,
+    live: Tracked<BTreeMap<u64, Connection>>,
+    ended: Notify,
+}
+
+impl Connections {
+    fn new() -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            live: Tracked::new("control.connections", BTreeMap::new()),
+            ended: Notify::new(),
         }
-        if let Some(listener) = &network
-            && let Ok((stream, _)) = listener.accept()
-        {
-            let shared = shared.clone();
-            std::thread::spawn(move || {
-                let _ = serve_peer(shared, stream);
+    }
+
+    fn count(&self) -> usize {
+        self.live.lock().len()
+    }
+
+    fn remove(&self, id: u64) {
+        self.live.lock().remove(&id);
+        self.ended.poke();
+    }
+
+    /// Waits until `done(&live)` holds or `deadline` passes.
+    fn wait(&self, deadline: Instant, done: impl Fn(&BTreeMap<u64, Connection>) -> bool) -> bool {
+        loop {
+            let seen = self.ended.count();
+            if done(&self.live.lock()) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            // Busy flags change without a poke: re-check at least every 20 ms.
+            self.ended
+                .wait(seen, remaining.min(Duration::from_millis(20)));
+        }
+    }
+}
+
+impl ControlServer {
+    fn start(ctx: Arc<Ctx>, listener: TcpListener) -> Result<Self> {
+        let address = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(Connections::new());
+        let accept = {
+            let (stop, connections) = (stop.clone(), connections.clone());
+            thread::Builder::new()
+                .name("control-accept".into())
+                .spawn(move || accept_control(ctx, listener, stop, connections))?
+        };
+        Ok(Self {
+            address,
+            stop,
+            connections,
+            accept: Some(accept),
+        })
+    }
+
+    /// Stops accepting, lets requests in flight finish (half the budget),
+    /// closes every connection and waits for their threads (the rest).
+    fn stop(mut self, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        wake_accept(&self.stop, self.address);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+        let settle = Instant::now() + budget / 2;
+        self.connections.wait(settle, |live| {
+            live.values().all(|c| !c.busy.load(Ordering::Acquire))
+        });
+        let killers: Vec<TcpStream> = self
+            .connections
+            .live
+            .lock()
+            .values_mut()
+            .filter_map(|connection| connection.killer.take())
+            .collect();
+        for killer in killers {
+            let _ = killer.shutdown(Shutdown::Both);
+        }
+        if !self.connections.wait(deadline, BTreeMap::is_empty) {
+            event!(warn, REQUEST_TIMEOUT, {
+                "detail": "control connections still open at the join deadline",
+                "connections": self.connections.count(),
             });
         }
-        if Instant::now() >= reconcile {
-            let mut s = lock(&shared);
-            if let Err(error) = s.reconcile() {
-                eprintln!("worker reconcile: {error:#}");
-            }
-            reconcile = s.next_reconcile(Instant::now() + RECONCILE_INTERVAL);
+    }
+}
+
+fn accept_control(
+    ctx: Arc<Ctx>,
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    connections: Arc<Connections>,
+) {
+    for stream in listener.incoming() {
+        if stop.load(Ordering::Acquire) {
+            return;
         }
-        let current = lock(&shared).peers();
-        match current {
-            Ok(current) => peers = current,
+        let stream = match stream {
+            Ok(stream) => stream,
             Err(error) => {
-                event!(warn, "CATALOG_UNAVAILABLE", {
-                    "error": format!("{error:#}"),
-                    "kept_peers": peers.len(),
+                event!(warn, WS_CONNECT_FAILED, {
+                    "detail": "control accept failed",
+                    "error": error.to_string(),
                 });
+                thread::sleep(ACCEPT_ERROR_PAUSE);
+                continue;
+            }
+        };
+        if connections.count() >= limits::MAX_CONTROL_CONNECTIONS {
+            event!(warn, BUSY, {
+                "detail": "control connection refused: too many open connections",
+                "limit": limits::MAX_CONTROL_CONNECTIONS,
+            });
+            continue;
+        }
+        let id = connections.next.fetch_add(1, Ordering::Relaxed);
+        let busy = Arc::new(AtomicBool::new(false));
+        connections.live.lock().insert(
+            id,
+            Connection {
+                killer: stream.try_clone().ok(),
+                busy: busy.clone(),
+            },
+        );
+        let spawned = {
+            let (ctx, connections) = (ctx.clone(), connections.clone());
+            thread::Builder::new()
+                .name(format!("control-conn-{id}"))
+                .spawn(move || {
+                    serve_control(&ctx, stream, &busy);
+                    connections.remove(id);
+                })
+        };
+        if let Err(error) = spawned {
+            connections.remove(id);
+            event!(warn, BUSY, {
+                "detail": "cannot start a control connection thread",
+                "error": error.to_string(),
+            });
+        }
+    }
+}
+
+/// A persistent control connection: requests are answered in order until
+/// the client goes away, the connection idles for [`CONTROL_IDLE`], or it
+/// asked for Shutdown (answered, then the daemon's shutdown is signalled).
+fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, busy: &AtomicBool) {
+    let Ok(mut socket) = ws::accept(stream) else {
+        return;
+    };
+    if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {
+        let _ = tcp.set_read_timeout(Some(CONTROL_IDLE));
+    }
+    loop {
+        let Ok(raw) = ws::receive::<Value>(&mut socket) else {
+            return;
+        };
+        busy.store(true, Ordering::Release);
+        let parsed = serde_json::from_value::<Action>(raw);
+        let shutdown = matches!(parsed, Ok(Action::Shutdown));
+        let result = match parsed {
+            Ok(action) => catch_unwind(AssertUnwindSafe(|| manage(ctx, action)))
+                .unwrap_or_else(|_| Err(anyhow!("UNKNOWN_ERROR: the request handler panicked"))),
+            Err(error) => Err(anyhow!("INVALID_REQUEST: {error}")),
+        };
+        let accepted = result.is_ok();
+        let sent = ws::reply(&mut socket, result);
+        busy.store(false, Ordering::Release);
+        if shutdown && accepted {
+            // The reply is flushed: now the main thread may finish (§3.6 4–6).
+            ctx.shutdown.cancel();
+            return;
+        }
+        if sent.is_err() {
+            return;
+        }
+    }
+}
+
+/// The peer listener: one thread per inbound legacy connection.
+struct InboundServer {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    accept: Option<thread::JoinHandle<()>>,
+}
+
+impl InboundServer {
+    fn start(bridge: Arc<LegacyBridge>, listener: TcpListener) -> Result<Self> {
+        let address = listener.local_addr()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept = {
+            let stop = stop.clone();
+            thread::Builder::new()
+                .name("net-accept".into())
+                .spawn(move || accept_inbound(bridge, listener, stop))?
+        };
+        Ok(Self {
+            address,
+            stop,
+            accept: Some(accept),
+        })
+    }
+
+    fn stop(mut self) {
+        wake_accept(&self.stop, self.address);
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
+    }
+}
+
+fn accept_inbound(bridge: Arc<LegacyBridge>, listener: TcpListener, stop: Arc<AtomicBool>) {
+    let mut next = 0u64;
+    for stream in listener.incoming() {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                event!(warn, WS_CONNECT_FAILED, {
+                    "detail": "peer accept failed",
+                    "error": error.to_string(),
+                });
+                thread::sleep(ACCEPT_ERROR_PAUSE);
+                continue;
+            }
+        };
+        if bridge.inbound_sessions() >= limits::MAX_SESSIONS {
+            event!(warn, BUSY, {
+                "detail": "peer connection refused: too many sessions",
+                "limit": limits::MAX_SESSIONS,
+            });
+            continue;
+        }
+        next += 1;
+        let bridge = bridge.clone();
+        let spawned = thread::Builder::new()
+            .name(format!("net-conn-{next}"))
+            .spawn(move || bridge.serve_inbound(stream));
+        if let Err(error) = spawned {
+            event!(warn, BUSY, {
+                "detail": "cannot start a peer connection thread",
+                "error": error.to_string(),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows: standard handles (CCR-WP1.INT-1)
+
+/// Marks every handle the daemon inherited non-inheritable, its standard
+/// handles first. `Command::spawn` creates processes with
+/// `bInheritHandles = TRUE`, so every inheritable handle of the daemon would
+/// reach its workers: the standard handles its parent gave it (a pipe from a
+/// shell or CI runner, CCR-WP1.INT-1), and any other inheritable handle of
+/// that parent (inherited by value into this process). This runs first in
+/// `run`, before the daemon starts any process, when every inheritable
+/// handle in the table came from the parent (`std` creates its own handles
+/// non-inheritable). The explicit worker stdio (null, a pipe, `worker.log`)
+/// is duplicated as inheritable by `std` at each spawn and is not affected.
+#[cfg(windows)]
+fn keep_inherited_handles_private() {
+    type Handle = *mut core::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(which: u32) -> Handle;
+        fn GetCurrentProcess() -> Handle;
+        fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryInformationProcess(
+            process: Handle,
+            class: u32,
+            information: *mut core::ffi::c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
+    }
+    /// `PROCESS_HANDLE_TABLE_ENTRY_INFO` (ntpsapi.h).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Entry {
+        handle: Handle,
+        handle_count: usize,
+        pointer_count: usize,
+        granted_access: u32,
+        object_type_index: u32,
+        attributes: u32,
+        reserved: u32,
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    /// `ProcessHandleInformation` (Windows 8 and later).
+    const PROCESS_HANDLE_INFORMATION: u32 = 51;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
+    const OBJ_INHERIT: u32 = 0x2;
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: plain Win32 calls on this process's own standard handles;
+        // a missing or invalid handle is skipped.
+        unsafe {
+            let handle = GetStdHandle(which);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
             }
         }
-        for peer in &peers {
-            for lane in 0..peer.pool_size() {
-                let key = link_key(peer, lane);
-                lanes.entry(key).or_insert_with(|| {
-                    let shared = shared.clone();
-                    let peer = peer.clone();
-                    std::thread::spawn(move || run_lane(shared, peer, lane))
-                });
+    }
+    // Every other inheritable handle of the table. A failed query leaves
+    // them as they are (the standard handles are done).
+    let mut buffer = vec![0u8; 64 * 1024];
+    for _ in 0..4 {
+        let mut needed = 0u32;
+        // SAFETY: the buffer is valid for `len` bytes; the call writes at
+        // most that many and reports the size it needs.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                GetCurrentProcess(),
+                PROCESS_HANDLE_INFORMATION,
+                buffer.as_mut_ptr().cast(),
+                u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                &mut needed,
+            )
+        };
+        if status == STATUS_INFO_LENGTH_MISMATCH {
+            let next = (needed as usize).max(buffer.len() * 2);
+            buffer.resize(next + 4096, 0);
+            continue;
+        }
+        if status < 0 {
+            return;
+        }
+        let header = 2 * std::mem::size_of::<usize>();
+        let entry = std::mem::size_of::<Entry>();
+        // SAFETY: the first field is the entry count; unaligned reads of a
+        // byte buffer the kernel filled.
+        let count = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<usize>()) };
+        let available = buffer.len().saturating_sub(header) / entry;
+        for index in 0..count.min(available) {
+            // SAFETY: `index < available` keeps the read inside the buffer.
+            let entry: Entry = unsafe {
+                std::ptr::read_unaligned(buffer.as_ptr().add(header + index * entry).cast())
+            };
+            if entry.attributes & OBJ_INHERIT != 0 {
+                // SAFETY: a handle value of this process's own table.
+                unsafe {
+                    SetHandleInformation(entry.handle, HANDLE_FLAG_INHERIT, 0);
+                }
             }
         }
-        lanes.retain(|_, handle| !handle.is_finished());
-        controls.retain(|handle| !handle.is_finished());
-        std::thread::sleep(Duration::from_millis(10));
+        return;
     }
-    // Finish the shutdown response before the executable exits.
-    for handle in controls {
-        let _ = handle.join();
-    }
-    let _ = fs::remove_file(discovery_path);
-    Ok(())
 }

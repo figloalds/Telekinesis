@@ -1,11 +1,16 @@
 //! Folder lifecycle and networking belong to one daemon. Workers never dial peers.
 mod api;
+// The legacy `Supervisor` and its catalog SQL stay compiled, and reachable
+// through the legacy `api::manage`, but the daemon no longer runs them
+// (REVAMP_PLAN §14 WP2.1 task 6); WP2.INT deletes both files.
+#[allow(dead_code)]
 mod catalog_db;
 mod config;
 mod lanes;
 mod peering;
 mod run;
 mod status;
+#[allow(dead_code)]
 mod supervisor;
 
 // Seam modules landed by WP0.INT (REVAMP_PLAN §14 WP0.INT); each file names
@@ -34,7 +39,7 @@ pub mod worker_client;
 
 pub use api::{Action, Project, client, manage};
 pub use config::{Config, Network};
-pub use run::run;
+pub use run::{run, serve, serve_with};
 pub use supervisor::{Shared, Supervisor};
 
 #[cfg(unix)]
