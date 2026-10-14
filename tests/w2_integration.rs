@@ -164,11 +164,15 @@ fn attach_after_fixing_the_mount_path_keeps_the_worker() {
         a.try_inspect(&state).is_ok_and(|p| p["mounted"] == true)
     });
     assert_eq!(worker_pid(&a, &state), Some(pid), "attached in place");
-    assert_eq!(
-        folder_status(&a, &state).unwrap()["mount"]["state"]
-            .to_string()
-            .contains("attached"),
-        true
+    a.wait_for(
+        "status shows the mount attached",
+        Duration::from_secs(5),
+        || {
+            folder_status(&a, &state).is_some_and(|folder| {
+                let mount = folder["mount"]["state"].to_string();
+                mount.contains("attached") && !mount.contains("attach_failed")
+            })
+        },
     );
     // The mount serves the folder's content.
     assert!(wait_until(Duration::from_secs(10), || fs::read(
