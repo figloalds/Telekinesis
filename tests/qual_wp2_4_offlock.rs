@@ -514,17 +514,28 @@ fn stale_convergence_worker() {
         return;
     }
     let stop = Arc::new(AtomicBool::new(false));
+    // WP2.INT: the bursty writer of `stale_convergence` (WP2.4 deviation 7):
+    // a write every 100 ms for 0.5 s, then 1 s without. A writer that
+    // commits every 50 ms for the whole run makes every prepared ticket
+    // Stale (§4.4: never committed inline), so the slow events starve by
+    // design; with WP2.3's activator merged this scenario now runs instead
+    // of skipping.
     let writer = {
         let (stop, state) = (stop.clone(), d.b_state.clone());
         thread::spawn(move || {
             let mut i = 0;
+            let started = Instant::now();
             while !stop.load(Ordering::Relaxed) {
+                if !(started.elapsed().as_millis() / 500).is_multiple_of(3) {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
                 let _ = rpc_at(
                     &state,
                     json!({"op":"import","path":format!("local-{i:04}.txt"),"hex":hex::encode(format!("{i}"))}),
                 );
                 i += 1;
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(100));
             }
             i
         })
