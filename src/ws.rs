@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
-    net::{TcpStream, ToSocketAddrs},
-    time::Duration,
+    net::{SocketAddr, TcpStream, ToSocketAddrs},
+    time::{Duration, Instant},
 };
 use tungstenite::{
     Connector, Message, WebSocket, client::IntoClientRequest, protocol::WebSocketConfig,
@@ -185,6 +185,206 @@ pub fn accept(stream: TcpStream) -> Result<Socket> {
     ))
 }
 
+/// A raw WebSocket over TCP or TLS, as the v3 session layer (`session`) uses
+/// it: binary frames, no JSON codec.
+pub type RawSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// Dials `endpoint` with extra upgrade `headers` (for example
+/// `X-Tkfs-Sync: 3`) and returns the raw WebSocket together with the server's
+/// upgrade response, so the caller can check what the server echoed.
+///
+/// Every resolved address is tried in turn, and `timeout` is the budget of
+/// one address's whole attempt: the TCP connect plus the TLS and WebSocket
+/// upgrade share it (the upgrade gets what the connect left, as its socket
+/// read/write timeouts and as a watchdog deadline that shuts down the socket
+/// of a server trickling its response). The first address whose upgrade
+/// succeeds wins. The returned socket keeps those socket timeouts (at most
+/// `timeout`) and the default 64 MiB message bound; callers set their own.
+/// `timeout` must be non-zero. Unlike [`connect`], no `X-Tkfs-Wire` codec is
+/// offered. An attempt whose watchdog cannot be started fails rather than
+/// run unbounded.
+///
+/// Errors carry `WS_CONNECT_FAILED` (or `INVALID_WS_ENDPOINT` and friends for
+/// a malformed endpoint); the last address's `tungstenite::Error` stays in the
+/// chain, so a caller can tell an HTTP refusal (`Error::Http`) apart.
+pub fn connect_with(
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    connector: Option<Connector>,
+    timeout: Duration,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    let uri = endpoint_uri(endpoint)?;
+    let host = uri
+        .host()
+        .context("WS_HOST_REQUIRED")?
+        .trim_matches(['[', ']'])
+        .to_owned();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") {
+            443
+        } else {
+            80
+        });
+    let mut request = endpoint.into_client_request()?;
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                .context("INVALID_REQUEST: upgrade header name")?,
+            tungstenite::http::HeaderValue::from_str(value)
+                .context("INVALID_REQUEST: upgrade header value")?,
+        );
+    }
+    let addresses: Vec<SocketAddr> = (host.as_str(), port)
+        .to_socket_addrs()
+        .with_context(|| format!("WS_CONNECT_FAILED: cannot resolve {host}"))?
+        .collect();
+    connect_any(&host, &addresses, &request, connector, timeout)
+}
+
+/// [`connect_with`] over already-resolved `addresses`, in order.
+fn connect_any(
+    host: &str,
+    addresses: &[SocketAddr],
+    request: &tungstenite::handshake::client::Request,
+    connector: Option<Connector>,
+    timeout: Duration,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    let mut connector = connector;
+    let mut last = None;
+    for (index, address) in addresses.iter().enumerate() {
+        let last_address = index + 1 == addresses.len();
+        // A connector that cannot be copied is used once (never silently
+        // replaced by the default trust store on a later address).
+        let (attempt, final_attempt) = match connector.as_ref().map(clone_connector) {
+            None => (None, last_address),
+            Some(Some(copy)) if !last_address => (Some(copy), false),
+            Some(_) => (connector.take(), true),
+        };
+        match connect_one(*address, request, attempt, timeout) {
+            Ok(connected) => return Ok(connected),
+            Err(error) => last = Some(error.context(format!("WS_CONNECT_FAILED: {address}"))),
+        }
+        if final_attempt {
+            break;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("WS_CONNECT_FAILED: {host} resolved to no address")))
+}
+
+fn clone_connector(connector: &Connector) -> Option<Connector> {
+    match connector {
+        Connector::Plain => Some(Connector::Plain),
+        Connector::NativeTls(tls) => Some(Connector::NativeTls(tls.clone())),
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+fn connect_one(
+    address: SocketAddr,
+    request: &tungstenite::handshake::client::Request,
+    connector: Option<Connector>,
+    timeout: Duration,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    // One deadline for the whole attempt: the upgrade gets what the TCP
+    // connect left of `timeout`.
+    let deadline = Instant::now() + timeout;
+    let stream = TcpStream::connect_timeout(&address, timeout)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(upgrade_timed_out().into());
+    }
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(Some(remaining))?;
+    stream.set_write_timeout(Some(remaining))?;
+    // The socket timeouts bound each read; the watchdog bounds the whole TLS
+    // and WebSocket upgrade, so a server trickling its response cannot hold
+    // the dialer. No watchdog, no attempt.
+    let watchdog =
+        watchdog::Watchdog::start(&stream).context("websocket upgrade watchdog could not start")?;
+    watchdog.arm(remaining);
+    let result =
+        tungstenite::client_tls_with_config(request.clone(), stream, Some(config()), connector);
+    watchdog.disarm();
+    let fired = watchdog.fired();
+    match result {
+        // The watchdog shut the socket down: even a completed upgrade is
+        // unusable.
+        Ok(_) if fired => Err(upgrade_timed_out().into()),
+        Ok(connected) => Ok(connected),
+        Err(error) if fired => {
+            Err(anyhow::Error::new(handshake_failure(error)).context("websocket upgrade timed out"))
+        }
+        Err(error) => Err(anyhow::Error::new(handshake_failure(error))),
+    }
+}
+
+fn upgrade_timed_out() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::TimedOut, "websocket upgrade timed out")
+}
+
+/// A blocking handshake that stopped on `WouldBlock` timed out (Unix reports
+/// a read timeout as `WouldBlock`, Windows as `TimedOut`).
+fn handshake_failure<R: tungstenite::handshake::HandshakeRole>(
+    error: tungstenite::HandshakeError<R>,
+) -> tungstenite::Error {
+    match error {
+        tungstenite::HandshakeError::Failure(error) => error,
+        tungstenite::HandshakeError::Interrupted(_) => tungstenite::Error::Io(upgrade_timed_out()),
+    }
+}
+
+/// Accepts a WebSocket upgrade on `stream` with every incoming message (and
+/// frame) bounded by `max_message` bytes.
+///
+/// `on_request` sees the upgrade request and may add response headers (for
+/// example the `X-Tkfs-Sync` echo). Setting a status other than
+/// `101 Switching Protocols` on the response refuses the upgrade: that status
+/// is sent with no headers and an error is returned.
+///
+/// The stream is switched to blocking mode with `TCP_NODELAY`. Socket
+/// timeouts already set by the caller are kept; a stream with none gets the
+/// legacy 15 s, so a silent client cannot hold the upgrade forever.
+#[allow(clippy::result_large_err)]
+pub fn accept_with(
+    stream: TcpStream,
+    max_message: usize,
+    on_request: impl FnOnce(
+        &tungstenite::handshake::server::Request,
+        &mut tungstenite::handshake::server::Response,
+    ),
+) -> Result<RawSocket> {
+    // Windows inherits the listener's nonblocking mode on accepted sockets.
+    stream.set_nonblocking(false)?;
+    stream.set_nodelay(true)?;
+    if stream.read_timeout()?.is_none() {
+        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    }
+    if stream.write_timeout()?.is_none() {
+        stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    }
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(max_message))
+        .max_frame_size(Some(max_message));
+    tungstenite::accept_hdr_with_config(
+        MaybeTlsStream::Plain(stream),
+        move |request: &tungstenite::handshake::server::Request,
+              mut response: tungstenite::handshake::server::Response| {
+            on_request(request, &mut response);
+            if response.status() == tungstenite::http::StatusCode::SWITCHING_PROTOCOLS {
+                Ok(response)
+            } else {
+                let mut refusal = tungstenite::handshake::server::ErrorResponse::new(None);
+                *refusal.status_mut() = response.status();
+                Err(refusal)
+            }
+        },
+        Some(config),
+    )
+    .map_err(|error| anyhow::Error::new(handshake_failure(error)))
+}
+
 pub fn send<T: Serialize>(socket: &mut Socket, value: &T) -> Result<()> {
     if socket.binary {
         let bytes = crate::wire::encode(serde_json::to_value(value)?, MAX_MESSAGE)?;
@@ -250,6 +450,219 @@ pub fn call<T: Serialize>(socket: &mut Socket, request: &T) -> Result<Value> {
             Err(RemoteError(error.to_owned()).into())
         }
         None => bail!("INVALID_WS_REPLY: missing boolean ok"),
+    }
+}
+
+/// A deadline on a whole blocking exchange over one TCP socket (a WebSocket
+/// upgrade, a handshake step). Socket timeouts bound each `read`/`write`
+/// call; a watchdog bounds the whole exchange, so a peer that trickles one
+/// byte at a time cannot hold it open. [`connect_with`] uses it for the
+/// upgrade, and the v3 handshake (`session::handshake`) for every step. It
+/// lives here, in the transport, so the transport never depends on the
+/// session layer.
+pub(crate) mod watchdog {
+    use std::{
+        io,
+        net::{Shutdown, TcpStream},
+        sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+        thread::{self, JoinHandle},
+        time::{Duration, Instant},
+    };
+
+    /// The socket timeouts an expired watchdog leaves: the next blocking call
+    /// on the socket returns at once.
+    const EXPIRED_TIMEOUT: Duration = Duration::from_millis(1);
+
+    /// Ends a blocking exchange that overruns its armed budget: it shrinks
+    /// the socket timeouts and shuts the socket down (through a duplicate
+    /// handle; see [`watchdog_handle`]).
+    pub(crate) struct Watchdog {
+        shared: Arc<(Mutex<Watch>, Condvar)>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    #[derive(Default)]
+    struct Watch {
+        deadline: Option<Instant>,
+        fired: bool,
+        done: bool,
+    }
+
+    fn lock_watch(mutex: &Mutex<Watch>) -> MutexGuard<'_, Watch> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        /// Test hook: makes [`Watchdog::start`] fail on this thread, as a
+        /// failed thread spawn would.
+        pub(crate) static REFUSE_WATCHDOG: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+        /// Test hook: a watchdog started on this thread finds its `shutdown`
+        /// failing when it fires (as a stale Windows duplicate would).
+        pub(crate) static FAIL_SHUTDOWN: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    impl Watchdog {
+        /// Starts a watchdog for `stream`, initially disarmed.
+        ///
+        /// Fails when no verified duplicate handle can be made or the thread
+        /// cannot be spawned. Callers then refuse the connection: without a
+        /// watchdog only the per-call socket timeouts apply, and a peer
+        /// trickling bytes (or fragments) would be bounded by nothing (fail
+        /// closed, invariant 22).
+        pub(crate) fn start(stream: &TcpStream) -> io::Result<Watchdog> {
+            let handle = watchdog_handle(stream)?;
+            #[cfg(test)]
+            if REFUSE_WATCHDOG.with(std::cell::Cell::get) {
+                return Err(io::Error::other("watchdog thread refused (test hook)"));
+            }
+            #[cfg(test)]
+            let shutdown_fails = FAIL_SHUTDOWN.with(std::cell::Cell::get);
+            #[cfg(not(test))]
+            let shutdown_fails = false;
+            let shared = Arc::new((Mutex::new(Watch::default()), Condvar::new()));
+            let watched = shared.clone();
+            let thread = thread::Builder::new()
+                .name("tkfs-handshake-watchdog".into())
+                .spawn(move || watch(&watched, &handle, shutdown_fails))?;
+            Ok(Watchdog {
+                shared,
+                thread: Some(thread),
+            })
+        }
+
+        /// A watchdog with no thread, which never fires (tests of the bounds
+        /// that must hold without one).
+        #[cfg(test)]
+        pub(crate) fn inert() -> Watchdog {
+            Watchdog {
+                shared: Arc::new((Mutex::new(Watch::default()), Condvar::new())),
+                thread: None,
+            }
+        }
+
+        pub(crate) fn arm(&self, budget: Duration) {
+            lock_watch(&self.shared.0).deadline = Some(Instant::now() + budget);
+            self.shared.1.notify_all();
+        }
+
+        /// Once `disarm` returns, [`Watchdog::fired`] no longer changes for
+        /// the budget just disarmed.
+        pub(crate) fn disarm(&self) {
+            lock_watch(&self.shared.0).deadline = None;
+            self.shared.1.notify_all();
+        }
+
+        pub(crate) fn fired(&self) -> bool {
+            lock_watch(&self.shared.0).fired
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            lock_watch(&self.shared.0).done = true;
+            self.shared.1.notify_all();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A duplicate handle the watchdog can shut the socket down with, or an
+    /// error when none can be verified (the caller then refuses the
+    /// connection: fail closed).
+    ///
+    /// On Windows, a duplicate taken right after a non-blocking connect
+    /// (what `TcpStream::connect_timeout` does) can carry a stale "not
+    /// connected" state, and `shutdown` on it then fails with `WSAENOTCONN`,
+    /// so an overrunning exchange would not be interrupted. A stale duplicate
+    /// stays stale (measured: 23 of 3,000 connects gave one, and none of them
+    /// recovered on a second `getpeername` or `shutdown`), but a `getpeername`
+    /// on the original refreshes the state a new duplicate is created from
+    /// (each of those 23 re-duplicated cleanly). So the original is refreshed
+    /// before each clone and the duplicate verified the same way. A duplicate
+    /// that fails verification three times is never used: its `shutdown`
+    /// would fail when it matters. Elsewhere the first clone verifies, unless
+    /// the connection is already gone.
+    fn watchdog_handle(stream: &TcpStream) -> io::Result<TcpStream> {
+        let mut last = None;
+        for _ in 0..3 {
+            let _ = stream.peer_addr();
+            let duplicate = stream.try_clone()?;
+            match duplicate.peer_addr() {
+                Ok(_) => return Ok(duplicate),
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "no verified socket handle for the watchdog: {}",
+                last.map(|error| error.to_string()).unwrap_or_default()
+            ),
+        ))
+    }
+
+    fn watch(shared: &(Mutex<Watch>, Condvar), stream: &TcpStream, shutdown_fails: bool) {
+        let (mutex, condvar) = shared;
+        let mut state = lock_watch(mutex);
+        loop {
+            if state.done {
+                return;
+            }
+            match state.deadline {
+                None => {
+                    state = condvar.wait(state).unwrap_or_else(PoisonError::into_inner);
+                }
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        state.fired = true;
+                        state.deadline = None;
+                        drop(state);
+                        expire(stream, shutdown_fails);
+                        return;
+                    }
+                    state = condvar
+                        .wait_timeout(state, deadline - now)
+                        .map(|(state, _)| state)
+                        .unwrap_or_else(|error| error.into_inner().0);
+                }
+            }
+        }
+    }
+
+    /// Ends the exchange: `shutdown` ends the call in progress and every
+    /// later one.
+    ///
+    /// The socket timeouts are shrunk first, as a second line should
+    /// `shutdown` fail (it is then logged as `WATCHDOG_SHUTDOWN_FAILED`). On
+    /// Unix they belong to the socket, so every later blocking call on the
+    /// owner's handle returns at once and a trickling peer is cut off at its
+    /// next pause. On Windows they belong to the handle (measured: a timeout
+    /// set through a duplicate leaves the original's unchanged), so there the
+    /// bound rests on `shutdown` through the duplicate [`watchdog_handle`]
+    /// verified. The one failure known there is a connection already gone,
+    /// which ends the owner's call by itself.
+    fn expire(stream: &TcpStream, shutdown_fails: bool) {
+        let read = stream.set_read_timeout(Some(EXPIRED_TIMEOUT));
+        let write = stream.set_write_timeout(Some(EXPIRED_TIMEOUT));
+        let shutdown = if shutdown_fails {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "shutdown refused (test hook)",
+            ))
+        } else {
+            stream.shutdown(Shutdown::Both)
+        };
+        if let Err(error) = shutdown {
+            crate::util::log::event!(warn, WATCHDOG_SHUTDOWN_FAILED, {
+                "error": error.to_string(),
+                "timeouts_shrunk": read.is_ok() && write.is_ok(),
+            });
+        }
     }
 }
 
@@ -437,5 +850,85 @@ mod tests {
         }
         assert!(socket.sent_bytes < 16 * 1024 && socket.received_bytes < 16 * 1024);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_with_tries_every_address_in_turn() {
+        // Hosts-independent fallback: a refused address, then a silent one
+        // (it accepts TCP, never answers the upgrade), then a listening one.
+        let refused = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let silent_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent = silent_listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accept_with(stream, 1024, |_, response| {
+                response.headers_mut().insert(
+                    "X-Fallback",
+                    tungstenite::http::HeaderValue::from_static("reached"),
+                );
+            })
+            .map(|_| ())
+        });
+        let request = format!("ws://{open}").into_client_request().unwrap();
+        let budget = Duration::from_millis(800);
+        let started = Instant::now();
+        let (_socket, response) =
+            connect_any("fallback", &[refused, silent, open], &request, None, budget).unwrap();
+        assert_eq!(response.headers()["X-Fallback"], "reached");
+        // The silent address was abandoned once its budget ran out (the
+        // refused one costs at most its own budget).
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= budget - Duration::from_millis(100) && elapsed < Duration::from_secs(10),
+            "connected after {elapsed:?}"
+        );
+        server.join().unwrap().unwrap();
+        drop(silent_listener);
+
+        // Every address refused: WS_CONNECT_FAILED naming the last one tried.
+        let error = connect_any("fallback", &[silent, refused], &request, None, budget)
+            .expect_err("no address accepts");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("WS_CONNECT_FAILED: {refused}")),
+            "{text}"
+        );
+        // No address at all.
+        let error =
+            connect_any("fallback", &[], &request, None, budget).expect_err("nothing to dial");
+        assert!(format!("{error:#}").contains("WS_CONNECT_FAILED"));
+    }
+
+    /// Unix only: Windows still answers `getpeername` on a socket whose
+    /// connection is closed, so this state cannot be built there.
+    #[cfg(unix)]
+    #[test]
+    fn a_watchdog_never_runs_on_an_unverified_handle() {
+        use std::{io::Read, net::Shutdown};
+        // A socket whose connection is fully closed: no duplicate of it
+        // verifies, so no watchdog starts (fail closed) rather than one
+        // whose `shutdown` would fail.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        drop(listener.accept().unwrap().0);
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!((&client).read(&mut [0u8; 4]).unwrap(), 0);
+        client.shutdown(Shutdown::Both).unwrap();
+        let started = Instant::now();
+        while client.peer_addr().is_ok() {
+            assert!(started.elapsed() < Duration::from_secs(5), "never closed");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let error = watchdog::Watchdog::start(&client)
+            .err()
+            .expect("no watchdog on a closed socket");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected, "{error}");
     }
 }
