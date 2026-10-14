@@ -26,7 +26,7 @@ use crate::{
     model::{
         errors::code_of,
         ipc::{FeedApplyRequest, FeedExchangeReply, FeedExchangeRequest, FeedOfferRequest, ops},
-        protocol::feed::FeedApplyResult,
+        protocol::feed::{FeedApplyResult, MetaExchangeReply, MetaExchangeRequest},
     },
     paired_sync::SyncRoute,
     util::{fault, lock::lock},
@@ -88,13 +88,42 @@ pub fn dispatch(ctx: &WorkerCtx, op: &str, payload: &Value) -> Result<Value> {
     }
 }
 
-/// The op's typed request. A payload that does not parse is answered
-/// `UNSUPPORTED_OPERATION` (the answer the Wave 0 stub gave every feed op,
-/// which `tests/worker_lifecycle.rs` still pins for a route-less
-/// `feed-offer`; CCR-WP2.5-1 asks for `INVALID_REQUEST` instead).
+/// The op's typed request; a payload that does not parse is answered with
+/// [`malformed`]'s code.
 fn request<'a, T: Deserialize<'a>>(op: &str, payload: &'a Value) -> Result<T> {
-    T::deserialize(payload)
-        .map_err(|error| anyhow!("UNSUPPORTED_OPERATION: {op}: malformed request: {error}"))
+    T::deserialize(payload).map_err(|error| {
+        anyhow!(
+            "{}: {op}: malformed request: {error}",
+            malformed(op, payload)
+        )
+    })
+}
+
+/// The code of a feed op payload that does not parse:
+/// - `UNSUPPORTED_OPERATION` for a `feed-offer` whose `route` does not parse,
+///   the answer the Wave 0 stub gave, which `tests/worker_lifecycle.rs` still
+///   pins (CCR-WP2.5-1 asks for `INVALID_REQUEST`); nothing else gets it, so
+///   it never stands for a peer's malformed message;
+/// - `PROTOCOL_VIOLATION` when only the peer's message does not parse (the
+///   `request` of `feed-exchange`, the `reply` of `feed-apply`);
+/// - `INVALID_REQUEST` otherwise (the orchestrator's own members).
+fn malformed(op: &str, payload: &Value) -> &'static str {
+    // Whether member `key` is present and `check` holds for it.
+    let member = |key: &str, check: fn(&Value) -> bool| payload.get(key).is_some_and(check);
+    let route = member("route", |v| SyncRoute::deserialize(v).is_ok());
+    let peer_message_bad = match op {
+        ops::FEED_EXCHANGE => member("request", |v| MetaExchangeRequest::deserialize(v).is_err()),
+        ops::FEED_APPLY => {
+            member("request_id", Value::is_string)
+                && member("reply", |v| MetaExchangeReply::deserialize(v).is_err())
+        }
+        _ => false,
+    };
+    match op {
+        ops::FEED_OFFER if !route => "UNSUPPORTED_OPERATION",
+        _ if route && peer_message_bad => "PROTOCOL_VIOLATION",
+        _ => "INVALID_REQUEST",
+    }
 }
 
 /// The route must name this worker (`paired_sync::binding`'s codes).
