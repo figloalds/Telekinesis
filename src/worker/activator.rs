@@ -32,7 +32,10 @@
 //!    against the view for every entity the batch activated when it ends
 //!    (after [`NOTIFY_BATCH`], or twenty times the capture's own cost if
 //!    longer, or when no work is left), so the O(entries) capture is not paid
-//!    on every slice;
+//!    on every slice. A slice that finds SQLite's writer held by another
+//!    connection gives up at once and is retried a millisecond later, so the
+//!    activator never waits for another writer while holding the engine
+//!    (`fail_busy`, up to [`WRITER_PATIENCE`]);
 //! 4. a `SlowTicket` is prepared off-lock (`Store::prepare_slow` on a pooled
 //!    `SyncStore`) and committed under the lock (`commit_prepared`;
 //!    `Prepared::Inline` runs the slow path there until WP2.4's off-lock
@@ -131,6 +134,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Committing slices between two off-lock WAL checkpoints (besides the one
 /// after every seal).
 pub const CHECKPOINT_EVERY: u32 = 16;
+/// The pause before a slice that found SQLite's writer busy is retried.
+const WRITER_RETRY: Duration = Duration::from_millis(1);
+/// How long slices give up at once on a busy writer before they wait for it
+/// under the engine lock like any other engine user (`fail_busy`).
+pub const WRITER_PATIENCE: Duration = Duration::from_secs(2);
 /// Per-event re-queue backoff (`Stale` tickets, failed preparations).
 const EVENT_BASE: Duration = Duration::from_millis(250);
 const EVENT_CAP: Duration = Duration::from_secs(30);
@@ -273,6 +281,31 @@ fn poll_busy(attempts: i32) -> bool {
     }
     thread::sleep(Duration::from_millis(1));
     true
+}
+
+/// The engine connection's busy handler during the activator's own slice:
+/// give up at once. A slice's only statement that can find SQLite's writer
+/// busy is its opening `BEGIN IMMEDIATE` (later statements run inside the
+/// write transaction), so a busy slice changed nothing and is simply retried
+/// after [`WRITER_RETRY`], with the engine free for the filesystem meanwhile,
+/// instead of polling for the writer while holding it (another connection's
+/// staging transaction and fsync can take tens of milliseconds on a busy
+/// disk). After [`WRITER_PATIENCE`] of busy slices the slice waits for the
+/// writer as every other engine user does (the store's 5 s budget).
+fn fail_busy(_attempts: i32) -> bool {
+    false
+}
+
+/// Whether `error` is SQLite's `SQLITE_BUSY` (the writer is held by another
+/// connection).
+fn writer_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    })
 }
 
 /// Whether a slice could do anything: a `ready` row, an unclassified (legacy
@@ -457,6 +490,9 @@ struct Activator {
     since_checkpoint: u32,
     /// The engine connection's page cache is raised (a backlog is draining).
     cache_raised: bool,
+    /// Since when slices keep finding SQLite's writer held by another
+    /// connection.
+    writer_busy_since: Option<Instant>,
 }
 
 impl Activator {
@@ -470,6 +506,7 @@ impl Activator {
             sealed: false,
             since_checkpoint: 0,
             cache_raised: false,
+            writer_busy_since: None,
         }
     }
 
@@ -500,7 +537,19 @@ impl Activator {
                 self.cache_raised = true;
             }
             self.begin_batch(&engine);
+            // While another connection holds SQLite's writer, the slice's
+            // `BEGIN IMMEDIATE` fails at once instead of waiting for it
+            // under the engine lock (see `writer_busy`).
+            let fail_fast = self
+                .writer_busy_since
+                .is_none_or(|since| since.elapsed() < WRITER_PATIENCE);
+            if fail_fast {
+                let _ = engine.store.db.busy_handler(Some(fail_busy));
+            }
             let slice = engine.store.activate_slice(budget);
+            if fail_fast {
+                let _ = engine.store.db.busy_handler(Some(poll_busy));
+            }
             if let Ok(slice) = &slice {
                 self.activated(&mut engine, &slice.activated);
                 if !slice.more && slice.slow_ticket.is_none() {
@@ -513,7 +562,18 @@ impl Activator {
             (slice, sealing)
         };
         self.others.released(&ctx.gauges, &self.vitals);
-        let slice = slice?;
+        let slice = match slice {
+            Err(error) if writer_busy(&error) => {
+                // Nothing was done: retry soon, without the engine meanwhile.
+                self.writer_busy_since.get_or_insert_with(Instant::now);
+                thread::sleep(WRITER_RETRY);
+                return Ok(true);
+            }
+            slice => {
+                self.writer_busy_since = None;
+                slice?
+            }
+        };
         let changed = !slice.activated.is_empty() || !slice.quarantined.is_empty();
         self.counters.slices += 1;
         self.counters.last_slice_ms =
@@ -801,6 +861,25 @@ mod tests {
         others.yield_to(&gauges, &vitals);
         assert!(others.busy(), "a filesystem hold was not seen");
         assert_eq!(others.budget(), BUSY_SLICE);
+    }
+
+    /// `SQLITE_BUSY` (through any context) is the writer-busy retry, other
+    /// errors are not.
+    #[test]
+    fn writer_busy_detects_sqlite_busy_only() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(writer_busy(
+            &anyhow::Error::new(busy).context("inbox_slice")
+        ));
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        assert!(!writer_busy(&anyhow::Error::new(full)));
+        assert!(!writer_busy(&anyhow::anyhow!("SQLITE_BUSY in a message")));
     }
 
     /// The sealing commit is alone in its slice, and the slice before it
