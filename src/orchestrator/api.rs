@@ -168,7 +168,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
                 ),
                 "UNSUPPORTED_FOLDER_ACTION"
             );
-            let info = shared.lock().unwrap().discovery(&state)?;
+            let info = crate::util::lock::lock(shared).discovery(&state)?;
             return runtime::rpc(&info, &request, payload);
         }
         Action::Pair {
@@ -177,7 +177,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
             connections,
         } => {
             let (installation, count) = {
-                let s = shared.lock().unwrap();
+                let s = crate::util::lock::lock(shared);
                 (
                     s.installation.clone(),
                     connections.unwrap_or(s.config.network.connections),
@@ -186,7 +186,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
             ensure!((1..=16).contains(&count), "INVALID_CONNECTION_COUNT");
             let (_, remote) = dial(&endpoint, &code, &installation)?;
             ensure!(remote != installation, "CANNOT_PAIR_WITH_SELF");
-            let s = shared.lock().unwrap();
+            let s = crate::util::lock::lock(shared);
             s.upsert_peer(&endpoint, &code, &remote, count)?;
             return Ok(
                 json!({"endpoint":endpoint,"installation":remote,"connections":count.max(2),"configured_connections":count,"reserved_connections":1}),
@@ -225,7 +225,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
                     .any(|p| p.repo == repo),
                 "REMOTE_FOLDER_NOT_FOUND"
             );
-            return shared.lock().unwrap().create(
+            return crate::util::lock::lock(shared).create(
                 label,
                 Some(repo),
                 mount,
@@ -235,7 +235,7 @@ pub fn manage(shared: &Shared, action: Action) -> Result<Value> {
         }
         _ => {}
     }
-    let mut s = shared.lock().unwrap();
+    let mut s = crate::util::lock::lock(shared);
     ensure!(!s.stopping.load(Ordering::Relaxed), "ORCHESTRATOR_STOPPING");
     match action {
         Action::List => Ok(json!({"installation":s.installation,"folders":s.projects()?.iter().map(|p|s.inspect(&p.state)).collect::<Result<Vec<_>>>()?})),

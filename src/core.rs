@@ -37,9 +37,10 @@ use derive::{activated_ids, persist_projection};
 use inbox::{validate_direct_links, validate_known_links};
 
 pub use derive::project;
+pub use objects::ScrubOutcome;
 pub(crate) use objects::install_object;
 pub use objects::{ObjectLocks, VerifyMode};
-pub use transfer::{Bundle, ObjectPart};
+pub use transfer::{Bundle, ObjectPart, PartOutcome};
 pub use verify::DerivedDiff;
 
 pub const ROOT: &str = "root";
@@ -292,8 +293,11 @@ pub fn name_key(name: &str) -> Result<String> {
 }
 
 /// How `Store::open_existing_with` runs the recovery phases of `Store::open`.
-/// Wave 0: every `VerifyMode` verifies like `Full`, and activation is never
-/// deferred (`startup_drain` still activates staged events).
+/// `VerifyMode::default()` is `Changed` (WP1.8): objects whose recorded size
+/// and mtime still match are trusted without hashing, changed ones are
+/// hashed, and a one-time full verify runs after an upgrade; `Lazy` skips
+/// hashing; `Full` hashes everything. Activation is never deferred yet
+/// (`startup_drain` still activates staged events). CCR-WP1.8-1.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OpenOptions {
     /// Leave staged incoming events to a background activator (classify only).

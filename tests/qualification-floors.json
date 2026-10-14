@@ -13,6 +13,7 @@
     {"id": "tiny_pending_objects_12k", "wave": 1, "scenario": "qual_wp1_8_objects::tiny_pending_objects_12k", "metric": "completed", "op": "==", "value": 1, "unit": "bool", "baseline": "page cliff above 10,031 parts"},
     {"id": "watch_latency", "wave": 1, "scenario": "qual_wp1_4_worker::watch_latency", "metric": "watch_ms", "op": "<=", "value": 1500, "unit": "ms", "baseline": "no watch op"},
     {"id": "session_slow_does_not_block_fast", "wave": 1, "scenario": "qual_wp1_9_session::slow_does_not_block_fast", "metric": "fast_p99_ms", "op": "<", "value": 50, "unit": "ms", "baseline": "head-of-line blocking"},
+    {"id": "session_control_under_queued_data", "wave": 1, "scenario": "qual_wp1_9_session::slow_does_not_block_fast", "metric": "control_queued_30mib_p99_ms", "op": "<", "value": 50, "unit": "ms", "baseline": "head-of-line blocking (CCR-WP1.9-3)"},
     {"id": "session_loopback_throughput", "wave": 1, "scenario": "qual_wp1_9_session::loopback_throughput", "metric": "mib_per_s", "op": ">=", "value": 300, "unit": "MiB/s", "baseline": "JSON+hex request/response"},
     {"id": "legacy_hung_repo_healthy_progress", "wave": 1, "scenario": "qual_wp1_12_legacy::hung_remote_repo_charged", "metric": "healthy_delay_ms", "op": "<=", "value": 45000, "unit": "ms", "baseline": "lane-wide resets, 30 s backoff"},
     {"id": "legacy_interval_20s_reconnects", "wave": 1, "scenario": "qual_wp1_12_legacy::interval_20s_no_reconnects", "metric": "reconnects", "op": "<=", "value": 0, "unit": "count", "baseline": "every idle cycle"},

@@ -53,7 +53,7 @@ use crate::{
         status::StatusEvent,
     },
     runtime::Discovery,
-    startup::{self, Watchdog},
+    startup::Watchdog,
     util::{
         backoff::Backoff, cancel::Cancel, lock::Tracked, log::event, notify::Notify,
         snapshot::Snapshot, time::Clock,
@@ -1812,16 +1812,10 @@ impl Controller {
         }
     }
 
-    /// `startup::Watchdog` expiry with a configurable silence: the watchdog
-    /// measures `LEEWAY`, so `now` is shifted by `LEEWAY - startup_silence`.
+    /// `startup::Watchdog` expiry with the configurable startup silence
+    /// (`Watchdog::expired_after`, CCR-WP1.2-4).
     fn watchdog_expired(&self, watchdog: &Watchdog, now: Instant) -> bool {
-        let silence = self.limits().startup_silence;
-        let shifted = if silence <= startup::LEEWAY {
-            now.checked_add(startup::LEEWAY - silence)
-        } else {
-            now.checked_sub(silence - startup::LEEWAY)
-        };
-        shifted.is_some_and(|at| watchdog.expired(at))
+        watchdog.expired_after(now, self.limits().startup_silence)
     }
 
     fn startup_timeout(&mut self) {

@@ -100,7 +100,12 @@ impl Watchdog {
         }
     }
     pub fn expired(&self, now: Instant) -> bool {
-        now.duration_since(self.last) >= LEEWAY
+        self.expired_after(now, LEEWAY)
+    }
+    /// Whether `silence` has passed without progress (a supervisor's own
+    /// startup-silence limit; [`Self::expired`] uses [`LEEWAY`]). CCR-WP1.2-4.
+    pub fn expired_after(&self, now: Instant, silence: Duration) -> bool {
+        now.saturating_duration_since(self.last) >= silence
     }
 }
 
