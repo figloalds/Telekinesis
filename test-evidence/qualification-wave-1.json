@@ -1,0 +1,1077 @@
+{
+    "schema":  1,
+    "kind":  "wave-1",
+    "wave":  1,
+    "generated_at":  "2026-10-14T01:42:35.8811895-03:00",
+    "duration_s":  2121,
+    "git":  {
+                "commit":  "65543f0b7ee14c2702433716bf318974f2e79835",
+                "branch":  "revamp/wp1-int",
+                "dirty":  false,
+                "dirty_paths":  [
+
+                                ]
+            },
+    "toolchain":  "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "hardware":  {
+                     "cpu":  "AMD Ryzen 9 7950X3D 16-Core Processor          ",
+                     "cores":  16,
+                     "threads":  32,
+                     "memory_gb":  127.7,
+                     "os":  "Microsoft Windows 11 Pro 10.0.26300",
+                     "machine":  "FIGLOALDS"
+                 },
+    "settings":  {
+                     "budget_s":  2400,
+                     "file_timeout_min":  150,
+                     "priority":  "BelowNormal",
+                     "filter":  "",
+                     "profile":  "release"
+                 },
+    "summary":  {
+                    "ok":  false,
+                    "scenarios":  29,
+                    "by_status":  {
+                                      "pass":  27,
+                                      "fail":  2
+                                  },
+                    "floors_evaluated":  16,
+                    "floors_passed":  14,
+                    "floors_failed":  2,
+                    "floors_missing":  0,
+                    "floors_not_run":  0,
+                    "floors_incomplete":  0,
+                    "enforced_failures":  [
+                                              "concurrent_namespace_ops_5k",
+                                              "legacy_crash_backoff"
+                                          ]
+                },
+    "files":  [
+                  {
+                      "file":  "qual_wp1_4_worker",
+                      "wave":  1,
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  9.1,
+                      "result":  "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.26s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_4_worker.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::accept_loop_survives_faults",
+                                            "status":  "pass",
+                                            "elapsed_ms":  693,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "failed_calls",
+                                                                "value":  3.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::mount_failure_keeps_worker_serving",
+                                            "status":  "pass",
+                                            "elapsed_ms":  107,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::poison_exit_persists_dirty",
+                                            "status":  "pass",
+                                            "elapsed_ms":  10,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "exit_code",
+                                                                "value":  70.0,
+                                                                "unit":  "code"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::rpc_before_mount",
+                                            "status":  "pass",
+                                            "elapsed_ms":  95,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "ready_ms",
+                                                                "value":  31.7925,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "status_ms",
+                                                                "value":  4.3182,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "attach_ms",
+                                                                "value":  8.676,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_4_worker::watch_latency",
+                                            "status":  "pass",
+                                            "elapsed_ms":  5078,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "watch_ms",
+                                                                "value":  1000.3,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_5_mount",
+                      "wave":  1,
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  2.1,
+                      "result":  "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.44s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_5_mount.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_5_mount::attach_detach_attach_same_pid",
+                                            "status":  "pass",
+                                            "elapsed_ms":  123,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "reattach_ms",
+                                                                "value":  2.9362,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_5_mount::force_detach_persists_dirty",
+                                            "status":  "pass",
+                                            "elapsed_ms":  1151,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_5_mount::foreign_mount_untouched",
+                                            "status":  "pass",
+                                            "elapsed_ms":  83,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "outcome: Ok(Object {\"address\": String(\"ws://127.0.0.1:50539\"), \"device\": String(\"4ed5cd47-a530-4f8b-9a6e-d1efe82ce7aa\"), \"instance\": String(\"0027312a-975f-4edb-aadb-610b656102dc\"), \"ipc\": Number(3), \"mount_error\": Object {\"class\": String(\"needs_user_action\"), \"code\": String(\"MOUNT_PATH_MUST_NOT_EXIST\"), \"message\": String(\"MOUNT_PATH_MUST_NOT_EXIST: \\\\\\\\?\\\\C:\\\\Users\\\\felyp\\\\AppData\\\\Local\\\\Temp\\\\.tmpN4EVyu\\\\foreign\")}, \"mounted\": Bool(false), \"pid\": Number(82836), \"ready\": Bool(true), \"repo\": String(\"c2dc082f-5887-47c7-b8ba-b76194b008c0\"), \"runtime\": String(\"\\\\\\\\?\\\\C:\\\\Users\\\\felyp\\\\AppData\\\\Local\\\\Temp\\\\.tmpN4EVyu\\\\state\\\\runtime.json\"), \"version\": String(\"0.1.0+152d439c1860\")})"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_6_activation",
+                      "wave":  1,
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  27.5,
+                      "result":  "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.72s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_6_activation.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::local_create_after_resolved_conflict",
+                                            "status":  "pass",
+                                            "elapsed_ms":  44,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "p90_ms",
+                                                                "value":  1.6792,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "p50_ms",
+                                                                "value":  1.4511,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "slow_path_commits",
+                                                                "value":  0.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::quarantine_not_pending",
+                                            "status":  "pass",
+                                            "elapsed_ms":  70,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "caught_up_ms",
+                                                                "value":  10.7091,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::remote_linear_create_10k",
+                                            "status":  "pass",
+                                            "elapsed_ms":  19480,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "authored 10000 local creates in 2152 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  1.9398457300000005,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::remote_linear_create_2k",
+                                            "status":  "pass",
+                                            "elapsed_ms":  1375,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "authored 2000 local creates in 427 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  0.6797927499999998,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_6_activation::transient_retry",
+                                            "status":  "pass",
+                                            "elapsed_ms":  113,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "first receive: Ok(0)"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "quarantined",
+                                                                "value":  0.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_7_derive",
+                      "wave":  1,
+                      "status":  "fail",
+                      "exit_code":  101,
+                      "duration_s":  1589.1,
+                      "result":  "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1590.08s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_7_derive.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_7_derive::concurrent_namespace_ops_5k",
+                                            "status":  "fail",
+                                            "elapsed_ms":  16739,
+                                            "failures":  [
+                                                             "FLOOR concurrent_namespace_ops_5k: max_op_ms \u003c= 500 (measured Some(721.2254))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "max_op_ms",
+                                                                "value":  721.2254,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "p50_op_ms",
+                                                                "value":  311.4595,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "append_commits",
+                                                                "value":  50.0,
+                                                                "unit":  "commits"
+                                                            },
+                                                            {
+                                                                "metric":  "fallbacks",
+                                                                "value":  0.0,
+                                                                "unit":  "commits"
+                                                            },
+                                                            {
+                                                                "metric":  "derive_ms_per_commit",
+                                                                "value":  17.91134,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_7_derive::two_way_backlog_2k",
+                                            "status":  "pass",
+                                            "elapsed_ms":  150059,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  60.93231234999996,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "append_commits",
+                                                                "value":  2000.0,
+                                                                "unit":  "commits"
+                                                            },
+                                                            {
+                                                                "metric":  "fallbacks",
+                                                                "value":  0.0,
+                                                                "unit":  "commits"
+                                                            },
+                                                            {
+                                                                "metric":  "derive_ms_per_commit",
+                                                                "value":  2.6681640000000004,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "oracle_ms",
+                                                                "value":  28142.891200000002,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_7_derive::two_way_backlog_6400",
+                                            "status":  "pass",
+                                            "elapsed_ms":  1416943,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "per_event_ms",
+                                                                "value":  221.36841576562472,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "append_commits",
+                                                                "value":  6400.0,
+                                                                "unit":  "commits"
+                                                            },
+                                                            {
+                                                                "metric":  "fallbacks",
+                                                                "value":  0.0,
+                                                                "unit":  "commits"
+                                                            },
+                                                            {
+                                                                "metric":  "derive_ms_per_commit",
+                                                                "value":  10.81955140625,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_8_objects",
+                      "wave":  1,
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  168.9,
+                      "result":  "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 168.02s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_8_objects.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::content_status_50k",
+                                            "status":  "pass",
+                                            "elapsed_ms":  665,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "50000 objects stored in 33806 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "cold_content_status_ms",
+                                                                "value":  511.2157,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "content_status_ms",
+                                                                "value":  0.0704,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::corrupt_mid_page_keeps_completed",
+                                            "status":  "pass",
+                                            "elapsed_ms":  128,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "receive_parts: Err(CORRUPT_OBJECT: 7798e59cbf9c2e9d992684e3be9c0ec5115af62282910609f033b77ed11c3e38)"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "kept",
+                                                                "value":  2.0,
+                                                                "unit":  "objects"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::restart_without_rehash_20k",
+                                            "status":  "pass",
+                                            "elapsed_ms":  1993,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "20000 objects stored in 13159 ms"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "first_ready_ms",
+                                                                "value":  3534.4805,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "ready_ms",
+                                                                "value":  1003.6601999999999,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "open_ms",
+                                                                "value":  963.9684,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_8_objects::tiny_pending_objects_12k",
+                                            "status":  "pass",
+                                            "elapsed_ms":  39752,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "completed",
+                                                                "value":  1.0,
+                                                                "unit":  "bool"
+                                                            },
+                                                            {
+                                                                "metric":  "objects_per_s",
+                                                                "value":  301.897435064449,
+                                                                "unit":  "objects/s"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_9_session",
+                      "wave":  1,
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  89.2,
+                      "result":  "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 88.51s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_9_session.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_9_session::dead_peer_detection",
+                                            "status":  "pass",
+                                            "elapsed_ms":  20021,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "session::Conn through a FaultProxy blackhole; heartbeat 5s, dead after 20s"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "detect_ms",
+                                                                "value":  20013.0433,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::duplex_32mib",
+                                            "status":  "pass",
+                                            "elapsed_ms":  247,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "duplex_ms",
+                                                                "value":  44.3917,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "duplex_wss_ms",
+                                                                "value":  153.7584,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::idle_60s",
+                                            "status":  "pass",
+                                            "elapsed_ms":  60005,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "session::Conn through a FaultProxy, production heartbeat 5 s / dead 20 s"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "ping_after_idle_ms",
+                                                                "value":  0.28709999999999997,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "rtt_ms",
+                                                                "value":  0.0,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::loopback_throughput",
+                                            "status":  "pass",
+                                            "elapsed_ms":  6342,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "session::Conn streamed response, 1024 x 1 MiB chunks (plain WS); upload and WSS recorded too"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "mib_per_s",
+                                                                "value":  651.4273798108532,
+                                                                "unit":  "MiB/s"
+                                                            },
+                                                            {
+                                                                "metric":  "upload_mib_per_s",
+                                                                "value":  380.2490051698269,
+                                                                "unit":  "MiB/s"
+                                                            },
+                                                            {
+                                                                "metric":  "wss_mib_per_s",
+                                                                "value":  507.57951537953545,
+                                                                "unit":  "MiB/s"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_9_session::slow_does_not_block_fast",
+                                            "status":  "pass",
+                                            "elapsed_ms":  1885,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+                                                          "session::Conn, production options; one 20 s handler on stream A, 50 calls on stream B"
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "fast_p99_ms",
+                                                                "value":  0.1822,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "control_queued_30mib_p99_ms",
+                                                                "value":  40.3134,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  },
+                  {
+                      "file":  "qual_wp1_12_legacy",
+                      "wave":  1,
+                      "status":  "fail",
+                      "exit_code":  101,
+                      "duration_s":  127.2,
+                      "result":  "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 126.54s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713\\qual_wp1_12_legacy.log",
+                      "scenarios":  [
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::crash_backoff",
+                                            "status":  "fail",
+                                            "elapsed_ms":  20094,
+                                            "failures":  [
+                                                             "FLOOR legacy_crash_backoff: restarts_20s \u003c= 5 (measured Some(20.0))"
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "restarts_20s",
+                                                                "value":  20.0,
+                                                                "unit":  "count"
+                                                            },
+                                                            {
+                                                                "metric":  "list_p99_ms",
+                                                                "value":  6.2253,
+                                                                "unit":  "ms"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::hung_remote_repo_charged",
+                                            "status":  "pass",
+                                            "elapsed_ms":  15078,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "healthy_delay_ms",
+                                                                "value":  3072.4575999999997,
+                                                                "unit":  "ms"
+                                                            },
+                                                            {
+                                                                "metric":  "hung_repo_charged",
+                                                                "value":  1.0,
+                                                                "unit":  "bool"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::interval_20s_no_reconnects",
+                                            "status":  "pass",
+                                            "elapsed_ms":  60001,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "reconnects",
+                                                                "value":  0.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        },
+                                        {
+                                            "scenario":  "qual_wp1_12_legacy::worker_busy_not_counted",
+                                            "status":  "pass",
+                                            "elapsed_ms":  20105,
+                                            "failures":  [
+
+                                                         ],
+                                            "notes":  [
+
+                                                      ],
+                                            "unsupported":  [
+
+                                                            ],
+                                            "metrics":  [
+                                                            {
+                                                                "metric":  "busy_observed",
+                                                                "value":  124.0,
+                                                                "unit":  "samples"
+                                                            },
+                                                            {
+                                                                "metric":  "busy_counted",
+                                                                "value":  0.0,
+                                                                "unit":  "samples"
+                                                            },
+                                                            {
+                                                                "metric":  "busy_retries_max",
+                                                                "value":  4.0,
+                                                                "unit":  "count"
+                                                            }
+                                                        ]
+                                        }
+                                    ]
+                  }
+              ],
+    "floors":  [
+                   {
+                       "id":  "remote_linear_create_2k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_6_activation::remote_linear_create_2k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "ms",
+                       "measured":  0.6797927499999998,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "15.9 s per event @2K"
+                   },
+                   {
+                       "id":  "remote_linear_create_10k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_6_activation::remote_linear_create_10k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "ms",
+                       "measured":  1.9398457300000005,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "6.2 s @1K, 15.9 s @2K, 218 s @6.4K"
+                   },
+                   {
+                       "id":  "local_create_after_resolved_conflict",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_6_activation::local_create_after_resolved_conflict",
+                       "metric":  "p90_ms",
+                       "op":  "\u003c=",
+                       "floor":  10,
+                       "unit":  "ms",
+                       "measured":  1.6792,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "4.2 s"
+                   },
+                   {
+                       "id":  "two_way_backlog_2k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_7_derive::two_way_backlog_2k",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  100,
+                       "unit":  "ms",
+                       "measured":  60.93231234999996,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "slow path, 15.9 s @2K"
+                   },
+                   {
+                       "id":  "two_way_backlog_6400",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_7_derive::two_way_backlog_6400",
+                       "metric":  "per_event_ms",
+                       "op":  "\u003c=",
+                       "floor":  300,
+                       "unit":  "ms",
+                       "measured":  221.36841576562472,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "slow path, 218 s @6.4K"
+                   },
+                   {
+                       "id":  "concurrent_namespace_ops_5k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_7_derive::concurrent_namespace_ops_5k",
+                       "metric":  "max_op_ms",
+                       "op":  "\u003c=",
+                       "floor":  500,
+                       "unit":  "ms",
+                       "measured":  721.2254,
+                       "verdict":  "fail",
+                       "enforced":  true,
+                       "baseline":  "O(N^2) seconds to minutes"
+                   },
+                   {
+                       "id":  "restart_ready_20k_objects",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_8_objects::restart_without_rehash_20k",
+                       "metric":  "ready_ms",
+                       "op":  "\u003c=",
+                       "floor":  3000,
+                       "unit":  "ms",
+                       "measured":  1003.6601999999999,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "full re-hash"
+                   },
+                   {
+                       "id":  "content_status_50k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_8_objects::content_status_50k",
+                       "metric":  "content_status_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  0.0704,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "about 6.5 s"
+                   },
+                   {
+                       "id":  "tiny_pending_objects_12k",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_8_objects::tiny_pending_objects_12k",
+                       "metric":  "completed",
+                       "op":  "==",
+                       "floor":  1,
+                       "unit":  "bool",
+                       "measured":  1.0,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "page cliff above 10,031 parts"
+                   },
+                   {
+                       "id":  "watch_latency",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_4_worker::watch_latency",
+                       "metric":  "watch_ms",
+                       "op":  "\u003c=",
+                       "floor":  1500,
+                       "unit":  "ms",
+                       "measured":  1000.3,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "no watch op"
+                   },
+                   {
+                       "id":  "session_slow_does_not_block_fast",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_9_session::slow_does_not_block_fast",
+                       "metric":  "fast_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  0.1822,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "head-of-line blocking"
+                   },
+                   {
+                       "id":  "session_control_under_queued_data",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_9_session::slow_does_not_block_fast",
+                       "metric":  "control_queued_30mib_p99_ms",
+                       "op":  "\u003c",
+                       "floor":  50,
+                       "unit":  "ms",
+                       "measured":  40.3134,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "head-of-line blocking (CCR-WP1.9-3)"
+                   },
+                   {
+                       "id":  "session_loopback_throughput",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_9_session::loopback_throughput",
+                       "metric":  "mib_per_s",
+                       "op":  "\u003e=",
+                       "floor":  300,
+                       "unit":  "MiB/s",
+                       "measured":  651.4273798108532,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "JSON+hex request/response"
+                   },
+                   {
+                       "id":  "legacy_hung_repo_healthy_progress",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_12_legacy::hung_remote_repo_charged",
+                       "metric":  "healthy_delay_ms",
+                       "op":  "\u003c=",
+                       "floor":  45000,
+                       "unit":  "ms",
+                       "measured":  3072.4575999999997,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "lane-wide resets, 30 s backoff"
+                   },
+                   {
+                       "id":  "legacy_interval_20s_reconnects",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_12_legacy::interval_20s_no_reconnects",
+                       "metric":  "reconnects",
+                       "op":  "\u003c=",
+                       "floor":  0,
+                       "unit":  "count",
+                       "measured":  0.0,
+                       "verdict":  "pass",
+                       "enforced":  true,
+                       "baseline":  "every idle cycle"
+                   },
+                   {
+                       "id":  "legacy_crash_backoff",
+                       "wave":  1,
+                       "scenario":  "qual_wp1_12_legacy::crash_backoff",
+                       "metric":  "restarts_20s",
+                       "op":  "\u003c=",
+                       "floor":  5,
+                       "unit":  "count",
+                       "measured":  20.0,
+                       "verdict":  "fail",
+                       "enforced":  true,
+                       "baseline":  "restart every 2 s"
+                   }
+               ],
+    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp1-int\\test-runs\\qualify-wave-1-20261014-010713",
+    "merged_from":  null
+}
