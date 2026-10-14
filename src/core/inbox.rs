@@ -54,10 +54,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Inbox cache (owned by WP1.6 / WP2.4; nothing cached: the slow path's
-/// event cache lives in `commit::Cache`, beside the commit path that reads it).
+/// Inbox cache (owned by WP1.6 / WP2.4; the slow path's event cache lives in
+/// `commit::Cache`, beside the commit path that reads it).
 #[derive(Default)]
-pub(crate) struct Cache {}
+pub(crate) struct Cache {
+    /// `prepare_slow` began a read transaction on this handle and has not
+    /// seen it end (its `ROLLBACK` failed): the next call ends it first.
+    read_open: std::cell::Cell<bool>,
+}
+
+/// Fault point (tests): fails `prepare_slow`'s `ROLLBACK` of its own read
+/// transaction, which then stays open.
+const PREPARE_ROLLBACK_FAULT: &str = "core.prepare.rollback";
 
 /// Rows loaded per slice, both for classification and for the ready window.
 const WINDOW: usize = 512;
@@ -1334,6 +1342,9 @@ impl Store {
     /// `SQLITE_BUSY` when another connection writes), else a savepoint inside
     /// the caller's transaction. Any failure rolls back and drops the view.
     fn with_write<T>(&mut self, name: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        // A view still holding a commit rolled back around the store is not
+        // kept (`commit` module docs, "Rolled-back commits and the view").
+        self.drop_rolled_back_view();
         // Opening the transaction changes no data: keep a fresh view fresh.
         let view = self.keep_view();
         let outer = begin_write(&self.db, name)?;
@@ -1405,15 +1416,40 @@ impl Store {
     /// its delta instead. A refusal is recorded, not returned:
     /// `commit_prepared` applies it as the inline path would. `Err` only when
     /// the read transaction cannot be used; nothing changed then.
+    ///
+    /// A read transaction left open (its `ROLLBACK` failed) would pin its
+    /// snapshot: every later call on the handle would join it, compute from
+    /// that old state and come back `Stale`, and the open reader would hold
+    /// WAL checkpoints back. So a failed `ROLLBACK` that leaves the
+    /// transaction open is an `Err`, and the next call ends that transaction
+    /// before it begins its own (`Err` if it still cannot: replace the
+    /// handle).
     pub fn prepare_slow(read: &Store, t: &SlowTicket) -> Result<Prepared> {
+        let open = &read.caches.inbox.read_open;
+        if open.get() {
+            if !read.db.is_autocommit() {
+                read.db
+                    .execute_batch("ROLLBACK")
+                    .context("cannot end the read transaction of an earlier prepare_slow")?;
+            }
+            open.set(false);
+        }
         let own = read.db.is_autocommit();
         if own {
             read.db.execute_batch("BEGIN")?;
+            open.set(true);
         }
         let result = read.prepare_computed(t, own);
         if own {
             // Read-only: nothing to keep.
-            let _ = read.db.execute_batch("ROLLBACK");
+            let ended = crate::util::fault::fail(PREPARE_ROLLBACK_FAULT)
+                .and_then(|()| Ok(read.db.execute_batch("ROLLBACK")?));
+            if let Err(error) = ended
+                && !read.db.is_autocommit()
+            {
+                return Err(error.context("cannot end prepare_slow's read transaction"));
+            }
+            open.set(false);
             // Copy the WAL into the database here, off-lock, so that the
             // commit (a forced seal writes the whole projection) does not
             // run SQLite's automatic checkpoint under the engine lock: with
