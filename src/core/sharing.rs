@@ -30,10 +30,22 @@
 //! **Regressions**: a peer reporting a lower cursor of our (unchanged) feed
 //! than it reported before lost state (a restore). We then forget everything
 //! we know about it (`peer_known`, recomputing outbox acks: withdrawn events
-//! are queued again) and re-read its feed from the start, which rebuilds the
-//! evidence that is still true. While we re-read, we report *no cursor*
-//! (`None` in a request, an empty-epoch cursor in a reply), which the peer
-//! treats as invalid (it resets us) and never as a regression of ours.
+//! are queued again; its `feed_needs`) and re-read its feed from the start,
+//! which rebuilds the evidence and the needs that are still true. A reset
+//! page of its feed forgets it the same way. While we re-read, we report *no
+//! cursor* (`None` in a request, an empty-epoch cursor in a reply), which the
+//! peer treats as invalid (it resets us) and never as a regression of ours.
+//!
+//! **Digests** are of an event's canonical serialization (`serde_json` of the
+//! parsed `Event`): what a receiver re-serializes a payload-bearing entry to,
+//! and what every held-payload check accepts. It is the stored text itself
+//! for everything `commit` and staging write; a payload stored otherwise (an
+//! older build, another tool) still travels and is acked.
+//!
+//! **Bounds** (invariant 22): every peer-supplied value that is compared or
+//! stored is checked first (`check_page`, `well_formed_cursor`); ids a peer
+//! reports `unknown` only touch needs we hold or missing parents of waiting
+//! rows, and expired `parent` marks are dropped.
 //!
 //! A report is compared only with the previous report of the same channel.
 //! Each channel is sequential (one exchange per peer and repository in each
@@ -54,7 +66,10 @@ use crate::model::protocol::feed::{
     PageStatus, RejectedEvent,
 };
 use crate::paired_sync::SyncRoute;
+use crate::util::lock::lock;
 use std::cell::Cell;
+use std::collections::VecDeque;
+use std::sync::Mutex;
 
 /// Sharing cache: counters of the feed paths (derived, disposable).
 #[derive(Default)]
@@ -68,7 +83,8 @@ const SCHEMA_VERSION: i64 = 1;
 /// An id a peer reported unknown is asked for again after this long.
 const NEED_RETRY_MS: i64 = 60_000;
 /// `feed_needs.reason` of ids listed by the peer's feed (elided entries we do
-/// not hold, `large` entries); these keep the peer's metadata not caught up.
+/// not hold, `large` entries); these keep the peer's metadata not caught up
+/// until they arrive or the peer reports them `unknown`.
 const NEED_LISTED: [&str; 2] = ["elided", "large"];
 /// `feed_needs.reason` of missing parents of waiting rows.
 const NEED_PARENT: &str = "parent";
@@ -76,11 +92,52 @@ const NEED_PARENT: &str = "parent";
 const VIA_REQUEST: &str = "request";
 /// `feed_out.via`: a cursor carried by the peer's reply to our request.
 const VIA_REPLY: &str = "reply";
+/// Hex characters of a feed epoch (`journal_epoch`).
+const EPOCH_HEX_LEN: usize = 32;
+/// Longest event, replica or cursor id accepted from a peer.
+const MAX_ID_BYTES: usize = 128;
+/// Offers whose sent counts wait for their `feed-apply` (oldest dropped).
+const OFFERS_KEPT: usize = 1024;
+
+/// What one `build_exchange_request` sent, until `apply_exchange_reply`
+/// folds it into the dialer's summary. Process-wide: the offer and the apply
+/// of one exchange may run on different pooled stores of the worker.
+struct Offer {
+    request: String,
+    repo: String,
+    peer: String,
+    sent: Sent,
+}
+
+static OFFERS: Mutex<VecDeque<Offer>> = Mutex::new(VecDeque::new());
+
+fn remember_offer(offer: Offer) {
+    let mut offers = lock(&OFFERS);
+    while offers.len() >= OFFERS_KEPT {
+        offers.pop_front();
+    }
+    offers.push_back(offer);
+}
+
+/// What the request `request` of `repo` to `peer` sent (nothing when this
+/// process did not build it, e.g. across a worker restart).
+fn take_offer(request: &str, repo: &str, peer: &str) -> Sent {
+    let mut offers = lock(&OFFERS);
+    let offer = offers
+        .iter()
+        .position(|offer| offer.request == request)
+        .and_then(|position| offers.remove(position));
+    match offer {
+        Some(offer) if offer.repo == repo && offer.peer == peer => offer.sent,
+        _ => Sent::default(),
+    }
+}
 
 /// `sharing::ensure_schema` (`schema:sharing=1`, REVAMP_PLAN §9, WP2.5 task 1):
 /// the `journal_epoch` config row and the triggers that regenerate it when the
-/// journal loses or rewrites a row; the per-peer feed tables; an index on
-/// `incoming_sources(peer)` (per-peer inbox counts); and the
+/// journal loses or rewrites a row; the per-peer feed tables; indexes on
+/// `incoming_sources(peer)` (per-peer inbox counts) and `feed_needs(event)`
+/// (an event that arrives clears every peer's need of it); and the
 /// `feed_outbox_known` trigger, which acks an outbox row as it is inserted
 /// when a feed peer is already known to hold the event (point lookups per
 /// feed peer: no index on `peer_known(event)` to maintain per received
@@ -108,6 +165,7 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
                 PRIMARY KEY(peer,event));
             CREATE TABLE IF NOT EXISTS feed_rejected(peer TEXT NOT NULL,event TEXT NOT NULL,seq INTEGER NOT NULL,
                 code TEXT NOT NULL,message TEXT NOT NULL,payload TEXT,at_ms INTEGER NOT NULL,PRIMARY KEY(peer,event));
+            CREATE INDEX IF NOT EXISTS feed_needs_event ON feed_needs(event);
             CREATE INDEX IF NOT EXISTS incoming_sources_peer ON incoming_sources(peer);
             CREATE TRIGGER IF NOT EXISTS feed_outbox_known AFTER INSERT ON outbox
                 WHEN NEW.acknowledged=0 AND EXISTS(SELECT 1 FROM peer_known k WHERE k.peer IN (SELECT peer FROM feed_in) AND k.event=NEW.event) BEGIN
@@ -325,14 +383,45 @@ fn now_ms() -> i64 {
 }
 
 fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128
+    !id.is_empty() && id.len() <= MAX_ID_BYTES
+}
+
+/// `len` lowercase hex characters.
+fn lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn valid_digest(digest: &str) -> bool {
-    digest.len() == DIGEST_HEX_LEN
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    lower_hex(digest, DIGEST_HEX_LEN)
+}
+
+fn valid_epoch(epoch: &str) -> bool {
+    lower_hex(epoch, EPOCH_HEX_LEN)
+}
+
+/// A peer-supplied cursor is bounded before it is compared or stored
+/// (invariant 22): a feed epoch, or empty (the peer has no record, or is
+/// re-reading our feed); an id of at most `MAX_ID_BYTES` (empty at the
+/// start); a seq that is not negative.
+fn well_formed_cursor(cursor: &Cursor) -> bool {
+    (cursor.epoch.is_empty() || valid_epoch(&cursor.epoch))
+        && cursor.id.len() <= MAX_ID_BYTES
+        && cursor.seq >= 0
+}
+
+/// A stored payload as a feed entry carries it: the parsed event (`None`
+/// when the text does not parse), the digest of its canonical serialization
+/// and that serialization's length (what the receiver re-serializes and
+/// checks). For text `commit` or staging wrote, this is the text itself.
+fn canonical(payload: &str) -> Result<(Option<Event>, String, usize)> {
+    let Ok(event) = serde_json::from_str::<Event>(payload) else {
+        return Ok((None, feed::digest(payload), payload.len()));
+    };
+    let text = serde_json::to_string(&event)?;
+    Ok((Some(event), feed::digest(&text), text.len()))
 }
 
 fn capped(n: i64) -> u64 {
@@ -446,7 +535,9 @@ struct PeerView {
     /// Inbox rows staged from this peer, by state.
     source: InboxCounts,
     rejected: u64,
-    /// Ids this peer's feed listed that we still lack.
+    /// Ids this peer's feed listed that we still lack, except those the peer
+    /// since reported `unknown` (it no longer has them to give; they are
+    /// asked again after `NEED_RETRY_MS`).
     needs: u64,
     /// Entries of our feed after the peer's cursor of it: what the peer has
     /// still to read, elided or not (exact, capped at `COUNT_CAP`).
@@ -467,14 +558,14 @@ impl PeerView {
     /// Entries of the peer's feed after our cursor (an upper bound when the
     /// peer's feed has gaps: private events and deleted rows hold seqs).
     fn remaining(&self) -> u64 {
-        capped(self.remote_tip() - self.cursor_in())
+        capped(self.remote_tip().saturating_sub(self.cursor_in()))
     }
     fn to_receive(&self) -> u64 {
         self.remaining().saturating_add(self.needs).min(COUNT_CAP)
     }
     /// §6.3.6 `metadata.caught_up`: our cursor is at the peer's tip, no inbox
     /// row sourced from the peer is still pending, and nothing its feed
-    /// listed is still missing here.
+    /// listed is still missing here (and still to be had from it).
     fn metadata_caught_up(&self) -> bool {
         self.row.is_some()
             && self.remaining() == 0
@@ -610,7 +701,7 @@ impl Store {
     pub fn build_exchange_request(&self, route: &SyncRoute) -> Result<MetaExchangeRequest> {
         self.check_route(route)?;
         let peer = route.remote_replica.as_str();
-        self.feed_read(|| {
+        let request = self.feed_read(|| {
             let out = self.out_row(peer)?;
             let page =
                 self.page_after(out.as_ref(), peer, MAX_PAGE_ENTRIES, MAX_PAGE_BYTES, true)?;
@@ -625,7 +716,19 @@ impl Store {
                 need: self.need_list(peer)?,
                 state: self.feed_state()?,
             })
-        })
+        })?;
+        // The dialer's `feed-apply` summary reports what this request sent.
+        let mut sent = page_sent(&request.page);
+        sent.bytes = request.need.iter().fold(sent.bytes, |bytes, id| {
+            bytes.saturating_add(id.len() as u64 + 3)
+        });
+        remember_offer(Offer {
+            request: request.request.clone(),
+            repo: self.repo.clone(),
+            peer: peer.to_owned(),
+            sent,
+        });
+        Ok(request)
     }
     /// `feed-exchange` (§6.3.5 step 2), on the acceptor: stage the request
     /// page (§6.3.4), record the dialer's cursor of our feed (regression
@@ -656,6 +759,10 @@ impl Store {
         ensure!(
             req.need.iter().all(|id| valid_id(id)),
             "PROTOCOL_VIOLATION: malformed need id"
+        );
+        ensure!(
+            req.cursor.as_ref().is_none_or(well_formed_cursor),
+            "PROTOCOL_VIOLATION: malformed feed cursor"
         );
         let peer = route.remote_replica.as_str();
         let before = self.feed_read(|| self.marks(peer))?;
@@ -755,6 +862,14 @@ impl Store {
             reply.unknown.iter().all(|id| valid_id(id)),
             "PROTOCOL_VIOLATION: malformed unknown id"
         );
+        let expected = match &reply.page_status {
+            PageStatus::CursorMismatch { expected } => Some(expected),
+            _ => None,
+        };
+        ensure!(
+            well_formed_cursor(&reply.cursor) && expected.is_none_or(well_formed_cursor),
+            "PROTOCOL_VIOLATION: malformed feed cursor"
+        );
         let peer = route.remote_replica.as_str();
         let before = self.feed_read(|| self.marks(peer))?;
         let mut received = self.feed_write(|| {
@@ -773,7 +888,9 @@ impl Store {
         received.bytes = received
             .bytes
             .saturating_add(ENTRY_OVERHEAD * reply.page.entries.len() as u64 + MESSAGE_OVERHEAD);
-        self.feed_read(|| self.apply_result(peer, &received, &Sent::default(), before))
+        // What our request sent (recorded by `build_exchange_request`).
+        let sent = take_offer(request_id, &self.repo, peer);
+        self.feed_read(|| self.apply_result(peer, &received, &sent, before))
     }
     /// Per-peer feed counters for the heartbeat (`PeerFeedCounters`).
     /// `last_exchange_ms` is when our record of the peer last changed.
@@ -1002,16 +1119,18 @@ impl Store {
             let id: String = row.get(1)?;
             let payload: String = row.get(2)?;
             self.count_payload_read();
+            // The digest (and size) of the canonical serialization, which
+            // receivers check (module docs).
+            let (event, digest, len) = canonical(&payload)?;
             let mut entry = FeedEntry {
                 seq,
-                digest: feed::digest(&payload),
+                digest,
                 id,
                 event: None,
                 large: None,
             };
             let mut last = false;
             if !self.peer_knows(peer, &entry.id)? {
-                let len = payload.len();
                 if len > LARGE_EVENT_BYTES && !inline_large {
                     entry.large = Some(len as u64);
                 } else {
@@ -1022,7 +1141,9 @@ impl Store {
                     }
                     used += len;
                     last = len > LARGE_EVENT_BYTES;
-                    entry.event = Some(serde_json::from_str(&payload)?);
+                    entry.event = Some(event.with_context(|| {
+                        format!("INVALID_STORE_METADATA: unreadable payload of {}", entry.id)
+                    })?);
                 }
             }
             through = Cursor {
@@ -1502,10 +1623,18 @@ impl Store {
         }
         Ok(None)
     }
-    /// Forget what `peer` is known to hold: delete its `peer_known` rows and
-    /// recompute every outbox ack from the evidence left (withdrawn events
-    /// are queued again; the port of `remember_peer_inventory`'s re-queue).
+    /// Forget what `peer` is known to hold, when its feed restarts (a reset
+    /// page) or it regressed: delete its `peer_known` rows and recompute
+    /// every outbox ack from the evidence left (withdrawn events are queued
+    /// again; the port of `remember_peer_inventory`'s re-queue), and delete
+    /// its `feed_needs`: what its old feed listed (it may have lost those
+    /// events, which would keep its metadata from ever catching up) and its
+    /// `unknown` answers. The re-read of its feed lists again what it still
+    /// has.
     fn forget_peer(&self, peer: &str) -> Result<()> {
+        self.db
+            .prepare_cached("DELETE FROM feed_needs WHERE peer=?")?
+            .execute([peer])?;
         let removed = self
             .db
             .execute("DELETE FROM peer_known WHERE peer=?", [peer])?;
@@ -1569,15 +1698,43 @@ impl Store {
         }
         Ok(regressed)
     }
-    /// Ids `peer` reported unknown: not asked again for `NEED_RETRY_MS`.
+    /// Ids `peer` reported unknown: not asked again for `NEED_RETRY_MS`, and
+    /// a listed one no longer counts as outstanding (`PeerView::needs`).
+    /// Only ids we could have asked for are recorded (invariant 22): a need
+    /// of `peer` we hold, or a missing parent of a waiting row (a `parent`
+    /// mark). Marks that expired, which suppress nothing, are dropped first.
     fn mark_unknown(&self, peer: &str, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let now = now_ms();
+        self.db
+            .prepare_cached("DELETE FROM feed_needs WHERE peer=? AND reason=? AND missing_at<=?")?
+            .execute(params![
+                peer,
+                NEED_PARENT,
+                now.saturating_sub(NEED_RETRY_MS)
+            ])?;
         for id in ids {
-            self.db.execute(
-                "INSERT INTO feed_needs(peer,event,reason,requested_ms,missing_at,seq,digest) VALUES(?,?,?,?,?,0,NULL)
-                ON CONFLICT(peer,event) DO UPDATE SET missing_at=excluded.missing_at",
-                params![peer, id, NEED_PARENT, now, now],
-            )?;
+            let marked = self
+                .db
+                .prepare_cached("UPDATE feed_needs SET missing_at=? WHERE peer=? AND event=?")?
+                .execute(params![now, peer, id])?;
+            if marked > 0 {
+                continue;
+            }
+            let waited_on: bool = self
+                .db
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM incoming_waits WHERE parent=?)")?
+                .query_row([id], |r| r.get(0))?;
+            if waited_on {
+                self.db
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO feed_needs(peer,event,reason,requested_ms,missing_at,seq,digest)
+                        VALUES(?,?,?,?,?,0,NULL)",
+                    )?
+                    .execute(params![peer, id, NEED_PARENT, now, now])?;
+            }
         }
         Ok(())
     }
@@ -1690,9 +1847,13 @@ impl Store {
             .db
             .prepare_cached("SELECT count(*) FROM feed_rejected WHERE peer=?")?
             .query_row([peer], |r| r.get(0))?;
+        // Listed ids the peer reported unknown are not outstanding: it lost
+        // them, or they were never its to give.
         let needs: i64 = self
             .db
-            .prepare_cached("SELECT count(*) FROM feed_needs WHERE peer=? AND reason IN (?,?)")?
+            .prepare_cached(
+                "SELECT count(*) FROM feed_needs WHERE peer=? AND reason IN (?,?) AND missing_at IS NULL",
+            )?
             .query_row(params![peer, NEED_LISTED[0], NEED_LISTED[1]], |r| r.get(0))?;
         Ok(PeerView {
             row: self.in_row(peer)?,
@@ -1759,7 +1920,8 @@ fn page_sent(page: &FeedPage) -> Sent {
 }
 
 /// Structural checks of a received page: bounded (invariant 22), one epoch,
-/// an ordered range after its cursor.
+/// an ordered range after its cursor, a tip that is not negative (probes
+/// included: the tip is stored and subtracted from).
 fn check_page(page: &FeedPage) -> Result<()> {
     ensure!(
         page.entries.len() <= MAX_PAGE_ENTRIES,
@@ -1767,8 +1929,17 @@ fn check_page(page: &FeedPage) -> Result<()> {
         page.entries.len()
     );
     ensure!(
-        !page.epoch.is_empty(),
-        "PROTOCOL_VIOLATION: a feed page names its epoch"
+        valid_epoch(&page.epoch),
+        "PROTOCOL_VIOLATION: a feed page names its epoch ({EPOCH_HEX_LEN} hex characters)"
+    );
+    ensure!(
+        page.tip >= 0,
+        "PROTOCOL_VIOLATION: negative feed tip {}",
+        page.tip
+    );
+    ensure!(
+        well_formed_cursor(&page.through) && page.after.as_ref().is_none_or(well_formed_cursor),
+        "PROTOCOL_VIOLATION: malformed feed page cursor"
     );
     let Some(after) = &page.after else {
         ensure!(

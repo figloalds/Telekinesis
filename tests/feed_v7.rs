@@ -27,8 +27,8 @@ use tkfs::{
         errors::{ErrorClass, code_of},
         ipc::WorkerHeartbeat,
         protocol::feed::{
-            Cursor, FeedApplyResult, LARGE_EVENT_BYTES, MAX_NEED, MAX_PAGE_BYTES, MAX_PAGE_ENTRIES,
-            MetaExchangeReply, MetaExchangeRequest, PageStatus,
+            self, Cursor, FeedApplyResult, LARGE_EVENT_BYTES, MAX_NEED, MAX_PAGE_BYTES,
+            MAX_PAGE_ENTRIES, MetaExchangeReply, MetaExchangeRequest, PageStatus,
         },
     },
     paired_sync::SyncRoute,
@@ -925,6 +925,87 @@ fn digest_mismatch_no_ack() {
     assert!(!peer_known(&b, &a).contains(&w.id));
 }
 
+/// Rewrite the stored payload of `event` as equivalent JSON that is not
+/// `serde_json`'s serialization of the `Event` (sorted keys, the empty
+/// `dependencies` and `reviewed` left out): what an older build or another
+/// tool may have written.
+fn store_non_canonical(s: &Store, event: &str) {
+    let payload: String =
+        s.db.query_row("SELECT payload FROM events WHERE id=?", [event], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let mut value: Value = serde_json::from_str(&payload).unwrap();
+    let object = value.as_object_mut().unwrap();
+    for key in ["dependencies", "reviewed"] {
+        if object[key].as_array().is_some_and(Vec::is_empty) {
+            object.remove(key);
+        }
+    }
+    let text = value.to_string();
+    assert_ne!(text, payload);
+    assert_eq!(
+        serde_json::from_str::<Event>(&text).unwrap(),
+        serde_json::from_str::<Event>(&payload).unwrap()
+    );
+    s.db.execute(
+        "UPDATE events SET payload=? WHERE id=?",
+        params![text, event],
+    )
+    .unwrap();
+}
+
+#[test]
+fn non_canonical_stored_payloads_travel_and_are_acked() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    a.create("plain", "directory").unwrap();
+    let plain = a.journal_id_at(a.feed_tip().unwrap()).unwrap().unwrap();
+    let big = big_event(&a, "-", 400);
+    a.commit(big.clone(), true).unwrap();
+    for event in [&plain, &big.id] {
+        store_non_canonical(&a, event);
+    }
+    // Entries, payload-bearing, large or elided, carry the digest of the
+    // canonical serialization, which is what receivers check.
+    let canonical = |event: &str| {
+        let event = a
+            .events()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == event)
+            .unwrap();
+        feed::digest(&serde_json::to_string(&event).unwrap())
+    };
+    let start = Cursor::start(&a.feed_epoch().unwrap());
+    a.db.execute("INSERT INTO peer_known SELECT 'q',id FROM events", [])
+        .unwrap();
+    for peer in ["p", "q"] {
+        let page = a
+            .feed_page(Some(&start), peer, 100, MAX_PAGE_BYTES)
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        for entry in &page.entries {
+            assert_eq!(entry.digest, canonical(&entry.id), "{peer}: {}", entry.id);
+        }
+    }
+    // The plain event travels in a page, the large one through `need`; both
+    // stage, activate and are acked from B's (canonical) echo.
+    settle(&mut b, &mut a);
+    assert!(
+        rejected_codes(&b, &a).is_empty(),
+        "{:?}",
+        rejected_codes(&b, &a)
+    );
+    assert!(rejected_codes(&a, &b).is_empty());
+    assert_converged(&[&a, &b]);
+    assert!(shared(&b).contains(&plain) && shared(&b).contains(&big.id));
+    assert_eq!(peer_known(&a, &b), shared(&a));
+    assert!(b.feed_gate(&a.device).unwrap().caught_up);
+}
+
 // ---------------------------------------------------------------------------
 // Need
 
@@ -998,6 +1079,108 @@ fn unknown_parent_reported() {
             .any(|w| w == "1 event waiting for parents")
     );
     assert_eq!(b.inbox_counts().unwrap().waiting, 1);
+}
+
+/// `s`'s `feed_needs` rows for `peer`: `(event, reason, reported unknown)`.
+fn needs_of(s: &Store, peer: &Store) -> Vec<(String, String, bool)> {
+    s.db.prepare("SELECT event,reason,missing_at FROM feed_needs WHERE peer=? ORDER BY event")
+        .unwrap()
+        .query_map([&peer.device], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, Option<i64>>(2)?.is_some()))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn a_listed_need_the_source_lost_does_not_wedge_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let (a_root, snapshot) = (dir.path().join("a"), dir.path().join("a-snapshot"));
+    let mut a = create(&a_root, &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    a.create("base", "directory").unwrap();
+    settle(&mut b, &mut a);
+    assert_converged(&[&a, &b]);
+    drop(a);
+    copy_dir(&a_root, &snapshot).unwrap();
+    let mut a = reopen(&a_root, &repo);
+    // A commits a large event; B's next exchange lists it (a need).
+    let big = big_event(&a, "-", 400);
+    a.commit(big.clone(), true).unwrap();
+    let round = exchange(&b, &a);
+    assert!(
+        round
+            .reply
+            .page
+            .entries
+            .iter()
+            .any(|e| e.id == big.id && e.large.is_some())
+    );
+    assert_eq!(
+        needs_of(&b, &a),
+        vec![(big.id.clone(), "large".to_owned(), false)]
+    );
+    assert_eq!(b.peer_feed_counters(&a.device).unwrap().to_receive, 1);
+    // A is restored from before it: A's feed no longer has it. The reset of
+    // A's feed drops what the old feed listed; B catches up with A again.
+    drop(a);
+    std::fs::remove_dir_all(&a_root).unwrap();
+    copy_dir(&snapshot, &a_root).unwrap();
+    let mut a = reopen(&a_root, &repo);
+    let mut resets = 0;
+    for _ in 0..12 {
+        let round = exchange(&b, &a);
+        resets += usize::from(round.reply.page.reset);
+        activate(&mut a);
+        activate(&mut b);
+    }
+    assert_eq!(resets, 1);
+    assert!(needs_of(&b, &a).is_empty(), "{:?}", needs_of(&b, &a));
+    let gate = b.feed_gate(&a.device).unwrap();
+    assert!(gate.caught_up && gate.waiting_on.is_empty(), "{gate:?}");
+    let counters = b.peer_feed_counters(&a.device).unwrap();
+    assert!(
+        counters.caught_up && counters.to_receive == 0,
+        "{counters:?}"
+    );
+    assert_converged(&[&a, &b]);
+    assert!(!shared(&b).contains(&big.id));
+}
+
+#[test]
+fn a_listed_need_reported_unknown_is_not_outstanding() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    a.create("one", "directory").unwrap();
+    a.create("two", "directory").unwrap();
+    // A's page lists a large event A cannot serve (here: a tampered entry).
+    let phantom = "phantom-large".to_owned();
+    let listed = phantom.clone();
+    let round = exchange_with(&b, &a, move |reply| {
+        let entry = reply.page.entries.last_mut().unwrap();
+        entry.id = listed;
+        entry.digest = "0".repeat(16);
+        entry.event = None;
+        entry.large = Some(300_000);
+    });
+    assert_eq!(round.applied.summary.to_receive, 1);
+    assert!(!round.applied.summary.caught_up);
+    let round = exchange(&b, &a);
+    assert_eq!(round.request.need, vec![phantom.clone()]);
+    assert_eq!(round.reply.unknown, vec![phantom.clone()]);
+    activate(&mut b);
+    // A has nothing more to give: B's view of A is caught up.
+    let counters = b.peer_feed_counters(&a.device).unwrap();
+    assert_eq!(counters.to_receive, 0, "{counters:?}");
+    assert!(counters.caught_up);
+    let round = exchange(&b, &a);
+    assert!(round.request.need.is_empty(), "asked again only later");
+    assert!(round.applied.summary.caught_up && round.applied.gate.caught_up);
+    assert_eq!(needs_of(&b, &a), vec![(phantom, "large".to_owned(), true)]);
 }
 
 /// One event creating `dirs` directories with long multi-byte names (about
@@ -1399,6 +1582,90 @@ fn oversized_or_malformed_messages_are_refused_whole() {
     assert_eq!(b.inbox_counts().unwrap().total(), 3);
 }
 
+#[test]
+fn peer_supplied_values_are_bounded_before_they_are_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    let c = create(&dir.path().join("c"), &repo);
+    linear_history(&mut a, 3).unwrap();
+    settle(&mut b, &mut a);
+    let code = |e: anyhow::Error| code_of(&e);
+    let handle = |from: &Store, request: &MetaExchangeRequest| {
+        a.handle_exchange_request(&route(&a, from), request)
+            .map(|_| ())
+    };
+    let huge = "z".repeat(1 << 20);
+    // A probe with a negative tip (stored, then subtracted from our cursor).
+    let mut probe = b.build_exchange_request(&route(&b, &a)).unwrap();
+    probe.page.after = None;
+    probe.page.entries.clear();
+    probe.page.reset = false;
+    probe.page.tip = i64::MIN;
+    assert_eq!(code(handle(&b, &probe).unwrap_err()), "PROTOCOL_VIOLATION");
+    let counters = a.peer_feed_counters(&b.device).unwrap();
+    assert!(counters.cursor_seq > 0 && counters.remote_tip >= 0);
+    // A first contact naming an epoch that is not one (it would be stored).
+    let mut first = c.build_exchange_request(&route(&c, &a)).unwrap();
+    assert!(first.page.after.is_none());
+    first.page.epoch = huge.clone();
+    first.page.through.epoch = huge.clone();
+    assert_eq!(code(handle(&c, &first).unwrap_err()), "PROTOCOL_VIOLATION");
+    assert!(a.feed_peers().unwrap().iter().all(|peer| *peer != c.device));
+    // Oversized cursor ids, in a request (a seq-0 cursor is valid whatever
+    // its id) and in a reply.
+    let mut request = b.build_exchange_request(&route(&b, &a)).unwrap();
+    let mut cursor = Cursor::start(&a.feed_epoch().unwrap());
+    cursor.id = huge.clone();
+    request.cursor = Some(cursor);
+    assert_eq!(
+        code(handle(&b, &request).unwrap_err()),
+        "PROTOCOL_VIOLATION"
+    );
+    let request = b.build_exchange_request(&route(&b, &a)).unwrap();
+    let (reply, _) = a.handle_exchange_request(&route(&a, &b), &request).unwrap();
+    let apply = |reply: &MetaExchangeReply| {
+        b.apply_exchange_reply(&route(&b, &a), &request.request, reply)
+            .map(|_| ())
+    };
+    let mut long_id = reply.clone();
+    long_id.cursor.id = huge.clone();
+    assert_eq!(code(apply(&long_id).unwrap_err()), "PROTOCOL_VIOLATION");
+    let mut long_epoch = reply.clone();
+    long_epoch.page_status = PageStatus::CursorMismatch {
+        expected: Cursor {
+            epoch: huge.clone(),
+            seq: 1,
+            id: "x".into(),
+        },
+    };
+    assert_eq!(code(apply(&long_epoch).unwrap_err()), "PROTOCOL_VIOLATION");
+    // `unknown` ids we never asked for are not recorded.
+    let mut unasked = reply.clone();
+    unasked.unknown = (0..MAX_NEED).map(|_| id()).collect();
+    apply(&unasked).unwrap();
+    assert!(needs_of(&b, &a).is_empty());
+    // A missing parent of a waiting row is; an expired mark is dropped.
+    let mut orphan = mkdir_event(&a, "orphan");
+    orphan.dependencies.push("phantom-parent".into());
+    inject(&a, &orphan);
+    exchange(&b, &a);
+    b.db.execute(
+        "INSERT INTO feed_needs(peer,event,reason,requested_ms,missing_at) VALUES(?,'expired','parent',0,0)",
+        [&a.device],
+    )
+    .unwrap();
+    let round = exchange_with(&b, &a, |reply| {
+        reply.unknown.extend((0..100).map(|_| id()));
+    });
+    assert_eq!(round.request.need, vec!["phantom-parent".to_owned()]);
+    assert_eq!(
+        needs_of(&b, &a),
+        vec![("phantom-parent".to_owned(), "parent".to_owned(), true)]
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The worker RPC seam (`runtime::sync_rpc`)
 
@@ -1617,4 +1884,73 @@ fn mutual_dialing_converges_without_false_regressions() {
     }
     assert_converged(&[&a, &b]);
     assert_eq!(shared(&a).len(), 24);
+}
+
+#[test]
+fn the_dialer_summary_counts_what_its_request_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    linear_history_named(&mut b, "b", 4).unwrap();
+    // The first request is a probe; the second carries B's four payloads.
+    let probe = exchange(&b, &a);
+    assert_eq!(probe.applied.summary.sent_events, 0);
+    let round = exchange(&b, &a);
+    assert_eq!(round.request_payloads(), 4);
+    assert_eq!(round.local.summary.received_events, 4);
+    let sent = &round.applied.summary;
+    assert_eq!(sent.sent_events, 4);
+    let payload: usize = round
+        .request
+        .page
+        .entries
+        .iter()
+        .filter_map(|e| e.event.as_ref())
+        .map(|e| serde_json::to_string(e).unwrap().len())
+        .sum();
+    assert!(sent.bytes_up > payload as u64, "{} bytes up", sent.bytes_up);
+    assert!(sent.metadata_advanced);
+    // Idle rounds send nothing.
+    activate(&mut a);
+    settle(&mut b, &mut a);
+    let idle = exchange(&b, &a);
+    assert_eq!(idle.applied.summary.sent_events, 0);
+    assert!(!idle.applied.summary.metadata_advanced);
+    // A reply to a request this process did not build (a restarted worker)
+    // counts nothing sent.
+    linear_history_named(&mut b, "late", 2).unwrap();
+    let mut request = b.build_exchange_request(&route(&b, &a)).unwrap();
+    assert_eq!(
+        request
+            .page
+            .entries
+            .iter()
+            .filter(|e| e.event.is_some())
+            .count(),
+        2
+    );
+    request.request = id();
+    let (reply, _) = a.handle_exchange_request(&route(&a, &b), &request).unwrap();
+    let summary = b
+        .apply_exchange_reply(&route(&b, &a), &request.request, &reply)
+        .unwrap()
+        .summary;
+    assert_eq!(summary.sent_events, 0);
+    // Through the worker RPC (offer and apply on pooled stores).
+    let a = worker(&dir.path().join("wa"), &repo);
+    let b = worker(&dir.path().join("wb"), &repo);
+    for name in ["x", "y"] {
+        b.engine
+            .lock()
+            .unwrap()
+            .store
+            .create(name, "directory")
+            .unwrap();
+    }
+    rpc_round(&b, &a);
+    let (request, _, applied) = rpc_round(&b, &a);
+    assert_eq!(request["page"]["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(applied["summary"]["sent_events"], 2);
+    assert!(applied["summary"]["bytes_up"].as_u64().unwrap() > 0);
 }
