@@ -1,4 +1,4 @@
-//! Owned by WP1.4.
+//! Owned by WP1.4; WP2.3 in Wave 2.
 //!
 //! The worker's loopback RPC server (REVAMP_PLAN §4.1, §6.1): a blocking
 //! accept loop that never gives up on transient errors, one thread per
@@ -6,6 +6,16 @@
 //! request, and the IPC v3 ops (`hello`, `watch`, `stop{mode}`,
 //! `mount-attach`/`-detach`/`-status`, `revalidate`, `published-summary`, prefix routing for
 //! `feed-*` and `objects.*`) next to the legacy ones.
+//!
+//! WP2.3: `status` is served from the status cell without the engine lock
+//! (`worker::status_cell::reply`; never `WORKER_BUSY`, never the old
+//! busy/stale fallback), and every mutating request refreshes the cell before
+//! it replies (read-your-writes). Pending-save retries and filesystem
+//! notifications left this server: the maintenance and notifier threads own
+//! them (the old 250 ms recovery loop is gone). The legacy `start_rpc`
+//! wrapper starts the heartbeat, maintenance and notifier threads, but no
+//! background activator, so in-process callers keep the legacy bounded
+//! activation of `published-*` (≤ 32 events per metadata exchange).
 //!
 //! Crash-only internals: a request that panics while holding the engine
 //! poisons it, and the poison policy (`runtime::lock_engine`) then persists
@@ -20,8 +30,8 @@
 //! attached after its stop.
 use super::{
     Discovery, EngineGuard, EngineVitals, Shared, check_engine_poison, content::fetch_verified,
-    ctx::WorkerCtx, export::export_bucket, lock_engine_tracked, notify::deliver_notifications,
-    objects_rpc, published::published_rpc, register_worker, sync_rpc, try_lock_engine,
+    ctx::WorkerCtx, export::export_bucket, lock_engine_tracked, objects_rpc,
+    published::published_rpc, register_worker, sync_rpc, try_lock_engine,
 };
 use crate::{
     core::*,
@@ -55,17 +65,40 @@ use std::{
 /// How long the accept-error exit waits for the engine before it exits
 /// without retaining ([`Core::exit_after_accept_errors`]).
 const EXIT_RETAIN_WAIT: Duration = Duration::from_secs(2);
+/// `revalidate` activates what it re-queued in one bounded pass (the legacy
+/// lane receive budget, WP1.INT task 1).
+const REVALIDATE_ACTIVATION_EVENTS: usize = 32;
+const REVALIDATE_ACTIVATION_MS: u64 = 50;
+/// How long `revalidate` waits for the background activator's pass over the
+/// rows it re-queued (the request holds no engine lock meanwhile).
+pub const REVALIDATE_WAIT: Duration = Duration::from_secs(1);
+/// `Engine::control` ops that change nothing (no status refresh after them).
+const READ_ONLY_CONTROL_OPS: &[&str] = &[
+    "status",
+    "folder-details",
+    "preview-object",
+    "branches",
+    "conflicts",
+    "history",
+    "state",
+    "cat-object",
+    "events",
+];
 
 /// Legacy entry point (in-process tests and tools): builds a minimal
-/// `WorkerCtx` (unsupervised, no previous record, no activator), starts the
-/// RPC server and the heartbeat, and publishes `runtime.json` with `mount`
-/// (as given: callers pass an absolute path, as the legacy worker did).
+/// `WorkerCtx` (unsupervised, no previous record), starts the RPC server, the
+/// heartbeat, maintenance and notifier threads (no background activator: a
+/// `published-*` exchange keeps its legacy bounded activation), and publishes
+/// `runtime.json` with `mount` (as given: callers pass an absolute path, as
+/// the legacy worker did).
 pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<Discovery> {
     let ctx = crate::worker::build_ctx(engine, state, false, None);
     let server = start_rpc_server(ctx.clone())?;
-    // The heartbeat first, as in `worker::run`: nothing is published by a
-    // call that then fails.
-    crate::worker::heartbeat::spawn(ctx, server.vitals().clone())?;
+    // The threads first, as in `worker::run`: nothing is published by a call
+    // that then fails.
+    crate::worker::heartbeat::spawn(ctx.clone(), server.vitals().clone())?;
+    crate::worker::maintenance::spawn(ctx.clone())?;
+    super::notify::spawn_notifier(ctx)?;
     server.publish(mount)
 }
 
@@ -81,10 +114,12 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     register_worker(&ctx);
-    let (observation, vitals) = {
-        let e = lock_engine_tracked(&ctx.engine);
-        (e.observation.clone(), e.vitals.clone())
-    };
+    let vitals = lock_engine_tracked(&ctx.engine).vitals.clone();
+    // The first status cell: the counters now (no content scan before
+    // Ready); the first `status` reply computes the content unless
+    // maintenance has by then.
+    crate::worker::status_cell::refresh_cheap(&ctx)?;
+    crate::worker::status_cell::want_content(&ctx);
     let discovery = Discovery {
         format: 2,
         address: format!("ws://{address}"),
@@ -102,7 +137,6 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         },
         ctx,
         vitals,
-        observation,
         discovery,
         address,
         stop: Notify::new(),
@@ -112,10 +146,6 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         reply_flushed: Condvar::new(),
         connections: AtomicU64::new(0),
     });
-    let recovery = core.clone();
-    thread::Builder::new()
-        .name("recovery".into())
-        .spawn(move || recovery.recovery_loop())?;
     let accept = core.clone();
     thread::Builder::new()
         .name("rpc-accept".into())
@@ -208,8 +238,6 @@ struct StopReplyState {
 struct Core {
     ctx: Arc<WorkerCtx>,
     vitals: Arc<EngineVitals>,
-    /// The legacy busy-status observation (`Engine::publish_observation`).
-    observation: Arc<Mutex<Value>>,
     bulk: crate::bulk_sync::Worker,
     /// This server's discovery with `mount: None`.
     discovery: Discovery,
@@ -233,25 +261,6 @@ struct Handled {
 }
 
 impl Core {
-    /// The 250 ms recovery loop (unchanged duty): retry pending saves, publish
-    /// the observation, deliver filesystem notifications. A panic is contained;
-    /// if it poisoned the engine, the poison policy runs.
-    fn recovery_loop(&self) {
-        while !self.ctx.stopping.load(Ordering::Relaxed) {
-            thread::sleep(Duration::from_millis(250));
-            let tick = catch_unwind(AssertUnwindSafe(|| {
-                if let Some(mut e) = try_lock_engine(&self.ctx.engine) {
-                    let _ = e.retry_pending();
-                    e.publish_observation();
-                }
-                deliver_notifications(&self.ctx.engine);
-            }));
-            if tick.is_err() {
-                check_engine_poison(&self.ctx.engine);
-            }
-        }
-    }
-
     /// Blocking accept, one thread per connection. Never exits on an error:
     /// log, pause 100 ms, and after 50 consecutive errors retain the dirty
     /// sessions and exit 70 ([`Core::exit_after_accept_errors`]). Returns only
@@ -349,7 +358,7 @@ impl Core {
     }
 
     /// One connection: a persistent request loop. Notifications are delivered
-    /// by the recovery loop, never on the reply path.
+    /// by the notifier thread, never on the reply path.
     fn serve(&self, stream: TcpStream) {
         let Ok(mut socket) = crate::ws::accept(stream) else {
             return;
@@ -417,7 +426,7 @@ impl Core {
             // `Store::revalidate` (WP1.6), wired by WP1.INT (§14 WP1.INT task 1).
             ops::REVALIDATE => self.revalidate(payload),
             ops::PUBLISHED_SUMMARY => self.published_summary(),
-            ops::STATUS => self.status(request, payload),
+            ops::STATUS => self.status(),
             op if op.starts_with(ops::FEED_PREFIX) => sync_rpc::dispatch(&self.ctx, op, payload),
             op if op.starts_with(ops::OBJECTS_PREFIX) => {
                 let (header, body) = objects_rpc::dispatch(&self.ctx, op, payload, &[])
@@ -432,18 +441,28 @@ impl Core {
             op if op.starts_with("published-bulk-") => {
                 crate::bulk_sync::worker_control(&self.bulk, payload)
             }
-            op if op.starts_with("published-") => published_rpc(&self.ctx.engine, payload),
+            op if op.starts_with("published-") => published_rpc(&self.ctx, &self.vitals, payload),
             "preview-object" | "cat-object" => self.object(op, payload),
             "bucket-export" => export_bucket(&self.ctx.engine, payload),
             "checkout" => {
                 let mounted = self.engine()?.mounted;
-                if mounted {
+                let result = if mounted {
                     crate::mount::checkout(&self.ctx.engine, request, payload)
                 } else {
                     self.engine()?.control(request, payload)
-                }
+                };
+                crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+                result
             }
-            _ => self.engine()?.control(request, payload),
+            op => {
+                let result = self.engine()?.control(request, payload);
+                if !READ_ONLY_CONTROL_OPS.contains(&op) {
+                    // Journaled mutations, demand (`request-object`) and
+                    // anything unknown: refreshed before the reply.
+                    crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+                }
+                result
+            }
         }
     }
 
@@ -454,15 +473,6 @@ impl Core {
         let guard = lock_engine_tracked(&self.ctx.engine);
         fault::trigger("engine.poison")?;
         Ok(guard)
-    }
-
-    /// [`Core::engine`] without waiting: `None` while another thread holds it.
-    fn try_engine(&self) -> Result<Option<EngineGuard<'_>>> {
-        let Some(guard) = try_lock_engine(&self.ctx.engine) else {
-            return Ok(None);
-        };
-        fault::trigger("engine.poison")?;
-        Ok(Some(guard))
     }
 
     fn contact(&self) {
@@ -651,36 +661,63 @@ impl Core {
     /// `revalidate{ids?}` (§6.1, wired by WP1.INT): re-queue quarantined,
     /// blocked and retry inbox rows (all, or `ids` and the rows blocked on
     /// them) through `Store::revalidate`, then activate what is now ready in
-    /// one bounded pass, as a legacy lane's receive does (≤ 32 events,
-    /// ≤ 50 ms, with the engine's namespace notifications and session
-    /// refresh). Whatever is left activates on the next receive (or WP2.3's
-    /// activator, which `ctx.activation` wakes). The rows are re-queued
-    /// durably before the activation, so an activation failure is logged,
-    /// not returned.
+    /// one bounded pass, as a legacy lane's receive does, so the reply
+    /// reflects that pass. While the background activator runs, the pass is
+    /// the activator's: the request wakes it and waits (without the engine,
+    /// at most [`REVALIDATE_WAIT`]) for one activator cycle that began after
+    /// the re-queue and ran its slice (a cycle whose slice found SQLite's
+    /// writer busy did nothing and does not count; re-queued rows keep their
+    /// arrival order, so they are at the head of that cycle's slice), and
+    /// nothing is activated under the
+    /// request's own engine hold (§4.4: a slow event is prepared off-lock,
+    /// never committed inline on a request). Without the activator (the
+    /// in-process `start_rpc` wrapper) the request activates inline (≤ 32
+    /// events, ≤ 50 ms, with the engine's namespace notifications and
+    /// session refresh); whatever is left activates on the next receive. The
+    /// rows are re-queued durably before the activation, so an activation
+    /// failure (or a wait that ran out) is logged, not returned.
     fn revalidate(&self, payload: &Value) -> Result<Value> {
         let RevalidateRequest { ids } = serde_json::from_value(payload.clone())?;
+        let background = self.ctx.activator_running.load(Ordering::SeqCst);
         let requeued = {
             let mut engine = self.engine()?;
             let requeued = engine.store.revalidate(ids.as_deref())?;
-            if requeued > 0 {
-                let empty = Bundle {
-                    repo: engine.store.repo.clone(),
-                    branches: vec![],
-                    events: vec![],
-                    objects: Default::default(),
-                };
-                if let Err(error) = engine.receive_peer_budget(empty, &Default::default(), Some(32))
-                {
-                    crate::util::log::event!(info, (crate::model::errors::code_of(&error)), {
-                        "site": "worker.revalidate",
-                        "requeued": requeued,
-                        "message": format!("{error:#}"),
-                    });
-                }
+            if requeued > 0
+                && !background
+                && let Err(error) =
+                    engine.activate_bounded(REVALIDATE_ACTIVATION_EVENTS, REVALIDATE_ACTIVATION_MS)
+            {
+                crate::util::log::event!(info, (crate::model::errors::code_of(&error)), {
+                    "site": "worker.revalidate",
+                    "requeued": requeued,
+                    "message": format!("{error:#}"),
+                });
             }
             requeued
         };
+        // Read after the re-queue committed: a cycle numbered past `begun`
+        // loads its slice after it.
+        let (begun, _) = self.vitals.activator_cycles();
         self.ctx.activation.poke();
+        if requeued > 0 && background {
+            let deadline = Instant::now() + REVALIDATE_WAIT;
+            while self.vitals.activator_cycles().1 <= begun
+                && self.ctx.activator_running.load(Ordering::SeqCst)
+            {
+                if Instant::now() >= deadline {
+                    crate::util::log::event!(info, REQUEST_TIMEOUT, {
+                        "site": "worker.revalidate",
+                        "requeued": requeued,
+                        "message": "the activator has not activated the re-queued rows yet",
+                    });
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        if requeued > 0 {
+            crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+        }
         Ok(json!(RevalidateReply {
             requeued: requeued as u64
         }))
@@ -704,28 +741,21 @@ impl Core {
             replica: self.ctx.device.clone(),
             label: self.ctx.repo.clone(),
             branches,
-            // The feed epoch arrives with WP2.5, the sync generation with WP2.3.
+            // The feed epoch arrives with WP2.5.
             tip: FeedTip {
                 epoch: String::new(),
                 seq,
             },
-            sync_generation: 0,
+            sync_generation: crate::worker::status_cell::sync_generation(&self.ctx, &self.vitals),
         }))
     }
 
-    /// The legacy status JSON (or, while the engine is busy, the last
-    /// observation marked `busy`/`stale`), plus the typed `mount`,
-    /// `store_health` and `heartbeat_seq` members (§6.1).
-    fn status(&self, request: &str, payload: &Value) -> Result<Value> {
-        let mut status = match self.try_engine()? {
-            Some(mut e) => e.control(request, payload)?,
-            None => {
-                let mut status = lock(&self.observation).clone();
-                status["busy"] = json!(true);
-                status["stale"] = json!(true);
-                status
-            }
-        };
+    /// The status reply (§6.1, WP2.3 task 4): the status cell plus the
+    /// engine's lock-free vitals (`worker::status_cell::reply`), and the typed
+    /// `mount`, `store_health` and `heartbeat_seq` members. Never takes the
+    /// engine lock and never answers `WORKER_BUSY`.
+    fn status(&self) -> Result<Value> {
+        let mut status = crate::worker::status_cell::reply(&self.ctx, &self.vitals)?;
         status["mount"] = json!(self.ctx.mount.status());
         status["store_health"] = json!(self.vitals.store_health());
         status["heartbeat_seq"] = json!(self.ctx.heartbeat.load().seq);

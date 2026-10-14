@@ -335,8 +335,16 @@ fn status_is_responsive_while_engine_is_busy() {
         .recv_timeout(std::time::Duration::from_secs(1))
         .unwrap()
         .unwrap();
-    assert_eq!(status["busy"], true);
-    assert_eq!(status["stale"], true);
+    // WP2.3: `status` is served from the status cell without the engine lock,
+    // so a held engine no longer turns it into the busy/stale fallback: the
+    // reply carries the full counts (it asserted `busy`/`stale` before).
+    assert!(status.get("busy").is_none(), "{status}");
+    assert!(status.get("stale").is_none(), "{status}");
+    assert_eq!(status["incoming_pending"], 0, "{status}");
+    assert_eq!(status["incoming_quarantined"], 0, "{status}");
+    assert_eq!(status["outgoing_unacknowledged"], 0, "{status}");
+    assert!(status["content"]["complete"].is_boolean(), "{status}");
+    assert!(status["inbox"].is_object(), "{status}");
     assert_eq!(status["caught_up"], false);
     drop(guard);
     client.join().unwrap();
