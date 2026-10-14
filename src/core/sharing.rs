@@ -9,6 +9,9 @@
 //! cursor `{epoch, seq, id}` that the feed's owner validates against its own
 //! journal on every exchange; `journal_epoch` changes whenever an event row is
 //! deleted (or rewritten), so a cursor never survives a journal that shrank.
+//! `feed_journal` is the feed as a table (the `journal_sequence` rows of
+//! shared events, kept by triggers), so the tip and the counts after a cursor
+//! never visit private rows.
 //!
 //! Per peer `P` (keyed by P's replica id, like `peer_known`):
 //!
@@ -71,11 +74,16 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-/// Sharing cache: counters of the feed paths (derived, disposable).
+/// Sharing cache: counters and scan positions of the feed paths (derived,
+/// disposable).
 #[derive(Default)]
 pub(crate) struct Cache {
     /// Event payload rows read to build feed pages or serve needs.
     payload_reads: Cell<u64>,
+    /// Where the next look for missing parents continues: after the waiting
+    /// row at `(received_ms, rowid)` (`None` = start over; `received_ms` is
+    /// `None` for a legacy row without one, which sorts first).
+    missing_scan: Cell<Option<(Option<i64>, i64)>>,
 }
 
 /// `schema:sharing` stamp.
@@ -135,7 +143,8 @@ fn take_offer(request: &str, repo: &str, peer: &str) -> Sent {
 
 /// `sharing::ensure_schema` (`schema:sharing=1`, REVAMP_PLAN §9, WP2.5 task 1):
 /// the `journal_epoch` config row and the triggers that regenerate it when the
-/// journal loses or rewrites a row; the per-peer feed tables; indexes on
+/// journal loses or rewrites a row; the per-peer feed tables; the
+/// `feed_journal` index of the feed (below); indexes on
 /// `incoming_sources(peer)` (per-peer inbox counts) and `feed_needs(event)`
 /// (an event that arrives clears every peer's need of it); and the
 /// `feed_outbox_known` trigger, which acks an outbox row as it is inserted
@@ -143,10 +152,25 @@ fn take_offer(request: &str, repo: &str, peer: &str) -> Sent {
 /// feed peer: no index on `peer_known(event)` to maintain per received
 /// event). Only new objects: no table changes shape. Idempotent; runs in its
 /// own savepoint.
+///
+/// `feed_journal(seq, event)` holds the `journal_sequence` rows of shared
+/// events: the feed itself, so the tip, `journal_id_at` and the counts after
+/// a cursor are rowid operations that never visit private rows (an idle
+/// exchange stays O(1) however long the private tail is). Triggers on
+/// `journal_sequence` (which `snapshot`'s triggers keep in step with every
+/// insert, update and delete of `events`) and on a branch's `shared` flag
+/// maintain it, for writes by any executable; it is built from the journal
+/// when it is created. Reads still join the event's branch, so a row that
+/// were ever stale could not put a private event on the feed.
 pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
     let db = &store.db;
     db.execute_batch("SAVEPOINT sharing_schema")?;
     let result = (|| -> Result<()> {
+        let built: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed_journal')",
+            [],
+            |r| r.get(0),
+        )?;
         db.execute_batch(
             "INSERT OR IGNORE INTO config(key,value) VALUES('journal_epoch',lower(hex(randomblob(16))));
             CREATE TRIGGER IF NOT EXISTS feed_epoch_delete AFTER DELETE ON events BEGIN
@@ -170,8 +194,34 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
             CREATE TRIGGER IF NOT EXISTS feed_outbox_known AFTER INSERT ON outbox
                 WHEN NEW.acknowledged=0 AND EXISTS(SELECT 1 FROM peer_known k WHERE k.peer IN (SELECT peer FROM feed_in) AND k.event=NEW.event) BEGIN
                 UPDATE outbox SET acknowledged=1 WHERE event=NEW.event;
+            END;
+            CREATE TABLE IF NOT EXISTS feed_journal(seq INTEGER PRIMARY KEY,event TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS feed_journal_insert AFTER INSERT ON journal_sequence BEGIN
+                INSERT OR REPLACE INTO feed_journal(seq,event) SELECT NEW.seq,NEW.event FROM events e
+                    JOIN branches b ON b.id=e.branch WHERE e.id=NEW.event AND b.shared=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS feed_journal_update AFTER UPDATE ON journal_sequence BEGIN
+                DELETE FROM feed_journal WHERE seq=OLD.seq;
+                INSERT OR REPLACE INTO feed_journal(seq,event) SELECT NEW.seq,NEW.event FROM events e
+                    JOIN branches b ON b.id=e.branch WHERE e.id=NEW.event AND b.shared=1;
+            END;
+            CREATE TRIGGER IF NOT EXISTS feed_journal_delete AFTER DELETE ON journal_sequence BEGIN
+                DELETE FROM feed_journal WHERE seq=OLD.seq;
+            END;
+            CREATE TRIGGER IF NOT EXISTS feed_journal_branch AFTER UPDATE OF shared ON branches
+                WHEN OLD.shared IS NOT NEW.shared BEGIN
+                DELETE FROM feed_journal WHERE seq IN (SELECT s.seq FROM journal_sequence s
+                    JOIN events e ON e.id=s.event WHERE e.branch=NEW.id);
+                INSERT OR REPLACE INTO feed_journal(seq,event) SELECT s.seq,s.event FROM journal_sequence s
+                    JOIN events e ON e.id=s.event WHERE e.branch=NEW.id AND NEW.shared=1;
             END;",
         )?;
+        if !built {
+            db.execute_batch(
+                "INSERT OR REPLACE INTO feed_journal(seq,event) SELECT s.seq,s.event FROM journal_sequence s
+                    JOIN events e ON e.id=s.event JOIN branches b ON b.id=e.branch WHERE b.shared=1",
+            )?;
+        }
         db.execute(
             "INSERT INTO config(key,value) VALUES('schema:sharing',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
             [SCHEMA_VERSION],
@@ -346,32 +396,46 @@ impl Store {
 // ---------------------------------------------------------------------------
 // Metadata feed, format 7 (REVAMP_PLAN §6.3; WP2.5)
 
-/// The shared feed in seq order. `CROSS JOIN` pins `journal_sequence` as the
-/// outer loop, so a page is a rowid range scan with point lookups.
+/// The feed in seq order: a `feed_journal` rowid range scan (private rows are
+/// not in it) with point lookups. `CROSS JOIN` pins `feed_journal` as the
+/// outer loop; the branch join keeps a private event off the feed even if a
+/// `feed_journal` row were stale.
 const PAGE_SQL: &str =
-    "SELECT s.seq,e.id,e.payload FROM journal_sequence s CROSS JOIN events e ON e.id=s.event
-    CROSS JOIN branches b ON b.id=e.branch WHERE s.seq>?1 AND b.shared=1 ORDER BY s.seq LIMIT ?2";
-/// The feed tip: a reverse rowid scan that stops at the first shared event.
-const TIP_SQL: &str = "SELECT s.seq FROM journal_sequence s CROSS JOIN events e ON e.id=s.event
-    CROSS JOIN branches b ON b.id=e.branch WHERE b.shared=1 ORDER BY s.seq DESC LIMIT 1";
-const ID_AT_SQL: &str = "SELECT e.id FROM journal_sequence s CROSS JOIN events e ON e.id=s.event
-    CROSS JOIN branches b ON b.id=e.branch WHERE s.seq=?1 AND b.shared=1";
-/// Shared entries after `?1`, capped at `?2`.
-const SHARED_AFTER_SQL: &str =
-    "SELECT count(*) FROM (SELECT 1 FROM journal_sequence s CROSS JOIN events e ON e.id=s.event
-    CROSS JOIN branches b ON b.id=e.branch WHERE s.seq>?1 AND b.shared=1 LIMIT ?2)";
-/// Journal rows after `?1`, capped at `?2`: a rowid range count (every row
-/// is a shared entry when the replica has no private branch).
-const ROWS_AFTER_SQL: &str =
-    "SELECT count(*) FROM (SELECT 1 FROM journal_sequence WHERE seq>?1 LIMIT ?2)";
-/// Missing parents among the oldest `?1` waits (rowid order), at most `?2`.
-/// A wait on a missing parent never resolves, so it ages to the front; waits
-/// on staged parents resolve as activation proceeds. Bounded per call.
-const MISSING_PARENTS_SQL: &str = "SELECT DISTINCT w.parent FROM (SELECT child,parent FROM incoming_waits ORDER BY rowid LIMIT ?1) w
-    JOIN incoming_events c ON c.id=w.child AND c.state='waiting'
+    "SELECT f.seq,e.id,e.payload FROM feed_journal f CROSS JOIN events e ON e.id=f.event
+    CROSS JOIN branches b ON b.id=e.branch WHERE f.seq>?1 AND b.shared=1 ORDER BY f.seq LIMIT ?2";
+/// The feed tip: the last `feed_journal` row (a rowid seek), checked shared.
+const TIP_SQL: &str = "SELECT f.seq FROM feed_journal f CROSS JOIN events e ON e.id=f.event
+    CROSS JOIN branches b ON b.id=e.branch WHERE b.shared=1 ORDER BY f.seq DESC LIMIT 1";
+const ID_AT_SQL: &str = "SELECT e.id FROM feed_journal f CROSS JOIN events e ON e.id=f.event
+    CROSS JOIN branches b ON b.id=e.branch WHERE f.seq=?1 AND b.shared=1";
+/// Feed entries after `?1`, capped at `?2`: a `feed_journal` rowid range count.
+const FEED_AFTER_SQL: &str =
+    "SELECT count(*) FROM (SELECT 1 FROM feed_journal WHERE seq>?1 LIMIT ?2)";
+/// The oldest waiting rows (`incoming_events_state` order: `received_ms`,
+/// then rowid; a legacy row without `received_ms` sorts first), at most `?1`.
+const WAITING_FIRST_SQL: &str =
+    "SELECT received_ms,rowid,id FROM incoming_events WHERE state='waiting'
+    ORDER BY received_ms,rowid LIMIT ?1";
+/// Waiting rows without `received_ms` after rowid `?1`, at most `?2`.
+const WAITING_UNTIMED_AFTER_SQL: &str = "SELECT received_ms,rowid,id FROM incoming_events
+    WHERE state='waiting' AND received_ms IS NULL AND rowid>?1 ORDER BY rowid LIMIT ?2";
+/// Waiting rows after `(?1 received_ms, ?2 rowid)` in index order, at most
+/// `?3` (an index range from `received_ms ≥ ?1`).
+const WAITING_AFTER_SQL: &str = "SELECT received_ms,rowid,id FROM incoming_events
+    WHERE state='waiting' AND received_ms>=?1 AND (received_ms,rowid)>(?1,?2)
+    ORDER BY received_ms,rowid LIMIT ?3";
+/// Parents of the waiting rows `?1` (a JSON array of ids) that are neither
+/// staged nor committed here, that peer `?2` has not had refused here
+/// (`feed_rejected`: asking again would only bring the same refusal) and
+/// has not reported unknown since `?3`; in id order, at most `?4`.
+const MISSING_PARENTS_SQL: &str = "SELECT DISTINCT w.parent FROM json_each(?1) c CROSS JOIN incoming_waits w ON w.child=c.value
     WHERE NOT EXISTS(SELECT 1 FROM incoming_events i WHERE i.id=w.parent)
-    AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=w.parent) ORDER BY w.parent LIMIT ?2";
-/// Waits one need list looks at for missing parents.
+    AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=w.parent)
+    AND NOT EXISTS(SELECT 1 FROM feed_rejected r WHERE r.peer=?2 AND r.event=w.parent)
+    AND NOT EXISTS(SELECT 1 FROM feed_needs n WHERE n.peer=?2 AND n.event=w.parent AND n.missing_at>?3)
+    ORDER BY w.parent LIMIT ?4";
+/// Waiting rows one need list looks at for missing parents (a window that
+/// moves on with every look, so every waiting row is looked at in turn).
 const MISSING_SCAN: usize = 4096;
 /// Approximate JSON bytes of one entry without its payload (seq, id, digest).
 const ENTRY_OVERHEAD: u64 = 96;
@@ -654,15 +718,14 @@ impl Store {
             .optional()?)
     }
     /// §6.3.1: `epoch == ours && seq ≤ tip && (seq == 0 || journal_id_at(seq) == id)`.
+    /// A seq where `journal_id_at` finds a shared event is at most the tip
+    /// (the newest shared event's seq), so the tip is not read separately.
     pub fn validate_cursor(&self, c: &Cursor) -> Result<bool> {
         if c.epoch != self.feed_epoch()? || c.seq < 0 {
             return Ok(false);
         }
         if c.seq == 0 {
             return Ok(true);
-        }
-        if c.seq > self.feed_tip()? {
-            return Ok(false);
         }
         Ok(self.journal_id_at(c.seq)?.as_deref() == Some(c.id.as_str()))
     }
@@ -1448,10 +1511,13 @@ impl Store {
             )?;
         }
         for (id, seq, error, payload) in rejected {
+            // A refusal again keeps the feed seq of the first one when it has
+            // none (an event served through `need` that no entry listed).
             self.db.execute(
                 "INSERT INTO feed_rejected(peer,event,seq,code,message,payload,at_ms) VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(peer,event) DO UPDATE SET seq=excluded.seq,code=excluded.code,message=excluded.message,
-                payload=coalesce(excluded.payload,feed_rejected.payload),at_ms=excluded.at_ms",
+                ON CONFLICT(peer,event) DO UPDATE SET
+                seq=CASE WHEN excluded.seq>0 THEN excluded.seq ELSE feed_rejected.seq END,code=excluded.code,
+                message=excluded.message,payload=coalesce(excluded.payload,feed_rejected.payload),at_ms=excluded.at_ms",
                 params![peer, id, seq, error.code, error.message, payload, now_ms()],
             )?;
             self.db.execute(
@@ -1742,9 +1808,11 @@ impl Store {
     /// we lack, then missing parents of waiting rows. Parents are looked for
     /// only once our cursor is at the peer's tip (while its feed streams, a
     /// feed in acceptance order brings parents before children), and only
-    /// among the oldest `MISSING_SCAN` waits (`Store::missing_parents` scans
-    /// every wait, O(staged) per offer during a large catch-up). Ids the peer
-    /// reported unknown are skipped for `NEED_RETRY_MS`.
+    /// among the next `MISSING_SCAN` waiting rows (`waiting_window`;
+    /// `Store::missing_parents` scans every wait, O(staged) per offer during
+    /// a large catch-up). A parent `peer` reported unknown is skipped for
+    /// `NEED_RETRY_MS`, and one we refused from `peer` is never asked of it
+    /// again: it would only be served and refused again, every exchange.
     fn need_list(&self, peer: &str) -> Result<Vec<String>> {
         let retry_before = now_ms().saturating_sub(NEED_RETRY_MS);
         let mut need: Vec<String> = self
@@ -1762,28 +1830,77 @@ impl Store {
             .in_row(peer)?
             .is_some_and(|row| row.cursor.seq < row.tip);
         if need.len() < MAX_NEED && !streaming {
+            let window = self.waiting_window()?;
+            if window.is_empty() {
+                return Ok(need);
+            }
             let mut listed: BTreeSet<String> = need.iter().cloned().collect();
             let parents: Vec<String> = self
                 .db
                 .prepare_cached(MISSING_PARENTS_SQL)?
-                .query_map(params![MISSING_SCAN as i64, MAX_NEED as i64], |r| r.get(0))?
+                .query_map(
+                    params![
+                        serde_json::to_string(&window)?,
+                        peer,
+                        retry_before,
+                        MAX_NEED as i64
+                    ],
+                    |r| r.get(0),
+                )?
                 .collect::<rusqlite::Result<_>>()?;
             for parent in parents {
                 if need.len() >= MAX_NEED {
                     break;
                 }
-                let recently_missing: bool = self
-                    .db
-                    .prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM feed_needs WHERE peer=? AND event=? AND missing_at>?)",
-                    )?
-                    .query_row(params![peer, parent, retry_before], |r| r.get(0))?;
-                if !recently_missing && listed.insert(parent.clone()) {
+                if listed.insert(parent.clone()) {
                     need.push(parent);
                 }
             }
         }
         Ok(need)
+    }
+    /// The ids of the next `MISSING_SCAN` waiting rows, oldest first,
+    /// continuing after the last look's window (round robin; starting over
+    /// once a window reaches the last waiting row). Only `waiting` rows: a
+    /// blocked row keeps its waits but needs nothing. Rows that never stop
+    /// waiting (on a parent nobody has, or one refused here) therefore never
+    /// hide a newer row's missing parent, however many there are. Index
+    /// ranges only: an idle replica (no waiting row) costs one seek.
+    fn waiting_window(&self) -> Result<Vec<String>> {
+        type Row = (Option<i64>, i64, String);
+        let read = |r: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        };
+        let rows_of = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<Vec<Row>> {
+            Ok(self
+                .db
+                .prepare_cached(sql)?
+                .query_map(params, read)?
+                .collect::<rusqlite::Result<_>>()?)
+        };
+        let limit = MISSING_SCAN as i64;
+        let position = self.caches.sharing.missing_scan.get();
+        let mut rows = match position {
+            None => rows_of(WAITING_FIRST_SQL, params![limit])?,
+            Some((None, rowid)) => rows_of(WAITING_UNTIMED_AFTER_SQL, params![rowid, limit])?,
+            Some((Some(received), rowid)) => {
+                rows_of(WAITING_AFTER_SQL, params![received, rowid, limit])?
+            }
+        };
+        if matches!(position, Some((None, _))) && rows.len() < MISSING_SCAN {
+            // Rows with a receive time follow the legacy rows without one.
+            let more = (MISSING_SCAN - rows.len()) as i64;
+            rows.extend(rows_of(
+                WAITING_AFTER_SQL,
+                params![i64::MIN, i64::MIN, more],
+            )?);
+        }
+        let next = match rows.last() {
+            Some((received, rowid, _)) if rows.len() >= MISSING_SCAN => Some((*received, *rowid)),
+            _ => None,
+        };
+        self.caches.sharing.missing_scan.set(next);
+        Ok(rows.into_iter().map(|(_, _, id)| id).collect())
     }
     /// Inbox rows staged from `peer` (`incoming_sources`), by state. When
     /// every staged row came (also) from `peer`, these are the inbox counts
@@ -1830,18 +1947,9 @@ impl Store {
             Some(cursor) if self.validate_cursor(cursor)? => cursor.seq,
             _ => 0,
         };
-        let private: bool = self
-            .db
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM branches WHERE shared=0)")?
-            .query_row([], |r| r.get(0))?;
-        let count_sql = if private {
-            SHARED_AFTER_SQL
-        } else {
-            ROWS_AFTER_SQL
-        };
         let to_send: i64 = self
             .db
-            .prepare_cached(count_sql)?
+            .prepare_cached(FEED_AFTER_SQL)?
             .query_row(params![base, COUNT_CAP as i64], |r| r.get(0))?;
         let rejected: i64 = self
             .db

@@ -555,6 +555,141 @@ fn idle_exchange_reads_no_payloads_and_echo_is_small() {
     );
 }
 
+/// Fix round 2: an idle exchange stays O(1) when private events follow the
+/// last shared one (the tip, cursor checks and counts never visit private
+/// rows), in both directions.
+#[test]
+fn idle_exchange_is_o1_with_a_private_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    linear_history(&mut a, 50).unwrap();
+    settle(&mut b, &mut a);
+    settle(&mut a, &mut b);
+    let tip = a.feed_tip().unwrap();
+    // 3,000 private events on A after its last shared one.
+    let main = a.active.clone();
+    let private = a.fork("private", false).unwrap();
+    a.checkout(&private.id).unwrap();
+    linear_history_named(&mut a, "private", 3_000).unwrap();
+    a.checkout(&main).unwrap();
+    let private_rows: i64 =
+        a.db.query_row(
+            "SELECT count(*) FROM journal_sequence WHERE seq>?",
+            [tip],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(private_rows >= 3_000);
+    assert_eq!(
+        a.feed_tip().unwrap(),
+        tip,
+        "private events never move the tip"
+    );
+    // One round notices nothing new; then idle, both ways.
+    exchange(&b, &a);
+    exchange(&a, &b);
+    let mut best = Duration::MAX;
+    for _ in 0..20 {
+        let reads = (a.feed_payload_reads(), b.feed_payload_reads());
+        let started = Instant::now();
+        let dialed = exchange(&b, &a);
+        let dialing = exchange(&a, &b);
+        best = best.min(started.elapsed() / 2);
+        assert_eq!((a.feed_payload_reads(), b.feed_payload_reads()), reads);
+        for round in [&dialed, &dialing] {
+            assert!(round.request.page.entries.is_empty() && round.reply.page.entries.is_empty());
+            assert!(round.request.need.is_empty());
+            for summary in [&round.applied.summary, &round.local.summary] {
+                assert!(!summary.metadata_advanced, "{summary:?}");
+                assert!(summary.caught_up && summary.to_send == 0 && summary.to_receive == 0);
+            }
+        }
+        assert_eq!(dialed.local.summary.local_tip, tip);
+        assert_eq!(dialing.applied.summary.local_tip, tip);
+    }
+    assert!(
+        best < Duration::from_millis(5),
+        "idle exchange with a private tail took {best:?}"
+    );
+}
+
+/// `feed_journal` (the feed as a table) follows every journal change and
+/// is built when it is missing (a store that a build without it opened).
+#[test]
+fn feed_journal_follows_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let root = dir.path().join("a");
+    let mut a = create(&root, &repo);
+    let feed = |s: &Store| -> Vec<(i64, String)> {
+        s.db.prepare("SELECT seq,event FROM feed_journal ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    // What `feed_journal` must hold: the shared rows of `journal_sequence`.
+    let expected = |s: &Store| -> Vec<(i64, String)> {
+        s.db.prepare(
+            "SELECT s.seq,s.event FROM journal_sequence s JOIN events e ON e.id=s.event
+            JOIN branches b ON b.id=e.branch WHERE b.shared=1 ORDER BY s.seq",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    };
+    linear_history(&mut a, 5).unwrap();
+    let main = a.active.clone();
+    let private = a.fork("private", false).unwrap();
+    a.checkout(&private.id).unwrap();
+    a.create("secret", "file").unwrap();
+    a.checkout(&main).unwrap();
+    a.create("after", "file").unwrap();
+    let shared_rows = feed(&a);
+    assert_eq!(shared_rows, expected(&a));
+    assert_eq!(shared_rows.len(), shared(&a).len());
+    assert_eq!(a.feed_tip().unwrap(), shared_rows.last().unwrap().0);
+    // A store whose schema predates `feed_journal`: built when opened.
+    a.db.execute_batch(
+        "DROP TRIGGER feed_journal_insert; DROP TRIGGER feed_journal_update;
+        DROP TRIGGER feed_journal_delete; DROP TRIGGER feed_journal_branch; DROP TABLE feed_journal;",
+    )
+    .unwrap();
+    drop(a);
+    let mut a = reopen(&root, &repo);
+    assert_eq!(feed(&a), shared_rows);
+    assert_eq!(a.feed_tip().unwrap(), shared_rows.last().unwrap().0);
+    a.create("reopened", "file").unwrap();
+    assert_eq!(feed(&a).len(), shared_rows.len() + 1);
+    assert_eq!(feed(&a), expected(&a));
+    // A rewritten row; a deleted one (the newest shared event).
+    let (first_seq, first) = shared_rows[0].clone();
+    a.db.execute("UPDATE events SET payload=payload WHERE id=?", [&first])
+        .unwrap();
+    assert_eq!(feed(&a), expected(&a));
+    assert!(feed(&a).iter().any(|(seq, _)| *seq == first_seq));
+    let (last_seq, last) = feed(&a).last().unwrap().clone();
+    a.db.execute("DELETE FROM events WHERE id=?", [&last])
+        .unwrap();
+    assert!(!feed(&a).iter().any(|(seq, _)| *seq == last_seq));
+    assert_eq!(feed(&a), expected(&a));
+    assert!(a.feed_tip().unwrap() < last_seq);
+    // A branch that stops (or starts) being shared leaves (or joins) the feed.
+    a.db.execute("UPDATE branches SET shared=0 WHERE id=?", [&main])
+        .unwrap();
+    assert!(feed(&a).is_empty());
+    assert_eq!(a.feed_tip().unwrap(), 0);
+    a.db.execute("UPDATE branches SET shared=1 WHERE id=?", [&main])
+        .unwrap();
+    assert!(!feed(&a).is_empty());
+    assert_eq!(feed(&a), expected(&a));
+}
+
 // ---------------------------------------------------------------------------
 // Acknowledgements (invariant 10)
 
@@ -1079,6 +1214,149 @@ fn unknown_parent_reported() {
             .any(|w| w == "1 event waiting for parents")
     );
     assert_eq!(b.inbox_counts().unwrap().waiting, 1);
+}
+
+/// Fix round 2: a parent refused at staging is never asked for again. A's
+/// journal holds a forged event F (in B's name) and A's own child C of it. B
+/// refuses F and stages C, which waits on F for good; asking A for F would
+/// only bring the same refusal, every exchange, and keep the feed busy.
+#[test]
+fn a_refused_parent_is_not_requested_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    a.create("base", "directory").unwrap();
+    settle(&mut b, &mut a);
+    let mut forged = mkdir_event(&a, "forged");
+    forged.device = b.device.clone();
+    inject(&a, &forged);
+    let mut child = mkdir_event(&a, "child");
+    child.dependencies = vec![forged.id.clone()];
+    inject(&a, &child);
+    let round = exchange(&b, &a);
+    assert_eq!(
+        rejected_codes(&b, &a),
+        vec![(forged.id.clone(), "FORGED_EVENT_ORIGIN".to_owned())]
+    );
+    assert_eq!(round.applied.summary.staged, 1);
+    activate(&mut b);
+    assert_eq!(b.inbox_counts().unwrap().waiting, 1);
+    assert_eq!(b.missing_parents(10).unwrap(), vec![forged.id.clone()]);
+    let seq = b.feed_rejections(&a.device).unwrap()[0].seq;
+    assert!(seq > 0, "the refusal records the entry's feed seq");
+    // At most one more round settles the echo; then every exchange is idle
+    // on both sides: no need, nothing served or refused, no payload read.
+    exchange(&b, &a);
+    for _ in 0..6 {
+        let reads = (a.feed_payload_reads(), b.feed_payload_reads());
+        let round = exchange(&b, &a);
+        assert!(round.request.need.is_empty(), "{:?}", round.request.need);
+        assert!(round.reply.need_served.is_empty() && round.reply.unknown.is_empty());
+        assert_eq!(round.applied.summary.rejected, 0);
+        assert!(!round.applied.summary.metadata_advanced);
+        assert!(!round.local.summary.metadata_advanced);
+        assert_eq!((a.feed_payload_reads(), b.feed_payload_reads()), reads);
+        // The reverse direction asks for nothing either.
+        let reverse = exchange(&a, &b);
+        assert!(reverse.request.need.is_empty() && reverse.reply.need_served.is_empty());
+        assert!(!reverse.applied.summary.metadata_advanced);
+        assert!(!reverse.local.summary.metadata_advanced);
+    }
+    // The gate on A says why: the refusal, and the row that waits on it.
+    let gate = b.feed_gate(&a.device).unwrap();
+    assert!(gate.blocked && !gate.caught_up);
+    assert!(gate.waiting_on.iter().any(|w| w == "1 event rejected"));
+    assert!(
+        gate.waiting_on
+            .iter()
+            .any(|w| w == "1 event waiting for parents")
+    );
+    // A peer that serves the refused event unasked has it refused again; the
+    // durable row keeps the feed seq of the first refusal.
+    let pushed = forged.clone();
+    let round = exchange_with(&b, &a, move |reply| reply.need_served.push(pushed));
+    assert_eq!(round.applied.summary.rejected, 1);
+    let rejections = b.feed_rejections(&a.device).unwrap();
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(
+        (rejections[0].id.as_str(), rejections[0].seq),
+        (forged.id.as_str(), seq)
+    );
+    assert_eq!(acked(&a, &forged.id), Some(false));
+    assert_eq!(acked(&a, &child.id), Some(false));
+}
+
+/// Fix round 2: the look for missing parents covers every waiting row in
+/// turn. Rows that wait for good (on parents refused here) or that are
+/// blocked (they keep their waits) never hide a newer row's missing parent,
+/// however many there are.
+#[test]
+fn missing_parents_are_found_past_blocked_and_settled_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    a.create("base", "directory").unwrap();
+    settle(&mut b, &mut a);
+    // B's inbox, older than anything A sends next: 4,100 blocked rows (each
+    // still waiting on a missing parent) and 4,100 waiting rows whose parents
+    // B refused from A. More of each than one look at waiting rows covers.
+    let rows = 4_100;
+    b.db.execute_batch("BEGIN").unwrap();
+    for i in 0..rows {
+        for (state, parent) in [
+            ("blocked", format!("gone-{i:05}")),
+            ("waiting", format!("refused-{i:05}")),
+        ] {
+            let row = id();
+            b.db.execute(
+                "INSERT INTO incoming_events(id,payload,state,received_ms,attempts) VALUES(?,'{}',?,1,0)",
+                params![row, state],
+            )
+            .unwrap();
+            b.db.execute(
+                "INSERT INTO incoming_waits(child,parent) VALUES(?,?)",
+                params![row, parent],
+            )
+            .unwrap();
+            if state == "waiting" {
+                b.db.execute(
+                    "INSERT INTO feed_rejected(peer,event,seq,code,message,payload,at_ms) VALUES(?,?,0,'INVALID_EVENT','',NULL,1)",
+                    params![a.device, parent],
+                )
+                .unwrap();
+            }
+        }
+    }
+    b.db.execute_batch("COMMIT").unwrap();
+    // A new orphan: the page that carried its parent is lost.
+    a.create("parent", "directory").unwrap();
+    let parent = a.journal_id_at(a.feed_tip().unwrap()).unwrap().unwrap();
+    a.create("parent/child", "directory").unwrap();
+    let lost = parent.clone();
+    let round = exchange_with(&b, &a, move |reply| {
+        reply.page.entries.retain(|entry| entry.id != lost);
+    });
+    assert_eq!(round.applied.summary.staged, 1);
+    assert_eq!(activate(&mut b), 0);
+    let mut asked = None;
+    for round_no in 1..=3 {
+        let round = exchange(&b, &a);
+        assert!(
+            round.request.need.iter().all(|id| id == &parent),
+            "only the obtainable parent is asked: {:?}",
+            &round.request.need[..round.request.need.len().min(3)]
+        );
+        if !round.request.need.is_empty() {
+            assert_eq!(round.reply.need_served.len(), 1);
+            asked = Some(round_no);
+            break;
+        }
+    }
+    assert!(asked.is_some(), "the missing parent was never asked for");
+    assert_eq!(activate(&mut b), 2, "the parent and its child activate");
+    assert!(shared(&b).contains(&parent));
 }
 
 /// `s`'s `feed_needs` rows for `peer`: `(event, reason, reported unknown)`.
@@ -1846,6 +2124,62 @@ fn feed_rpc_errors() {
     )
     .unwrap_err();
     assert_eq!(code_of(&unbound), "UNBOUND_PEER_RESPONSE");
+    // Only that route-less `feed-offer` keeps the Wave 0 answer: a peer's
+    // malformed message is a protocol violation, and the orchestrator's own
+    // malformed members are an invalid request (fix round 2).
+    let code = |ctx: &WorkerCtx, payload: Value| code_of(&rpc(ctx, payload).unwrap_err());
+    let mut bad_request = request.clone();
+    bad_request["page"] = json!("not a page");
+    assert_eq!(
+        code(
+            &a,
+            json!({"op":"feed-exchange","route":route_json(&a, &b),"request":bad_request})
+        ),
+        "PROTOCOL_VIOLATION"
+    );
+    assert_eq!(
+        code(
+            &a,
+            json!({"op":"feed-exchange","route":route_json(&a, &b),"request":{"format":7}})
+        ),
+        "PROTOCOL_VIOLATION"
+    );
+    assert_eq!(
+        code(
+            &a,
+            json!({"op":"feed-exchange","route":{},"request":request})
+        ),
+        "INVALID_REQUEST"
+    );
+    assert_eq!(
+        code(&a, json!({"op":"feed-exchange","route":route_json(&a, &b)})),
+        "INVALID_REQUEST"
+    );
+    let mut bad_reply = exchanged["reply"].clone();
+    bad_reply["page_status"] = json!("Sideways");
+    assert_eq!(
+        code(
+            &b,
+            json!({"op":"feed-apply","route":route_json(&b, &a),"request_id":request["request"],
+                "reply":bad_reply})
+        ),
+        "PROTOCOL_VIOLATION"
+    );
+    assert_eq!(
+        code(
+            &b,
+            json!({"op":"feed-apply","route":route_json(&b, &a),"reply":exchanged["reply"]})
+        ),
+        "INVALID_REQUEST"
+    );
+    assert_eq!(
+        code(
+            &b,
+            json!({"op":"feed-apply","route":{"repo":repo},"request_id":request["request"],
+                "reply":bad_reply})
+        ),
+        "INVALID_REQUEST"
+    );
 }
 
 #[test]
