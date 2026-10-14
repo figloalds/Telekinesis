@@ -41,6 +41,10 @@ struct Worker {
     server: RpcServer,
     engine: Shared,
     info: Discovery,
+    /// One persistent connection for the test's calls (as the orchestrator's
+    /// pooled client): a new socket per call ran a loaded machine out of
+    /// ephemeral ports (WSAENOBUFS) in a full suite.
+    lane: Mutex<runtime::RpcLane>,
 }
 
 impl Worker {
@@ -69,10 +73,14 @@ impl Worker {
             server,
             engine,
             info,
+            lane: Mutex::default(),
         }
     }
     fn rpc(&self, payload: Value) -> anyhow::Result<Value> {
-        runtime::rpc(&self.info, &id(), payload)
+        self.lane
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .call(&self.info, &id(), payload)
     }
     fn status(&self) -> Value {
         self.rpc(json!({"op":"status"})).unwrap()
