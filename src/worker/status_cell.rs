@@ -151,18 +151,26 @@ struct Cheap {
     revision: Option<u64>,
     identity: Value,
     counters: StatusCounters,
+    /// The feed tip (shared events only) and epoch (WP2.5): the heartbeat's
+    /// `tip`, the MetaScheduler's trigger (CCR-WP2.5-5, wired by WP2.INT).
+    feed: FeedTip,
     branches_hash: String,
 }
 
 fn compute_cheap(store: &Store, target: u64, revision: Option<u64>) -> Result<Cheap> {
     let identity = store.status_identity()?;
     let counters = store.status_counters()?;
+    let feed = FeedTip {
+        epoch: store.feed_epoch()?,
+        seq: store.feed_tip()?,
+    };
     let branches_hash = crate::core::hash(&serde_json::to_vec(&store.branches()?)?);
     Ok(Cheap {
         target,
         revision,
         identity,
         counters,
+        feed,
         branches_hash,
     })
 }
@@ -234,13 +242,11 @@ fn merge_cheap(next: &mut Value, meta: &mut CellMeta, cheap: &Cheap) {
     }
     merge_object(next, cheap.identity.clone());
     merge_object(next, cheap.counters.legacy_json());
-    next["tip"] = json!(FeedTip {
-        epoch: String::new(),
-        seq: cheap.counters.tip,
-    });
+    next["tip"] = json!(cheap.feed);
     let mut journal: JournalCounters =
         serde_json::from_value(next["journal"].clone()).unwrap_or_default();
     journal.tip = cheap.counters.tip;
+    journal.epoch = Some(cheap.feed.epoch.clone());
     journal.outgoing_unacknowledged = cheap.counters.outgoing_unacknowledged;
     journal.unresolved_conflicts = cheap.counters.unresolved_conflicts;
     next["journal"] = json!(journal);
