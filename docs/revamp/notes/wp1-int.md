@@ -72,7 +72,7 @@ created: the coordinator does both after review (§13 rule 6 and rule 8 item 7).
 | CCR-WP1.2-2 (one frozen worker version source) | resolved without a contract change | WP1.4 provides `tkfs::worker::version()` (`0.1.0+<build id>`), used by Ready, `hello` and `worker.json`; WP2.1 sets `LifecycleLimits::worker_version` from it. WP1.2's prefix comparison stays the fallback |
 | CCR-WP1.2-3 (`WorkerProcess` drop never kills) | applied (`8841d4a`) | doc on the trait |
 | CCR-WP1.2-4 (`Watchdog::expired_after`) | applied (`8841d4a`) | `startup::Watchdog::expired_after(now, silence)`; `expired(now)` = `expired_after(now, LEEWAY)`; the FolderController uses it instead of shifting `now` |
-| CCR-WP1.3-1 (`WORKER_IDENTITY_MISMATCH`) | **declined** (optional) | `WORKER_NOT_RUNNING` is accurate (the recorded worker is not running) and the WP1.2 controller treats it as such; a new code needs a controller path that WP2.1 owns. Revisit with the WP1.3 review finding on `Probe::Unknown` (open issues) |
+| CCR-WP1.3-1 (`WORKER_IDENTITY_MISMATCH`) | **declined for now** (optional) | `WORKER_NOT_RUNNING` is accurate (the recorded worker is not running), and the message says why. A dedicated code is best decided together with the WP1.3 review finding that "cannot inspect" (`Probe::Unknown`) is also reported as not running (package table); both are WP2.1's when it wires the launcher |
 | CCR-WP1.3-2 | information | adopted workers' `stderr_tail` comes from `process::log_tail`; for WP2.1 |
 | CCR-WP1.4-1 (engine locks in `runtime/{content,export,notify,published,control}.rs`) | applied (`77ce440`) | `lock_engine`/`try_lock_engine` everywhere (control.rs had none). A poisoned engine now follows the poison policy in `published-*` too (it answered `WORKER_BUSY` before) |
 | CCR-WP1.4-2 (`lock_engine` returns `EngineGuard`) | applied (`77ce440`) | `lock_engine` = `lock_engine_tracked`; every caller only dereferences it. Filesystem callbacks and mount adapters now feed the hold gauges, `engine.stalled` and `EngineVitals` |
@@ -178,7 +178,51 @@ old `TrackedGuard` drop order: checked), `log_rate_windows_are_bounded`
 
 ## VERIFY
 
-VERIFY_PLACEHOLDER
+All on the merged tree after the last code change (`8841d4a`; later
+commits change only these notes and the evidence file). Windows
+`CARGO_TARGET_DIR=C:/tkfs-target/wp1-int`, WSL
+`CARGO_TARGET_DIR=$HOME/tkfs-target/wp1-int`. The machine was otherwise
+idle (no other agent's suite or build ran meanwhile).
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo build --all-targets` | pass, no warnings |
+| `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **pass, SUITE_EXIT=0: 583 passed, 0 failed, 84 ignored** across 52 test binaries; no failing test, no retry |
+| WSL `cargo check --all-targets` | pass, no warnings |
+| WSL `cargo clippy --all-targets -- -D warnings` (extra: `cfg(unix)` code, `fuse_linux.rs`) | pass |
+| WSL `cargo test --all-targets --no-fail-fast` (the whole suite; it contains §13 rule 8's subset `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle`) | **pass, exit 0: 586 passed, 0 failed, 85 ignored** across 52 binaries. `/dev/fuse` and `fusermount3` present, so every FUSE scenario ran (`mount_lifecycle` 17) |
+| Legacy fixtures (§13 rule 8.3) | `harness_selftest::legacy_worker_fixture_opens_with_current_build`, `legacy_datadir_fixture_opens_with_current_build` and `compat_goldens_recapture_identically` pass on Windows and WSL; `catalog_actor::legacy_datadir_opens_equal_to_the_legacy_supervisor_view` passes; `w1_integration::revalidate_…` runs a real worker on the legacy worker fixture |
+| Interoperability (§13 rule 8.4) | pass, see below |
+
+**Per binary (Windows / WSL):** lib 52+2i / 56+2i, bin 4 / 0,
+acknowledgements 3, activation_inbox 21, additional 5, availability 13 / 10,
+availability_index 21, basic_metadata 4, bulk_lanes 3, catalog_actor 19,
+contracts 39, control_transactions 4, core 16, derive_oracle 11+2i,
+directory_progress 3, folder_controller 50, harness_selftest 18+2i,
+legacy_stabilizers 7, mount_lifecycle 11 / 17, oracle_smoke 4,
+orchestrator 15, paired_sync 9, partial_content 8, posix_metadata 3,
+recovery 6, replication_regressions 9, runtime_lanes 3, scalability 5,
+seam_stubs 8, session_core 52, session_handshake 21, startup_snapshots 8,
+status_hub 74, w1_integration 3+1i, worker_lifecycle 25, worker_process 22,
+worker_seams 4, and 15 qual binaries with 77 ignored scenarios on Windows
+(78 in WSL: `qual_wp1_5_mount::stale_owned_mount_recovered_after_crash` is
+Linux-only).
+
+**Count reconciliation.** WP0.INT's final tree ran 199 passed and 80
+ignored in 39 binaries. Wave 1 added 13 binaries and 384 passing tests:
+catalog_actor 19, folder_controller 50, worker_process 22,
+worker_lifecycle 25, worker_seams +1, mount_lifecycle 11 (Windows),
+activation_inbox 21, derive_oracle 11, availability_index 21, session_core
+52, session_handshake 21, status_hub 74, legacy_stabilizers 7 (6 + the
+un-ignored mount-failure test), lib unit tests +38 (14 → 52), and WP1.INT's
+contracts +8 (31 → 39) and w1_integration 3. 199 + 384 = 583. Ignored:
+80 + derive_oracle 2 + lib 1 (WP1.7's memory probe) + w1_integration 1
+(interop) = 84.
+
+**Stability of the new tests.** `w1_integration` ran 5 times on Windows
+(3 of them with the interop test), all green.
 
 ## Qualification (`test-evidence/qualification-wave-1.json`)
 
@@ -190,12 +234,62 @@ The baseline binary was built from `git archive 6298d0b` (no worktree was
 added to the repository) in `C:/tkfs-build/wp1-int-baseline-src` with
 `CARGO_TARGET_DIR=C:/tkfs-target/wp1-int-baseline` (debug, 1 min).
 
-INTEROP_PLACEHOLDER
+`TKFS_BASELINE_BIN=C:/tkfs-target/wp1-int-baseline/debug/tkfs.exe cargo
+test --test w1_integration -- --include-ignored` (Windows, debug): **pass, 4
+of 4 runs**, about 5.5 s each. The scenario
+(`w1_integration::interop_with_a_6298d0b_peer`):
+
+1. this build pairs with the 6298d0b daemon (3 connections) and receives a
+   folder it created; a file written on the old side arrives on the new
+   side, and a file written on the new side arrives on the old side;
+2. the 6298d0b daemon pairs with this build and receives a folder this build
+   created; files flow both ways again;
+3. both daemons list each other as peers; a final round old → new.
+
+The old folder's worker answers `hello` with an error, which proves the peer
+really runs the old build. No wire-format change was needed: the legacy
+lanes, `published-*`, `bulk_sync` protocol 1 and the pairing exchange are
+unchanged on the wire (WP1.8 kept bulk protocol 1; WP1.12's additions are
+local; v3 sessions are not used on any network path until WP3.1).
+Interop was not run in WSL (it needs a Linux baseline build) or with
+mounted folders.
 
 ## Package status
 
-PACKAGES_PLACEHOLDER
+| Package | Review | Merged | Status in the merged tree | Open issues (owner) |
+|---|---|---|---|---|
+| WP1.1 catalog actor | approved | `a18c841` | green: `catalog_actor` 19; used by `w1_integration` (a real catalog across a daemon "crash") | minors: `snapshot_p99_under_1ms_while_a_command_is_held` does not wait for the writer to hold its transaction before sampling (test); `CreateFolder` silently drops a gate on a mount-less record and accepts an installation-only gate (empty `initial_sync.endpoint`); `OverrideGate`/`RetargetGate` on a gateless folder are silent no-ops (WP2.1 must check `snapshot.gates`); a dead catalog thread is not restarted (WP2.1) |
+| WP1.2 folder controller | approved | `47a18c5` | green: `folder_controller` 50; with the real launcher, worker and catalog in `w1_integration` (Running, adoption, Revalidate, Shutdown) | minor: a controller can lose its `maximum_running` wake-up while `reconcile` spawns controllers before inserting their handles (fix in `registry.rs`, or a self-healing timer; WP2.1); a folder removed and re-added under the same state while its retired controller still stops the worker gets two controllers; `Failed{WORKER_STOP_TIMEOUT}` with an unkillable lock holder cycles to `CRASH_LOOP` |
+| WP1.3 process launcher | approved | `6f782af` | green: `worker_process` 22; the real `daemon --supervised` launch, Ready validation and adoption of a real worker are now checked (`w1_integration`), which closes WP1.3's open item | minors: the adopted-worker probe and `kill_verified` treat "cannot inspect" (`Probe::Unknown`, e.g. EMFILE on `/proc`) as exited / `WORKER_NOT_RUNNING`; `JsonWorkerClient::call` panics on `Duration::MAX` (`Instant + deadline` overflow); a copied stdout line is two writes to `worker.log` (interleaving). CCR-WP1.INT-1 (Windows handle inheritance) |
+| WP1.4 worker lifecycle | approved | `decaef8` | green: `worker_lifecycle` 25, `worker_seams` 4; `revalidate` wired (task 1); CCR-WP1.4-1/-2 applied; the concurrent-beat ordering finding fixed with CCR-WP1.5-2 | minors: the supervised idle exit measures with the wall clock (`now_ms`), which a clock step can trip (a WSL flake of `unsupervised_worker_exits_when_idle_and_contact_keeps_it_alive` was reported; it did not recur here); a retried Linux signal refused with `BUSY_VIEW` is dropped without a log line; the accept-error exit retains only best-effort; `qual_wp1_4_worker` stays `#[ignore]` by the qualify convention |
+| WP1.5 mount controller | approved | `4a5fe6e` | green: `mount_lifecycle` 11 (WinFsp) / 17 (FUSE); qual run below; CCR-WP1.5-1/-2 applied | minors: the adoption branch of `Inner::attach` does not call `watch_lost()` (legacy `mount::start` path only); a FUSE checkout whose unmount is refused while the dispatch thread died leaves `Attached`; WinFsp `TK_HANDLE` contexts leak at detach (`native/mount.c`); a lazy external unmount with open files reads `Attached` until the next attach/detach |
+| WP1.6 inbox and fast paths | approved | `226fcb7` | green: `activation_inbox` 21 (also under the strict oracle of CCR-WP1.7-1); remote fast paths on by default | CCR-WP1.6-5 (successors do not count `NAMESPACE_HISTORY_LIMIT` cuts; invariant 11's "refused before ACK" not guaranteed for > 4,096 competing cuts); the `TKFS_REMOTE_FASTPATH=0` doc says "exactly" but gates on the event's branch; `core.commit.busy` ignores the fault action; CCR-WP1.6-1/-3/-4 deferred (above) |
+| WP1.7 append-mode derivation | approved | `63846e5` (+ `801ca56`) | green: `derive_oracle` 11; CCR-WP1.7-1 applied, which also resolves the review finding that the adapter's plain pass used a deferred savepoint | qualification below; minors: verify mode returns full's refusal without comparing it with append's (the fuzzer's commit checks do compare); `append_guard` scans the whole branch and two of its guards depend on peer-controlled data (a `,` in an entity id, > 16 multi-relocation events), after which every slow commit of that branch runs full mode (a CCR on `commit.rs` validation to reject `,` is suggested; Wave 2) |
+| WP1.8 object indexes | approved | `c359811` | green: `availability_index` 21, `availability`, `partial_content`, `bulk_lanes`; CCR-WP1.8-1/-2 applied | minors: on Linux `scan_objects` fails the whole call when an entry vanishes between readdir and stat (ENOENT; skip it); the cached `objects/` listing has no maximum age (filesystems without directory mtime updates); `put_object`/`put_stream` add a separate durable commit per new local object (13–20 % slower local writes in `scalability`); a cold `content_status` costs ~0.7 s at 50K objects during active sync (WP2.3 status cell); CCR-WP1.8-3 deferred |
+| WP1.9 session core | **not approved** | `237a852` | green: `session_core` 52; a real `Conn` runs over the real handshake in `w1_integration`. Nothing blocked the merge, and no wire path uses v3 sessions until WP3.1 | **blockers (open):** (1) a zero-length streamed request part put in an upload's overflow is never delivered (`deliver_uploads`/`next_wake` key on `overflow_bytes`), so an upload ending with empty parts stalls to its idle timeout (0-byte files over `objects.push`); (2) receive-side flow control charges only body bytes, so empty or tiny parts with large headers grow memory without bound (invariant 22; the review measured +0.8–1.9 GiB). Minors: `control_call_is_fast_while_data_is_queued` checks every sample < 50 ms in release (1 in 12 runs fails; use p99); a residual cross-side idle case and up to 4 MiB uncounted per running stream (documented). **Needs a WP1.9 fix round before WP2.6/WP2.8 rely on the bounds** |
+| WP1.10 session handshake | approved | `963d478` | green: `session_handshake` 21; CCR-WP1.10-1/-2/-3 applied; its "accept either outcome" tests now reach a real `Conn` | minors: the distinct-nonce check compares hex strings (an upper-case echo passes; no exploit: proofs use different labels); peer-chosen text (serde error detail, GOAWAY message) reaches error messages unescaped; `ws::connect_any` keeps only the last address's error (an HTTP 401/403 can be reported as `WS_CONNECT_FAILED`). Optional: switch the private pre-auth frame codec to `session::frame` |
+| WP1.11 status hub | **not approved** | `a818984` | green: `status_hub` 74; used with a real registry in `w1_integration`. Not wired until WP2.1, so nothing blocked the merge | **major (open):** object transfer rates and ETA include metadata exchange bytes (the per-pair EWMAs add every op's bytes), so mixed traffic misreports object rate/ETA (the §14 "within 5 %" item) and an idle pair shows non-zero object rates. Minors: exchange activity entries coalesce only with the newest entry, so two concurrent transfers fill the 500-entry ring; inbound-incompatible notices whose code changes still fill the daemon history; CCR-WP1.11-1/-2 deferred to WP2.INT. **Needs a WP1.11 fix round before WP2.1 wires it** |
+| WP1.12 legacy stabilizers | approved | `d7b10f3` (+ `9b36508`) | green: `legacy_stabilizers` 7 (the mount-failure test un-ignored and passing with real WinFsp); CCR-WP1.12-2 applied | minors: `DeadlineLane`'s 3 s does not bound the WebSocket upgrade (a frozen worker costs ~15 s per `list` call; widen CCR-WP1.12-1 to a deadline-aware `ws::connect`); `LOCAL_WORKER_UNAVAILABLE` anywhere in a chain is Contention, which hides wrapped `WORKER_STATE_MISMATCH` and `runtime.json` errors (only `WORKER_NOT_RUNNING` should be); `WORKER_LIMIT` escalates the crash backoff (up to 60 s to start once a slot frees); `lane_active` retires lanes on a `peers()` error while `run.rs` keeps the list (lane churn); discovery runs under the supervisor mutex for backed-off repositories; the notes' VERIFY table names the wrong ignored `harness_selftest` tests |
 
 ## Known limitations
 
-LIMITS_PLACEHOLDER
+- WP1.9's two blockers and WP1.11's major finding are open (package
+  table). They do not affect the release point "after WP1.INT" (§14),
+  because neither v3 sessions nor the hub run in the daemon yet, but Wave 2
+  packages that build on them (WP2.1, WP2.6, WP2.8) should wait for their
+  fix rounds.
+- The new components (catalog, registry, launcher, hub, sessions) are still
+  standalone: the daemon runs the legacy `Supervisor` and lanes until
+  WP2.1. `w1_integration` is the only place they run together.
+- Interoperability was checked on Windows only, with headless folders and
+  small files, in debug builds, one 6298d0b daemon against one Wave 1
+  daemon.
+- Deferred CCRs (above) stay with their named owners: CCR-WP1.4-4 (WP4.2),
+  CCR-WP1.6-1 (WP2.4), CCR-WP1.6-3/-4 (WP2.3), CCR-WP1.6-5 (Wave 2),
+  CCR-WP1.8-3 (WP3.2), CCR-WP1.9-2 (WP3.2/WP3.3), CCR-WP1.11-1/-2
+  (WP2.INT); declined: CCR-WP1.3-1, CCR-WP1.6-2, CCR-WP1.12-1.
+- `verify_derived_state_strict` now runs the from-empty rebuild twice
+  (deviation 5); WP2.x can drop it once its tests call the plain oracle.
+- Build artefacts outside the repository: the 6298d0b source export
+  `C:/tkfs-build/wp1-int-baseline-src` and its target
+  `C:/tkfs-target/wp1-int-baseline` (no git worktree was added).
