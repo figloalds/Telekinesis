@@ -20,9 +20,11 @@
 //!   most 4 rebuilds a second. [`wait_newer`] serves `subscribe` long polls;
 //!   an unchanged hub serves the published snapshot from the inbox lock alone.
 //! * **Tick.** [`tick`] (the caller runs it at `HubConfig::interval`, 1 Hz,
-//!   see [`StatusHub::spawn_ticker`]) folds the EWMA rates (10 s and 60 s),
-//!   runs the stall detector, applies the time-based error display policy
-//!   (Contention after 30 s), resolves pair errors whose work is gone,
+//!   see [`StatusHub::spawn_ticker`]) folds the EWMA rates (10 s and 60 s:
+//!   per lane and per peer from every exchange's bytes, per (repo, peer)
+//!   pair from objects ops only, as those are the object transfer rates and
+//!   ETA), runs the stall detector, applies the time-based error display
+//!   policy (Contention after 30 s), resolves pair errors whose work is gone,
 //!   expires stale inbound-incompatible notices and prunes state of folders
 //!   that were removed or never registered.
 //! * **Two clocks.** Reported `*_ms` fields are wall-clock time; every
@@ -1373,6 +1375,8 @@ struct PairEntry {
     inbound_seen: bool,
     summary: Option<ExchangeSummary>,
     last_meta_exchange_ms: Option<u64>,
+    /// Object transfer rates (bytes of objects ops only), shown as
+    /// `objects_up`/`objects_down` rates and used for their ETA.
     up: Ewma,
     down: Ewma,
     /// Last progress (monotonic; reported by its age).
@@ -2198,10 +2202,13 @@ impl HubState {
                 pair.outbound_seen = true;
             }
         }
-        pair.up.add(x.bytes_up);
-        pair.down.add(x.bytes_down);
         let mut progress = x.objects_up > 0 || x.objects_down > 0;
         if objects_op {
+            // The pair's rates are its object transfer rates (and ETA): only
+            // objects ops feed them. Metadata exchange bytes count in the
+            // peer's and the lane's rates above.
+            pair.up.add(x.bytes_up);
+            pair.down.add(x.bytes_down);
             pair.down_episode = pair.down_episode.saturating_add(x.bytes_down);
             pair.up_episode = pair.up_episode.saturating_add(x.bytes_up);
             if x.bytes_down >= rules::PROGRESS_MIN_BYTES || x.objects_down > 0 {
