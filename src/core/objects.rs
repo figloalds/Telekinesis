@@ -19,6 +19,22 @@
 //! * `object_error_state(hash, code, class, attempts, retry_at_ms, last_ms)`:
 //!   per-object failure backoff. The positional `object_errors` table and its
 //!   writers are unchanged.
+//! * `spool_state(hash, durable, total, updated_ms)` (WP3.2, §6.4): the
+//!   committed durable offset of each spool in `incoming-objects/`. A durable
+//!   offset is recorded only after the spool's fsync, and only a recorded one
+//!   is ever advertised (invariant 2); at open, a spool longer than its
+//!   recorded offset is truncated to it (`transfer::reconcile_spools`).
+//!
+//! # Objects v3 reads (WP3.2)
+//!
+//! `read_object_range` serves a byte range only under the authorization triad
+//! of §6.4 (invariant 13): the hash is shareable (`published_objects` or
+//! `received_shared_objects`), referenced by a committed shared event, and its
+//! bytes are available. Bytes whose marker is not trusted are hashed in full
+//! before their first range is served (verify-on-first-serve), which also
+//! heals a file the index had marked missing or corrupt when a good copy
+//! reappears. `report_corrupt` re-verifies a copy a receiver reported and
+//! quarantines it when it is corrupt.
 //!
 //! # Startup markers
 //!
@@ -30,7 +46,10 @@
 //! mtime. `VerifyMode::Changed` hashes only untrusted objects, `Full` hashes
 //! everything, `Lazy` hashes nothing (rows stay unverified for `scrub_step`).
 use super::*;
-use crate::model::errors::{ErrorClass, ErrorWire};
+use crate::model::{
+    errors::{ErrorClass, ErrorWire},
+    protocol::objects::ReportAction,
+};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -55,8 +74,8 @@ const STAMP_NS: i64 = STAMP_SECS as i64 * 1_000_000_000;
 const RACY_NS: i64 = 3_000_000_000;
 /// Rows per backfill / startup-check transaction.
 const CHUNK: usize = 10_000;
-/// `config('schema:objects')`.
-const SCHEMA_VERSION: &str = "1";
+/// `config('schema:objects')` (2: `spool_state`, WP3.2).
+const SCHEMA_VERSION: &str = "2";
 /// One-time markers (§5.3).
 const AVAILABILITY_MARKER: &str = "availability_v2";
 const EVENT_OBJECTS_MARKER: &str = "event_objects_v1";
@@ -66,6 +85,11 @@ const EVENT_OBJECTS_MARKER: &str = "event_objects_v1";
 pub(crate) struct Cache {
     /// Whole-object SHA-256 verifications performed through this handle.
     hashed: Cell<u64>,
+    /// Spool data fsyncs performed through this handle (`write_object_items`).
+    pub(crate) spool_syncs: Cell<u64>,
+    /// Registration transactions committed through this handle
+    /// (`write_object_items`).
+    pub(crate) registrations: Cell<u64>,
     /// The last content scan (owned by `core::status`).
     pub(crate) content: RefCell<Option<super::status::ContentCache>>,
 }
@@ -147,6 +171,7 @@ const SCHEMA: &str = "SAVEPOINT objects_schema;
     CREATE TABLE IF NOT EXISTS staged_objects(hash TEXT NOT NULL,event TEXT NOT NULL,PRIMARY KEY(hash,event));
     CREATE INDEX IF NOT EXISTS staged_objects_by_event ON staged_objects(event);
     CREATE TABLE IF NOT EXISTS object_error_state(hash TEXT PRIMARY KEY,code TEXT NOT NULL,class TEXT NOT NULL,attempts INTEGER NOT NULL,retry_at_ms INTEGER NOT NULL,last_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS spool_state(hash TEXT PRIMARY KEY,durable INTEGER NOT NULL,total INTEGER NOT NULL,updated_ms INTEGER NOT NULL);
     CREATE TRIGGER IF NOT EXISTS event_objects_insert AFTER INSERT ON events BEGIN
         INSERT OR IGNORE INTO event_objects(hash,event,shared)
             SELECT json_extract(c.value,'$.value'),NEW.id,coalesce(json_extract(NEW.payload,'$.branch.shared'),0)
@@ -260,15 +285,15 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
 
 /// One `object_availability` row.
 #[derive(Debug, Clone, Copy)]
-struct Row {
-    size: i64,
-    state: i64,
-    mtime_ns: i64,
-    verified_ms: i64,
+pub(crate) struct Row {
+    pub(crate) size: i64,
+    pub(crate) state: i64,
+    pub(crate) mtime_ns: i64,
+    pub(crate) verified_ms: i64,
 }
 impl Row {
     /// Verified, not racy, and the file still has the recorded size and mtime.
-    fn trusted(&self, len: u64, mtime_ns: i64) -> bool {
+    pub(crate) fn trusted(&self, len: u64, mtime_ns: i64) -> bool {
         self.state == AVAILABLE
             && self.size == len as i64
             && self.mtime_ns == mtime_ns
@@ -405,7 +430,10 @@ pub(super) fn startup_object_check(store: &mut Store, verify: VerifyMode) -> Res
         [],
     )?;
     tx.commit()?;
-    Ok(())
+    // Spools (WP3.2): legacy adoption once, then every spool is cut back to
+    // its recorded durable offset. Nothing is registered here (I4).
+    crate::startup::progress("reconciling spools");
+    super::transfer::reconcile_spools(store)
 }
 
 /// The legacy per-open bookkeeping (`object_references`, `object_sizes` from
@@ -512,7 +540,7 @@ fn check_object(
 }
 
 /// The recorded size descriptor of `object`, without touching the filesystem.
-fn known_size(db: &Connection, object: &str) -> Result<Option<u64>> {
+pub(crate) fn known_size(db: &Connection, object: &str) -> Result<Option<u64>> {
     Ok(db
         .query_row(
             "SELECT size FROM object_sizes WHERE hash=?",
@@ -527,6 +555,16 @@ impl Store {
     /// clean `Changed` startup performs none).
     pub fn object_hashes(&self) -> u64 {
         self.caches.objects.hashed.get()
+    }
+    /// Spool data fsyncs performed through this handle by
+    /// `write_object_items` (one per object part batch that changed a spool).
+    pub fn spool_syncs(&self) -> u64 {
+        self.caches.objects.spool_syncs.get()
+    }
+    /// Registration transactions committed through this handle by
+    /// `write_object_items` (at most one per call).
+    pub fn object_registrations(&self) -> u64 {
+        self.caches.objects.registrations.get()
     }
     /// What `objects/` holds right now: one directory `stat`, plus one
     /// enumeration when the directory changed since the cached listing.
@@ -560,7 +598,7 @@ impl Store {
         let cache = &self.caches.objects.hashed;
         cache.set(cache.get() + 1);
     }
-    fn availability_row(&self, object: &str) -> Result<Option<Row>> {
+    pub(crate) fn availability_row(&self, object: &str) -> Result<Option<Row>> {
         Ok(self
             .db
             .prepare_cached(
@@ -620,7 +658,7 @@ impl Store {
         });
     }
     /// A read found no file: an `AVAILABLE` row becomes `MISSING` (best effort).
-    fn note_missing(&self, object: &str) {
+    pub(crate) fn note_missing(&self, object: &str) {
         let _ = self.db.execute(
             "UPDATE object_availability SET state=?1,verified_ms=0 WHERE hash=?2 AND state=?3",
             params![MISSING, object, AVAILABLE],
@@ -1095,10 +1133,201 @@ impl Store {
     }
 }
 
+/// A lowercase 64-digit SHA-256 hex id: the only form objects v3 accepts. The
+/// legacy `valid_object` also admits upper case, which a case-insensitive
+/// filesystem maps onto the same file under a different grant key.
+pub fn canonical_object(object: &str) -> bool {
+    object.len() == 64
+        && object
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// Objects whose bytes the read path verified in this process, with the
+/// `(len, mtime_ns)` they had then: a file the index could not trust (no
+/// marker, a racy one, or a row that said missing) is hashed once, not on
+/// every range read. Keyed by store root and hash; bounded.
+type ServedMap = BTreeMap<(PathBuf, String), (u64, i64)>;
+static SERVED: Mutex<ServedMap> = Mutex::new(BTreeMap::new());
+const MAX_SERVED: usize = 4096;
+/// Objects re-verified for a corruption report, and when: a peer's reports
+/// re-hash one object at most once per `REPORT_REVERIFY`.
+static REPORTED: Mutex<BTreeMap<(PathBuf, String), std::time::Instant>> =
+    Mutex::new(BTreeMap::new());
+const REPORT_REVERIFY: Duration = Duration::from_secs(10);
+const MAX_REPORTED: usize = 4096;
+
+fn served() -> std::sync::MutexGuard<'static, ServedMap> {
+    SERVED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl Store {
+    /// Objects v3 `objects.read` (§6.4): up to `len` bytes of `object` from
+    /// `offset`, with the object's total size. Served only under the
+    /// authorization triad (invariant 13): the hash is shareable, referenced by
+    /// a committed **shared** event, and its bytes are available; otherwise
+    /// `NOT_PERMITTED` (a hash alone grants nothing) or `NOT_AVAILABLE`.
+    ///
+    /// Bytes are verified before they are served: a trusted marker (size and
+    /// mtime as recorded at a verification) serves at once; any other file is
+    /// hashed in full first (verify-on-first-serve). A good file that
+    /// reappears after the index marked it missing or corrupt is healed back
+    /// to available; a corrupt one is quarantined.
+    pub fn read_object_range(
+        &self,
+        object: &str,
+        offset: u64,
+        len: usize,
+    ) -> std::result::Result<(u64, Vec<u8>), ErrorWire> {
+        if !canonical_object(object) {
+            return Err(ErrorWire::coded("INVALID_OBJECT_ID", object));
+        }
+        let wire = |error: anyhow::Error| ErrorWire::from_error(&error);
+        let permitted = (|| -> Result<bool> {
+            Ok(self.object_shareable(object)? && self.objects_referenced_committed(object)?)
+        })()
+        .map_err(wire)?;
+        if !permitted {
+            return Err(ErrorWire::coded(
+                "NOT_PERMITTED",
+                format!("{object} is not a shared object of this replica"),
+            ));
+        }
+        let path = self.root.join("objects").join(object);
+        let row = self.availability_row(object).map_err(wire)?;
+        let Some(metadata) = fs::metadata(&path).ok().filter(fs::Metadata::is_file) else {
+            if row.is_some_and(|row| row.state == AVAILABLE) {
+                self.note_missing(object);
+            }
+            return Err(ErrorWire::coded(
+                "NOT_AVAILABLE",
+                format!("{object} is not installed"),
+            ));
+        };
+        let (total, mtime) = (metadata.len(), mtime_ns(&metadata));
+        if known_size(&self.db, object)
+            .map_err(wire)?
+            .is_some_and(|size| size != total)
+        {
+            let error = anyhow::anyhow!("CORRUPT_OBJECT: {object} has {total} bytes");
+            self.quarantine(object, &error).map_err(wire)?;
+            return Err(ErrorWire::coded(
+                "NOT_AVAILABLE",
+                format!("{object} was corrupt"),
+            ));
+        }
+        let key = (self.root.clone(), object.to_owned());
+        let trusted = row.is_some_and(|row| row.trusted(total, mtime))
+            || served().get(&key) == Some(&(total, mtime));
+        if !trusted {
+            match self.verify_object(object) {
+                Ok(()) => {
+                    self.set_availability(object, total as i64, AVAILABLE, mtime, time() as i64)
+                        .map_err(wire)?;
+                    let _ = self
+                        .db
+                        .execute("DELETE FROM object_error_state WHERE hash=?", [object]);
+                    let mut served = served();
+                    if served.len() >= MAX_SERVED {
+                        served.clear();
+                    }
+                    served.insert(key, (total, mtime));
+                }
+                Err(error) if crate::model::errors::code_of(&error) == "CORRUPT_OBJECT" => {
+                    self.quarantine(object, &error).map_err(wire)?;
+                    return Err(ErrorWire::coded(
+                        "NOT_AVAILABLE",
+                        format!("{object} was corrupt"),
+                    ));
+                }
+                Err(error) => {
+                    return Err(ErrorWire::coded("NOT_AVAILABLE", format!("{error:#}")));
+                }
+            }
+        }
+        if offset > total {
+            return Err(ErrorWire::coded(
+                "INVALID_OBJECT_OFFSET",
+                format!("offset {offset} beyond {total} bytes of {object}"),
+            ));
+        }
+        let count = (total - offset).min(len as u64) as usize;
+        let read = (|| -> Result<Vec<u8>> {
+            let mut file = fs::File::open(&path).map_err(object_error)?;
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            let mut bytes = vec![0; count];
+            file.read_exact(&mut bytes).map_err(object_error)?;
+            Ok(bytes)
+        })();
+        match read {
+            Ok(bytes) => Ok((total, bytes)),
+            Err(error) => {
+                self.object_available_checked(object);
+                Err(ErrorWire::coded("NOT_AVAILABLE", format!("{error:#}")))
+            }
+        }
+    }
+
+    /// Objects v3 `objects.report` on the sender (§6.4): a receiver found that
+    /// the bytes it got from us do not hash to `object`. Re-verify our copy in
+    /// full (ignoring markers): a good copy answers `VerifiedOk`, a corrupt
+    /// one is quarantined (`<hash>.corrupt-<id>` rename, availability
+    /// `CORRUPT`, error state and backoff, queued for download) and answers
+    /// `Quarantined`. Only shareable objects (ones we could have served) are
+    /// re-verified, each at most once per 10 s.
+    pub fn report_corrupt(&self, object: &str) -> Result<ReportAction> {
+        ensure!(canonical_object(object), "INVALID_OBJECT_ID: {object}");
+        ensure!(
+            self.object_shareable(object)?,
+            "NOT_PERMITTED: {object} is not a shared object of this replica"
+        );
+        let path = self.root.join("objects").join(object);
+        let Some(metadata) = fs::metadata(&path).ok().filter(fs::Metadata::is_file) else {
+            self.note_missing(object);
+            bail!("NOT_AVAILABLE: {object} is not installed");
+        };
+        let key = (self.root.clone(), object.to_owned());
+        {
+            let mut reported = REPORTED.lock().unwrap_or_else(|p| p.into_inner());
+            reported.retain(|_, at| at.elapsed() < REPORT_REVERIFY);
+            if reported.contains_key(&key) {
+                return Ok(ReportAction::VerifiedOk);
+            }
+            if reported.len() >= MAX_REPORTED {
+                reported.clear();
+            }
+            reported.insert(key.clone(), std::time::Instant::now());
+        }
+        served().remove(&key);
+        match self.verify_object(object) {
+            Ok(()) => {
+                let (len, mtime) = (metadata.len(), mtime_ns(&metadata));
+                self.set_availability(object, len as i64, AVAILABLE, mtime, time() as i64)?;
+                Ok(ReportAction::VerifiedOk)
+            }
+            Err(error) if crate::model::errors::code_of(&error) == "CORRUPT_OBJECT" => {
+                self.quarantine(object, &error)?;
+                Ok(ReportAction::Quarantined)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Per-object mutual exclusion for concurrent writers of one spool/install
 /// (invariant 19). Entries are dropped once no holder remains.
+///
+/// Also the spool I/O gate of `write_object_items` (WP3.2): the appends,
+/// data fsyncs and installs of concurrent `objects.write` calls on one store
+/// take turns. Concurrent flushes of many small files thrash the filesystem's
+/// journal: measured on NTFS, 10K tiny objects written by 4 concurrent calls
+/// went at 166–255 objects/s ungated, 314–320/s gated (one call: 286–359/s).
+/// Taken after the object locks, and never held across the call's offset
+/// commit, its registration transaction or a whole-object hash.
 #[derive(Default)]
-pub struct ObjectLocks(Mutex<BTreeMap<String, Weak<Mutex<()>>>>);
+pub struct ObjectLocks(Mutex<BTreeMap<String, Weak<Mutex<()>>>>, Mutex<()>);
 impl ObjectLocks {
     pub fn for_object(&self, object: &str) -> Arc<Mutex<()>> {
         let mut locks = self.0.lock().unwrap();
@@ -1110,10 +1339,16 @@ impl ObjectLocks {
         locks.insert(object.to_owned(), Arc::downgrade(&lock));
         lock
     }
+    /// The spool I/O gate (see the type's docs).
+    pub(crate) fn spool_io(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[cfg(windows)]
-pub(crate) fn install_object(temp: &Path, dest: &Path) -> Result<()> {
+fn move_file(temp: &Path, dest: &Path, flags: u32) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -1121,14 +1356,54 @@ pub(crate) fn install_object(temp: &Path, dest: &Path) -> Result<()> {
     }
     let old: Vec<_> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
     let new: Vec<_> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
-    if unsafe { MoveFileExW(old.as_ptr(), new.as_ptr(), 8) } == 0 {
+    if unsafe { MoveFileExW(old.as_ptr(), new.as_ptr(), flags) } == 0 {
         bail!(std::io::Error::last_os_error());
     }
     Ok(())
 }
+/// Installs one object durably: `MoveFileExW` WRITE_THROUGH.
+#[cfg(windows)]
+pub(crate) fn install_object(temp: &Path, dest: &Path) -> Result<()> {
+    const MOVEFILE_WRITE_THROUGH: u32 = 8;
+    move_file(temp, dest, MOVEFILE_WRITE_THROUGH)
+}
+/// Installs one object durably: rename, then the directory's fsync.
 #[cfg(not(windows))]
 pub(crate) fn install_object(temp: &Path, dest: &Path) -> Result<()> {
     fs::rename(temp, dest)?;
     fs::File::open(dest.parent().unwrap())?.sync_all()?;
+    Ok(())
+}
+/// Renames a verified spool into `objects/` without waiting for the rename
+/// to reach the disk. `write_object_items` installs a call's objects this way
+/// and makes all of them durable with one [`sync_dir`] of `objects/` before
+/// it registers any ("rename plus directory fsync", §6.4).
+#[cfg(windows)]
+pub(crate) fn rename_object(temp: &Path, dest: &Path) -> Result<()> {
+    move_file(temp, dest, 0)
+}
+#[cfg(not(windows))]
+pub(crate) fn rename_object(temp: &Path, dest: &Path) -> Result<()> {
+    fs::rename(temp, dest)?;
+    Ok(())
+}
+/// The directory fsync of the renames into `dir`: `FlushFileBuffers` on the
+/// directory itself (opened with backup semantics; on NTFS it flushes the
+/// journal that holds the renames, as `MoveFileExW` WRITE_THROUGH flushes the
+/// renamed file), `fsync` elsewhere.
+#[cfg(windows)]
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)?
+        .sync_all()?;
+    Ok(())
+}
+#[cfg(not(windows))]
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }

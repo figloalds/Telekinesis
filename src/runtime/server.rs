@@ -1,4 +1,4 @@
-//! Owned by WP1.4; WP2.3 in Wave 2.
+//! Owned by WP1.4; WP2.3 in Wave 2; WP3.2 in Wave 3 (loopback sessions).
 //!
 //! The worker's loopback RPC server (REVAMP_PLAN §4.1, §6.1): a blocking
 //! accept loop that never gives up on transient errors, one thread per
@@ -28,6 +28,19 @@
 //! accepted, and a stop that arrives during an attach waits for it and then
 //! detaches what it attached, so a worker never exits with a mount it
 //! attached after its stop.
+//!
+//! **Loopback sessions (WP3.2, §6.1, §6.4).** The same listener serves v3
+//! loopback sessions: a connection whose WebSocket upgrade carries
+//! `X-Tkfs-Sync: 3-loopback` (read with `peek`, so nothing is consumed) goes
+//! to `session::accept_loopback` and `Conn::serve`; every other upgrade is
+//! the JSON RPC, unchanged. On a session, `objects.*` ops carry binary bodies
+//! (`objects_rpc::dispatch`). The other ops are the JSON RPC ops over the
+//! session: the request header is the op's payload (or, when the request has
+//! a body, the body is the payload's JSON), and the reply is the JSON result
+//! as the header, or, above [`INLINE_REPLY`] bytes, the header
+//! `{"in_body": true}` with the JSON as the body. `stop` stays on the JSON
+//! RPC, whose reply flush the stop ladder waits for. Workers never dial
+//! (invariant 25): sessions are accepted only.
 use super::{
     Discovery, EngineGuard, EngineVitals, Shared, check_engine_poison, content::fetch_verified,
     ctx::WorkerCtx, export::export_bucket, lock_engine_tracked, objects_rpc,
@@ -44,7 +57,9 @@ use crate::{
             ops, timing,
         },
         orchestrator::FeedTip,
+        protocol::{UPGRADE_HEADER, UPGRADE_LOOPBACK, UPGRADE_V3},
     },
+    session::{self, ConnOptions, Handler, Incoming, UpgradeKind},
     util::{fault, lock::lock, notify::Notify, time::now_ms},
 };
 use anyhow::{Context, Result, ensure};
@@ -72,6 +87,88 @@ const REVALIDATE_ACTIVATION_MS: u64 = 50;
 /// How long `revalidate` waits for the background activator's pass over the
 /// rows it re-queued (the request holds no engine lock meanwhile).
 pub const REVALIDATE_WAIT: Duration = Duration::from_secs(1);
+/// How long a new connection may take to send its WebSocket upgrade request
+/// before the listener decides what it is (`peek`, nothing consumed).
+const UPGRADE_PEEK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bytes of an upgrade request read to find its `X-Tkfs-Sync` header (the
+/// pre-auth bound of §6.2).
+const UPGRADE_PEEK_MAX: usize = 16 * 1024;
+/// Largest JSON result a loopback session returns as its reply header (the
+/// session header bound is 64 KiB); larger ones travel as the body.
+pub const INLINE_REPLY: usize = 60 * 1024;
+/// Handler threads and queued requests of one loopback session: the
+/// orchestrator keeps up to 4 reads and 4 writes in flight per transfer, and
+/// one session (`worker_client::session_for`) serves every lane.
+const LOOPBACK_HANDLERS: usize = 8;
+const LOOPBACK_QUEUE: usize = 64;
+
+/// The options of an accepted loopback session.
+pub fn loopback_options() -> ConnOptions {
+    ConnOptions {
+        handlers: LOOPBACK_HANDLERS,
+        handler_queue: LOOPBACK_QUEUE,
+        ..ConnOptions::default()
+    }
+}
+
+/// The kind of the WebSocket upgrade request waiting on `stream`, from its
+/// `X-Tkfs-Sync` header, read with `peek` (the request stays for the
+/// handshake that follows). `Legacy` when no complete request head arrives
+/// within [`UPGRADE_PEEK_TIMEOUT`] or [`UPGRADE_PEEK_MAX`] bytes: the JSON
+/// RPC handshake then refuses it as before.
+pub fn peek_upgrade(stream: &TcpStream) -> UpgradeKind {
+    // Windows inherits the listener's mode on accepted sockets.
+    if stream.set_nonblocking(false).is_err()
+        || stream.set_read_timeout(Some(UPGRADE_PEEK_TIMEOUT)).is_err()
+    {
+        return UpgradeKind::Legacy;
+    }
+    let deadline = Instant::now() + UPGRADE_PEEK_TIMEOUT;
+    let mut buffer = vec![0u8; UPGRADE_PEEK_MAX];
+    let mut seen = 0;
+    let kind = loop {
+        let Ok(count) = stream.peek(&mut buffer) else {
+            break UpgradeKind::Legacy;
+        };
+        if count == 0 {
+            break UpgradeKind::Legacy;
+        }
+        let head = &buffer[..count];
+        if let Some(end) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+            break upgrade_kind_of(&head[..end]);
+        }
+        if count == buffer.len() || Instant::now() >= deadline {
+            break UpgradeKind::Legacy;
+        }
+        if count == seen {
+            // Nothing new yet: `peek` returns at once while bytes wait.
+            thread::sleep(Duration::from_millis(1));
+        }
+        seen = count;
+    };
+    let _ = stream.set_read_timeout(None);
+    kind
+}
+
+/// `UpgradeKind` from a request head's `X-Tkfs-Sync` header (case-insensitive
+/// name, trimmed value), as `session::upgrade_kind` reads a parsed request.
+fn upgrade_kind_of(head: &[u8]) -> UpgradeKind {
+    let text = String::from_utf8_lossy(head);
+    for line in text.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(UPGRADE_HEADER) {
+            return match value.trim() {
+                UPGRADE_LOOPBACK => UpgradeKind::Loopback,
+                UPGRADE_V3 => UpgradeKind::V3,
+                _ => UpgradeKind::Legacy,
+            };
+        }
+    }
+    UpgradeKind::Legacy
+}
+
 /// `Engine::control` ops that change nothing (no status refresh after them).
 const READ_ONLY_CONTROL_OPS: &[&str] = &[
     "status",
@@ -357,9 +454,14 @@ impl Core {
         std::process::exit(crate::model::ipc::EXIT_INTERNAL)
     }
 
-    /// One connection: a persistent request loop. Notifications are delivered
-    /// by the notifier thread, never on the reply path.
-    fn serve(&self, stream: TcpStream) {
+    /// One connection: a v3 loopback session ([`Core::serve_session`]), or
+    /// the JSON RPC's persistent request loop. Notifications are delivered by
+    /// the notifier thread, never on the reply path.
+    fn serve(self: Arc<Self>, stream: TcpStream) {
+        if peek_upgrade(&stream) == UpgradeKind::Loopback {
+            self.serve_session(stream);
+            return;
+        }
         let Ok(mut socket) = crate::ws::accept(stream) else {
             return;
         };
@@ -390,6 +492,81 @@ impl Core {
             if sent.is_err() || self.ctx.stopping.load(Ordering::Relaxed) {
                 return;
             }
+        }
+    }
+
+    /// One loopback session: accepted (`session::accept_loopback`; no token
+    /// until WP4.1), served by its handler pool, closed when the worker stops.
+    fn serve_session(self: Arc<Self>, stream: TcpStream) {
+        let conn = match session::accept_loopback(stream, None, loopback_options()) {
+            Ok(conn) => conn,
+            Err(error) => {
+                crate::util::log::event!(info, (error.code.as_str()), {
+                    "site": "worker.loopback.accept",
+                    "message": error.message,
+                });
+                return;
+            }
+        };
+        conn.serve(Arc::new(LoopbackHandler { core: self.clone() }));
+        loop {
+            if conn.wait_closed(Duration::from_millis(500)).is_some() {
+                return;
+            }
+            if self.ctx.stopping.load(Ordering::Relaxed) {
+                conn.close();
+                return;
+            }
+        }
+    }
+
+    /// One request of a loopback session (module docs).
+    fn session_request(
+        &self,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+    ) -> Result<(Value, Vec<u8>), ErrorWire> {
+        let wire = |error: anyhow::Error| ErrorWire::from_error(&error);
+        if op.starts_with(ops::OBJECTS_PREFIX) {
+            // The JSON ops below reach `worker.rpc.<op>` in `route`, once,
+            // as over the JSON RPC.
+            fault::trigger(&format!("worker.rpc.{op}")).map_err(wire)?;
+            return objects_rpc::dispatch(&self.ctx, op, &header, &body);
+        }
+        if op == ops::STOP {
+            return Err(ErrorWire::coded(
+                "UNSUPPORTED_OPERATION",
+                "stop is served on the JSON RPC (its reply is flushed before the exit)",
+            ));
+        }
+        let mut payload = if body.is_empty() {
+            header
+        } else {
+            serde_json::from_slice(&body).map_err(|error| {
+                ErrorWire::coded(
+                    "INVALID_REQUEST",
+                    format!("{op}: body is not JSON: {error}"),
+                )
+            })?
+        };
+        let Some(members) = payload.as_object_mut() else {
+            return Err(ErrorWire::coded(
+                "INVALID_REQUEST",
+                format!("{op}: the payload must be a JSON object"),
+            ));
+        };
+        members.insert("op".into(), json!(op));
+        // A fresh request id: session ids restart per connection, and request
+        // ids key the engine's idempotency receipts.
+        let request = json!({"request": crate::core::id(), "payload": payload});
+        let mut stop = false;
+        let value = self.route(&request, &mut stop).map_err(wire)?;
+        let text = serde_json::to_vec(&value).map_err(|error| wire(error.into()))?;
+        if text.len() <= INLINE_REPLY {
+            Ok((value, vec![]))
+        } else {
+            Ok((json!({"in_body": true}), text))
         }
     }
 
@@ -793,6 +970,48 @@ impl Core {
             json!({"object":object,"size":total,"truncated":total > bytes.len() as u64,
             "text":if binary { "Binary content; text preview unavailable".to_owned() } else { String::from_utf8_lossy(&bytes).into_owned() }}),
         )
+    }
+}
+
+/// Serves the requests of one loopback session on its handler pool.
+struct LoopbackHandler {
+    core: Arc<Core>,
+}
+
+impl Handler for LoopbackHandler {
+    fn handle(&self, req: Incoming) {
+        let Incoming {
+            op,
+            header,
+            body,
+            chunks,
+            responder,
+            ..
+        } = req;
+        if chunks.is_some() {
+            responder.error(ErrorWire::coded(
+                "INVALID_REQUEST",
+                format!("{op}: worker ops take no streamed body"),
+            ));
+            return;
+        }
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            self.core.session_request(&op, header, body)
+        }));
+        match outcome {
+            Ok(Ok((header, body))) => responder.reply(header, body),
+            Ok(Err(error)) => responder.error(error),
+            Err(panic) => {
+                check_engine_poison(&self.core.ctx.engine);
+                responder.error(ErrorWire::coded(
+                    "UNKNOWN_ERROR",
+                    format!(
+                        "request handler panicked: {}",
+                        panic_message(panic.as_ref())
+                    ),
+                ));
+            }
+        }
     }
 }
 
