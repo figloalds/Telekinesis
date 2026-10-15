@@ -1,34 +1,79 @@
+// Owned by WP3.4. The desktop UI (REVAMP_PLAN §7.4). Every value shown here is
+// computed by `tkfs::ui_model` from the daemon's status snapshot; this file
+// only lays it out. Visual language: misc/prototype.html (dark palette).
 import { ScrollView, TextEdit, AboutSlint, Palette } from "std-widgets.slint";
-export struct FolderRow { state: string, label: string, mount: string, running: bool, starting: bool, error: string, sync: string }
+
+export struct Chip { text: string, tone: string, action: string, action-label: string }
+export struct FolderRow {
+    state: string, label: string, mount: string,
+    sync: Chip, detail: string, progress: float, has-progress: bool,
+    mount-chip: Chip, life: Chip, conflicts: int,
+    error-title: string, error-meta: string, error-hint: string, error-tone: string,
+    attention: bool, busy: string, primary: string, primary-label: string, running: bool,
+}
+export struct PeerRow {
+    installation: string, name: string, endpoint: string, badge: Chip, direction: string,
+    inbound-only: bool, rtt: string, rates: string, protocol: string, lanes-summary: string,
+    folders: string, error-title: string, error-meta: string, error-hint: string, online: bool,
+}
+export struct LaneRow { lane: string, role: string, state: Chip, inflight: string, since: string, bytes: string, rate: string, error: string }
+export struct KV { key: string, value: string, tone: string }
+export struct PeerSyncRow {
+    name: string, direction: string, state: Chip, meta: string, counts: string, down: string, up: string,
+    progress: string, error-title: string, error-meta: string, error-hint: string, error-tone: string,
+}
+export struct ErrorRow { title: string, meta: string, hint: string, tone: string, open: bool }
+export struct ActivityRow { time: string, ago: string, kind: string, subject: string, message: string, tone: string }
+export struct ActionData { id: string, label: string, enabled: bool, danger: bool }
+export struct MissingRow { path: string, state: string, progress: string, error: string }
 export struct ConflictRow { id: string, description: string, field: string, entity: string }
 export struct RevisionRow { id: string, description: string }
 export struct RemoteRow { repo: string, label: string }
-export struct PeerRow { endpoint: string, online: bool }
+
 global Theme {
     out property <color> background: #0e131b;
     out property <color> panel: #161d28;
+    out property <color> raised: #1b2432;
+    out property <color> side: #0a1020;
     out property <color> line: #263040;
     out property <color> ink: #e6eaf0;
     out property <color> muted: #97a1b2;
     out property <color> accent: #7f9fff;
+    public pure function fg(tone: string) -> color {
+        tone == "ok" ? #5fd0a6 : tone == "progress" ? #8fb0ff : tone == "warn" ? #f2c35b
+            : tone == "error" ? #ff9d96 : tone == "muted" ? #97a1b2 : #e6eaf0
+    }
+    public pure function bg(tone: string) -> color {
+        tone == "ok" ? #12342a : tone == "progress" ? #1b2a52 : tone == "warn" ? #3a2f14
+            : tone == "error" ? #43262a : #222a37
+    }
 }
+
 component Label inherits Text { color: Theme.ink; font-size: 14px; vertical-alignment: center; overflow: elide; }
 component Muted inherits Label { color: Theme.muted; font-size: 12px; }
-component ActionButton inherits Rectangle {
+component Mono inherits Label { font-family: "Consolas"; font-size: 12px; color: Theme.muted; }
+
+component Button inherits Rectangle {
     in property <string> text;
     in property <bool> primary;
     in property <bool> quiet;
+    in property <bool> danger;
+    in property <bool> small;
     in property <bool> enabled: true;
     callback clicked();
     forward-focus: focus;
-    height: 34px;
-    min-width: caption.preferred-width + 24px;
-    border-radius: 7px;
+    height: root.small ? 26px : 34px;
+    min-width: caption.preferred-width + (root.small ? 16px : 24px);
+    border-radius: root.small ? 6px : 7px;
     border-width: 1px;
-    border-color: focus.has-focus ? Theme.accent : root.primary ? Theme.accent : root.quiet ? transparent : Theme.line;
-    background: !root.enabled ? Theme.panel : touch.pressed ? #30416a : touch.has-hover ? #253047 : root.primary ? Theme.accent : root.quiet ? transparent : Theme.panel;
+    border-color: focus.has-focus ? Theme.accent : root.primary ? Theme.accent : root.danger ? #7a3a3a : root.quiet ? transparent : Theme.line;
+    background: !root.enabled ? Theme.panel : touch.pressed ? #30416a : touch.has-hover ? #253047 : root.primary ? #4f6fd8 : root.quiet ? transparent : Theme.panel;
     opacity: root.enabled ? 1 : 0.45;
-    caption := Label { text: root.text; color: root.primary ? #ffffff : Theme.ink; horizontal-alignment: center; font-size: 13px; font-weight: 600; }
+    caption := Label {
+        text: root.text; horizontal-alignment: center;
+        color: root.primary ? #ffffff : root.danger ? #ff9d96 : Theme.ink;
+        font-size: root.small ? 12px : 13px; font-weight: 600;
+    }
     focus := FocusScope {
         enabled: root.enabled;
         key-pressed(event) => {
@@ -42,13 +87,14 @@ component ActionButton inherits Rectangle {
     accessible-label: root.text;
     accessible-action-default => { if root.enabled { root.clicked(); } }
 }
+
 component Field inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <string> placeholder;
     in property <bool> enabled: true;
     callback edited(string);
     forward-focus: input;
-    height: 38px;
+    height: 36px;
     border-radius: 7px;
     border-width: 1px;
     border-color: input.has-focus ? Theme.accent : Theme.line;
@@ -63,18 +109,85 @@ component Field inherits Rectangle {
         accessible-label: root.placeholder;
     }
 }
+
 component Card inherits Rectangle { background: Theme.panel; border-color: Theme.line; border-width: 1px; border-radius: 11px; }
+
+// A status pill; the text elides when the column is narrow.
+component Pill inherits Rectangle {
+    in property <string> text;
+    in property <string> tone;
+    height: 24px;
+    min-width: 36px;
+    preferred-width: label.preferred-width + 22px;
+    max-width: label.preferred-width + 22px;
+    border-radius: 12px;
+    background: Theme.bg(root.tone);
+    label := Text {
+        x: 11px; width: parent.width - 22px; height: parent.height;
+        text: root.text; color: Theme.fg(root.tone);
+        font-size: 12px; font-weight: 500; vertical-alignment: center; overflow: elide;
+    }
+}
+
+// Three dots that pulse while a command runs.
+component Spinner inherits Rectangle {
+    width: 22px; height: 12px;
+    property <float> phase: Math.mod(floor(animation-tick() / 280ms), 3);
+    for i in 3: Rectangle {
+        x: i * 8px; y: 3px; width: 6px; height: 6px; border-radius: 3px;
+        background: Theme.accent;
+        opacity: root.phase == i ? 1 : 0.3;
+    }
+}
+
+// A status in a table cell or a header: a dot and the text in the state's
+// colour, wrapping instead of eliding, and the remedy's button under it.
+component StatusCell {
+    in property <Chip> chip;
+    in property <bool> enabled: true;
+    in property <bool> strong;
+    callback act(string);
+    VerticalLayout { spacing: 4px; alignment: center;
+        HorizontalLayout { spacing: 7px;
+            VerticalLayout { alignment: start; padding-top: 5px;
+                Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.fg(root.chip.tone); }
+            }
+            Text {
+                text: root.chip.text; color: Theme.fg(root.chip.tone);
+                font-size: 13px; font-weight: root.strong ? 600 : 500;
+                wrap: word-wrap; horizontal-stretch: 1;
+            }
+        }
+        if root.chip.action != "": HorizontalLayout { alignment: start; padding-left: 15px;
+            Button { small: true; text: root.chip.action-label; enabled: root.enabled; clicked => { root.act(root.chip.action); } }
+        }
+    }
+}
+
+component Bar inherits Rectangle {
+    in property <float> value;
+    in property <string> tone: "progress";
+    height: 5px; border-radius: 3px; background: Theme.line;
+    Rectangle {
+        x: 0; y: 0; height: parent.height; border-radius: 3px;
+        width: parent.width * max(0, min(1, root.value));
+        background: Theme.fg(root.tone);
+    }
+}
+
 component Stat inherits Card {
     in property <string> title;
     in property <string> value;
     in property <string> detail;
-    height: 98px;
-    VerticalLayout { padding: 16px; spacing: 5px;
+    in property <string> tone: "neutral";
+    height: 92px;
+    VerticalLayout { padding: 14px; spacing: 4px;
         Muted { text: root.title; }
-        Label { text: root.value; font-size: 23px; font-weight: 600; }
+        Label { text: root.value; font-size: 22px; font-weight: 600; color: Theme.fg(root.tone); }
         Muted { text: root.detail; }
     }
 }
+
 component FolderIcon inherits Rectangle {
     width: 30px;
     Rectangle { y: (parent.height - 26px) / 2; width: 30px; height: 26px; border-radius: 5px; background: #1b2a52;
@@ -82,325 +195,650 @@ component FolderIcon inherits Rectangle {
         Rectangle { x: 7px; y: 9px; width: 16px; height: 12px; background: #ffc44d; border-radius: 2px; }
     }
 }
+
+component ErrorLine {
+    in property <string> title;
+    in property <string> meta;
+    in property <string> hint;
+    in property <string> tone: "error";
+    VerticalLayout { spacing: 1px;
+        Text { text: "! " + root.title; color: Theme.fg(root.tone); font-size: 12px; wrap: word-wrap; }
+        if root.meta != "": Text { text: root.meta; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+        if root.hint != "": Text { text: "→ " + root.hint; color: Theme.ink; font-size: 11px; wrap: word-wrap; }
+    }
+}
+
+component KVList {
+    in property <[KV]> rows;
+    VerticalLayout { spacing: 6px;
+        for kv in root.rows: HorizontalLayout { spacing: 12px;
+            Text { text: kv.key; width: 140px; color: Theme.muted; font-size: 12px; vertical-alignment: top; }
+            Text { text: kv.value; color: Theme.fg(kv.tone); font-size: 13px; wrap: word-wrap; horizontal-stretch: 1; }
+        }
+    }
+}
+
+component FolderRowView inherits Rectangle {
+    in property <FolderRow> data;
+    in property <bool> enabled: true;
+    in property <length> name-width;
+    in property <length> mount-width;
+    in property <length> life-width;
+    in property <length> actions-width;
+    callback act(string, string);
+    callback open(string);
+    background: hover.has-hover ? Theme.raised : transparent;
+    hover := TouchArea { clicked => { root.open(root.data.state); } }
+    VerticalLayout {
+        padding-left: 16px; padding-right: 16px; padding-top: 12px; padding-bottom: 12px; spacing: 6px;
+        HorizontalLayout { spacing: 14px;
+            HorizontalLayout { width: root.name-width; spacing: 10px; alignment: start;
+                FolderIcon {}
+                VerticalLayout { spacing: 2px; alignment: center;
+                    HorizontalLayout { spacing: 6px;
+                        Label { text: root.data.label; font-weight: 600; horizontal-stretch: 1; }
+                        if root.data.conflicts > 0: Pill { text: root.data.conflicts + (root.data.conflicts == 1 ? " conflict" : " conflicts"); tone: "warn"; }
+                    }
+                    Mono { text: root.data.mount == "" ? "No mount point" : root.data.mount; font-size: 11px; }
+                }
+            }
+            VerticalLayout { spacing: 5px; horizontal-stretch: 1; alignment: center; min-width: 200px;
+                StatusCell { chip: root.data.sync; strong: true; enabled: root.enabled && root.data.busy == ""; act(a) => { root.act(root.data.state, a); } }
+                if root.data.has-progress: HorizontalLayout { padding-left: 15px; Bar { value: root.data.progress; tone: root.data.sync.tone; } }
+                if root.data.detail != "": HorizontalLayout { padding-left: 15px; Muted { text: root.data.detail; font-size: 11px; wrap: word-wrap; } }
+            }
+            VerticalLayout { width: root.mount-width; alignment: center;
+                StatusCell { chip: root.data.mount-chip; enabled: root.enabled && root.data.busy == ""; act(a) => { root.act(root.data.state, a); } }
+            }
+            VerticalLayout { width: root.life-width; alignment: center;
+                StatusCell { chip: root.data.life; enabled: root.enabled && root.data.busy == ""; act(a) => { root.act(root.data.state, a); } }
+            }
+            VerticalLayout { width: root.actions-width; spacing: 6px; alignment: center;
+                if root.data.busy != "": HorizontalLayout { spacing: 6px; alignment: end;
+                    VerticalLayout { alignment: center; Spinner {} }
+                    Muted { text: root.data.busy + "…"; horizontal-stretch: 0; }
+                }
+                HorizontalLayout { spacing: 6px; alignment: end;
+                    if root.data.busy == "" && root.data.primary != "": Button {
+                        small: true; text: root.data.primary-label; enabled: root.enabled;
+                        danger: root.data.primary == "force-stop";
+                        clicked => { root.act(root.data.state, root.data.primary); }
+                    }
+                    Button { small: true; text: "Details"; enabled: root.enabled; clicked => { root.open(root.data.state); } }
+                }
+            }
+        }
+        if root.data.error-title != "": HorizontalLayout { padding-left: 40px;
+            ErrorLine { title: root.data.error-title; meta: root.data.error-meta; hint: root.data.error-hint; tone: root.data.error-tone; }
+        }
+    }
+    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+}
+
+component Tab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    in property <TextHorizontalAlignment> align: center;
+    callback clicked();
+    height: 30px;
+    min-width: label.preferred-width + 22px;
+    border-radius: 7px;
+    background: root.active ? #253047 : touch.has-hover ? #1d2533 : transparent;
+    label := Label { x: 11px; width: parent.width - 22px; text: root.text; font-size: 13px; horizontal-alignment: root.align; color: root.active ? Theme.ink : Theme.muted; font-weight: root.active ? 600 : 400; }
+    touch := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+    accessible-role: tab;
+    accessible-label: root.text;
+}
+
 export component AppWindow inherits Window {
-    title: "Telekinesis — Virtual folders";
-    preferred-width: 1320px; preferred-height: 820px;
-    min-width: 1040px; min-height: 680px;
+    title: "Telekinesis";
+    preferred-width: 1380px; preferred-height: 880px;
+    min-width: 1180px; min-height: 700px;
     background: Theme.background;
     init => { Palette.color-scheme = ColorScheme.dark; }
     default-font-family: "Segoe UI";
+
+    // Host and daemon.
     in property <string> config-path;
-    in-out property <string> status: "Connecting to the local orchestrator…";
-    in property <bool> status-error;
-    in property <bool> connected;
-    in property <bool> busy;
-    in property <string> listen-address;
     in property <string> host-name;
+    in property <string> daemon-title: "Telekinesis";
+    in property <string> daemon-version;
+    in property <Chip> daemon-status: { text: "Connecting…", tone: "progress" };
+    in property <string> daemon-installation;
+    in property <string> daemon-network;
+    in property <string> daemon-control;
+    in property <bool> connected;
+    in property <string> banner-text: "Connecting to the local daemon…";
+    in property <string> banner-tone: "progress";
+    in property <string> banner-action;
+    in property <string> banner-action-label;
+    in property <[ErrorRow]> daemon-errors;
+    // Overview.
+    in property <string> stat-folders: "—";
+    in property <string> stat-folders-detail;
+    in property <string> stat-folders-tone: "neutral";
+    in property <string> stat-mounted: "—";
+    in property <string> stat-mounted-detail;
+    in property <string> stat-peers: "—";
+    in property <string> stat-peers-detail;
+    in property <string> stat-transfer: "—";
+    in property <string> stat-transfer-detail;
     in property <int> folder-count;
-    in property <int> mounted-count;
-    in property <int> online-count;
     in property <[FolderRow]> folders;
-    in property <string> folder-summary;
-    in property <string> network-summary;
-    in-out property <bool> show-conflicts: false;
+    in property <[PeerRow]> peers;
+    in property <[ActivityRow]> activity;
+    in-out property <string> view: "folders";
+    in-out property <string> search;
+    in-out property <string> status;
+    in property <bool> status-error;
+    in property <string> global-busy;
+    // Folder dialog.
+    in-out property <string> dialog;
+    in-out property <string> selected-state;
+    in-out property <string> selected-label;
+    in-out property <string> detail-tab: "overview";
+    in property <FolderRow> detail-row;
+    in property <[KV]> detail-overview;
+    in property <[string]> detail-waiting-on;
+    in property <[PeerSyncRow]> detail-peers;
+    in property <[KV]> detail-activation;
+    in property <[KV]> detail-content;
+    in property <[MissingRow]> detail-missing;
+    in property <string> detail-missing-note;
+    in property <[ErrorRow]> detail-errors;
+    in property <[ActivityRow]> detail-activity;
+    in property <[ActionData]> detail-actions;
+    // Peer dialog.
+    in-out property <string> selected-peer;
+    in property <PeerRow> peer-detail;
+    in property <[LaneRow]> peer-lanes;
+    // Conflicts.
     in property <int> conflict-count;
     in property <int> conflict-offset;
-    callback conflict-page(int);
     in property <[ConflictRow]> conflicts;
     in property <[RevisionRow]> revisions;
+    in property <string> conflict-summary;
     in-out property <string> selected-conflict;
     in-out property <string> selected-entity;
     in-out property <string> selected-revision;
     in-out property <string> conflict-field;
     in-out property <string> recovery-target;
     in property <string> conflict-preview;
-    callback folder-details(string);
-    callback select-conflict(string);
-    callback preview-revision(string);
-    callback resolve-conflict();
-    callback recover-conflict(string);
-
+    // Pairing, remote folders, dialogs.
     in property <[RemoteRow]> remote-folders;
-    in property <[PeerRow]> peer-rows;
-    in-out property <string> selected-state;
     in-out property <string> selected-repo;
-    in-out property <string> selected-label;
     in-out property <string> pairing-code;
-    in-out property <string> dialog;
     in-out property <string> endpoint;
     in-out property <string> folder-name;
     in-out property <string> mount-path;
     in-out property <string> remote-mount;
     in-out property <string> code;
-    in-out property <string> search;
-    in property <string> remote-message: "Connect to an orchestrator, then browse its folders.";
+    in property <string> remote-message: "Pair with another host, then browse its folders.";
+    in-out property <string> confirm-action;
+    in-out property <string> confirm-text;
+
+    callback folder-action(string, string);
+    callback open-folder(string);
+    callback open-peer(string);
+    callback detail-tab-changed(string);
+    callback refresh-content();
+    callback open-log();
+    callback banner-clicked(string);
     callback search-folders(string);
-    callback remote-changed();
-    callback refresh();
     callback create-folder(string, string);
-    callback start-folder(string);
-    callback stop-folder(string);
     callback configure-mount(string, string);
     callback pair(string, string);
     callback remote-list(string);
     callback receive-folder(string, string, string, string);
     callback reset-code();
     callback unpair(string);
-    callback peers();
     callback shutdown();
-    private property <bool> interactive: root.dialog == "" && !root.busy;
-    private property <length> name-column: 190px;
+    callback remote-changed();
+    callback dialog-closed();
+    callback conflict-page(int);
+    callback select-conflict(string);
+    callback preview-revision(string);
+    callback resolve-conflict();
+    callback recover-conflict(string);
+
+    private property <bool> idle: root.global-busy == "";
+    private property <bool> interactive: root.dialog == "";
+    function dismiss() {
+        root.dialog = "";
+        root.pairing-code = "";
+        root.dialog-closed();
+    }
+    // Invariant 21: the one-time pairing code lives only while the host
+    // dialog that asked for it is open. Every way to another dialog clears
+    // it at once (dismiss(), the buttons below, show_dialog in gui.rs); this
+    // catches any other way before the next frame.
+    changed dialog => {
+        if root.dialog != "host" {
+            root.pairing-code = "";
+        }
+    }
     forward-focus: keyboard;
     keyboard := FocusScope {
-
         key-pressed(event) => {
-            if event.text == Key.Escape && root.dialog != "" && !root.busy { root.dialog = ""; return accept; }
+            if event.text == Key.Escape && root.dialog != "" && root.idle { root.dismiss(); return accept; }
             return reject;
         }
+
     HorizontalLayout { spacing: 0px;
-        Rectangle { width: 248px; background: #0a1020;
-            VerticalLayout { padding: 14px; spacing: 10px;
-                HorizontalLayout { padding: 8px; spacing: 10px; height: 44px;
+        // ---------------------------------------------------------------- sidebar
+        Rectangle { width: 250px; background: Theme.side;
+            VerticalLayout { padding: 14px; spacing: 6px;
+                HorizontalLayout { padding: 6px; spacing: 10px; height: 44px;
                     Rectangle { width: 28px; height: 28px; background: #4778ed; border-radius: 8px; Image { source: @image-url("anchor.svg"); x: 5px; y: 5px; width: 18px; height: 18px; } }
-                    Label { text: "Telekinesis"; font-weight: 700; font-size: 18px; }
+                    Label { text: "Telekinesis"; font-weight: 700; font-size: 18px; color: #ffffff; }
                 }
-                Rectangle { height: 38px; background: #2b3141; border-radius: 8px;
-                    HorizontalLayout { padding-left: 12px; padding-right: 12px; spacing: 8px;
-                        Label { text: "Virtual folders"; }
-                        Muted { text: root.folder-count; horizontal-alignment: right; }
-                    }
-                }
-                Muted { text: "Remote orchestrators"; height: 30px; color: #8393b3; }
+                Tab { text: "Folders  ·  " + root.folder-count; align: left; height: 36px; active: root.view == "folders"; clicked => { root.view = "folders"; } }
+                Tab { text: "Activity"; align: left; height: 36px; active: root.view == "activity"; clicked => { root.view = "activity"; } }
+                Muted { text: "Peers"; height: 28px; color: #8393b3; }
                 ScrollView { vertical-stretch: 1;
-                    VerticalLayout { spacing: 5px;
-                        for peer in root.peer-rows: ActionButton { min-width: 0px; text: (peer.online ? "●  " : "○  ") + peer.endpoint; quiet: true; enabled: root.interactive;
-                            clicked => { root.endpoint = peer.endpoint; root.selected-repo = ""; root.dialog = "connect"; root.remote-list(peer.endpoint); }
+                    VerticalLayout { spacing: 2px; alignment: start;
+                        for peer in root.peers: Rectangle {
+                            height: 46px; border-radius: 8px;
+                            background: peer-touch.has-hover ? #172036 : transparent;
+                            peer-touch := TouchArea { mouse-cursor: pointer; clicked => { root.selected-peer = peer.installation; root.dialog = "peer"; root.open-peer(peer.installation); } }
+                            HorizontalLayout { padding-left: 8px; padding-right: 8px; spacing: 9px;
+                                VerticalLayout { alignment: center; Rectangle { width: 8px; height: 8px; border-radius: 4px; background: Theme.fg(peer.badge.tone); } }
+                                VerticalLayout { alignment: center; spacing: 1px;
+                                    Label { text: peer.name; font-size: 13px; color: #dfe6f3; }
+                                    Text { text: peer.badge.text + (peer.inbound-only ? "  ·  inbound only" : ""); color: Theme.fg(peer.badge.tone); font-size: 11px; overflow: elide; }
+                                }
+                            }
                         }
-                        if root.peer-rows.length == 0: Muted { text: "No remotes connected"; height: 28px; }
-                        ActionButton { text: "+  Connect orchestrator"; quiet: true; enabled: root.interactive; clicked => { root.dialog = "connect"; } }
-                        Rectangle { vertical-stretch: 1; }
+                        if root.peers.length == 0: Muted { text: "No peers yet"; height: 28px; }
+                        Button { text: "+  Pair with a host"; quiet: true; enabled: root.interactive; clicked => { root.dialog = "connect"; } }
                     }
                 }
-                ActionButton { text: "Host settings"; quiet: true; enabled: root.interactive; clicked => { root.dialog = "host"; } }
-                Card { height: 140px; background: #0a1020;
-                    VerticalLayout { padding: 13px; spacing: 5px;
+                Card { height: 150px; background: #0c1426;
+                    VerticalLayout { padding: 12px; spacing: 4px;
                         Label { text: "Host · " + root.host-name; font-size: 12px; font-weight: 600; }
-                        HorizontalLayout { Muted { text: "Status"; } Label { text: root.connected ? "● Running" : "○ Offline"; color: root.connected ? #5fd0a6 : Theme.muted; horizontal-alignment: right; font-size: 12px; } }
-                        HorizontalLayout { Muted { text: "Listening"; } Muted { text: root.listen-address; horizontal-alignment: right; } }
-                        HorizontalLayout { Muted { text: "Mounted"; } Muted { text: root.mounted-count + " of " + root.folder-count; horizontal-alignment: right; } }
-                        HorizontalLayout { Muted { text: "Storage"; } Muted { text: "Not reported"; horizontal-alignment: right; } }
+                        HorizontalLayout { spacing: 6px; Muted { text: "Daemon"; width: 74px; } Text { text: root.daemon-status.text; color: Theme.fg(root.daemon-status.tone); font-size: 12px; horizontal-alignment: right; overflow: elide; horizontal-stretch: 1; } }
+                        HorizontalLayout { spacing: 6px; Muted { text: "Version"; width: 74px; } Muted { text: root.daemon-version; horizontal-alignment: right; horizontal-stretch: 1; } }
+                        HorizontalLayout { spacing: 6px; Muted { text: "Listening"; width: 74px; } Muted { text: root.daemon-network; horizontal-alignment: right; horizontal-stretch: 1; } }
+                        HorizontalLayout { spacing: 6px; Muted { text: "Installation"; width: 74px; } Muted { text: root.daemon-installation; horizontal-alignment: right; horizontal-stretch: 1; } }
+                        HorizontalLayout { spacing: 6px;
+                            Button { small: true; text: "Log"; quiet: true; clicked => { root.open-log(); } }
+                            Button { small: true; text: "Settings"; quiet: true; enabled: root.interactive; clicked => { root.pairing-code = ""; root.dialog = "host"; } }
+                        }
                     }
                 }
             }
         }
+        // ---------------------------------------------------------------- main
         VerticalLayout { spacing: 0px;
-            Rectangle { height: 158px; background: Theme.panel;
-                VerticalLayout { padding-top: 20px; padding-bottom: 15px; padding-left: 24px; padding-right: 24px; spacing: 10px;
-                    Label { text: "Virtual folders"; font-size: 20px; font-weight: 600; }
-                    Field { placeholder: "Search folders"; text <=> root.search; enabled: root.dialog == ""; edited(text) => { root.search-folders(text); } }
-                    HorizontalLayout { spacing: 10px;
-                        ActionButton { text: "Connect remote"; enabled: root.interactive; clicked => { root.dialog = "connect"; } }
-                        ActionButton { text: "New folder"; primary: true; enabled: root.interactive; clicked => { root.folder-name = ""; root.mount-path = ""; root.dialog = "create"; } }
-                        Rectangle { horizontal-stretch: 1; }
-                        ActionButton { text: "Refresh"; quiet: true; enabled: root.interactive; clicked => { root.refresh(); } }
+            Rectangle { height: 64px; background: Theme.panel;
+                HorizontalLayout { padding-left: 24px; padding-right: 24px; spacing: 10px;
+                    Label { text: root.view == "activity" ? "Activity" : "Folders"; font-size: 20px; font-weight: 600; }
+                    Rectangle { horizontal-stretch: 1; }
+                    if root.view == "folders": VerticalLayout { alignment: center; width: 240px;
+                        Field { placeholder: "Search folders"; text <=> root.search; enabled: root.interactive; edited(text) => { root.search-folders(text); } }
                     }
+                    VerticalLayout { alignment: center; Button { text: "Pair with a host"; enabled: root.interactive; clicked => { root.dialog = "connect"; } } }
+                    VerticalLayout { alignment: center; Button { text: "New folder"; primary: true; enabled: root.interactive && root.connected; clicked => { root.folder-name = ""; root.mount-path = ""; root.dialog = "create"; } } }
                 }
                 Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
             }
-            VerticalLayout { padding: 24px; spacing: 18px;
-                HorizontalLayout { spacing: 12px;
-                    Stat { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; title: "Storage used"; value: "—"; detail: "Storage usage is not reported yet"; }
-                    Stat { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; title: "Folders mounted"; value: root.mounted-count + " / " + root.folder-count; detail: "On this host"; }
-                    Stat { min-width: 0px; preferred-width: 0px; horizontal-stretch: 1; title: "Orchestrators online"; value: root.online-count + " / " + root.peer-rows.length; detail: "Connected remote hosts"; }
+            if root.banner-text != "": Rectangle {
+                background: Theme.bg(root.banner-tone);
+                HorizontalLayout { padding-left: 24px; padding-right: 24px; padding-top: 8px; padding-bottom: 8px; spacing: 10px;
+                    if root.banner-tone == "progress": VerticalLayout { alignment: center; Spinner {} }
+                    Text { text: root.banner-text; color: Theme.fg(root.banner-tone); font-size: 13px; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+                    if root.banner-action != "": VerticalLayout { alignment: center; Button { small: true; text: root.banner-action-label; clicked => { root.banner-clicked(root.banner-action); } } }
                 }
-                Card { min-height: 104px; preferred-height: root.folders.length == 0 ? 260px : 46px + root.folders.length * 58px; vertical-stretch: 0;
+            }
+            if root.daemon-errors.length > 0: Rectangle {
+                background: #2a1a1e;
+                VerticalLayout { padding-left: 24px; padding-right: 24px; padding-top: 8px; padding-bottom: 8px; spacing: 6px;
+                    for e in root.daemon-errors: ErrorLine { title: e.title; meta: e.meta; hint: e.hint; tone: e.tone; }
+                }
+            }
+            if root.view == "folders": VerticalLayout { padding: 22px; spacing: 16px; vertical-stretch: 1;
+                HorizontalLayout { spacing: 12px;
+                    Stat { horizontal-stretch: 1; title: "Folders in sync"; value: root.stat-folders; detail: root.stat-folders-detail; tone: root.stat-folders-tone; }
+                    Stat { horizontal-stretch: 1; title: "Mounted"; value: root.stat-mounted; detail: root.stat-mounted-detail; }
+                    Stat { horizontal-stretch: 1; title: "Peers online"; value: root.stat-peers; detail: root.stat-peers-detail; }
+                    Stat { horizontal-stretch: 1; title: "Transfer"; value: root.stat-transfer; detail: root.stat-transfer-detail; }
+                }
+                Card { vertical-stretch: 1;
                     VerticalLayout { spacing: 0px; padding: 1px;
-                        HorizontalLayout { height: 42px; padding-left: 16px; padding-right: 16px; spacing: 14px;
-                            Muted { text: "Name"; width: root.name-column; }
-                            Muted { text: "Mount point"; horizontal-stretch: 1.2; }
-                            Muted { text: "Status"; width: 118px; }
-                            Muted { text: "Actions"; width: 320px; horizontal-alignment: right; }
+                        HorizontalLayout { height: 38px; padding-left: 16px; padding-right: 16px; spacing: 12px;
+                            Muted { text: "Folder"; width: 210px; }
+                            Muted { text: "Sync"; horizontal-stretch: 1; }
+                            Muted { text: "Mount"; width: 170px; }
+                            Muted { text: "Worker"; width: 180px; }
+                            Muted { text: ""; width: 132px; }
                         }
                         Rectangle { height: 1px; background: Theme.line; }
-                        if root.folders.length > 0: ScrollView {
-                            VerticalLayout { spacing: 0px;
-                                for folder in root.folders: Rectangle { height: 58px; background: row-hover.has-hover ? #1b2432 : transparent;
-                                    row-hover := TouchArea {}
-                                    HorizontalLayout { padding-left: 16px; padding-right: 16px; padding-top: 12px; padding-bottom: 12px; spacing: 14px;
-                                        HorizontalLayout { width: root.name-column; spacing: 10px; alignment: start;
-                                            FolderIcon {}
-                                            VerticalLayout { spacing: 1px;
-                                                Label { text: folder.label; font-weight: 600; horizontal-stretch: 1; }
-                                                Muted { text: folder.sync; font-size: 10px; }
-                                            }
-                                        }
-                                        Label { text: folder.mount == "" ? "No mount point" : folder.mount; font-family: "Consolas"; font-size: 12px; horizontal-stretch: 1.2; }
-                                        Rectangle { width: 118px;
-                                          Rectangle { y: (parent.height - 24px) / 2; width: parent.width; height: 24px; border-radius: 12px;
-                                            background: folder.error != "" ? #43262a : folder.running ? #12342a : #222a37;
-                                            Label { text: folder.starting ? "◌ Starting" : folder.error != "" ? "! Needs attention" : folder.running ? (folder.mount == "" ? "● Headless" : "● Mounted") : "○ Not mounted"; color: folder.error != "" ? #ff9d96 : folder.running ? #5fd0a6 : Theme.muted; font-size: 11px; horizontal-alignment: center; }
-                                          }
-                                        }
-                                        HorizontalLayout { width: 320px; spacing: 6px;
-                                            ActionButton { text: folder.starting ? "Cancel" : folder.running ? (folder.mount == "" ? "Stop" : "Unmount") : (folder.mount == "" ? "Start" : "Mount"); enabled: root.interactive;
-                                                clicked => { if folder.running || folder.starting { root.stop-folder(folder.state); } else { root.start-folder(folder.state); } }
-                                            }
-                                            ActionButton { text: "Sync / conflicts"; enabled: root.interactive;
-                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.selected-conflict = ""; root.selected-revision = ""; root.show-conflicts = false; root.dialog = "folder"; root.folder-details(folder.state); }
-                                            }
-                                            ActionButton { text: "Change path"; enabled: root.interactive;
-                                                clicked => { root.selected-state = folder.state; root.selected-label = folder.label; root.mount-path = folder.mount; root.dialog = (folder.running || folder.starting) ? "stop-first" : "mount"; }
-                                            }
-                                        }
-                                    }
-                                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                        if root.folders.length > 0: ScrollView { vertical-stretch: 1;
+                            VerticalLayout { spacing: 0px; alignment: start;
+                                for folder in root.folders: FolderRowView {
+                                    data: folder; enabled: root.interactive;
+                                    name-width: 210px; mount-width: 170px; life-width: 180px; actions-width: 132px;
+                                    act(state, action) => { root.folder-action(state, action); }
+                                    open(state) => { root.selected-state = state; root.selected-label = folder.label; root.detail-tab = "overview"; root.dialog = "folder"; root.open-folder(state); }
                                 }
-                                Rectangle { vertical-stretch: 1; }
                             }
                         }
-                        if root.folders.length == 0: VerticalLayout { padding: 40px; spacing: 12px; alignment: center;
-                            Label { text: root.search != "" ? "No folders match your search" : "Your folders, all in one place"; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
-                            Muted { text: root.search != "" ? "Try another name or mount path." : "Create a virtual folder or connect a remote orchestrator to get started."; horizontal-alignment: center; }
-                            Rectangle { height: 12px; }
-                            HorizontalLayout { alignment: center;
-                                ActionButton { text: root.search != "" ? "Clear search" : "Create your first folder"; primary: true; enabled: root.interactive;
+                        if root.folders.length == 0: VerticalLayout { padding: 40px; spacing: 12px; alignment: center; vertical-stretch: 1;
+                            Label { text: !root.connected ? "Waiting for the daemon" : root.search != "" ? "No folders match your search" : "Your folders, all in one place"; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
+                            Muted { text: !root.connected ? "Folders appear here once the local daemon answers." : root.search != "" ? "Try another name or mount path." : "Create a folder, or pair with a host and receive one of its folders."; horizontal-alignment: center; }
+                            if root.connected: HorizontalLayout { alignment: center;
+                                Button { text: root.search != "" ? "Clear search" : "Create your first folder"; primary: true; enabled: root.interactive;
                                     clicked => { if root.search != "" { root.search = ""; root.search-folders(""); } else { root.folder-name = ""; root.mount-path = ""; root.dialog = "create"; } }
                                 }
                             }
                         }
                     }
                 }
-                Rectangle { vertical-stretch: 1; }
-                HorizontalLayout { height: 34px; spacing: 12px;
-                    Label { text: root.busy ? "Working…" : root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; horizontal-stretch: 1; }
-                    ActionButton { text: "Details"; quiet: true; enabled: root.dialog == ""; clicked => { root.dialog = "details"; } }
+                HorizontalLayout { height: 22px; spacing: 10px;
+                    if !root.idle: VerticalLayout { alignment: center; Spinner {} }
+                    Text { text: root.idle ? root.status : root.global-busy + "…"; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
+                }
+            }
+            if root.view == "activity": VerticalLayout { padding: 22px; spacing: 12px; vertical-stretch: 1;
+                Card { vertical-stretch: 1;
+                    VerticalLayout { padding: 1px;
+                        if root.activity.length == 0: Muted { text: "No activity yet."; height: 60px; horizontal-alignment: center; }
+                        ScrollView { vertical-stretch: 1;
+                            VerticalLayout { alignment: start;
+                                for entry in root.activity: Rectangle {
+                                    HorizontalLayout { padding-left: 16px; padding-right: 16px; padding-top: 7px; padding-bottom: 7px; spacing: 12px;
+                                        Mono { text: entry.time; width: 120px; }
+                                        Muted { text: entry.ago; width: 90px; }
+                                        Pill { text: entry.kind; tone: entry.tone; width: 100px; }
+                                        Label { text: entry.subject; width: 200px; font-size: 13px; }
+                                        Text { text: entry.message; color: Theme.fg(entry.tone); font-size: 13px; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
+                                    }
+                                    Rectangle { y: parent.height - 1px; height: 1px; background: Theme.line; }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
+    // -------------------------------------------------------------------- dialogs
     if root.dialog != "": Rectangle {
         background: #050913bb;
-        TouchArea { clicked => { if !root.busy { root.dialog = ""; } } }
+        TouchArea { clicked => { if root.idle { root.dismiss(); } } }
         Card {
             x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-            width: root.dialog == "folder" ? 880px : root.dialog == "connect" ? 600px : 510px;
-            height: self.preferred-height;
+            width: root.dialog == "folder" ? min(parent.width - 60px, 1040px) : root.dialog == "peer" ? 860px : root.dialog == "connect" ? 600px : 520px;
+            height: root.dialog == "folder" ? min(parent.height - 60px, 760px) : root.dialog == "peer" ? min(parent.height - 60px, 640px) : self.preferred-height;
             TouchArea {}
-            VerticalLayout { padding: 24px; spacing: 14px;
-                HorizontalLayout {
-                    Label { text: root.dialog == "folder" ? root.selected-label + " — Sync & conflicts" : root.dialog == "create" ? "New virtual folder" : root.dialog == "mount" || root.dialog == "stop-first" ? "Change mount point" : root.dialog == "connect" ? "Connect remote orchestrator" : root.dialog == "host" ? "Host settings" : root.dialog == "shutdown" ? "Shut down host" : "Activity details"; font-size: 20px; font-weight: 600; }
-                    ActionButton { width: 34px; text: "×"; quiet: true; enabled: !root.busy; clicked => { root.dialog = ""; } }
+            VerticalLayout { padding: 22px; spacing: 12px;
+                HorizontalLayout { spacing: 10px;
+                    Label {
+                        text: root.dialog == "folder" ? root.detail-row.label
+                            : root.dialog == "peer" ? root.peer-detail.name
+                            : root.dialog == "create" ? "New folder"
+                            : root.dialog == "mount" || root.dialog == "stop-first" ? "Change mount point"
+                            : root.dialog == "connect" ? "Pair with a host"
+                            : root.dialog == "host" ? "Settings"
+                            : root.dialog == "shutdown" ? "Shut down the daemon"
+                            : root.dialog == "confirm" ? "Are you sure?" : "Details";
+                        font-size: 20px; font-weight: 600; horizontal-stretch: 1;
+                    }
+                    if !root.idle: VerticalLayout { alignment: center; Spinner {} }
+                    Button { width: 34px; text: "×"; quiet: true; enabled: root.idle; clicked => { root.dismiss(); } }
                 }
+                // ------------------------------------------------ folder dialog
+                if root.dialog == "folder": VerticalLayout { spacing: 10px; vertical-stretch: 1;
+                    HorizontalLayout { spacing: 8px; alignment: start;
+                        Mono { text: root.detail-row.mount == "" ? "Headless" : root.detail-row.mount; }
+                    }
+                    HorizontalLayout { spacing: 18px;
+                        StatusCell { horizontal-stretch: 2; chip: root.detail-row.sync; strong: true; enabled: root.detail-row.busy == ""; act(a) => { root.folder-action(root.selected-state, a); } }
+                        StatusCell { horizontal-stretch: 1; chip: root.detail-row.mount-chip; enabled: root.detail-row.busy == ""; act(a) => { root.folder-action(root.selected-state, a); } }
+                        StatusCell { horizontal-stretch: 1; chip: root.detail-row.life; enabled: root.detail-row.busy == ""; act(a) => { root.folder-action(root.selected-state, a); } }
+                    }
+                    if root.detail-row.has-progress: Bar { value: root.detail-row.progress; tone: root.detail-row.sync.tone; }
+                    if root.detail-row.detail != "": Muted { text: root.detail-row.detail; wrap: word-wrap; }
+                    if root.detail-row.error-title != "": ErrorLine { title: root.detail-row.error-title; meta: root.detail-row.error-meta; hint: root.detail-row.error-hint; tone: root.detail-row.error-tone; }
+                    HorizontalLayout { spacing: 6px; alignment: start;
+                        for a in root.detail-actions: Button {
+                            small: true; text: a.label; danger: a.danger;
+                            enabled: a.enabled && root.detail-row.busy == "";
+                            clicked => { root.folder-action(root.selected-state, a.id); }
+                        }
+                        if root.detail-row.busy != "": HorizontalLayout { spacing: 6px; VerticalLayout { alignment: center; Spinner {} } Muted { text: root.detail-row.busy + "…"; } }
+                    }
+                    HorizontalLayout { spacing: 4px; alignment: start;
+                        for t in [
+                            { id: "overview", label: "Overview" }, { id: "sync", label: "Sync" }, { id: "activation", label: "Activation" },
+                            { id: "content", label: "Content" }, { id: "conflicts", label: "Conflicts" }, { id: "errors", label: "Errors" },
+                            { id: "activity", label: "Activity" }
+                        ]: Tab {
+                            text: t.label; active: root.detail-tab == t.id;
+                            clicked => { root.detail-tab = t.id; root.detail-tab-changed(t.id); }
+                        }
+                    }
+                    Rectangle { height: 1px; background: Theme.line; }
+                    if root.detail-tab == "overview": ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 10px; alignment: start; padding-right: 12px;
+                            KVList { rows: root.detail-overview; }
+                            if root.detail-waiting-on.length > 0: VerticalLayout { spacing: 4px;
+                                Muted { text: "The initial sync is waiting on:"; }
+                                for w in root.detail-waiting-on: Text { text: "•  " + w; color: Theme.ink; font-size: 13px; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                    if root.detail-tab == "sync": ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 8px; alignment: start; padding-right: 12px;
+                            if root.detail-peers.length == 0: Muted { text: "No peer shares this folder."; }
+                            for p in root.detail-peers: Card {
+                                background: Theme.raised;
+                                VerticalLayout { padding: 12px; spacing: 5px;
+                                    HorizontalLayout { spacing: 10px;
+                                        Label { text: p.name; font-weight: 600; }
+                                        Muted { text: p.direction; }
+                                        Rectangle { horizontal-stretch: 1; }
+                                        Pill { text: p.state.text; tone: p.state.tone; }
+                                    }
+                                    HorizontalLayout { spacing: 12px; Muted { text: "Metadata"; width: 90px; } Text { text: p.meta; color: Theme.ink; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; } }
+                                    HorizontalLayout { spacing: 12px; Muted { text: "Events"; width: 90px; } Text { text: p.counts; color: Theme.ink; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; } }
+                                    HorizontalLayout { spacing: 12px; Muted { text: "↓ Download"; width: 90px; } Text { text: p.down; color: Theme.ink; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; } }
+                                    HorizontalLayout { spacing: 12px; Muted { text: "↑ Upload"; width: 90px; } Text { text: p.up; color: Theme.ink; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; } }
+                                    HorizontalLayout { spacing: 12px; Muted { text: "Progress"; width: 90px; } Text { text: p.progress; color: Theme.muted; font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; } }
+                                    if p.error-title != "": ErrorLine { title: p.error-title; meta: p.error-meta; hint: p.error-hint; tone: p.error-tone; }
+                                }
+                            }
+                        }
+                    }
+                    if root.detail-tab == "activation": ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 12px; alignment: start; padding-right: 12px;
+                            KVList { rows: root.detail-activation; }
+                            HorizontalLayout { alignment: start;
+                                Button { text: "Revalidate quarantined"; enabled: root.detail-row.busy == "" && root.detail-row.running; clicked => { root.folder-action(root.selected-state, "revalidate"); } }
+                            }
+                        }
+                    }
+                    if root.detail-tab == "content": ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 12px; alignment: start; padding-right: 12px;
+                            KVList { rows: root.detail-content; }
+                            HorizontalLayout { spacing: 10px;
+                                Label { text: "Missing files"; font-weight: 600; horizontal-stretch: 1; }
+                                Button { small: true; text: "Refresh"; enabled: root.detail-row.running; clicked => { root.refresh-content(); } }
+                            }
+                            if root.detail-missing-note != "": Muted { text: root.detail-missing-note; wrap: word-wrap; }
+                            for m in root.detail-missing: HorizontalLayout { spacing: 12px;
+                                Mono { text: m.path; horizontal-stretch: 1; color: Theme.ink; }
+                                Muted { text: m.state; width: 110px; }
+                                Muted { text: m.progress; width: 150px; }
+                                if m.error != "": Text { text: m.error; color: #ff9d96; font-size: 11px; width: 260px; overflow: elide; }
+                            }
+                        }
+                    }
+                    if root.detail-tab == "conflicts": VerticalLayout { spacing: 10px; vertical-stretch: 1;
+                        Muted { text: root.conflict-summary; wrap: word-wrap; }
+                        HorizontalLayout { spacing: 8px;
+                            Label { text: "Unresolved conflicts (" + root.conflict-count + ")"; font-weight: 600; horizontal-stretch: 1; }
+                            Button { small: true; text: "Previous"; enabled: root.idle && root.conflict-offset > 0; clicked => { root.conflict-page(max(0, root.conflict-offset - 100)); } }
+                            Button { small: true; text: "Next"; enabled: root.idle && root.conflict-offset + 100 < root.conflict-count; clicked => { root.conflict-page(root.conflict-offset + 100); } }
+                            Button { small: true; text: "Refresh"; enabled: root.idle; clicked => { root.detail-tab-changed("conflicts"); } }
+                        }
+                        HorizontalLayout { spacing: 12px;
+                            ScrollView { width: 320px; height: 150px;
+                                VerticalLayout { spacing: 4px; alignment: start;
+                                    for conflict in root.conflicts: Button { small: true; min-width: 0px; text: (root.selected-conflict == conflict.id && root.selected-entity == conflict.entity ? "● " : "") + conflict.description;
+                                        enabled: root.idle; clicked => { root.selected-conflict = conflict.id; root.selected-entity = conflict.entity; root.conflict-field = conflict.field; root.selected-revision = ""; root.select-conflict(conflict.id); }
+                                    }
+                                }
+                            }
+                            ScrollView { height: 150px;
+                                VerticalLayout { spacing: 4px; alignment: start;
+                                    for revision in root.revisions: Button { small: true; min-width: 0px; text: (root.selected-revision == revision.id ? "● " : "") + revision.description;
+                                        enabled: root.idle; clicked => { root.selected-revision = revision.id; root.preview-revision(revision.id); }
+                                    }
+                                }
+                            }
+                        }
+                        TextEdit { text: root.conflict-preview; read-only: true; vertical-stretch: 1; min-height: 90px; }
+                        if root.selected-conflict != "" && root.conflict-field != "namespace": HorizontalLayout { alignment: start;
+                            Button { text: "Use selected revision"; primary: true; enabled: root.idle && root.selected-revision != ""; clicked => { root.resolve-conflict(); } }
+                        }
+                        if root.selected-conflict != "" && (root.conflict-field == "namespace" || root.conflict-field == "location"): HorizontalLayout { spacing: 8px;
+                            Field { text <=> root.recovery-target; placeholder: "New path for the selected entry, e.g. recovered/file.txt"; enabled: root.idle; }
+                            Button { text: "Recover at path"; enabled: root.idle && root.recovery-target != "" && root.selected-revision != ""; clicked => { root.recover-conflict(root.recovery-target); } }
+                        }
+                        Muted { text: "Choosing a revision records an explicit resolution. Close open files before resolving. Missing previews download on demand."; wrap: word-wrap; }
+                    }
+                    if root.detail-tab == "errors": ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 10px; alignment: start; padding-right: 12px;
+                            if root.detail-errors.length == 0: Muted { text: "No errors."; }
+                            for e in root.detail-errors: ErrorLine { title: e.title; meta: e.meta; hint: e.hint; tone: e.tone; }
+                        }
+                    }
+                    if root.detail-tab == "activity": ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 4px; alignment: start; padding-right: 12px;
+                            if root.detail-activity.length == 0: Muted { text: "No activity for this folder yet."; }
+                            for entry in root.detail-activity: HorizontalLayout { spacing: 10px;
+                                Mono { text: entry.time; width: 120px; }
+                                Muted { text: entry.kind; width: 90px; }
+                                Text { text: (entry.subject != "" ? entry.subject + ": " : "") + entry.message; color: Theme.fg(entry.tone); font-size: 12px; wrap: word-wrap; horizontal-stretch: 1; }
+                            }
+                        }
+                    }
+                }
+                // -------------------------------------------------- peer dialog
+                if root.dialog == "peer": VerticalLayout { spacing: 10px; vertical-stretch: 1;
+                    HorizontalLayout { spacing: 10px; alignment: start;
+                        Pill { text: root.peer-detail.badge.text; tone: root.peer-detail.badge.tone; }
+                        Muted { text: root.peer-detail.direction; }
+                        if root.peer-detail.protocol != "": Muted { text: root.peer-detail.protocol; }
+                        if root.peer-detail.rtt != "": Muted { text: "RTT " + root.peer-detail.rtt; }
+                        if root.peer-detail.rates != "": Muted { text: root.peer-detail.rates; }
+                    }
+                    Mono { text: root.peer-detail.endpoint == "" ? "Inbound only: this host does not dial it" : root.peer-detail.endpoint; }
+                    if root.peer-detail.lanes-summary != "": Muted { text: root.peer-detail.lanes-summary; }
+                    if root.peer-detail.folders != "": Text { text: "Shared folders: " + root.peer-detail.folders; color: Theme.ink; font-size: 13px; wrap: word-wrap; }
+                    if root.peer-detail.error-title != "": ErrorLine { title: root.peer-detail.error-title; meta: root.peer-detail.error-meta; hint: root.peer-detail.error-hint; }
+                    Rectangle { height: 1px; background: Theme.line; }
+                    HorizontalLayout { spacing: 10px;
+                        Muted { text: "Lane"; width: 50px; } Muted { text: "Role"; width: 110px; } Muted { text: "State"; width: 170px; }
+                        Muted { text: "In flight"; horizontal-stretch: 1; } Muted { text: "Since"; width: 90px; } Muted { text: "Bytes"; width: 170px; }
+                    }
+                    ScrollView { vertical-stretch: 1;
+                        VerticalLayout { spacing: 6px; alignment: start; padding-right: 12px;
+                            if root.peer-lanes.length == 0: Muted { text: "No lanes."; }
+                            for lane in root.peer-lanes: VerticalLayout { spacing: 2px;
+                                HorizontalLayout { spacing: 10px;
+                                    Label { text: lane.lane; width: 50px; font-size: 12px; }
+                                    Label { text: lane.role; width: 110px; font-size: 12px; }
+                                    HorizontalLayout { width: 170px; alignment: start; Pill { text: lane.state.text; tone: lane.state.tone; } }
+                                    Text { text: lane.inflight == "" ? "—" : lane.inflight; color: Theme.ink; font-size: 12px; horizontal-stretch: 1; overflow: elide; vertical-alignment: center; }
+                                    Muted { text: lane.since; width: 90px; }
+                                    Muted { text: lane.bytes; width: 170px; }
+                                }
+                                if lane.rate != "": Muted { text: "   " + lane.rate; font-size: 11px; }
+                                if lane.error != "": Text { text: "   ! " + lane.error; color: #ff9d96; font-size: 11px; wrap: word-wrap; }
+                            }
+                        }
+                    }
+                    HorizontalLayout { spacing: 8px; alignment: end;
+                        if root.peer-detail.endpoint != "": Button { text: "Browse folders"; enabled: root.idle; clicked => { root.endpoint = root.peer-detail.endpoint; root.selected-repo = ""; root.dialog = "connect"; root.remote-list(root.peer-detail.endpoint); } }
+                        if root.peer-detail.endpoint != "": Button { text: "Pair again"; enabled: root.idle; clicked => { root.endpoint = root.peer-detail.endpoint; root.code = ""; root.dialog = "connect"; } }
+                        if root.peer-detail.endpoint != "": Button { text: "Disconnect"; danger: true; enabled: root.idle; clicked => { root.unpair(root.peer-detail.endpoint); } }
+                    }
+                }
+                // ------------------------------------------ create / mount path
                 if root.dialog == "create" || root.dialog == "mount": VerticalLayout { spacing: 10px;
                     Muted { text: root.dialog == "create" ? "Create a folder on this host and choose where it appears on disk." : "Choose a new mount point for “" + root.selected-label + "”."; wrap: word-wrap; }
                     if root.dialog == "create": VerticalLayout { spacing: 6px;
                         Label { text: "Folder name"; }
-                        Field { placeholder: "Project files"; text <=> root.folder-name; enabled: !root.busy; }
+                        Field { placeholder: "Project files"; text <=> root.folder-name; enabled: root.idle; }
                     }
                     Label { text: "Mount point"; }
-                    Field { placeholder: "e.g. C:\\Telekinesis\\projects"; text <=> root.mount-path; enabled: !root.busy; }
+                    Field { placeholder: "e.g. C:\\Telekinesis\\projects"; text <=> root.mount-path; enabled: root.idle; }
                     Muted { text: root.dialog == "create" ? "Leave empty to use the default mount directory. The folder mounts immediately." : "Leave empty to run without a filesystem mount. Start the folder after saving."; wrap: word-wrap; }
                     HorizontalLayout { alignment: end; spacing: 8px;
-                        ActionButton { text: "Cancel"; enabled: !root.busy; clicked => { root.dialog = ""; } }
-                        ActionButton { text: root.dialog == "create" ? "Create & mount" : "Save mount point"; primary: true; enabled: !root.busy && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path); } else { root.configure-mount(root.selected-state, root.mount-path); } } }
+                        Button { text: "Cancel"; enabled: root.idle; clicked => { root.dismiss(); } }
+                        Button { text: root.dialog == "create" ? "Create & mount" : "Save mount point"; primary: true; enabled: root.idle && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path); } else { root.configure-mount(root.selected-state, root.mount-path); } } }
                     }
                 }
                 if root.dialog == "stop-first": VerticalLayout { spacing: 16px;
-                    Label { text: "Unmount “" + root.selected-label + "” before changing its path. Close any open files in this folder first."; wrap: word-wrap; }
-                    ActionButton { text: "Stop folder to change path"; primary: true; enabled: !root.busy; clicked => { root.stop-folder(root.selected-state); } }
+                    Label { text: "Stop “" + root.selected-label + "” before changing its mount point. Close any open files in it first."; wrap: word-wrap; }
+                    HorizontalLayout { alignment: end; spacing: 8px;
+                        Button { text: "Cancel"; enabled: root.idle; clicked => { root.dismiss(); } }
+                        Button { text: "Stop the folder"; primary: true; enabled: root.idle; clicked => { root.folder-action(root.selected-state, "stop"); } }
+                    }
                 }
+                if root.dialog == "confirm": VerticalLayout { spacing: 16px;
+                    Label { text: root.confirm-text; wrap: word-wrap; }
+                    HorizontalLayout { alignment: end; spacing: 8px;
+                        Button { text: "Cancel"; clicked => { root.dismiss(); } }
+                        Button { text: "Force stop"; danger: true; clicked => { root.dialog = ""; root.folder-action(root.selected-state, "confirmed-" + root.confirm-action); } }
+                    }
+                }
+                // ------------------------------------------------- pairing
                 if root.dialog == "connect": VerticalLayout { spacing: 9px;
                     Muted { text: "Pair with another host to browse and receive its shared folders."; }
-                    Label { text: "Orchestrator address"; }
-                    Field { placeholder: "ws://host:43180 or wss://host"; text <=> root.endpoint; enabled: !root.busy; edited(_) => { root.remote-changed(); } }
-                    Label { text: "Remote pairing code"; }
-                    Field { placeholder: "Enter the code from the remote host"; text <=> root.code; enabled: !root.busy; }
+                    Label { text: "Host address"; }
+                    Field { placeholder: "ws://host:43180 or wss://host"; text <=> root.endpoint; enabled: root.idle; edited(_) => { root.remote-changed(); } }
+                    Label { text: "The host's pairing code"; }
+                    Field { placeholder: "Enter the code shown in the other host's Settings"; text <=> root.code; enabled: root.idle; }
                     HorizontalLayout { spacing: 8px;
-                        ActionButton { text: "Pair"; primary: true; enabled: !root.busy && root.endpoint != "" && root.code != ""; clicked => { root.pair(root.endpoint, root.code); } }
-                        ActionButton { text: "Browse folders"; enabled: !root.busy && root.endpoint != ""; clicked => { root.remote-list(root.endpoint); } }
-                        ActionButton { text: "Disconnect"; enabled: !root.busy && root.endpoint != ""; clicked => { root.unpair(root.endpoint); } }
+                        Button { text: "Pair"; primary: true; enabled: root.idle && root.endpoint != "" && root.code != ""; clicked => { root.pair(root.endpoint, root.code); } }
+                        Button { text: "Browse folders"; enabled: root.idle && root.endpoint != ""; clicked => { root.remote-list(root.endpoint); } }
+                        Button { text: "Disconnect"; enabled: root.idle && root.endpoint != ""; clicked => { root.unpair(root.endpoint); } }
                     }
                     Muted { text: root.remote-message; wrap: word-wrap; }
                     ScrollView { height: 110px;
-                        VerticalLayout { spacing: 5px;
-                            for remote in root.remote-folders: ActionButton { min-width: 0px; text: (root.selected-repo == remote.repo ? "●  " : "○  ") + remote.label; enabled: !root.busy; clicked => { root.selected-repo = remote.repo; root.selected-label = remote.label; } }
-                            Rectangle { vertical-stretch: 1; }
+                        VerticalLayout { spacing: 4px; alignment: start;
+                            for remote in root.remote-folders: Button { small: true; min-width: 0px; text: (root.selected-repo == remote.repo ? "●  " : "○  ") + remote.label; enabled: root.idle; clicked => { root.selected-repo = remote.repo; root.selected-label = remote.label; } }
                         }
                     }
-                    Field { placeholder: "Local mount point (optional)"; text <=> root.remote-mount; enabled: !root.busy; }
-                    ActionButton { min-width: 0px; text: root.selected-repo == "" ? "Select a folder to receive" : "Receive & mount “" + root.selected-label + "”"; primary: true; enabled: !root.busy && root.selected-repo != ""; clicked => { root.receive-folder(root.endpoint, root.selected-repo, root.selected-label, root.remote-mount); } }
+                    Field { placeholder: "Local mount point (optional)"; text <=> root.remote-mount; enabled: root.idle; }
+                    Button { min-width: 0px; text: root.selected-repo == "" ? "Select a folder to receive" : "Receive & mount “" + root.selected-label + "”"; primary: true; enabled: root.idle && root.selected-repo != ""; clicked => { root.receive-folder(root.endpoint, root.selected-repo, root.selected-label, root.remote-mount); } }
                 }
-                if root.dialog == "host": VerticalLayout { spacing: 12px;
+                if root.dialog == "host": VerticalLayout { spacing: 10px;
                     Muted { text: "Configuration"; }
-                    Label { text: root.config-path; wrap: word-wrap; }
-                    Muted { text: "Generate a code to pair another host with this orchestrator. A new code replaces the old one; existing peers must pair again."; wrap: word-wrap; }
-                    ActionButton { text: "Generate new pairing code"; enabled: !root.busy; clicked => { root.reset-code(); } }
-                    TextEdit { text: root.pairing-code; read-only: true; height: 60px; }
-                    Muted { text: "Closing this window leaves the daemon and mounts running."; wrap: word-wrap; }
+                    Mono { text: root.config-path; wrap: word-wrap; color: Theme.ink; }
+                    Muted { text: "Control endpoint: " + root.daemon-control; }
+                    Muted { text: "Generate a code to pair another host with this one. A new code replaces the old one; hosts already paired must pair again."; wrap: word-wrap; }
+                    Button { text: "Generate a new pairing code"; enabled: root.idle && root.connected; clicked => { root.reset-code(); } }
+                    if root.pairing-code != "": TextEdit { text: root.pairing-code; read-only: true; height: 56px; }
+                    if root.pairing-code != "": Muted { text: "Shown once: copy it now. It is cleared when this dialog closes."; wrap: word-wrap; }
+                    Muted { text: "Closing this window leaves the daemon and its mounts running."; wrap: word-wrap; }
                     HorizontalLayout { spacing: 8px;
-                        ActionButton { text: "About Slint"; clicked => { about.show(); } }
-                        ActionButton { text: "Shut down daemon"; enabled: !root.busy && root.connected; clicked => { root.dialog = "shutdown"; } }
+                        Button { text: "About Slint"; clicked => { about.show(); } }
+                        Button { text: "Shut down the daemon"; danger: true; enabled: root.idle && root.connected; clicked => { root.pairing-code = ""; root.dialog = "shutdown"; } }
                     }
                 }
                 if root.dialog == "shutdown": VerticalLayout { spacing: 16px;
-                    Label { text: "Shut down this host? All running folders will stop and their mounts will become unavailable."; wrap: word-wrap; }
-                    ActionButton { text: "Shut down daemon"; enabled: !root.busy; clicked => { root.shutdown(); } }
-                }
-                if root.dialog == "folder": VerticalLayout { spacing: 10px;
-                    HorizontalLayout { spacing: 8px;
-                        ActionButton { text: "Synchronization"; primary: !root.show-conflicts; clicked => { root.show-conflicts = false; } }
-                        ActionButton { text: "Conflicts (" + root.conflict-count + ")"; primary: root.show-conflicts; clicked => { root.show-conflicts = true; } }
-                        Rectangle { horizontal-stretch: 1; }
-                        Muted { text: "Refreshes every 5 seconds"; }
-                    }
-                    if !root.show-conflicts: VerticalLayout { spacing: 8px;
-                        Label { text: "Local content and metadata"; font-weight: 600; }
-                        TextEdit { text: root.folder-summary; read-only: true; height: 140px; }
-                        Label { text: "Peers and transfer lanes"; font-weight: 600; }
-                        TextEdit { text: root.network-summary; read-only: true; height: 260px; }
-                    }
-                    if root.show-conflicts: VerticalLayout { spacing: 10px;
-                    TextEdit { text: root.folder-summary; read-only: true; height: 100px; }
-                    HorizontalLayout { spacing: 8px;
-                        Label { text: "Unresolved conflicts (" + root.conflict-count + ")"; font-weight: 600; horizontal-stretch: 1; }
-                        ActionButton { text: "Previous"; enabled: !root.busy && root.conflict-offset > 0; clicked => { root.conflict-page(max(0, root.conflict-offset - 100)); } }
-                        ActionButton { text: "Next"; enabled: !root.busy && root.conflict-offset + 100 < root.conflict-count; clicked => { root.conflict-page(root.conflict-offset + 100); } }
-                        ActionButton { text: "Refresh"; enabled: !root.busy; clicked => { root.folder-details(root.selected-state); } }
-                    }
-                    HorizontalLayout { spacing: 12px;
-                        ScrollView { width: 290px; height: 140px;
-                            VerticalLayout { spacing: 6px;
-                                for conflict in root.conflicts: ActionButton { min-width: 0px; text: (root.selected-conflict == conflict.id && root.selected-entity == conflict.entity ? "● " : "") + conflict.description;
-                                    enabled: !root.busy; clicked => { root.selected-conflict = conflict.id; root.selected-entity = conflict.entity; root.conflict-field = conflict.field; root.selected-revision = ""; root.select-conflict(conflict.id); }
-                                }
-                                Rectangle { vertical-stretch: 1; }
-                            }
-                        }
-                        ScrollView { height: 140px;
-                            VerticalLayout { spacing: 6px;
-                                for revision in root.revisions: ActionButton { min-width: 0px; text: (root.selected-revision == revision.id ? "● " : "") + revision.description;
-                                    enabled: !root.busy; clicked => { root.selected-revision = revision.id; root.preview-revision(revision.id); }
-                                }
-                                Rectangle { vertical-stretch: 1; }
-                            }
-                        }
-                    }
-                    TextEdit { text: root.conflict-preview; read-only: true; height: 128px; }
-                    if root.selected-conflict != "" && root.conflict-field != "namespace": ActionButton {
-                        text: "Use selected revision"; primary: true; enabled: !root.busy && root.selected-revision != "";
-                        clicked => { root.resolve-conflict(); }
-                    }
-                    if root.selected-conflict != "" && (root.conflict-field == "namespace" || root.conflict-field == "location"): HorizontalLayout { spacing: 8px;
-                        Field { text <=> root.recovery-target; placeholder: "New path for selected entry, e.g. recovered/file.txt"; enabled: !root.busy; }
-                        ActionButton { text: "Recover at path"; enabled: !root.busy && root.recovery-target != "" && root.selected-revision != "";
-                            clicked => { root.recover-conflict(root.recovery-target); }
-                        }
-                    }
-                    Muted { text: "Choosing a revision records an explicit resolution. Close open files before resolving. Missing previews download on demand."; wrap: word-wrap; }
+                    Label { text: "Shut down the daemon? Running folders stop and their mounts go away. It is not restarted until you start it again."; wrap: word-wrap; }
+                    HorizontalLayout { alignment: end; spacing: 8px;
+                        Button { text: "Cancel"; enabled: root.idle; clicked => { root.dismiss(); } }
+                        Button { text: "Shut down"; danger: true; enabled: root.idle; clicked => { root.shutdown(); } }
                     }
                 }
-                if root.dialog == "details": TextEdit { text: root.status; read-only: true; height: 180px; }
-                if root.dialog != "details": Label { text: root.busy ? "Working…" : root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; wrap: word-wrap; }
+                if root.dialog != "folder" && root.dialog != "peer": Text { text: root.idle ? root.status : root.global-busy + "…"; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; wrap: word-wrap; }
+                if root.dialog == "folder" || root.dialog == "peer": Text { text: root.status; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; overflow: elide; }
             }
         }
     }
