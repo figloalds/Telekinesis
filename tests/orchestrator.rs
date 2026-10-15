@@ -1409,12 +1409,10 @@ fn noise(seed: u64, len: usize) -> Vec<u8> {
         .collect()
 }
 
-/// `name` holds `bytes` and the folder's content is complete (the object is
-/// installed, not only its metadata).
+/// `name` holds `bytes`, and the object is installed (read back from the
+/// store; the status cell's `content.complete` may lag a new event).
 fn has_content(p: &Value, name: &str, bytes: &[u8]) -> bool {
-    has(p, name, bytes)
-        && runtime::rpc(&info(p), &id(), json!({"op":"status"}))
-            .is_ok_and(|status| status["content"]["complete"] == true)
+    has(p, name, bytes) && object_is(p, bytes)
 }
 
 /// The object of `bytes`, read back from the folder's store, is `bytes`.
