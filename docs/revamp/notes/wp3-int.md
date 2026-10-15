@@ -68,15 +68,26 @@ coordinator does that after review (§13 rule 6, rule 8 item 7).
    equal before and after); otherwise the metric is NaN and the floor
    fails.
 
-4. **`session_loopback_throughput` (≥ 300 MiB/s)** (`e362f8c`). The receive
-   path's chunk buffers come from one process-wide pool (32 buffers) instead
-   of a pool per connection, so a new connection does not pay fresh pages
-   for its first chunks (S1's memory pinning is not reintroduced: the pool
-   is bounded and holds no connection's data). The scenario takes the best of
-   three downloads on one connection and records every run (deviation 3).
-   Measured: best-of-3 390–535 MiB/s over five runs; with the old per-connection
-   pool and the same measurement 422–504 MiB/s, so most of the miss was
-   run-to-run variance on the shared machine, not the code.
+4. **`session_loopback_throughput` (≥ 300 MiB/s)** (`e362f8c`, `a972843`).
+   - First (`e362f8c`): the receive path's chunk buffers come from one
+     process-wide pool (32 buffers) instead of a pool per connection, and
+     the scenario takes the best of three downloads on one connection,
+     recording every run (deviation 3). Single runs looked better (best-of-3
+     390–535 MiB/s that morning), but in the qualification runs the scenario
+     still measured 265–286 MiB/s: not the fix.
+   - The cause (`a972843`): instrumented, both I/O threads were idle most of
+     the download (5–7 s of a 3–4 s download summed over the two threads in
+     `poller.wait`, under 0.6 s reading and writing), and the writer met
+     `WouldBlock` about once per 1 MiB frame: Windows' default socket buffers
+     (64 KiB) made the download move about one frame per poller round trip.
+     A bare tungstenite loopback on the same machine runs at 2.7 GiB/s. The
+     session socket now gets 4 MiB send and receive buffers on Windows
+     (`session::io::SOCKET_BUFFER_BYTES`; the send buffer alone gave 250–390
+     MiB/s): the download runs at 2.6–4.0 GiB/s, upload about 2 GiB/s, WSS
+     640–670 MiB/s, and `control_queued_30mib_p99_ms` dropped from 45 to
+     3 ms. These are kernel buffers, used only while data is in flight; S1's
+     user-space pinning is not reintroduced (the chunk copies stay). Linux
+     keeps its own buffer auto-tuning.
 
 5. **Throughput and scale fixes found by the Wave 3 end to end** (`1e57432`,
    `338f1fb`, `8695de0`):
@@ -185,13 +196,16 @@ coordinator does that after review (§13 rule 6, rule 8 item 7).
    3.1's daemon and 3.3's lanes together).
 2. **Core files changed by the integrator** (§13 rule 5): `core/snapshot.rs`,
    `core/commit.rs`, `core.rs`, `core/inbox.rs`, `core/transfer.rs`,
-   `worker/activator.rs`, `worker/maintenance.rs`, `session/conn.rs`. Each
+   `worker/activator.rs`, `worker/maintenance.rs`, `session/conn.rs`,
+   `session/io.rs`. Each
    change is a CCR above, a review finding or a defect the Wave 3 end to end
    found (the startup replay), with its test.
 3. **`qual_wp1_9_session::loopback_throughput` measures the best of three
-   downloads** on one connection (it was one run). The floor judges what the
-   session layer can carry; interference from other jobs on the shared
-   machine only lowers a run. Every run is recorded (`runs_mib_per_s`).
+   downloads** on one connection (it was one run), as the brief allowed. The
+   floor judges what the session layer can carry; interference from other
+   jobs on the shared machine only lowers a run. Every run is recorded
+   (`runs_mib_per_s`). Since the socket buffers (summary item 4) every run is
+   about ten times the floor, so this no longer decides it.
 4. **`inbound_v3::role_violations_and_route_violations_keep_their_codes`** expects `INVALID_REQUEST` for a
    malformed `objects.pull` (it was the Wave 2 stub's
    `UNSUPPORTED_OPERATION`): CCR-WP3.3-3.
@@ -271,6 +285,7 @@ coordinator does that after review (§13 rule 6, rule 8 item 7).
 | `w3_integration::the_folder_passthrough_call_is_bounded_and_never_replayed` | WP3.1 minor: `compat::worker_call` answers `REQUEST_TIMEOUT` within its deadline, sends each request once, returns a timely reply | n/a (coverage the review asked for) |
 | `w3_integration::a_large_copied_wal_is_truncated_once_no_reader_is_on_it` | CCR-WP3.INT-3: not under a reader (and quickly), truncated once the reader left, a small WAL left alone, busy timeout restored | yes (the old checkpoint never truncates) |
 | `w3_integration::a_startup_replays_the_snapshot_suffix_against_one_view` | a reopen replays a 72-event suffix with at most 3 view loads, to the same projection, and seals it | yes (72 loads) |
+| `w3_integration::session_sockets_get_large_buffers_on_windows` | both ends of a session socket get the 4 MiB send buffer (read through a duplicated handle, which does not report the receive buffer; `qual_wp1_9_session` measures the effect of both) | yes (64 KiB) |
 
 Changed: `qual_wp3_int_e2e::idle_exchange_daemons` (summary item 3 and
 deviation 10), `::feed_150k_daemons` (deviation 6),
@@ -281,19 +296,20 @@ deviation 10), `::feed_150k_daemons` (deviation 6),
 
 ## VERIFY
 
-Run on `8695de0` (the code of the final commit; later commits change only
-the notes and the evidence), Windows 11, `CARGO_TARGET_DIR=C:/tkfs-target/wp3-int`.
+Run on `7c40efb` (`a972843`'s code: the last code change; later commits
+change only the notes and the evidence), Windows 11,
+`CARGO_TARGET_DIR=C:/tkfs-target/wp3-int`.
 
 | Command | Result |
 |---|---|
 | `cargo fmt --check` | clean |
 | `cargo build --all-targets` | ok |
 | `cargo clippy --all-targets -- -D warnings` | clean |
-| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **ok: 65 test binaries, 922 passed, 0 failed, 104 ignored** (ignored: the 86 qualification scenarios, 77 of them run below and `qual_scale`'s 9 of Wave 4, and 18 marked tests: `objects_v3_lanes` 8, `derive_oracle` 2, `harness_selftest` 2, lib 2, `meta_scheduler` 1, `offlock_commit` 1, and the 6298d0b interop tests of waves 1–2, `w1_integration` 1 and `w2_integration` 1). The first run of the suite stopped at `peer_supervisor::a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed`: the unpair took 1.503 s against its 1.5 s bound (WP3.1's test; one lane was in its TCP connect, which is not interruptible, the open WP3.1 finding); it passed 5 of 5 runs alone and in the full rerun |
-| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp3-int`) | ok |
-| WSL: `cargo test --no-fail-fast` of `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle` (FUSE), and the touched `objects_v3_worker`, `objects_v3_lanes`, `status_hub`, `w3_integration` (its mounted end to end ran under FUSE, 2.3 s), `startup_snapshots`, `inbound_v3`, `feed_v7`, `worker_concurrency`, `activation_inbox`, `offlock_commit`, `core`, `contracts`, `peer_supervisor` | **ok: 18 binaries, 514 passed, 0 failed, 9 ignored** (`objects_v3_lanes` 8, `offlock_commit` 1). An earlier WSL run, concurrent with the 150K scenario on Windows, timed out `orchestrator::failed_repository…` at its 60 s outbound wait (deviation 8); it passed alone, and with the new waits in this run |
+| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **ok: 65 test binaries, 923 passed, 0 failed, 104 ignored** (ignored: the 86 qualification scenarios, 77 of them run below and `qual_scale`'s 9 of Wave 4, and 18 marked tests: `objects_v3_lanes` 8, `derive_oracle` 2, `harness_selftest` 2, lib 2, `meta_scheduler` 1, `offlock_commit` 1, and the 6298d0b interop tests of waves 1–2, `w1_integration` 1 and `w2_integration` 1). Earlier full runs: on `8695de0`, one stopped at `peer_supervisor::a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed` (the unpair took 1.503 s against its 1.5 s bound; WP3.1's test, a lane in its TCP connect, which is not interruptible, the open WP3.1 finding; it passed 5 of 5 runs alone), and the rerun passed: 65 binaries, 922 passed, 0 failed, 104 ignored |
+| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp3-int`) | ok (on `8695de0` and again on `a972843`) |
+| WSL: `cargo test --no-fail-fast` of `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle` (FUSE), and the touched `objects_v3_worker`, `objects_v3_lanes`, `status_hub`, `w3_integration` (its mounted end to end ran under FUSE, 2.3 s), `startup_snapshots`, `inbound_v3`, `feed_v7`, `worker_concurrency`, `activation_inbox`, `offlock_commit`, `core`, `contracts`, `peer_supervisor` | **ok: 18 binaries, 514 passed, 0 failed, 9 ignored** (`objects_v3_lanes` 8, `offlock_commit` 1), on `8695de0`'s code. An earlier WSL run, concurrent with the 150K scenario on Windows, timed out `orchestrator::failed_repository…` at its 60 s outbound wait (deviation 8); it passed alone, and with the new waits in this run. After `a972843` (its code change is Windows-only; the Linux path is unchanged): `session_core` 59, `session_handshake` 21, `w3_integration` 7 (its Windows socket test is not built on Linux): ok |
 
-Per binary (Windows): `lib` 49+2i, `bin` 1, `acknowledgements` 3, `activation_inbox` 21, `additional` 5, `availability` 13, `availability_index` 21, `basic_metadata` 4, `bulk_lanes` 3, `catalog_actor` 19, `contracts` 40, `control_transactions` 4, `core` 16, `derive_oracle` 11+2i, `directory_progress` 3, `feed_v7` 44, `folder_controller` 56, `gui_model` 37, `harness_selftest` 18+2i, `inbound_v3` 20, `legacy_stabilizers` 2, `management_api` 27, `meta_scheduler` 24+1i, `mount_lifecycle` 11, `objects_v3_lanes` 25+8i, `objects_v3_worker` 30, `offlock_commit` 20+1i, `oracle_smoke` 4, `orchestrator` 18, `orchestrator_runtime` 17, `paired_sync` 9, `partial_content` 8, `peer_supervisor` 25, `posix_metadata` 3, `recovery` 6, `replication_regressions` 9, `runtime_lanes` 3, `scalability` 5, `seam_stubs` 7, `session_core` 59, `session_handshake` 21, `startup_snapshots` 8, `status_hub` 89, `w1_integration` 4+1i, `w2_integration` 13+1i, `w3_integration` 7, `worker_concurrency` 29, `worker_lifecycle` 25, `worker_process` 22, `worker_seams` 4.
+Per binary (Windows): `lib` 49+2i, `bin` 1, `acknowledgements` 3, `activation_inbox` 21, `additional` 5, `availability` 13, `availability_index` 21, `basic_metadata` 4, `bulk_lanes` 3, `catalog_actor` 19, `contracts` 40, `control_transactions` 4, `core` 16, `derive_oracle` 11+2i, `directory_progress` 3, `feed_v7` 44, `folder_controller` 56, `gui_model` 37, `harness_selftest` 18+2i, `inbound_v3` 20, `legacy_stabilizers` 2, `management_api` 27, `meta_scheduler` 24+1i, `mount_lifecycle` 11, `objects_v3_lanes` 25+8i, `objects_v3_worker` 30, `offlock_commit` 20+1i, `oracle_smoke` 4, `orchestrator` 18, `orchestrator_runtime` 17, `paired_sync` 9, `partial_content` 8, `peer_supervisor` 25, `posix_metadata` 3, `recovery` 6, `replication_regressions` 9, `runtime_lanes` 3, `scalability` 5, `seam_stubs` 7, `session_core` 59, `session_handshake` 21, `startup_snapshots` 8, `status_hub` 89, `w1_integration` 4+1i, `w2_integration` 13+1i, `w3_integration` 8, `worker_concurrency` 29, `worker_lifecycle` 25, `worker_process` 22, `worker_seams` 4.
 
 ## Qualification (`test-evidence/qualification-wave-3.json`)
 
