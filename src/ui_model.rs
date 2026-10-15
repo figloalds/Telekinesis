@@ -146,6 +146,43 @@ pub fn when(now: Now, ms: u64) -> String {
     format!("{} ({})", clock(now, ms), ago(now, ms))
 }
 
+/// `as of 14:03:07 (3 min ago)`: when a status that is no longer live was
+/// taken (WP3.INT re-review).
+pub fn as_of(now: Now, ms: u64) -> String {
+    format!("as of {}", when(now, ms))
+}
+
+/// A folder row of a status that is no longer live (the daemon does not
+/// answer, WP3.INT re-review): its last known states, greyed and labelled,
+/// without the live numbers (rates, ETAs, progress) or the remedies (no
+/// command reaches a daemon that does not answer).
+pub fn stale_folder_row(mut row: FolderRowModel, as_of: &str) -> FolderRowModel {
+    row.sync = Chip::new(
+        format!("Last known: {} ({as_of})", sync_state_name(row.sync_state)),
+        Tone::Muted,
+    );
+    row.mount = Chip::new(format!("{} (last known)", row.mount.text), Tone::Muted);
+    row.lifecycle = Chip::new(format!("{} (last known)", row.lifecycle.text), Tone::Muted);
+    row.progress = None;
+    row.attention = false;
+    row.actions.clear();
+    row.primary = None;
+    row
+}
+
+/// A peer row of a status that is no longer live: its last known badge,
+/// greyed, and no rates.
+pub fn stale_peer_row(mut row: PeerRowModel, as_of: &str) -> PeerRowModel {
+    row.badge = Chip::new(
+        format!("Last known: {} ({as_of})", row.badge.text),
+        Tone::Muted,
+    );
+    row.online = false;
+    row.rtt = "unknown".to_owned();
+    row.rates = "unknown".to_owned();
+    row
+}
+
 /// (`YYYY-MM-DD`, `HH:MM:SS`) of a Unix time in milliseconds.
 fn civil(ms: u64) -> (String, String) {
     let seconds = ms / 1000;
@@ -587,6 +624,16 @@ impl<'a> Names<'a> {
         }
     }
 
+    /// A listed peer's name ([`Names::peer`]), else the scope's own text in
+    /// full: an installation, or the endpoint of a refused pairing (WP3.INT
+    /// re-review: it read `peer peer ws://10.`).
+    pub fn peer_or_id(&self, installation: &str) -> String {
+        match self.peer_status(installation) {
+            Some(_) => self.peer(installation),
+            None => installation.to_owned(),
+        }
+    }
+
     pub fn folder(&self, state: &str) -> String {
         match self.folders.iter().find(|f| f.state == state) {
             Some(folder) => folder_name(folder),
@@ -640,7 +687,10 @@ pub fn error_line(record: &ErrorRecord, names: &Names, now: Now) -> ErrorLine {
         scope: scope_text(&record.scope, names),
         when: when(now, record.last_at_ms),
         count: record.count,
-        first: (record.count > 1).then(|| clock(now, record.first_at_ms)),
+        // The first occurrence, when it is not the one `when` shows (a
+        // re-reported condition keeps its count; WP3.INT re-review).
+        first: (record.count > 1 || record.first_at_ms != record.last_at_ms)
+            .then(|| clock(now, record.first_at_ms)),
         next_retry: record
             .next_retry_at_ms
             .filter(|next| open && *next > now.ms)
@@ -667,11 +717,12 @@ fn scope_text(scope: &Scope, names: &Names) -> Option<String> {
         )),
         Scope::Event { id, .. } => Some(format!("event {}", short(id))),
         Scope::FolderPeer { installation, .. } | Scope::Peer { installation } => {
-            Some(format!("peer {}", names.peer(installation)))
+            Some(format!("peer {}", names.peer_or_id(installation)))
         }
-        Scope::Lane { installation, lane } => {
-            Some(format!("peer {} lane {lane}", names.peer(installation)))
-        }
+        Scope::Lane { installation, lane } => Some(format!(
+            "peer {} lane {lane}",
+            names.peer_or_id(installation)
+        )),
     }
 }
 
@@ -742,9 +793,16 @@ fn lane_state_name(state: LaneState) -> &'static str {
 // ---------------------------------------------------------------------------
 // Transfer arithmetic
 
-/// The download or upload totals of a folder over its sharing peers. Peers
-/// may offer the same objects, so the remaining work is the largest any
-/// peer reports (as the hub's summary does); rates add up.
+/// The download or upload totals of a folder over its sharing peers (WP3.INT
+/// re-review: the remainders and totals of several peers did not add up):
+///
+/// * downloads: peers may offer the same objects, so what is left is the
+///   largest remainder any peer reports (as the hub's summary does), and
+///   what was done is every peer's episode (its total minus its remainder)
+///   added up;
+/// * uploads: every peer is its own job, so remainders and totals add up;
+///
+/// rates add up, and the ETA is the hub's, the longest of the peers'.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Transfer {
     pub objects_left: u64,
@@ -752,20 +810,39 @@ pub struct Transfer {
     pub total_bytes: u64,
     pub rate_bps: u64,
     pub in_flight: u32,
+    /// The hub's ETA (the longest of the peers'), when it gave one.
+    pub eta: Option<u64>,
 }
 
 impl Transfer {
-    fn add(&mut self, t: &TransferProgress) {
-        self.objects_left = self.objects_left.max(t.objects_remaining);
-        self.bytes_left = self.bytes_left.max(t.bytes_remaining);
-        self.total_bytes = self.total_bytes.max(t.total_bytes);
+    fn rates(&mut self, t: &TransferProgress) {
         self.rate_bps = self.rate_bps.saturating_add(t.rate_bps);
         self.in_flight = self.in_flight.saturating_add(t.in_flight);
+        self.eta = self.eta.max(t.eta_s);
+    }
+
+    /// One more peer's download: the same objects may come from any peer.
+    fn add_down(&mut self, t: &TransferProgress) {
+        let done = self
+            .done_bytes()
+            .saturating_add(t.total_bytes.saturating_sub(t.bytes_remaining));
+        self.objects_left = self.objects_left.max(t.objects_remaining);
+        self.bytes_left = self.bytes_left.max(t.bytes_remaining);
+        self.total_bytes = done.saturating_add(self.bytes_left);
+        self.rates(t);
+    }
+
+    /// One more peer's upload: a job of its own.
+    fn add_up(&mut self, t: &TransferProgress) {
+        self.objects_left = self.objects_left.saturating_add(t.objects_remaining);
+        self.bytes_left = self.bytes_left.saturating_add(t.bytes_remaining);
+        self.total_bytes = self.total_bytes.saturating_add(t.total_bytes);
+        self.rates(t);
     }
 
     fn of(t: &TransferProgress) -> Self {
         let mut out = Self::default();
-        out.add(t);
+        out.add_up(t);
         out
     }
 
@@ -779,7 +856,11 @@ impl Transfer {
     }
 
     pub fn eta_s(&self) -> Option<u64> {
-        (self.bytes_left > 0 && self.rate_bps > 0).then(|| self.bytes_left.div_ceil(self.rate_bps))
+        if self.bytes_left == 0 {
+            return None;
+        }
+        self.eta
+            .or_else(|| (self.rate_bps > 0).then(|| self.bytes_left.div_ceil(self.rate_bps)))
     }
 
     /// Fraction done in `0..=1`, when the total is known.
@@ -894,7 +975,7 @@ fn sharing(folder: &FolderStatus) -> impl Iterator<Item = &FolderPeerSync> {
 fn downloads(folder: &FolderStatus) -> Transfer {
     let mut out = Transfer::default();
     for p in sharing(folder) {
-        out.add(&p.objects_down);
+        out.add_down(&p.objects_down);
     }
     out
 }
@@ -902,7 +983,7 @@ fn downloads(folder: &FolderStatus) -> Transfer {
 fn uploads(folder: &FolderStatus) -> Transfer {
     let mut out = Transfer::default();
     for p in sharing(folder) {
-        out.add(&p.objects_up);
+        out.add_up(&p.objects_up);
     }
     out
 }
@@ -1121,6 +1202,36 @@ pub fn sync_chip(folder: &FolderStatus, names: &Names, now: Now) -> Chip {
             if down.active() {
                 parts.push(format!("↓ {}", down.text()));
             }
+            // The source (or, without one, every sharing peer) cannot be
+            // reached: the initial sync cannot progress, and says why
+            // (WP3.INT re-review: it showed frozen progress).
+            let pairs: Vec<&FolderPeerSync> = match folder.gate.source.as_deref() {
+                Some(source) => sharing(folder)
+                    .filter(|p| p.installation == source)
+                    .collect(),
+                None => sharing(folder).collect(),
+            };
+            if let Some(stuck) = pairs
+                .iter()
+                .find(|p| crate::orchestrator::hub_rules::unreachable(p.state))
+                .filter(|_| {
+                    pairs
+                        .iter()
+                        .all(|p| crate::orchestrator::hub_rules::unreachable(p.state))
+                })
+            {
+                let tone = match stuck.state {
+                    FolderPeerState::Incompatible | FolderPeerState::Unauthorized => Tone::Error,
+                    _ => Tone::Warn,
+                };
+                let head = format!(
+                    "{} — waiting ({})",
+                    parts[0],
+                    peer_wait_reason(stuck, names, now)
+                );
+                parts[0] = head;
+                return text(parts.join(" · "), tone);
+            }
             text(parts.join(" · "), Tone::Progress)
         }
         F::Metadata => text(meta_work(folder).text("Syncing metadata"), Tone::Progress),
@@ -1165,6 +1276,17 @@ pub fn sync_chip(folder: &FolderStatus, names: &Names, now: Now) -> Chip {
                 chip
             }
         }
+        F::Backoff
+            if sharing(folder).all(|p| {
+                names
+                    .peer_status(&p.installation)
+                    .is_some_and(|peer| peer.state != PeerConnState::Online)
+            }) =>
+        {
+            // The peers' connections back off (their hosts cannot be
+            // reached): who, for how long, and why (WP3.INT re-review).
+            text(waiting_text(folder, names, now), Tone::Warn)
+        }
         F::Backoff => {
             let next = sharing(folder)
                 .filter_map(|p| retry_at(p, names, now))
@@ -1184,12 +1306,9 @@ pub fn sync_chip(folder: &FolderStatus, names: &Names, now: Now) -> Chip {
             let stalled: Vec<&FolderPeerSync> = sharing(folder)
                 .filter(|p| p.state == FolderPeerState::Stalled)
                 .collect();
-            let since = stalled
-                .iter()
-                .filter_map(|p| p.last_progress_ms.or(p.stalled_since_ms))
-                .min();
-            let mut out = match since.filter(|since| now.ms >= *since) {
-                Some(since) => format!("Stalled {}", format_elapsed(now.ms - since)),
+            let stalled_for = stalled.iter().filter_map(|p| stalled_for(p, now)).max();
+            let mut out = match stalled_for {
+                Some(ms) => format!("Stalled {}", format_elapsed(ms)),
                 None => "Stalled".to_owned(),
             };
             if let Some(record) = stalled.iter().find_map(|p| p.error.as_ref()) {
@@ -1224,6 +1343,28 @@ pub fn sync_chip(folder: &FolderStatus, names: &Names, now: Now) -> Chip {
                 text("Up to date".into(), Tone::Ok)
             }
         }
+    }
+}
+
+/// How long a pair has been stalled, as the hub counts it (WP3.INT
+/// re-review): no progress since the later of its last progress and the
+/// moment it could progress again. The hub's `stalled_since_ms` is when the
+/// threshold (at least `policy::STALL_MIN`) was crossed, so the stall began
+/// at least that much earlier; its last progress bounds it too (a pair back
+/// from a long outage has not been stalled for the outage).
+fn stalled_for(p: &FolderPeerSync, now: Now) -> Option<u64> {
+    let threshold =
+        u64::try_from(crate::model::status::policy::STALL_MIN.as_millis()).unwrap_or(u64::MAX);
+    let by_threshold = p
+        .stalled_since_ms
+        .map(|since| now.ms.saturating_sub(since).saturating_add(threshold));
+    let by_progress = p
+        .last_progress_ms
+        .filter(|at| now.ms >= *at)
+        .map(|at| now.ms - at);
+    match (by_threshold, by_progress) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -1266,11 +1407,22 @@ fn waiting_text(folder: &FolderStatus, names: &Names, now: Now) -> String {
     let peers: Vec<&FolderPeerSync> = sharing(folder).collect();
     match peers.as_slice() {
         [] => "Waiting for peers".to_owned(),
-        [p] => format!(
-            "Waiting for {} ({})",
-            names.peer(&p.installation),
-            peer_wait_reason(p, names, now)
-        ),
+        [p] => {
+            let mut text = format!(
+                "Waiting for {} ({})",
+                names.peer(&p.installation),
+                peer_wait_reason(p, names, now)
+            );
+            // Why its connection fails (`WS_CONNECT_FAILED`, …).
+            if let Some(error) = unreachable_for(p, names, now)
+                .and_then(|_| names.peer_status(&p.installation))
+                .and_then(|peer| peer.error.as_ref())
+            {
+                text.push_str(" — ");
+                text.push_str(&error.error.code);
+            }
+            text
+        }
         many => {
             let mut reasons: Vec<String> = many
                 .iter()
@@ -1300,8 +1452,29 @@ fn peer_wait_kind(state: FolderPeerState) -> &'static str {
     }
 }
 
+/// A peer's connection that has not been up for a while: dialing, backing
+/// off, offline. How long, from the hub's `since_ms`, which keeps the time
+/// the peer became unreachable across those flips (WP3.INT re-review).
+const UNREACHABLE_SHOWN_AFTER_MS: u64 = 10_000;
+
+fn unreachable_for(p: &FolderPeerSync, names: &Names, now: Now) -> Option<u64> {
+    let peer = names.peer_status(&p.installation)?;
+    if !matches!(
+        peer.state,
+        PeerConnState::Connecting | PeerConnState::Backoff | PeerConnState::Offline
+    ) {
+        return None;
+    }
+    peer.since_ms
+        .filter(|since| *since != 0 && now.ms >= *since)
+        .map(|since| now.ms - since)
+}
+
 /// Why one peer cannot be synced with, with how long or when it retries.
 fn peer_wait_reason(p: &FolderPeerSync, names: &Names, now: Now) -> String {
+    let unreachable = unreachable_for(p, names, now)
+        .filter(|ms| *ms >= UNREACHABLE_SHOWN_AFTER_MS)
+        .map(|ms| format!("unreachable {}", format_elapsed(ms)));
     match p.state {
         FolderPeerState::Offline => {
             match names
@@ -1313,9 +1486,19 @@ fn peer_wait_reason(p: &FolderPeerSync, names: &Names, now: Now) -> String {
                 None => "offline".to_owned(),
             }
         }
-        FolderPeerState::Backoff => match retry_at(p, names, now) {
-            Some(at) => format!("retry in {}", format_duration(at - now.ms)),
-            None => "retrying".to_owned(),
+        FolderPeerState::Backoff => {
+            let retry = match retry_at(p, names, now) {
+                Some(at) => format!("retry in {}", format_duration(at - now.ms)),
+                None => "retrying".to_owned(),
+            };
+            match unreachable {
+                Some(unreachable) => format!("{unreachable} · {retry}"),
+                None => retry,
+            }
+        }
+        FolderPeerState::Connecting => match unreachable {
+            Some(unreachable) => format!("connecting · {unreachable}"),
+            None => "connecting".to_owned(),
         },
         state => peer_wait_kind(state).to_owned(),
     }
@@ -1422,6 +1605,12 @@ fn sync_detail(folder: &FolderStatus) -> String {
             "conflicts",
         ));
     }
+    // Rejected events never activate (no remaining work, no Blocked state):
+    // shown here, with their codes in the Sync tab (WP3.INT re-review).
+    let (_, _, rejected) = blocked_counts(folder);
+    if rejected > 0 {
+        parts.push(format!("{} rejected", count(rejected, "event", "events")));
+    }
     parts.join(" · ")
 }
 
@@ -1485,7 +1674,14 @@ pub fn mount_chip(folder: &FolderStatus, now: Now) -> Chip {
         MountState::Detaching => Chip::new("Unmounting…", Tone::Progress),
         MountState::Detached | MountState::Disabled => {
             if gated && folder.intents.mount_enabled {
-                let chip = Chip::new("Waiting for initial sync", Tone::Progress);
+                // A blocked gate waits for the user, not for progress
+                // (WP3.INT re-review: it read as an initial sync in progress
+                // next to "Needs attention: initial sync blocked").
+                let chip = if folder.gate.state == GateKind::Blocked {
+                    Chip::new("Initial sync blocked", Tone::Warn)
+                } else {
+                    Chip::new("Waiting for initial sync", Tone::Progress)
+                };
                 return if running || folder.lifecycle.phase == LifecyclePhase::Starting {
                     chip.with_action(FolderAction::MountNow, "Mount now")
                 } else {
@@ -2392,9 +2588,8 @@ pub fn folder_peer_chip(p: &FolderPeerSync, names: &Names, now: Now) -> Chip {
             Tone::Warn,
         ),
         S::Stalled => {
-            let since = p.last_progress_ms.or(p.stalled_since_ms);
-            let mut text = match since.filter(|since| now.ms >= *since) {
-                Some(since) => format!("Stalled since {} ago", format_elapsed(now.ms - since)),
+            let mut text = match stalled_for(p, now) {
+                Some(ms) => format!("Stalled since {} ago", format_elapsed(ms)),
                 None => "Stalled".to_owned(),
             };
             if let Some(record) = &p.error {
@@ -2473,6 +2668,9 @@ fn activation_rows(f: &FolderStatus, now: Now, rate: Option<f64>) -> Vec<KeyValu
     rows.push(kv(
         "Rate",
         match rate {
+            // No activator: nothing activates, whatever the last samples
+            // said (WP3.INT re-review).
+            _ if !c.running => "idle".to_owned(),
             Some(rate) if rate >= 0.05 => format!("{rate:.1} events/s"),
             Some(_) => "idle".to_owned(),
             None => "measuring…".to_owned(),
@@ -2922,6 +3120,19 @@ impl RateMeter {
         let (first, last) = (samples.front()?, samples.back()?);
         let span = last.0.checked_sub(first.0).filter(|span| *span > 0)?;
         Some(last.1.saturating_sub(first.1) as f64 * 1000.0 / span as f64)
+    }
+
+    /// [`RateMeter::per_second`] as of `now_ms` (the render clock): samples
+    /// older than the window are expired, so a folder whose counter stopped
+    /// moving (no new snapshot carries it) reads 0 once the window passed
+    /// (WP3.INT re-review).
+    pub fn per_second_at(&self, state: &str, now_ms: u64) -> Option<f64> {
+        let samples = self.samples.get(state)?;
+        let last = samples.back()?;
+        if now_ms.saturating_sub(last.0) > Self::WINDOW_MS {
+            return Some(0.0);
+        }
+        self.per_second(state)
     }
 }
 

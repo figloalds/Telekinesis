@@ -2315,7 +2315,7 @@ impl Controller {
         self.heartbeat = None;
         self.degraded = false;
         self.mount = idle_mount(&self.record);
-        self.remove_entry();
+        self.withdraw_entry();
         if self.shutdown.is_some() {
             self.stop = None;
             self.start = None;
@@ -3509,6 +3509,29 @@ impl Controller {
         entry.updated_at_ms = self.deps.clock.now_ms();
         let entry = entry.clone();
         self.deps.published.update(&self.state, Some(entry));
+    }
+
+    /// The worker is gone (stopped, crashed, restarting): the entry stays
+    /// published as `unavailable`, so peers wait for the folder (their pair
+    /// reads `WaitingForRemote`, §3.7) instead of reading it as no longer
+    /// shared (WP3.INT re-review). It is published again once the worker
+    /// runs (`maybe_refresh_published`), and removed when the folder leaves
+    /// the catalog.
+    fn withdraw_entry(&mut self) {
+        self.published.rpc = None;
+        self.published.retry_at = None;
+        self.published.refresh = false;
+        self.published.branches_gen = None;
+        let now_ms = self.deps.clock.now_ms();
+        if let Some(entry) = self.published.entry.as_mut()
+            && entry.state != EntryState::Unavailable
+        {
+            entry.state = EntryState::Unavailable;
+            entry.error = None;
+            entry.updated_at_ms = now_ms;
+            let entry = entry.clone();
+            self.deps.published.update(&self.state, Some(entry));
+        }
     }
 
     fn remove_entry(&mut self) {

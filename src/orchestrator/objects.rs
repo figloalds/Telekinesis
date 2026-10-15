@@ -2577,19 +2577,12 @@ impl LaneRun {
         });
         let before = lock(&self.remote_content).insert(target.repo.clone(), now);
         if before.is_some_and(|(shared, current)| now.0 > shared || now.1 > current) {
-            let reset = object_backoffs_reset(
+            object_backoffs_reset(
                 &self.ctx.installation,
                 &self.peer.installation,
                 &target.repo,
                 false,
             );
-            if reset > 0 {
-                event!(debug, OBJECT_BACKOFF_RESET, {
-                    "peer": self.peer.installation,
-                    "repo": target.repo,
-                    "objects": reset,
-                });
-            }
         }
     }
 

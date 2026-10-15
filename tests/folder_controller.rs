@@ -1514,7 +1514,16 @@ fn graceful_stop_persists_desired_before_the_stop_rpc() {
     assert!(!env.catalog.folder("a").desired_running);
     assert!(!view.record.desired_running);
     assert_eq!(env.kills(), 0);
-    assert!(env.published.entry("a").is_none());
+    // The entry stays published, unavailable: peers wait for the folder
+    // instead of reading it as no longer shared (WP3.INT re-review; it was
+    // removed). Only leaving the catalog removes it (below).
+    assert!(
+        env.published
+            .entry("a")
+            .is_some_and(|entry| entry.state == EntryState::Unavailable),
+        "{:?}",
+        env.published.entry("a")
+    );
     assert_eq!(env.registry.running_slots(), 0);
     assert!(env.registry.client("a").is_none());
     // A stopped folder is never restarted on its own (invariant 26).

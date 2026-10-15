@@ -761,8 +761,31 @@ impl Inner {
             exchanges: Arc::new(AtomicUsize::new(0)),
             exchange_slots: self.session_options(peer.role).handlers,
         }));
-        while conn.wait_closed(Duration::from_secs(3600)).is_none() {}
+        let reason = loop {
+            if let Some(reason) = conn.wait_closed(Duration::from_secs(3600)) {
+                break reason;
+            }
+        };
         drop(registered);
+        // The peer unpaired us (its GOAWAY explains the close). A peer we do
+        // not dial ourselves shared nothing with us but through these
+        // sessions: it is gone, not offline (WP3.INT re-review; the hub
+        // forgets it once its last session closed). A peer we also dial
+        // stays: our own pairing decides that.
+        if reason.code == "PEER_NOT_PAIRED"
+            && peer.role != LaneRole::Probe
+            && !self
+                .ctx
+                .catalog
+                .snapshot()
+                .peers
+                .iter()
+                .any(|record| record.installation == peer.installation)
+        {
+            self.record(StatusEvent::PeerRemoved {
+                installation: peer.installation.clone(),
+            });
+        }
     }
 
     fn handshake_failed(&self, address: SocketAddr, error: &ErrorWire) {

@@ -3921,8 +3921,10 @@ fn activation_elsewhere_is_not_progress_for_a_stuck_pair() {
 /// The worker stamps its per-peer counters when it applies an exchange,
 /// before the orchestrator records that exchange's summary: counters of the
 /// same exchange (or a later one) are at least as fresh as the summary and
-/// win. `rejected`, which only the counters carry, is always theirs, so
-/// "only rejected work remains" reads Blocked. Before the re-review fix the
+/// win. `rejected`, which only the counters carry, is always theirs; since
+/// WP3.INT's re-review "only rejected events remain" reads up to date, with
+/// the rejected events shown (it read Blocked, for good: the rejected rows
+/// are never deleted and nothing clears them). Before the re-review fix the
 /// summary won whenever it was recorded after the counters' stamp, which is
 /// every time, and `rejected` read 0.
 #[test]
@@ -3956,13 +3958,17 @@ fn worker_counters_of_the_same_exchange_win_over_its_summary() {
     assert_eq!(pair.metadata.rejected, 4);
     assert_eq!(pair.metadata.last_exchange_ms, Some(applied));
     assert_eq!(pair.state, FolderPeerState::Metadata);
-    // The staged rows activate; only rejected work is left.
+    // The staged rows activate; only rejected events are left.
     fx.advance(1000);
     fx.rec(counters(2, 0, 4, applied));
     let folder = fx.folder();
-    assert_eq!(folder.sync.peers[0].state, FolderPeerState::Blocked);
-    assert_eq!(folder.sync.state, FolderSyncState::Blocked);
-    assert_eq!(folder.sync.summary, "Blocked — 4 events rejected");
+    assert_eq!(folder.sync.peers[0].state, FolderPeerState::UpToDate);
+    assert_eq!(folder.sync.state, FolderSyncState::UpToDate);
+    assert_eq!(
+        folder.sync.summary,
+        "Up to date · 1 of 1 peer · 4 events rejected"
+    );
+    assert_eq!(folder.sync.peers[0].metadata.rejected, 4);
     // A newer exchange whose counters have not arrived yet: its summary wins,
     // and `rejected` still comes from the counters.
     fx.advance(1000);
@@ -5170,4 +5176,265 @@ fn an_inbound_exchange_start_is_booked_on_the_inbound_lane() {
     let peer = fx.snap().peers[0].clone();
     assert!(peer.lanes[0].inflight.is_empty());
     assert_eq!(peer.direction, Direction::Inbound);
+}
+
+// ===========================================================================
+// WP3.INT post-integration re-review
+
+/// Mutual pairing after the peer rotated its code (v3 network re-review
+/// major): our lanes to it are refused (Unauthorized, shown on its badge),
+/// but its sessions to us sync the repo; the folder reads its real state,
+/// not "offline · 1 of 1 peer unreachable".
+#[test]
+fn a_peer_that_still_reaches_us_after_a_rotation_is_not_unreachable() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    assert_eq!(fx.folder().sync.state, FolderSyncState::UpToDate);
+    // It dials us too.
+    for (lane, role) in [(0, LaneRole::Control), (1, LaneRole::Bulk)] {
+        fx.rec(StatusEvent::InboundSession {
+            installation: PEER_A.into(),
+            lane,
+            role,
+            opened: true,
+        });
+    }
+    // It rotates its code: our lanes are refused.
+    let refused = ErrorWire::new("PAIRING_CODE_CHANGED", "PAIRING_CODE_CHANGED: rotated");
+    fx.rec(lane(PEER_A, 0, LaneState::Unauthorized, Some(refused)));
+    fx.rec(finished(
+        PEER_A,
+        0,
+        "meta.exchange",
+        Direction::Inbound,
+        None,
+        Some(summary(0, 0)),
+        100,
+        0,
+    ));
+    let snap = fx.snap();
+    assert_eq!(snap.peers[0].state, PeerConnState::Unauthorized);
+    let folder = fx.folder();
+    assert_eq!(folder.sync.peers[0].state, FolderPeerState::UpToDate);
+    assert_eq!(
+        folder.sync.state,
+        FolderSyncState::UpToDate,
+        "{}",
+        folder.sync.summary
+    );
+    // Work in flight over its sessions is a transfer, not a wait.
+    fx.rec(finished(
+        PEER_A,
+        0,
+        "meta.exchange",
+        Direction::Inbound,
+        None,
+        Some(summary(0, 12)),
+        100,
+        0,
+    ));
+    assert_eq!(fx.folder().sync.state, FolderSyncState::Metadata);
+    // Its sessions close too: now it is unreachable.
+    for (lane, role) in [(0, LaneRole::Control), (1, LaneRole::Bulk)] {
+        fx.rec(StatusEvent::InboundSession {
+            installation: PEER_A.into(),
+            lane,
+            role,
+            opened: false,
+        });
+    }
+    assert_eq!(fx.pair(PEER_A).state, FolderPeerState::Unauthorized);
+    assert_eq!(fx.folder().sync.state, FolderSyncState::Offline);
+}
+
+/// Each side missing different objects (v3 network re-review minor): while
+/// we upload a lot to the peer, what we miss that it holds is still a
+/// download; two replicas missing the very same objects owe each other
+/// nothing.
+#[test]
+fn download_work_shows_when_each_side_misses_different_objects() {
+    // We miss one 64 KiB object; the peer misses three 6 MiB ones we hold.
+    let ours = ContentCounters {
+        shared_objects: 40,
+        shared_available: 39,
+        shared_missing_bytes: 64 * 1024,
+        ..ContentCounters::default()
+    };
+    let theirs = ContentCounters {
+        shared_objects: 40,
+        shared_available: 37,
+        shared_missing_bytes: 18 * 1024 * 1024,
+        ..ContentCounters::default()
+    };
+    assert_eq!(rules::download_work(&ours, Some(&theirs)), (1, 64 * 1024));
+    assert_eq!(
+        rules::upload_work(Some(&ours), &theirs),
+        (3, 18 * 1024 * 1024)
+    );
+    // Lost everywhere: the same objects and bytes missing on both sides.
+    assert_eq!(rules::download_work(&ours, Some(&ours)), (0, 0));
+    assert_eq!(rules::upload_work(Some(&ours), &ours), (0, 0));
+    // A peer that holds nothing at all supplies nothing.
+    let empty = ContentCounters {
+        shared_objects: 40,
+        shared_available: 0,
+        shared_missing_bytes: 100 * 1024 * 1024,
+        ..ContentCounters::default()
+    };
+    assert_eq!(rules::download_work(&ours, Some(&empty)), (0, 0));
+}
+
+/// A configured peer whose host is down cycles its lanes through Dialing and
+/// Backoff (ux re-review major): its status keeps the time it became
+/// unreachable across those flips, so the folder's chip says who and for how
+/// long, with the lane's error.
+#[test]
+fn an_unreachable_peer_keeps_the_time_it_became_unreachable() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    fx.advance(1000);
+    let down_at = fx.now();
+    let failed = || {
+        Some(ErrorWire::new(
+            "WS_CONNECT_FAILED",
+            "WS_CONNECT_FAILED: connection refused",
+        ))
+    };
+    // Five minutes of Dialing (3 s), then Backoff (until +30 s).
+    for _ in 0..9 {
+        fx.rec(lane(PEER_A, 0, LaneState::Dialing, None));
+        fx.advance(3000);
+        let mut backoff = lane(PEER_A, 0, LaneState::Backoff, failed());
+        if let StatusEvent::LaneState {
+            backoff_until_ms, ..
+        } = &mut backoff
+        {
+            *backoff_until_ms = Some(fx.now() + 30_000);
+        }
+        fx.rec(backoff);
+        fx.run(30);
+    }
+    let snap = fx.snap();
+    let peer = &snap.peers[0];
+    assert!(
+        matches!(
+            peer.state,
+            PeerConnState::Backoff | PeerConnState::Connecting
+        ),
+        "{:?}",
+        peer.state
+    );
+    assert_eq!(peer.since_ms, Some(down_at), "the flips reset its time");
+    let now = tkfs::ui_model::Now::of(&snap);
+    let chip = &tkfs::ui_model::folder_rows_at(&snap, now)[0].sync;
+    assert!(
+        chip.text.contains("unreachable 4 min") && chip.text.contains("WS_CONNECT_FAILED"),
+        "{}",
+        chip.text
+    );
+    assert!(
+        chip.text
+            .contains(&tkfs::ui_model::peer_name(None, Some(ENDPOINT_A), PEER_A))
+    );
+    // Back online: a new time.
+    fx.rec(lane(PEER_A, 0, LaneState::Ready, None));
+    assert_eq!(fx.snap().peers[0].since_ms, Some(fx.now()));
+}
+
+/// A mount that failed once, re-reported with every heartbeat and view,
+/// keeps the time of its attempt (ux re-review minor: it read "just now"
+/// for hours); a new attempt is a new time.
+#[test]
+fn a_mount_failure_keeps_the_time_of_its_attempt() {
+    let fx = Fx::new();
+    let mut mounted = view(running());
+    let failed = |attempt: u32| MountStatus {
+        intent: MountIntent::Attach,
+        path: Some(std::env::temp_dir().join("occupied")),
+        state: MountState::AttachFailed {
+            error: ErrorWire::new(
+                "MOUNT_PATH_MUST_NOT_EXIST",
+                "MOUNT_PATH_MUST_NOT_EXIST: occupied",
+            ),
+            attempt,
+            next_retry_at_ms: None,
+        },
+    };
+    mounted.mount = failed(1);
+    fx.rec(StatusEvent::FolderLifecycle(Box::new(mounted.clone())));
+    let failed_at = fx.now();
+    for seq in 0..600 {
+        fx.advance(1000);
+        let mut again = mounted.clone();
+        again.generation += seq + 1;
+        fx.rec(StatusEvent::FolderLifecycle(Box::new(again)));
+    }
+    let error = fx
+        .folder()
+        .errors
+        .into_iter()
+        .find(|e| e.error.code == "MOUNT_PATH_MUST_NOT_EXIST")
+        .unwrap();
+    assert_eq!(
+        (error.first_at_ms, error.last_at_ms),
+        (failed_at, failed_at)
+    );
+    assert_eq!(error.count, 1);
+    // The second attempt fails too: its own time.
+    mounted.mount = failed(2);
+    mounted.generation += 1000;
+    fx.rec(StatusEvent::FolderLifecycle(Box::new(mounted)));
+    let error = fx
+        .folder()
+        .errors
+        .into_iter()
+        .find(|e| e.error.code == "MOUNT_PATH_MUST_NOT_EXIST")
+        .unwrap();
+    assert_eq!(
+        (error.first_at_ms, error.last_at_ms, error.count),
+        (failed_at, fx.now(), 2)
+    );
+}
+
+/// An inbound-only peer that unpaired us (the inbound server records it
+/// gone once its sessions close with `PEER_NOT_PAIRED`) no longer shares
+/// the folder (v3 network re-review minor: it read "Offline · Waiting for
+/// peers" for as long as the daemon ran).
+#[test]
+fn an_inbound_only_peer_that_unpaired_us_is_forgotten() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.rec(StatusEvent::InboundSession {
+        installation: PEER_B.into(),
+        lane: 0,
+        role: LaneRole::Control,
+        opened: true,
+    });
+    fx.rec(finished(
+        PEER_B,
+        0,
+        "meta.exchange",
+        Direction::Inbound,
+        None,
+        Some(summary(0, 0)),
+        100,
+        0,
+    ));
+    assert_eq!(fx.folder().sync.state, FolderSyncState::UpToDate);
+    fx.rec(StatusEvent::InboundSession {
+        installation: PEER_B.into(),
+        lane: 0,
+        role: LaneRole::Control,
+        opened: false,
+    });
+    assert_eq!(fx.folder().sync.state, FolderSyncState::Offline);
+    fx.rec(StatusEvent::PeerRemoved {
+        installation: PEER_B.into(),
+    });
+    assert_eq!(fx.folder().sync.state, FolderSyncState::NotShared);
+    assert!(fx.snap().peers.is_empty());
 }
