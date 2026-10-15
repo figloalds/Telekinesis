@@ -83,8 +83,8 @@ use crate::{
         errors::ErrorWire,
         ipc::{self, FeedExchangeReply, FeedExchangeRequest},
         orchestrator::{
-            CallError, CatalogSnapshot, Ctx, FolderCmd, FolderPhase, FolderView, GateEvidence,
-            PublishedEntry, WorkerClient, limits,
+            CallError, CatalogSnapshot, Ctx, FolderCmd, FolderPhase, FolderView, PublishedEntry,
+            WorkerClient, limits,
         },
         protocol::{
             self, CatalogListRequest, LaneRole, MetaExchangeHeader,
@@ -1655,6 +1655,14 @@ fn meta_exchange(ctx: &Arc<Ctx>, peer: &AcceptedPeer, req: Incoming) {
         Ok((reply, body)) => {
             let bytes_up = body.len() as u64;
             let FeedExchangeReply { local, .. } = reply;
+            // The dialer's mapping (one helper): a caught-up source with
+            // blocked, quarantined or rejected rows is the Blocked gate.
+            let evidence = super::meta_exchange::evidence_of(
+                &peer.installation,
+                ctx.clock.now_ms(),
+                &local.gate,
+                local.summary.caught_up,
+            );
             let mut summary = local.summary;
             if summary.bytes_up == 0 {
                 summary.bytes_up = bytes_up;
@@ -1666,13 +1674,6 @@ fn meta_exchange(ctx: &Arc<Ctx>, peer: &AcceptedPeer, req: Incoming) {
             // may reuse this exchange's slot, and readers of status should
             // already see the exchange.
             finish(Ok(()), Some(summary), bytes_up);
-            let evidence = GateEvidence {
-                installation: peer.installation.clone(),
-                at_ms: ctx.clock.now_ms(),
-                caught_up: local.gate.caught_up,
-                blocked: local.gate.blocked,
-                waiting_on: local.gate.waiting_on,
-            };
             let _ = ctx
                 .folders
                 .send(&served.view.record.state, FolderCmd::GateEvidence(evidence));

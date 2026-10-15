@@ -1520,6 +1520,59 @@ fn role_violations_and_route_violations_keep_their_codes() {
     assert_eq!(worker.calls().len(), 2);
 }
 
+/// Post-integration re-review (WP2.INT): the acceptor's own view of a source
+/// that is caught up but has a rejected row (`GateView{caught_up: false,
+/// blocked: true}`, metadata caught up) is the Blocked gate's evidence
+/// (`caught_up && blocked`), as the dialer maps the same view
+/// (`meta_exchange::gate_evidence`). Before the fix the inbound server
+/// forwarded the raw view (`caught_up: false`): the gate stayed Awaiting.
+#[test]
+fn a_caught_up_but_blocked_source_view_is_blocked_evidence() {
+    let node = Node::start();
+    let worker = FakeWorker::new(|op, payload| match op {
+        "feed-exchange" => {
+            let request: FeedExchangeRequest = serde_json::from_value(payload.clone()).unwrap();
+            let mut reply = feed_reply(&request, true);
+            reply.local.gate = GateView {
+                caught_up: false,
+                waiting_on: vec!["1 event rejected".into()],
+                blocked: true,
+            };
+            Ok(serde_json::to_value(reply).unwrap())
+        }
+        other => Err(CallError::Remote(ErrorWire::coded(
+            "UNSUPPORTED_OPERATION",
+            other,
+        ))),
+    });
+    node.folder(STATE_A, REPO_A, DEVICE_A, Some(worker));
+    let request = meta_request(REPO_A, DEVICE_A);
+    node.control()
+        .call(
+            "meta.exchange",
+            json!({ "repo": REPO_A }),
+            meta_body(&request),
+        )
+        .unwrap();
+    let evidence = node.folders.evidence();
+    let [(state, evidence)] = evidence.as_slice() else {
+        panic!("{evidence:#?}");
+    };
+    assert_eq!(state, STATE_A);
+    let dialer = tkfs::orchestrator::meta_exchange::evidence_of(
+        CLIENT,
+        evidence.at_ms,
+        &GateView {
+            caught_up: false,
+            waiting_on: vec!["1 event rejected".into()],
+            blocked: true,
+        },
+        true,
+    );
+    assert_eq!(evidence, &dialer, "both directions map a view alike");
+    assert!(evidence.caught_up && evidence.blocked, "{evidence:?}");
+}
+
 /// A folder that is paused, stopped or whose worker cannot be reached is
 /// answered without a worker call (`FOLDER_SYNC_PAUSED`,
 /// `REMOTE_WORKER_STARTING`).

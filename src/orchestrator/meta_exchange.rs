@@ -173,13 +173,35 @@ pub fn exchange_with(
 /// reads `caught_up && !blocked` as satisfied and `caught_up && blocked` as
 /// the Blocked gate ("caught up, but blocked, quarantined or rejected rows
 /// remain"), so `caught_up` here is the gate view's claim, or, when the gate
-/// view is blocked, the metadata claim.
+/// view is blocked, the metadata claim ([`evidence_of`]).
 pub fn gate_evidence(installation: &str, at_ms: u64, outcome: &ExchangeOutcome) -> GateEvidence {
-    let gate = &outcome.gate;
+    evidence_of(
+        installation,
+        at_ms,
+        &outcome.gate,
+        outcome.summary.caught_up,
+    )
+}
+
+/// The `GateEvidence` a feed exchange's gate view stands for, in either
+/// direction: the dialer's `feed-apply` result ([`gate_evidence`]) and the
+/// acceptor's own `feed-exchange` `local` view (the inbound server). A
+/// `GateView`'s `caught_up` is the full gate claim (§6.3.6), so it is false
+/// whenever `blocked` holds; the controller's Blocked gate is `caught_up &&
+/// blocked`, so `caught_up` here is the gate claim, or, when the view is
+/// blocked, `metadata_caught_up` (the summary's `caught_up`). One helper for
+/// both sides (post-integration re-review, WP2.INT: the inbound server
+/// forwarded the raw view, so an acceptor-side gate never reached Blocked).
+pub fn evidence_of(
+    installation: &str,
+    at_ms: u64,
+    gate: &GateView,
+    metadata_caught_up: bool,
+) -> GateEvidence {
     GateEvidence {
         installation: installation.to_owned(),
         at_ms,
-        caught_up: gate.caught_up || (gate.blocked && outcome.summary.caught_up),
+        caught_up: gate.caught_up || (gate.blocked && metadata_caught_up),
         blocked: gate.blocked,
         waiting_on: gate.waiting_on.clone(),
     }

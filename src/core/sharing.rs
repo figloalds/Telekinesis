@@ -106,6 +106,13 @@ const EPOCH_HEX_LEN: usize = 32;
 const MAX_ID_BYTES: usize = 128;
 /// Offers whose sent counts wait for their `feed-apply` (oldest dropped).
 const OFFERS_KEPT: usize = 1024;
+/// Stored payload bytes one page may read (and canonicalize) for its entries,
+/// elided and `large` ones included; the page ends before an entry that
+/// would pass it (it always lists its first). Without it a run of large
+/// entries made one page read up to 4,096 × `MAX_EVENT` bytes, past the
+/// exchange deadline, and the next exchange rebuilt the same page
+/// (post-integration re-review, WP2.INT).
+pub const PAGE_READ_BUDGET: u64 = 8 * 1024 * 1024;
 
 /// What one `build_exchange_request` sent, until `apply_exchange_reply`
 /// folds it into the dialer's summary. Process-wide: the offer and the apply
@@ -115,6 +122,8 @@ struct Offer {
     repo: String,
     peer: String,
     sent: Sent,
+    /// When the request was built (`now_ms`).
+    at_ms: i64,
 }
 
 static OFFERS: Mutex<VecDeque<Offer>> = Mutex::new(VecDeque::new());
@@ -127,17 +136,18 @@ fn remember_offer(offer: Offer) {
     offers.push_back(offer);
 }
 
-/// What the request `request` of `repo` to `peer` sent (nothing when this
-/// process did not build it, e.g. across a worker restart).
-fn take_offer(request: &str, repo: &str, peer: &str) -> Sent {
+/// What the request `request` of `repo` to `peer` sent, and when it was
+/// built (`None` when this process did not build it, e.g. across a worker
+/// restart).
+fn take_offer(request: &str, repo: &str, peer: &str) -> (Sent, Option<i64>) {
     let mut offers = lock(&OFFERS);
     let offer = offers
         .iter()
         .position(|offer| offer.request == request)
         .and_then(|position| offers.remove(position));
     match offer {
-        Some(offer) if offer.repo == repo && offer.peer == peer => offer.sent,
-        _ => Sent::default(),
+        Some(offer) if offer.repo == repo && offer.peer == peer => (offer.sent, Some(offer.at_ms)),
+        _ => (Sent::default(), None),
     }
 }
 
@@ -467,10 +477,17 @@ impl Store {
 /// The feed in seq order: a `feed_journal` rowid range scan (private rows are
 /// not in it) with point lookups. `CROSS JOIN` pins `feed_journal` as the
 /// outer loop; the branch join keeps a private event off the feed even if a
-/// `feed_journal` row were stale.
+/// `feed_journal` row were stale. The payload's stored length only
+/// (`octet_length` reads no payload): a page reads the payloads it lists
+/// within [`PAGE_READ_BUDGET`] ([`PAYLOAD_SQL`]).
 const PAGE_SQL: &str =
-    "SELECT f.seq,e.id,e.payload FROM feed_journal f CROSS JOIN events e ON e.id=f.event
+    "SELECT f.seq,e.id,octet_length(e.payload) FROM feed_journal f CROSS JOIN events e ON e.id=f.event
     CROSS JOIN branches b ON b.id=e.branch WHERE f.seq>?1 AND b.shared=1 ORDER BY f.seq LIMIT ?2";
+/// One committed event's payload.
+const PAYLOAD_SQL: &str = "SELECT payload FROM events WHERE id=?1";
+/// A committed shared event's stored payload length (need serving reads the
+/// payload only when it fits the budget).
+const SHARED_LENGTH_SQL: &str = "SELECT octet_length(e.payload) FROM events e JOIN branches b ON b.id=e.branch WHERE e.id=?1 AND b.shared=1";
 /// The feed tip: the last `feed_journal` row (a rowid seek), checked shared.
 const TIP_SQL: &str = "SELECT f.seq FROM feed_journal f CROSS JOIN events e ON e.id=f.event
     CROSS JOIN branches b ON b.id=e.branch WHERE b.shared=1 ORDER BY f.seq DESC LIMIT 1";
@@ -495,9 +512,14 @@ const WAITING_AFTER_SQL: &str = "SELECT received_ms,rowid,id FROM incoming_event
 /// Parents of the waiting rows `?1` (a JSON array of ids) that are neither
 /// staged nor committed here, that peer `?2` has not had refused here
 /// (`feed_rejected`: asking again would only bring the same refusal) and
-/// has not reported unknown since `?3`; in id order, at most `?4`.
+/// has not reported unknown since `?3`; in id order, at most `?4`. Only ids
+/// a need list may carry (1 to `MAX_ID_BYTES` bytes): a waiting row staged
+/// with a malformed parent (an older build, the legacy path) never puts
+/// that id in a request, which every acceptor would refuse whole
+/// (post-integration re-review, WP2.INT).
 const MISSING_PARENTS_SQL: &str = "SELECT DISTINCT w.parent FROM json_each(?1) c CROSS JOIN incoming_waits w ON w.child=c.value
-    WHERE NOT EXISTS(SELECT 1 FROM incoming_events i WHERE i.id=w.parent)
+    WHERE octet_length(w.parent) BETWEEN 1 AND 128
+    AND NOT EXISTS(SELECT 1 FROM incoming_events i WHERE i.id=w.parent)
     AND NOT EXISTS(SELECT 1 FROM events e WHERE e.id=w.parent)
     AND NOT EXISTS(SELECT 1 FROM feed_rejected r WHERE r.peer=?2 AND r.event=w.parent)
     AND NOT EXISTS(SELECT 1 FROM feed_needs n WHERE n.peer=?2 AND n.event=w.parent AND n.missing_at>?3)
@@ -858,6 +880,7 @@ impl Store {
             repo: self.repo.clone(),
             peer: peer.to_owned(),
             sent,
+            at_ms: now_ms(),
         });
         Ok(request)
     }
@@ -1003,6 +1026,9 @@ impl Store {
         );
         let peer = route.remote_replica.as_str();
         let before = self.feed_read(|| self.marks(peer))?;
+        // What our request sent, and when (recorded by
+        // `build_exchange_request`).
+        let (sent, offered_ms) = take_offer(request_id, &self.repo, peer);
         let mut received = self.feed_write(|| {
             let (_, mut received) = self.receive_page(peer, &reply.page, &reply.state)?;
             self.receive_served(peer, &reply.need_served, &mut received)?;
@@ -1013,14 +1039,15 @@ impl Store {
             };
             // `Reset`: the acceptor took our reset page, so it restarts low.
             let restart = reply.page_status == PageStatus::Reset;
-            self.observe_report(peer, VIA_REPLY, Some(report), restart)?;
+            let regressed = self.observe_report(peer, VIA_REPLY, Some(report), restart)?;
+            if !regressed && !restart {
+                self.check_reply_report(peer, report, offered_ms)?;
+            }
             Ok(received)
         })?;
         received.bytes = received
             .bytes
             .saturating_add(ENTRY_OVERHEAD * reply.page.entries.len() as u64 + MESSAGE_OVERHEAD);
-        // What our request sent (recorded by `build_exchange_request`).
-        let sent = take_offer(request_id, &self.repo, peer);
         self.feed_read(|| self.apply_result(peer, &received, &sent, before))
     }
     /// Per-peer feed counters for the heartbeat (`PeerFeedCounters`).
@@ -1090,21 +1117,28 @@ impl Store {
             if !seen.insert(id.as_str()) {
                 continue;
             }
-            let payload: Option<String> = self
+            // The stored length first (`octet_length` reads no payload): a
+            // payload that does not fit is not read at all. Reading every
+            // requested payload made draining N large needs read about N²/2
+            // of them (post-integration re-review, WP2.INT).
+            let length: Option<i64> = self
                 .db
-                .prepare_cached(
-                    "SELECT e.payload FROM events e JOIN branches b ON b.id=e.branch WHERE e.id=? AND b.shared=1",
-                )?
+                .prepare_cached(SHARED_LENGTH_SQL)?
                 .query_row([id], |r| r.get(0))
                 .optional()?;
-            let Some(payload) = payload else {
+            let Some(length) = length else {
                 unknown.push(id.clone());
                 continue;
             };
-            self.count_payload_read();
-            if used.saturating_add(payload.len()) > max_bytes {
+            let length = usize::try_from(length).unwrap_or(usize::MAX);
+            if used.saturating_add(length) > max_bytes {
                 continue;
             }
+            let payload: String = self
+                .db
+                .prepare_cached(PAYLOAD_SQL)?
+                .query_row([id], |r| r.get(0))?;
+            self.count_payload_read();
             used += payload.len();
             served.push(serde_json::from_str(&payload)?);
         }
@@ -1243,12 +1277,25 @@ impl Store {
         let mut entries = vec![];
         let mut through = base.clone();
         let mut used = 0usize;
+        let mut read = 0u64;
         let mut statement = self.db.prepare_cached(PAGE_SQL)?;
         let mut rows = statement.query(params![base.seq, max_entries.max(1) as i64])?;
         while let Some(row) = rows.next()? {
             let seq: i64 = row.get(0)?;
             let id: String = row.get(1)?;
-            let payload: String = row.get(2)?;
+            let stored: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+            let stored = u64::try_from(stored).unwrap_or(0);
+            // Every listed entry's payload is read for its digest: the page
+            // ends before the read budget is passed (it always lists its
+            // first entry; `through` is the last entry listed).
+            if !entries.is_empty() && read.saturating_add(stored) > PAGE_READ_BUDGET {
+                break;
+            }
+            read = read.saturating_add(stored);
+            let payload: String = self
+                .db
+                .prepare_cached(PAYLOAD_SQL)?
+                .query_row([&id], |r| r.get(0))?;
             self.count_payload_read();
             // The digest (and size) of the canonical serialization, which
             // receivers check (module docs).
@@ -1703,11 +1750,19 @@ impl Store {
         if text.len() > MAX_EVENT {
             return error("EVENT_METADATA_TOO_LARGE", &event.id);
         }
+        // Its references too: a parent id no replica can hold (commit
+        // refuses such ids) would keep the event waiting for good, and would
+        // go into need lists (post-integration re-review, WP2.INT).
         if !valid_id(&event.id)
             || !valid_id(&event.device)
             || !valid_id(&event.branch.id)
             || event.changes.is_empty()
             || event.changes.len() > 10000
+            || !event.dependencies.iter().all(|id| valid_id(id))
+            || !event
+                .changes
+                .iter()
+                .all(|change| change.parents.iter().all(|id| valid_id(id)))
         {
             return error("INVALID_EVENT", &event.id);
         }
@@ -1832,6 +1887,70 @@ impl Store {
         }
         Ok(regressed)
     }
+    /// A reply's report of `peer`'s cursor of our feed (its `cursor`, or the
+    /// `expected` of a `CursorMismatch`) is authoritative across channels:
+    /// the acceptor read it in its write transaction, after our request
+    /// arrived. So when it is lower than the report the *request* channel
+    /// recorded before our request was built (`offered_ms`; unknown offer:
+    /// any), of the same epoch and still valid, the peer regressed (§6.3.4's
+    /// single `feed_out(P)` rule): it is forgotten as `observe_report` does.
+    /// A request-borne report recorded after our offer may legitimately be
+    /// newer than this reply's (mutual dialing), so it is not compared.
+    /// Without this, a peer restored from a backup taken before it last
+    /// dialed us, and now only dialed by us, answered every page with
+    /// `CursorMismatch` for good: our pages followed the stale, higher
+    /// request-channel report (post-integration re-review, WP2.INT).
+    fn check_reply_report(
+        &self,
+        peer: &str,
+        report: &Cursor,
+        offered_ms: Option<i64>,
+    ) -> Result<bool> {
+        if report.epoch.is_empty() {
+            return Ok(false);
+        }
+        let request: Option<(Cursor, i64)> = self
+            .db
+            .prepare_cached("SELECT epoch,seq,id,reported_ms FROM feed_out WHERE peer=? AND via=?")?
+            .query_row(params![peer, VIA_REQUEST], |r| {
+                Ok((
+                    Cursor {
+                        epoch: r.get(0)?,
+                        seq: r.get(1)?,
+                        id: r.get(2)?,
+                    },
+                    r.get(3)?,
+                ))
+            })
+            .optional()?;
+        let Some((request, reported_ms)) = request else {
+            return Ok(false);
+        };
+        let older = offered_ms.is_none_or(|offered| reported_ms <= offered);
+        let regressed = older
+            && request.epoch == report.epoch
+            && report.seq < request.seq
+            && self.validate_cursor(&request)?;
+        if regressed {
+            self.forget_peer(peer)?;
+            self.db
+                .execute("DELETE FROM feed_in WHERE peer=?", [peer])?;
+            self.db
+                .execute("DELETE FROM feed_out WHERE peer=?", [peer])?;
+            self.db.execute(
+                "INSERT INTO feed_out(peer,via,epoch,seq,id,reported_ms) VALUES(?,?,?,?,?,?)",
+                params![
+                    peer,
+                    VIA_REPLY,
+                    report.epoch,
+                    report.seq,
+                    report.id,
+                    now_ms()
+                ],
+            )?;
+        }
+        Ok(regressed)
+    }
     /// Ids `peer` reported unknown: not asked again for `NEED_RETRY_MS`, and
     /// a listed one no longer counts as outstanding (`PeerView::needs`).
     /// Only ids we could have asked for are recorded (invariant 22): a need
@@ -1894,6 +2013,9 @@ impl Store {
                 |r| r.get(0),
             )?
             .collect::<rusqlite::Result<_>>()?;
+        // Never a malformed id: the acceptor refuses a request that carries
+        // one (invariant 22), and nothing here would ever change it.
+        need.retain(|id| valid_id(id));
         let streaming = self
             .in_row(peer)?
             .is_some_and(|row| row.cursor.seq < row.tip);

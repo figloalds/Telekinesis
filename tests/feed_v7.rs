@@ -27,8 +27,8 @@ use tkfs::{
         errors::{ErrorClass, code_of},
         ipc::WorkerHeartbeat,
         protocol::feed::{
-            self, Cursor, FeedApplyResult, LARGE_EVENT_BYTES, MAX_NEED, MAX_PAGE_BYTES,
-            MAX_PAGE_ENTRIES, MetaExchangeReply, MetaExchangeRequest, PageStatus,
+            self, Cursor, FeedApplyResult, LARGE_EVENT_BYTES, MAX_NEED, MAX_NEED_BYTES,
+            MAX_PAGE_BYTES, MAX_PAGE_ENTRIES, MetaExchangeReply, MetaExchangeRequest, PageStatus,
         },
     },
     paired_sync::SyncRoute,
@@ -1600,6 +1600,226 @@ fn peer_restore_requeues_withdrawn_events() {
     settle(&mut b, &mut a);
     assert_converged(&[&a, &b]);
     assert_eq!(peer_known(&a, &b), shared(&a));
+}
+
+/// Post-integration re-review (WP2.INT): a reply's cursor is authoritative
+/// across channels. D's request channel holds a report from when A used to
+/// dial (seq 5); A is then restored from a backup taken before, and only D
+/// dials. A's `CursorMismatch.expected` (seq 0) is lower than that report:
+/// A regressed, D forgets it and pages from where A really is. Before the
+/// fix D kept paging after the stale report: every round answered
+/// `CursorMismatch` and A never received any of D's events.
+#[test]
+fn a_restored_acceptor_is_found_through_the_other_channel() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let (a_root, snapshot) = (dir.path().join("a"), dir.path().join("a-backup"));
+    let mut d = create(&dir.path().join("d"), &repo);
+    let a = create(&a_root, &repo);
+    linear_history(&mut d, 5).unwrap();
+    // D dials A once (a probe): D's reply channel has A's cursor at 0.
+    exchange(&d, &a);
+    drop(a);
+    copy_dir(&a_root, &snapshot).unwrap();
+    let mut a = reopen(&a_root, &repo);
+    // A dials D twice: D's request channel now has A's cursor at 5.
+    exchange(&a, &d);
+    exchange(&a, &d);
+    activate(&mut a);
+    // A is restored from the backup; D commits 3 more events.
+    drop(a);
+    std::fs::remove_dir_all(&a_root).unwrap();
+    copy_dir(&snapshot, &a_root).unwrap();
+    let mut a = reopen(&a_root, &repo);
+    linear_history_named(&mut d, "late", 3).unwrap();
+    assert_eq!(shared(&d).len(), 8);
+    // Only D dials from now on.
+    let mut statuses = vec![];
+    for _ in 0..20 {
+        let round = exchange(&d, &a);
+        statuses.push(round.reply.page_status.clone());
+        activate(&mut a);
+        activate(&mut d);
+    }
+    assert!(
+        shared(&d).is_subset(&shared(&a)),
+        "A received {} of D's 8 events; page statuses: {statuses:?}",
+        shared(&d).intersection(&shared(&a)).count()
+    );
+    let counters = a.peer_feed_counters(&d.device).unwrap();
+    assert!(counters.caught_up, "{counters:?}");
+    assert_eq!(peer_known(&d, &a), shared(&d));
+}
+
+/// Post-integration re-review (WP2.INT): an event whose change parent is an
+/// id no replica can hold (over 128 bytes) is refused at staging
+/// (`INVALID_EVENT` in `feed_rejected`), so it never waits and its parent
+/// never goes into a need list; a waiting row staged with such a parent by
+/// another path (the legacy one) does not put it there either. Before the
+/// fix the dialer staged it waiting and sent the malformed id in every
+/// request to every peer, which every acceptor refused whole
+/// (`PROTOCOL_VIOLATION: malformed need id`): no metadata moved again.
+#[test]
+fn a_malformed_parent_never_reaches_a_need_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut d = create(&dir.path().join("d"), &repo);
+    let mut a = create(&dir.path().join("a"), &repo);
+    let m = create(&dir.path().join("m"), &repo);
+    settle(&mut d, &mut a);
+    let malformed = |s: &Store| {
+        let mut event = mkdir_event(s, "orphan");
+        event.changes[0].parents = vec!["p".repeat(200)];
+        event
+    };
+    let bad = malformed(&m);
+    inject(&m, &bad);
+    let round = exchange(&d, &m);
+    assert_eq!(round.applied.summary.staged, 0);
+    assert_eq!(
+        rejected_codes(&d, &m),
+        vec![(bad.id.clone(), "INVALID_EVENT".to_owned())]
+    );
+    assert_eq!(d.inbox_counts().unwrap().waiting, 0);
+    // The same shape staged by another path waits, but is never asked for.
+    let legacy = malformed(&m);
+    let allowed: BTreeSet<String> = [m.device.clone(), d.device.clone()].into();
+    d.stage_incoming(
+        vec![tkfs::core::inbox::StagedEvent {
+            event: legacy,
+            source: None,
+        }],
+        &allowed,
+    )
+    .unwrap();
+    activate(&mut d);
+    assert_eq!(d.inbox_counts().unwrap().waiting, 1);
+    // D's exchanges with an honest peer keep working.
+    a.create("a2", "directory").unwrap();
+    for _ in 0..3 {
+        let request = d.build_exchange_request(&route(&d, &a)).unwrap();
+        assert!(
+            request
+                .need
+                .iter()
+                .all(|id| !id.is_empty() && id.len() <= 128),
+            "{:?}",
+            request.need
+        );
+        let (reply, _) = a
+            .handle_exchange_request(&route(&a, &d), &request)
+            .expect("the acceptor refuses no request");
+        d.apply_exchange_reply(&route(&d, &a), &request.request, &reply)
+            .unwrap();
+        activate(&mut d);
+        activate(&mut a);
+    }
+    assert!(d.lookup("a2").is_ok(), "A's new event reached D");
+    // And with M itself.
+    let request = d.build_exchange_request(&route(&d, &m)).unwrap();
+    assert!(request.need.iter().all(|id| id.len() <= 128));
+    m.handle_exchange_request(&route(&m, &d), &request)
+        .expect("M refuses no request either");
+}
+
+/// An event of about `bytes` bytes (one padded change), not validated.
+fn padded_event(s: &Store, bytes: usize) -> Event {
+    s.event(
+        &main_branch(s),
+        vec![Change {
+            entity: id(),
+            field: "basic".into(),
+            parents: vec![],
+            value: json!({ "pad": "x".repeat(bytes) }),
+        }],
+    )
+}
+
+/// Post-integration re-review (WP2.INT): need serving reads a payload only
+/// when it fits the reply's budget (its stored length is read first). Before
+/// the fix every requested payload was read, served or not, so draining N
+/// large needs read about N²/2 payloads.
+#[test]
+fn need_serving_reads_only_the_payloads_it_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("a"), &id());
+    let ids: Vec<String> = (0..24)
+        .map(|_| {
+            let event = padded_event(&a, 774_000);
+            inject(&a, &event);
+            event.id
+        })
+        .collect();
+    let mut left = ids.clone();
+    let mut rounds = 0;
+    let before = a.feed_payload_reads();
+    while !left.is_empty() {
+        let reads = a.feed_payload_reads();
+        let (served, unknown) = a.events_by_ids(&left, MAX_NEED_BYTES).unwrap();
+        assert!(unknown.is_empty());
+        assert!(!served.is_empty());
+        assert_eq!(
+            (a.feed_payload_reads() - reads) as usize,
+            served.len(),
+            "payloads read beyond those served"
+        );
+        let served: BTreeSet<String> = served.into_iter().map(|e| e.id).collect();
+        left.retain(|id| !served.contains(id));
+        rounds += 1;
+    }
+    assert_eq!(rounds, 2, "16 fit the 12 MiB budget, then 8");
+    assert_eq!((a.feed_payload_reads() - before) as usize, ids.len());
+}
+
+/// Post-integration re-review (WP2.INT): a page reads at most
+/// `PAGE_READ_BUDGET` of stored payloads for its entries, `large` and elided
+/// ones included, and ends there (`more`; the next page continues
+/// contiguously). Before the fix a page listed up to 4,096 such entries and
+/// read every payload (738 MiB for 1,000 large events in the review), past
+/// the exchange deadline.
+#[test]
+fn a_page_reads_its_entries_within_a_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = create(&dir.path().join("a"), &id());
+    let size = 774_000;
+    for _ in 0..40 {
+        inject(&a, &padded_event(&a, size));
+    }
+    let per_page = tkfs::core::sharing::PAGE_READ_BUDGET as usize / size + 1;
+    let mut after = Cursor::start(&a.feed_epoch().unwrap());
+    let mut listed = vec![];
+    let mut pages = 0;
+    loop {
+        let reads = a.feed_payload_reads();
+        let page = a
+            .feed_page(Some(&after), "some-peer", MAX_PAGE_ENTRIES, MAX_PAGE_BYTES)
+            .unwrap();
+        assert!(!page.entries.is_empty());
+        assert!(
+            page.entries.len() <= per_page,
+            "{} entries",
+            page.entries.len()
+        );
+        assert_eq!(
+            (a.feed_payload_reads() - reads) as usize,
+            page.entries.len()
+        );
+        assert!(
+            page.entries
+                .iter()
+                .all(|e| e.event.is_none() && e.large.is_some())
+        );
+        assert_eq!(page.through.seq, page.entries.last().unwrap().seq);
+        listed.extend(page.entries.iter().map(|e| e.seq));
+        after = page.through.clone();
+        pages += 1;
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(listed.len(), 40);
+    assert!(listed.windows(2).all(|w| w[0] < w[1]));
+    assert!(pages > 1);
 }
 
 #[test]
