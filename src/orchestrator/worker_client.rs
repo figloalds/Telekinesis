@@ -1,10 +1,12 @@
-//! Owned by WP1.3.
+//! Owned by WP1.3 (JSON client) and WP3.3 (v3 loopback session client).
 //!
-//! The JSON [`WorkerClient`] (REVAMP_PLAN §3.3, §6.1, §14 WP1.3): requests
-//! `{"request": id, "payload": {"op": …}}` over the worker's loopback
+//! Two [`WorkerClient`]s of one worker instance (REVAMP_PLAN §3.3, §6.1, §6.4):
+//!
+//! # `JsonWorkerClient` (WP1.3)
+//!
+//! Requests `{"request": id, "payload": {"op": …}}` over the worker's loopback
 //! WebSocket endpoint, the same envelope and `{ok, result | error}` reply as
-//! `ws::call`. WP3.3 adds the v3 loopback session client and WP4.1 the worker
-//! token.
+//! `ws::call`. WP4.1 adds the worker token.
 //!
 //! * **Pool.** Up to [`MAX_IDLE`] idle connections are kept. A call checks one
 //!   out (or opens a new one) and returns it afterwards; no socket is ever used
@@ -22,19 +24,67 @@
 //!     Both are uncertain (the worker may have executed the request), the
 //!     socket is dropped, and the request is **never** replayed (invariant 16);
 //!   - failing to connect or to upgrade → `Unavailable` (nothing was sent).
-//! * `call_bytes` → `Unavailable(BINARY_OPS_REQUIRE_SESSION)` until WP3.3.
-use crate::model::{
-    errors::{ErrorWire, UNKNOWN_CODE, code_in},
-    orchestrator::{CallError, WorkerClient, WorkerEndpoint},
+//! * `call_bytes` (binary bodies) goes through the instance's
+//!   [`SessionWorkerClient`] ([`session_for`]); a worker that cannot open one
+//!   answers `Unavailable(BINARY_OPS_REQUIRE_SESSION: …)` (nothing was sent).
+//!
+//! # `SessionWorkerClient` (WP3.3)
+//!
+//! One multiplexed v3 loopback session (`X-Tkfs-Sync: 3-loopback`,
+//! `session::dial_loopback`) per worker instance, shared by every bulk lane
+//! and inbound exchange of the daemon ([`session_for`] caches it per
+//! instance). It carries the worker's objects v3 ops (§6.4) with binary
+//! bodies:
+//!
+//! | method | op | request | reply |
+//! |---|---|---|---|
+//! | [`SessionWorkerClient::want`] | `objects.want` | header `WantHeader` | header `WantReply` |
+//! | [`SessionWorkerClient::read`] | `objects.read` | header `ReadHeader` (len ≤ 1 MiB) | header `ReadReply{total}`, body = bytes |
+//! | [`SessionWorkerClient::read_stream`] | `objects.read` × n | ≤ `INFLIGHT_READS` reads in flight, delivered in order | |
+//! | [`SessionWorkerClient::write_batch`] | `objects.write` | header `WriteHeader`, body = the items' bytes concatenated (≤ 1 MiB) | header `WriteReply` |
+//! | [`SessionWorkerClient::report`] | `objects.report` | header `ReportHeader` | header `ReportReply` |
+//!
+//! A JSON reply is read from the response body when there is one, else from
+//! the header. The [`WorkerClient`] methods send `call(op, payload)` as a
+//! header-only request (`payload` is the header, the reply header is the
+//! result) and `call_bytes` as a request with a body.
+//!
+//! * **Session.** Dialed by [`SessionWorkerClient::connect`]; a session that
+//!   closed (the worker restarted its listener, a transport error) is redialed
+//!   by the next call. A call that was in flight on it is uncertain and is
+//!   never replayed (invariant 16).
+//! * **Refusals.** A request the worker refused without running it
+//!   (`BUSY`/`WORKER_BUSY`, Contention: its handler queue was full; or the
+//!   local queue was full) is sent again after 10 ms → 250 ms, within the
+//!   call's deadline. Nothing else is retried.
+//! * **No objects v3.** A worker that does not echo the loopback upgrade
+//!   header (a Wave 2 worker) gives `Unavailable(UNSUPPORTED_OPERATION: …)`;
+//!   [`session_for`] remembers that for the instance (a worker instance never
+//!   changes its build), and the bulk lanes fall back to the interim path.
+use crate::{
+    model::{
+        errors::{ErrorWire, UNKNOWN_CODE, code_in},
+        orchestrator::{CallError, WorkerClient, WorkerEndpoint},
+        protocol::objects::{
+            self as wire, ReadHeader, ReadReply, ReportAction, ReportHeader, ReportReply,
+            WantHeader, WantItem, WantReply, WriteHeader, WriteItem, WriteReply, WriteResult,
+        },
+    },
+    paired_sync::SyncRoute,
+    session::{self, Conn, ConnOptions, DialError, Priority, Reply as SessionReply},
+    util::lock::lock,
 };
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::{
+    collections::{BTreeMap, HashMap, HashSet},
     fmt, io,
     net::{TcpStream, ToSocketAddrs},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
     time::{Duration, Instant},
 };
 use tungstenite::{
@@ -252,16 +302,22 @@ impl WorkerClient for JsonWorkerClient {
         }
     }
 
+    /// Binary ops travel on the instance's v3 loopback session
+    /// ([`session_for`]). When none can be opened, nothing was sent:
+    /// `Unavailable(BINARY_OPS_REQUIRE_SESSION: …)`, with the reason.
     fn call_bytes(
         &self,
         op: &str,
-        _header: Value,
-        _body: &[u8],
-        _deadline: Duration,
+        header: Value,
+        body: &[u8],
+        deadline: Duration,
     ) -> Result<(Value, Vec<u8>), CallError> {
-        Err(CallError::Unavailable(format!(
-            "BINARY_OPS_REQUIRE_SESSION: {op} needs a v3 loopback session (Wave 3)"
-        )))
+        let session = session_for(&self.endpoint).map_err(|error| {
+            CallError::Unavailable(format!(
+                "BINARY_OPS_REQUIRE_SESSION: {op} needs a v3 loopback session: {error}"
+            ))
+        })?;
+        session.call_bytes(op, header, body, deadline)
     }
 }
 
@@ -416,4 +472,613 @@ fn config() -> WebSocketConfig {
     WebSocketConfig::default()
         .max_message_size(Some(crate::ws::MAX_MESSAGE))
         .max_frame_size(Some(crate::ws::MAX_MESSAGE))
+}
+
+// ---------------------------------------------------------------------------
+// v3 loopback session client (WP3.3)
+
+/// Per-call deadlines of the worker's objects ops.
+pub mod deadlines {
+    use std::time::Duration;
+    /// `objects.want`: a worker query plus lease bookkeeping.
+    pub const WANT: Duration = Duration::from_secs(10);
+    /// `objects.read` of ≤ 1 MiB. Generous: the first serve of an object
+    /// verifies it whole (verify-on-first-serve, §14 WP3.2).
+    pub const READ: Duration = Duration::from_secs(60);
+    /// `objects.write` of ≤ 1 MiB: append, spool fsync, `spool_state` commit,
+    /// and on completion a full re-read SHA-256, install and registration.
+    pub const WRITE: Duration = Duration::from_secs(60);
+    /// `objects.report`: the sender re-verifies its copy.
+    pub const REPORT: Duration = Duration::from_secs(60);
+}
+
+/// First pause before a request the worker refused (`BUSY`) is sent again.
+const REFUSED_RETRY_FIRST: Duration = Duration::from_millis(10);
+/// Longest pause between two attempts of a refused request.
+const REFUSED_RETRY_CAP: Duration = Duration::from_millis(250);
+/// Worker instances [`session_for`] remembers.
+const MAX_CACHED_SESSIONS: usize = 256;
+
+/// The v3 loopback session client of one worker instance (module docs).
+pub struct SessionWorkerClient {
+    endpoint: WorkerEndpoint,
+    options: ConnOptions,
+    conn: Mutex<Option<Conn>>,
+    dials: AtomicU64,
+}
+
+impl fmt::Debug for SessionWorkerClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionWorkerClient")
+            .field("instance", &self.endpoint.instance)
+            .field("address", &self.endpoint.address)
+            .field("open", &self.is_open())
+            .field("dials", &self.dials())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One range of an object for [`SessionWorkerClient::read_stream`]
+/// (`len` ≤ [`wire::MAX_READ_LEN`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadRange {
+    pub hash: String,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// The consumer of [`SessionWorkerClient::read_stream`]: one range's
+/// `(total, bytes)` or its error, in range order.
+pub type ReadConsumer<'a> =
+    dyn FnMut(&ReadRange, Result<(u64, Vec<u8>), CallError>) -> ReadFlow + 'a;
+
+/// What the consumer of a read stream wants next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFlow {
+    Continue,
+    /// No more ranges of this range's object (reads already in flight are
+    /// dropped).
+    SkipObject,
+    /// End the stream.
+    Stop,
+}
+
+impl SessionWorkerClient {
+    /// Dials the worker's loopback endpoint now (`Unavailable` when it
+    /// cannot: `UNSUPPORTED_OPERATION` for a worker without loopback
+    /// sessions, `LOCAL_WORKER_UNAVAILABLE` otherwise).
+    pub fn connect(ep: &WorkerEndpoint) -> Result<Arc<Self>, CallError> {
+        Self::connect_with(ep, ConnOptions::default())
+    }
+
+    /// [`SessionWorkerClient::connect`] with explicit session options.
+    pub fn connect_with(ep: &WorkerEndpoint, options: ConnOptions) -> Result<Arc<Self>, CallError> {
+        let client = Arc::new(Self {
+            endpoint: ep.clone(),
+            options,
+            conn: Mutex::new(None),
+            dials: AtomicU64::new(0),
+        });
+        let conn = client.dial()?;
+        *lock(&client.conn) = Some(conn);
+        Ok(client)
+    }
+
+    pub fn endpoint(&self) -> &WorkerEndpoint {
+        &self.endpoint
+    }
+
+    /// Sessions dialed so far (the first one included).
+    pub fn dials(&self) -> u64 {
+        self.dials.load(Ordering::Relaxed)
+    }
+
+    /// Whether the current session is open.
+    pub fn is_open(&self) -> bool {
+        lock(&self.conn)
+            .as_ref()
+            .is_some_and(|conn| conn.closed().is_none())
+    }
+
+    /// Closes the current session (calls in flight fail `ConnectionLost`);
+    /// the next call dials a new one.
+    pub fn close(&self) {
+        if let Some(conn) = lock(&self.conn).take() {
+            conn.close();
+        }
+    }
+
+    fn dial(&self) -> Result<Conn, CallError> {
+        let ep = &self.endpoint;
+        let conn = session::dial_loopback(&ep.address, ep.token.as_deref(), self.options)
+            .map_err(|error| dial_error(ep, error))?;
+        self.dials.fetch_add(1, Ordering::Relaxed);
+        Ok(conn)
+    }
+
+    /// The open session, dialing a new one when the last one closed.
+    pub fn conn(&self) -> Result<Conn, CallError> {
+        let mut slot = lock(&self.conn);
+        if let Some(conn) = slot.as_ref()
+            && conn.closed().is_none()
+        {
+            return Ok(conn.clone());
+        }
+        // Dialed under the lock: concurrent callers wait for one dial
+        // (bounded by the dial attempt timeout) instead of each dialing.
+        let conn = self.dial()?;
+        *slot = Some(conn.clone());
+        Ok(conn)
+    }
+
+    /// One request. A refusal that ran nothing (`BUSY`/`WORKER_BUSY`, a full
+    /// local queue) is sent again within `deadline`; any other outcome is
+    /// returned as is (an uncertain one is never replayed, invariant 16).
+    pub fn request(
+        &self,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+        prio: Priority,
+        deadline: Duration,
+    ) -> Result<SessionReply, CallError> {
+        let started = Instant::now();
+        let mut pause = REFUSED_RETRY_FIRST;
+        let mut body = Some(body);
+        loop {
+            let conn = self.conn()?;
+            let left = deadline
+                .saturating_sub(started.elapsed())
+                .max(Duration::from_millis(1));
+            // The body is only copied when this attempt may be refused and
+            // sent again (rare: a full handler queue).
+            let attempt = match body.take() {
+                Some(owned) if left <= pause => owned,
+                Some(owned) => {
+                    let copy = owned.clone();
+                    body = Some(owned);
+                    copy
+                }
+                None => Vec::new(),
+            };
+            let result = conn.call(op, header.clone(), attempt, prio, left);
+            match result {
+                Err(error) if refused(&error) && body.is_some() => {
+                    let left = deadline.saturating_sub(started.elapsed());
+                    if left <= pause {
+                        return Err(error);
+                    }
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(REFUSED_RETRY_CAP);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Worker `objects.want`.
+    pub fn want(
+        &self,
+        header: &WantHeader,
+        deadline: Duration,
+    ) -> Result<Vec<WantItem>, CallError> {
+        let reply = self.request(
+            wire::ops::WANT,
+            to_header(header)?,
+            Vec::new(),
+            Priority::Control,
+            deadline,
+        )?;
+        let reply: WantReply = json_reply(&reply, wire::ops::WANT)?;
+        Ok(reply.items)
+    }
+
+    /// Worker `objects.read`: `(total, bytes)`.
+    pub fn read(
+        &self,
+        header: &ReadHeader,
+        deadline: Duration,
+    ) -> Result<(u64, Vec<u8>), CallError> {
+        let reply = self.request(
+            wire::ops::READ,
+            to_header(header)?,
+            Vec::new(),
+            Priority::Control,
+            deadline,
+        )?;
+        let head: ReadReply = serde_json::from_value(reply.header)
+            .map_err(|error| invalid_reply(wire::ops::READ, &error))?;
+        Ok((head.total, reply.body))
+    }
+
+    /// Reads `ranges` with at most `inflight` `objects.read` calls in flight
+    /// and hands each outcome to `consume` **in range order** (at most
+    /// `inflight` results are held at once). `consume` sees `(total, bytes)`
+    /// or the call's error, and decides what follows. Returns when every
+    /// range was consumed or skipped, or `consume` stopped the stream (reads
+    /// in flight then end on their own, within `deadline`).
+    pub fn read_stream(
+        &self,
+        route: &SyncRoute,
+        ranges: &[ReadRange],
+        inflight: usize,
+        deadline: Duration,
+        consume: &mut ReadConsumer<'_>,
+    ) {
+        if ranges.is_empty() {
+            return;
+        }
+        let inflight = inflight.clamp(1, ranges.len());
+        let shared = ReadShared {
+            state: Mutex::new(ReadState::default()),
+            changed: Condvar::new(),
+        };
+        thread::scope(|scope| {
+            for _ in 0..inflight {
+                scope.spawn(|| read_loop(self, route, ranges, inflight, deadline, &shared));
+            }
+            let mut index = 0;
+            while index < ranges.len() {
+                let outcome = {
+                    let mut state = lock(&shared.state);
+                    loop {
+                        if let Some(outcome) = state.results.remove(&index) {
+                            state.consumed = index + 1;
+                            break outcome;
+                        }
+                        state = shared
+                            .changed
+                            .wait(state)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                };
+                shared.changed.notify_all();
+                let range = &ranges[index];
+                index += 1;
+                let Some(result) = outcome else {
+                    continue;
+                };
+                if lock(&shared.state).skipped.contains(&range.hash) {
+                    continue;
+                }
+                match consume(range, result) {
+                    ReadFlow::Continue => {}
+                    ReadFlow::SkipObject => {
+                        lock(&shared.state).skipped.insert(range.hash.clone());
+                    }
+                    ReadFlow::Stop => break,
+                }
+            }
+            lock(&shared.state).stop = true;
+            shared.changed.notify_all();
+        });
+    }
+
+    /// Worker `objects.write`: one call, `body` = the items' bytes in order.
+    pub fn write_batch(
+        &self,
+        route: &SyncRoute,
+        session: &str,
+        items: Vec<WriteItem>,
+        body: Vec<u8>,
+        deadline: Duration,
+    ) -> Result<Vec<WriteResult>, CallError> {
+        let header = WriteHeader {
+            route: route.clone(),
+            session: session.to_owned(),
+            items,
+        };
+        let reply = self.request(
+            wire::ops::WRITE,
+            to_header(&header)?,
+            body,
+            Priority::Data,
+            deadline,
+        )?;
+        let reply: WriteReply = json_reply(&reply, wire::ops::WRITE)?;
+        Ok(reply.results)
+    }
+
+    /// Worker `objects.report{route, hash, code}`.
+    pub fn report(
+        &self,
+        route: &SyncRoute,
+        hash: &str,
+        code: &str,
+        deadline: Duration,
+    ) -> Result<ReportAction, CallError> {
+        let header = ReportHeader {
+            route: route.clone(),
+            hash: hash.to_owned(),
+            code: code.to_owned(),
+        };
+        let reply = self.request(
+            wire::ops::REPORT,
+            to_header(&header)?,
+            Vec::new(),
+            Priority::Control,
+            deadline,
+        )?;
+        let reply: ReportReply = json_reply(&reply, wire::ops::REPORT)?;
+        Ok(reply.action)
+    }
+}
+
+impl WorkerClient for SessionWorkerClient {
+    fn instance(&self) -> &str {
+        &self.endpoint.instance
+    }
+
+    /// A JSON op as a header-only request; the reply is its JSON body, or
+    /// its header when it has no body.
+    fn call(&self, op: &str, payload: Value, deadline: Duration) -> Result<Value, CallError> {
+        let payload = match payload {
+            Value::Object(map) => Value::Object(map),
+            Value::Null => Value::Object(Map::new()),
+            other => {
+                return Err(CallError::Unavailable(format!(
+                    "INVALID_REQUEST: the payload of {op} must be a JSON object, not {other}"
+                )));
+            }
+        };
+        let reply = self.request(op, payload, Vec::new(), Priority::Control, deadline)?;
+        if reply.body.is_empty() {
+            Ok(reply.header)
+        } else {
+            serde_json::from_slice(&reply.body).map_err(|error| invalid_reply(op, &error))
+        }
+    }
+
+    fn call_bytes(
+        &self,
+        op: &str,
+        header: Value,
+        body: &[u8],
+        deadline: Duration,
+    ) -> Result<(Value, Vec<u8>), CallError> {
+        let prio = if body.is_empty() {
+            Priority::Control
+        } else {
+            Priority::Data
+        };
+        let reply = self.request(op, header, body.to_vec(), prio, deadline)?;
+        Ok((reply.header, reply.body))
+    }
+}
+
+/// Whether a call was refused without running (worth sending again).
+fn refused(error: &CallError) -> bool {
+    match error {
+        CallError::Busy => true,
+        CallError::Remote(wire) => wire.code == "BUSY" || wire.code == "WORKER_BUSY",
+        _ => false,
+    }
+}
+
+fn dial_error(ep: &WorkerEndpoint, error: DialError) -> CallError {
+    match error {
+        DialError::NeedsUpgrade { detail } => CallError::Unavailable(format!(
+            "UNSUPPORTED_OPERATION: worker {} does not serve objects v3 loopback sessions: {detail}",
+            ep.instance
+        )),
+        DialError::Unauthorized(error) | DialError::Rejected(error) => {
+            CallError::Unavailable(format!(
+                "{}: worker {} refused the loopback session: {}",
+                error.code, ep.instance, error.message
+            ))
+        }
+        other => CallError::Unavailable(format!(
+            "LOCAL_WORKER_UNAVAILABLE: worker {} at {}: {other}",
+            ep.instance, ep.address
+        )),
+    }
+}
+
+fn to_header(value: &impl Serialize) -> Result<Value, CallError> {
+    serde_json::to_value(value).map_err(|error| {
+        CallError::Unavailable(format!(
+            "INVALID_REQUEST: cannot encode the request: {error}"
+        ))
+    })
+}
+
+fn invalid_reply(op: &str, error: &dyn fmt::Display) -> CallError {
+    CallError::Remote(ErrorWire::coded(
+        "INVALID_REPLY",
+        format!("the worker's {op} reply does not parse: {error}"),
+    ))
+}
+
+/// A JSON reply: the response body when there is one, else the header.
+fn json_reply<T: DeserializeOwned>(reply: &SessionReply, op: &str) -> Result<T, CallError> {
+    if reply.body.is_empty() {
+        serde_json::from_value(reply.header.clone()).map_err(|error| invalid_reply(op, &error))
+    } else {
+        serde_json::from_slice(&reply.body).map_err(|error| invalid_reply(op, &error))
+    }
+}
+
+type ReadOutcome = Option<Result<(u64, Vec<u8>), CallError>>;
+
+#[derive(Default)]
+struct ReadState {
+    /// Next range index a reader takes.
+    next: usize,
+    /// Ranges handed to the consumer so far.
+    consumed: usize,
+    /// Results waiting for the consumer (`None`: skipped, never read).
+    results: BTreeMap<usize, ReadOutcome>,
+    skipped: HashSet<String>,
+    stop: bool,
+}
+
+struct ReadShared {
+    state: Mutex<ReadState>,
+    changed: Condvar,
+}
+
+/// One reader of [`SessionWorkerClient::read_stream`]: takes ranges in
+/// order while fewer than `window` are ahead of the consumer.
+fn read_loop(
+    client: &SessionWorkerClient,
+    route: &SyncRoute,
+    ranges: &[ReadRange],
+    window: usize,
+    deadline: Duration,
+    shared: &ReadShared,
+) {
+    loop {
+        let (index, skip) = {
+            let mut state = lock(&shared.state);
+            loop {
+                if state.stop || state.next >= ranges.len() {
+                    return;
+                }
+                if state.next < state.consumed + window {
+                    break;
+                }
+                state = shared
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            let index = state.next;
+            state.next += 1;
+            (index, state.skipped.contains(&ranges[index].hash))
+        };
+        let outcome = if skip {
+            None
+        } else {
+            let range = &ranges[index];
+            let header = ReadHeader {
+                route: route.clone(),
+                hash: range.hash.clone(),
+                offset: range.offset,
+                len: range.len,
+            };
+            Some(client.read(&header, deadline))
+        };
+        lock(&shared.state).results.insert(index, outcome);
+        shared.changed.notify_all();
+    }
+}
+
+enum Cached {
+    Client(Arc<SessionWorkerClient>),
+    /// The instance has no loopback sessions (its `UNSUPPORTED_OPERATION`).
+    Unsupported(String),
+}
+
+struct CacheEntry {
+    address: String,
+    cached: Cached,
+    used: u64,
+}
+
+fn sessions() -> &'static Mutex<HashMap<String, CacheEntry>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static CACHE_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// The loopback session client of worker instance `ep` (a per-instance
+/// cache; a worker instance never changes, so neither does whether it serves
+/// loopback sessions). A failed dial other than "no loopback sessions" is not
+/// remembered: the next call dials again.
+pub fn session_for(ep: &WorkerEndpoint) -> Result<Arc<SessionWorkerClient>, CallError> {
+    let tick = CACHE_CLOCK.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut map = lock(sessions());
+        if let Some(entry) = map.get_mut(&ep.instance)
+            && entry.address == ep.address
+        {
+            entry.used = tick;
+            match &entry.cached {
+                Cached::Client(client) => return Ok(client.clone()),
+                Cached::Unsupported(detail) => {
+                    return Err(CallError::Unavailable(detail.clone()));
+                }
+            }
+        }
+    }
+    let dialed = SessionWorkerClient::connect(ep);
+    let mut map = lock(sessions());
+    let mut evicted = Vec::new();
+    let result = match dialed {
+        Ok(client) => {
+            if let Some(entry) = map.get(&ep.instance)
+                && entry.address == ep.address
+                && let Cached::Client(existing) = &entry.cached
+            {
+                // Another caller dialed it meanwhile: keep that one.
+                client.close();
+                Ok(existing.clone())
+            } else {
+                evicted.extend(map.insert(
+                    ep.instance.clone(),
+                    CacheEntry {
+                        address: ep.address.clone(),
+                        cached: Cached::Client(client.clone()),
+                        used: tick,
+                    },
+                ));
+                Ok(client)
+            }
+        }
+        Err(error) if error.code() == "UNSUPPORTED_OPERATION" => {
+            evicted.extend(map.insert(
+                ep.instance.clone(),
+                CacheEntry {
+                    address: ep.address.clone(),
+                    cached: Cached::Unsupported(error.to_string()),
+                    used: tick,
+                },
+            ));
+            Err(error)
+        }
+        Err(error) => Err(error),
+    };
+    if map.len() > MAX_CACHED_SESSIONS {
+        let closed: Vec<String> = map
+            .iter()
+            .filter(|(_, entry)| match &entry.cached {
+                Cached::Client(client) => !client.is_open(),
+                Cached::Unsupported(_) => false,
+            })
+            .map(|(instance, _)| instance.clone())
+            .collect();
+        for instance in closed {
+            evicted.extend(map.remove(&instance));
+        }
+        while map.len() > MAX_CACHED_SESSIONS {
+            let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(instance, _)| instance.clone())
+            else {
+                break;
+            };
+            evicted.extend(map.remove(&oldest));
+        }
+    }
+    drop(map);
+    for entry in evicted {
+        if let Cached::Client(client) = entry.cached {
+            client.close();
+        }
+    }
+    result
+}
+
+/// Forgets (and closes) the cached session client of `instance`, if any.
+pub fn drop_session(instance: &str) {
+    let removed = lock(sessions()).remove(instance);
+    if let Some(CacheEntry {
+        cached: Cached::Client(client),
+        ..
+    }) = removed
+    {
+        client.close();
+    }
 }

@@ -1,39 +1,103 @@
 //! Owned by WP2.7 (interim, Wave 2) and WP3.3 (objects v3, Wave 3).
 //!
-//! One bulk lane of a peer (pool lanes 1..N-1), on the interim path of
-//! REVAMP_PLAN §6.5: for every repository shared with the peer (its catalog
-//! lists it, and a local folder holds it with sync enabled), worker
-//! `published-bulk-offer`, then peer `objects.exchange`, then worker
-//! `published-bulk-apply`. The pages are the legacy `bulk_sync::Page` (bulk
-//! protocol 1, hex parts) with `Lane{index, count}` taken from the lane's
-//! [`LaneSpec`], so objects keep exactly one owning lane (invariant 19).
-//! Bulk lanes carry no metadata: they never stage, activate or acknowledge
-//! events (invariant 18).
+//! One bulk lane of a peer (pool lanes 1..N-1): objects v3 (REVAMP_PLAN
+//! §6.4), the dialer side. The acceptor side is
+//! [`super::inbound_objects`]; both share the data plane in this file
+//! ([`Sink`], the worker reads of [`worker_client`], the allotment rule).
 //!
-//! The lane is scheduled by the same engine as the control lane
-//! ([`super::scheduler`]): per-(peer, repo, `objects.exchange`) keys, at
-//! most `REPOS_PER_LANE` (2) exchanges at once and one per repository, a
-//! per-key backoff by class, and no counting of Contention or of folders
-//! that are not serving. After an exchange that moved object bytes the key
-//! runs again after 10 ms; otherwise it waits `sync_interval_ms`, or a
-//! trigger: the local feed tip or content generation moved (new objects to
-//! want or offer), or the peer's published tip or content counters moved.
+//! # Scheduling
 //!
-//! **Wire shape.** Request: header `{repo, lane}`, body the JSON page.
-//! Reply: the JSON page (`reply_to` = our request), as the body or streamed
-//! as body CHUNK frames (`hash: None`, in offset order) before the RESPONSE.
-//! A request body must fit the session's per-op body limit
-//! (`protocol::max_body`), 16 MiB for `objects.exchange` since WP2.INT
-//! applied CCR-WP2.7-1: a larger page fails its exchange with
-//! `WS_MESSAGE_TOO_LARGE`, charged to its key. A plain reply body has the
-//! same limit on the acceptor's side; a streamed reply does not.
+//! A lane runs two schedulers of the shared engine ([`super::scheduler`]),
+//! one per direction, each with its own per-(peer, repo, op) keys, slots
+//! (`REPOS_PER_LANE` = 2 repositories at once), backoff by class, and claims:
 //!
-//! **Status.** `ExchangeStarted`/`ExchangeFinished{op: objects.exchange}` on
-//! status lane `index + 1`, with the object bytes of each direction and the
-//! objects completed: installed here (`objects_down`), or sent in full and
-//! listed as available by the peer's reply (`objects_up`).
+//! * **download** (`objects.pull`, scope `objects.pull#<lane>`): D pulls from A;
+//! * **upload** (`objects.push`, scope `objects.push#<lane>`): D pushes to A.
 //!
-//! WP3.3 replaces this file with objects v3 (§6.4).
+//! So a stalled push never holds a pull of the same lane, and a failing
+//! direction backs off alone. Both directions run on the lane's one bulk
+//! session; the peer runs at most `PEER_CALLS` (2, its per-session exchange
+//! slots, `limits::BULK_HANDLERS`) of our `objects.*` calls at once, so the
+//! lane admits at most that many ([`LaneOptions::peer_calls`]): a first pull
+//! and a push wait their turn in order; a second (pipelined) pull is only
+//! taken when nobody waits. A key's round ends after [`ROUND_CAP`] (10 s)
+//! so other repositories get their turn; one that moved data runs again
+//! after [`CONTENT_YIELD`].
+//!
+//! Triggers: the local feed tip, the remote tip and content counters, and
+//! the local `generations.sync` (it moves when the metadata exchange stages
+//! events: their objects are wanted **before activation**, because the
+//! worker wants objects referenced by validly staged events too). The upload
+//! direction ignores its own echo (`absorb`).
+//!
+//! # Download round (one key)
+//!
+//! 1. Worker `objects.want{route, lane, max_items 256, max_bytes 16 MiB,
+//!    session}`: wanted objects owned by the lane, with their durable spool
+//!    offsets. The lease session alternates between two ids per lane
+//!    ([`pull_lease`]), so a want issued while a pull is in flight never
+//!    returns that pull's objects (the worker excludes objects leased by
+//!    another session), and both ids are stable across reconnects: after a
+//!    connection loss the next want returns the object again, with its
+//!    durable offset, and the transfer resumes there (never a blind replay).
+//!    Objects owned by another lane, objects in their per-object backoff, and
+//!    objects already begun in this round are left out.
+//! 2. Peer `objects.pull{repo, sender, receiver, lane, items, budget}`: the
+//!    lane's **window** (16 MiB, shared by its keys) bounds what is in
+//!    flight: a pull reserves its budget, and the budget comes back as its
+//!    bytes are written durably (or dropped) and, at its end, whatever it did
+//!    not deliver. At most 2 pulls are in flight; the second is issued when
+//!    half the window is free again ("re-pull at half"). A large object is
+//!    split across consecutive pulls; their chunks may interleave on the
+//!    wire, and the sink orders them.
+//! 3. Each CHUNK `{hash, offset, total, last}` goes to the [`Sink`]: at most
+//!    `INFLIGHT_WRITES` (4) worker `objects.write` calls in flight, one per
+//!    object at a time, each at the object's durable offset, ≤ 1 MiB, tiny
+//!    objects batched into one call. A write's `durable_offset` is only
+//!    trusted once it is returned (invariant 2).
+//! 4. Per-object results: a worker hash mismatch (`CorruptAtSource`) is
+//!    reported to the peer (`objects.report{CORRUPT_AT_SOURCE}`), and that
+//!    object backs off for that source (30 s → 1 h); one bad object never
+//!    stops the others. `ObjectError` per failed object; a completed object
+//!    that had failed before resolves its error.
+//!
+//! # Upload round (one key)
+//!
+//! Peer `objects.wants` (the peer's worker leases what it wants to this lane)
+//! → our worker `objects.read` (≤ 4 in flight, authorization is the worker's)
+//! → peer `objects.push` (CHUNK stream, ≤ 16 MiB per push) → per-object
+//! results. A `CorruptAtSource` result makes our worker re-verify its copy
+//! (`objects.report`).
+//!
+//! # Wire rules (both sides)
+//!
+//! * Requests are the JSON header (`ObjectsPull`, `ObjectsWantsRequest`,
+//!   `ObjectsPush`, `ObjectsReport`); replies are a JSON body, or the header
+//!   when there is no body ([`super::meta_exchange`]'s `body_of`).
+//! * **Allotment** ([`allot`]): the items of a pull or push cover, in order,
+//!   `[offset, offset + min(size − offset, budget left))`; an item's share is
+//!   fixed by the list whether or not it is served. A zero-size object is one
+//!   empty chunk. So both sides know exactly which bytes a request covers.
+//!
+//! # Status
+//!
+//! `ExchangeStarted`/`ExchangeFinished{op: objects.pull|objects.push}` per
+//! pull or push on status lane `index + 1`, with the real duration (from the
+//! request to the last write of its bytes), the bytes moved, and the objects
+//! **completed** (installed here for a pull, `Completed` in the peer's
+//! results for a push); `ObjectError`/`Resolved` per object.
+//!
+//! # Interim fallback (§6.5)
+//!
+//! A local worker without loopback sessions or objects ops, or a peer that
+//! answers `UNSUPPORTED_OPERATION` (a Wave 2 build), puts the key on the
+//! interim path: worker `published-bulk-offer` → peer `objects.exchange` →
+//! worker `published-bulk-apply` (legacy `bulk_sync::Page`, hex parts), run
+//! by the download scheduler for both directions (op `objects.exchange`);
+//! v3 is tried again when the key resets (new worker instance or remote
+//! replica) or after [`INTERIM_RECHECK`]. [`run_bulk_lane_with`] runs the
+//! interim path alone, as Wave 2 did. WP3.INT can delete the fallback once
+//! every worker serves objects v3 (CCR-WP3.3-2).
 use super::{
     Config,
     meta_exchange::{body_of, invalid, parse},
@@ -41,22 +105,40 @@ use super::{
         DriveOptions, ExchangeError, Finished, Job, Next, Report, Signals, Target, check_session,
         drive, refuse, short, sync_interval,
     },
+    worker_client::{self, ReadFlow, ReadRange, SessionWorkerClient},
 };
 use crate::{
     bulk_sync::{self, Page},
     model::{
-        orchestrator::{CallError, Ctx, FolderView, PeerContext, PublishedEntry},
-        protocol::{LaneRole, LaneSpec, deadlines, objects::REPOS_PER_LANE, ops},
+        errors::{ErrorClass, ErrorWire, Scope},
+        orchestrator::{CallError, Ctx, FolderView, PeerContext, PublishedEntry, limits},
+        protocol::{
+            LaneRole, LaneSpec, deadlines,
+            frame::ChunkHeader,
+            objects::{
+                INFLIGHT_PULLS, INFLIGHT_READS, INFLIGHT_WRITES, MAX_READ_LEN, MAX_WANT_ITEMS,
+                ObjectOutcome, ObjectsPull, ObjectsPush, ObjectsReport, ObjectsResult,
+                ObjectsWantsReply, ObjectsWantsRequest, PULL_BUDGET_BYTES, REPOS_PER_LANE,
+                WantHeader, WantItem, WriteItem, WriteResult,
+            },
+            ops,
+        },
+        status::{Direction, StatusEvent},
     },
     paired_sync::SyncRoute,
     session::{self, Priority},
-    util::{cancel::Cancel, lock::lock},
+    util::{backoff::Backoff, cancel::Cancel, lock::lock, log::event},
 };
 use serde_json::json;
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-    time::Duration,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, PoisonError,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 /// Worker ops of the interim path (served by `bulk_sync::worker_control`).
@@ -71,6 +153,2670 @@ pub mod worker_ops {
 pub const WORKER_DEADLINE: Duration = Duration::from_secs(30);
 /// A key whose exchange moved object bytes runs again after this.
 pub const CONTENT_YIELD: Duration = Duration::from_millis(10);
+/// The download window of a lane: object bytes requested from the peer and
+/// not yet written durably (or dropped) by the local worker.
+pub const WINDOW_BYTES: u64 = PULL_BUDGET_BYTES;
+/// Object bytes one push carries at most.
+pub const PUSH_BUDGET_BYTES: u64 = PULL_BUDGET_BYTES;
+/// `objects.*` calls a lane runs on the peer at once: the acceptor's
+/// exchange slots per bulk session (`limits::BULK_HANDLERS`; a third call
+/// would be refused `BUSY`). See CCR-WP3.3-1.
+pub const PEER_CALLS: usize = limits::BULK_HANDLERS;
+/// A key's round ends after this, so the lane's other repositories get a
+/// turn (it runs again after [`CONTENT_YIELD`] when it moved data).
+pub const ROUND_CAP: Duration = Duration::from_secs(10);
+/// A key on the interim path tries objects v3 again after this (or at once
+/// when the key resets).
+pub const INTERIM_RECHECK: Duration = Duration::from_secs(600);
+/// An acceptor stops reading a push while this much is waiting to be
+/// written (the session then holds the dialer back).
+pub const PUSH_BUFFERED_BYTES: u64 = 8 * 1024 * 1024;
+/// An exchange served for the peer sends a PROGRESS this often while it
+/// waits on its worker, so the dialer's idle deadline never runs out.
+pub const KEEPALIVE: Duration = Duration::from_secs(5);
+/// Bytes per worker `objects.write` call (the op's body bound).
+const MAX_WRITE_BYTES: usize = MAX_READ_LEN as usize;
+/// Objects per worker `objects.write` call.
+const MAX_WRITE_ITEMS: usize = MAX_WANT_ITEMS;
+/// Longest wait of a round's event loop before it re-checks its state.
+const EVENT_WAIT: Duration = Duration::from_millis(100);
+/// Per-object failures remembered before expired ones are pruned.
+const BACKOFF_PRUNE: usize = 16 * 1024;
+
+// ---------------------------------------------------------------------------
+// Options and statistics
+
+/// Options of a v3 bulk lane.
+#[derive(Clone, Debug)]
+pub struct LaneOptions {
+    /// The download scheduler (`objects.pull` keys).
+    pub download: DriveOptions,
+    /// The upload scheduler (`objects.push` keys).
+    pub upload: DriveOptions,
+    /// See [`WINDOW_BYTES`].
+    pub window_bytes: u64,
+    /// Pulls in flight per lane (2).
+    pub pulls: usize,
+    /// See [`PEER_CALLS`].
+    pub peer_calls: usize,
+    /// Repositories with rounds on the lane at once, both directions of one
+    /// repository counting once (`REPOS_PER_LANE`, 2).
+    pub repos: usize,
+    /// Worker `objects.write` calls in flight per round (4).
+    pub writes: usize,
+    /// Worker `objects.read` calls in flight per push (4).
+    pub reads: usize,
+    /// Peer `objects.pull`/`objects.push` idle deadline (30 s).
+    pub idle: Duration,
+    /// See [`ROUND_CAP`].
+    pub round: Duration,
+    /// The interim path (fallback).
+    pub interim: BulkOptions,
+    /// Where to count what the lane does (tests and diagnostics).
+    pub stats: Option<Arc<LaneStats>>,
+}
+
+impl LaneOptions {
+    /// The frozen limits of §6.4 and the configured interval.
+    pub fn for_config(config: &Config) -> Self {
+        let interval = sync_interval(config);
+        Self {
+            download: DriveOptions::new(REPOS_PER_LANE, interval),
+            upload: DriveOptions::new(REPOS_PER_LANE, interval),
+            window_bytes: WINDOW_BYTES,
+            pulls: INFLIGHT_PULLS,
+            peer_calls: PEER_CALLS,
+            repos: REPOS_PER_LANE,
+            writes: INFLIGHT_WRITES,
+            reads: INFLIGHT_READS,
+            idle: deadlines::OBJECTS_IDLE,
+            round: ROUND_CAP,
+            interim: BulkOptions::for_config(config),
+            stats: None,
+        }
+    }
+}
+
+/// What a lane did (counters only grow; `*_peak` are maxima).
+#[derive(Debug, Default)]
+pub struct LaneStats {
+    /// Download window bytes reserved now / at most.
+    pub window_used: AtomicU64,
+    pub window_peak: AtomicU64,
+    /// Peer `objects.*` calls in flight now / at most.
+    pub peer_calls: AtomicU64,
+    pub peer_calls_peak: AtomicU64,
+    /// Pulls in flight now / at most, and issued.
+    pub pulls_in_flight: AtomicU64,
+    pub pulls_peak: AtomicU64,
+    pub pulls: AtomicU64,
+    pub pushes: AtomicU64,
+    /// Object bytes received by pulls, written durably here, sent by pushes.
+    pub bytes_pulled: AtomicU64,
+    pub bytes_written: AtomicU64,
+    pub bytes_pushed: AtomicU64,
+    /// Objects installed here / completed at the peer.
+    pub objects_down: AtomicU64,
+    pub objects_up: AtomicU64,
+    /// Peer `objects.report` calls sent.
+    pub reports: AtomicU64,
+    /// Rounds run on objects v3, and interim exchanges.
+    pub v3_rounds: AtomicU64,
+    pub interim_exchanges: AtomicU64,
+    /// Repositories with a round on the lane now / at most.
+    pub repos: AtomicU64,
+    pub repos_peak: AtomicU64,
+}
+
+fn bump(counter: &AtomicU64, by: u64) -> u64 {
+    counter.fetch_add(by, Ordering::Relaxed) + by
+}
+
+fn peak(counter: &AtomicU64, value: u64) {
+    counter.fetch_max(value, Ordering::Relaxed);
+}
+
+impl LaneStats {
+    pub fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wire helpers shared with `inbound_objects`
+
+/// The byte range `[start, end)` each item of a pull or push covers (module
+/// docs, "Allotment"): items in order, each from its offset, until `budget`
+/// is spent; an item's share does not depend on whether it is served.
+pub fn allot(items: &[WantItem], budget: u64) -> Vec<(u64, u64)> {
+    let mut left = budget;
+    items
+        .iter()
+        .map(|item| {
+            let take = item.size.saturating_sub(item.offset).min(left);
+            left -= take;
+            (item.offset, item.offset + take)
+        })
+        .collect()
+}
+
+/// The worker reads of `items` under `spans` ([`allot`]): ≤ 1 MiB each, in
+/// order; one empty read for a zero-size object, none for an item whose span
+/// is empty otherwise.
+pub fn read_ranges(items: &[WantItem], spans: &[(u64, u64)]) -> Vec<ReadRange> {
+    let mut ranges = Vec::new();
+    for (item, &(start, end)) in items.iter().zip(spans) {
+        if item.size == 0 && start == 0 {
+            ranges.push(ReadRange {
+                hash: item.hash.clone(),
+                offset: 0,
+                len: 0,
+            });
+            continue;
+        }
+        let mut offset = start;
+        while offset < end {
+            let len = (end - offset).min(MAX_READ_LEN);
+            ranges.push(ReadRange {
+                hash: item.hash.clone(),
+                offset,
+                len,
+            });
+            offset += len;
+        }
+    }
+    ranges
+}
+
+/// Whether an item covers a byte or is a zero-size object (it is sent).
+pub fn covered(item: &WantItem, span: (u64, u64)) -> bool {
+    span.1 > span.0 || (item.size == 0 && item.offset == 0)
+}
+
+/// The lease session of a dialer's pulls on `lane` of `peer` (`slot` 0 or
+/// 1): stable across reconnects, so a resumed transfer finds its own lease.
+pub fn pull_lease(peer: &str, lane: LaneSpec, slot: u64) -> String {
+    format!(
+        "pull:{peer}:{}/{}:{}",
+        lane.index,
+        lane.count,
+        if slot.is_multiple_of(2) { 'a' } else { 'b' }
+    )
+}
+
+/// The lease session of the pushes an acceptor serves for `peer` on `lane`
+/// (its `objects.wants` takes the leases, its writes use them).
+pub fn push_lease(peer: &str, lane: LaneSpec) -> String {
+    format!("push:{peer}:{}/{}", lane.index, lane.count)
+}
+
+/// Whether an error says "objects v3 is not served here" (a Wave 2 worker or
+/// peer): the interim path takes over.
+pub fn is_unsupported(error: &CallError) -> bool {
+    error.code() == "UNSUPPORTED_OPERATION"
+}
+
+/// The outcome a failed worker read stands for.
+pub fn read_outcome(error: &CallError) -> ObjectOutcome {
+    match error.code().as_str() {
+        "NOT_PERMITTED" | "UNAUTHORIZED_OBJECT" => ObjectOutcome::NotPermitted,
+        "NOT_AVAILABLE" | "OFFLINE_OBJECT_MISSING" | "CONTENT_UNAVAILABLE" => {
+            ObjectOutcome::NotAvailable
+        }
+        "CORRUPT_AT_SOURCE" => ObjectOutcome::CorruptAtSource,
+        "SIZE_MISMATCH" => ObjectOutcome::SizeMismatch,
+        _ => ObjectOutcome::Failed(error.to_wire()),
+    }
+}
+
+/// Whether an outcome is a per-object failure worth a backoff and an
+/// `ObjectError` (not success, not Contention).
+pub fn is_failure(outcome: &ObjectOutcome) -> bool {
+    match outcome {
+        ObjectOutcome::Completed
+        | ObjectOutcome::Progressed { .. }
+        | ObjectOutcome::Skipped
+        | ObjectOutcome::InFlightElsewhere => false,
+        ObjectOutcome::Failed(error) => error.class != ErrorClass::Contention,
+        _ => true,
+    }
+}
+
+/// The wire error of a failed outcome.
+pub fn outcome_error(hash: &str, outcome: &ObjectOutcome, detail: &str) -> Option<ErrorWire> {
+    match outcome {
+        ObjectOutcome::Failed(error) => Some(error.clone()),
+        other => other
+            .code()
+            .map(|code| ErrorWire::coded(code, format!("object {hash}: {detail}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-object backoff (§8 objects: 30 s → 1 h), per source
+
+struct Held {
+    backoff: Backoff,
+    until: Instant,
+    code: String,
+}
+
+fn held() -> &'static Mutex<HashMap<String, Held>> {
+    static HELD: OnceLock<Mutex<HashMap<String, Held>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A per-object backoff key: (local installation, peer, repository,
+/// direction, hash).
+pub(crate) fn object_key(local: &str, peer: &str, repo: &str, up: bool, hash: &str) -> String {
+    let direction = if up { "up" } else { "down" };
+    format!("{local}\u{1f}{peer}\u{1f}{repo}\u{1f}{direction}\u{1f}{hash}")
+}
+
+/// Whether `key` is inside its backoff.
+pub(crate) fn object_blocked(key: &str) -> bool {
+    lock(held())
+        .get(key)
+        .is_some_and(|held| Instant::now() < held.until)
+}
+
+/// Records a failure of `key`; returns the delay before it is tried again.
+pub(crate) fn object_failed(key: &str, code: &str) -> Duration {
+    let now = Instant::now();
+    let mut map = lock(held());
+    if map.len() >= BACKOFF_PRUNE {
+        map.retain(|_, held| now < held.until + Duration::from_secs(3600));
+    }
+    let held = map.entry(key.to_owned()).or_insert_with(|| Held {
+        backoff: Backoff::objects(),
+        until: now,
+        code: String::new(),
+    });
+    let delay = held.backoff.failure(now);
+    held.until = now + delay;
+    held.code = code.to_owned();
+    delay
+}
+
+/// `key` completed: forgets its failures; returns the code of the failure
+/// it had, if any (to resolve in the hub).
+pub(crate) fn object_completed(key: &str) -> Option<String> {
+    lock(held()).remove(key).map(|held| held.code)
+}
+
+// ---------------------------------------------------------------------------
+// Window and peer-call slots of a lane
+
+/// Waiters served in arrival order (a releasing thread cannot jump the
+/// queue by re-acquiring at once).
+#[derive(Default)]
+struct Queue {
+    next: u64,
+    waiting: VecDeque<u64>,
+}
+
+impl Queue {
+    fn join(&mut self) -> u64 {
+        let ticket = self.next;
+        self.next += 1;
+        self.waiting.push_back(ticket);
+        ticket
+    }
+
+    fn first(&self, ticket: u64) -> bool {
+        self.waiting.front() == Some(&ticket)
+    }
+
+    fn leave(&mut self, ticket: u64) {
+        self.waiting.retain(|waiting| *waiting != ticket);
+    }
+}
+
+/// A byte budget shared by a lane's pulls (module docs).
+pub(crate) struct Window {
+    capacity: u64,
+    state: Mutex<WindowState>,
+    changed: Condvar,
+    stats: Option<Arc<LaneStats>>,
+}
+
+#[derive(Default)]
+struct WindowState {
+    used: u64,
+    queue: Queue,
+}
+
+impl Window {
+    pub(crate) fn new(capacity: u64, stats: Option<Arc<LaneStats>>) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(WindowState::default()),
+            changed: Condvar::new(),
+            stats,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    fn take(&self, state: &mut WindowState, min: u64, max: u64) -> Option<u64> {
+        let free = self.capacity - state.used.min(self.capacity);
+        let min = min.min(self.capacity);
+        if free < min {
+            return None;
+        }
+        let take = free.min(max.max(min));
+        state.used += take;
+        if let Some(stats) = &self.stats {
+            stats.window_used.store(state.used, Ordering::Relaxed);
+            peak(&stats.window_peak, state.used);
+        }
+        Some(take)
+    }
+
+    /// Waits (in turn with other waiters) until `min` bytes are free and
+    /// takes up to `max`; `None` once `stop` holds.
+    pub(crate) fn reserve(&self, min: u64, max: u64, stop: &dyn Fn() -> bool) -> Option<u64> {
+        let mut state = lock(&self.state);
+        let ticket = state.queue.join();
+        let taken = loop {
+            if stop() {
+                break None;
+            }
+            if state.queue.first(ticket)
+                && let Some(taken) = self.take(&mut state, min, max)
+            {
+                break Some(taken);
+            }
+            state = self
+                .changed
+                .wait_timeout(state, EVENT_WAIT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        };
+        state.queue.leave(ticket);
+        drop(state);
+        self.changed.notify_all();
+        taken
+    }
+
+    /// Takes up to `max` if `min` bytes are free and nobody waits.
+    pub(crate) fn try_reserve(&self, min: u64, max: u64) -> Option<u64> {
+        let mut state = lock(&self.state);
+        if !state.queue.waiting.is_empty() {
+            return None;
+        }
+        self.take(&mut state, min, max)
+    }
+
+    pub(crate) fn release(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = lock(&self.state);
+        state.used = state.used.saturating_sub(bytes);
+        if let Some(stats) = &self.stats {
+            stats.window_used.store(state.used, Ordering::Relaxed);
+        }
+        drop(state);
+        self.changed.notify_all();
+    }
+}
+
+/// The peer `objects.*` calls a lane may have in flight (module docs).
+pub(crate) struct Slots {
+    capacity: usize,
+    state: Mutex<SlotsState>,
+    changed: Condvar,
+    stats: Option<Arc<LaneStats>>,
+}
+
+#[derive(Default)]
+struct SlotsState {
+    used: usize,
+    queue: Queue,
+}
+
+/// One peer call slot, given back when dropped.
+pub(crate) struct Slot(Arc<Slots>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut state = lock(&self.0.state);
+        state.used = state.used.saturating_sub(1);
+        if let Some(stats) = &self.0.stats {
+            stats.peer_calls.store(state.used as u64, Ordering::Relaxed);
+        }
+        drop(state);
+        self.0.changed.notify_all();
+    }
+}
+
+impl Slots {
+    pub(crate) fn new(capacity: usize, stats: Option<Arc<LaneStats>>) -> Arc<Self> {
+        Arc::new(Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(SlotsState::default()),
+            changed: Condvar::new(),
+            stats,
+        })
+    }
+
+    fn grant(self: &Arc<Self>, state: &mut SlotsState) -> Slot {
+        state.used += 1;
+        if let Some(stats) = &self.stats {
+            stats.peer_calls.store(state.used as u64, Ordering::Relaxed);
+            peak(&stats.peer_calls_peak, state.used as u64);
+        }
+        Slot(self.clone())
+    }
+
+    /// Waits for a slot in turn; `None` once `stop` holds.
+    pub(crate) fn acquire(self: &Arc<Self>, stop: &dyn Fn() -> bool) -> Option<Slot> {
+        let mut state = lock(&self.state);
+        let ticket = state.queue.join();
+        let slot = loop {
+            if stop() {
+                break None;
+            }
+            if state.queue.first(ticket) && state.used < self.capacity {
+                break Some(self.grant(&mut state));
+            }
+            state = self
+                .changed
+                .wait_timeout(state, EVENT_WAIT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        };
+        state.queue.leave(ticket);
+        drop(state);
+        self.changed.notify_all();
+        slot
+    }
+
+    /// A slot if one is free and nobody waits.
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<Slot> {
+        let mut state = lock(&self.state);
+        (state.queue.waiting.is_empty() && state.used < self.capacity)
+            .then(|| self.grant(&mut state))
+    }
+}
+
+/// At most `capacity` repositories have rounds on a lane at once (both
+/// directions of a repository count once); waiting repositories enter in
+/// order, before a repository that just left comes back.
+pub(crate) struct RepoGate {
+    capacity: usize,
+    state: Mutex<RepoGateState>,
+    changed: Condvar,
+    stats: Option<Arc<LaneStats>>,
+}
+
+#[derive(Default)]
+struct RepoGateState {
+    active: HashMap<String, usize>,
+    waiting: VecDeque<String>,
+}
+
+/// A repository's turn on a lane, given back when dropped.
+pub(crate) struct RepoTurn<'a> {
+    gate: &'a RepoGate,
+    repo: String,
+}
+
+impl RepoGate {
+    pub(crate) fn new(capacity: usize, stats: Option<Arc<LaneStats>>) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            state: Mutex::new(RepoGateState::default()),
+            changed: Condvar::new(),
+            stats,
+        }
+    }
+
+    /// Waits for `repo`'s turn; `None` once `stop` holds.
+    pub(crate) fn enter(&self, repo: &str, stop: &dyn Fn() -> bool) -> Option<RepoTurn<'_>> {
+        let mut state = lock(&self.state);
+        let mut queued = false;
+        let entered = loop {
+            if stop() {
+                break false;
+            }
+            let first = state.waiting.front().is_none_or(|front| front == repo);
+            if state.active.contains_key(repo) || (state.active.len() < self.capacity && first) {
+                break true;
+            }
+            if !queued {
+                state.waiting.push_back(repo.to_owned());
+                queued = true;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, EVENT_WAIT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        };
+        if queued && let Some(index) = state.waiting.iter().position(|name| name == repo) {
+            state.waiting.remove(index);
+        }
+        if !entered {
+            drop(state);
+            self.changed.notify_all();
+            return None;
+        }
+        *state.active.entry(repo.to_owned()).or_default() += 1;
+        if let Some(stats) = &self.stats {
+            let count = state.active.len() as u64;
+            stats.repos.store(count, Ordering::Relaxed);
+            peak(&stats.repos_peak, count);
+        }
+        drop(state);
+        self.changed.notify_all();
+        Some(RepoTurn {
+            gate: self,
+            repo: repo.to_owned(),
+        })
+    }
+}
+
+impl Drop for RepoTurn<'_> {
+    fn drop(&mut self) {
+        let mut state = lock(&self.gate.state);
+        if let Some(count) = state.active.get_mut(&self.repo) {
+            *count -= 1;
+            if *count == 0 {
+                state.active.remove(&self.repo);
+            }
+        }
+        if let Some(stats) = &self.gate.stats {
+            stats
+                .repos
+                .store(state.active.len() as u64, Ordering::Relaxed);
+        }
+        drop(state);
+        self.gate.changed.notify_all();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sink: received object streams → local worker writes
+
+/// What a [`Sink`] reports, from the thread that settled it (never under
+/// the sink's lock).
+#[derive(Clone, Debug)]
+pub(crate) enum SinkEvent {
+    /// `bytes` offered under `tag` left the sink: written durably
+    /// (`written`), or dropped.
+    Released { tag: u64, bytes: u64, written: bool },
+    /// `hash` reached its final state in this sink. `call` is set when the
+    /// whole write call failed (not an outcome of this object).
+    Settled {
+        hash: String,
+        tag: u64,
+        outcome: ObjectOutcome,
+        call: bool,
+    },
+}
+
+pub(crate) type SinkHook = Box<dyn Fn(SinkEvent) + Send + Sync>;
+
+/// How a [`Sink`] writes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SinkOptions {
+    /// Write calls in flight (4).
+    pub writers: usize,
+    /// Bytes per write call (1 MiB).
+    pub max_write: usize,
+    /// Objects per write call (256).
+    pub max_items: usize,
+    pub deadline: Duration,
+}
+
+impl Default for SinkOptions {
+    fn default() -> Self {
+        Self {
+            writers: INFLIGHT_WRITES,
+            max_write: MAX_WRITE_BYTES,
+            max_items: MAX_WRITE_ITEMS,
+            deadline: worker_client::deadlines::WRITE,
+        }
+    }
+}
+
+/// The final state of one object in a finished [`Sink`].
+#[derive(Clone, Debug)]
+pub(crate) struct SinkResult {
+    /// The settled outcome (`None`: never settled; see `durable`).
+    pub outcome: Option<ObjectOutcome>,
+    /// The worker's durable offset as last reported (or the start offset).
+    pub durable: u64,
+    /// Bytes written durably through this sink.
+    pub written: u64,
+}
+
+/// Received object bytes on their way into the local worker (`objects.write`
+/// with the lease of the session that wanted them): ordered per object (out
+/// of order ranges wait in `pending`), at most `writers` calls in flight and
+/// one per object, tiny objects batched. Every byte offered is released
+/// exactly once ([`SinkEvent::Released`]).
+pub(crate) struct Sink {
+    inner: Arc<SinkInner>,
+    writers: Vec<thread::JoinHandle<()>>,
+}
+
+struct SinkInner {
+    client: Arc<SessionWorkerClient>,
+    route: SyncRoute,
+    options: SinkOptions,
+    state: Mutex<SinkState>,
+    changed: Condvar,
+    hook: SinkHook,
+}
+
+#[derive(Default)]
+struct SinkState {
+    objects: HashMap<String, SinkObject>,
+    ready: VecDeque<String>,
+    writing: usize,
+    buffered: u64,
+    closing: bool,
+    fatal: Option<CallError>,
+}
+
+struct SinkObject {
+    lease: String,
+    total: u64,
+    /// Next byte expected in `buf` (the end of the contiguous data).
+    next: u64,
+    /// Nothing at or after this is accepted (a pull ended short).
+    limit: u64,
+    durable: u64,
+    written: u64,
+    /// Contiguous data `[next − buf_len, next)` as received pieces (tag,
+    /// bytes), in order: a write takes whole pieces, so nothing is moved.
+    buf: VecDeque<(u64, Vec<u8>)>,
+    buf_len: usize,
+    /// Ranges ahead of `next`: offset → (tag, bytes).
+    pending: BTreeMap<u64, (u64, Vec<u8>)>,
+    /// The empty write of a zero-size object is due.
+    empty_due: bool,
+    writing: bool,
+    queued: bool,
+    flush: bool,
+    settled: Option<ObjectOutcome>,
+    last_tag: u64,
+}
+
+/// One write call being made.
+struct Batch {
+    lease: String,
+    items: Vec<WriteItem>,
+    body: Vec<u8>,
+    /// Per item: its tags (tag, bytes) in order.
+    tags: Vec<Vec<(u64, u64)>>,
+}
+
+impl SinkState {
+    fn release(&mut self, tag: u64, bytes: u64, written: bool, events: &mut Vec<SinkEvent>) {
+        self.buffered = self.buffered.saturating_sub(bytes);
+        if bytes > 0 {
+            events.push(SinkEvent::Released {
+                tag,
+                bytes,
+                written,
+            });
+        }
+    }
+
+    /// Drops whatever `hash` still holds (buffered and pending data).
+    fn drop_data(&mut self, hash: &str, events: &mut Vec<SinkEvent>) {
+        let Some(object) = self.objects.get_mut(hash) else {
+            return;
+        };
+        let tags: Vec<(u64, u64)> = object
+            .buf
+            .drain(..)
+            .map(|(tag, bytes)| (tag, bytes.len() as u64))
+            .collect();
+        object.buf_len = 0;
+        object.empty_due = false;
+        let pending: Vec<(u64, u64)> = std::mem::take(&mut object.pending)
+            .into_values()
+            .map(|(tag, bytes)| (tag, bytes.len() as u64))
+            .collect();
+        for (tag, bytes) in tags.into_iter().chain(pending) {
+            self.release(tag, bytes, false, events);
+        }
+    }
+
+    fn settle(
+        &mut self,
+        hash: &str,
+        outcome: ObjectOutcome,
+        call: bool,
+        events: &mut Vec<SinkEvent>,
+    ) {
+        self.drop_data(hash, events);
+        let Some(object) = self.objects.get_mut(hash) else {
+            return;
+        };
+        if object.settled.is_some() {
+            return;
+        }
+        object.settled = Some(outcome.clone());
+        events.push(SinkEvent::Settled {
+            hash: hash.to_owned(),
+            tag: object.last_tag,
+            outcome,
+            call,
+        });
+    }
+
+    fn dispatchable(&self, object: &SinkObject, max_write: usize) -> bool {
+        if object.writing || object.settled.is_some() {
+            return false;
+        }
+        object.empty_due
+            || (object.buf_len > 0
+                && (object.buf_len >= max_write
+                    || object.next == object.total
+                    || object.flush
+                    || self.closing))
+    }
+
+    fn enqueue(&mut self, hash: &str, max_write: usize) -> bool {
+        let Some(object) = self.objects.get(hash) else {
+            return false;
+        };
+        if object.queued || !self.dispatchable(object, max_write) {
+            return false;
+        }
+        if let Some(object) = self.objects.get_mut(hash) {
+            object.queued = true;
+        }
+        self.ready.push_back(hash.to_owned());
+        true
+    }
+
+    /// Appends `bytes` at `offset == next`, then whatever pending ranges
+    /// became contiguous (overlapping ones are dropped).
+    fn append(&mut self, hash: &str, tag: u64, bytes: Vec<u8>, events: &mut Vec<SinkEvent>) {
+        let mut dropped = Vec::new();
+        if let Some(object) = self.objects.get_mut(hash) {
+            let mut piece = Some((tag, bytes));
+            while let Some((tag, bytes)) = piece.take() {
+                let len = bytes.len() as u64;
+                object.next += len;
+                object.last_tag = tag;
+                if len > 0 {
+                    object.buf_len += bytes.len();
+                    object.buf.push_back((tag, bytes));
+                }
+                while let Some(entry) = object.pending.first_entry() {
+                    let offset = *entry.key();
+                    if offset > object.next {
+                        break;
+                    }
+                    let (tag, bytes) = entry.remove();
+                    if offset == object.next {
+                        piece = Some((tag, bytes));
+                        break;
+                    }
+                    dropped.push((tag, bytes.len() as u64));
+                }
+            }
+        }
+        for (tag, bytes) in dropped {
+            self.release(tag, bytes, false, events);
+        }
+    }
+
+    /// The next write call: ready objects of one lease, ≤ `max_write`
+    /// bytes and ≤ `max_items` objects.
+    fn take_batch(&mut self, options: &SinkOptions) -> Option<Batch> {
+        let mut lease: Option<String> = None;
+        let mut batch = Batch {
+            lease: String::new(),
+            items: Vec::new(),
+            body: Vec::new(),
+            tags: Vec::new(),
+        };
+        let mut later = Vec::new();
+        while let Some(hash) = self.ready.pop_front() {
+            let max_write = options.max_write;
+            let Some(object) = self.objects.get(&hash) else {
+                continue;
+            };
+            if !self.dispatchable(object, max_write) {
+                if let Some(object) = self.objects.get_mut(&hash) {
+                    object.queued = false;
+                }
+                continue;
+            }
+            if lease.as_ref().is_some_and(|lease| *lease != object.lease) {
+                later.push(hash);
+                continue;
+            }
+            let room = max_write.saturating_sub(batch.body.len());
+            if room == 0 || (room < object.buf_len && !batch.items.is_empty()) {
+                later.push(hash);
+                break;
+            }
+            let Some(object) = self.objects.get_mut(&hash) else {
+                continue;
+            };
+            object.queued = false;
+            object.writing = true;
+            object.flush = false;
+            let take = object.buf_len.min(room);
+            let offset = object.next - object.buf_len as u64;
+            object.empty_due = false;
+            // Whole pieces; only the last one taken may be split.
+            let mut left = take;
+            let mut tags = Vec::new();
+            while left > 0 {
+                let Some((tag, mut bytes)) = object.buf.pop_front() else {
+                    break;
+                };
+                if bytes.len() > left {
+                    let rest = bytes.split_off(left);
+                    object.buf.push_front((tag, rest));
+                }
+                left -= bytes.len();
+                object.buf_len -= bytes.len();
+                tags.push((tag, bytes.len() as u64));
+                if batch.body.is_empty() {
+                    batch.body = bytes;
+                } else {
+                    batch.body.extend_from_slice(&bytes);
+                }
+            }
+            if tags.is_empty() {
+                tags.push((object.last_tag, 0));
+            }
+            batch.items.push(WriteItem {
+                hash: hash.clone(),
+                offset,
+                total: object.total,
+                len: take as u64,
+                last: offset + take as u64 == object.total,
+            });
+            batch.tags.push(tags);
+            lease.get_or_insert_with(|| object.lease.clone());
+            if batch.items.len() >= options.max_items || batch.body.len() >= max_write {
+                break;
+            }
+        }
+        for hash in later.into_iter().rev() {
+            self.ready.push_front(hash);
+        }
+        if batch.items.is_empty() {
+            return None;
+        }
+        batch.lease = lease.unwrap_or_default();
+        self.writing += 1;
+        Some(batch)
+    }
+
+    /// Applies the outcome of a write call.
+    fn apply(
+        &mut self,
+        batch: Batch,
+        result: Result<Vec<WriteResult>, CallError>,
+        options: &SinkOptions,
+        events: &mut Vec<SinkEvent>,
+    ) {
+        self.writing = self.writing.saturating_sub(1);
+        let call_error = result.as_ref().err().cloned();
+        if let Some(CallError::Unavailable(_)) = &call_error {
+            self.fatal = call_error.clone();
+        }
+        let results: HashMap<String, WriteResult> = result
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| (result.hash.clone(), result))
+            .collect();
+        for (item, tags) in batch.items.iter().zip(batch.tags) {
+            let hash = &item.hash;
+            if let Some(object) = self.objects.get_mut(hash) {
+                object.writing = false;
+            }
+            let end = item.offset + item.len;
+            let (written, outcome, call) = match (&call_error, results.get(hash)) {
+                (Some(error), _) => (false, Some(ObjectOutcome::Failed(error.to_wire())), true),
+                (None, None) => (
+                    false,
+                    Some(ObjectOutcome::Failed(ErrorWire::coded(
+                        "INVALID_REPLY",
+                        format!("objects.write returned no result for {hash}"),
+                    ))),
+                    true,
+                ),
+                (None, Some(result)) => match &result.outcome {
+                    ObjectOutcome::Completed => (true, Some(ObjectOutcome::Completed), false),
+                    ObjectOutcome::Progressed { durable_offset } if *durable_offset == end => {
+                        (true, None, false)
+                    }
+                    // The worker kept less (or more) than this call wrote:
+                    // its durable offset is the truth; resynchronize.
+                    ObjectOutcome::Progressed { durable_offset } => (
+                        false,
+                        Some(ObjectOutcome::Progressed {
+                            durable_offset: *durable_offset,
+                        }),
+                        false,
+                    ),
+                    other => (false, Some(other.clone()), false),
+                },
+            };
+            if let Some(object) = self.objects.get_mut(hash) {
+                if let Some(result) = results.get(hash) {
+                    object.durable = match &result.outcome {
+                        ObjectOutcome::Completed => object.total,
+                        _ => result.durable_offset,
+                    };
+                }
+                if written {
+                    object.written += item.len;
+                }
+            }
+            for (tag, bytes) in tags {
+                self.release(tag, bytes, written, events);
+            }
+            match outcome {
+                Some(outcome) => self.settle(hash, outcome, call, events),
+                None => {
+                    self.enqueue(hash, options.max_write);
+                }
+            }
+        }
+        if let Some(fatal) = self.fatal.clone() {
+            let open: Vec<String> = self
+                .objects
+                .iter()
+                .filter(|(_, object)| object.settled.is_none() && !object.writing)
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            for hash in open {
+                self.settle(&hash, ObjectOutcome::Failed(fatal.to_wire()), true, events);
+            }
+        }
+    }
+}
+
+impl Sink {
+    pub(crate) fn start(
+        client: Arc<SessionWorkerClient>,
+        route: SyncRoute,
+        options: SinkOptions,
+        hook: SinkHook,
+    ) -> Sink {
+        let inner = Arc::new(SinkInner {
+            client,
+            route,
+            options,
+            state: Mutex::new(SinkState::default()),
+            changed: Condvar::new(),
+            hook,
+        });
+        let writers = (0..options.writers.max(1))
+            .filter_map(|index| {
+                let inner = inner.clone();
+                thread::Builder::new()
+                    .name(format!("objects-write-{index}"))
+                    .spawn(move || write_loop(&inner))
+                    .ok()
+            })
+            .collect();
+        Sink { inner, writers }
+    }
+
+    fn with_state<T>(&self, f: impl FnOnce(&mut SinkState, &mut Vec<SinkEvent>) -> T) -> T {
+        let mut events = Vec::new();
+        let value = {
+            let mut state = lock(&self.inner.state);
+            f(&mut state, &mut events)
+        };
+        self.inner.changed.notify_all();
+        for event in events {
+            (self.inner.hook)(event);
+        }
+        value
+    }
+
+    /// Declares that `hash` (`total` bytes) will arrive from `offset`, under
+    /// `lease`. An object already declared keeps its state (a later pull
+    /// continues it).
+    pub(crate) fn expect(&self, hash: &str, lease: &str, total: u64, offset: u64, tag: u64) {
+        self.with_state(|state, _| {
+            state
+                .objects
+                .entry(hash.to_owned())
+                .or_insert_with(|| SinkObject {
+                    lease: lease.to_owned(),
+                    total,
+                    next: offset,
+                    limit: total,
+                    durable: offset,
+                    written: 0,
+                    buf: VecDeque::new(),
+                    buf_len: 0,
+                    pending: BTreeMap::new(),
+                    empty_due: false,
+                    writing: false,
+                    queued: false,
+                    flush: false,
+                    settled: None,
+                    last_tag: tag,
+                });
+        });
+    }
+
+    /// Offers one received part. `Err` (the part was dropped and released at
+    /// once): the object is unknown (`Unsolicited`), settled, cut, the part
+    /// overlaps data already received (`Skipped`), or it contradicts the
+    /// object's size (the object settles `SizeMismatch`).
+    pub(crate) fn offer(
+        &self,
+        hash: &str,
+        offset: u64,
+        total: u64,
+        bytes: &[u8],
+        tag: u64,
+    ) -> Result<(), ObjectOutcome> {
+        let len = bytes.len() as u64;
+        let max_write = self.inner.options.max_write;
+        self.with_state(|state, events| {
+            let verdict = match state.objects.get(hash) {
+                _ if state.fatal.is_some() => Err(ObjectOutcome::Failed(
+                    state
+                        .fatal
+                        .as_ref()
+                        .map(CallError::to_wire)
+                        .unwrap_or_else(|| ErrorWire::coded("LOCAL_WORKER_UNAVAILABLE", hash)),
+                )),
+                None => Err(ObjectOutcome::Unsolicited),
+                Some(object) if object.settled.is_some() => {
+                    Err(object.settled.clone().unwrap_or(ObjectOutcome::Skipped))
+                }
+                Some(object) if total != object.total || offset.saturating_add(len) > total => {
+                    Err(ObjectOutcome::SizeMismatch)
+                }
+                Some(object)
+                    if offset.saturating_add(len) > object.limit || offset < object.next =>
+                {
+                    Err(ObjectOutcome::Skipped)
+                }
+                Some(object) if offset > object.next && object.pending.contains_key(&offset) => {
+                    Err(ObjectOutcome::Skipped)
+                }
+                Some(_) => Ok(()),
+            };
+            if let Err(outcome) = &verdict {
+                if len > 0 {
+                    events.push(SinkEvent::Released {
+                        tag,
+                        bytes: len,
+                        written: false,
+                    });
+                }
+                if *outcome == ObjectOutcome::SizeMismatch {
+                    state.settle(hash, ObjectOutcome::SizeMismatch, false, events);
+                }
+                return verdict;
+            }
+            state.buffered += len;
+            let next = state.objects.get(hash).map_or(offset, |object| object.next);
+            if offset == next {
+                state.append(hash, tag, bytes.to_vec(), events);
+                if let Some(object) = state.objects.get_mut(hash)
+                    && object.total == 0
+                    && object.written == 0
+                {
+                    object.empty_due = true;
+                }
+            } else if let Some(object) = state.objects.get_mut(hash) {
+                object.pending.insert(offset, (tag, bytes.to_vec()));
+            }
+            state.enqueue(hash, max_write);
+            Ok(())
+        })
+    }
+
+    /// Nothing of `hash` at or after `at` will be accepted (a pull ended
+    /// short there): later ranges already waiting are dropped, and what is
+    /// contiguous is written.
+    pub(crate) fn cut(&self, hash: &str, at: u64) {
+        let max_write = self.inner.options.max_write;
+        self.with_state(|state, events| {
+            let mut dropped = Vec::new();
+            if let Some(object) = state.objects.get_mut(hash) {
+                object.limit = object.limit.min(at.max(object.next));
+                let limit = object.limit;
+                let tail: Vec<u64> = object.pending.range(limit..).map(|(k, _)| *k).collect();
+                for offset in tail {
+                    if let Some((tag, bytes)) = object.pending.remove(&offset) {
+                        dropped.push((tag, bytes.len() as u64));
+                    }
+                }
+                object.flush = true;
+            }
+            for (tag, bytes) in dropped {
+                state.release(tag, bytes, false, events);
+            }
+            state.enqueue(hash, max_write);
+        });
+    }
+
+    /// Writes the partial data of `hashes` without waiting for a full call.
+    pub(crate) fn flush(&self, hashes: &[String]) {
+        let max_write = self.inner.options.max_write;
+        self.with_state(|state, _| {
+            for hash in hashes {
+                if let Some(object) = state.objects.get_mut(hash) {
+                    object.flush = true;
+                }
+                state.enqueue(hash, max_write);
+            }
+        });
+    }
+
+    /// Waits until fewer than `limit` contiguous bytes wait to be written,
+    /// or `stop` holds. (Ranges ahead of a gap do not count: only the sender
+    /// can fill the gap, so waiting for them could never end.)
+    pub(crate) fn wait_below(&self, limit: u64, stop: &dyn Fn() -> bool) {
+        let mut state = lock(&self.inner.state);
+        let held = |state: &SinkState| -> u64 {
+            state
+                .objects
+                .values()
+                .map(|object| object.buf_len as u64)
+                .sum()
+        };
+        while held(&state) >= limit && state.fatal.is_none() && !stop() {
+            state = self
+                .inner
+                .changed
+                .wait_timeout(state, EVENT_WAIT)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// The local worker cannot be reached: the sink writes nothing more.
+    pub(crate) fn fatal(&self) -> Option<CallError> {
+        lock(&self.inner.state).fatal.clone()
+    }
+
+    /// Ends the sink: writes what is held (`flush`) or drops it, waits for
+    /// the calls in flight, releases whatever is left, and returns every
+    /// object's final state.
+    pub(crate) fn finish(mut self, flush: bool) -> HashMap<String, SinkResult> {
+        let max_write = self.inner.options.max_write;
+        self.with_state(|state, events| {
+            state.closing = true;
+            let hashes: Vec<String> = state.objects.keys().cloned().collect();
+            for hash in hashes {
+                if flush {
+                    if let Some(object) = state.objects.get_mut(&hash) {
+                        object.flush = true;
+                    }
+                    state.enqueue(&hash, max_write);
+                } else if state
+                    .objects
+                    .get(&hash)
+                    .is_some_and(|object| !object.writing)
+                {
+                    state.drop_data(&hash, events);
+                }
+            }
+        });
+        for writer in std::mem::take(&mut self.writers) {
+            let _ = writer.join();
+        }
+        self.with_state(|state, events| {
+            let hashes: Vec<String> = state.objects.keys().cloned().collect();
+            for hash in &hashes {
+                state.drop_data(hash, events);
+            }
+            state
+                .objects
+                .iter()
+                .map(|(hash, object)| {
+                    (
+                        hash.clone(),
+                        SinkResult {
+                            outcome: object.settled.clone(),
+                            durable: object.durable,
+                            written: object.written,
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        // Not finished (a panic): the writers stop after their current call.
+        if !self.writers.is_empty() {
+            lock(&self.inner.state).closing = true;
+            self.inner.changed.notify_all();
+        }
+    }
+}
+
+/// One writer of a [`Sink`]: one `objects.write` call at a time.
+fn write_loop(inner: &SinkInner) {
+    loop {
+        let batch = {
+            let mut state = lock(&inner.state);
+            loop {
+                if let Some(batch) = state.take_batch(&inner.options) {
+                    break Some(batch);
+                }
+                if state.closing && state.ready.is_empty() {
+                    break None;
+                }
+                state = inner
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        let Some(mut batch) = batch else {
+            inner.changed.notify_all();
+            return;
+        };
+        let items = std::mem::take(&mut batch.items);
+        let body = std::mem::take(&mut batch.body);
+        let result = inner.client.write_batch(
+            &inner.route,
+            &batch.lease,
+            items.clone(),
+            body,
+            inner.options.deadline,
+        );
+        batch.items = items;
+        let mut events = Vec::new();
+        {
+            let mut state = lock(&inner.state);
+            state.apply(batch, result, &inner.options, &mut events);
+        }
+        inner.changed.notify_all();
+        for event in events {
+            (inner.hook)(event);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The v3 lane
+
+/// One bulk lane: objects v3 with the interim fallback (module docs). Runs
+/// until `cancel` fires or the session closes or goes away.
+pub fn run_bulk_lane(
+    ctx: Arc<Ctx>,
+    peer: Arc<PeerContext>,
+    lane: LaneSpec,
+    conn: session::Conn,
+    cancel: Cancel,
+) {
+    let options = LaneOptions::for_config(&ctx.config);
+    run_lane_with(ctx, peer, lane, conn, cancel, options);
+}
+
+/// [`run_bulk_lane`] with explicit options.
+pub fn run_lane_with(
+    ctx: Arc<Ctx>,
+    peer: Arc<PeerContext>,
+    lane: LaneSpec,
+    conn: session::Conn,
+    cancel: Cancel,
+    options: LaneOptions,
+) {
+    let status = status_lane(lane);
+    let name = format!("bulk-{}-{}", short(&peer.installation), status);
+    if let Err(error) = lane_check(&peer, &conn, lane) {
+        refuse(
+            &ctx,
+            &peer,
+            &conn,
+            &cancel,
+            status,
+            error,
+            &options.download,
+        );
+        return;
+    }
+    // Either direction's end (cancel, session gone) ends the other.
+    let token = cancel.child();
+    let stats = options.stats.clone().unwrap_or_default();
+    let run = Arc::new(LaneRun {
+        ctx: ctx.clone(),
+        peer: peer.clone(),
+        conn: conn.clone(),
+        spec: lane,
+        status,
+        window: Arc::new(Window::new(options.window_bytes, Some(stats.clone()))),
+        slots: Slots::new(options.peer_calls, Some(stats.clone())),
+        repos: RepoGate::new(options.repos, Some(stats.clone())),
+        stats,
+        cancel: token.clone(),
+        modes: Mutex::new(HashMap::new()),
+        interim: InterimState::default(),
+        turn: AtomicU64::new(0),
+        options: options.clone(),
+    });
+    let up = Arc::new(UploadJob(run.clone()));
+    let uploads = {
+        let (ctx, peer, conn, token, options, name) = (
+            ctx.clone(),
+            peer.clone(),
+            conn.clone(),
+            token.clone(),
+            options.upload.clone(),
+            format!("{name}-up"),
+        );
+        thread::Builder::new().name(name.clone()).spawn(move || {
+            drive(&ctx, &peer, &conn, &token, up, &options, status, &name);
+            token.cancel();
+        })
+    };
+    let down = Arc::new(DownloadJob(run));
+    drive(
+        &ctx,
+        &peer,
+        &conn,
+        &token,
+        down,
+        &options.download,
+        status,
+        &name,
+    );
+    token.cancel();
+    if let Ok(handle) = uploads {
+        let _ = handle.join();
+    }
+}
+
+fn lane_check(peer: &PeerContext, conn: &session::Conn, lane: LaneSpec) -> Result<(), ErrorWire> {
+    if lane.is_valid() {
+        check_session(peer, conn, LaneRole::Bulk, Some(lane))
+    } else {
+        Err(ErrorWire::coded(
+            "INVALID_BULK_LANE",
+            format!(
+                "lane {}/{} is not a valid bulk lane",
+                lane.index, lane.count
+            ),
+        ))
+    }
+}
+
+/// What both directions of a lane share.
+struct LaneRun {
+    ctx: Arc<Ctx>,
+    peer: Arc<PeerContext>,
+    conn: session::Conn,
+    spec: LaneSpec,
+    status: u32,
+    window: Arc<Window>,
+    slots: Arc<Slots>,
+    repos: RepoGate,
+    stats: Arc<LaneStats>,
+    cancel: Cancel,
+    /// Repositories on the interim path, until when.
+    modes: Mutex<HashMap<String, Instant>>,
+    interim: InterimState,
+    /// Alternates the pull lease sessions.
+    turn: AtomicU64,
+    options: LaneOptions,
+}
+
+/// How a v3 round ended without an error.
+enum RoundEnd {
+    Done(Next),
+    /// Objects v3 is not served (here or at the peer): take the interim path.
+    Interim,
+}
+
+impl LaneRun {
+    fn stopped(&self) -> bool {
+        self.cancel.is_cancelled()
+            || self.conn.closed().is_some()
+            || self.ctx.stopping.load(Ordering::Relaxed)
+    }
+
+    fn stop_error(&self) -> ExchangeError {
+        let detail = match self.conn.closed() {
+            Some(error) => format!("WS_CLOSED: the bulk session closed: {error}"),
+            None => "WS_CLOSED: the bulk lane is stopping".to_owned(),
+        };
+        ExchangeError::peer(CallError::Unavailable(detail))
+    }
+
+    fn on_interim(&self, repo: &str) -> bool {
+        let mut modes = lock(&self.modes);
+        match modes.get(repo) {
+            Some(until) if Instant::now() < *until => true,
+            Some(_) => {
+                modes.remove(repo);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn set_interim(&self, repo: &str, why: &CallError) {
+        let first = lock(&self.modes)
+            .insert(repo.to_owned(), Instant::now() + INTERIM_RECHECK)
+            .is_none();
+        if first {
+            event!(info, UNSUPPORTED_OPERATION, {
+                "peer": self.peer.installation,
+                "repo": repo,
+                "lane": self.status,
+                "detail": format!("objects v3 is not served; using the interim path: {why}"),
+            });
+        }
+    }
+
+    fn forget(&self, repo: &str) {
+        lock(&self.modes).remove(repo);
+        self.interim.forget(repo);
+    }
+
+    fn route(&self, target: &Target) -> SyncRoute {
+        SyncRoute {
+            peer: self.peer.installation.clone(),
+            repo: target.folder.record.repo.clone(),
+            local_replica: target.folder.record.device.clone(),
+            remote_replica: target.remote.replica.clone(),
+        }
+    }
+
+    /// The local worker's loopback session client; `None` when it serves no
+    /// objects v3 (the interim path).
+    fn local(&self, target: &Target) -> Result<Option<Arc<SessionWorkerClient>>, ExchangeError> {
+        let Some(endpoint) = target.folder.worker.as_ref() else {
+            return Err(ExchangeError::local(CallError::Unavailable(format!(
+                "LOCAL_WORKER_UNAVAILABLE: folder {} has no running worker",
+                target.folder.record.state
+            ))));
+        };
+        match worker_client::session_for(endpoint) {
+            Ok(client) => Ok(Some(client)),
+            Err(error) if is_unsupported(&error) => {
+                self.set_interim(&target.repo, &error);
+                Ok(None)
+            }
+            Err(error) => Err(ExchangeError::local(error)),
+        }
+    }
+
+    fn started(&self, repo: &str, op: &str) {
+        self.ctx.status.record(StatusEvent::ExchangeStarted {
+            installation: self.peer.installation.clone(),
+            repo: repo.to_owned(),
+            lane: self.status,
+            op: op.to_owned(),
+            at_ms: self.ctx.clock.now_ms(),
+            direction: Direction::Outbound,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finished(
+        &self,
+        repo: &str,
+        op: &str,
+        error: Option<ErrorWire>,
+        bytes_up: u64,
+        bytes_down: u64,
+        objects_up: u64,
+        objects_down: u64,
+        started: Instant,
+    ) {
+        self.ctx.status.record(StatusEvent::ExchangeFinished {
+            installation: self.peer.installation.clone(),
+            repo: repo.to_owned(),
+            lane: self.status,
+            op: op.to_owned(),
+            direction: Direction::Outbound,
+            ok: error.is_none(),
+            error,
+            summary: None,
+            bytes_up,
+            bytes_down,
+            objects_up,
+            objects_down,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
+    }
+
+    fn key(&self, repo: &str, up: bool, hash: &str) -> String {
+        object_key(
+            &self.ctx.installation,
+            &self.peer.installation,
+            repo,
+            up,
+            hash,
+        )
+    }
+
+    /// A per-object failure: backoff for this source, `ObjectError`.
+    fn object_failed(&self, target: &Target, up: bool, hash: &str, outcome: &ObjectOutcome) {
+        if !is_failure(outcome) {
+            return;
+        }
+        let detail = if up {
+            format!("pushing to peer {}", self.peer.installation)
+        } else {
+            format!("pulling from peer {}", self.peer.installation)
+        };
+        let Some(error) = outcome_error(hash, outcome, &detail) else {
+            return;
+        };
+        let delay = object_failed(&self.key(&target.repo, up, hash), &error.code);
+        event!(debug, (error.code.as_str()), {
+            "peer": self.peer.installation,
+            "repo": target.repo,
+            "object": hash,
+            "retry_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+            "message": error.message,
+        });
+        self.ctx.status.record(StatusEvent::ObjectError {
+            state: target.folder.record.state.clone(),
+            hash: hash.to_owned(),
+            error,
+        });
+    }
+
+    /// An object completed: clears its backoff and resolves its error.
+    fn object_done(&self, target: &Target, up: bool, hash: &str) {
+        if let Some(code) = object_completed(&self.key(&target.repo, up, hash)) {
+            self.ctx.status.record(StatusEvent::Resolved {
+                scope: Scope::Object {
+                    state: target.folder.record.state.clone(),
+                    hash: hash.to_owned(),
+                },
+                code,
+            });
+        }
+    }
+
+    /// The interim exchange of `target` (both directions).
+    fn interim_exchange(
+        &self,
+        target: &Target,
+        retry_after: &mut dyn FnMut(&ExchangeError) -> Option<Duration>,
+    ) -> Result<Next, ExchangeError> {
+        bump(&self.stats.interim_exchanges, 1);
+        self.interim.run(
+            &self.ctx,
+            &self.conn,
+            &self.peer,
+            self.spec,
+            &self.options.interim,
+            target,
+            retry_after,
+        )
+    }
+}
+
+/// Signals both directions react to (module docs).
+fn objects_triggered(before: &Signals, after: &Signals, absorbing: bool) -> bool {
+    before.tip != after.tip
+        || before.remote_tip != after.remote_tip
+        || (before.remote_content != after.remote_content && !absorbing)
+        || (before.content != after.content && !absorbing)
+}
+
+/// The download direction of a lane.
+struct DownloadJob(Arc<LaneRun>);
+
+impl Job for DownloadJob {
+    fn op(&self) -> &str {
+        ops::OBJECTS_PULL
+    }
+
+    fn scope(&self) -> String {
+        format!("{}#{}", ops::OBJECTS_PULL, self.0.spec.index)
+    }
+
+    fn class(&self) -> &'static str {
+        "objects"
+    }
+
+    fn triggered(&self, before: &Signals, after: &Signals, absorbing: bool) -> bool {
+        // Staging moves `sync`: objects of staged events are wanted at once.
+        objects_triggered(before, after, absorbing) || before.sync != after.sync
+    }
+
+    fn run(
+        &self,
+        target: &Target,
+        retry_after: &mut dyn FnMut(&ExchangeError) -> Option<Duration>,
+    ) -> Result<Next, ExchangeError> {
+        let lane = &*self.0;
+        let stop = || lane.stopped();
+        let Some(_turn) = lane.repos.enter(&target.repo, &stop) else {
+            return Err(lane.stop_error());
+        };
+        if lane.on_interim(&target.repo) {
+            return lane.interim_exchange(target, retry_after);
+        }
+        let Some(client) = lane.local(target)? else {
+            return lane.interim_exchange(target, retry_after);
+        };
+        bump(&lane.stats.v3_rounds, 1);
+        match download_round(lane, target, &client)? {
+            RoundEnd::Done(next) => Ok(next),
+            RoundEnd::Interim => lane.interim_exchange(target, retry_after),
+        }
+    }
+
+    fn forget(&self, repo: &str) {
+        self.0.forget(repo);
+    }
+}
+
+/// The upload direction of a lane.
+struct UploadJob(Arc<LaneRun>);
+
+impl Job for UploadJob {
+    fn op(&self) -> &str {
+        ops::OBJECTS_PUSH
+    }
+
+    fn scope(&self) -> String {
+        format!("{}#{}", ops::OBJECTS_PUSH, self.0.spec.index)
+    }
+
+    fn class(&self) -> &'static str {
+        "objects"
+    }
+
+    fn triggered(&self, before: &Signals, after: &Signals, absorbing: bool) -> bool {
+        objects_triggered(before, after, absorbing) || (before.sync != after.sync && !absorbing)
+    }
+
+    fn run(
+        &self,
+        target: &Target,
+        _retry_after: &mut dyn FnMut(&ExchangeError) -> Option<Duration>,
+    ) -> Result<Next, ExchangeError> {
+        let lane = &*self.0;
+        // On the interim path the download scheduler moves both directions.
+        let idle = Next {
+            after: None,
+            progress: false,
+        };
+        if lane.on_interim(&target.repo) {
+            return Ok(idle);
+        }
+        let stop = || lane.stopped();
+        let Some(_turn) = lane.repos.enter(&target.repo, &stop) else {
+            return Err(lane.stop_error());
+        };
+        let Some(client) = lane.local(target)? else {
+            return Ok(idle);
+        };
+        match upload_round(lane, target, &client)? {
+            RoundEnd::Done(next) => Ok(next),
+            RoundEnd::Interim => Ok(idle),
+        }
+    }
+
+    fn forget(&self, repo: &str) {
+        self.0.forget(repo);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Download round
+
+/// One wanted object, planned for a pull.
+#[derive(Clone, Debug)]
+struct Planned {
+    item: WantItem,
+    lease: String,
+}
+
+/// One pull of a round.
+struct Pull {
+    started: Instant,
+    /// `(hash, start, end)` this pull covers.
+    spans: Vec<(String, u64, u64)>,
+    budget: u64,
+    received: u64,
+    released: u64,
+    completed: u64,
+    ended: Option<Result<ObjectsResult, CallError>>,
+    reported: bool,
+}
+
+enum RoundEvent {
+    Sink(SinkEvent),
+    PullEnded {
+        tag: u64,
+        result: Result<ObjectsResult, CallError>,
+        received: u64,
+        ends: HashMap<String, u64>,
+    },
+}
+
+/// What a download round has seen so far.
+#[derive(Default)]
+struct RoundState {
+    plan: VecDeque<Planned>,
+    begun: HashSet<String>,
+    pulls: BTreeMap<u64, Pull>,
+    next_tag: u64,
+    want_dry: bool,
+    written: u64,
+    completed: u64,
+    corrupt: Vec<String>,
+    leftovers: bool,
+    interim: Option<CallError>,
+    session_lost: Option<CallError>,
+    peer_error: Option<CallError>,
+    local_error: Option<CallError>,
+}
+
+impl RoundState {
+    fn in_flight(&self) -> usize {
+        self.pulls
+            .values()
+            .filter(|pull| pull.ended.is_none())
+            .count()
+    }
+
+    fn plan_bytes(&self) -> u64 {
+        self.plan
+            .iter()
+            .map(|planned| planned.item.size.saturating_sub(planned.item.offset))
+            .sum()
+    }
+
+    fn failed(&self) -> bool {
+        self.interim.is_some()
+            || self.session_lost.is_some()
+            || self.peer_error.is_some()
+            || self.local_error.is_some()
+    }
+}
+
+fn download_round(
+    lane: &LaneRun,
+    target: &Target,
+    client: &Arc<SessionWorkerClient>,
+) -> Result<RoundEnd, ExchangeError> {
+    let route = lane.route(target);
+    let (tx, rx) = mpsc::channel::<RoundEvent>();
+    // Started with the round's first pull: a round that finds nothing to
+    // pull (most anti-entropy rounds) starts no writer threads.
+    let sink = LazySink {
+        cell: OnceLock::new(),
+        make: Box::new({
+            let (tx, route, client) = (Mutex::new(tx.clone()), route.clone(), client.clone());
+            // Credit comes back on the writer threads: the round's own
+            // thread may be waiting for it (the next first pull).
+            let window = lane.window.clone();
+            let writers = lane.options.writes;
+            move || {
+                let (tx, window) = (lock(&tx).clone(), window.clone());
+                Sink::start(
+                    client.clone(),
+                    route.clone(),
+                    SinkOptions {
+                        writers,
+                        ..SinkOptions::default()
+                    },
+                    Box::new(move |event| {
+                        if let SinkEvent::Released { bytes, .. } = &event {
+                            window.release(*bytes);
+                        }
+                        let _ = tx.send(RoundEvent::Sink(event));
+                    }),
+                )
+            }
+        }),
+    };
+    let abort = AtomicBool::new(false);
+    let started = Instant::now();
+    let mut state = RoundState::default();
+    thread::scope(|scope| {
+        loop {
+            while let Ok(event) = rx.try_recv() {
+                round_event(lane, target, &sink, &mut state, event);
+            }
+            report_pulls(lane, target, &mut state);
+            if lane.stopped() {
+                break;
+            }
+            if let Some(error) = sink.cell.get().and_then(Sink::fatal) {
+                state.local_error.get_or_insert(error);
+            }
+            if state.failed() {
+                if state.in_flight() == 0 {
+                    break;
+                }
+            } else {
+                let over = started.elapsed() >= lane.options.round;
+                let in_flight = state.in_flight();
+                if !over
+                    && state.plan.is_empty()
+                    && !state.want_dry
+                    && in_flight < lane.options.pulls.max(1)
+                {
+                    want_more(lane, target, client, &route, &mut state);
+                    continue;
+                }
+                if !over && !state.plan.is_empty() && in_flight < lane.options.pulls.max(1) {
+                    let issued =
+                        issue_pull(lane, target, &route, &sink, &tx, &abort, &mut state, scope);
+                    if issued {
+                        continue;
+                    }
+                    if in_flight == 0 {
+                        // Stopped while waiting for the window or a slot.
+                        break;
+                    }
+                }
+                if in_flight == 0 && (over || (state.plan.is_empty() && state.want_dry)) {
+                    break;
+                }
+            }
+            if let Ok(event) = rx.recv_timeout(EVENT_WAIT) {
+                round_event(lane, target, &sink, &mut state, event);
+            }
+        }
+        // Wind down: no new pulls; pulls in flight end (at once when aborted).
+        let aborting = lane.stopped() || state.failed();
+        if aborting {
+            abort.store(true, Ordering::Relaxed);
+        }
+        while state.in_flight() > 0 {
+            if let Ok(event) = rx.recv_timeout(EVENT_WAIT) {
+                round_event(lane, target, &sink, &mut state, event);
+            }
+        }
+    });
+    // The pulls are over: write what arrived (unless the lane stops), then
+    // account every byte.
+    let results = sink
+        .cell
+        .into_inner()
+        .map(|sink| sink.finish(!lane.stopped()))
+        .unwrap_or_default();
+    drop(tx);
+    while let Ok(event) = rx.try_recv() {
+        round_event(lane, target, &SinkGone, &mut state, event);
+    }
+    if results.values().any(|result| result.outcome.is_none()) {
+        state.leftovers = true;
+    }
+    for pull in state.pulls.values_mut() {
+        pull.released = pull.released.max(pull.received);
+    }
+    report_pulls(lane, target, &mut state);
+    send_reports(lane, target, &route, &mut state);
+
+    let moved = state.written > 0 || state.completed > 0;
+    let progress = |after: Option<Duration>| {
+        Ok(RoundEnd::Done(Next {
+            after,
+            progress: moved,
+        }))
+    };
+    if let Some(error) = state.interim.take() {
+        lane.set_interim(&target.repo, &error);
+        return Ok(RoundEnd::Interim);
+    }
+    if let Some(error) = state.session_lost.take() {
+        return Err(ExchangeError::peer(error));
+    }
+    if lane.stopped() {
+        return Err(lane.stop_error());
+    }
+    if let Some(error) = state.local_error.take()
+        && (!moved || matches!(error, CallError::Unavailable(_)))
+    {
+        return Err(ExchangeError::local(error));
+    }
+    if let Some(error) = state.peer_error.take()
+        && !moved
+    {
+        return Err(ExchangeError::peer(error));
+    }
+    let over = started.elapsed() >= lane.options.round;
+    let again = moved && (over || state.leftovers || !state.want_dry);
+    progress(again.then_some(CONTENT_YIELD))
+}
+
+/// The sink of a download round, started on first use.
+struct LazySink {
+    cell: OnceLock<Sink>,
+    make: Box<dyn Fn() -> Sink + Send + Sync>,
+}
+
+impl LazySink {
+    fn get(&self) -> &Sink {
+        self.cell.get_or_init(|| (self.make)())
+    }
+}
+
+/// Stand-in sink for events drained after the round's sink finished.
+struct SinkGone;
+
+/// What `round_event` needs of a sink.
+trait SinkOps {
+    fn cut(&self, hash: &str, at: u64);
+    fn flush(&self, hashes: &[String]);
+}
+
+impl SinkOps for Sink {
+    fn cut(&self, hash: &str, at: u64) {
+        Sink::cut(self, hash, at);
+    }
+    fn flush(&self, hashes: &[String]) {
+        Sink::flush(self, hashes);
+    }
+}
+
+impl SinkOps for LazySink {
+    fn cut(&self, hash: &str, at: u64) {
+        if let Some(sink) = self.cell.get() {
+            sink.cut(hash, at);
+        }
+    }
+    fn flush(&self, hashes: &[String]) {
+        if let Some(sink) = self.cell.get() {
+            sink.flush(hashes);
+        }
+    }
+}
+
+impl SinkOps for SinkGone {
+    fn cut(&self, _: &str, _: u64) {}
+    fn flush(&self, _: &[String]) {}
+}
+
+fn round_event(
+    lane: &LaneRun,
+    target: &Target,
+    sink: &dyn SinkOps,
+    state: &mut RoundState,
+    event: RoundEvent,
+) {
+    match event {
+        RoundEvent::Sink(SinkEvent::Released {
+            tag,
+            bytes,
+            written,
+        }) => {
+            // (The window got this credit back on the writer thread.)
+            if let Some(pull) = state.pulls.get_mut(&tag) {
+                pull.released += bytes;
+            }
+            if written {
+                state.written += bytes;
+                bump(&lane.stats.bytes_written, bytes);
+            }
+        }
+        RoundEvent::Sink(SinkEvent::Settled {
+            hash,
+            tag,
+            outcome,
+            call,
+        }) => {
+            state.want_dry = false;
+            match &outcome {
+                ObjectOutcome::Completed => {
+                    state.completed += 1;
+                    bump(&lane.stats.objects_down, 1);
+                    if let Some(pull) = state.pulls.get_mut(&tag) {
+                        pull.completed += 1;
+                    }
+                    lane.object_done(target, false, &hash);
+                }
+                ObjectOutcome::CorruptAtSource => {
+                    state.corrupt.push(hash.clone());
+                    lane.object_failed(target, false, &hash, &outcome);
+                }
+                ObjectOutcome::Failed(error) if call => {
+                    // The whole write call failed: the round's error, not
+                    // the object's (it resumes from its durable offset).
+                    state.leftovers = true;
+                    if matches!(error.class, ErrorClass::Contention) {
+                        return;
+                    }
+                    state
+                        .local_error
+                        .get_or_insert_with(|| CallError::Remote(error.clone()));
+                }
+                ObjectOutcome::Progressed { .. } => state.leftovers = true,
+                other => lane.object_failed(target, false, &hash, other),
+            }
+        }
+        RoundEvent::PullEnded {
+            tag,
+            result,
+            received,
+            ends,
+        } => {
+            state.want_dry = false;
+            let Some(pull) = state.pulls.get_mut(&tag) else {
+                return;
+            };
+            pull.received = received;
+            lane.window.release(pull.budget.saturating_sub(received));
+            bump(&lane.stats.bytes_pulled, received);
+            let mut hashes = Vec::new();
+            let mut short_ended = Vec::new();
+            for (hash, start, end) in &pull.spans {
+                let got = ends.get(hash).copied().unwrap_or(*start);
+                if got < *end {
+                    short_ended.push((hash.clone(), got));
+                }
+                hashes.push(hash.clone());
+            }
+            for (hash, at) in &short_ended {
+                sink.cut(hash, *at);
+                state.plan.retain(|planned| planned.item.hash != *hash);
+                state.leftovers = true;
+            }
+            sink.flush(&hashes);
+            match &result {
+                Ok(results) => {
+                    for result in &results.results {
+                        if is_failure(&result.outcome) {
+                            lane.object_failed(target, false, &result.hash, &result.outcome);
+                        }
+                    }
+                }
+                Err(error) if is_unsupported(error) => {
+                    state.interim.get_or_insert(error.clone());
+                }
+                Err(error @ (CallError::ConnectionLost(_) | CallError::Unavailable(_))) => {
+                    state.session_lost.get_or_insert(error.clone());
+                }
+                Err(CallError::Remote(error)) if error.code == "CANCELLED" => {}
+                Err(error) => {
+                    state.peer_error.get_or_insert(error.clone());
+                }
+            }
+            pull.ended = Some(result);
+            lane.stats.pulls_in_flight.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Emits `ExchangeFinished` for every pull that ended and whose bytes have
+/// all left the sink.
+fn report_pulls(lane: &LaneRun, target: &Target, state: &mut RoundState) {
+    for pull in state.pulls.values_mut() {
+        if pull.reported || pull.released < pull.received {
+            continue;
+        }
+        let Some(result) = &pull.ended else {
+            continue;
+        };
+        pull.reported = true;
+        let error = match result {
+            Ok(_) => None,
+            Err(CallError::Remote(error)) if error.code == "CANCELLED" => None,
+            Err(error) => Some(error.to_wire()),
+        };
+        lane.finished(
+            &target.repo,
+            ops::OBJECTS_PULL,
+            error,
+            0,
+            pull.received,
+            0,
+            pull.completed,
+            pull.started,
+        );
+    }
+}
+
+/// Asks the local worker for more wanted objects (module docs, step 1).
+fn want_more(
+    lane: &LaneRun,
+    target: &Target,
+    client: &SessionWorkerClient,
+    route: &SyncRoute,
+    state: &mut RoundState,
+) {
+    let turn = lane.turn.fetch_add(1, Ordering::Relaxed);
+    let lease = pull_lease(&lane.peer.installation, lane.spec, turn);
+    let header = WantHeader {
+        route: route.clone(),
+        lane: lane.spec,
+        max_items: MAX_WANT_ITEMS as u32,
+        max_bytes: lane.options.window_bytes,
+        session: lease.clone(),
+    };
+    match client.want(&header, worker_client::deadlines::WANT) {
+        Ok(items) => {
+            let mut fresh = 0;
+            for item in items {
+                if !lane.spec.owns(&item.hash)
+                    || state.begun.contains(&item.hash)
+                    || state
+                        .plan
+                        .iter()
+                        .any(|planned| planned.item.hash == item.hash)
+                {
+                    if state.begun.contains(&item.hash) {
+                        state.leftovers = true;
+                    }
+                    continue;
+                }
+                if object_blocked(&lane.key(&target.repo, false, &item.hash)) {
+                    continue;
+                }
+                fresh += 1;
+                state.plan.push_back(Planned {
+                    item,
+                    lease: lease.clone(),
+                });
+            }
+            if fresh == 0 {
+                state.want_dry = true;
+            }
+        }
+        Err(error) if is_unsupported(&error) => {
+            state.interim = Some(error);
+        }
+        Err(error) => {
+            state.local_error.get_or_insert(error);
+        }
+    }
+}
+
+/// Issues the next pull when the window and a peer slot allow (module docs,
+/// step 2). The first pull of a round waits its turn; a second one only
+/// goes when half the window is free and nobody waits.
+#[allow(clippy::too_many_arguments)]
+fn issue_pull<'scope, 'env>(
+    lane: &'env LaneRun,
+    target: &'env Target,
+    route: &'env SyncRoute,
+    sink: &'env LazySink,
+    tx: &mpsc::Sender<RoundEvent>,
+    abort: &'env AtomicBool,
+    state: &mut RoundState,
+    scope: &'scope thread::Scope<'scope, 'env>,
+) -> bool {
+    let first = state.in_flight() == 0;
+    // A pull's budget never exceeds what the acceptor honours.
+    let window = lane.window.capacity().min(PULL_BUDGET_BYTES);
+    let plan_bytes = state.plan_bytes();
+    let min = plan_bytes.min(window / 2);
+    let max = plan_bytes.min(window);
+    let stop = || lane.stopped();
+    let budget = if first {
+        lane.window.reserve(min, max, &stop)
+    } else {
+        lane.window.try_reserve(min, max)
+    };
+    let Some(budget) = budget else {
+        return false;
+    };
+    let slot = if first {
+        lane.slots.acquire(&stop)
+    } else {
+        lane.slots.try_acquire()
+    };
+    let Some(slot) = slot else {
+        lane.window.release(budget);
+        return false;
+    };
+    // Take items in order; the last one may be split (its rest stays first
+    // in the plan for the next pull).
+    let mut items = Vec::new();
+    let mut leases = Vec::new();
+    let mut left = budget;
+    while let Some(front) = state.plan.front_mut() {
+        let remaining = front.item.size.saturating_sub(front.item.offset);
+        if remaining > 0 && left == 0 {
+            break;
+        }
+        let take = remaining.min(left);
+        items.push(front.item.clone());
+        leases.push(front.lease.clone());
+        left -= take;
+        if take == remaining {
+            state.plan.pop_front();
+        } else {
+            front.item.offset += take;
+            break;
+        }
+    }
+    let budget = budget - left;
+    lane.window.release(left);
+    let spans = allot(&items, budget);
+    let tag = state.next_tag;
+    state.next_tag += 1;
+    let sink = sink.get();
+    for ((item, lease), (start, _)) in items.iter().zip(&leases).zip(&spans) {
+        sink.expect(&item.hash, lease, item.size, *start, tag);
+        state.begun.insert(item.hash.clone());
+    }
+    let allowed: HashMap<String, (u64, u64)> = items
+        .iter()
+        .zip(&spans)
+        .map(|(item, span)| (item.hash.clone(), *span))
+        .collect();
+    state.pulls.insert(
+        tag,
+        Pull {
+            started: Instant::now(),
+            spans: items
+                .iter()
+                .zip(&spans)
+                .map(|(item, (start, end))| (item.hash.clone(), *start, *end))
+                .collect(),
+            budget,
+            received: 0,
+            released: 0,
+            completed: 0,
+            ended: None,
+            reported: false,
+        },
+    );
+    bump(&lane.stats.pulls, 1);
+    let in_flight = bump(&lane.stats.pulls_in_flight, 1);
+    peak(&lane.stats.pulls_peak, in_flight);
+    lane.started(&target.repo, ops::OBJECTS_PULL);
+    let request = ObjectsPull {
+        repo: route.repo.clone(),
+        sender: route.local_replica.clone(),
+        receiver: route.remote_replica.clone(),
+        lane: lane.spec,
+        items,
+        budget_bytes: budget,
+    };
+    let tx = tx.clone();
+    scope.spawn(move || {
+        let _slot = slot;
+        let mut received = 0u64;
+        let mut ends: HashMap<String, u64> = HashMap::new();
+        let header = serde_json::to_value(&request).unwrap_or_default();
+        let result = lane
+            .conn
+            .call_streaming(
+                ops::OBJECTS_PULL,
+                header,
+                Vec::new(),
+                Priority::Control,
+                None,
+                lane.options.idle,
+                &mut |chunk: ChunkHeader, bytes: &[u8]| {
+                    if abort.load(Ordering::Relaxed) || lane.stopped() {
+                        return Err(ErrorWire::coded("CANCELLED", "the objects round ended"));
+                    }
+                    let len = bytes.len() as u64;
+                    let Some(hash) = chunk.hash.as_deref() else {
+                        return Err(ErrorWire::coded(
+                            "PROTOCOL_VIOLATION",
+                            "an objects.pull stream carried a chunk without an object",
+                        ));
+                    };
+                    let Some(&(start, end)) = allowed.get(hash) else {
+                        return Err(ErrorWire::coded(
+                            "PROTOCOL_VIOLATION",
+                            format!("objects.pull streamed {hash}, which it was not asked for"),
+                        ));
+                    };
+                    let chunk_end = chunk.offset.saturating_add(len);
+                    if chunk.offset < start
+                        || chunk_end > end
+                        || received.saturating_add(len) > budget
+                        || ends.get(hash).is_some_and(|seen| chunk.offset != *seen)
+                    {
+                        return Err(ErrorWire::coded(
+                            "PROTOCOL_VIOLATION",
+                            format!(
+                                "objects.pull streamed {hash} [{}, {chunk_end}) outside [{start}, {end})",
+                                chunk.offset
+                            ),
+                        ));
+                    }
+                    received += len;
+                    ends.insert(hash.to_owned(), chunk_end);
+                    let _ = sink.offer(hash, chunk.offset, chunk.total, bytes, tag);
+                    Ok(())
+                },
+            )
+            .and_then(|reply| body_of::<ObjectsResult>(&reply, ops::OBJECTS_PULL));
+        let _ = tx.send(RoundEvent::PullEnded {
+            tag,
+            result,
+            received,
+            ends,
+        });
+    });
+    true
+}
+
+/// Reports objects whose bytes failed our worker's hash check to the peer
+/// (`objects.report{CORRUPT_AT_SOURCE}`); the peer re-verifies its copy.
+fn send_reports(lane: &LaneRun, target: &Target, route: &SyncRoute, state: &mut RoundState) {
+    for hash in std::mem::take(&mut state.corrupt) {
+        let stop = || lane.stopped();
+        let Some(_slot) = lane.slots.acquire(&stop) else {
+            return;
+        };
+        let report = ObjectsReport {
+            repo: route.repo.clone(),
+            sender: route.local_replica.clone(),
+            hash: hash.clone(),
+            code: "CORRUPT_AT_SOURCE".into(),
+        };
+        let header = serde_json::to_value(&report).unwrap_or_default();
+        bump(&lane.stats.reports, 1);
+        if let Err(error) = lane.conn.call(
+            ops::OBJECTS_REPORT,
+            header,
+            Vec::new(),
+            Priority::Control,
+            deadlines::OBJECTS_REPORT,
+        ) {
+            event!(warn, (error.code().as_str()), {
+                "peer": lane.peer.installation,
+                "repo": target.repo,
+                "object": hash,
+                "detail": format!("objects.report failed: {error}"),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Upload round
+
+fn upload_round(
+    lane: &LaneRun,
+    target: &Target,
+    client: &Arc<SessionWorkerClient>,
+) -> Result<RoundEnd, ExchangeError> {
+    let route = lane.route(target);
+    let started = Instant::now();
+    let mut moved = false;
+    loop {
+        if lane.stopped() {
+            return Err(lane.stop_error());
+        }
+        if started.elapsed() >= lane.options.round {
+            return Ok(RoundEnd::Done(Next {
+                after: moved.then_some(CONTENT_YIELD),
+                progress: moved,
+            }));
+        }
+        let stop = || lane.stopped();
+        let Some(slot) = lane.slots.acquire(&stop) else {
+            return Err(lane.stop_error());
+        };
+        let request = ObjectsWantsRequest {
+            repo: route.repo.clone(),
+            sender: route.local_replica.clone(),
+            receiver: route.remote_replica.clone(),
+            lane: lane.spec,
+            max_items: MAX_WANT_ITEMS as u32,
+            max_bytes: PUSH_BUDGET_BYTES,
+        };
+        let wants = lane
+            .conn
+            .call(
+                ops::OBJECTS_WANTS,
+                serde_json::to_value(&request).unwrap_or_default(),
+                Vec::new(),
+                Priority::Control,
+                deadlines::OBJECTS_WANTS,
+            )
+            .and_then(|reply| body_of::<ObjectsWantsReply>(&reply, ops::OBJECTS_WANTS));
+        let wanted = match wants {
+            Ok(reply) => reply.items,
+            Err(error) if is_unsupported(&error) => {
+                lane.set_interim(&target.repo, &error);
+                return Ok(RoundEnd::Interim);
+            }
+            Err(error) => return idle_or(moved, ExchangeError::peer(error)),
+        };
+        let mut seen = HashSet::new();
+        let items: Vec<WantItem> = wanted
+            .into_iter()
+            .filter(|item| {
+                lane.spec.owns(&item.hash)
+                    && seen.insert(item.hash.clone())
+                    && !object_blocked(&lane.key(&target.repo, true, &item.hash))
+            })
+            .collect();
+        let spans = allot(&items, PUSH_BUDGET_BYTES);
+        let (items, spans): (Vec<WantItem>, Vec<(u64, u64)>) = items
+            .into_iter()
+            .zip(spans)
+            .filter(|(item, span)| covered(item, *span))
+            .unzip();
+        if items.is_empty() {
+            return Ok(RoundEnd::Done(Next {
+                after: None,
+                progress: moved,
+            }));
+        }
+        let pushed = push(lane, target, client, &route, items, &spans, slot);
+        match pushed {
+            Ok(push) => {
+                moved |= push.sent > 0 || push.completed > 0;
+                if push.sent == 0 && push.completed == 0 {
+                    return Ok(RoundEnd::Done(Next {
+                        after: None,
+                        progress: moved,
+                    }));
+                }
+            }
+            Err(PushError::Interim(error)) => {
+                lane.set_interim(&target.repo, &error);
+                return Ok(RoundEnd::Interim);
+            }
+            Err(PushError::Failed(error)) => return idle_or(moved, error),
+        }
+    }
+}
+
+/// A failure that moved nothing is the key's; one after progress is left
+/// for the next round (it repeats there if it persists).
+fn idle_or(moved: bool, error: ExchangeError) -> Result<RoundEnd, ExchangeError> {
+    if moved && !error.session_lost() && !matches!(error.error, CallError::Unavailable(_)) {
+        Ok(RoundEnd::Done(Next {
+            after: Some(CONTENT_YIELD),
+            progress: true,
+        }))
+    } else {
+        Err(error)
+    }
+}
+
+struct Pushed {
+    sent: u64,
+    completed: u64,
+}
+
+enum PushError {
+    Interim(CallError),
+    Failed(ExchangeError),
+}
+
+/// One push: our worker's reads streamed to the peer (module docs).
+fn push(
+    lane: &LaneRun,
+    target: &Target,
+    client: &SessionWorkerClient,
+    route: &SyncRoute,
+    items: Vec<WantItem>,
+    spans: &[(u64, u64)],
+    slot: Slot,
+) -> Result<Pushed, PushError> {
+    let began = Instant::now();
+    lane.started(&target.repo, ops::OBJECTS_PUSH);
+    bump(&lane.stats.pushes, 1);
+    let sizes: HashMap<String, u64> = items
+        .iter()
+        .map(|item| (item.hash.clone(), item.size))
+        .collect();
+    let ranges = read_ranges(&items, spans);
+    let request = ObjectsPush {
+        repo: route.repo.clone(),
+        sender: route.local_replica.clone(),
+        receiver: route.remote_replica.clone(),
+        lane: lane.spec,
+        items,
+    };
+    let finish = |error: Option<&CallError>, sent: u64, completed: u64| {
+        lane.finished(
+            &target.repo,
+            ops::OBJECTS_PUSH,
+            error.map(CallError::to_wire),
+            sent,
+            0,
+            completed,
+            0,
+            began,
+        );
+    };
+    let mut upload = match lane.conn.upload(
+        ops::OBJECTS_PUSH,
+        serde_json::to_value(&request).unwrap_or_default(),
+        Priority::Control,
+        lane.options.idle,
+    ) {
+        Ok(upload) => upload,
+        Err(error) => {
+            finish(Some(&error), 0, 0);
+            drop(slot);
+            return Err(PushError::Failed(ExchangeError::peer(error)));
+        }
+    };
+    let mut sent = 0u64;
+    let mut local: HashMap<String, ObjectOutcome> = HashMap::new();
+    let mut failure: Option<ExchangeError> = None;
+    client.read_stream(
+        route,
+        &ranges,
+        lane.options.reads,
+        worker_client::deadlines::READ,
+        &mut |range, result| {
+            if lane.stopped() {
+                failure = Some(lane.stop_error());
+                return ReadFlow::Stop;
+            }
+            match result {
+                Ok((total, bytes)) => {
+                    let size = sizes.get(&range.hash).copied().unwrap_or(total);
+                    if total != size || bytes.len() as u64 != range.len {
+                        local.insert(range.hash.clone(), ObjectOutcome::SizeMismatch);
+                        return ReadFlow::SkipObject;
+                    }
+                    let header = ChunkHeader {
+                        id: 0,
+                        hash: Some(range.hash.clone()),
+                        offset: range.offset,
+                        total,
+                        last: range.offset + range.len == total,
+                    };
+                    match upload.chunk(header, &bytes) {
+                        Ok(()) => {
+                            sent += range.len;
+                            ReadFlow::Continue
+                        }
+                        Err(error) => {
+                            failure = Some(ExchangeError::peer(error));
+                            ReadFlow::Stop
+                        }
+                    }
+                }
+                Err(error @ (CallError::Unavailable(_) | CallError::ConnectionLost(_))) => {
+                    failure = Some(ExchangeError::local(error));
+                    ReadFlow::Stop
+                }
+                Err(error) => {
+                    local.insert(range.hash.clone(), read_outcome(&error));
+                    ReadFlow::SkipObject
+                }
+            }
+        },
+    );
+    bump(&lane.stats.bytes_pushed, sent);
+    let result = match failure {
+        Some(error) => {
+            drop(upload);
+            Err(error)
+        }
+        None => upload
+            .finish()
+            .and_then(|reply| body_of::<ObjectsResult>(&reply, ops::OBJECTS_PUSH))
+            .map_err(ExchangeError::peer),
+    };
+    drop(slot);
+    for (hash, outcome) in &local {
+        lane.object_failed(target, true, hash, outcome);
+    }
+    match result {
+        Ok(results) => {
+            let mut completed = 0;
+            for result in &results.results {
+                match &result.outcome {
+                    ObjectOutcome::Completed => {
+                        completed += 1;
+                        lane.object_done(target, true, &result.hash);
+                    }
+                    ObjectOutcome::CorruptAtSource => {
+                        // The peer's hash check failed on our bytes: our
+                        // worker re-verifies (and quarantines) its copy.
+                        lane.object_failed(target, true, &result.hash, &result.outcome);
+                        if let Err(error) = client.report(
+                            route,
+                            &result.hash,
+                            "CORRUPT_AT_SOURCE",
+                            worker_client::deadlines::REPORT,
+                        ) {
+                            event!(warn, (error.code().as_str()), {
+                                "peer": lane.peer.installation,
+                                "repo": target.repo,
+                                "object": result.hash,
+                                "detail": format!("local objects.report failed: {error}"),
+                            });
+                        }
+                    }
+                    other if !local.contains_key(&result.hash) => {
+                        lane.object_failed(target, true, &result.hash, other);
+                    }
+                    _ => {}
+                }
+            }
+            bump(&lane.stats.objects_up, completed);
+            finish(None, sent, completed);
+            Ok(Pushed { sent, completed })
+        }
+        Err(error) => {
+            finish(Some(&error.error), sent, 0);
+            if is_unsupported(&error.error) {
+                return Err(PushError::Interim(error.error));
+            }
+            Err(PushError::Failed(error))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interim path (§6.5)
 
 /// Options of an interim bulk lane.
 #[derive(Clone, Debug)]
@@ -136,20 +2882,8 @@ impl BulkOutcome {
     }
 }
 
-/// One bulk lane: runs until `cancel` fires or the session closes or goes
-/// away.
-pub fn run_bulk_lane(
-    ctx: Arc<Ctx>,
-    peer: Arc<PeerContext>,
-    lane: LaneSpec,
-    conn: session::Conn,
-    cancel: Cancel,
-) {
-    let options = BulkOptions::for_config(&ctx.config);
-    run_bulk_lane_with(ctx, peer, lane, conn, cancel, options);
-}
-
-/// [`run_bulk_lane`] with explicit options.
+/// One bulk lane on the interim path only (Wave 2's lane): runs until
+/// `cancel` fires or the session closes or goes away.
 pub fn run_bulk_lane_with(
     ctx: Arc<Ctx>,
     peer: Arc<PeerContext>,
@@ -160,18 +2894,7 @@ pub fn run_bulk_lane_with(
 ) {
     let status = status_lane(lane);
     let name = format!("bulk-{}-{}", short(&peer.installation), status);
-    let checked = if lane.is_valid() {
-        check_session(&peer, &conn, LaneRole::Bulk, Some(lane))
-    } else {
-        Err(crate::model::errors::ErrorWire::coded(
-            "INVALID_BULK_LANE",
-            format!(
-                "lane {}/{} is not a valid bulk lane",
-                lane.index, lane.count
-            ),
-        ))
-    };
-    if let Err(error) = checked {
+    if let Err(error) = lane_check(&peer, &conn, lane) {
         refuse(&ctx, &peer, &conn, &cancel, status, error, &options.drive);
         return;
     }
@@ -181,7 +2904,7 @@ pub fn run_bulk_lane_with(
         conn: conn.clone(),
         lane,
         options: options.clone(),
-        inventories: Mutex::new(Inventories::default()),
+        state: InterimState::default(),
     });
     drive(
         &ctx,
@@ -201,7 +2924,7 @@ struct BulkJob {
     conn: session::Conn,
     lane: LaneSpec,
     options: BulkOptions,
-    inventories: Mutex<Inventories>,
+    state: InterimState,
 }
 
 /// The peer's last inventory per repository (the legacy lane's cache): the
@@ -220,6 +2943,73 @@ struct Inventories {
 impl Inventories {
     fn epoch(&self, repo: &str) -> u64 {
         self.epochs.get(repo).copied().unwrap_or(0)
+    }
+}
+
+/// The interim path's state of one lane.
+#[derive(Default)]
+struct InterimState {
+    inventories: Mutex<Inventories>,
+}
+
+impl InterimState {
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &self,
+        ctx: &Ctx,
+        conn: &session::Conn,
+        peer: &PeerContext,
+        lane: LaneSpec,
+        options: &BulkOptions,
+        target: &Target,
+        retry_after: &mut dyn FnMut(&ExchangeError) -> Option<Duration>,
+    ) -> Result<Next, ExchangeError> {
+        let (epoch, inventory) = {
+            let cache = lock(&self.inventories);
+            (
+                cache.epoch(&target.repo),
+                cache.pages.get(&target.repo).cloned(),
+            )
+        };
+        let result = bulk_exchange(
+            ctx,
+            conn,
+            peer,
+            lane,
+            &target.folder,
+            &target.remote,
+            inventory.as_ref(),
+            options,
+            retry_after,
+        );
+        let mut cache = lock(&self.inventories);
+        match result {
+            Ok(outcome) => {
+                let moved = outcome.moved();
+                // Not if the key was reset or removed meanwhile: this is the
+                // inventory of the old route (or of a key that is gone).
+                if cache.epoch(&target.repo) == epoch {
+                    cache.pages.insert(target.repo.clone(), outcome.inventory);
+                }
+                Ok(Next {
+                    after: moved.then_some(options.content_yield),
+                    progress: moved,
+                })
+            }
+            Err(error) => {
+                // A failed exchange may leave the cached inventory stale (a
+                // replica change, say): the next offer starts without it.
+                cache.pages.remove(&target.repo);
+                Err(error)
+            }
+        }
+    }
+
+    fn forget(&self, repo: &str) {
+        let mut cache = lock(&self.inventories);
+        cache.pages.remove(repo);
+        let epoch = cache.epochs.entry(repo.to_owned()).or_default();
+        *epoch = epoch.wrapping_add(1);
     }
 }
 
@@ -248,52 +3038,19 @@ impl Job for BulkJob {
         target: &Target,
         retry_after: &mut dyn FnMut(&ExchangeError) -> Option<Duration>,
     ) -> Result<Next, ExchangeError> {
-        let (epoch, inventory) = {
-            let cache = lock(&self.inventories);
-            (
-                cache.epoch(&target.repo),
-                cache.pages.get(&target.repo).cloned(),
-            )
-        };
-        let result = bulk_exchange(
+        self.state.run(
             &self.ctx,
             &self.conn,
             &self.peer,
             self.lane,
-            &target.folder,
-            &target.remote,
-            inventory.as_ref(),
             &self.options,
+            target,
             retry_after,
-        );
-        let mut cache = lock(&self.inventories);
-        match result {
-            Ok(outcome) => {
-                let moved = outcome.moved();
-                // Not if the key was reset or removed meanwhile: this is the
-                // inventory of the old route (or of a key that is gone).
-                if cache.epoch(&target.repo) == epoch {
-                    cache.pages.insert(target.repo.clone(), outcome.inventory);
-                }
-                Ok(Next {
-                    after: moved.then_some(self.options.content_yield),
-                    progress: moved,
-                })
-            }
-            Err(error) => {
-                // A failed exchange may leave the cached inventory stale (a
-                // replica change, say): the next offer starts without it.
-                cache.pages.remove(&target.repo);
-                Err(error)
-            }
-        }
+        )
     }
 
     fn forget(&self, repo: &str) {
-        let mut cache = lock(&self.inventories);
-        cache.pages.remove(repo);
-        let epoch = cache.epochs.entry(repo.to_owned()).or_default();
-        *epoch = epoch.wrapping_add(1);
+        self.state.forget(repo);
     }
 }
 
@@ -468,12 +3225,7 @@ fn run(
 pub const MAX_REPLY: usize = crate::ws::MAX_MESSAGE;
 
 /// Appends one streamed reply chunk: in order, and within [`MAX_REPLY`].
-fn collect(
-    body: &mut Vec<u8>,
-    chunk: &crate::model::protocol::frame::ChunkHeader,
-    bytes: &[u8],
-) -> Result<(), crate::model::errors::ErrorWire> {
-    use crate::model::errors::ErrorWire;
+fn collect(body: &mut Vec<u8>, chunk: &ChunkHeader, bytes: &[u8]) -> Result<(), ErrorWire> {
     if chunk.hash.is_some() || chunk.offset != body.len() as u64 {
         return Err(ErrorWire::coded(
             "PROTOCOL_VIOLATION",
