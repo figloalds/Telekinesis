@@ -795,7 +795,7 @@ fn arrives(what: &str, folder: &Value, name: &str, bytes: &[u8], logs: impl Fn()
 /// Run with `TKFS_BASELINE_BIN=<6298d0b tkfs binary> cargo test --test
 /// w1_integration -- --ignored interop`.
 #[test]
-#[ignore = "WP1.INT interop: needs TKFS_BASELINE_BIN (a 6298d0b tkfs binary)"]
+#[ignore = "WP1.INT interop (waves 1-2 only; since WP3.1 a 6298d0b peer fails closed, see qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides): needs TKFS_BASELINE_BIN"]
 fn interop_with_a_6298d0b_peer() {
     let baseline = PathBuf::from(
         std::env::var("TKFS_BASELINE_BIN").expect("TKFS_BASELINE_BIN: path of a 6298d0b tkfs"),

@@ -450,6 +450,7 @@ fn fixture(gate: Option<GateRecord>, view_gate: GateState) -> Fx {
         stopping: Arc::new(AtomicBool::new(false)),
         started_at_ms: now_ms(),
         endpoints: Snapshot::new(DaemonEndpoints::default()),
+        extensions: OnceLock::new(),
     });
     Fx {
         ctx,

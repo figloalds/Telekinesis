@@ -21,6 +21,7 @@
 //! | `feed_out(P, via)` | P's last reported cursor of our feed, per channel: carried by P's requests (`request`) or by P's replies to ours (`reply`) |
 //! | `feed_needs(P, id)` | ids P's feed listed (elided or `large`) that we lack, and missing parents we asked P for |
 //! | `feed_rejected(P, id)` | events of P's feed we refused, durably (never acked) |
+//! | `feed_remaining(P)` | P's exact count of its feed entries after our cursor, as its last page reported it (CCR-WP2.5-4) |
 //!
 //! **Acks** (invariant 10): `peer_known(P, id)` is written only for an entry
 //! of P's committed feed (or an event P served from its committed journal
@@ -29,6 +30,15 @@
 //! committed. The cursor never acks; a staged or rejected event never acks;
 //! an outbox row inserted later (a staged event that commits) is acked by the
 //! `feed_outbox_known` trigger when the evidence is already there.
+//!
+//! **Needs, both ways** (CCR-WP2.5-2, applied by WP3.1): a request lists
+//! what the dialer needs from the acceptor (`need`, served in the reply's
+//! `need_served`), and a reply lists what the acceptor needs from the dialer
+//! (`need`, served in the dialer's next request's `need_served`, with ids it
+//! does not have in `unknown`). So large events, elided entries a side
+//! lacks and missing parents travel in both directions under one-way
+//! pairing, and request pages flag large events like reply pages do (they
+//! no longer carry them inline).
 //!
 //! **Regressions**: a peer reporting a lower cursor of our (unchanged) feed
 //! than it reported before lost state (a restore). We then forget everything
@@ -86,8 +96,8 @@ pub(crate) struct Cache {
     missing_scan: Cell<Option<(Option<i64>, i64)>>,
 }
 
-/// `schema:sharing` stamp.
-const SCHEMA_VERSION: i64 = 1;
+/// `schema:sharing` stamp (2: `feed_remaining`, WP3.1).
+const SCHEMA_VERSION: i64 = 2;
 /// An id a peer reported unknown is asked for again after this long.
 const NEED_RETRY_MS: i64 = 60_000;
 /// `feed_needs.reason` of ids listed by the peer's feed (elided entries we do
@@ -113,6 +123,56 @@ const OFFERS_KEPT: usize = 1024;
 /// exchange deadline, and the next exchange rebuilt the same page
 /// (post-integration re-review, WP2.INT).
 pub const PAGE_READ_BUDGET: u64 = 8 * 1024 * 1024;
+
+/// What an acceptor asked of us in its reply (`reply.need`), until our next
+/// request to it serves it (CCR-WP2.5-2). Process-wide like the offers (the
+/// apply and the next offer may run on different pooled stores); a need
+/// lost with a worker restart is asked again in the acceptor's next reply.
+/// Keyed by the local replica too: in a process holding several replicas
+/// of one repository that dial the same acceptor, one replica must not take
+/// (and serve, or report `unknown`) what the acceptor asked of another.
+struct PendingNeed {
+    repo: String,
+    local: String,
+    peer: String,
+    ids: Vec<String>,
+}
+
+impl PendingNeed {
+    fn is(&self, repo: &str, local: &str, peer: &str) -> bool {
+        self.repo == repo && self.local == local && self.peer == peer
+    }
+}
+
+static PENDING_NEEDS: Mutex<VecDeque<PendingNeed>> = Mutex::new(VecDeque::new());
+
+fn remember_needs(repo: &str, local: &str, peer: &str, ids: Vec<String>) {
+    let mut pending = lock(&PENDING_NEEDS);
+    pending.retain(|need| !need.is(repo, local, peer));
+    if ids.is_empty() {
+        return;
+    }
+    while pending.len() >= OFFERS_KEPT {
+        pending.pop_front();
+    }
+    pending.push_back(PendingNeed {
+        repo: repo.to_owned(),
+        local: local.to_owned(),
+        peer: peer.to_owned(),
+        ids,
+    });
+}
+
+fn take_needs(repo: &str, local: &str, peer: &str) -> Vec<String> {
+    let mut pending = lock(&PENDING_NEEDS);
+    match pending.iter().position(|need| need.is(repo, local, peer)) {
+        Some(position) => pending
+            .remove(position)
+            .map(|need| need.ids)
+            .unwrap_or_default(),
+        None => vec![],
+    }
+}
 
 /// What one `build_exchange_request` sent, until `apply_exchange_reply`
 /// folds it into the dialer's summary. Process-wide: the offer and the apply
@@ -218,6 +278,8 @@ fn define_schema(db: &Connection) -> Result<()> {
                 PRIMARY KEY(peer,event));
             CREATE TABLE IF NOT EXISTS feed_rejected(peer TEXT NOT NULL,event TEXT NOT NULL,seq INTEGER NOT NULL,
                 code TEXT NOT NULL,message TEXT NOT NULL,payload TEXT,at_ms INTEGER NOT NULL,PRIMARY KEY(peer,event));
+            CREATE TABLE IF NOT EXISTS feed_remaining(peer TEXT PRIMARY KEY,epoch TEXT NOT NULL,seq INTEGER NOT NULL,
+                tip INTEGER NOT NULL,remaining INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS feed_needs_event ON feed_needs(event);
             CREATE INDEX IF NOT EXISTS incoming_sources_peer ON incoming_sources(peer);
             CREATE TRIGGER IF NOT EXISTS feed_outbox_known AFTER INSERT ON outbox
@@ -697,6 +759,10 @@ struct PeerView {
     /// still to read, elided or not (exact, capped at `COUNT_CAP`).
     to_send: u64,
     local_tip: i64,
+    /// The peer's own count of its feed entries after our cursor, from the
+    /// page that moved the cursor there and reported the current tip
+    /// (CCR-WP2.5-4); `None` when no such report is on record.
+    reported_remaining: Option<u64>,
 }
 
 impl PeerView {
@@ -709,10 +775,14 @@ impl PeerView {
     fn remote_pending(&self) -> u64 {
         self.row.as_ref().map_or(0, |row| row.pending_active)
     }
-    /// Entries of the peer's feed after our cursor (an upper bound when the
-    /// peer's feed has gaps: private events and deleted rows hold seqs).
+    /// Entries of the peer's feed after our cursor: the peer's exact count
+    /// when its page reported one for this cursor and tip (CCR-WP2.5-4), else
+    /// the upper bound `tip - cursor` (private events and deleted rows of the
+    /// peer's journal hold seqs too).
     fn remaining(&self) -> u64 {
-        capped(self.remote_tip().saturating_sub(self.cursor_in()))
+        let bound = capped(self.remote_tip().saturating_sub(self.cursor_in()));
+        self.reported_remaining
+            .map_or(bound, |reported| reported.min(bound))
     }
     fn to_receive(&self) -> u64 {
         self.remaining().saturating_add(self.needs).min(COUNT_CAP)
@@ -846,18 +916,19 @@ impl Store {
         self.feed_read(|| self.page_after(after, for_peer, max_entries, max_bytes, false))
     }
     /// `feed-offer` (§6.3.5 step 1): our page from `feed_out(peer)`, our
-    /// cursor of the peer's feed, the ids we need from it and our state.
-    ///
-    /// A request page carries a large event inline, as its last payload: the
-    /// acceptor can never ask the dialer for an event, since a reply has no
-    /// `need` (CCR-WP2.5-2).
+    /// cursor of the peer's feed, the ids we need from it, our state, and
+    /// what the peer's previous reply asked of us (`need_served`, `unknown`;
+    /// CCR-WP2.5-2). Large events are flagged in the page, as in a reply:
+    /// the acceptor asks for them through its reply's `need`.
     pub fn build_exchange_request(&self, route: &SyncRoute) -> Result<MetaExchangeRequest> {
         self.check_route(route)?;
         let peer = route.remote_replica.as_str();
+        let asked = take_needs(&self.repo, &self.device, peer);
         let request = self.feed_read(|| {
             let out = self.out_row(peer)?;
             let page =
-                self.page_after(out.as_ref(), peer, MAX_PAGE_ENTRIES, MAX_PAGE_BYTES, true)?;
+                self.page_after(out.as_ref(), peer, MAX_PAGE_ENTRIES, MAX_PAGE_BYTES, false)?;
+            let (need_served, unknown) = self.events_by_ids(&asked, MAX_NEED_BYTES)?;
             Ok(MetaExchangeRequest {
                 format: FEED_FORMAT,
                 request: id(),
@@ -868,13 +939,23 @@ impl Store {
                 cursor: self.in_row(peer)?.map(|row| row.cursor),
                 need: self.need_list(peer)?,
                 state: self.feed_state()?,
+                need_served,
+                unknown,
             })
         })?;
         // The dialer's `feed-apply` summary reports what this request sent.
         let mut sent = page_sent(&request.page);
-        sent.bytes = request.need.iter().fold(sent.bytes, |bytes, id| {
-            bytes.saturating_add(id.len() as u64 + 3)
-        });
+        sent.bytes = request
+            .need
+            .iter()
+            .chain(&request.unknown)
+            .fold(sent.bytes, |bytes, id| {
+                bytes.saturating_add(id.len() as u64 + 3)
+            });
+        for event in &request.need_served {
+            sent.events += 1;
+            sent.bytes += serde_json::to_vec(event)?.len() as u64;
+        }
         remember_offer(Offer {
             request: request.request.clone(),
             repo: self.repo.clone(),
@@ -906,12 +987,16 @@ impl Store {
         );
         uuid::Uuid::parse_str(&req.request).context("INVALID_SYNC_REQUEST_ID")?;
         ensure!(
-            req.need.len() <= MAX_NEED,
-            "INVENTORY_TOO_LARGE: {} needed ids",
-            req.need.len()
+            req.need.len() <= MAX_NEED
+                && req.need_served.len() <= MAX_NEED
+                && req.unknown.len() <= MAX_NEED,
+            "INVENTORY_TOO_LARGE: {} needed, {} served and {} unknown ids",
+            req.need.len(),
+            req.need_served.len(),
+            req.unknown.len()
         );
         ensure!(
-            req.need.iter().all(|id| valid_id(id)),
+            req.need.iter().chain(&req.unknown).all(|id| valid_id(id)),
             "PROTOCOL_VIOLATION: malformed need id"
         );
         ensure!(
@@ -921,7 +1006,10 @@ impl Store {
         let peer = route.remote_replica.as_str();
         let before = self.feed_read(|| self.marks(peer))?;
         let (status, mut received) = self.feed_write(|| {
-            let (status, received) = self.receive_page(peer, &req.page, &req.state)?;
+            let (status, mut received) = self.receive_page(peer, &req.page, &req.state)?;
+            // What we asked of the dialer in our previous reply (CCR-WP2.5-2).
+            self.receive_served(peer, &req.need_served, &mut received)?;
+            self.mark_unknown(peer, &req.unknown)?;
             // Our reply page resets when the dialer's cursor of our feed is
             // invalid: it restarts from the start, which is all we know of it.
             let reset = match &req.cursor {
@@ -979,6 +1067,9 @@ impl Store {
                 need_served,
                 unknown,
                 state: self.feed_state()?,
+                // What we need from the dialer, served in its next request
+                // (CCR-WP2.5-2).
+                need: self.need_list(peer)?,
             };
             Ok((reply, local))
         })
@@ -1009,11 +1100,16 @@ impl Store {
         ensure!(
             reply.need_served.len() <= MAX_NEED
                 && reply.unknown.len() <= MAX_NEED
+                && reply.need.len() <= MAX_NEED
                 && reply.rejected.len() <= MAX_REJECTED_SHOWN,
             "INVENTORY_TOO_LARGE: feed reply lists"
         );
         ensure!(
-            reply.unknown.iter().all(|id| valid_id(id)),
+            reply
+                .unknown
+                .iter()
+                .chain(&reply.need)
+                .all(|id| valid_id(id)),
             "PROTOCOL_VIOLATION: malformed unknown id"
         );
         let expected = match &reply.page_status {
@@ -1048,6 +1144,8 @@ impl Store {
         received.bytes = received
             .bytes
             .saturating_add(ENTRY_OVERHEAD * reply.page.entries.len() as u64 + MESSAGE_OVERHEAD);
+        // The acceptor's needs, for our next request to it (CCR-WP2.5-2).
+        remember_needs(&self.repo, &self.device, peer, reply.need.clone());
         self.feed_read(|| self.apply_result(peer, &received, &sent, before))
     }
     /// Per-peer feed counters for the heartbeat (`PeerFeedCounters`).
@@ -1266,6 +1364,7 @@ impl Store {
                 entries: vec![],
                 tip,
                 more: tip > 0,
+                remaining: Some(self.feed_after(0)?),
             });
         };
         let reset = !self.validate_cursor(after)?;
@@ -1339,10 +1438,20 @@ impl Store {
             after: Some(base),
             reset,
             entries,
+            remaining: Some(self.feed_after(through.seq)?),
             through,
             tip,
             epoch,
         })
+    }
+    /// Entries of our feed after `seq` (a `feed_journal` rowid range count,
+    /// capped at `COUNT_CAP`).
+    fn feed_after(&self, seq: i64) -> Result<u64> {
+        let count: i64 = self
+            .db
+            .prepare_cached(FEED_AFTER_SQL)?
+            .query_row(params![seq, COUNT_CAP as i64], |r| r.get(0))?;
+        Ok(capped(count))
     }
     fn peer_knows(&self, peer: &str, id: &str) -> Result<bool> {
         Ok(self
@@ -1460,6 +1569,7 @@ impl Store {
         let mut received = Received::default();
         let Some(after) = &page.after else {
             self.put_in_row(peer, previous.as_ref(), &row)?;
+            self.put_remaining(peer, &row, page)?;
             return Ok((PageStatus::Accepted, received));
         };
         let status = if page.reset {
@@ -1498,7 +1608,35 @@ impl Store {
         )?;
         row.cursor = page.through.clone();
         self.put_in_row(peer, previous.as_ref(), &row)?;
+        self.put_remaining(peer, &row, page)?;
         Ok((status, received))
+    }
+    /// Records `page.remaining` (CCR-WP2.5-4) when it counts from our cursor
+    /// (`row`, as just stored): the page ends at our cursor. Kept with the
+    /// cursor and the tip it was counted at, and used only while both are
+    /// still ours (`peer_view`), so a stale count never shows.
+    fn put_remaining(&self, peer: &str, row: &InRow, page: &FeedPage) -> Result<()> {
+        let Some(remaining) = page.remaining else {
+            return Ok(());
+        };
+        if row.cursor != page.through {
+            return Ok(());
+        }
+        let remaining = i64::try_from(remaining.min(COUNT_CAP)).unwrap_or(0);
+        self.db
+            .prepare_cached(
+                "INSERT INTO feed_remaining(peer,epoch,seq,tip,remaining) VALUES(?1,?2,?3,?4,?5)
+                ON CONFLICT(peer) DO UPDATE SET epoch=?2,seq=?3,tip=?4,remaining=?5
+                WHERE (epoch,seq,tip,remaining)<>(?2,?3,?4,?5)",
+            )?
+            .execute(params![
+                peer,
+                row.cursor.epoch,
+                row.cursor.seq,
+                row.tip,
+                remaining
+            ])?;
+        Ok(())
     }
     /// Stage events `peer` served through `need` (its committed shared
     /// events), checked against the digest its feed listed, if any.
@@ -2153,14 +2291,30 @@ impl Store {
                 "SELECT count(*) FROM feed_needs WHERE peer=? AND reason IN (?,?) AND missing_at IS NULL",
             )?
             .query_row(params![peer, NEED_LISTED[0], NEED_LISTED[1]], |r| r.get(0))?;
+        let row = self.in_row(peer)?;
+        let reported_remaining = match &row {
+            Some(row) => self
+                .db
+                .prepare_cached(
+                    "SELECT remaining FROM feed_remaining WHERE peer=? AND epoch=? AND seq=? AND tip=?",
+                )?
+                .query_row(
+                    params![peer, row.cursor.epoch, row.cursor.seq, row.tip],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+                .map(capped),
+            None => None,
+        };
         Ok(PeerView {
-            row: self.in_row(peer)?,
+            row,
             out,
             source: self.source_counts(peer)?,
             rejected: capped(rejected),
             needs: capped(needs),
             to_send: capped(to_send),
             local_tip: self.feed_tip()?,
+            reported_remaining,
         })
     }
     fn apply_result(

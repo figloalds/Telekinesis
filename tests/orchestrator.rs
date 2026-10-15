@@ -1,15 +1,38 @@
+//! Daemon-level tests (two or three real daemons). WP3.1 migrated them to
+//! v3 networking (REVAMP_PLAN §14 WP3.1 task 3): the legacy (v2) lanes are
+//! gone, the List/Inspect/Peers shapes are the hub's projection (§7.3), and
+//! a 6298d0b peer fails closed (`legacy_peer_fails_closed_with_needs_upgrade`).
 use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
     process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 use tkfs::{
     core::{hash, id},
+    model::{
+        errors::ErrorWire,
+        ipc::{FeedExchangeReply, PublishedSummary},
+        orchestrator::{EntryState, PublishedEntry},
+        protocol::{
+            CatalogListReply,
+            feed::{LARGE_EVENT_BYTES, MetaExchangeRequest},
+        },
+    },
     orchestrator::{self, Action, Config},
+    paired_sync::SyncRoute,
     runtime::{self, Discovery},
+    session::{
+        self, AcceptPolicy, AcceptedPeer, ClientHello, CodeAuth, Conn, ConnOptions, DialError,
+        Handler, Incoming, LaneRole, Priority, Reply,
+    },
     ws,
 };
 
@@ -101,6 +124,16 @@ impl Node {
             .as_str()
             .unwrap()
             .into()
+    }
+    fn installation(&self) -> String {
+        self.call(Action::List)["installation"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+    /// The typed status (`Status`, schema 2) as JSON.
+    fn status(&self) -> Value {
+        self.try_call(Action::Status).unwrap()
     }
     fn create(&self, label: &str, headless: bool) -> Value {
         let p = self.call(Action::Create {
@@ -242,7 +275,9 @@ fn one_repository_uses_all_bulk_lanes_and_keeps_control_free_of_objects() {
     let peers = b.call(Action::Peers);
     for lane in peers[0]["lanes"].as_array().unwrap() {
         assert_eq!(lane["parallel_bulk"], true);
-        assert_eq!(lane["transport"], "tkfs-binary-gzip-v1");
+        // WP3.1: every lane is a v3 session (§7.3); the rest of this test is
+        // served by the hub's projection of the v3 lanes.
+        assert_eq!(lane["transport"], "tkfs-peer/3");
     }
     let control = &peers[0]["lanes"][0]["repositories"][pa["repo"].as_str().unwrap()];
     assert_eq!(control["total_received_object_bytes"], 0);
@@ -382,20 +417,47 @@ fn pairing_code_only_rotation_invalidates_persistent_connections_and_rejects_leg
         .is_err()
     );
     b.pair(&a, &code);
-    let mut socket = ws::connect(&a.endpoint()).unwrap();
-    ws::call(
-        &mut socket,
-        &json!({"op":"pair","version":2,"code":code,"installation":id()}),
-    )
-    .unwrap();
-    ws::call(&mut socket, &json!({"op":"list"})).unwrap();
+    // WP3.1: a raw v3 probe session (what pairing and RemoteList dial) is
+    // the persistent connection; the legacy (v2) pair request is refused.
+    let probe = |code: &str| {
+        let hello = session::client_hello(&id(), LaneRole::Probe, None, 2);
+        session::dial(
+            &a.endpoint(),
+            hello,
+            &CodeAuth { code: code.into() },
+            None,
+            ConnOptions::for_role(LaneRole::Probe),
+        )
+    };
+    let (conn, server) = probe(&code).unwrap();
+    assert_eq!(server.installation, a.installation());
+    list_catalog(&conn).unwrap();
     let next = a.code();
     assert_ne!(next, code);
+    // The rotation sends the older session away: GOAWAY{PAIRING_CODE_CHANGED}.
+    let closed = conn
+        .wait_closed(Duration::from_secs(5))
+        .expect("the session outlived the rotation");
+    assert_eq!(closed.code, "PAIRING_CODE_CHANGED", "{closed}");
+    assert!(list_catalog(&conn).is_err());
+    // The old code no longer opens a session; the new one does.
+    match probe(&code) {
+        Err(DialError::Unauthorized(error)) => assert_eq!(error.code, "INVALID_PAIRING_CODE"),
+        other => panic!("the old code was not refused: {:?}", other.map(|_| ())),
+    }
+    let (fresh, _) = probe(&next).unwrap();
+    list_catalog(&fresh).unwrap();
+    fresh.close();
+    // A legacy (v2) transport is refused before any code is looked at.
+    let mut socket = ws::connect(&a.endpoint()).unwrap();
+    let refused = ws::call(
+        &mut socket,
+        &json!({"op":"pair","version":2,"code":next,"installation":id()}),
+    )
+    .unwrap_err();
     assert!(
-        ws::call(&mut socket, &json!({"op":"list"}))
-            .unwrap_err()
-            .to_string()
-            .contains("PAIRING_CODE_CHANGED")
+        format!("{refused:#}").contains("PEER_NEEDS_UPGRADE"),
+        "{refused:#}"
     );
     b.pair(&a, &next);
     wait_for(|| {
@@ -737,40 +799,332 @@ fn large_pages_resume_after_daemon_crash_and_server_restart_keeps_its_verifier()
     wait_for(|| has(&pa, "after-restart.txt", b"same code, same repository"));
 }
 
-#[test]
-fn pairing_refuses_a_peer_that_does_not_reserve_lanes() {
-    let node = Node::new();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        let mut socket = ws::accept(listener.accept().unwrap().0).unwrap();
-        let hello: Value = ws::receive(&mut socket).unwrap();
-        assert_eq!(hello["lane"], "control");
-        ws::reply(&mut socket, Ok(json!({"installation":id(),"version":2}))).unwrap();
-    });
-    let error = node
-        .try_call(Action::Pair {
-            endpoint,
-            code: "test".into(),
-            connections: None,
-        })
-        .unwrap_err();
-    assert!(error.to_string().contains("RESERVED_LANES_UNSUPPORTED"));
-    assert_eq!(node.call(Action::Peers), json!([]));
-    server.join().unwrap();
+/// An emulated 6298d0b acceptor: it upgrades any WebSocket (without the
+/// `X-Tkfs-Sync` echo, which a 6298d0b server does not know) and answers a
+/// legacy pairing hello. It records whether a pairing code ever reached it.
+struct LegacyAcceptor {
+    endpoint: String,
+    connections: Arc<AtomicUsize>,
+    saw_code: Arc<AtomicBool>,
 }
 
+impl LegacyAcceptor {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let connections = Arc::new(AtomicUsize::new(0));
+        let saw_code = Arc::new(AtomicBool::new(false));
+        let (count, seen) = (connections.clone(), saw_code.clone());
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                count.fetch_add(1, Ordering::SeqCst);
+                let seen = seen.clone();
+                thread::spawn(move || {
+                    let Ok(mut socket) = ws::accept(stream) else {
+                        return;
+                    };
+                    while let Ok(hello) = ws::receive::<Value>(&mut socket) {
+                        if hello.get("code").is_some() {
+                            seen.store(true, Ordering::SeqCst);
+                        }
+                        let reply = json!({"installation": id(), "version": 2,
+                            "lane": hello["lane"], "bulk_protocol": 1,
+                            "bulk_lane": hello["bulk_lane"]});
+                        if ws::reply(&mut socket, Ok(reply)).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Self {
+            endpoint,
+            connections,
+            saw_code,
+        }
+    }
+}
+
+/// WP3.1 replaces `pairing_refuses_a_peer_that_does_not_reserve_lanes` (a v2
+/// rule): a 6298d0b peer fails closed with `PEER_NEEDS_UPGRADE` on both
+/// sides (§6.2, invariant 20), and both daemons show it.
+#[test]
+fn legacy_peer_fails_closed_with_needs_upgrade() {
+    let mut a = Node::new();
+    let b = Node::new();
+    // (a) A v3 node pairing with a v2 acceptor: refused before the code is
+    // sent (no `X-Tkfs-Sync` echo), and nothing is stored.
+    let legacy = LegacyAcceptor::start();
+    let error = a
+        .try_call(Action::Pair {
+            endpoint: legacy.endpoint.clone(),
+            code: "secret-code".into(),
+            connections: Some(2),
+        })
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PEER_NEEDS_UPGRADE"),
+        "{error:#}"
+    );
+    assert!(legacy.connections.load(Ordering::SeqCst) > 0);
+    assert!(!legacy.saw_code.load(Ordering::SeqCst), "a code was sent");
+    assert_eq!(a.call(Action::Peers), json!([]));
+    // (b) A v2 dialer facing a v3 node: answered in the legacy format.
+    let code = b.code();
+    let mut socket = ws::connect(&b.endpoint()).unwrap();
+    let refused = ws::call(
+        &mut socket,
+        &json!({"op":"pair","version":2,"code":code,"installation":id(),
+            "lane":"control","bulk_protocol":1,"bulk_lane":null}),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("PEER_NEEDS_UPGRADE"),
+        "{refused:#}"
+    );
+    // (c) Both daemons' Status show it: the dialer's refused pairing, the
+    // acceptor's inbound attempt (never the code).
+    for (node, side) in [(&a, "dialer"), (&b, "acceptor")] {
+        wait_for(|| {
+            node.status()["daemon"]["errors"]
+                .as_array()
+                .is_some_and(|errors| {
+                    errors.iter().any(|record| {
+                        record["error"]["code"] == "PEER_NEEDS_UPGRADE"
+                            && record["resolved_at_ms"].is_null()
+                    })
+                })
+        });
+        let status = node.status().to_string();
+        assert!(!status.contains(&code), "{side}: the code is in status");
+        assert!(
+            !status.contains("secret-code"),
+            "{side}: the code is in status"
+        );
+    }
+    // A peer paired before the upgrade (a 6298d0b data directory) that still
+    // runs 6298d0b: the lanes stay Incompatible (no tight redial), Status and
+    // the legacy Peers reply say so, and the code is never sent.
+    a.stop();
+    let peer = id();
+    {
+        let db =
+            rusqlite::Connection::open(a.config.data_directory.join("folders.sqlite")).unwrap();
+        db.execute(
+            "INSERT INTO peers VALUES(?1,?2,?3,2,?4)",
+            rusqlite::params![legacy.endpoint, "legacy-code", peer, id()],
+        )
+        .unwrap();
+    }
+    a.start();
+    wait_for(|| {
+        let status = a.status();
+        status["peers"].as_array().is_some_and(|peers| {
+            peers.iter().any(|entry| {
+                entry["installation"] == peer.as_str()
+                    && entry["state"] == "incompatible"
+                    && entry["error"]["error"]["code"] == "PEER_NEEDS_UPGRADE"
+            })
+        })
+    });
+    let peers = a.call(Action::Peers);
+    assert_eq!(peers[0]["installation"], peer.as_str());
+    assert!(
+        peers[0]["lanes"].as_array().unwrap().iter().any(|lane| {
+            lane["connected"] == false
+                && lane["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("PEER_NEEDS_UPGRADE"))
+        }),
+        "{peers}"
+    );
+    let dials = legacy.connections.load(Ordering::SeqCst);
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        legacy.connections.load(Ordering::SeqCst) <= dials + 1,
+        "an incompatible peer is redialed in a loop"
+    );
+    assert!(!legacy.saw_code.load(Ordering::SeqCst), "a code was sent");
+}
+
+/// A v3 acceptor emulated in the test (`session::accept`): its folder is an
+/// in-process worker (`runtime::start_rpc`) that serves the feed
+/// (`feed-exchange`) and the interim bulk pages (`published-bulk-exchange`),
+/// as a daemon's inbound server would. Its first bulk `objects.exchange`
+/// stalls for `stall` before it is served.
+struct V3Acceptor {
+    endpoint: String,
+    code: String,
+    sessions: Arc<Mutex<Vec<(LaneRole, Conn)>>>,
+    stalled: mpsc::Receiver<()>,
+}
+
+struct AcceptorPolicy {
+    installation: String,
+    verifier: tkfs::pairing_code::Verifier,
+}
+
+impl AcceptPolicy for AcceptorPolicy {
+    fn installation(&self) -> String {
+        self.installation.clone()
+    }
+    fn verifier(&self) -> Option<(tkfs::pairing_code::Verifier, u64)> {
+        Some((self.verifier.clone(), 1))
+    }
+    fn admit(&self, _: &ClientHello) -> Result<(), ErrorWire> {
+        Ok(())
+    }
+    fn legacy_attempt(&self, _: std::net::SocketAddr, _: &Value) {}
+}
+
+struct AcceptorHandler {
+    peer: AcceptedPeer,
+    worker: Discovery,
+    stall: Duration,
+    stalled: Arc<AtomicBool>,
+    blocked: mpsc::Sender<()>,
+}
+
+impl Handler for AcceptorHandler {
+    fn handle(&self, req: Incoming) {
+        let Incoming {
+            op,
+            body,
+            responder,
+            ..
+        } = req;
+        let worker = |payload: Value| {
+            runtime::rpc(&self.worker, &id(), payload)
+                .map_err(|error| ErrorWire::from_error(&error))
+        };
+        let route = |sender: &str| SyncRoute {
+            peer: self.peer.installation.clone(),
+            repo: self.worker.repo.clone(),
+            local_replica: self.worker.device.clone(),
+            remote_replica: sender.to_owned(),
+        };
+        let reply: Result<(Value, Vec<u8>), ErrorWire> = match op.as_str() {
+            "ping" => Ok((json!({"alive": true}), vec![])),
+            "catalog.list" => worker(json!({"op":"published-summary"})).map(|summary| {
+                let summary: PublishedSummary = serde_json::from_value(summary).unwrap();
+                let entry = PublishedEntry {
+                    repo: summary.repo,
+                    replica: summary.replica,
+                    label: summary.label,
+                    branches: summary.branches,
+                    state: EntryState::Running,
+                    tip: Some(summary.tip),
+                    sync_generation: summary.sync_generation,
+                    content: None,
+                    error: None,
+                    updated_at_ms: 0,
+                };
+                let reply = CatalogListReply {
+                    generation: summary.sync_generation + 1,
+                    unchanged: false,
+                    entries: vec![entry],
+                };
+                (serde_json::to_value(reply).unwrap(), vec![])
+            }),
+            "meta.exchange" => {
+                let request: MetaExchangeRequest = serde_json::from_slice(&body).unwrap();
+                let route = route(&request.sender);
+                worker(json!({"op":"feed-exchange","route":route,"request":request})).map(|value| {
+                    let reply: FeedExchangeReply = serde_json::from_value(value).unwrap();
+                    (
+                        json!({"repo": route.repo}),
+                        serde_json::to_vec(&reply.reply).unwrap(),
+                    )
+                })
+            }
+            "objects.exchange" => {
+                if !self.stalled.swap(true, Ordering::SeqCst) {
+                    let _ = self.blocked.send(());
+                    thread::sleep(self.stall);
+                }
+                let page: tkfs::bulk_sync::Page = serde_json::from_slice(&body).unwrap();
+                let route = route(&page.sender);
+                worker(json!({"op":"published-bulk-exchange","route":route,"lane":page.lane,"page":page}))
+                    .map(|page| (json!({"repo": route.repo}), serde_json::to_vec(&page).unwrap()))
+            }
+            other => Err(ErrorWire::coded("UNKNOWN_PEER_OPERATION", other)),
+        };
+        match reply {
+            Ok((header, body)) => responder.reply(header, body),
+            Err(error) => responder.error(error),
+        }
+    }
+}
+
+impl V3Acceptor {
+    fn start(worker: Discovery, stall: Duration) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (code, verifier) = tkfs::pairing_code::Verifier::generate();
+        let policy = Arc::new(AcceptorPolicy {
+            installation: id(),
+            verifier,
+        });
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let (blocked, stalled) = mpsc::channel();
+        let stalled_once = Arc::new(AtomicBool::new(false));
+        let kept = sessions.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (policy, kept, worker, blocked, stalled_once) = (
+                    policy.clone(),
+                    kept.clone(),
+                    worker.clone(),
+                    blocked.clone(),
+                    stalled_once.clone(),
+                );
+                thread::spawn(move || {
+                    let Ok((conn, peer)) = session::accept(
+                        stream,
+                        policy as Arc<dyn AcceptPolicy>,
+                        ConnOptions::default(),
+                    ) else {
+                        return;
+                    };
+                    kept.lock().unwrap().push((peer.role, conn.clone()));
+                    conn.serve(Arc::new(AcceptorHandler {
+                        peer,
+                        worker,
+                        stall,
+                        stalled: stalled_once,
+                        blocked,
+                    }));
+                });
+            }
+        });
+        Self {
+            endpoint,
+            code,
+            sessions,
+            stalled,
+        }
+    }
+
+    /// Sessions accepted so far, by role.
+    fn accepted(&self, role: LaneRole) -> usize {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(accepted, _)| *accepted == role)
+            .count()
+    }
+}
+
+/// Rewritten by WP3.1 for v3 sessions: the acceptor's bulk handler stalls
+/// 20 s (longer than the legacy lanes' 15 s timeout) while the control
+/// session's `meta.exchange` is served by the acceptor's feed. The event
+/// still arrives within 8 s, and no lane resets (no new session is dialed).
 #[test]
 fn reserved_connection_delivers_events_while_bulk_is_blocked() {
-    use std::{
-        net::TcpListener,
-        sync::{Arc, Mutex, mpsc},
-    };
-    use tkfs::{
-        core::Store,
-        paired_sync::{self, SyncPage, SyncRoute},
-        runtime::Engine,
-    };
+    use tkfs::{core::Store, runtime::Engine};
 
     let mut node = Node::new();
     let project = node.create("Reserved lane", true);
@@ -779,107 +1133,33 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     let remote = Arc::new(Mutex::new(Engine::new(
         Store::initialize(remote_root.path(), project["repo"].as_str().unwrap(), &id()).unwrap(),
     )));
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let (blocked_tx, blocked_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let release_rx = Arc::new(Mutex::new(release_rx));
-    let server_remote = remote.clone();
-    let server =
-        thread::spawn(move || {
-            let installation = id();
-            let mut handlers = Vec::new();
-            // One pairing probe, then one reserved and one bulk connection even
-            // though the caller requested a pool of one.
-            for _ in 0..3 {
-                let (tcp, _) = listener.accept().unwrap();
-                let remote = server_remote.clone();
-                let installation = installation.clone();
-                let blocked = blocked_tx.clone();
-                let release = release_rx.clone();
-                handlers.push(thread::spawn(move || {
-                    let mut socket = ws::accept(tcp).unwrap();
-                    let hello: Value = ws::receive(&mut socket).unwrap();
-                    let role = hello["lane"].as_str().unwrap_or("probe");
-                    ws::reply(
-                        &mut socket,
-                        Ok(json!({"installation":installation,"version":2,"lane":hello["lane"]})),
-                    )
-                    .unwrap();
-                    let mut stalled = false;
-                    while let Ok(request) = ws::receive::<Value>(&mut socket) {
-                        if role == "bulk" && request["op"] == "exchange" && !stalled {
-                            blocked.send(()).unwrap();
-                            release
-                                .lock()
-                                .unwrap()
-                                .recv_timeout(Duration::from_secs(15))
-                                .unwrap();
-                            stalled = true;
-                        }
-                        let mut engine = remote.lock().unwrap();
-                        let response =
-                            match request["op"].as_str().unwrap() {
-                                "list" => {
-                                    assert_eq!(role, "control");
-                                    json!([paired_sync::summary(&engine).unwrap()])
-                                }
-                                "ping" => json!({"alive":true}),
-                                "exchange" => {
-                                    let page: SyncPage =
-                                        serde_json::from_value(request["page"].clone()).unwrap();
-                                    if role == "control" {
-                                        assert!(page.bundle.objects.is_empty());
-                                        assert!(page.object_parts.is_empty());
-                                    }
-                                    let route = SyncRoute {
-                                        peer: hello["installation"].as_str().unwrap().into(),
-                                        repo: engine.store.repo.clone(),
-                                        local_replica: engine.store.device.clone(),
-                                        remote_replica: page.sender.clone(),
-                                    };
-                                    paired_sync::worker_control(&mut engine, &json!({
-                                "op":"published-exchange","route":route,"page":page,
-                                "metadata_only":role == "control","max_frame":4*1024*1024
-                            })).unwrap()
-                                }
-                                other => panic!("unexpected request {other}"),
-                            };
-                        drop(engine);
-                        if ws::reply(&mut socket, Ok(response)).is_err() {
-                            break;
-                        }
-                    }
-                }));
-            }
-            for handler in handlers {
-                handler.join().unwrap();
-            }
-        });
+    let worker = runtime::start_rpc(remote.clone(), remote_root.path(), None).unwrap();
+    let acceptor = V3Acceptor::start(worker, Duration::from_secs(20));
+    // One pairing probe, then one reserved (control) and one bulk session even
+    // though the caller requested a pool of one.
     let paired = node.call(Action::Pair {
-        endpoint,
-        code: "test".into(),
+        endpoint: acceptor.endpoint.clone(),
+        code: acceptor.code.clone(),
         connections: Some(1),
     });
     assert_eq!(paired["connections"], 2);
-    blocked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    acceptor
+        .stalled
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap();
+    let stalled_at = Instant::now();
     rpc(&project, json!({"op":"mkdir","path":"during-bulk-stall"}));
     // An event created after the bulk exchange was blocked must arrive before
-    // release. Its file-write ancestor is valid metadata even without bytes;
-    // both the file and the new directory must already be visible.
+    // the stall ends. Its file-write ancestor is valid metadata even without
+    // bytes; both the file and the new directory must already be visible.
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
-        let delivered: bool = remote
+        let delivered = remote
             .lock()
             .unwrap()
             .store
-            .db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE payload LIKE '%during-bulk-stall%')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+            .lookup("during-bulk-stall")
+            .is_ok();
         if delivered {
             break;
         }
@@ -889,6 +1169,7 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
         );
         thread::sleep(Duration::from_millis(25));
     }
+    assert!(stalled_at.elapsed() < Duration::from_secs(20));
     assert!(remote.lock().unwrap().store.lookup("content.bin").is_ok());
     assert_eq!(
         remote.lock().unwrap().store.content_status().unwrap()["complete"],
@@ -900,20 +1181,143 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     assert_eq!(peers[0]["lanes"][0]["role"], "control");
     assert_eq!(peers[0]["lanes"][1]["role"], "bulk");
     assert!(peers[0]["lanes"][0]["exchanges"].as_u64().unwrap() > 0);
-    release_tx.send(()).unwrap();
+    // Once the stall ends the bulk page is served on the same session.
     wait_for(|| remote.lock().unwrap().store.content_status().unwrap()["complete"] == true);
-    wait_for(|| {
-        remote
-            .lock()
-            .unwrap()
-            .store
-            .lookup("during-bulk-stall")
-            .is_ok()
-    });
+    assert!(stalled_at.elapsed() >= Duration::from_secs(19));
+    assert_eq!(acceptor.accepted(LaneRole::Probe), 1);
+    assert_eq!(
+        acceptor.accepted(LaneRole::Control),
+        1,
+        "the control lane reset"
+    );
+    assert_eq!(acceptor.accepted(LaneRole::Bulk), 1, "the bulk lane reset");
     node.stop();
-    server.join().unwrap();
 }
 
+/// CCR-WP2.5-2 (need both ways): a dialer's event over `LARGE_EVENT_BYTES`
+/// is only flagged in its request page; the acceptor asks for it in its
+/// reply (`need`) and the dialer serves it in its next request
+/// (`need_served`). The dialer books that next request at once, as it does
+/// for `page.more`: under one-way pairing the event never waits for the
+/// idle interval (20 s here). WP3.1 fix round 1: the dialer counted only
+/// `page.more` as more work, so the event waited one full interval unless
+/// something else (a later heartbeat, a remote tip) called for an exchange.
+/// The test leaves nothing else: the event is made while B's sync is
+/// paused, so resuming calls for exactly one exchange.
+#[test]
+fn a_dialers_large_event_reaches_the_acceptor_without_waiting_for_the_interval() {
+    const DIRS: usize = 260;
+    let a = Node::with_interval(20_000);
+    let b = Node::with_interval(20_000);
+    let pa = a.create("Large dialer event", true);
+    // B dials A; A never dials B (one-way pairing).
+    b.pair(&a, &a.code());
+    let pb = b.receive(&a, &pa);
+    let state = pb["state"].as_str().unwrap().to_owned();
+    // B's current state: directories with 724-byte names, so that B's
+    // shared fork of it (one event that lists them all) is a large event.
+    let stem = "€".repeat(240);
+    for index in 0..DIRS {
+        rpc(
+            &pb,
+            json!({"op":"mkdir","path":format!("{stem}{index:04}")}),
+        );
+    }
+    let dirs = |p: &Value| {
+        rpc(p, json!({"op":"state"}))["entries"]
+            .as_object()
+            .map_or(0, |entries| {
+                entries
+                    .values()
+                    .filter(|e| {
+                        e["alive"] == true
+                            && e["name"]
+                                .as_str()
+                                .is_some_and(|name| name.starts_with(&stem))
+                    })
+                    .count()
+            })
+    };
+    wait_long("B's directories at A", Duration::from_secs(180), || {
+        dirs(&pa) == DIRS
+    });
+    // B has seen A's final tip (B polls A's catalog every 2 s, and a changed
+    // remote tip calls for an exchange).
+    let tip_at = |node: &Node| {
+        node.status()["folders"][0]["journal"]["tip"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    wait_long("B sees A's tip", Duration::from_secs(60), || {
+        let peer = &b.status()["folders"][0]["sync"]["peers"][0]["metadata"];
+        peer["remote_tip"].as_u64() == Some(tip_at(&a))
+            && peer["to_send"] == 0
+            && peer["to_receive"] == 0
+    });
+    thread::sleep(Duration::from_secs(3));
+    // The fork, while B's sync is paused: B's heartbeats report the new tip
+    // before the lane may use it.
+    b.call(Action::PauseSync {
+        state: state.clone(),
+    });
+    let before = tip_at(&b);
+    rpc(
+        &pb,
+        json!({"op":"publish","name":"big","current_state_only":true}),
+    );
+    wait_long("B's tip after the fork", Duration::from_secs(30), || {
+        tip_at(&b) == before + 1
+    });
+    thread::sleep(Duration::from_secs(3));
+    let has_branch = |p: &Value| {
+        rpc(p, json!({"op":"branches"}))
+            .as_array()
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| branch["name"] == "big" && branch["shared"] == true)
+            })
+    };
+    assert!(!has_branch(&pa));
+    let started = Instant::now();
+    b.call(Action::ResumeSync { state });
+    wait_long("the large event at A", Duration::from_secs(90), || {
+        has_branch(&pa)
+    });
+    let elapsed = started.elapsed();
+    // It is one large event of B's, and A committed it.
+    let on_big = |p: &Value| -> Vec<Value> {
+        rpc(p, json!({"op":"events"}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["branch"]["name"] == "big")
+            .cloned()
+            .collect()
+    };
+    let sent = on_big(&pb);
+    assert_eq!(sent.len(), 1);
+    let size = serde_json::to_string(&sent[0]).unwrap().len();
+    assert!(size > LARGE_EVENT_BYTES, "the fork is {size} bytes");
+    let committed = on_big(&pa);
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0]["id"], sent[0]["id"]);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the large event took {elapsed:?} to reach the acceptor (idle interval 20 s)"
+    );
+}
+
+/// `catalog.list` on a v3 session.
+fn list_catalog(conn: &Conn) -> Result<Reply, tkfs::model::orchestrator::CallError> {
+    conn.call(
+        "catalog.list",
+        json!({}),
+        vec![],
+        Priority::Control,
+        Duration::from_secs(10),
+    )
+}
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn real_partial_mount_fetches_on_read_without_blocking_unrelated_metadata() {
@@ -1068,6 +1472,16 @@ fn received_mount_waits_for_complete_metadata_across_daemon_restart() {
     wait_for(|| inspect(&b)["startup_phase"] == "synchronizing remote metadata");
     assert_eq!(inspect(&b)["initial_sync_pending"], true);
     assert!(!mount.exists());
+    // The gated worker runs already (RPC first, the mount attached in place
+    // once the gate is satisfied): its pid is the same after the attach.
+    let worker_pid = || {
+        let record: Value = serde_json::from_slice(
+            &fs::read(Path::new(pb["directory"].as_str().unwrap()).join("worker.json")).unwrap(),
+        )
+        .unwrap();
+        record["pid"].as_u64().unwrap()
+    };
+    let gated_pid = worker_pid();
     rpc(
         &pa,
         json!({"op":"published-exchange","route":reverse,"page":full,"metadata_only":true}),
@@ -1075,6 +1489,7 @@ fn received_mount_waits_for_complete_metadata_across_daemon_restart() {
     wait_for(|| inspect(&b)["running"] == true);
     assert_eq!(inspect(&b)["initial_sync_pending"], false);
     assert_eq!(inspect(&b)["mounted"], true);
+    assert_eq!(worker_pid(), gated_pid, "the worker restarted to attach");
     assert!(mount.join("parent/child").is_dir());
     // Once initialized, remounting remains possible with the source stopped.
     a.call(Action::Stop {
@@ -1087,4 +1502,224 @@ fn received_mount_waits_for_complete_metadata_across_daemon_restart() {
     });
     b.call(Action::Start { state });
     assert!(mount.join("parent/child").is_dir());
+}
+
+// ---------------------------------------------------------------------------
+// WP3.1: real daemons over a faulty v3 link
+
+#[allow(dead_code)]
+#[path = "support/proxy.rs"]
+mod proxy;
+#[path = "v3_wire_tap/mod.rs"]
+mod wire_tap;
+
+/// Deterministic bytes that do not compress.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// `name` holds `bytes`, and the object is installed (read back from the
+/// store; the status cell's `content.complete` may lag a new event).
+fn has_content(p: &Value, name: &str, bytes: &[u8]) -> bool {
+    has(p, name, bytes) && object_is(p, bytes)
+}
+
+/// The object of `bytes`, read back from the folder's store, is `bytes`.
+fn object_is(p: &Value, bytes: &[u8]) -> bool {
+    runtime::rpc(
+        &info(p),
+        &id(),
+        json!({"op":"cat-object","object":hash(bytes)}),
+    )
+    .is_ok_and(|object| object["hex"] == hex::encode(bytes))
+}
+
+fn wait_long(what: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !predicate() {
+        assert!(Instant::now() < deadline, "timeout: {what}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Two real daemons sync over v3 through a faulty link (`FaultProxy`): added
+/// latency and a bandwidth cap, a stall longer than the sessions' 20 s
+/// liveness bound (every session dies and is redialed), and resets in the
+/// middle of a transfer. Sync never sticks, in either direction, and no
+/// request is ever sent twice: a tap in front of the proxy reads the
+/// dialer's wire and sees every exchange identity once (invariant 16).
+#[test]
+fn sync_survives_latency_bandwidth_stalls_and_resets_without_replays() {
+    let a = Node::new();
+    let b = Node::new();
+    let proxy = proxy::FaultProxy::start(&a.endpoint());
+    let tap = wire_tap::WireTap::start(&proxy.endpoint());
+    let fa = a.create("Faulty link", true);
+    write(&fa, "seed.txt", b"seed");
+    b.call(Action::Pair {
+        endpoint: tap.endpoint(),
+        code: a.code(),
+        connections: Some(3),
+    });
+    let fb = b.call(Action::Receive {
+        endpoint: tap.endpoint(),
+        repo: fa["repo"].as_str().unwrap().into(),
+        label: "Faulty link".into(),
+        mount: None,
+        headless: true,
+    });
+    assert_eq!(fb["running"], true, "{fb}");
+    wait_long("the seed at B", Duration::from_secs(60), || {
+        has(&fb, "seed.txt", b"seed")
+    });
+
+    // 1. 40 ms RTT and 1 MiB/s each way: an object and events, both ways.
+    proxy.set_latency(Duration::from_millis(20));
+    proxy.set_bandwidth(1024 * 1024);
+    let big = noise(1, 2 * 1024 * 1024);
+    write(&fa, "big.bin", &big);
+    write(&fb, "from-b.txt", b"written at B");
+    wait_long(
+        "both directions under latency",
+        Duration::from_secs(90),
+        || has_content(&fb, "big.bin", &big) && has(&fa, "from-b.txt", b"written at B"),
+    );
+    assert!(object_is(&fb, &big));
+
+    // 2. A 22 s stall: no frame crosses the link for longer than the 20 s
+    // liveness bound, so every session is declared dead and redialed once
+    // the link is back. What was written meanwhile arrives, both ways.
+    let before_stall = proxy.connections();
+    proxy.stall_for(Duration::from_secs(22));
+    let stalled = Instant::now();
+    write(&fa, "during-stall-a.txt", b"written at A during the stall");
+    write(&fb, "during-stall-b.txt", b"written at B during the stall");
+    wait_long(
+        "the writes made during the stall",
+        Duration::from_secs(90),
+        || {
+            has(&fb, "during-stall-a.txt", b"written at A during the stall")
+                && has(&fa, "during-stall-b.txt", b"written at B during the stall")
+        },
+    );
+    assert!(stalled.elapsed() >= Duration::from_secs(20));
+    assert!(
+        proxy.connections() > before_stall,
+        "the dead sessions were not replaced"
+    );
+
+    // 3. Resets in the middle of a transfer: the transfer completes on new
+    // sessions (the uncertain exchanges are not replayed: fresh requests).
+    proxy.set_bandwidth(2 * 1024 * 1024);
+    let resets = proxy.resets();
+    let large = noise(2, 3 * 1024 * 1024);
+    write(&fa, "reset.bin", &large);
+    proxy.reset_after(512 * 1024);
+    wait_long(
+        "the transfer cut by a reset",
+        Duration::from_secs(120),
+        || has_content(&fb, "reset.bin", &large),
+    );
+    assert!(proxy.resets() > resets, "no connection was reset");
+    assert!(object_is(&fb, &large));
+    proxy.reset_all();
+    write(&fb, "after-reset.txt", b"after the resets");
+    wait_long("a write after the resets", Duration::from_secs(60), || {
+        has(&fa, "after-reset.txt", b"after the resets")
+    });
+
+    // 4. A clean link: nothing is left stuck.
+    proxy.clear();
+    write(&fa, "clean-a.txt", b"clean A");
+    write(&fb, "clean-b.txt", b"clean B");
+    wait_long(
+        "both directions on a clean link",
+        Duration::from_secs(60),
+        || has(&fb, "clean-a.txt", b"clean A") && has(&fa, "clean-b.txt", b"clean B"),
+    );
+
+    // Nothing was ever sent twice.
+    assert!(tap.count("meta.exchange") > 0, "{:?}", tap.seen().len());
+    assert!(tap.count("objects.exchange") > 0);
+    assert_eq!(tap.malformed(), 0, "the tap lost the dialer's stream");
+    // Every exchange request was identified, so the check below covers
+    // replays across connections too (not only reused session ids).
+    let unidentified = tap.unidentified();
+    assert!(unidentified.is_empty(), "{unidentified:#?}");
+    let duplicates = tap.duplicates();
+    assert!(duplicates.is_empty(), "{duplicates:#?}");
+}
+
+/// WP3.1 fix round 2: a Shutdown whose sequence panics before its network
+/// step (§3.6 step 2) still stops the network before the daemon ends. Both
+/// stacks' tokens are children of `ctx.shutdown`, so they stop accepting by
+/// themselves, but only `DaemonNetwork::shutdown` drains the inbound
+/// sessions and joins the peer supervisors within the deadline; and they
+/// hold the context, so the daemon letting go of its handle never did. Once
+/// `serve_with` returned, the network has been shut down (both stacks taken
+/// and stopped) and nothing accepts on the peer listener. In-process,
+/// because the fault is injected in this process (no other test of this
+/// file runs a daemon in-process).
+#[test]
+fn a_shutdown_sequence_that_panics_still_stops_the_network() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: orchestrator::Network {
+            listen: Some("127.0.0.1:0".into()),
+            connections: 2,
+            sync_interval_ms: 500,
+        },
+    };
+    let daemon = orchestrator::ctx::build(config).unwrap();
+    let endpoints = daemon.ctx.endpoints.load();
+    let control = endpoints.control.clone();
+    let network: std::net::SocketAddr = endpoints
+        .network
+        .as_deref()
+        .and_then(|endpoint| endpoint.strip_prefix("ws://"))
+        .expect("a peer listener")
+        .parse()
+        .unwrap();
+    let net = daemon.net.clone();
+    let server = thread::spawn(move || orchestrator::serve_with(daemon, false));
+    let accepts = || std::net::TcpStream::connect_timeout(&network, Duration::from_secs(5)).is_ok();
+    assert!(accepts(), "the peer listener does not accept");
+    fault::configure(Some(FaultConfig::new(
+        orchestrator::shutdown::faults::SEQUENCE,
+        FaultAction::Panic,
+    )));
+    let answered = ws::connect(&control)
+        .and_then(|mut socket| ws::call(&mut socket, &json!({"op":"shutdown"})));
+    fault::configure(None);
+    assert!(
+        answered.is_err(),
+        "the sequence did not panic: {answered:?}"
+    );
+    let until = Instant::now() + Duration::from_secs(30);
+    while !server.is_finished() {
+        assert!(Instant::now() < until, "the daemon did not end");
+        thread::sleep(Duration::from_millis(50));
+    }
+    server.join().unwrap().unwrap();
+    assert!(
+        net.inbound().is_none() && net.peers().is_none(),
+        "the daemon ended without shutting its network down: {net:?}"
+    );
+    assert!(
+        !accepts(),
+        "the peer listener still accepts after the daemon ended"
+    );
 }

@@ -285,10 +285,13 @@ fn offer(route: &SyncRoute, request: &str) -> MetaExchangeRequest {
             through: Cursor::start("local-epoch"),
             tip: 0,
             more: false,
+            remaining: None,
         },
         cursor: None,
         need: vec![],
         state: FeedState::default(),
+        need_served: vec![],
+        unknown: vec![],
     }
 }
 
@@ -583,6 +586,7 @@ fn ctx(world: &Arc<World>, interval_ms: u64) -> Arc<Ctx> {
         stopping: Arc::new(AtomicBool::new(false)),
         started_at_ms: 0,
         endpoints: Snapshot::new(DaemonEndpoints::default()),
+        extensions: OnceLock::new(),
     })
 }
 
@@ -925,6 +929,7 @@ fn reply_to(request: &MetaExchangeRequest, more: bool, status: PageStatus) -> Me
             through: Cursor::start(REMOTE_EPOCH),
             tip: 1,
             more,
+            remaining: None,
         },
         staged: 0,
         rejected: vec![],
@@ -935,6 +940,7 @@ fn reply_to(request: &MetaExchangeRequest, more: bool, status: PageStatus) -> Me
             tip: 1,
             ..FeedState::default()
         },
+        need: vec![],
     }
 }
 

@@ -1,8 +1,9 @@
 //! Owned by WP2.8 — the inbound v3 server (REVAMP_PLAN §3.8).
 //!
 //! The serving side of the peer protocol: bounded, authenticated and
-//! observable. Built standalone in Wave 2; WP3.1 runs it on the daemon's
-//! network listener ([`start`]) and stops it with [`InboundServer::shutdown`].
+//! observable. Built standalone in Wave 2; since WP3.1 the daemon runs it on
+//! its network listener ([`start`], from `run::serve`) and stops it with
+//! [`InboundServer::shutdown`] (through `ctx.network`'s shutdown).
 //!
 //! **Bounds (invariant 22).** One `net-accept` thread accepts. At most
 //! [`InboundOptions::max_preauth`] (32) connections are in the pre-auth
@@ -75,9 +76,11 @@
 //! {direction: inbound}` for every exchange a worker served (ok or failed,
 //! with the worker's own `FeedApplyResult` summary for `meta.exchange`);
 //! `InboundIncompatible` for a legacy (v2) hello or an unsupported protocol
-//! version. `ExchangeStarted` is not sent: the hub reads it as outbound
-//! work. A served `meta.exchange` also sends the folder its gate evidence
-//! from the acceptor's own view (`FolderCmd::GateEvidence`).
+//! version. A served `meta.exchange` records `ExchangeStarted{direction:
+//! inbound}` before its worker call (CCR-WP2.8-3, switched on by WP3.1: the
+//! hub books it on the inbound lane, so an inbound lane shows the exchange
+//! in flight). A served `meta.exchange` also sends the folder its gate
+//! evidence from the acceptor's own view (`FolderCmd::GateEvidence`).
 use crate::{
     model::{
         errors::ErrorWire,
@@ -1620,6 +1623,16 @@ fn meta_exchange(ctx: &Arc<Ctx>, peer: &AcceptedPeer, req: Incoming) {
     if responder.cancelled() {
         return;
     }
+    // CCR-WP2.8-3: the exchange is in flight on the inbound lane until its
+    // `ExchangeFinished` (every path below records one).
+    ctx.status.record(StatusEvent::ExchangeStarted {
+        installation: peer.installation.clone(),
+        repo: repo.clone(),
+        lane: status_lane(peer),
+        op: op.to_owned(),
+        at_ms: ctx.clock.now_ms(),
+        direction: Direction::Inbound,
+    });
     let reply = served
         .client
         .call(ipc::ops::FEED_EXCHANGE, payload, wait)
