@@ -88,7 +88,7 @@ Every must-fix item from the three judge panels appears below with its resolutio
 | I3 | Conflict counting over full-mode antichains; reproduce DELETE or prove monotonicity; accepted histories must rebuild; incremental mode behind a switch. | Append mode runs only under an **exactness precondition**: the old cone set is a subset of the new cone set, and each touched cone's relevant set equals the old set plus the new event. Under that precondition the old antichains are unchanged and full mode's DELETE is provably a no-op. Otherwise full mode runs, including the DELETE. Counting is always over all full-mode antichains. `TKFS_CONFLICT_MODE=full\|append\|verify`; `verify` runs both and fails on any difference. The oracle rebuild catches any accepted history that full mode would refuse. Clock-based incremental derivation is a **scope cut**. | §5.2, WP1.7 |
 | I4 | Private CAS: register only after a full verified transfer; no `AlreadyAvailable` or startup registration path. | The receiver skips an object only if it is already **shareable** (published or received_shared, and available). A physically present private object is re-transferred, verified and then registered. No startup reconciliation registers objects. The private-CAS tests, including the restart leg, are kept. A crash-between-install-and-register test is added. | §6.4, WP1.8, WP3.2 |
 | I5 | No ALTER on positional-INSERT tables. | Side tables only. The single exception is `incoming_events`, whose writers all use named columns (`core.rs:914`, `:2287`). Audit list in §9. The false claim in the base proposal ("object_errors uses named columns") is corrected: `core.rs:440` and `runtime.rs:1059` are positional. | §9 |
-| I6 | View cache on secondary handles. | The freshness key becomes `(branch, total_changes, PRAGMA data_version, transactional)`. | WP0.3 |
+| I6 | View cache on secondary handles. | The freshness key becomes `(branch, total_changes, PRAGMA data_version, transactional)`. Since WP3.INT a view also records the projection tables' change counter (`projection_version`, a side table bumped by triggers on `current_state` and `current_parts`, so older binaries' writes count too): another connection's commit that left the counter alone re-keys the view to the new `data_version` instead of reloading it. | WP0.3, WP3.INT |
 | I7 | Off-lock commit re-validates DB-dependent checks. | `commit_prepared` re-runs `EVENT_ID_REUSED`, `OBJECT_SIZE_CHANGED`, `BRANCH_DESCRIPTOR_CHANGED`, `UNREFERENCED_OBJECT_SIZE` and the branch-seq staleness check inside the commit savepoint, under the engine lock. | WP2.4 |
 | I8 | Dirty sessions on poison and force; Shutdown never kills responsive or refusing workers; verified pid kill. | **Poison:** `into_inner`, then `retain_all_dirty`, then `exit(70)`. **Force detach:** fence, drain callbacks, persist dirty sessions, stop native, clear orphaned handles. **Shutdown:** leaves busy or unresponsive Running workers for adoption. **Kills:** require pid, OS process start time and image path to match `worker.json`. | WP1.4, WP1.5, WP1.2/1.3 |
 | I9 | Gate deleted only after attach; source-based gate; fallback only on unpair or MountNow. | The gate source is the installation the folder was received from. The gate requires all of: cursor at the source tip; no inbox rows from the source in any state; no `feed_rejected` rows from the source; the source's `pending_active == 0`. Fallback to any sharing peer happens only when the source is unpaired. MountNow overrides. The gate marker is deleted only after `MountState::Attached`. | §3.3, WP1.2, WP2.7 |
@@ -595,6 +595,7 @@ Failures before Ready print a `FatalLine` and exit with 73 (store), 75 (locked),
 - **`event_objects(hash, event, shared, PK(hash, event))`** is maintained by `AFTER INSERT`/`DELETE` triggers on `events`, using `json_each` over `$.changes` where `field='content'`. Like `journal_sequence`, this also covers writes by older binaries.
 - **`staged_objects(hash, event, PK)`** is maintained by triggers on `incoming_events` insert and delete.
 - **`object_error_state(hash PK, code, class, attempts, retry_at_ms, last_ms)`** is a side table. The positional `object_errors` table and its writers are untouched.
+- **`projection_version(id PK = 1, version)`** (WP3.INT) is a side table: `AFTER INSERT`/`UPDATE`/`DELETE` triggers on `current_state` and `current_parts` bump it in the writing transaction (view freshness, I6).
 - **Backfills** are one-time, chunked (10K rows per transaction), resumable through config markers `availability_v2` and `event_objects_v1`, and emit `startup_progress` per chunk.
 - **Startup** (`VerifyMode::Changed`): an object is trusted if its row matches size and mtime. Otherwise it is hashed once (as today) and the marker recorded. A one-time full verify happens after upgrade. `scrub_step(budget_bytes)` is the background scrubber API.
 - **Per-object outcomes:**
@@ -694,7 +695,7 @@ off len  field
 
 The code never crosses the wire, and replaying a captured proof fails because the nonce differs.
 
-**Loopback sessions** (orchestrator ↔ worker, Wave 3): the upgrade header `X-Tkfs-Sync: 3-loopback`; no HELLO or AUTH until WP4.1 adds the `X-Tkfs-Token` check.
+**Loopback sessions** (orchestrator ↔ worker, Wave 3): the upgrade header `X-Tkfs-Sync: 3-loopback`; no HELLO or AUTH until WP4.1 adds the `X-Tkfs-Token` check. The worker's listener serves them beside the JSON RPC (it peeks the upgrade header). Besides `objects.*` (binary bodies, §6.4) a loopback session serves the worker's JSON ops: the request header is the payload (or `{"in_body": true}` with the JSON as the body), the reply is the JSON as the header, or `{"in_body": true}` with the JSON as the body above 60 KiB. The session's limits apply: a request header ≤ 64 KiB and request and reply bodies ≤ `max_body(op)` (1 MiB), so feed ops and other large-payload ops stay on the JSON RPC; `stop` is refused there (the stop ladder waits for the JSON RPC's reply flush); `objects.want` and `objects.report` also answer over the JSON RPC, `objects.read`/`write` only over a session (`BINARY_OPS_REQUIRE_SESSION`) (CCR-WP3.2-4, ratified in WP3.INT).
 
 **I/O model:**
 - One I/O thread per connection owns the `WebSocket<MaybeTlsStream<TcpStream>>` in non-blocking mode, plus a `polling::Poller`.
@@ -893,7 +894,18 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 - A hash mismatch on completion makes the receiver send `objects.report{CORRUPT_AT_SOURCE}`. The sender re-verifies and, if corrupt, quarantines its copy (`corrupt-<id>` rename, availability `corrupt`, error state).
 - The receiver backs off that object for that source.
 
-**Status:** `ExchangeFinished{op: objects.pull|objects.push, bytes, objects, duration}` per pull or push, plus `ObjectError` events.
+**Status:** `ExchangeFinished{op: objects.pull|objects.push, bytes, objects, duration}` per pull or push, plus `ObjectError` events (with their transfer's `source{installation, lane, direction}`, CCR-WP3.INT-1).
+
+**Wire details and rules fixed by WP3.2/WP3.3** (CCR-WP3.3-5 and CCR-WP3.2-5, ratified in WP3.INT):
+- Peer requests are the JSON header; replies the JSON body or header. `sender` is the requesting replica, `receiver` the acceptor's (as `meta.exchange`). A malformed request is `INVALID_REQUEST` (CCR-WP3.3-3); an acceptor without objects v3 answers `UNSUPPORTED_OPERATION`.
+- **Allotment:** a pull's or push's items cover, in order, `[offset, offset + min(size − offset, budget left))`; an item's share is fixed by the list whether or not it is served; a zero-size object is one empty chunk. A stream must start each object at its span's start and stay contiguous and inside its share; a chunk outside it ends the request `PROTOCOL_VIOLATION` before it is buffered.
+- A pull's per-item results at the sender: `Completed` (sent through its end), `Progressed{durable_offset}` (sent up to there), `Skipped` (nothing sent), or the read's failure. A receiver counts a peer's results only for the items its request listed, each once; it reports `CORRUPT_AT_SOURCE` to its own worker only for an object its push sent through its end, and an acceptor takes `objects.report` only for an object of the session's lane that it served that peer through its end (`OBJECT_ON_WRONG_LANE`, `UNSOLICITED_OBJECT`) (invariant 22; WP3.INT).
+- Lease ids: the dialer uses two per lane and repository (`pull:<peer>:<i>/<n>:a|b`): a want with a pull in flight uses the id the last want did not; a want with none asks both, the second only when the first found nothing. The acceptor uses `push:<peer>:<i>/<n>`.
+- Leases renew only on progress (a write whose durable offset advances); a want that offers an object again to its holder does not renew it. A lease that lapses (no progress for one TTL) backs its object off for the source that held it for 60 s, so other sources' sessions are offered it. Writes in flight for one object may arrive out of order; the worker waits up to 2 s for the earlier ones.
+- `RESUME_OFFSET_AHEAD` and `OBJECT_PART_CHANGED` are resume points, not failures of the object: the receiver resynchronizes from the durable offset the worker answered, with no backoff and no `ObjectError` (WP3.INT). `SizeMismatch` and malformed items back the object off for that source (worker side); local failures record `object_error_state`.
+- A daemon hands an object its source cannot serve to another of its transfers under the lease that holds it (the *lease handoff*): the taker holds a claim that only it renews (30 s), and gives it back, parked at the durable offset it reached, when it fails or stops.
+- An object a peer wants that we may not serve (`NotPermitted` at our worker) is backed off silently, on the dialer as on the acceptor: not serving is no error of ours (WP3.INT).
+- `objects.write` installs a call's verified objects with plain renames and one directory fsync before registering any (§6.4 durability, "rename plus directory fsync"); the spool I/O of concurrent calls takes turns (one turn per call for its appends, one for its renames).
 
 ### 6.5 Interim bulk path (Wave 2 → replaced in Wave 3)
 
@@ -904,7 +916,7 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 | Dialer | `orchestrator/objects.rs` (WP2.7) | runs worker `published-bulk-offer`, then peer `objects.exchange`, then worker `published-bulk-apply` |
 | Acceptor | `inbound_objects.rs` (WP2.8) | routes to worker `published-bulk-exchange` |
 
-This exists so the cutover (WP3.1) is end-to-end testable in its own worktree. WP3.3 replaces both files in the same wave.
+This exists so the cutover (WP3.1) is end-to-end testable in its own worktree. WP3.3 replaces both files in the same wave. Since WP3.INT every key runs objects v3; the interim path remains only as a per-key fallback for a peer or worker that answers `UNSUPPORTED_OPERATION` (none since WP3.2 merged), its removal deferred to Wave 4 (CCR-WP3.3-2).
 
 ---
 
@@ -973,7 +985,8 @@ pub enum StatusEvent {
     PeerCatalog { installation: String, entries: Vec<PublishedEntry> },
     InboundSession { installation: String, lane: u32, role: LaneRole, opened: bool },
     InboundIncompatible { address: String, detail: String },
-    ObjectError { state: String, hash: String, error: ErrorWire },
+    ObjectError { state: String, hash: String, error: ErrorWire,
+                  #[serde(default)] source: Option<ObjectSource> },  // CCR-WP3.INT-1: {installation, lane, direction} of the transfer
     LegacyLink { key: String, value: serde_json::Value },   // pre-cutover passthrough (W2)
     Error { scope: Scope, error: ErrorWire }, Resolved { scope: Scope, code: String },
     Activity(ActivityEntry) }
@@ -1028,6 +1041,8 @@ List, Inspect and Peers keep their exact shapes and add a typed `status: FolderS
 | `publication_error` | published entry error (`PUBLISHED_SUMMARY_FAILED: …`) |
 | `sync` | **Waves 1–2:** legacy `LinkStatus` JSON served verbatim from legacy lanes (`orchestrator.rs:653-672` shape). **From WP3.1:** `hub.legacy_folder_sync()`, which keeps keys `endpoint`, `connected`, `remote_available`, `error`, `metadata{last_success_ms, caught_up, metadata_caught_up, metadata_progress, …}`, `lanes[{lane, role, connected, transport:"tkfs-peer/3", parallel_bulk:true, error, repository{…RepositoryStatus keys…}}]` |
 | Peers | `[{endpoint, installation, connections, configured_connections, reserved_connections:1, lanes:[{role, connected, exchanges, last_success_ms, error, transport, parallel_bulk, repositories{repo:{…}}}]}]`; outbound peers only (the acceptor lists `[]`, as today) |
+| v3 values (WP3.INT) | a bulk lane never claims `caught_up` (CCR-WP3.1-1); no lane claims `caught_up`/`metadata_caught_up` while the remote still has events to activate (`remote_pending > 0`, CCR-WP3.1-2); every bulk lane lists each repository both sides hold, whether objects moved on it yet or not; `object_inventory` is read from the folder's and the peer's content counters at projection time; a failed object transfer (`ObjectError` with a source, CCR-WP3.INT-1) shows as its lane's repository `error`, `consecutive_failures` and `retry_at_ms` while the folder's error for that object is open |
+| RemoteList, Receive | the peer's catalog entries that are `Running` only, as the legacy `list` replied (CCR-WP3.1-4); a pairing refused by an incompatible endpoint shows in Status as an error scoped `Peer{installation: "<endpoint>"}` until that endpoint pairs, fails otherwise or is unpaired |
 | Create, Receive, Start | inspect shape with `starting:true` |
 | Stop | inspect shape after a ≤ 15 s wait (`running:false`, `starting:false`, `startup_phase:null`), or `{…, stopping:true, waiting_for:"BUSY_VIEW…"}` |
 
@@ -1170,7 +1185,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
 | 2 | Overlap verified; no gaps; offset advertised only after fsync | `spool_state.durable` advances only after a spool fsync and a commit. Append must start exactly at `durable`. Overlap is compared byte for byte. | `objects_v3_worker::crash_mid_object_resumes_from_durable` (WP3.2) |
 | 3 | Register only after install; crash between them is recoverable | Registration happens after install. A crash in between is repaired by re-transfer: the object is not shareable, so it is still wanted. No startup registration. | `crash_between_install_and_register_retransfers` (WP1.8, WP3.2) |
 | 4 | `synchronous=FULL`; atomic commit | Index triggers and side rows join the existing savepoints. Activation slice savepoint. | existing suites |
-| 5 | Snapshots are disposable | Format unchanged; forced seal kept. | `startup_snapshots` (all) |
+| 5 | Snapshots are disposable | Format unchanged; forced seal kept. The periodic seal interval scales with the sealed payload, `bytes / 4 KiB` events between 128 and 1024 (CCR-WP2.4-3, applied in WP3.INT); a startup resumes a tail of up to 1024 events. | `startup_snapshots` (all), `w3_integration` |
 | 6 | Immutable events | No payload rewrite. Derived tables only. Digests are computed, never stored in events. | `EVENT_ID_REUSED` tests |
 | 7 | Immutable sizes | `OBJECT_SIZE_CHANGED` checked at stage, at `commit_prepared` (re-validated), and at write. | `offlock_commit::size_change_between_prepare_and_commit_rejected` (WP2.4) |
 | 8 | Dirty sessions survive | Force detach: fence → drain → persist. Poison: `into_inner`, then `retain_all_dirty`. Shutdown leaves busy workers running. | `worker_lifecycle::force_stop_persists_dirty`, `poison_exit_persists_dirty` (WP1.4/1.5) |
