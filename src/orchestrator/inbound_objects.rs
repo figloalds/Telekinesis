@@ -108,7 +108,7 @@ use super::{
         SinkOptions, SinkResult, allot, covered, handoff_park, handoff_progress, handoff_release,
         handoff_take, handoff_unclaim, handoff_unclaim_all, handoff_wanted, is_failure,
         is_unsupported, object_blocked, object_failed, object_installed, object_key, outcome_error,
-        push_lease, read_outcome, read_ranges, size_unknown,
+        push_lease, read_outcome, read_ranges, size_unknown, wire_pieces,
     },
     worker_client::{self, ReadFlow, SessionWorkerClient},
 };
@@ -434,15 +434,11 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                             outcomes.insert(range.hash.clone(), ObjectOutcome::SizeMismatch);
                             return ReadFlow::SkipObject;
                         }
-                        let chunk = ChunkHeader {
-                            id: 0,
-                            hash: Some(range.hash.clone()),
-                            offset: range.offset,
-                            total,
-                            last: range.offset + range.len == total,
-                        };
-                        if responder.chunk(chunk, &bytes).is_err() {
-                            return ReadFlow::Stop;
+                        for (chunk, piece) in wire_pieces(&range.hash, range.offset, total, &bytes)
+                        {
+                            if responder.chunk(chunk, piece).is_err() {
+                                return ReadFlow::Stop;
+                            }
                         }
                         sent += range.len;
                         sent_to.insert(range.hash.clone(), range.offset + range.len);

@@ -145,8 +145,8 @@ fn tcp(ws: &Socket) -> io::Result<&TcpStream> {
     }
 }
 
-/// The send and receive buffers of a session socket on Windows (WP3.INT).
-/// With the system's defaults (64 KiB each) every 1 MiB frame met
+/// The largest send and receive buffers of a session socket on Windows
+/// (WP3.INT). With the system's defaults (64 KiB each) every 1 MiB frame met
 /// `WouldBlock` part way and waited for writable readiness, so a loopback
 /// download moved about one frame per poller round trip
 /// (`qual_wp1_9_session` measured 270–360 MiB/s, its I/O threads idle most
@@ -155,29 +155,150 @@ fn tcp(ws: &Socket) -> io::Result<&TcpStream> {
 /// only while data is in flight; no user-space buffer is pinned (WP1.INT's
 /// S1). Linux sizes its socket buffers itself (setting them would turn that
 /// off).
+///
+/// The receive buffer is set at once. The send buffer is not (WP3.INT
+/// re-review): every byte in it is a byte a control frame (a pull's request,
+/// a cancel, a heartbeat) waits behind, so a fixed 4 MiB on a slow uplink
+/// delayed every request in the other direction by seconds (4 MiB at
+/// 128 KiB/s: 32 s). It starts at the system's own size and follows the
+/// rate the socket drains at ([`SendBuffer`]): about two round trips of
+/// data (at least 100 ms), between [`SEND_BUFFER_MIN`] and this.
 #[cfg(windows)]
 pub const SOCKET_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
 
-/// Sets [`SOCKET_BUFFER_BYTES`] as the socket's send and receive buffers.
-/// Best effort: a refusal keeps the system's defaults.
+/// The largest send buffer [`SendBuffer`] sets.
+#[cfg(windows)]
+const SEND_BUFFER_MAX: usize = SOCKET_BUFFER_BYTES as usize;
+#[cfg(not(windows))]
+const SEND_BUFFER_MAX: usize = 4 * 1024 * 1024;
+
+/// The smallest send buffer [`SendBuffer`] sets (the system's default).
+pub const SEND_BUFFER_MIN: usize = 64 * 1024;
+/// How long [`SendBuffer`] measures the drain rate before it resizes.
+pub const SEND_BUFFER_WINDOW: Duration = Duration::from_millis(250);
+/// The round trip assumed before one is measured.
+const SEND_BUFFER_RTT_MS: u64 = 100;
+/// The shortest round trip the send buffer is sized for (it holds two).
+const SEND_BUFFER_HORIZON_MS: u64 = 50;
+
+/// The adaptive send buffer of a session socket (WP3.INT re-review): the
+/// bytes the kernel took in a window while the socket refused more (it was
+/// saturated) give its drain rate; the buffer holds about two round trips
+/// of that (two [`SEND_BUFFER_HORIZON_MS`] at least), so the link stays full
+/// (the buffer is at least the bandwidth-delay product) while a control
+/// frame never waits behind more than that. A window in which the socket
+/// took everything changes nothing.
+#[derive(Debug)]
+pub struct SendBuffer {
+    /// The size set (`None`: the system's own).
+    size: Option<usize>,
+    max: usize,
+    window: Instant,
+    flushed: usize,
+    saturated: bool,
+    min_rtt_ms: Option<u64>,
+}
+
+impl SendBuffer {
+    pub fn new(max: usize, now: Instant) -> Self {
+        Self {
+            size: None,
+            max: max.max(SEND_BUFFER_MIN),
+            window: now,
+            flushed: 0,
+            saturated: false,
+            min_rtt_ms: None,
+        }
+    }
+
+    /// The size set (`None`: the system's own).
+    pub fn size(&self) -> Option<usize> {
+        self.size
+    }
+
+    /// The kernel took `bytes` (a complete flush).
+    pub fn took(&mut self, bytes: usize) {
+        self.flushed = self.flushed.saturating_add(bytes);
+    }
+
+    /// The socket refused bytes (`WouldBlock`).
+    pub fn refused(&mut self) {
+        self.saturated = true;
+    }
+
+    /// At the end of a window, the size the socket's send buffer should get,
+    /// if it should change. `rtt_ms`: the session's last measured round trip
+    /// (`u64::MAX`: none yet); the smallest one seen is used (a round trip
+    /// measured behind a full queue is not the link's).
+    pub fn resize(&mut self, now: Instant, rtt_ms: u64) -> Option<usize> {
+        if rtt_ms != u64::MAX {
+            self.min_rtt_ms = Some(self.min_rtt_ms.map_or(rtt_ms, |min| min.min(rtt_ms)));
+        }
+        let elapsed = now.saturating_duration_since(self.window);
+        if elapsed < SEND_BUFFER_WINDOW {
+            return None;
+        }
+        let (flushed, saturated) = (self.flushed, self.saturated);
+        self.window = now;
+        self.flushed = 0;
+        self.saturated = false;
+        if !saturated {
+            return None;
+        }
+        let rtt = self
+            .min_rtt_ms
+            .unwrap_or(SEND_BUFFER_RTT_MS)
+            .max(SEND_BUFFER_HORIZON_MS);
+        let rate = flushed as f64 / elapsed.as_secs_f64();
+        let target = (rate * 2.0 * rtt as f64 / 1000.0) as usize;
+        let target = target.clamp(SEND_BUFFER_MIN, self.max);
+        match self.size {
+            None if target <= SEND_BUFFER_MIN => None,
+            Some(size) if target * 2 > size && target < size * 2 => None,
+            _ => {
+                self.size = Some(target);
+                Some(target)
+            }
+        }
+    }
+}
+
+/// Sets [`SOCKET_BUFFER_BYTES`] as the socket's receive buffer. Best effort:
+/// a refusal keeps the system's default.
 #[cfg(windows)]
 fn size_socket_buffers(stream: &TcpStream) {
+    set_buffer(stream, SO_RCVBUF, SOCKET_BUFFER_BYTES as usize);
+}
+
+#[cfg(windows)]
+const SO_SNDBUF: i32 = 0x1001;
+#[cfg(windows)]
+const SO_RCVBUF: i32 = 0x1002;
+
+/// Sets one socket buffer option (best effort).
+#[cfg(windows)]
+fn set_buffer(stream: &TcpStream, name: i32, bytes: usize) {
     use std::os::windows::io::AsRawSocket;
     #[link(name = "ws2_32")]
     unsafe extern "system" {
         fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, length: i32) -> i32;
     }
     const SOL_SOCKET: i32 = 0xffff;
-    const SO_SNDBUF: i32 = 0x1001;
-    const SO_RCVBUF: i32 = 0x1002;
     let socket = stream.as_raw_socket() as usize;
-    let value = SOCKET_BUFFER_BYTES.to_ne_bytes();
-    for name in [SO_SNDBUF, SO_RCVBUF] {
-        // SAFETY: `socket` is the open socket `stream` owns, and `value` is
-        // the 4-byte integer option the call reads, alive for the call.
-        unsafe { setsockopt(socket, SOL_SOCKET, name, value.as_ptr(), value.len() as i32) };
-    }
+    let value = i32::try_from(bytes).unwrap_or(i32::MAX).to_ne_bytes();
+    // SAFETY: `socket` is the open socket `stream` owns, and `value` is the
+    // 4-byte integer option the call reads, alive for the call.
+    unsafe { setsockopt(socket, SOL_SOCKET, name, value.as_ptr(), value.len() as i32) };
 }
+
+/// Sets the socket's send buffer (Windows; Linux sizes its own).
+#[cfg(windows)]
+fn set_send_buffer(stream: &TcpStream, bytes: usize) {
+    set_buffer(stream, SO_SNDBUF, bytes);
+}
+
+#[cfg(not(windows))]
+fn set_send_buffer(_: &TcpStream, _: usize) {}
 
 #[cfg(not(windows))]
 fn size_socket_buffers(_: &TcpStream) {}
@@ -341,6 +462,8 @@ struct Io {
     /// Cost of the parts (channel and overflow) of streams no handler has
     /// taken yet.
     waiting_bytes: usize,
+    /// The socket's adaptive send buffer.
+    send_buffer: SendBuffer,
 }
 
 impl Drop for Io {
@@ -380,6 +503,7 @@ impl Io {
             uploads: HashMap::new(),
             overflow_bytes: 0,
             waiting_bytes: 0,
+            send_buffer: SendBuffer::new(SEND_BUFFER_MAX, now),
         }
     }
 
@@ -920,6 +1044,9 @@ impl Io {
                     "PROTOCOL_VIOLATION: response {id} body of {total} bytes is not allowed"
                 )));
             }
+            // The reply is arriving: a call with an idle deadline is not idle
+            // (WP3.INT re-review: a large reply on a slow link).
+            slot.push(Event::Progress);
             drop(state);
             let mut body = Vec::with_capacity(total);
             body.extend_from_slice(frame.body);
@@ -1063,6 +1190,13 @@ impl Io {
         }
         partial.body.extend_from_slice(frame.body);
         if !complete {
+            if matches!(partial.kind, PartialKind::Response(_))
+                && let Some(slot) = self.shared.lock().pending.get(&id)
+            {
+                // Each continuation of a reply resets its call's idle
+                // deadline, as a stream chunk does.
+                slot.push(Event::Progress);
+            }
             return Ok(());
         }
         let partial = self.partial.remove(&id).expect("partial body");
@@ -1612,6 +1746,7 @@ impl Io {
 
     fn write_turn(&mut self) -> Result<(), Stop> {
         self.write_more = false;
+        self.pace();
         let mut written = 0usize;
         loop {
             // While the socket is blocked, frames stay in our queues (where
@@ -1642,6 +1777,7 @@ impl Io {
                         // The frame is in tungstenite's buffer.
                         self.sent(len);
                         self.write_blocked = true;
+                        self.send_buffer.refused();
                         break;
                     }
                     Err(error) => return Err(self.write_error(error)),
@@ -1652,11 +1788,13 @@ impl Io {
                     if self.unflushed > 0 || self.write_blocked {
                         self.last_write_progress = Instant::now();
                     }
+                    self.send_buffer.took(self.unflushed);
                     self.unflushed = 0;
                     self.write_blocked = false;
                 }
                 Err(WsError::Io(error)) if would_block(&error) => {
                     self.write_blocked = true;
+                    self.send_buffer.refused();
                     return Ok(());
                 }
                 Err(error) => return Err(self.write_error(error)),
@@ -1668,6 +1806,17 @@ impl Io {
                 self.write_more = true;
                 return Ok(());
             }
+        }
+    }
+
+    /// Resizes the socket's send buffer to the rate it drains at (once per
+    /// [`SEND_BUFFER_WINDOW`]; see [`SendBuffer`]).
+    fn pace(&mut self) {
+        let rtt = self.shared.rtt_ms.load(Ordering::Relaxed);
+        if let Some(bytes) = self.send_buffer.resize(Instant::now(), rtt)
+            && let Ok(stream) = tcp(&self.ws)
+        {
+            set_send_buffer(stream, bytes);
         }
     }
 

@@ -412,6 +412,49 @@ pub fn read_ranges(items: &[WantItem], spans: &[(u64, u64)]) -> Vec<ReadRange> {
     ranges
 }
 
+/// The largest CHUNK frame of object bytes on a bulk session: a worker read
+/// (up to 1 MiB) goes out in pieces of at most this, so a control frame
+/// queued behind object data (a pull's request, a cancel, a heartbeat)
+/// waits for at most one piece in the session's own buffer (WP3.INT
+/// re-review: 1 MiB frames on a slow uplink held them for seconds).
+pub const WIRE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// The CHUNK frames of `bytes` read at `offset` of an object of `total`
+/// bytes: `(header, piece)`, contiguous, at most [`WIRE_CHUNK_BYTES`] each,
+/// one empty piece for no bytes.
+pub fn wire_pieces<'a>(
+    hash: &str,
+    offset: u64,
+    total: u64,
+    bytes: &'a [u8],
+) -> Vec<(ChunkHeader, &'a [u8])> {
+    let piece = |at: u64, part: &'a [u8]| {
+        let end = at + part.len() as u64;
+        (
+            ChunkHeader {
+                id: 0,
+                hash: Some(hash.to_owned()),
+                offset: at,
+                total,
+                last: end == total,
+            },
+            part,
+        )
+    };
+    if bytes.is_empty() {
+        return vec![piece(offset, bytes)];
+    }
+    let mut at = offset;
+    bytes
+        .chunks(WIRE_CHUNK_BYTES)
+        .map(|part| {
+            let pair = piece(at, part);
+            at += part.len() as u64;
+            pair
+        })
+        .collect()
+}
+
 /// Whether an item covers a byte or is a zero-size object (it is sent).
 pub fn covered(item: &WantItem, span: (u64, u64)) -> bool {
     span.1 > span.0 || (item.size == 0 && item.offset == 0)
@@ -3881,27 +3924,18 @@ fn push(
                         local.insert(range.hash.clone(), ObjectOutcome::SizeMismatch);
                         return ReadFlow::SkipObject;
                     }
-                    let header = ChunkHeader {
-                        id: 0,
-                        hash: Some(range.hash.clone()),
-                        offset: range.offset,
-                        total,
-                        last: range.offset + range.len == total,
-                    };
-                    let last = header.last;
-                    match upload.chunk(header, &bytes) {
-                        Ok(()) => {
-                            sent += range.len;
-                            if last {
-                                through_end.insert(range.hash.clone());
-                            }
-                            ReadFlow::Continue
-                        }
-                        Err(error) => {
+                    let last = range.offset + range.len == total;
+                    for (header, piece) in wire_pieces(&range.hash, range.offset, total, &bytes) {
+                        if let Err(error) = upload.chunk(header, piece) {
                             failure = Some(ExchangeError::peer(error));
-                            ReadFlow::Stop
+                            return ReadFlow::Stop;
                         }
+                        sent += piece.len() as u64;
                     }
+                    if last {
+                        through_end.insert(range.hash.clone());
+                    }
+                    ReadFlow::Continue
                 }
                 Err(error @ (CallError::Unavailable(_) | CallError::ConnectionLost(_))) => {
                     failure = Some(ExchangeError::local(error));

@@ -3824,6 +3824,56 @@ fn an_object_no_longer_wanted_settles_without_an_error() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
+/// Direction coupling on a slow uplink (v3 network re-review major): a pull's
+/// request travels up the link a push saturates; it waits only behind what
+/// the session handed the socket (its send buffer follows the link's drain
+/// rate, and object bytes go out in 256 KiB frames), not behind megabytes, so
+/// the pull completes in seconds, not tens of seconds.
+#[test]
+fn a_saturating_push_does_not_delay_pulls_on_a_slow_uplink() {
+    let (a, b) = pair(100);
+    let proxy = FaultProxy::start(&b.endpoint);
+    proxy.set_bandwidth(256 * 1024);
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&proxy.endpoint(), &b.code, LANE), options);
+    let pull = |seed: u64| {
+        let hash = b.worker.hold(content(seed, 64 * 1024));
+        a.worker.want(&hash, 64 * 1024);
+        let began = Instant::now();
+        a.world.bump_sync(STATE_A);
+        let done = wait_until(Duration::from_secs(60), || a.worker.has(&hash));
+        (done, began.elapsed())
+    };
+    let (done, idle) = pull(6000);
+    assert!(done, "the idle pull never completed");
+    // A saturates its uplink: three 6 MiB objects B wants.
+    let mut up = Vec::new();
+    for index in 0..3 {
+        let hash = a.worker.hold(content(6100 + index, 6 * MIB as usize));
+        b.worker.want(&hash, 6 * MIB);
+        up.push(hash);
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || proxy.bytes_up() > MIB),
+        "the push never started"
+    );
+    // (The uplink's buffers are full by now.)
+    sleep_ms(1500);
+    let (done, loaded) = pull(6200);
+    assert!(
+        up.iter().any(|hash| !b.worker.has(hash)),
+        "the push ended before the pull: the test proves nothing"
+    );
+    drop(lane);
+    assert!(done, "the pull under the push never completed");
+    // 256 KiB/s: the proxy itself queues about 2 MiB (8 s); with a fixed
+    // 4 MiB send buffer and 1 MiB frames the pull took 18-19 s.
+    assert!(
+        loaded < Duration::from_secs(12),
+        "a 64 KiB pull took {loaded:?} under a push (idle: {idle:?})"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Qualification (release, ignored): throughput of the data plane
 

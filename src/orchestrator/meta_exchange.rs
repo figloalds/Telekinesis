@@ -36,6 +36,7 @@ use crate::{
                 ExchangeSummary, FEED_FORMAT, FeedApplyResult, GateView, MetaExchangeReply,
                 MetaExchangeRequest, PageStatus,
             },
+            frame::ChunkHeader,
             ops,
         },
     },
@@ -49,12 +50,18 @@ use std::time::Duration;
 /// The status lane number of `meta.exchange` (the control session).
 pub const LANE: u32 = super::scheduler::CONTROL_LANE;
 
+/// The longest a `meta.exchange` call may take while its peer keeps
+/// sending (its reply's frames): see [`ExchangeOptions::exchange`].
+pub const EXCHANGE_CAP: Duration = Duration::from_secs(30 * 60);
+
 /// Deadlines of the three steps.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExchangeOptions {
     /// Worker `feed-offer` (10 s).
     pub offer: Duration,
-    /// Peer `meta.exchange` (30 s).
+    /// Peer `meta.exchange` (30 s): how long the peer may send nothing (an
+    /// idle deadline: every frame of its reply restarts it; WP3.INT
+    /// re-review), within [`EXCHANGE_CAP`].
     pub exchange: Duration,
     /// Worker `feed-apply` (10 s).
     pub apply: Duration,
@@ -261,13 +268,27 @@ fn run(
     let header = to_value(&MetaExchangeHeader {
         repo: route.repo.clone(),
     });
+    // `options.exchange` bounds how long the peer may stay silent, not the
+    // whole exchange (WP3.INT re-review): a large event's payload, served in
+    // the reply (up to `MAX_EVENT`, 8 MiB; `need` up to 16 MiB), may take
+    // minutes on a slow link, and an absolute deadline failed every attempt,
+    // each sending the same bytes again. Every frame of the reply resets the
+    // idle deadline; [`EXCHANGE_CAP`] bounds the whole call.
+    let mut no_stream = |chunk: ChunkHeader, _: &[u8]| -> Result<(), ErrorWire> {
+        Err(ErrorWire::coded(
+            "PROTOCOL_VIOLATION",
+            format!("meta.exchange request {} received a stream chunk", chunk.id),
+        ))
+    };
     let reply = conn
-        .call(
+        .call_streaming(
             ops::META_EXCHANGE,
             header,
             body,
             Priority::Response,
+            Some(EXCHANGE_CAP.max(options.exchange)),
             options.exchange,
+            &mut no_stream,
         )
         .map_err(ExchangeError::peer)?;
     finished.bytes_down = reply.body.len() as u64;

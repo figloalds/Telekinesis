@@ -6,6 +6,8 @@
 //! (`session::dial` ↔ `session::accept`). The server side is a scripted
 //! handler standing in for the peer, and the local worker is a
 //! `FakeWorker` behind a fake folder directory.
+mod support;
+
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -17,6 +19,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use support::FaultProxy;
 use tkfs::{
     bulk_sync::{self, Page},
     core::ObjectPart,
@@ -770,6 +773,47 @@ enum Behave {
     Fail(ErrorWire),
     /// Close the session on receipt.
     Close,
+    /// Reply with this many bytes of padding in the reply's JSON (a large
+    /// event's payload; WP3.INT re-review).
+    Padded(usize),
+}
+
+/// [`session`] through `proxy` (its target is the server's listener).
+fn session_via(
+    local: &str,
+    remote: &str,
+    handler: Arc<dyn Handler>,
+    bandwidth: u64,
+) -> (Conn, Conn, FaultProxy) {
+    let (code, verifier) = Verifier::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = format!("ws://{}", listener.local_addr().unwrap());
+    let proxy = FaultProxy::start(&target);
+    let policy = Arc::new(TestPolicy {
+        installation: remote.into(),
+        verifier,
+    });
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let options = ConnOptions {
+            handlers: 16,
+            ..ConnOptions::for_role(LaneRole::Control)
+        };
+        let (conn, _) = session::accept(stream, policy, options).unwrap();
+        conn.serve(handler);
+        conn
+    });
+    let hello = session::client_hello(local, LaneRole::Control, None, 4);
+    let (client, _) = session::dial(
+        &proxy.endpoint(),
+        hello,
+        &CodeAuth { code },
+        None,
+        ConnOptions::for_role(LaneRole::Control),
+    )
+    .unwrap();
+    proxy.set_bandwidth(bandwidth);
+    (client, server.join().unwrap(), proxy)
 }
 
 #[derive(Clone, Debug)]
@@ -900,6 +944,17 @@ impl Handler for MetaHandler {
                 if let Some(conn) = peer.server.get() {
                     conn.close();
                 }
+            }
+            Behave::Padded(bytes) => {
+                let mut reply =
+                    serde_json::to_value(reply_to(&request, false, PageStatus::Accepted)).unwrap();
+                reply["padding"] = json!("p".repeat(bytes));
+                let reply = serde_json::to_vec(&reply).unwrap();
+                peer.reply_lens
+                    .lock()
+                    .unwrap()
+                    .insert(request.request.clone(), reply.len());
+                req.responder.reply(json!({}), reply);
             }
         }
         peer.active.fetch_sub(1, Ordering::SeqCst);
@@ -3060,4 +3115,58 @@ fn anti_entropy_at_30_s_keeps_one_session_for_90_s() {
     assert!(!lane.view().stopped);
     assert!(world.finished().iter().all(|fin| fin.ok));
     lane.stop();
+}
+
+/// A large reply on a slow link (v3 network re-review major): the
+/// `meta.exchange` deadline bounds how long the peer stays silent (every
+/// frame of its reply restarts it), within a generous cap, so an exchange
+/// whose reply takes longer than the deadline to cross the link completes,
+/// once. With an absolute deadline it timed out, and every retry sent the
+/// same bytes again, forever. A peer that sends nothing still times out at
+/// the deadline.
+#[test]
+fn a_large_reply_on_a_slow_link_completes() {
+    let world = World::new();
+    world.put(folder("repo-a"));
+    let ctx = ctx(&world, 60_000);
+    let peer = peer_ctx(&ctx, vec![entry("repo-a", EntryState::Running)]);
+    let meta = MetaPeer::new();
+    meta.always("repo-a", Behave::Padded(6 * 1024 * 1024));
+    let (client, server, _proxy) =
+        session_via(&ctx.installation, PEER, meta.handler(), 2 * 1024 * 1024);
+    let options = ExchangeOptions {
+        offer: Duration::from_secs(5),
+        exchange: Duration::from_millis(1500),
+        apply: Duration::from_secs(5),
+    };
+    let view = world.view(&state_of("repo-a")).unwrap();
+    let remote = entry("repo-a", EntryState::Running);
+    let began = Instant::now();
+    let outcome =
+        meta_exchange::exchange_with(&ctx, &client, &peer, &view, &remote, &options, &mut |_| {
+            None
+        });
+    let took = began.elapsed();
+    assert!(outcome.is_ok(), "{:?} after {took:?}", outcome.err());
+    assert!(
+        took > options.exchange,
+        "the reply crossed the link in {took:?}: the test proves nothing"
+    );
+    assert_eq!(meta.seen("repo-a").len(), 1);
+    // Silence still times out at the deadline.
+    meta.always("repo-a", Behave::Hang);
+    let began = Instant::now();
+    let error =
+        meta_exchange::exchange_with(&ctx, &client, &peer, &view, &remote, &options, &mut |_| {
+            None
+        })
+        .unwrap_err();
+    assert_eq!(error.error.code(), "REQUEST_TIMEOUT", "{error:?}");
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
+    client.close();
+    server.close();
 }
