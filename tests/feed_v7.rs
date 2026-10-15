@@ -1645,6 +1645,46 @@ fn an_acceptor_gets_a_missing_parent_from_the_dialer() {
     assert!(round.request.unknown.is_empty());
 }
 
+/// CCR-WP2.5-2, WP3.1 fix round 2: what an acceptor asks of one dialer is
+/// served by that dialer only. Two replicas of one repository in one process
+/// dial the same acceptor: the other replica's next request neither serves
+/// nor reports `unknown` the first one's need, and the first one's next
+/// request still serves it.
+#[test]
+fn a_need_is_served_by_the_replica_it_was_asked_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut b = create(&dir.path().join("b"), &repo);
+    let c = create(&dir.path().join("c"), &repo);
+    // The first requests are probes (no report of A's cursor yet).
+    exchange(&b, &a);
+    exchange(&c, &a);
+    let big = big_event(&b, "+", 400);
+    assert!(serde_json::to_string(&big).unwrap().len() > LARGE_EVENT_BYTES);
+    b.commit(big.clone(), true).unwrap();
+    // B dials A: A asks B for the big event.
+    let round = exchange(&b, &a);
+    assert_eq!(round.reply.need, vec![big.id.clone()]);
+    // C's next request to A carries nothing of B's need.
+    let round = exchange(&c, &a);
+    assert!(
+        round.request.need_served.is_empty() && round.request.unknown.is_empty(),
+        "C answered B's need: served {:?}, unknown {:?}",
+        round.request.need_served,
+        round.request.unknown
+    );
+    // B's next request serves it.
+    let round = exchange(&b, &a);
+    assert_eq!(round.request.need_served, vec![big.clone()]);
+    assert!(round.request.unknown.is_empty());
+    assert_eq!(round.local.summary.staged, 1);
+    activate(&mut a);
+    activate(&mut b);
+    settle(&mut b, &mut a);
+    assert!(shared(&a).contains(&big.id));
+}
+
 /// CCR-WP2.5-4 (applied by WP3.1): a page reports the sender's exact count of
 /// its feed entries after `through`, so `to_receive` is exact when the
 /// sender's journal interleaves private events (before, it was the upper

@@ -1657,3 +1657,69 @@ fn sync_survives_latency_bandwidth_stalls_and_resets_without_replays() {
     let duplicates = tap.duplicates();
     assert!(duplicates.is_empty(), "{duplicates:#?}");
 }
+
+/// WP3.1 fix round 2: a Shutdown whose sequence panics before its network
+/// step (§3.6 step 2) still stops the network before the daemon ends. Both
+/// stacks' tokens are children of `ctx.shutdown`, so they stop accepting by
+/// themselves, but only `DaemonNetwork::shutdown` drains the inbound
+/// sessions and joins the peer supervisors within the deadline; and they
+/// hold the context, so the daemon letting go of its handle never did. Once
+/// `serve_with` returned, the network has been shut down (both stacks taken
+/// and stopped) and nothing accepts on the peer listener. In-process,
+/// because the fault is injected in this process (no other test of this
+/// file runs a daemon in-process).
+#[test]
+fn a_shutdown_sequence_that_panics_still_stops_the_network() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: orchestrator::Network {
+            listen: Some("127.0.0.1:0".into()),
+            connections: 2,
+            sync_interval_ms: 500,
+        },
+    };
+    let daemon = orchestrator::ctx::build(config).unwrap();
+    let endpoints = daemon.ctx.endpoints.load();
+    let control = endpoints.control.clone();
+    let network: std::net::SocketAddr = endpoints
+        .network
+        .as_deref()
+        .and_then(|endpoint| endpoint.strip_prefix("ws://"))
+        .expect("a peer listener")
+        .parse()
+        .unwrap();
+    let net = daemon.net.clone();
+    let server = thread::spawn(move || orchestrator::serve_with(daemon, false));
+    let accepts = || std::net::TcpStream::connect_timeout(&network, Duration::from_secs(5)).is_ok();
+    assert!(accepts(), "the peer listener does not accept");
+    fault::configure(Some(FaultConfig::new(
+        orchestrator::shutdown::faults::SEQUENCE,
+        FaultAction::Panic,
+    )));
+    let answered = ws::connect(&control)
+        .and_then(|mut socket| ws::call(&mut socket, &json!({"op":"shutdown"})));
+    fault::configure(None);
+    assert!(
+        answered.is_err(),
+        "the sequence did not panic: {answered:?}"
+    );
+    let until = Instant::now() + Duration::from_secs(30);
+    while !server.is_finished() {
+        assert!(Instant::now() < until, "the daemon did not end");
+        thread::sleep(Duration::from_millis(50));
+    }
+    server.join().unwrap().unwrap();
+    assert!(
+        net.inbound().is_none() && net.peers().is_none(),
+        "the daemon ended without shutting its network down: {net:?}"
+    );
+    assert!(
+        !accepts(),
+        "the peer listener still accepts after the daemon ended"
+    );
+}

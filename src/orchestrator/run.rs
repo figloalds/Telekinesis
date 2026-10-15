@@ -46,7 +46,7 @@ use super::{
     shutdown,
 };
 use crate::{
-    model::orchestrator::{Ctx, limits},
+    model::orchestrator::{Ctx, NetworkApi, limits},
     util::{lock::Tracked, log::event, notify::Notify},
     ws,
 };
@@ -127,9 +127,16 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
     let controls = ControlServer::start(ctx.clone(), control)?;
     ctx.shutdown.wait();
     // The signal path runs the sequence here; after the Shutdown action this
-    // returns the result it already has. Either way the network (outbound
-    // lanes, inbound sessions) is stopped by now.
+    // returns the result it already has.
     let _ = shutdown::run(&ctx, limits::SHUTDOWN_FOLDERS);
+    // The sequence stops the network in its step 2, but a sequence that
+    // panicked before that step did not. Both stacks stop accepting by
+    // themselves (their tokens are children of `ctx.shutdown`), yet only
+    // this drains the inbound sessions and joins the peer supervisors, and
+    // they hold the context, so dropping `net` would not: stop it here in
+    // every case (a no-op once stopped), before the discovery file and the
+    // catalog go.
+    net.shutdown(limits::SHUTDOWN_NETWORK);
     drop(net);
     controls.stop(limits::SHUTDOWN_CONTROL_JOIN);
     // The file goes first, while `orchestrator.lock` is still held: a
