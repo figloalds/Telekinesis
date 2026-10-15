@@ -268,7 +268,7 @@ The trait definitions are in §14 under WP0.4: `CatalogApi`, `FolderDirectory`, 
 
 - **Ownership:** thread `tkfs-catalog` acquires `orchestrator.lock`, then opens `folders.sqlite` with `journal_mode=WAL; synchronous=FULL`.
 - **Snapshot:** `CatalogSnapshot {generation, installation, folders, peers, verifier, verifier_generation, gates, peer_meta}`, indexed by state, repo, endpoint and installation.
-- **Commands:** `apply(CatalogCmd)` runs each command in one transaction, with `catch_unwind` per command and 3 retries on `SQLITE_BUSY`. The last good snapshot is kept on failure, and `CATALOG_UNAVAILABLE` is returned if the thread has died. The caller waits at most `APPLY_WAIT` (5 s): a command that has not started by then is withdrawn (`CATALOG_UNAVAILABLE`, never applied), one that is running answers `REQUEST_TIMEOUT` (it may still be applied), and while one command has run that long new ones are refused at once. A slow catalog write therefore never parks a folder controller or a control connection (§2.3 Catalog row; WP2.INT post-integration re-review).
+- **Commands:** `apply(CatalogCmd)` runs each command in one transaction, with `catch_unwind` per command and 3 retries on `SQLITE_BUSY`. The last good snapshot is kept on failure, and `CATALOG_UNAVAILABLE` is returned if the thread has died. The caller waits at most `APPLY_WAIT` (5 s): a command that has not started by then is withdrawn (`CATALOG_UNAVAILABLE`, never applied), one that is running answers `REQUEST_TIMEOUT` (it may still be applied), and while one command has run that long new ones are refused at once. A slow catalog write therefore never parks a folder controller or a control connection (§2.3 Catalog row; WP2.INT post-integration re-review). The refusals (withdrawn, not queued) carry `retry_after_ms` (`catalog::is_refusal`): the catalog is alive, so they are the caller's answer and never a daemon-level ErrorRecord. That record is for a catalog that is gone or a command that failed inside it, and the next management write that succeeds resolves it. A caller that answered `REQUEST_TIMEOUT` never undoes the command's side effects as if it had failed: Create waits up to `CREATE_SETTLE_WAIT` (5 s) for its folder (a later probe command the catalog answers `FOLDER_NOT_FOUND` proves it was not applied), and otherwise answers `REQUEST_TIMEOUT` naming the folder and keeps its state directory (WP2.INT confirmation review).
 - **Side tables** (§9): `folder_intents`, `mount_gates`, `peer_meta`, and the settings key `verifier_generation`. Existing tables are never ALTERed.
 - **Gate marker durability:** new code writes **both** `initial_sync` (legacy, positional `VALUES(?,?)`) and `mount_gates`, and deletes both after a successful attach. A downgrade therefore still sees the gate.
 - **Mount validation:** `validate_mount_path(snapshot, data_dir, state_dir, requested)` is pure. It keeps today's rules: absolute path; parent created; no overlap with data, state or other mounts; the path must not exist.
@@ -382,7 +382,7 @@ The controller's own catalog writes that follow an event (`ClearGate`, `Retarget
 - **Transport:** blocking accept, one thread per connection, persistent request loop. Every request first checks `stopping`. At most 64 connections outside a request, plus as many parked inside one (a write behind a slow catalog, a long Subscribe or Stop wait), so parked requests never lock List, Inspect and Status out (WP2.INT post-integration re-review).
 - **Reads** (List, Inspect, Peers, Status) are built from snapshots, FolderViews, the hub and `ctx.legacy()` with no waiting.
 - **Writes:** `catalog.apply`, then `FolderCmd`. Start returns immediately (`starting=true`). Stop waits ≤ 15 s for `Stopped|StopBlocked` (`wait:false` opts out).
-- **Create** runs `Store::initialize` on the request thread (no shared lock), then `CreateFolder`, then Start.
+- **Create** runs `Store::initialize` on the request thread (no shared lock), then `CreateFolder`, then Start. The new state directory is removed only when `CreateFolder` was not applied (§3.2).
 - **New actions** (§14 WP2.2): `status`, `subscribe`, `attach`, `detach`, `pause-sync`, `resume-sync`, `override-gate`, `force-stop`, `retry`, `revalidate`, `diagnostics`.
 - **`ControlClient`:** one persistent socket. It never replays a mutating action after a transport error: it returns `CONNECTION_LOST` and the caller re-reads status.
 
@@ -546,6 +546,7 @@ Failures before Ready print a `FatalLine` and exit with 73 (store), 75 (locked),
   - after every activator slice;
   - by maintenance at 1 Hz (`content_counters`, `inbox_counts`, per-peer feed counters).
 - The **`status` RPC** returns the cell without any lock. It never sets `busy`/`stale` unless the cell is older than 5 s.
+- **Content after a client mutation** (CCR-WP2.INT-6, ratified in WP2.INT): the cheap members are read-your-writes as above. The content members (`content`, `content_counters`, `pending_causal_events`) need the projection, which another connection's commit makes every pooled connection reload (O(projection), about 0.7–2.3 s at 50K entries), so they are refreshed on a background thread, never on the caller. A `status` call waits for that refresh only when one is expected to take at most 100 ms (`READ_YOUR_WRITES_BUDGET`: small stores still read their writes); otherwise it answers from the cell with the additive key `content_pending: true`, and the content lands in the cell for a later call (or maintenance's refresh).
 - **`WorkerHeartbeat`** (§6.1) is published at 1 Hz by the heartbeat thread from atomics, the cell and `MountControl::status()`. `watch` returns as soon as `seq > after_seq`.
 
 ---
@@ -2405,7 +2406,7 @@ The wire stays v2-compatible this wave: the bridged legacy lanes are the only ne
   - over 300 release seeds, a prepared off-lock commit equals the inline commit (projection, conflict rows, `current_parts`, snapshot);
   - a forced `Stale` (local commit between prepare and commit) converges;
   - `size_change_between_prepare_and_commit_rejected`;
-  - the engine lock is held < 50 ms for a slow event at 2K (release);
+  - the engine lock is held < 50 ms for a slow event at 2K (release); a slow event that adds or changes a conflict is measured without a floor (`lock_hold_slow_conflict_event_2k`, about 60 ms: the full projection rewrite; CCR-WP2.INT-5, deferred to Wave 3/4);
   - `EventCache` equals `events()` after inserts and deletes;
   - `replication_regressions`, `startup_snapshots` and `scalability` green.
 - **Invariants at risk:** 4, 7, 11.
@@ -2804,8 +2805,8 @@ pub struct WriteResult { pub hash: String, pub outcome: ObjectOutcome, pub durab
 | `qual_wp1_9_session` | slow does not block fast; idle 60 s; dead-peer detection; 32 MiB duplex; loopback throughput |
 | `qual_wp1_12_legacy` | hung remote repo charged; interval 20 s with no reconnects; WORKER_BUSY not counted; crash backoff |
 | `qual_wp2_1_lifecycle` | API latency under churn; crash loop; Shutdown with a busy folder; adoption; hung worker; mount failure end to end; SIGTERM |
-| `qual_wp2_3_worker` | FS p99 during catch-up; status latency; startup with 5K staged events |
-| `qual_wp2_4_offlock` | lock hold < 50 ms for a slow event at 2K; Stale convergence |
+| `qual_wp2_3_worker` | FS p99 during catch-up; status latency; startup with 5K staged events; status after a client mutation at 50K (no floor) |
+| `qual_wp2_4_offlock` | lock hold < 50 ms for a slow event at 2K (a conflict-producing one measured without a floor, CCR-WP2.INT-5); Stale convergence |
 | `qual_wp2_5_feed` | 150K-event feed; idle exchange at 50K; staged events not re-sent; peer restore |
 | `qual_wp3_1_transport` | hung remote repo; interval 20 s; v2 peer fails closed; inbound status; rotation |
 | `qual_wp3_2_objects` | 256 MiB worker-to-worker; 10K tiny objects; crash resume |

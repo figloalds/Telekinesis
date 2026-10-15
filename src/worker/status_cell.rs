@@ -17,8 +17,15 @@
 //!   per connection until the database changes, `core::status::Cache`). Run
 //!   by maintenance (about 1 Hz) and by the first `status` call. A `status`
 //!   call that finds the content older than a client mutation that changed
-//!   it refreshes the content and cheap members only, one computation for
-//!   concurrent callers (WP2.INT's post-integration re-review).
+//!   it has the content and cheap members refreshed on a background thread
+//!   (`status-content`, one at a time per store): it waits for that refresh
+//!   only when the last one took at most [`READ_YOUR_WRITES_BUDGET`] (then
+//!   it reads its writes); otherwise it answers from the cell at once, with
+//!   `content_pending: true`, and the refresh lands in the cell for the next
+//!   call. The refresh after another connection's commit reloads the
+//!   projection (cold, O(projection): about 2 s at 50K events), so it never
+//!   runs on the caller (WP2.INT's post-integration re-review and its
+//!   confirmation review).
 //!
 //! Each refresh records the `ctx.status_generation` it read before reading the
 //! store; a merge never replaces newer data with an older computation. A
@@ -39,7 +46,7 @@
 //! lock-free vitals (`mounted`, `open_handles`, `unflushed_files`, `health`,
 //! notifications, the last sync observations) and the values derived from
 //! them at reply time (`caught_up`, `metadata_caught_up`, `content_complete`,
-//! `upload_state`). `caught_up` follows the legacy rule except that staged
+//! `upload_state`, `content_pending`). `caught_up` follows the legacy rule except that staged
 //! rows count through `incoming_active` (`pending_active`): quarantined and
 //! blocked rows no longer hold it false forever (CCR-WP1.6-3). Its per-peer
 //! inventory match is recomputed when an exchange was observed or the feed
@@ -58,18 +65,40 @@ use crate::{
         orchestrator::FeedTip,
     },
     runtime::{EngineVitals, ctx::WorkerCtx},
-    util::time::now_ms,
+    util::{lock::lock, time::now_ms},
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    sync::atomic::Ordering,
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Condvar, Mutex, atomic::Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
 /// How long a peer's last sync observation counts for `caught_up` (legacy).
 const SYNC_FRESH_MS: u64 = 15_000;
+/// A `status` call after a client mutation waits for the background content
+/// refresh when one is expected to take at most this long (a cold content
+/// scan: 17 ms at 2K entries, 47 ms at 5K, 220 ms at 20K, release), so it
+/// reads its writes; a longer one is not waited for (`content_pending`).
+pub const READ_YOUR_WRITES_BUDGET: Duration = Duration::from_millis(100);
+/// On a store whose refresh is expected to take longer than
+/// [`READ_YOUR_WRITES_BUDGET`], a background content refresh starts only
+/// this many times the last one's duration after it ended (at most about
+/// half a core while a client mutates a large store and polls `status`;
+/// maintenance also refreshes).
+const SLOW_REFRESH_SPACING: u32 = 1;
+
+/// Fault points of the status cell (`util::fault`).
+pub mod faults {
+    /// `<CONTENT_REFRESH>.<repo>`: at the start of a background content
+    /// refresh (tests: a slow refresh; the repo keeps it to one in-process
+    /// worker).
+    pub const CONTENT_REFRESH: &str = "worker.status_cell.content";
+}
 
 /// The cell's own bookkeeping, stored under `"cell"` (stripped from replies).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +119,12 @@ pub struct CellMeta {
     pub content: u64,
     /// Duration of the last full refresh.
     pub full_ms: u64,
+    /// Duration of the cell's first full refresh: cold (a new process's
+    /// connections have no view loaded), so what a content refresh after a
+    /// commit is expected to cost before one ran in the background
+    /// (`catch_up_content`). The later ones read cached scans while the
+    /// store is idle.
+    pub first_full_ms: Option<u64>,
     /// When the per-peer inventory match was computed.
     pub inventory_at_ms: u64,
     /// The feed tip (shared events only, like the cell's `tip`) the per-peer
@@ -385,6 +420,7 @@ fn refresh_content_with(
                     meta.inventory_epoch.clone_from(&cheap.feed.epoch);
                 }
                 meta.full_ms = full_ms;
+                meta.first_full_ms.get_or_insert(full_ms);
             }
             meta.content_generation = target;
             meta.content_at_ms = now_ms();
@@ -458,11 +494,12 @@ pub fn activator_idle(ctx: &WorkerCtx, quiet: Duration) -> bool {
     ready && now_ms().saturating_sub(last) >= u64::try_from(quiet.as_millis()).unwrap_or(0)
 }
 
-/// The `status` RPC reply (module docs). Recomputes first when the cell is
-/// behind a mutation (`status_generation`) or behind the engine's store
-/// revision (writes through the mount), when a mutation asked for the
-/// content, or when the cell is older than `STATUS_CELL_STALE`.
-pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
+/// The `status` RPC reply (module docs). Recomputes the cheap members first
+/// when the cell is behind a mutation (`status_generation`) or behind the
+/// engine's store revision (writes through the mount), or when the cell is
+/// older than `STATUS_CELL_STALE`; when a mutation asked for the content,
+/// has it refreshed in the background ([`catch_up_content`]).
+pub fn reply(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>) -> Result<Value> {
     let target = ctx.status_generation.load(Ordering::SeqCst);
     let revision = vitals.store_revision();
     let mut cell = ctx.status_cell.load();
@@ -480,25 +517,20 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
         cell = ctx.status_cell.load();
         meta = CellMeta::of(&cell);
     }
-    if meta.content_generation < meta.content_wanted || cell.get("content").is_none() {
-        // One computation for concurrent callers: each waits for the one in
-        // progress and finds the content caught up.
-        let flight = content_flight(ctx);
-        let _flight = crate::util::lock::lock(&flight);
-        let current = ctx.status_cell.load();
-        let current_meta = CellMeta::of(&current);
-        let first = current.get("content").is_none();
-        if first || current_meta.content_generation < current_meta.content_wanted {
-            // The very first reply computes everything once.
-            let refreshed = if first {
-                refresh_full_with(ctx, Some(vitals))
-            } else {
-                refresh_content(ctx, vitals)
-            };
-            if let Err(error) = refreshed {
-                failure.get_or_insert(error);
-            }
+    if cell.get("content").is_none() {
+        // The very first reply computes everything once (the legacy shape
+        // has a `content` member), one computation for concurrent callers.
+        let job = content_job(ctx);
+        let _first = lock(&job.first);
+        if ctx.status_cell.load().get("content").is_none()
+            && let Err(error) = refresh_full_with(ctx, Some(vitals.as_ref()))
+        {
+            failure.get_or_insert(error);
         }
+        cell = ctx.status_cell.load();
+        meta = CellMeta::of(&cell);
+    } else if meta.content_generation < meta.content_wanted {
+        catch_up_content(ctx, vitals, &meta);
         cell = ctx.status_cell.load();
         meta = CellMeta::of(&cell);
     }
@@ -535,18 +567,139 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
     Ok(compose(&cell, &meta, ctx, vitals, stale))
 }
 
-/// The lock that makes one content refresh at a time per worker store
-/// (`reply`): concurrent `status` calls after a mutation share one
-/// computation instead of each repeating it (post-integration re-review,
-/// WP2.INT). Keyed by the store root (`WorkerCtx` is frozen).
-fn content_flight(ctx: &WorkerCtx) -> std::sync::Arc<std::sync::Mutex<()>> {
-    static FLIGHTS: std::sync::Mutex<
-        std::collections::BTreeMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
-    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
-    crate::util::lock::lock(&FLIGHTS)
-        .entry(ctx.root.clone())
-        .or_default()
-        .clone()
+/// One worker store's read-your-writes content refresh: at most one runs at
+/// a time, on its own thread, and every `status` call that wants it shares
+/// it. Keyed by the store root (`WorkerCtx` is frozen and has no slot).
+#[derive(Default)]
+struct ContentJob {
+    state: Mutex<JobState>,
+    /// Signalled when a refresh ends (its result is in the cell by then).
+    ended: Condvar,
+    /// Serializes the very first reply's full computation.
+    first: Mutex<()>,
+}
+
+#[derive(Default)]
+struct JobState {
+    running: bool,
+    /// How long the last background refresh took, and when it ended.
+    last: Option<(Duration, Instant)>,
+    /// What a refresh is expected to cost: a decaying maximum of their
+    /// durations, seeded with the cell's first full refresh. A maximum,
+    /// because a refresh that finds a pooled connection's view already
+    /// loaded after the commit (maintenance's) is fast without saying
+    /// anything about the next one, which reloads it; decaying (by a
+    /// quarter per refresh), so a one-off slow one is forgotten.
+    expected: Option<Duration>,
+}
+
+fn content_job(ctx: &WorkerCtx) -> Arc<ContentJob> {
+    static JOBS: Mutex<BTreeMap<PathBuf, Arc<ContentJob>>> = Mutex::new(BTreeMap::new());
+    lock(&JOBS).entry(ctx.root.clone()).or_default().clone()
+}
+
+/// Brings the content up to `meta.content_wanted` without computing
+/// it on the caller (WP2.INT's confirmation review: after another
+/// connection's commit the content scan reloads the projection, O(projection),
+/// 1.6–2.3 s at 50K events). The refresh runs on a `status-content` thread,
+/// one at a time per store; this waits for it only when a refresh is
+/// expected to take at most [`READ_YOUR_WRITES_BUDGET`] (`JobState::expected`;
+/// bounded by `STATUS_CELL_STALE`). Otherwise the caller answers from the
+/// cell (`content_pending`), and a refresh starts only
+/// [`SLOW_REFRESH_SPACING`] times the last one's duration after it ended (a
+/// later `status` call, or maintenance, catches the content up meanwhile).
+fn catch_up_content(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>, meta: &CellMeta) {
+    let wanted = meta.content_wanted;
+    let caught_up = || CellMeta::of(&ctx.status_cell.load()).content_generation >= wanted;
+    let job = content_job(ctx);
+    let mut state = lock(&job.state);
+    let expected = *state.expected.get_or_insert(Duration::from_millis(
+        meta.first_full_ms.unwrap_or(meta.full_ms),
+    ));
+    let cheap = expected <= READ_YOUR_WRITES_BUDGET;
+    let deadline = Instant::now()
+        + if cheap {
+            STATUS_CELL_STALE
+        } else {
+            Duration::ZERO
+        };
+    loop {
+        // Under the job lock: a refresh that ended has merged its result.
+        if caught_up() {
+            return;
+        }
+        if !state.running {
+            let spaced = cheap
+                || state.last.is_none_or(|(took, ended)| {
+                    ended.elapsed() >= took.saturating_mul(SLOW_REFRESH_SPACING)
+                });
+            if !spaced || ctx.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            if let Err(error) = spawn_content_refresh(ctx, vitals, &job) {
+                crate::util::log::event!(warn, UNKNOWN_ERROR, {
+                    "site": "worker.status_cell",
+                    "message": format!("cannot start a content refresh: {error}"),
+                });
+                return;
+            }
+            state.running = true;
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        state = job
+            .ended
+            .wait_timeout(state, left)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
+}
+
+/// Starts one background content refresh (`refresh_content` on a pooled
+/// store); its end, however it ends, is recorded in `job` and signalled.
+fn spawn_content_refresh(
+    ctx: &Arc<WorkerCtx>,
+    vitals: &Arc<EngineVitals>,
+    job: &Arc<ContentJob>,
+) -> std::io::Result<()> {
+    /// Records the refresh's end, also when it panics.
+    struct Ended {
+        job: Arc<ContentJob>,
+        started: Instant,
+    }
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            let took = self.started.elapsed();
+            let mut state = lock(&self.job.state);
+            state.running = false;
+            state.last = Some((took, Instant::now()));
+            state.expected = Some(state.expected.map_or(took, |e| took.max(e * 3 / 4)));
+            drop(state);
+            self.job.ended.notify_all();
+        }
+    }
+    let (ctx, vitals, job) = (ctx.clone(), vitals.clone(), job.clone());
+    thread::Builder::new()
+        .name("status-content".into())
+        .spawn(move || {
+            let _ended = Ended {
+                job,
+                started: Instant::now(),
+            };
+            let point = format!("{}.{}", faults::CONTENT_REFRESH, ctx.repo);
+            let refreshed =
+                crate::util::fault::trigger(&point).and_then(|()| refresh_content(&ctx, &vitals));
+            if let Err(error) = refreshed {
+                let wire = crate::model::errors::ErrorWire::from_error(&error);
+                crate::util::log::event!(warn, (wire.code.as_str()), {
+                    "site": "worker.status_cell.content",
+                    "message": wire.message,
+                });
+            }
+        })
+        .map(drop)
 }
 
 /// Every `caught_up` condition except the per-peer inventory match.
@@ -628,6 +781,11 @@ fn compose(
     s["status_generation"] = json!(meta.generation);
     if stale {
         s["stale"] = json!(true);
+    }
+    if meta.content_generation < meta.content_wanted {
+        // The content members predate a client mutation that changed them:
+        // their refresh runs in the background (`catch_up_content`).
+        s["content_pending"] = json!(true);
     }
     s
 }

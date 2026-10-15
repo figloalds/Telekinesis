@@ -470,3 +470,81 @@ fn startup_with_5k_staged() {
     let _ = worker.stop();
     s.finish();
 }
+
+/// WP2.INT's confirmation review (WP2.3 finding 5): the `status` right after
+/// a client mutation on a large store answers from the cell; the content
+/// refresh, which reloads the projection after the mutation's commit
+/// (1.6–2.3 s at 50K events when the caller ran it), runs in the background
+/// (`content_pending` until it lands). No floor: `status_after_mutation_ms`
+/// is the reply time after each of ten imports, `content_catch_up_ms` how
+/// long the content took to show each import.
+#[test]
+#[ignore = "WP2.INT"]
+fn status_after_mutation_large() {
+    let mut s = Scenario::new(FILE, "status_after_mutation_large");
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let n = scaled(50_000);
+    {
+        let mut store = Store::initialize(&state, &id(), &id()).unwrap();
+        linear_history(&mut store, n).unwrap();
+    }
+    let mut worker = WorkerProc::spawn(&state, &[], &[]).unwrap();
+    if let Err(e) = worker.wait_ready(Duration::from_secs(300)) {
+        s.timeout(format!("not Ready: {}", error_code(&format!("{e:#}"))));
+        return s.finish();
+    }
+    let info: tkfs::runtime::Discovery =
+        serde_json::from_slice(&fs::read(state.join("runtime.json")).unwrap()).unwrap();
+    let mut lane = tkfs::runtime::RpcLane::default();
+    let mut status = || lane.call(&info, &id(), json!({"op":"status"}));
+    let objects = |status: &Value| status["content"]["current_objects"].as_u64();
+    // The startup's full refresh has run.
+    let mut before = None;
+    let ready = wait_until(Duration::from_secs(120), || {
+        before = status().ok().and_then(|s| objects(&s));
+        before.is_some()
+    });
+    s.check(ready, "the status cell has its content");
+    let before = before.unwrap_or(0);
+    s.measure_from_now();
+    let mut replies = vec![];
+    let mut catch_up = vec![];
+    let mut pending = 0;
+    for i in 0..10u64 {
+        let name = format!("mutation-{i:02}.txt");
+        let imported = rpc_at(
+            &state,
+            json!({"op":"import","path":name,"hex":hex::encode(name.as_bytes())}),
+        );
+        if !s.check(imported.is_ok(), format!("import {i}: {imported:?}")) {
+            break;
+        }
+        let watch = Stopwatch::start();
+        let (reply, ms) = time_ms(&mut status);
+        replies.push(ms);
+        if reply.as_ref().is_ok_and(|r| r["content_pending"] == true) {
+            pending += 1;
+        }
+        // Each import adds one current object.
+        let current = before + i + 1;
+        let caught_up = wait_until(Duration::from_secs(60), || {
+            status()
+                .is_ok_and(|r| objects(&r) == Some(current) && r.get("content_pending").is_none())
+        });
+        catch_up.push(watch.ms());
+        if !s.check(caught_up, format!("the content shows import {i}")) {
+            break;
+        }
+    }
+    let summary = summarize(&replies);
+    s.metric_with(
+        "status_after_mutation_ms",
+        summary.p99,
+        "ms",
+        json!({"replies": summary.json(), "content_pending_replies": pending,
+            "content_catch_up_ms": summarize(&catch_up).json(), "files": n}),
+    );
+    let _ = worker.stop();
+    s.finish();
+}

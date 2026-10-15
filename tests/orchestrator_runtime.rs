@@ -1255,13 +1255,22 @@ fn a_received_mount_attaches_in_place_once_its_gate_is_satisfied() {
         "label":"Received","mount":mount,"headless":false}),
     );
     let state = state_id(&pb);
+    // The typed lifecycle comes from the status hub, whose snapshot may lag
+    // the controller's view by a throttled rebuild: wait for it too, and
+    // assert on the Inspect that satisfied the wait (WP2.INT's confirmation
+    // review: reading a new Inspect for it was flaky under suite load).
+    let mut gated = Value::Null;
     b.wait_for("gated", Duration::from_secs(30), || {
         b.try_inspect(&state).is_ok_and(|p| {
-            p["startup_phase"] == PHASE_GATED
+            let ready = p["startup_phase"] == PHASE_GATED
                 && p["sync"][0]["metadata"]["last_success_ms"].is_number()
+                && phase(&p) == "running";
+            if ready {
+                gated = p;
+            }
+            ready
         })
     });
-    let gated = b.inspect(&state);
     assert_eq!(gated["running"], false, "{gated}");
     assert_eq!(gated["starting"], true);
     assert_eq!(gated["mounted"], false);
@@ -1345,6 +1354,11 @@ fn a_hung_published_summary_never_slows_list() {
 /// hangs for 12 s; a 65th connection's `list` and `status` are answered.
 /// Before the fix the writes waited for the catalog, and the 65th connection
 /// was refused (`too many open connections`).
+///
+/// WP2.INT's confirmation review: the refusals are the writers' answers, not
+/// a catalog fault. Once the slow write is over and a write succeeds, no
+/// daemon-level `CATALOG_UNAVAILABLE` is open (it was: the refusals left one
+/// open until the daemon restarted).
 #[test]
 fn writes_behind_a_slow_catalog_never_lock_reads_out() {
     let _serial = serial();
@@ -1352,7 +1366,7 @@ fn writes_behind_a_slow_catalog_never_lock_reads_out() {
     let mut slow = FaultConfig::new(catalog::faults::SLOW_WRITE, FaultAction::Hang);
     slow.ms = Some(12_000);
     slow.count = Some(1);
-    fault::configure(Some(slow));
+    let _armed = Armed::new(slow);
     let writers: Vec<_> = (0..64)
         .map(|_| {
             let control = daemon.control.clone();
@@ -1387,5 +1401,230 @@ fn writes_behind_a_slow_catalog_never_lock_reads_out() {
             );
         }
     }
-    fault::configure(None);
+    // The slow write ends (12 s after the first writer): a write succeeds.
+    assert!(
+        wait_until(Duration::from_secs(20), || daemon
+            .call(json!({"op":"reset-pairing-code"}))
+            .is_ok()),
+        "no write succeeded after the slow write"
+    );
+    // Long enough for the hub to publish anything still queued.
+    thread::sleep(Duration::from_millis(600));
+    let status = daemon.call(json!({"op":"status"})).unwrap();
+    let open = open_catalog_errors(&status);
+    assert!(
+        open.is_empty(),
+        "a daemon-level CATALOG_UNAVAILABLE outlives the slow write: {open:?}"
+    );
+}
+
+/// The open daemon-level `CATALOG_UNAVAILABLE` errors of a `status` reply.
+fn open_catalog_errors(status: &Value) -> Vec<Value> {
+    status["daemon"]["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|record| {
+            record["error"]["code"] == "CATALOG_UNAVAILABLE"
+                && record["scope"]["kind"] == "daemon"
+                && record["resolved_at_ms"].is_null()
+        })
+        .cloned()
+        .collect()
+}
+
+/// Arms a fault point until dropped (also when the test fails), so the next
+/// test never runs with it.
+struct Armed;
+
+impl Armed {
+    fn new(config: FaultConfig) -> Self {
+        fault::configure(Some(config));
+        Armed
+    }
+}
+
+impl Drop for Armed {
+    fn drop(&mut self) {
+        fault::configure(None);
+    }
+}
+
+/// WP2.INT's confirmation review: a catalog command that fails inside the
+/// catalog (here, one that panics and is rolled back) is a daemon-level
+/// `CATALOG_UNAVAILABLE` (§2.3), and the next management write that
+/// succeeds resolves it. Before the fix nothing resolved it.
+#[test]
+fn a_failed_catalog_write_is_a_daemon_error_until_a_write_succeeds() {
+    let _serial = serial();
+    let daemon = InProcess::start(8);
+    {
+        let mut panics = FaultConfig::new(catalog::faults::SLOW_WRITE, FaultAction::Panic);
+        // Transient errors show after three occurrences.
+        panics.count = Some(3);
+        let _armed = Armed::new(panics);
+        for _ in 0..3 {
+            let error = daemon
+                .call(json!({"op":"reset-pairing-code"}))
+                .expect_err("the write panicked in the catalog");
+            assert!(
+                error.to_string().contains("CATALOG_UNAVAILABLE"),
+                "{error:#}"
+            );
+        }
+    }
+    let mut status = Value::Null;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            status = daemon.call(json!({"op":"status"})).unwrap();
+            !open_catalog_errors(&status).is_empty()
+        }),
+        "the failed writes are not a daemon error: {}",
+        status["daemon"]
+    );
+    daemon
+        .call(json!({"op":"reset-pairing-code"}))
+        .expect("the catalog thread lives on after a panicked command");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            status = daemon.call(json!({"op":"status"})).unwrap();
+            open_catalog_errors(&status).is_empty()
+        }),
+        "a successful write did not resolve the daemon error: {}",
+        status["daemon"]
+    );
+    let resolved = status["daemon"]["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|record| {
+            record["error"]["code"] == "CATALOG_UNAVAILABLE" && record["resolved_at_ms"].is_u64()
+        });
+    assert!(resolved, "{}", status["daemon"]);
+}
+
+/// The listed folder labelled `label`, if any.
+fn listed(daemon: &InProcess, label: &str) -> Option<Value> {
+    daemon.call(json!({"op":"list"})).ok().and_then(|listed| {
+        listed["folders"]
+            .as_array()?
+            .iter()
+            .find(|folder| folder["label"] == label)
+            .cloned()
+    })
+}
+
+/// WP2.INT's confirmation review: a `create_folder` still running when
+/// `catalog::APPLY_WAIT` passes may yet commit, so Create never deletes the
+/// new folder's store then. A write that commits within
+/// `manage::CREATE_SETTLE_WAIT` more is Create's reply; a slower one is
+/// `REQUEST_TIMEOUT` naming the folder, whose store is kept, and the folder
+/// the catalog lists afterwards has its state directory. Before the fix
+/// Create answered `REQUEST_TIMEOUT` at 5 s and deleted the directory of the
+/// folder the catalog then listed.
+#[test]
+fn create_behind_a_slow_catalog_write_never_deletes_a_listed_folder_store() {
+    let _serial = serial();
+    // The write commits 2 s after APPLY_WAIT: Create answers with the folder.
+    {
+        let daemon = InProcess::start(8);
+        let mut slow = FaultConfig::new(catalog::faults::SLOW_WRITE, FaultAction::Hang);
+        slow.ms = Some(7_000);
+        slow.count = Some(1);
+        let _armed = Armed::new(slow);
+        let started = Instant::now();
+        let created = daemon
+            .call(json!({"op":"create","label":"Slow","mount":null,"headless":true}))
+            .expect("Create waits for a write that commits soon after APPLY_WAIT");
+        assert!(
+            started.elapsed() >= catalog::APPLY_WAIT,
+            "the write was not slow: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(created["label"], "Slow", "{created}");
+        let folder = listed(&daemon, "Slow").expect("the folder is listed");
+        assert_eq!(folder["state"], created["state"]);
+        let directory = Path::new(folder["directory"].as_str().unwrap());
+        assert!(
+            directory.join("metadata.sqlite").is_file(),
+            "the listed folder's store {} is gone",
+            directory.display()
+        );
+    }
+    // The write commits after APPLY_WAIT + CREATE_SETTLE_WAIT: Create answers
+    // REQUEST_TIMEOUT and keeps the store of the folder listed afterwards.
+    {
+        let daemon = InProcess::start(8);
+        let mut slow = FaultConfig::new(catalog::faults::SLOW_WRITE, FaultAction::Hang);
+        slow.ms = Some(12_000);
+        slow.count = Some(1);
+        let _armed = Armed::new(slow);
+        let error = daemon
+            .call(json!({"op":"create","label":"Slower","mount":null,"headless":true}))
+            .expect_err("the write outlasts Create's wait");
+        let text = format!("{error:#}");
+        assert!(text.contains("REQUEST_TIMEOUT"), "{text}");
+        let mut folder = None;
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                folder = listed(&daemon, "Slower");
+                folder.is_some()
+            }),
+            "the slow create_folder never committed"
+        );
+        let folder = folder.unwrap();
+        let state = folder["state"].as_str().unwrap();
+        assert!(text.contains(state), "the reply names the folder: {text}");
+        let directory = Path::new(folder["directory"].as_str().unwrap());
+        assert!(
+            directory.join("metadata.sqlite").is_file(),
+            "the catalog lists folder {state} whose store {} Create deleted",
+            directory.display()
+        );
+    }
+}
+
+/// WP2.INT's confirmation review: a `create_folder` that ran past
+/// `catalog::APPLY_WAIT` and was then rolled back is found out (the catalog
+/// runs a later probe and finds no such folder): Create answers that the
+/// folder was not created and removes its state directory.
+#[test]
+fn create_behind_a_slow_rolled_back_write_leaves_nothing_behind() {
+    let _serial = serial();
+    let daemon = InProcess::start(8);
+    // The command waits 7 s before it runs (counted as running), then fails
+    // before its commit.
+    let mut late = FaultConfig::new(catalog::faults::ACTOR, FaultAction::Hang);
+    late.ms = Some(7_000);
+    late.count = Some(1);
+    let _armed = Armed::new(late);
+    let create = {
+        let control = daemon.control.clone();
+        thread::spawn(move || {
+            ws::call(
+                &mut ws::connect(&control).unwrap(),
+                &json!({"op":"create","label":"Rolled back","mount":null,"headless":true}),
+            )
+        })
+    };
+    // The actor holds the command in its ACTOR hang; the transaction that
+    // follows fails.
+    thread::sleep(Duration::from_secs(2));
+    let mut fail = FaultConfig::new(catalog::faults::SLOW_WRITE, FaultAction::Fail);
+    fail.count = Some(1);
+    fault::configure(Some(fail));
+    let error = create
+        .join()
+        .unwrap()
+        .expect_err("the create_folder was rolled back");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("CATALOG_UNAVAILABLE") && text.contains("not created"),
+        "{text}"
+    );
+    assert_eq!(listed(&daemon, "Rolled back"), None);
+    let states: Vec<_> = fs::read_dir(daemon.data.join("states"))
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(states.is_empty(), "left behind: {states:?}");
 }
