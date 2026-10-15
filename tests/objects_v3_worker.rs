@@ -426,9 +426,12 @@ fn hash_only_request_not_permitted() {
     .unwrap();
     assert!(s.lookup("stolen").is_ok());
     // Referenced by a committed shared event and physically present, but
-    // private: a hash alone grants nothing.
+    // private: a hash alone grants nothing. The refusal is the one a
+    // replica that never received the object gives (`NOT_AVAILABLE`, since
+    // WP3.INT's re-review: a relay that committed the event before its
+    // object arrived), so it does not tell whether a private copy exists.
     let error = s.read_object_range(&secret, 0, 1024).unwrap_err();
-    assert_eq!(error.code, "NOT_PERMITTED", "{error}");
+    assert_eq!(error.code, "NOT_AVAILABLE", "{error}");
     // Unknown hashes, upper-case aliases and junk are refused too.
     let unknown = tkfs::core::hash(b"never stored");
     assert_eq!(
@@ -468,7 +471,7 @@ fn hash_only_request_not_permitted() {
     };
     let conn = session::dial_loopback(&info.address, None, ConnOptions::default()).unwrap();
     let route = json!({"peer": "p", "repo": repo, "local_replica": device, "remote_replica": "r"});
-    for hash in [&secret, &unknown] {
+    for (hash, code) in [(&secret, "NOT_AVAILABLE"), (&unknown, "NOT_PERMITTED")] {
         let error = conn
             .call(
                 "objects.read",
@@ -478,7 +481,7 @@ fn hash_only_request_not_permitted() {
                 Duration::from_secs(10),
             )
             .unwrap_err();
-        assert_eq!(error.code(), "NOT_PERMITTED", "{error:?}");
+        assert_eq!(error.code(), code, "{error:?}");
     }
     let reply = conn
         .call(
@@ -565,9 +568,11 @@ fn private_present_object_is_retransferred_verified_then_registered() {
     file(&mut p.b, "copy", &shared_bytes);
     p.b.checkout("main").unwrap();
     assert!(p.b.object_available(&hash));
+    // Not served (the private copy is never sent), with the answer of a
+    // replica that has not received it (WP3.INT re-review).
     assert_eq!(
         p.b.read_object_range(&hash, 0, 8).unwrap_err().code,
-        "NOT_PERMITTED"
+        "NOT_AVAILABLE"
     );
     assert!(
         wants(&p.b).iter().any(|(h, _, _)| *h == hash),
@@ -1954,7 +1959,9 @@ fn crash_between_install_and_register_retransfers() {
         vec![],
     )
     .unwrap_err();
-    assert_eq!(refused.code(), "NOT_PERMITTED");
+    // Not shareable, so not served: answered as not received yet (a
+    // committed shared event references it; WP3.INT re-review).
+    assert_eq!(refused.code(), "NOT_AVAILABLE");
     let item = want_items(&conn, &p.route_b, "s2");
     assert_eq!(item.len(), 1);
     assert_eq!(item[0]["offset"], 0);
@@ -1970,4 +1977,252 @@ fn crash_between_install_and_register_retransfers() {
     )
     .unwrap();
     assert_eq!(served.body, content[..10].to_vec());
+}
+
+// ---------------------------------------------------------------------------
+// WP3.INT post-integration re-review
+
+/// A relay commits an event before its object arrives (v3 network re-review
+/// major): a read of that object answers `NOT_AVAILABLE` (Transient: the
+/// receiver tries again), not `NOT_PERMITTED` (Fatal, a security-class code
+/// shown for a benign wait). A hash no committed shared event references is
+/// still `NOT_PERMITTED`; once received, the object is served.
+#[test]
+fn a_committed_object_not_yet_received_is_not_available() {
+    let bytes = b"bytes the relay has not received yet".to_vec();
+    let p = pair(|a| {
+        file(a, "relayed", &bytes);
+    });
+    let hash = tkfs::core::hash(&bytes);
+    let error = p.b.read_object_range(&hash, 0, 16).unwrap_err();
+    assert_eq!(error.code, "NOT_AVAILABLE", "{error}");
+    let unknown = tkfs::core::hash(b"never referenced by any event");
+    assert_eq!(
+        p.b.read_object_range(&unknown, 0, 16).unwrap_err().code,
+        "NOT_PERMITTED"
+    );
+    let locks = ObjectLocks::default();
+    let (done, _) = transfer(&p.a, &p.b, &locks, &hash, MIB);
+    assert_eq!(done.outcome, ObjectOutcome::Completed);
+    assert_eq!(p.b.read_object_range(&hash, 0, 5).unwrap().1, b"bytes");
+}
+
+/// The read path's own verification of an untrusted file (no fresh marker)
+/// never outranks a later local verdict (objects re-review minor): bytes
+/// that went corrupt in place, keeping their size and mtime, and that a
+/// local verification marked `CORRUPT`, are verified again (and
+/// quarantined), never served.
+#[test]
+fn a_corrupt_verdict_outranks_an_earlier_serve() {
+    let bytes = vec![3u8; 200_000];
+    let p = pair(|a| {
+        file(a, "served", &bytes);
+    });
+    let hash = tkfs::core::hash(&bytes);
+    let path = p.a.root.join("objects").join(&hash);
+    let set_mtime = |when: std::time::SystemTime| {
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(when).unwrap();
+    };
+    // An untrusted marker: the file's mtime is not the verified one.
+    set_mtime(std::time::SystemTime::now() + Duration::from_secs(3600));
+    let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+    // Served once: verified in full by the read path.
+    let (_, head) = p.a.read_object_range(&hash, 0, 16).unwrap();
+    assert_eq!(head, vec![3u8; 16]);
+    // The first byte flips in place; size and mtime are kept.
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(&[0xfc]).unwrap();
+        file.sync_all().unwrap();
+    }
+    set_mtime(mtime);
+    // A local verification (a control read, an export) marks it corrupt.
+    assert!(p.a.verify_object(&hash).is_err());
+    assert_eq!(availability(&p.a, &hash), Some(CORRUPT));
+    // The read path does not serve the corrupt bytes.
+    match p.a.read_object_range(&hash, 0, 16) {
+        Ok((_, bytes)) => panic!("served bytes the index marked corrupt: {:?}", &bytes[..4]),
+        Err(error) => assert_eq!(error.code, "NOT_AVAILABLE", "{error}"),
+    }
+    assert!(!path.exists(), "the corrupt copy was not quarantined");
+}
+
+/// A spool of an object no event wants any more (its only reference was a
+/// staged event that was then quarantined) is not a download in progress,
+/// and the next open drops it (objects re-review minor).
+#[test]
+fn a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tkfs::core::id();
+    let mut a = Store::initialize(&dir.path().join("a"), &repo, &tkfs::core::id()).unwrap();
+    let hash = file(&mut a, "staged.bin", &vec![42; 2_000_000]);
+    let b = Store::initialize(&dir.path().join("b"), &repo, &tkfs::core::id()).unwrap();
+    let mut events = a.events().unwrap();
+    causal_sort(&mut events);
+    let allowed = BTreeSet::from([a.device.clone()]);
+    b.stage_incoming(
+        events
+            .into_iter()
+            .map(|event| StagedEvent {
+                event,
+                source: None,
+            })
+            .collect(),
+        &allowed,
+    )
+    .unwrap();
+    let locks = ObjectLocks::default();
+    let (total, head) = a.read_object_range(&hash, 0, 1_000_000).unwrap();
+    let progressed = b
+        .write_object_items(&[item(&hash, 0, total, 1_000_000)], &head, &locks)
+        .unwrap();
+    assert_eq!(
+        progressed[0].outcome,
+        ObjectOutcome::Progressed {
+            durable_offset: 1_000_000
+        }
+    );
+    assert_eq!(b.content_counters().unwrap().downloading, 1);
+    // The staged events are quarantined: nothing references the object.
+    b.db.execute(
+        "UPDATE incoming_events SET state='quarantined',error='TEST_QUARANTINED: by the test'",
+        [],
+    )
+    .unwrap();
+    assert!(!b.object_wanted(&hash).unwrap());
+    let counters = b.content_counters().unwrap();
+    assert_eq!((counters.downloading, counters.partial_bytes), (0, 0));
+    let root = b.root.clone();
+    drop(b);
+    let b = Store::open(&root, Some(&repo)).unwrap();
+    assert_eq!(spool_len(&root, &hash), None);
+    assert_eq!(b.spool_state(&hash).unwrap(), None);
+}
+
+/// An object whose size nothing records (a legacy event without a size
+/// descriptor) is wanted with size 0 and offset 0; the source's zero-length
+/// read gives its total, and a write with that total completes it (the
+/// contract objects v3's size probe relies on; objects re-review major).
+#[test]
+fn objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete() {
+    let bytes = vec![5u8; 300_000];
+    let p = pair(|a| {
+        file(a, "legacy.bin", &bytes);
+    });
+    let hash = tkfs::core::hash(&bytes);
+    p.b.db
+        .execute("DELETE FROM object_sizes WHERE hash=?", [&hash])
+        .unwrap();
+    let wanted = p.b.want_objects(lane(), 256, u64::MAX, &no_leases).unwrap();
+    let item = wanted.iter().find(|item| item.hash == hash).unwrap();
+    assert_eq!((item.size, item.offset), (0, 0), "{item:?}");
+    let (total, none) = p.a.read_object_range(&hash, 0, 0).unwrap();
+    assert_eq!((total, none.len()), (300_000, 0));
+    let locks = ObjectLocks::default();
+    let (done, read) = transfer(&p.a, &p.b, &locks, &hash, 128 * 1024);
+    assert_eq!(done.outcome, ObjectOutcome::Completed);
+    assert_eq!(read, 300_000);
+    assert!(received_shared(&p.b, &hash));
+    assert!(!wants(&p.b).iter().any(|(h, _, _)| *h == hash));
+}
+
+/// The same for a staged event without a size descriptor.
+#[test]
+fn staged_objects_without_a_size_descriptor_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = tkfs::core::id();
+    let mut a = Store::initialize(&dir.path().join("a"), &repo, &tkfs::core::id()).unwrap();
+    let hash = file(&mut a, "legacy-staged.bin", &vec![6; 150_000]);
+    let b = Store::initialize(&dir.path().join("b"), &repo, &tkfs::core::id()).unwrap();
+    let mut events = a.events().unwrap();
+    causal_sort(&mut events);
+    for event in &mut events {
+        event.object_sizes.clear();
+    }
+    let allowed = BTreeSet::from([a.device.clone()]);
+    let outcome = b
+        .stage_incoming(
+            events
+                .into_iter()
+                .map(|event| StagedEvent {
+                    event,
+                    source: None,
+                })
+                .collect(),
+            &allowed,
+        )
+        .unwrap();
+    assert!(!outcome.staged.is_empty(), "{outcome:?}");
+    let wanted = b.want_objects(lane(), 256, u64::MAX, &no_leases).unwrap();
+    let item = wanted.iter().find(|item| item.hash == hash).unwrap();
+    assert_eq!((item.size, item.offset), (0, 0), "{item:?}");
+    let locks = ObjectLocks::default();
+    let (done, _) = transfer(&a, &b, &locks, &hash, 64 * 1024);
+    assert_eq!(done.outcome, ObjectOutcome::Completed);
+    assert!(received_shared(&b, &hash));
+}
+
+/// A re-pairing with another `connections` restarts every lane of the peer
+/// under new lease ids (`pull:<peer>:<i>/<n>:a|b`): the new lane set takes
+/// the old set's leases over at once, from the durable offset, without a
+/// stall backoff for a healthy source (objects re-review minor). Another
+/// peer's ids, or the other kind of id, never take a lease over.
+#[test]
+fn a_new_lane_count_takes_over_the_old_lanes_leases() {
+    let content = vec![12u8; 300_000];
+    let w = worker(|a| {
+        file(a, "l.bin", &content);
+    });
+    let hash = tkfs::core::hash(&content);
+    let source_a = w.route_b["remote_replica"].as_str().unwrap().to_owned();
+    let (old, new) = ("pull:peer-a:0/1:a", "pull:peer-a:0/2:a");
+    assert!(offered(&want_op(&w, &w.route_b, old), &hash).is_some());
+    let progressed = write_op(&w, &w.route_b, old, &hash, 0, 300_000, &content[..100_000]);
+    assert_eq!(
+        progressed["outcome"]["progressed"]["durable_offset"],
+        100_000
+    );
+    // Another peer's lanes and the acceptor's push ids leave it alone.
+    assert!(offered(&want_op(&w, &route_c(&w), "pull:peer-c:0/3:a"), &hash).is_none());
+    assert!(offered(&want_op(&w, &w.route_b, "push:peer-a:0/5"), &hash).is_none());
+    // While an old lane still moves it (progress within a quarter of a TTL),
+    // it keeps it.
+    assert!(offered(&want_op(&w, &w.route_b, new), &hash).is_none());
+    // The peer's lanes restarted with two lanes: once the old lease saw no
+    // progress for a quarter of a TTL, the new lane set takes it over, from
+    // the durable offset (it waited a whole TTL, then a 60 s backoff).
+    w.ctx
+        .inflight_objects
+        .lock()
+        .unwrap()
+        .get_mut(&hash)
+        .unwrap()
+        .expires_ms -= 16_000;
+    let items = want_op(&w, &w.route_b, new);
+    assert_eq!(offered(&items, &hash).unwrap()["offset"], 100_000);
+    assert_eq!(lease(&w, &hash).session, new);
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hash).is_none());
+    let late = write_op(
+        &w,
+        &w.route_b,
+        old,
+        &hash,
+        100_000,
+        300_000,
+        &content[100_000..],
+    );
+    assert_eq!(late["outcome"], "in_flight_elsewhere", "{late}");
+    let done = write_op(
+        &w,
+        &w.route_b,
+        new,
+        &hash,
+        100_000,
+        300_000,
+        &content[100_000..],
+    );
+    assert_eq!(done["outcome"], "completed", "{done}");
 }

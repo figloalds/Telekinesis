@@ -369,7 +369,11 @@ impl Store {
                 (counters, missing)
             }
         };
-        let partial = self.partial_objects()?;
+        // Only spools of objects still wanted are downloads in progress: one
+        // whose staged event was quarantined or removed waits for the next
+        // open to be dropped (`reconcile_spools`; WP3.INT re-review).
+        let mut partial = self.partial_objects()?;
+        partial.retain(|object, _| self.object_wanted(object).unwrap_or(true));
         counters.downloading = partial.len() as u64;
         counters.partial_bytes = partial.values().sum();
         counters.requested = self.wanted_objects()?.len() as u64;

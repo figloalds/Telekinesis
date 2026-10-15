@@ -659,6 +659,7 @@ impl Store {
     }
     /// A read found no file: an `AVAILABLE` row becomes `MISSING` (best effort).
     pub(crate) fn note_missing(&self, object: &str) {
+        forget_served(&self.root, object);
         let _ = self.db.execute(
             "UPDATE object_availability SET state=?1,verified_ms=0 WHERE hash=?2 AND state=?3",
             params![MISSING, object, AVAILABLE],
@@ -666,6 +667,7 @@ impl Store {
     }
     /// A verification failed: the row becomes `CORRUPT` (best effort).
     fn note_corrupt(&self, object: &str, size: u64) {
+        forget_served(&self.root, object);
         let _ = self.db.execute(
             "INSERT INTO object_availability(hash,size,state,mtime_ns,verified_ms) VALUES(?1,?2,?3,0,0)
              ON CONFLICT(hash) DO UPDATE SET state=?3,verified_ms=0 WHERE object_availability.state<>?3",
@@ -697,6 +699,7 @@ impl Store {
     /// `object_errors` row and the backoff, mark the object `CORRUPT` and queue
     /// it for download again. The journal is kept.
     pub(crate) fn quarantine(&self, object: &str, error: &anyhow::Error) -> Result<()> {
+        forget_served(&self.root, object);
         let path = self.root.join("objects").join(object);
         let size = fs::metadata(&path).map_or(-1, |m| m.len() as i64);
         if path.is_file() {
@@ -1163,12 +1166,21 @@ fn served() -> std::sync::MutexGuard<'static, ServedMap> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The read path's verification of `object` no longer stands (it was found
+/// corrupt or missing, or quarantined).
+fn forget_served(root: &Path, object: &str) {
+    served().remove(&(root.to_path_buf(), object.to_owned()));
+}
+
 impl Store {
     /// Objects v3 `objects.read` (§6.4): up to `len` bytes of `object` from
     /// `offset`, with the object's total size. Served only under the
     /// authorization triad (invariant 13): the hash is shareable, referenced by
     /// a committed **shared** event, and its bytes are available; otherwise
-    /// `NOT_PERMITTED` (a hash alone grants nothing) or `NOT_AVAILABLE`.
+    /// `NOT_PERMITTED` (no committed shared event references it: a hash alone
+    /// grants nothing) or `NOT_AVAILABLE` (referenced, but not received here,
+    /// whether or not a private copy exists, or its bytes are gone; WP3.INT
+    /// re-review).
     ///
     /// Bytes are verified before they are served: a trusted marker (size and
     /// mtime as recorded at a verification) serves at once; any other file is
@@ -1185,14 +1197,27 @@ impl Store {
             return Err(ErrorWire::coded("INVALID_OBJECT_ID", object));
         }
         let wire = |error: anyhow::Error| ErrorWire::from_error(&error);
-        let permitted = (|| -> Result<bool> {
-            Ok(self.object_shareable(object)? && self.objects_referenced_committed(object)?)
+        let (referenced, shareable) = (|| -> Result<(bool, bool)> {
+            let referenced = self.objects_referenced_committed(object)?;
+            Ok((referenced, referenced && self.object_shareable(object)?))
         })()
         .map_err(wire)?;
-        if !permitted {
+        if !referenced {
             return Err(ErrorWire::coded(
                 "NOT_PERMITTED",
                 format!("{object} is not a shared object of this replica"),
+            ));
+        }
+        if !shareable {
+            // A committed shared event references it, but this replica has
+            // not received it (a relay that committed the event before its
+            // object arrived), or holds only a private copy: not available
+            // here, which is Transient for the receiver (WP3.INT re-review).
+            // The same answer either way, so it reveals nothing beyond the
+            // shared event (not whether a private copy exists; invariant 13).
+            return Err(ErrorWire::coded(
+                "NOT_AVAILABLE",
+                format!("{object} has not been received by this replica"),
             ));
         }
         let path = self.root.join("objects").join(object);
@@ -1219,8 +1244,14 @@ impl Store {
             ));
         }
         let key = (self.root.clone(), object.to_owned());
+        // This process's verification counts only while the index does not
+        // say otherwise: a later local verification that found the bytes
+        // corrupt (or the file missing) wins, even when the corruption kept
+        // the size and mtime (WP3.INT re-review). It is verified again (and
+        // quarantined if it still fails).
         let trusted = row.is_some_and(|row| row.trusted(total, mtime))
-            || served().get(&key) == Some(&(total, mtime));
+            || (row.is_none_or(|row| row.state == AVAILABLE)
+                && served().get(&key) == Some(&(total, mtime)));
         if !trusted {
             match self.verify_object(object) {
                 Ok(()) => {
