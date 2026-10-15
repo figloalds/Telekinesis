@@ -662,6 +662,114 @@ fn the_seal_forecast_never_parses_large_payloads() {
 }
 
 // ---------------------------------------------------------------------------
+// Post-integration re-review (WP2.INT): retired legacy lanes go quiet
+
+/// The state of `installation`'s outbound lane `lane` in `node`'s status.
+fn lane_state(node: &Node, installation: &str, lane: u64) -> Option<String> {
+    let snapshot = node.raw_call(json!({"op":"status"})).ok()?;
+    snapshot["peers"]
+        .as_array()?
+        .iter()
+        .find(|peer| peer["installation"] == installation)?["lanes"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["lane"] == lane && entry["direction"] == "outbound")
+        .and_then(|entry| entry["state"].as_str().map(str::to_owned))
+}
+
+/// Whether `node`'s status lists the peer `installation` at all.
+fn lists_peer(node: &Node, installation: &str) -> bool {
+    node.raw_call(json!({"op":"status"})).is_ok_and(|snapshot| {
+        snapshot["peers"].as_array().is_some_and(|peers| {
+            peers
+                .iter()
+                .any(|peer| peer["installation"] == installation)
+        })
+    })
+}
+
+/// After Unpair the peer is gone from the dialer's status and stays gone: a
+/// cancelled lane's late events (its `LegacyLink`, its final `Closed`) never
+/// recreate it. Before the fix the hub showed the removed peer again,
+/// `offline`, until the daemon restarted.
+#[test]
+fn unpair_removes_the_peer_from_status_for_good() {
+    let a = Node::new();
+    let b = Node::new();
+    let code = b.code();
+    a.pair(&b, &code);
+    let peer = b.installation();
+    a.wait_for("a ready control lane", START, || {
+        lane_state(&a, &peer, 0).as_deref() == Some("ready")
+    });
+    a.call(json!({"op":"unpair","endpoint":b.endpoint()}));
+    a.wait_for("the peer gone from status", Duration::from_secs(10), || {
+        !lists_peer(&a, &peer)
+    });
+    // The retired lanes' threads end meanwhile; nothing brings the peer back.
+    let until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < until {
+        assert!(!lists_peer(&a, &peer), "the removed peer came back");
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// A re-pair while the old control lane is parked in a slow local worker
+/// call: the new lane stays `ready` in the hub. The old lane's late `Closed`
+/// (when its call returns, 10 s later) is muted. Before the fix it
+/// overwrote the new lane's `Ready`, and the healthy lane showed `closed`
+/// until the daemon restarted.
+#[test]
+fn a_re_pair_keeps_the_new_lane_ready_while_the_old_one_ends_late() {
+    let a = Node::new();
+    let mut b = Node::new();
+    let code = a.code();
+    b.pair(&a, &code);
+    let (fa, _) = running_folder(&a, "Slow offer");
+    let received = b.receive(&a, &fa);
+    let state_b = state_id(&received);
+    // Only the old control lane's first local offer hangs (10 s).
+    b.restart_with_env(vec![
+        (
+            "TKFS_FAULT_POINT".into(),
+            "worker.rpc.published-offer".into(),
+        ),
+        ("TKFS_FAULT_ACTION".into(), "hang".into()),
+        ("TKFS_FAULT_MS".into(), "10000".into()),
+        ("TKFS_FAULT_COUNT".into(), "1".into()),
+        ("TKFS_FAULT_SCOPE".into(), state_b.clone()),
+    ]);
+    let peer = a.installation();
+    b.wait_for("b ready control lane", START, || {
+        lane_state(&b, &peer, 0).as_deref() == Some("ready")
+    });
+    b.wait_for("the received folder running", START, || {
+        b.try_inspect(&state_b).is_ok_and(|p| p["running"] == true)
+    });
+    // Give the old lane time to enter the hung offer, then re-pair.
+    thread::sleep(Duration::from_millis(1500));
+    b.pair(&a, &code);
+    let repaired = Instant::now();
+    let mut ready_seen = false;
+    let mut states = vec![];
+    while repaired.elapsed() < Duration::from_secs(18) {
+        let state = lane_state(&b, &peer, 0);
+        if state.as_deref() == Some("ready") {
+            ready_seen = true;
+        } else if ready_seen {
+            states.push((repaired.elapsed(), state.clone()));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    assert!(ready_seen, "the new control lane never became ready");
+    assert!(
+        states.is_empty(),
+        "the new ready lane was overwritten: {states:?}"
+    );
+    assert_eq!(lane_state(&b, &peer, 0).as_deref(), Some("ready"));
+}
+
+// ---------------------------------------------------------------------------
 // The v3 peer stack, end to end (not wired into the daemon until WP3.1)
 
 /// An in-process daemon context (WP2.1's `ctx::build_with`) whose workers are
