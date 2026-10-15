@@ -12,7 +12,12 @@
 //! Only clients originate requests (§6.2), so this direction is where a
 //! replayed request would show: invariant 16 holds when no exchange identity
 //! is ever seen twice ([`WireTap::duplicates`]), whatever faults the link
-//! behind the tap (a `FaultProxy`) injects.
+//! behind the tap (a `FaultProxy`) injects. That check means something only
+//! when every exchange request was identified: a caller also asserts that
+//! [`WireTap::unidentified`] is empty and [`WireTap::malformed`] is 0 (a
+//! frame the parser cannot read, a header that is not JSON included).
+//! A request whose body never finished crossing the tap (its connection
+//! ended mid-body) is not recorded: the peer never received it either.
 #![allow(dead_code)]
 
 use serde_json::Value;
@@ -113,6 +118,16 @@ impl WireTap {
     /// Client streams the parser could not follow (expected: 0).
     pub fn malformed(&self) -> u64 {
         self.shared.malformed.load(Ordering::Relaxed)
+    }
+
+    /// Exchange requests (`meta.exchange`, `objects.exchange`) seen without
+    /// an exchange identity (expected: none). [`WireTap::duplicates`] cannot
+    /// tell a replay of one of these on a new connection.
+    pub fn unidentified(&self) -> Vec<Seen> {
+        self.seen()
+            .into_iter()
+            .filter(|seen| is_exchange(&seen.op) && seen.request.is_none())
+            .collect()
     }
 
     /// Every request sent more than once: an exchange identity seen twice
@@ -319,9 +334,12 @@ impl Parser {
         Some((fin, opcode, payload, at + len))
     }
 
-    /// One v3 frame (§6.2 layout).
+    /// One v3 frame (§6.2 layout). Every v3 frame, pre-auth ones included,
+    /// has the 8-byte prefix and one JSON object header: anything else is a
+    /// stream the tap cannot follow (`broken`), never a frame it skips.
     fn v3(&mut self, m: &[u8], found: &mut dyn FnMut(u64, String, Option<String>)) {
         if m.len() < 8 {
+            self.broken = true;
             return;
         }
         let (kind, flags) = (m[0], m[1]);
@@ -331,8 +349,13 @@ impl Parser {
             return;
         }
         let Ok(header) = serde_json::from_slice::<Value>(&m[8..8 + header_len]) else {
+            self.broken = true;
             return;
         };
+        if !header.is_object() {
+            self.broken = true;
+            return;
+        }
         let body = &m[8 + header_len..];
         let id = header["id"].as_u64().unwrap_or(0);
         match kind {
@@ -363,7 +386,7 @@ impl Parser {
 /// The exchange identity a request carries: `request` of the JSON body (or,
 /// for an `objects.exchange` sent in the header, of the header).
 fn exchange_identity(op: &str, body: &[u8], header: &Value) -> Option<String> {
-    if op != "meta.exchange" && op != "objects.exchange" {
+    if !is_exchange(op) {
         return None;
     }
     let value = if body.is_empty() {
@@ -372,4 +395,9 @@ fn exchange_identity(op: &str, body: &[u8], header: &Value) -> Option<String> {
         serde_json::from_slice::<Value>(body).ok()?
     };
     value["request"].as_str().map(str::to_owned)
+}
+
+/// The ops whose requests carry an exchange identity.
+fn is_exchange(op: &str) -> bool {
+    op == "meta.exchange" || op == "objects.exchange"
 }

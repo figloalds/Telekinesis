@@ -475,6 +475,7 @@ fn faulty_link_no_stuck_sync_no_replay() {
 
     // Nothing was sent twice.
     let duplicates = tap.duplicates();
+    let unidentified = tap.unidentified();
     s.metric_with(
         "replayed_requests",
         duplicates.len() as f64,
@@ -484,11 +485,16 @@ fn faulty_link_no_stuck_sync_no_replay() {
             "objects_exchange": tap.count("objects.exchange"),
             "connections": tap.connections(),
             "malformed": tap.malformed(),
+            "unidentified": unidentified.len(),
             "duplicates": duplicates,
         }),
     );
     s.check(duplicates.is_empty(), "no request was sent twice");
     s.check(tap.malformed() == 0, "the tap followed the dialer's stream");
+    s.check(
+        unidentified.is_empty(),
+        "every exchange request carried its identity",
+    );
     s.check(
         tap.count("meta.exchange") > 0 && tap.count("objects.exchange") > 0,
         "exchanges were seen",

@@ -21,7 +21,10 @@ use tkfs::{
         errors::ErrorWire,
         ipc::{FeedExchangeReply, PublishedSummary},
         orchestrator::{EntryState, PublishedEntry},
-        protocol::{CatalogListReply, feed::MetaExchangeRequest},
+        protocol::{
+            CatalogListReply,
+            feed::{LARGE_EVENT_BYTES, MetaExchangeRequest},
+        },
     },
     orchestrator::{self, Action, Config},
     paired_sync::SyncRoute,
@@ -1191,6 +1194,120 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     node.stop();
 }
 
+/// CCR-WP2.5-2 (need both ways): a dialer's event over `LARGE_EVENT_BYTES`
+/// is only flagged in its request page; the acceptor asks for it in its
+/// reply (`need`) and the dialer serves it in its next request
+/// (`need_served`). The dialer books that next request at once, as it does
+/// for `page.more`: under one-way pairing the event never waits for the
+/// idle interval (20 s here). WP3.1 fix round 1: the dialer counted only
+/// `page.more` as more work, so the event waited one full interval unless
+/// something else (a later heartbeat, a remote tip) called for an exchange.
+/// The test leaves nothing else: the event is made while B's sync is
+/// paused, so resuming calls for exactly one exchange.
+#[test]
+fn a_dialers_large_event_reaches_the_acceptor_without_waiting_for_the_interval() {
+    const DIRS: usize = 260;
+    let a = Node::with_interval(20_000);
+    let b = Node::with_interval(20_000);
+    let pa = a.create("Large dialer event", true);
+    // B dials A; A never dials B (one-way pairing).
+    b.pair(&a, &a.code());
+    let pb = b.receive(&a, &pa);
+    let state = pb["state"].as_str().unwrap().to_owned();
+    // B's current state: directories with 724-byte names, so that B's
+    // shared fork of it (one event that lists them all) is a large event.
+    let stem = "€".repeat(240);
+    for index in 0..DIRS {
+        rpc(
+            &pb,
+            json!({"op":"mkdir","path":format!("{stem}{index:04}")}),
+        );
+    }
+    let dirs = |p: &Value| {
+        rpc(p, json!({"op":"state"}))["entries"]
+            .as_object()
+            .map_or(0, |entries| {
+                entries
+                    .values()
+                    .filter(|e| {
+                        e["alive"] == true
+                            && e["name"]
+                                .as_str()
+                                .is_some_and(|name| name.starts_with(&stem))
+                    })
+                    .count()
+            })
+    };
+    wait_long("B's directories at A", Duration::from_secs(180), || {
+        dirs(&pa) == DIRS
+    });
+    // B has seen A's final tip (B polls A's catalog every 2 s, and a changed
+    // remote tip calls for an exchange).
+    let tip_at = |node: &Node| {
+        node.status()["folders"][0]["journal"]["tip"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    wait_long("B sees A's tip", Duration::from_secs(60), || {
+        let peer = &b.status()["folders"][0]["sync"]["peers"][0]["metadata"];
+        peer["remote_tip"].as_u64() == Some(tip_at(&a))
+            && peer["to_send"] == 0
+            && peer["to_receive"] == 0
+    });
+    thread::sleep(Duration::from_secs(3));
+    // The fork, while B's sync is paused: B's heartbeats report the new tip
+    // before the lane may use it.
+    b.call(Action::PauseSync {
+        state: state.clone(),
+    });
+    let before = tip_at(&b);
+    rpc(
+        &pb,
+        json!({"op":"publish","name":"big","current_state_only":true}),
+    );
+    wait_long("B's tip after the fork", Duration::from_secs(30), || {
+        tip_at(&b) == before + 1
+    });
+    thread::sleep(Duration::from_secs(3));
+    let has_branch = |p: &Value| {
+        rpc(p, json!({"op":"branches"}))
+            .as_array()
+            .is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|branch| branch["name"] == "big" && branch["shared"] == true)
+            })
+    };
+    assert!(!has_branch(&pa));
+    let started = Instant::now();
+    b.call(Action::ResumeSync { state });
+    wait_long("the large event at A", Duration::from_secs(90), || {
+        has_branch(&pa)
+    });
+    let elapsed = started.elapsed();
+    // It is one large event of B's, and A committed it.
+    let on_big = |p: &Value| -> Vec<Value> {
+        rpc(p, json!({"op":"events"}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["branch"]["name"] == "big")
+            .cloned()
+            .collect()
+    };
+    let sent = on_big(&pb);
+    assert_eq!(sent.len(), 1);
+    let size = serde_json::to_string(&sent[0]).unwrap().len();
+    assert!(size > LARGE_EVENT_BYTES, "the fork is {size} bytes");
+    let committed = on_big(&pa);
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0]["id"], sent[0]["id"]);
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the large event took {elapsed:?} to reach the acceptor (idle interval 20 s)"
+    );
+}
+
 /// `catalog.list` on a v3 session.
 fn list_catalog(conn: &Conn) -> Result<Reply, tkfs::model::orchestrator::CallError> {
     conn.call(
@@ -1533,6 +1650,10 @@ fn sync_survives_latency_bandwidth_stalls_and_resets_without_replays() {
     assert!(tap.count("meta.exchange") > 0, "{:?}", tap.seen().len());
     assert!(tap.count("objects.exchange") > 0);
     assert_eq!(tap.malformed(), 0, "the tap lost the dialer's stream");
+    // Every exchange request was identified, so the check below covers
+    // replays across connections too (not only reused session ids).
+    let unidentified = tap.unidentified();
+    assert!(unidentified.is_empty(), "{unidentified:#?}");
     let duplicates = tap.duplicates();
     assert!(duplicates.is_empty(), "{duplicates:#?}");
 }
