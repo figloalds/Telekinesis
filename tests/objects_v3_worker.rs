@@ -949,6 +949,65 @@ fn tiny_objects_one_data_fsync_per_object_and_one_registration_per_batch() {
 // ---------------------------------------------------------------------------
 // Report and heal
 
+/// WP3.INT (the WP3.2 review's minor): when SQLite's writer stays busy past
+/// the busy timeout, a call's batched registration fails once and every
+/// installed object of the call is answered `SQLITE_BUSY` at once (not
+/// registered: still wanted), instead of one more busy wait per object; the
+/// next write registers the verified copy that is present.
+#[test]
+fn a_busy_writer_fails_the_registration_once_not_per_object() {
+    let p = pair(|a| {
+        for index in 0..6 {
+            file(
+                a,
+                &format!("busy-{index}"),
+                format!("busy object {index}").as_bytes(),
+            );
+        }
+    });
+    let locks = ObjectLocks::default();
+    let list =
+        p.b.want_objects(lane(), 256, PULL_BUDGET_BYTES, &no_leases)
+            .unwrap();
+    assert!(list.len() >= 6, "{list:?}");
+    let mut items = vec![];
+    let mut body = vec![];
+    for want in &list {
+        let (total, bytes) = p.a.read_object_range(&want.hash, 0, MIB as usize).unwrap();
+        items.push(item(&want.hash, 0, total, bytes.len() as u64));
+        body.extend_from_slice(&bytes);
+    }
+    // Another connection holds SQLite's writer for longer than the busy
+    // timeout of the call's registration transaction.
+    let holder =
+        rusqlite::Connection::open(p.dir.path().join("b").join("metadata.sqlite")).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let results = p.b.write_object_items(&items, &body, &locks).unwrap();
+    let took = started.elapsed();
+    holder.execute_batch("ROLLBACK").unwrap();
+    for result in &results {
+        match &result.outcome {
+            ObjectOutcome::Failed(error) => assert_eq!(error.code, "SQLITE_BUSY", "{result:?}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!received_shared(&p.b, &result.hash));
+    }
+    assert!(
+        took < Duration::from_secs(9),
+        "{took:?}: one busy wait (5 s), not one per object"
+    );
+    // Still wanted; the next write finds the verified copies and registers them.
+    let again = p.b.write_object_items(&items, &body, &locks).unwrap();
+    assert!(
+        again.iter().all(|r| r.outcome == ObjectOutcome::Completed),
+        "{again:?}"
+    );
+    for result in &again {
+        assert!(received_shared(&p.b, &result.hash));
+    }
+}
+
 #[test]
 fn report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read() {
     let content = vec![5u8; 200_000];

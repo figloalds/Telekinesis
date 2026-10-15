@@ -124,7 +124,17 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
         // sequence (§3.6 step 2).
         net.serve_inbound(&ctx, listener);
     }
-    let controls = ControlServer::start(ctx.clone(), control)?;
+    let controls = match ControlServer::start(ctx.clone(), control) {
+        Ok(controls) => controls,
+        Err(error) => {
+            // The inbound server and the peer stack run already: stop them
+            // before giving up (WP3.INT; the WP3.1 review's minor), as the
+            // shutdown sequence would.
+            ctx.shutdown.cancel();
+            net.shutdown(limits::SHUTDOWN_NETWORK);
+            return Err(error);
+        }
+    };
     ctx.shutdown.wait();
     // The signal path runs the sequence here; after the Shutdown action this
     // returns the result it already has.
