@@ -51,9 +51,9 @@ use tkfs::{
             LaneRole, LaneSpec,
             frame::{ChunkHeader, ClientHello},
             objects::{
-                ObjectOutcome, ObjectsPull, ObjectsPush, ObjectsResult, ReadHeader, ReadReply,
-                ReportHeader, WantHeader, WantItem, WantPriority, WantReply, WriteHeader,
-                WriteItem, WriteReply, WriteResult,
+                ObjectOutcome, ObjectResult, ObjectsPull, ObjectsPush, ObjectsReport,
+                ObjectsResult, ObjectsWantsReply, ReadHeader, ReadReply, ReportHeader, WantHeader,
+                WantItem, WantPriority, WantReply, WriteHeader, WriteItem, WriteReply, WriteResult,
             },
         },
         status::{Direction, StatusEvent, StatusSnapshot},
@@ -133,6 +133,9 @@ struct Faults {
     corrupt: HashSet<String>,
     /// The next N write calls are refused `BUSY`.
     busy_writes: usize,
+    /// The next N write calls are handed on, then answered `WORKER_BUSY`
+    /// (the worker's own answer: the write may run).
+    worker_busy_writes: usize,
     /// The next write call sleeps this long before it answers.
     hang_next_write: Option<Duration>,
     /// Every write call fails as a whole with this error (a store outage).
@@ -500,6 +503,14 @@ impl FakeWorker {
             if faults.busy_writes > 0 {
                 faults.busy_writes -= 1;
                 return Err(ErrorWire::coded("BUSY", "test: the handler queue is full"));
+            }
+            if faults.worker_busy_writes > 0 {
+                faults.worker_busy_writes -= 1;
+                self.write_calls.fetch_add(1, Ordering::Relaxed);
+                return Err(ErrorWire::coded(
+                    "WORKER_BUSY",
+                    "test: the write was handed on and is still running",
+                ));
             }
             if let Some(error) = &faults.fail_writes {
                 return Err(error.clone());
@@ -1653,8 +1664,9 @@ fn staging_alone_starts_a_download() {
 }
 
 /// The session client: a refused request (`BUSY`) is sent again; an
-/// uncertain one (no reply within its deadline) is never replayed
-/// (invariant 16).
+/// uncertain one (no reply within its deadline) is never replayed, nor is
+/// one the worker answered `WORKER_BUSY` (its own answer, possibly after it
+/// handed the request on) (invariant 16).
 #[test]
 fn the_session_client_retries_refusals_and_never_replays_uncertain_calls() {
     let worker = FakeWorker::start(REPLICA_A);
@@ -1709,6 +1721,23 @@ fn the_session_client_retries_refusals_and_never_replays_uncertain_calls() {
     );
     // The late reply was applied by the worker: the object is complete.
     assert!(worker.has(&hash));
+    // `WORKER_BUSY` is returned, not sent again.
+    worker.faults().worker_busy_writes = 1;
+    let error = client
+        .write_batch(
+            &route,
+            "session",
+            vec![item(0, 5)],
+            b"hello".to_vec(),
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "WORKER_BUSY", "{error}");
+    assert_eq!(
+        worker.write_calls.load(Ordering::Relaxed),
+        3,
+        "a WORKER_BUSY write was sent again"
+    );
     worker.shutdown();
 }
 
@@ -1755,7 +1784,9 @@ fn a_worker_without_loopback_sessions_is_remembered() {
 
 /// The acceptor's checks keep their codes and never reach the worker; per
 /// item: a hash another lane owns is `OBJECT_ON_WRONG_LANE`, a hash-only
-/// request for an object the worker does not serve gets no bytes.
+/// request for an object the worker does not serve gets no bytes. A report
+/// names an object of the lane that was served to the peer through its end
+/// (`OBJECT_ON_WRONG_LANE`, `UNSOLICITED_OBJECT` otherwise).
 #[test]
 fn inbound_checks_keep_their_codes() {
     let (a, b) = pair(100);
@@ -1889,6 +1920,35 @@ fn inbound_checks_keep_their_codes() {
     );
     assert_eq!(chunks[0].0.hash.as_deref(), Some(mine_hash.as_str()));
     assert!(chunks[0].0.last);
+
+    // `objects.report`: only for an object of the lane that B served this
+    // peer through its end; the others never reach the worker.
+    let report = |hash: &str| {
+        let report = ObjectsReport {
+            repo: REPO.into(),
+            sender: REPLICA_A.into(),
+            hash: hash.into(),
+            code: "CORRUPT_AT_SOURCE".into(),
+        };
+        conn.call(
+            "objects.report",
+            serde_json::to_value(&report).unwrap(),
+            Vec::new(),
+            Priority::Control,
+            Duration::from_secs(5),
+        )
+    };
+    assert_eq!(
+        report(&wrong_lane).unwrap_err().code(),
+        "OBJECT_ON_WRONG_LANE"
+    );
+    assert_eq!(report(&missing).unwrap_err().code(), "UNSOLICITED_OBJECT");
+    assert!(b.worker.reports().is_empty(), "{:?}", b.worker.reports());
+    report(&mine_hash).unwrap();
+    assert_eq!(
+        b.worker.reports(),
+        vec![(mine_hash.clone(), "CORRUPT_AT_SOURCE".to_owned())]
+    );
     conn.close();
 }
 
@@ -2468,6 +2528,413 @@ fn the_session_client_dials_without_its_lock() {
         "{:?}",
         began.elapsed()
     );
+}
+
+/// Multi-source liveness when the transfer that took an object over goes
+/// away (pull side): D wants X; B lacks it (D parks X under its lane to B's
+/// lease, which that lane keeps renewing); D's lane to C takes X over and
+/// moves part of it, then C's session resets and C stays away; E holds X.
+/// C's claim is given back when its round fails, so E's lane takes X over
+/// and installs it, with B's lane still running.
+#[test]
+fn a_holder_that_goes_away_hands_the_pulled_object_on() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let c = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let e = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let size = 8 * MIB;
+    let bytes = content(3400, size as usize);
+    let hash = c.worker.hold(bytes.clone());
+    e.worker.hold(bytes.clone());
+    let to_b = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    to_b.worker.want(&hash, size);
+    to_b.worker.faults().write_delay = Some(Duration::from_millis(20));
+    let to_c = to_b.to_peer(&c.installation(), &c.endpoint);
+    let to_e = to_b.to_peer(&e.installation(), &e.endpoint);
+    let (options, _) = to_b.options();
+    let lane_b = to_b.run(to_b.dial(&b.endpoint, &b.code, LANE), options);
+    let b_lanes = objects::pull_holder(&b.installation(), LANE);
+    assert!(
+        wait_until(Duration::from_secs(10), || to_b
+            .world
+            .object_errors()
+            .iter()
+            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+        "{:?}",
+        to_b.world.object_errors()
+    );
+    // C takes X over, and its session resets mid-transfer.
+    let proxy = FaultProxy::start(&c.endpoint);
+    proxy.reset_after(2 * MIB);
+    let (options, _) = to_c.options();
+    let mut lane_c = to_c.run(to_c.dial(&proxy.endpoint(), &c.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || lane_c.finished()),
+        "C's lane did not end with its session"
+    );
+    lane_c.stop();
+    assert!(!to_b.worker.has(&hash), "C delivered X before it went away");
+    assert!(
+        to_b.worker
+            .write_sessions(&hash)
+            .iter()
+            .all(|lease| lease.starts_with(&b_lanes)),
+        "{:?}",
+        to_b.worker.write_sessions(&hash)
+    );
+    // E takes it over (from where C left it) while B's lane keeps renewing
+    // the lease.
+    let began = Instant::now();
+    let (options, _) = to_e.options();
+    let lane_e = to_e.run(to_e.dial(&e.endpoint, &e.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || to_b.worker.has(&hash)),
+        "E never delivered X: lease {:?}, durable {:?}",
+        to_b.worker.lease_of(&hash),
+        to_b.worker.durable(&hash)
+    );
+    assert!(began.elapsed() < Duration::from_secs(25));
+    assert_eq!(to_b.worker.held_bytes(&hash).unwrap(), bytes);
+    let sessions = to_b.worker.write_sessions(&hash);
+    assert!(
+        sessions.len() == 1 && sessions.iter().all(|lease| lease.starts_with(&b_lanes)),
+        "{sessions:?}"
+    );
+    assert!(!lane_b.finished(), "B's lane stopped renewing the lease");
+    drop(lane_e);
+    drop(lane_b);
+}
+
+/// The same on the push side (a hub): B wants Y; A1 cannot serve it (B
+/// parks Y under A1's push lease, which A1's lane keeps renewing); C takes
+/// Y over and pushes part of it, then C's session resets and C stays away;
+/// E holds Y. C's push ends without its end, so B gives C's claim back, and
+/// E's push installs Y under A1's lease, with A1's lane still running.
+#[test]
+fn a_holder_that_goes_away_hands_the_pushed_object_on() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let size = 8 * MIB;
+    let bytes = content(3500, size as usize);
+    let hash = sha(&bytes);
+    b.worker.want(&hash, size);
+    b.worker.faults().write_delay = Some(Duration::from_millis(20));
+    let a1 = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let c = Dialer::start_as(
+        FakeWorker::start("replica-c"),
+        "replica-c",
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    c.worker.hold(bytes.clone());
+    let e = Dialer::start_as(
+        FakeWorker::start("replica-e"),
+        "replica-e",
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    e.worker.hold(bytes.clone());
+    let (options, _) = a1.options();
+    let lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
+    let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
+    assert!(
+        wait_until(Duration::from_secs(10), || a1
+            .world
+            .object_errors()
+            .iter()
+            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+        "{:?}",
+        a1.world.object_errors()
+    );
+    // C takes Y over, and its session resets mid-push.
+    let proxy = FaultProxy::start(&b.endpoint);
+    proxy.reset_after(3 * MIB);
+    let (options, _) = c.options();
+    let mut lane_c = c.run(c.dial(&proxy.endpoint(), &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || lane_c.finished()),
+        "C's lane did not end with its session"
+    );
+    lane_c.stop();
+    assert!(!b.worker.has(&hash), "C delivered Y before it went away");
+    assert!(
+        wait_until(Duration::from_secs(5), || b
+            .worker
+            .write_sessions(&hash)
+            .contains(&a1_lease)),
+        "C never pushed Y under A1's lease: {:?}",
+        b.worker.write_sessions(&hash)
+    );
+    let began = Instant::now();
+    let (options, _) = e.options();
+    let lane_e = e.run(e.dial(&b.endpoint, &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || b.worker.has(&hash)),
+        "E never delivered Y: lease {:?}, durable {:?}",
+        b.worker.lease_of(&hash),
+        b.worker.durable(&hash)
+    );
+    assert!(began.elapsed() < Duration::from_secs(25));
+    assert_eq!(b.worker.held_bytes(&hash).unwrap(), bytes);
+    assert_eq!(
+        b.worker.write_sessions(&hash),
+        BTreeSet::from([a1_lease.clone()])
+    );
+    assert!(!lane_a1.finished(), "A1's lane stopped renewing the lease");
+    drop(lane_e);
+    drop(lane_a1);
+}
+
+/// A large object spanning many short rounds resumes at the start of every
+/// round: no round finds it hidden under the lane's other lease id and
+/// idles for the anti-entropy interval (here 30 s).
+#[test]
+fn a_large_object_never_idles_between_rounds() {
+    let (a, b) = pair(30_000);
+    let size = 96 * MIB;
+    let bytes = content(3600, size as usize);
+    let hash = b.worker.hold(bytes.clone());
+    a.worker.want(&hash, size);
+    a.worker.faults().write_delay = Some(Duration::from_millis(20));
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let (mut options, stats) = a.options();
+    options.round = Duration::from_millis(300);
+    let began = Instant::now();
+    let lane = a.run(conn, options);
+    let done = wait_until(Duration::from_secs(60), || a.worker.has(&hash));
+    let took = began.elapsed();
+    drop(lane);
+    assert!(done, "not complete after 60 s");
+    assert!(
+        took < Duration::from_secs(15),
+        "a round idled between rounds: {took:?} for 96 MiB"
+    );
+    assert!(
+        LaneStats::get(&stats.v3_rounds) >= 2,
+        "the object did not span several rounds: {} rounds",
+        LaneStats::get(&stats.v3_rounds)
+    );
+    assert_eq!(a.worker.held_bytes(&hash).unwrap(), bytes);
+}
+
+/// The acceptor reads a push no faster than its worker writes, counting
+/// only bytes that drain without more input: a dialer that sends part of
+/// each of many objects (tails that are not whole writes, more than
+/// `PUSH_BUFFERED_BYTES` in all) never stalls its push; each tail is written
+/// when the next object starts.
+#[test]
+fn a_push_of_partial_objects_never_stalls_the_acceptor() {
+    let (a, b) = pair(100);
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let size = MIB + 1;
+    let part = 900 * 1024u64;
+    let objects: Vec<(String, Vec<u8>)> = (0..12)
+        .map(|index| {
+            let data = content(3700 + index, size as usize);
+            (sha(&data), data)
+        })
+        .collect();
+    for (hash, _) in &objects {
+        b.worker.want(hash, size);
+    }
+    let request = ObjectsPush {
+        repo: REPO.into(),
+        sender: REPLICA_A.into(),
+        receiver: REPLICA_B.into(),
+        lane: LANE,
+        items: objects
+            .iter()
+            .map(|(hash, _)| WantItem {
+                hash: hash.clone(),
+                size,
+                offset: 0,
+                priority: WantPriority::History,
+            })
+            .collect(),
+    };
+    let began = Instant::now();
+    let mut upload = conn
+        .upload(
+            "objects.push",
+            serde_json::to_value(&request).unwrap(),
+            Priority::Control,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    for (hash, data) in &objects {
+        let mut at = 0u64;
+        while at < part {
+            let len = (part - at).min(300 * 1024);
+            let header = ChunkHeader {
+                id: 0,
+                hash: Some(hash.clone()),
+                offset: at,
+                total: size,
+                last: false,
+            };
+            upload
+                .chunk(header, &data[at as usize..(at + len) as usize])
+                .unwrap();
+            at += len;
+        }
+    }
+    let reply = upload.finish().unwrap();
+    let result: ObjectsResult = if reply.body.is_empty() {
+        serde_json::from_value(reply.header).unwrap()
+    } else {
+        serde_json::from_slice(&reply.body).unwrap()
+    };
+    assert!(
+        began.elapsed() < Duration::from_secs(8),
+        "the push stalled: {:?}",
+        began.elapsed()
+    );
+    for (hash, _) in &objects {
+        let outcome = &result
+            .results
+            .iter()
+            .find(|result| result.hash == *hash)
+            .unwrap()
+            .outcome;
+        assert_eq!(
+            *outcome,
+            ObjectOutcome::Progressed {
+                durable_offset: part
+            }
+        );
+        assert_eq!(b.worker.durable(hash), Some(part));
+    }
+    conn.close();
+}
+
+/// A scripted v3 peer (its own bulk session server): `handler` answers the
+/// dialer's requests. Returns the peer's installation, pairing code and
+/// endpoint, and the thread that serves one session.
+fn scripted_peer(handler: Arc<dyn Handler>) -> (String, String, String, thread::JoinHandle<Conn>) {
+    struct Policy(String, Verifier);
+    impl AcceptPolicy for Policy {
+        fn installation(&self) -> String {
+            self.0.clone()
+        }
+        fn verifier(&self) -> Option<(Verifier, u64)> {
+            Some((self.1.clone(), 1))
+        }
+        fn admit(&self, _: &ClientHello) -> Result<(), ErrorWire> {
+            Ok(())
+        }
+        fn legacy_attempt(&self, _: SocketAddr, _: &Value) {}
+    }
+    let remote = format!("b-{}", uuid());
+    let (code, verifier) = Verifier::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = {
+        let remote = remote.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let (conn, _) = session::accept(
+                stream,
+                Arc::new(Policy(remote, verifier)),
+                ConnOptions::for_role(LaneRole::Bulk),
+            )
+            .unwrap();
+            conn.serve(handler);
+            conn
+        })
+    };
+    (remote, code, endpoint, server)
+}
+
+/// Invariant 22 at the dialer: a pull stream must start each object at the
+/// start of its span and stay contiguous. A peer that skips the start of a
+/// span ends the pull `PROTOCOL_VIOLATION`, and nothing of it is written.
+#[test]
+fn a_pull_stream_must_start_each_object_at_its_span() {
+    struct SkippingPeer {
+        hash: String,
+        data: Vec<u8>,
+        pulls: AtomicUsize,
+    }
+    impl Handler for SkippingPeer {
+        fn handle(&self, req: Incoming) {
+            match req.op.as_str() {
+                "objects.pull" => {
+                    self.pulls.fetch_add(1, Ordering::SeqCst);
+                    let size = self.data.len() as u64;
+                    // The span is [0, size); the stream starts at 1 MiB.
+                    let header = ChunkHeader {
+                        id: 0,
+                        hash: Some(self.hash.clone()),
+                        offset: MIB,
+                        total: size,
+                        last: true,
+                    };
+                    let _ = req.responder.chunk(header, &self.data[MIB as usize..]);
+                    let result = ObjectsResult {
+                        results: vec![ObjectResult {
+                            hash: self.hash.clone(),
+                            bytes: size - MIB,
+                            outcome: ObjectOutcome::Completed,
+                        }],
+                    };
+                    req.responder
+                        .reply(serde_json::to_value(result).unwrap(), Vec::new());
+                }
+                "objects.wants" => req.responder.reply(
+                    serde_json::to_value(ObjectsWantsReply { items: vec![] }).unwrap(),
+                    Vec::new(),
+                ),
+                op => req.responder.error(ErrorWire::coded(
+                    "UNSUPPORTED_OPERATION",
+                    format!("{op}: not scripted"),
+                )),
+            }
+        }
+    }
+    let data = content(3800, 2 * MIB as usize);
+    let hash = sha(&data);
+    let peer = Arc::new(SkippingPeer {
+        hash: hash.clone(),
+        data,
+        pulls: AtomicUsize::new(0),
+    });
+    let (remote, code, endpoint, server) = scripted_peer(peer.clone());
+    let a = Dialer::start(FakeWorker::start(REPLICA_A), &remote, &endpoint, 100);
+    a.worker.want(&hash, 2 * MIB);
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&endpoint, &code, LANE), options);
+    let refused = || {
+        a.world.finished().iter().any(|f| {
+            f.op == "objects.pull"
+                && !f.ok
+                && f.error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "PROTOCOL_VIOLATION")
+        })
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), refused),
+        "{:?}",
+        a.world.finished()
+    );
+    drop(lane);
+    assert!(peer.pulls.load(Ordering::SeqCst) >= 1);
+    assert!(!a.worker.has(&hash));
+    assert!(
+        a.worker.write_sessions(&hash).is_empty(),
+        "bytes past a skipped span start were written"
+    );
+    server.join().unwrap().close();
 }
 
 // ---------------------------------------------------------------------------

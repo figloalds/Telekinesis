@@ -55,10 +55,13 @@
 //!   the session meanwhile wait for that one dial, and share its failure. A
 //!   call that was in flight on it is uncertain and is never replayed
 //!   (invariant 16).
-//! * **Refusals.** A request the worker refused without running it
-//!   (`BUSY`/`WORKER_BUSY`, Contention: its handler queue was full; or the
-//!   local queue was full) is sent again after 10 ms → 250 ms, within the
-//!   call's deadline. Nothing else is retried.
+//! * **Refusals.** A request the session refused without running it is
+//!   sent again after 10 ms → 250 ms, within the call's deadline: the
+//!   worker session's `BUSY` (Contention: no handler took it, its queue was
+//!   full) or the local queue being full (`CallError::Busy`). Nothing else
+//!   is retried; in particular not the worker's own `WORKER_BUSY`, which it
+//!   may answer after it handed the command on (a mount transition that is
+//!   still running): sent again, it could run twice (invariant 16).
 //! * **No objects v3.** A worker that does not echo the loopback upgrade
 //!   header (a Wave 2 worker) gives `Unavailable(UNSUPPORTED_OPERATION: …)`;
 //!   [`session_for`] remembers that for the instance (a worker instance never
@@ -684,7 +687,7 @@ impl SessionWorkerClient {
         result
     }
 
-    /// One request. A refusal that ran nothing (`BUSY`/`WORKER_BUSY`, a full
+    /// One request. A refusal that ran nothing (the session's `BUSY`, a full
     /// local queue) is sent again within `deadline`; any other outcome is
     /// returned as is (an uncertain one is never replayed, invariant 16).
     pub fn request(
@@ -921,11 +924,15 @@ impl WorkerClient for SessionWorkerClient {
     }
 }
 
-/// Whether a call was refused without running (worth sending again).
+/// Whether a call was refused without running (worth sending again): the
+/// local queue was full, or the worker session's handler queue was (`BUSY`,
+/// the session layer's refusal: no handler took the request). Not
+/// `WORKER_BUSY`: the worker's own answer, possibly after it handed the
+/// command on (module docs, "Refusals").
 fn refused(error: &CallError) -> bool {
     match error {
         CallError::Busy => true,
-        CallError::Remote(wire) => wire.code == "BUSY" || wire.code == "WORKER_BUSY",
+        CallError::Remote(wire) => wire.code == "BUSY",
         _ => false,
     }
 }

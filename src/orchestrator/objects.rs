@@ -38,17 +38,22 @@
 //!
 //! 1. Worker `objects.want{route, lane, max_items 256, max_bytes 16 MiB,
 //!    session}`: wanted objects owned by the lane, with their durable spool
-//!    offsets. The lease session alternates between two ids per lane and
-//!    repository ([`pull_lease`]), so a want issued while a pull is in
-//!    flight never returns that pull's objects (the worker excludes objects
-//!    leased by another session), and both ids are stable across
-//!    reconnects: after a connection loss the next want returns the object
-//!    again, with its durable offset, and the transfer resumes there (never
-//!    a blind replay). Objects owned by another lane and objects already
-//!    begun in this round are left out; an object in its per-object backoff
-//!    for this source is *parked* (see "Lease handoff"). Before the want,
-//!    the round takes what it continues or takes over from the handoff
-//!    table.
+//!    offsets. The lease session is one of two ids per lane and repository
+//!    ([`pull_lease`]), both stable across reconnects. A want issued while a
+//!    pull is in flight uses the id the previous want did not, so it never
+//!    returns that pull's objects again (the worker hides objects leased to
+//!    another session). A want with no pull in flight asks **both** ids
+//!    (the second only when the first finds nothing to move): an object a
+//!    round or a run left unfinished (the round cap, a connection loss) may
+//!    be leased to either, so the next round, or the first round after a
+//!    reconnect, finds it at once, with its durable offset, and resumes there
+//!    (never a blind replay, never an idle interval). An id known to hold
+//!    nothing (its last want returned nothing, and no object of it is
+//!    unfinished) is not asked twice. Objects owned by another lane and
+//!    objects already begun in this round are left out; an object in its
+//!    per-object backoff for this source is *parked* (see "Lease handoff").
+//!    Before the want, the round takes what it continues or takes over from
+//!    the handoff table.
 //! 2. Peer `objects.pull{repo, sender, receiver, lane, items, budget}`
 //!    (`sender` is our replica, `receiver` the peer's, as in
 //!    `meta.exchange`): the lane's **window** (16 MiB, shared by its keys)
@@ -96,19 +101,34 @@
 //!
 //! * an object a source cannot serve is **parked** in the handoff table
 //!   ([`handoff_park`], [`handoff_wanted`]): its lease, the worker's durable
-//!   offset, no holder. The source's own wants keep returning it (and
-//!   renewing its lease) but leave it alone;
+//!   offset, no claim. The source's own wants keep returning it (and
+//!   renewing its lease) but leave it alone while the source is in its
+//!   backoff for it;
 //! * any other transfer of the daemon (a pull lane to another peer, or the
 //!   acceptor offering it to another dialer) **takes it over**
 //!   ([`handoff_take`]) if its lane owns it and it is not in its own
-//!   backoff, and moves it **under the parked lease**; the table then names
-//!   it the holder, and the source's wants leave it to that holder;
-//! * a holder continues it in its next rounds ([`handoff_progress`]),
-//!   releases it once installed or another session's ([`handoff_release`]),
-//!   and parks it again if it cannot serve it either.
+//!   backoff, and moves it **under the parked lease**: the table records
+//!   that transfer's **claim**, and the source's wants leave the object to
+//!   it while the claim stands;
+//! * a claim stands for [`CLAIM_TTL`] (30 s) and **only its holder renews
+//!   it** ([`handoff_renew`] while it works, [`handoff_take`] of its own
+//!   claims, [`handoff_progress`] after a round), never the source's wants.
+//!   A holder continues the object in its next rounds, releases it once
+//!   installed or another session's ([`handoff_release`]), and **gives the
+//!   claim back** ([`handoff_unclaim`]: parked again, at the durable offset
+//!   it reached) when it cannot serve it either, when its round or push
+//!   fails or is cancelled, and, for all its claims at once
+//!   ([`handoff_unclaim_all`]), when its lane run ends or its request fails.
+//!   A claim whose holder vanished without that lapses. Either way the
+//!   object is parked again: another transfer takes it over, or its source
+//!   moves it itself once it can (its backoff over). So a transfer that
+//!   took an object over and went away never pins it.
 //!
-//! Entries lapse with their lease (60 s without renewal). The worker remains
-//! the arbiter: a write under a lease another session now holds is
+//! A pull lane run claims under its own name ([`pull_holder`] and a run
+//! number), the acceptor under the dialer lane's push lease and its bulk
+//! session, so one run or session gives back only its own claims. Entries
+//! lapse with their lease (60 s without renewal). The worker remains the
+//! arbiter: a write under a lease another session now holds is
 //! `InFlightElsewhere`, and every append starts at the durable offset. The
 //! acceptor learns that a dialer did not serve an object from its own offer
 //! ([`super::inbound_objects`]). CCR-WP3.3-4 asks for the worker-side form
@@ -394,15 +414,17 @@ pub fn pull_lease(peer: &str, lane: LaneSpec, slot: u64) -> String {
     )
 }
 
-/// The handoff holder of a dialer's pulls on `lane` of `peer` (both lease
-/// sessions of the lane).
+/// The handoff name of a dialer's pulls on `lane` of `peer`: the prefix of
+/// both lease sessions of the lane; a run of the lane claims handed-off
+/// objects as `<this>#<run number>` (module docs, "Lease handoff").
 pub fn pull_holder(peer: &str, lane: LaneSpec) -> String {
     format!("pull:{peer}:{}/{}", lane.index, lane.count)
 }
 
 /// The lease session of the pushes an acceptor serves for `peer` on `lane`
-/// (its `objects.wants` takes the leases, its writes use them); also the
-/// handoff holder of those pushes.
+/// (its `objects.wants` takes the leases, its writes use them). The
+/// acceptor claims handed-off objects for that lane as `<this>@<bulk
+/// session>` (module docs, "Lease handoff").
 pub fn push_lease(peer: &str, lane: LaneSpec) -> String {
     format!("push:{peer}:{}/{}", lane.index, lane.count)
 }
@@ -551,19 +573,53 @@ pub(crate) fn object_installed(key: &ObjectKey) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Lease handoff between this daemon's transfers (module docs)
 
+/// How long a transfer's claim on a handed-off object stands unless that
+/// transfer renews it (it does while it works: module docs, "Lease
+/// handoff"). Only the claiming transfer renews it, never the source whose
+/// lease the object is under.
+pub const CLAIM_TTL: Duration = Duration::from_secs(30);
+/// A working holder renews its claims this often.
+const CLAIM_RENEW: Duration = Duration::from_secs(1);
+
+/// A transfer moving a handed-off object, until when (renewed by it alone).
+#[derive(Clone, Debug)]
+struct Claim {
+    holder: String,
+    until: Instant,
+}
+
 /// An object leased at one of our workers to a session that does not move
 /// it (its source cannot serve it: *parked*), or that a transfer of another
-/// source continues under that session's lease (*held*).
+/// source continues under that session's lease (*claimed*).
 #[derive(Clone, Debug)]
 struct Handoff {
     /// Size, the worker's durable offset as it last reported it, priority.
     item: WantItem,
     /// The worker session that holds the lease.
     lease: String,
-    /// The transfer moving it (`None`: parked, another source may take it).
-    holder: Option<String>,
+    /// The transfer moving it. None, or lapsed: parked (another transfer
+    /// may take it, and its own source moves it again once it can).
+    claim: Option<Claim>,
     /// When the lease lapses unless something renews it.
     until: Instant,
+}
+
+impl Handoff {
+    /// The transfer whose claim stands at `now`.
+    fn holder(&self, now: Instant) -> Option<&str> {
+        self.claim
+            .as_ref()
+            .filter(|claim| now < claim.until)
+            .map(|claim| claim.holder.as_str())
+    }
+
+    /// Whether `holder` claimed it and nobody took it since (its claim may
+    /// have lapsed: it is still the last to have moved it).
+    fn claimed_by(&self, holder: &str) -> bool {
+        self.claim
+            .as_ref()
+            .is_some_and(|claim| claim.holder == holder)
+    }
 }
 
 /// Handoffs per worker instance (a worker's leases are its own).
@@ -588,9 +644,12 @@ fn handoff_put(map: &mut HashMap<String, Handoff>, hash: &str, entry: Handoff, n
 
 /// A worker want of session `lease` returned `item` (so `lease` holds it,
 /// renewed) for transfer `holder`; returns whether `holder` moves it. Not
-/// when another transfer continues it under that lease, nor when `blocked`
-/// (its source cannot serve it now): it is then parked, so another source of
-/// this daemon can continue it at once, under the same lease.
+/// when another transfer's claim on it under that lease stands, nor when
+/// `blocked` (its source cannot serve it now): it is then parked, so another
+/// source of this daemon can continue it at once, under the same lease. The
+/// want renews the lease, never another transfer's claim: a claim whose
+/// holder went away lapses, and the object is parked again (or moved by its
+/// own source once that can serve it).
 pub(crate) fn handoff_wanted(
     instance: &str,
     item: &WantItem,
@@ -604,10 +663,19 @@ pub(crate) fn handoff_wanted(
         if let Some(entry) = map.get_mut(&item.hash)
             && entry.lease == lease
             && now < entry.until
-            && entry.holder.as_deref().is_some_and(|other| other != holder)
         {
+            // The want renewed the lease, and its offset is our worker's
+            // newest word.
             entry.until = now + LEASE_TTL;
-            return false;
+            entry.item = item.clone();
+            if entry.holder(now).is_some_and(|other| other != holder) {
+                // Another transfer continues it under this lease.
+                return false;
+            }
+            if blocked {
+                entry.claim = None;
+                return false;
+            }
         }
         if !blocked {
             // This lease's own transfer moves it: nothing to hand off.
@@ -624,7 +692,7 @@ pub(crate) fn handoff_wanted(
     let entry = Handoff {
         item: item.clone(),
         lease: lease.to_owned(),
-        holder: None,
+        claim: None,
         until: now + LEASE_TTL,
     };
     let map = all.entry(instance.to_owned()).or_default();
@@ -632,8 +700,9 @@ pub(crate) fn handoff_wanted(
     false
 }
 
-/// Parks `item` (`offset`: its durable offset as the worker reported it),
-/// leased to `lease`: its source cannot serve it; another may continue it.
+/// Parks `item` (its offset: the durable offset as the worker reported it),
+/// leased to `lease`, for that lease's own transfer: its source cannot
+/// serve it; another may continue it.
 pub(crate) fn handoff_park(instance: &str, item: &WantItem, lease: &str) {
     let now = Instant::now();
     let mut all = lock(handoffs());
@@ -641,16 +710,72 @@ pub(crate) fn handoff_park(instance: &str, item: &WantItem, lease: &str) {
     let entry = Handoff {
         item: item.clone(),
         lease: lease.to_owned(),
-        holder: None,
+        claim: None,
         until: now + LEASE_TTL,
     };
     handoff_put(map, &item.hash, entry, now);
 }
 
+/// `holder` gives its claim on `hash` (under `lease`) back: it cannot serve
+/// it, or it stopped (its round failed, its session ended). The object is
+/// parked again (`item`: where our worker stands, when known). Nothing
+/// changes when another transfer took it since, or the lease changed.
+pub(crate) fn handoff_unclaim(
+    instance: &str,
+    hash: &str,
+    lease: &str,
+    holder: &str,
+    item: Option<&WantItem>,
+) {
+    let mut all = lock(handoffs());
+    if let Some(entry) = all.get_mut(instance).and_then(|map| map.get_mut(hash))
+        && entry.lease == lease
+        && entry.claimed_by(holder)
+    {
+        entry.claim = None;
+        if let Some(item) = item {
+            entry.item = item.clone();
+        }
+    }
+}
+
+/// `holder` stopped (its lane run or session ended, its request failed):
+/// every claim it still has is given back (`instance`: on that worker only;
+/// `None`: on every worker).
+pub(crate) fn handoff_unclaim_all(instance: Option<&str>, holder: &str) {
+    let mut all = lock(handoffs());
+    for (name, map) in all.iter_mut() {
+        if instance.is_some_and(|instance| instance != name) {
+            continue;
+        }
+        for entry in map.values_mut() {
+            if entry.claimed_by(holder) {
+                entry.claim = None;
+            }
+        }
+    }
+}
+
+/// `holder` is still working: its claims at `instance` stand for another
+/// [`CLAIM_TTL`].
+pub(crate) fn handoff_renew(instance: &str, holder: &str) {
+    let until = Instant::now() + CLAIM_TTL;
+    let mut all = lock(handoffs());
+    if let Some(map) = all.get_mut(instance) {
+        for entry in map.values_mut() {
+            if let Some(claim) = entry.claim.as_mut()
+                && claim.holder == holder
+            {
+                claim.until = until;
+            }
+        }
+    }
+}
+
 /// What `holder` moves next under leases its own wants do not return: its
-/// continuations, then parked objects `accept` allows (they become
-/// `holder`'s), at most `max_items` and about `max_bytes`. Each comes with
-/// the lease to write it under.
+/// continuations, then parked objects (none, or a lapsed claim) that
+/// `accept` allows, at most `max_items` and about `max_bytes`. Each comes
+/// with the lease to write it under; `holder` claims each for [`CLAIM_TTL`].
 pub(crate) fn handoff_take(
     instance: &str,
     holder: &str,
@@ -671,8 +796,8 @@ pub(crate) fn handoff_take(
     let mut candidates: Vec<(bool, WantPriority, u64, String)> = map
         .iter()
         .filter_map(|(hash, handoff)| {
-            let mine = handoff.holder.as_deref() == Some(holder);
-            (mine || (handoff.holder.is_none() && accept(hash))).then(|| {
+            let mine = handoff.claimed_by(holder);
+            (mine || (handoff.holder(now).is_none() && accept(hash))).then(|| {
                 let remaining = handoff.item.size.saturating_sub(handoff.item.offset);
                 (!mine, handoff.item.priority, remaining, hash.clone())
             })
@@ -686,7 +811,10 @@ pub(crate) fn handoff_take(
             break;
         }
         if let Some(handoff) = map.get_mut(&hash) {
-            handoff.holder = Some(holder.to_owned());
+            handoff.claim = Some(Claim {
+                holder: holder.to_owned(),
+                until: now + CLAIM_TTL,
+            });
             taken.push((handoff.item.clone(), handoff.lease.clone()));
             bytes = bytes.saturating_add(remaining);
         }
@@ -694,19 +822,27 @@ pub(crate) fn handoff_take(
     taken
 }
 
-/// `holder` continues `item` (`offset`: the worker's durable offset after
-/// its last write) under `lease`, which that write renewed.
+/// `holder` continues `item` (its offset: the worker's durable offset after
+/// its last write) under `lease`, which that write renewed: its claim stands
+/// for another [`CLAIM_TTL`]. Nothing changes when the object is no longer
+/// in the table (its source moves it again, or it is installed), is under
+/// another lease, or another transfer's claim on it stands.
 pub(crate) fn handoff_progress(instance: &str, item: &WantItem, lease: &str, holder: &str) {
     let now = Instant::now();
     let mut all = lock(handoffs());
-    let map = all.entry(instance.to_owned()).or_default();
-    let entry = Handoff {
-        item: item.clone(),
-        lease: lease.to_owned(),
-        holder: Some(holder.to_owned()),
-        until: now + LEASE_TTL,
-    };
-    handoff_put(map, &item.hash, entry, now);
+    if let Some(entry) = all
+        .get_mut(instance)
+        .and_then(|map| map.get_mut(&item.hash))
+        && entry.lease == lease
+        && entry.holder(now).is_none_or(|other| other == holder)
+    {
+        entry.item = item.clone();
+        entry.claim = Some(Claim {
+            holder: holder.to_owned(),
+            until: now + CLAIM_TTL,
+        });
+        entry.until = entry.until.max(now + LEASE_TTL);
+    }
 }
 
 /// `hash` no longer moves under `lease` here (installed, failed without a
@@ -719,6 +855,39 @@ pub(crate) fn handoff_release(instance: &str, hash: &str, lease: &str) {
         map.remove(hash);
         if map.is_empty() {
             all.remove(instance);
+        }
+    }
+}
+
+/// Renews a working holder's claims at one worker, at most every
+/// [`CLAIM_RENEW`] (and only once it claimed something).
+pub(crate) struct Renewal {
+    instance: String,
+    holder: String,
+    active: std::cell::Cell<bool>,
+    last: std::cell::Cell<Instant>,
+}
+
+impl Renewal {
+    pub(crate) fn new(instance: &str, holder: &str) -> Self {
+        Self {
+            instance: instance.to_owned(),
+            holder: holder.to_owned(),
+            active: std::cell::Cell::new(false),
+            last: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    /// The holder claimed something: renew from now on.
+    pub(crate) fn activate(&self) {
+        self.active.set(true);
+    }
+
+    /// Renews if due (`now`: whether or not it is).
+    pub(crate) fn tick(&self, now: bool) {
+        if self.active.get() && (now || self.last.get().elapsed() >= CLAIM_RENEW) {
+            self.last.set(Instant::now());
+            handoff_renew(&self.instance, &self.holder);
         }
     }
 }
@@ -1038,7 +1207,9 @@ pub(crate) enum SinkEvent {
     },
 }
 
-pub(crate) type SinkHook = Box<dyn Fn(SinkEvent) + Send + Sync>;
+/// Receives what one sink step settled, in order and together (never
+/// empty): a write's releases and the objects it settled arrive at once.
+pub(crate) type SinkHook = Box<dyn Fn(Vec<SinkEvent>) + Send + Sync>;
 
 /// How a [`Sink`] writes.
 #[derive(Clone, Copy, Debug)]
@@ -1480,8 +1651,8 @@ impl Sink {
             f(&mut state, &mut events)
         };
         self.inner.changed.notify_all();
-        for event in events {
-            (self.inner.hook)(event);
+        if !events.is_empty() {
+            (self.inner.hook)(events);
         }
         value
     }
@@ -1624,15 +1795,20 @@ impl Sink {
         });
     }
 
-    /// Waits until fewer than `limit` contiguous bytes wait to be written,
-    /// or `stop` holds. (Ranges ahead of a gap do not count: only the sender
-    /// can fill the gap, so waiting for them could never end.)
+    /// Waits until fewer than `limit` bytes wait to be written that the
+    /// writers will take without more input, or `stop` holds. Only those
+    /// count: ranges ahead of a gap, and a partial tail that is not yet a
+    /// whole write (its object neither ends there nor is flushed), drain only
+    /// when the sender sends more, so waiting for them could never end. (The
+    /// caller bounds what it offers: a push's shares, a pull's budget.)
     pub(crate) fn wait_below(&self, limit: u64, stop: &dyn Fn() -> bool) {
         let mut state = lock(&self.inner.state);
+        let max_write = self.inner.options.max_write;
         let held = |state: &SinkState| -> u64 {
             state
                 .objects
                 .values()
+                .filter(|object| object.writing || state.dispatchable(object, max_write))
                 .map(|object| object.buf_len as u64)
                 .sum()
         };
@@ -1755,8 +1931,8 @@ fn write_loop(inner: &SinkInner) {
             state.apply(batch, result, &inner.options, &mut events);
         }
         inner.changed.notify_all();
-        for event in events {
-            (inner.hook)(event);
+        if !events.is_empty() {
+            (inner.hook)(events);
         }
     }
 }
@@ -1803,6 +1979,7 @@ pub fn run_lane_with(
     // Either direction's end (cancel, session gone) ends the other.
     let token = cancel.child();
     let stats = options.stats.clone().unwrap_or_default();
+    static RUNS: AtomicU64 = AtomicU64::new(0);
     let run = Arc::new(LaneRun {
         ctx: ctx.clone(),
         peer: peer.clone(),
@@ -1818,6 +1995,11 @@ pub fn run_lane_with(
         modes: Mutex::new(HashMap::new()),
         interim: InterimState::default(),
         turns: Mutex::new(HashMap::new()),
+        claimant: format!(
+            "{}#{}",
+            pull_holder(&peer.installation, lane),
+            RUNS.fetch_add(1, Ordering::Relaxed)
+        ),
         options: options.clone(),
     });
     let up = Arc::new(UploadJob(run.clone()));
@@ -1884,10 +2066,73 @@ struct LaneRun {
     /// Repositories on the interim path, until when.
     modes: Mutex<HashMap<String, Instant>>,
     interim: InterimState,
-    /// Alternates the pull lease sessions, per repository (each repository
-    /// is one worker, with its own leases).
-    turns: Mutex<HashMap<String, u64>>,
+    /// The pull lease ids, per repository (each repository is one worker,
+    /// with its own leases).
+    turns: Mutex<HashMap<String, Turns>>,
+    /// This lane run's name in the handoff table (module docs, "Lease
+    /// handoff"): the lane's holder name and a number of its own, so a run
+    /// gives back only its own claims.
+    claimant: String,
     options: LaneOptions,
+}
+
+impl Drop for LaneRun {
+    /// Both directions ended: whatever this run still claims in the handoff
+    /// table goes back to the table, for another source (or its next run).
+    fn drop(&mut self) {
+        handoff_unclaim_all(None, &self.claimant);
+    }
+}
+
+/// The two pull lease ids of one repository's wants (module docs, step 1).
+#[derive(Default)]
+struct Turns {
+    /// The id of the next want made while a pull is in flight.
+    next: usize,
+    /// Per id: until when it may hold leases at our worker (`None`: not
+    /// known, as in a new lane run, after a reconnect).
+    holds: [Option<Instant>; 2],
+}
+
+impl Turns {
+    fn may_hold(&self, slot: usize, now: Instant) -> bool {
+        self.holds[slot].is_none_or(|until| now < until)
+    }
+
+    /// The ids to ask, in order. While a pull is in flight, one: the id the
+    /// last want did not use, so the pull's own objects are not returned
+    /// again. Otherwise both (what a round resumes may be leased to either),
+    /// except one known to hold nothing; the one that may hold first.
+    fn order(&self, idle: bool, now: Instant) -> Vec<usize> {
+        let (first, second) = (self.next % 2, 1 - self.next % 2);
+        if !idle {
+            return vec![first];
+        }
+        let (first, second) = if !self.may_hold(first, now) && self.may_hold(second, now) {
+            (second, first)
+        } else {
+            (first, second)
+        };
+        if self.may_hold(second, now) {
+            vec![first, second]
+        } else {
+            vec![first]
+        }
+    }
+
+    /// A want with `slot` returned `items` objects or none.
+    fn asked(&mut self, slot: usize, items: bool, now: Instant) {
+        self.next = 1 - slot;
+        // A want leases (and renews) what it returns; one that returns
+        // nothing shows the id holds nothing.
+        self.holds[slot] = Some(if items { now + LEASE_TTL } else { now });
+    }
+
+    /// An object leased to `slot` is unfinished: the id may hold it.
+    fn holding(&mut self, slot: usize, now: Instant) {
+        let until = now + LEASE_TTL;
+        self.holds[slot] = Some(self.holds[slot].map_or(until, |held| held.max(until)));
+    }
 }
 
 /// How a v3 round ended without an error.
@@ -1910,20 +2155,33 @@ impl LaneRun {
         self.outer.is_cancelled() || self.ctx.stopping.load(Ordering::Relaxed)
     }
 
-    /// The handoff holder of this lane's pulls (module docs, "Lease handoff").
-    fn holder(&self) -> String {
-        pull_holder(&self.peer.installation, self.spec)
+    /// The lease ids (`slot`s of [`pull_lease`]) `repo`'s next want asks
+    /// with, in order ([`Turns::order`]).
+    fn want_order(&self, repo: &str, idle: bool) -> Vec<usize> {
+        lock(&self.turns)
+            .entry(repo.to_owned())
+            .or_default()
+            .order(idle, Instant::now())
     }
 
-    /// The lease session of `repo`'s next want (alternating, per repository).
-    fn next_lease(&self, repo: &str) -> String {
-        let turn = {
-            let mut turns = lock(&self.turns);
-            let turn = turns.entry(repo.to_owned()).or_default();
-            *turn += 1;
-            *turn - 1
-        };
-        pull_lease(&self.peer.installation, self.spec, turn)
+    /// A want of `repo` with `slot` returned `items` objects or none.
+    fn asked(&self, repo: &str, slot: usize, items: bool) {
+        lock(&self.turns)
+            .entry(repo.to_owned())
+            .or_default()
+            .asked(slot, items, Instant::now());
+    }
+
+    /// An object of `repo` leased to `slot` is unfinished.
+    fn holding(&self, repo: &str, slot: usize) {
+        lock(&self.turns)
+            .entry(repo.to_owned())
+            .or_default()
+            .holding(slot, Instant::now());
+    }
+
+    fn lease(&self, slot: usize) -> String {
+        pull_lease(&self.peer.installation, self.spec, slot as u64)
     }
 
     fn stop_error(&self) -> ExchangeError {
@@ -2228,8 +2486,15 @@ impl Job for UploadJob {
 struct Planned {
     item: WantItem,
     lease: String,
-    /// Taken from the handoff table: `lease` is not one of this lane's.
-    adopted: bool,
+    /// The lane's lease id it is under (`None`: taken from the handoff
+    /// table, `lease` is another source's).
+    slot: Option<usize>,
+}
+
+impl Planned {
+    fn adopted(&self) -> bool {
+        self.slot.is_none()
+    }
 }
 
 /// One pull of a round.
@@ -2246,7 +2511,10 @@ struct Pull {
 }
 
 enum RoundEvent {
-    Sink(SinkEvent),
+    /// What one sink step settled, together (a write's releases and the
+    /// objects it completed arrive at once, so a pull is never reported
+    /// between them).
+    Sink(Vec<SinkEvent>),
     PullEnded {
         tag: u64,
         result: Result<ObjectsResult, CallError>,
@@ -2339,11 +2607,16 @@ fn download_round(
                         writers,
                         ..SinkOptions::default()
                     },
-                    Box::new(move |event| {
-                        if let SinkEvent::Released { bytes, .. } = &event {
-                            window.release(*bytes);
-                        }
-                        let _ = tx.send(RoundEvent::Sink(event));
+                    Box::new(move |events: Vec<SinkEvent>| {
+                        let released: u64 = events
+                            .iter()
+                            .map(|event| match event {
+                                SinkEvent::Released { bytes, .. } => *bytes,
+                                SinkEvent::Settled { .. } => 0,
+                            })
+                            .sum();
+                        window.release(released);
+                        let _ = tx.send(RoundEvent::Sink(events));
                     }),
                 )
             }
@@ -2352,12 +2625,16 @@ fn download_round(
     let abort = AtomicBool::new(false);
     let started = Instant::now();
     let mut state = RoundState::default();
+    // What this round takes over from the handoff table stays claimed while
+    // it works (module docs, "Lease handoff").
+    let renewal = Renewal::new(&client.endpoint().instance, &lane.claimant);
     thread::scope(|scope| {
         loop {
             while let Ok(event) = rx.try_recv() {
                 round_event(lane, target, &sink, &mut state, event);
             }
             report_pulls(lane, target, &mut state);
+            renewal.tick(false);
             if lane.stopped() {
                 break;
             }
@@ -2365,6 +2642,9 @@ fn download_round(
                 state.local_error.get_or_insert(error);
             }
             if state.failed() {
+                // The round fails: pulls in flight stop at once rather than
+                // stream into a round whose bytes may be dropped.
+                abort.store(true, Ordering::Relaxed);
                 if state.in_flight() == 0 {
                     break;
                 }
@@ -2376,12 +2656,13 @@ fn download_round(
                     && !state.want_dry
                     && in_flight < lane.options.pulls.max(1)
                 {
-                    want_more(lane, target, client, &route, &mut state);
+                    want_more(lane, target, client, &route, &renewal, &mut state);
                     continue;
                 }
                 if !over && !state.plan.is_empty() && in_flight < lane.options.pulls.max(1) {
-                    let issued =
-                        issue_pull(lane, target, &route, &sink, &tx, &abort, &mut state, scope);
+                    let issued = issue_pull(
+                        lane, target, &route, &sink, &tx, &abort, &renewal, &mut state, scope,
+                    );
                     if issued {
                         continue;
                     }
@@ -2399,11 +2680,11 @@ fn download_round(
             }
         }
         // Wind down: no new pulls; pulls in flight end (at once when aborted).
-        let aborting = lane.stopped() || state.failed();
-        if aborting {
+        if lane.stopped() || state.failed() {
             abort.store(true, Ordering::Relaxed);
         }
         while state.in_flight() > 0 {
+            renewal.tick(false);
             if let Ok(event) = rx.recv_timeout(EVENT_WAIT) {
                 round_event(lane, target, &sink, &mut state, event);
             }
@@ -2412,6 +2693,7 @@ fn download_round(
     // The pulls are over: write what arrived (valid and contiguous: also
     // when the session ended, so the next one resumes after it; not when
     // the lane is told to stop), then account every byte.
+    renewal.tick(true);
     let results = sink
         .cell
         .into_inner()
@@ -2424,7 +2706,8 @@ fn download_round(
     if results.values().any(|result| result.outcome.is_none()) {
         state.leftovers = true;
     }
-    settle_handoffs(lane, client, &state, &results);
+    let failed = state.failed() || lane.stopped();
+    settle_handoffs(lane, target, client, &state, &results, failed);
     for pull in state.pulls.values_mut() {
         pull.released = pull.released.max(pull.received);
     }
@@ -2519,59 +2802,9 @@ fn round_event(
     event: RoundEvent,
 ) {
     match event {
-        RoundEvent::Sink(SinkEvent::Released {
-            tag,
-            bytes,
-            written,
-        }) => {
-            // (The window got this credit back on the writer thread.)
-            if let Some(pull) = state.pulls.get_mut(&tag) {
-                pull.released += bytes;
-            }
-            if written {
-                state.written += bytes;
-                bump(&lane.stats.bytes_written, bytes);
-            }
-        }
-        RoundEvent::Sink(SinkEvent::Settled {
-            hash,
-            tag,
-            outcome,
-            call,
-        }) => {
-            state.want_dry = false;
-            match &outcome {
-                ObjectOutcome::Completed => {
-                    state.completed += 1;
-                    bump(&lane.stats.objects_down, 1);
-                    if let Some(pull) = state.pulls.get_mut(&tag) {
-                        pull.completed += 1;
-                    }
-                    lane.object_done(target, false, &hash);
-                }
-                ObjectOutcome::CorruptAtSource => {
-                    state.corrupt.push(hash.clone());
-                    lane.object_failed(target, false, &hash, &outcome);
-                    state.failed.insert(hash);
-                }
-                ObjectOutcome::Failed(error) if call => {
-                    // The whole write call failed: the round's error, not
-                    // the object's (it resumes from its durable offset).
-                    state.leftovers = true;
-                    if matches!(error.class, ErrorClass::Contention) {
-                        return;
-                    }
-                    state
-                        .local_error
-                        .get_or_insert_with(|| CallError::Remote(error.clone()));
-                }
-                ObjectOutcome::Progressed { .. } => state.leftovers = true,
-                other => {
-                    if is_failure(other) {
-                        lane.object_failed(target, false, &hash, other);
-                        state.failed.insert(hash);
-                    }
-                }
+        RoundEvent::Sink(events) => {
+            for event in events {
+                sink_event(lane, target, state, event);
             }
         }
         RoundEvent::PullEnded {
@@ -2628,6 +2861,65 @@ fn round_event(
     }
 }
 
+fn sink_event(lane: &LaneRun, target: &Target, state: &mut RoundState, event: SinkEvent) {
+    match event {
+        SinkEvent::Released {
+            tag,
+            bytes,
+            written,
+        } => {
+            // (The window got this credit back on the writer thread.)
+            if let Some(pull) = state.pulls.get_mut(&tag) {
+                pull.released += bytes;
+            }
+            if written {
+                state.written += bytes;
+                bump(&lane.stats.bytes_written, bytes);
+            }
+        }
+        SinkEvent::Settled {
+            hash,
+            tag,
+            outcome,
+            call,
+        } => {
+            state.want_dry = false;
+            match &outcome {
+                ObjectOutcome::Completed => {
+                    state.completed += 1;
+                    bump(&lane.stats.objects_down, 1);
+                    if let Some(pull) = state.pulls.get_mut(&tag) {
+                        pull.completed += 1;
+                    }
+                    lane.object_done(target, false, &hash);
+                }
+                ObjectOutcome::CorruptAtSource => {
+                    state.corrupt.push(hash.clone());
+                    lane.object_failed(target, false, &hash, &outcome);
+                    state.failed.insert(hash);
+                }
+                ObjectOutcome::Failed(error) if call => {
+                    // The whole write call failed: the round's error, not
+                    // the object's (it resumes from its durable offset).
+                    state.leftovers = true;
+                    if !matches!(error.class, ErrorClass::Contention) {
+                        state
+                            .local_error
+                            .get_or_insert_with(|| CallError::Remote(error.clone()));
+                    }
+                }
+                ObjectOutcome::Progressed { .. } => state.leftovers = true,
+                other => {
+                    if is_failure(other) {
+                        lane.object_failed(target, false, &hash, other);
+                        state.failed.insert(hash);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Emits `ExchangeFinished` for every pull that ended and whose bytes have
 /// all left the sink.
 fn report_pulls(lane: &LaneRun, target: &Target, state: &mut RoundState) {
@@ -2660,16 +2952,20 @@ fn report_pulls(lane: &LaneRun, target: &Target, state: &mut RoundState) {
 /// Updates the handoff table after a download round (module docs, "Lease
 /// handoff"): an object its source failed here is parked under its lease,
 /// so another source of ours can continue it at once; one this lane took
-/// over is continued by its next round, and forgotten once installed or
-/// another session's.
+/// over is continued by its next round when the round went well, given
+/// back (parked) when the round failed, and forgotten once installed or
+/// another session's. Objects under the lane's own lease ids that are not
+/// finished keep their id marked as holding (its next rounds ask it).
 fn settle_handoffs(
     lane: &LaneRun,
+    target: &Target,
     client: &SessionWorkerClient,
     state: &RoundState,
     results: &HashMap<String, SinkResult>,
+    failed: bool,
 ) {
     let instance = client.endpoint().instance.as_str();
-    let holder = lane.holder();
+    let holder = lane.claimant.as_str();
     for (hash, planned) in &state.planned {
         let result = results.get(hash);
         // Where the worker stands, as it last said (not known after a write
@@ -2692,19 +2988,32 @@ fn settle_handoffs(
                     | ObjectOutcome::Unsolicited
             )
         );
+        if let Some(slot) = planned.slot
+            && !gone
+        {
+            lane.holding(&target.repo, slot);
+        }
+        let lease = planned.lease.as_str();
         match known {
             _ if gone => {
-                if planned.adopted {
-                    handoff_release(instance, hash, &planned.lease);
+                if planned.adopted() {
+                    handoff_release(instance, hash, lease);
                 }
             }
             Some(offset) if state.failed.contains(hash) => {
-                handoff_park(instance, &at(offset), &planned.lease);
+                if planned.adopted() {
+                    handoff_unclaim(instance, hash, lease, holder, Some(&at(offset)));
+                } else {
+                    handoff_park(instance, &at(offset), lease);
+                }
             }
-            Some(offset) if planned.adopted => {
-                handoff_progress(instance, &at(offset), &planned.lease, &holder);
+            Some(offset) if planned.adopted() && !failed => {
+                handoff_progress(instance, &at(offset), lease, holder);
             }
-            None if planned.adopted => handoff_release(instance, hash, &planned.lease),
+            Some(offset) if planned.adopted() => {
+                handoff_unclaim(instance, hash, lease, holder, Some(&at(offset)));
+            }
+            None if planned.adopted() => handoff_release(instance, hash, lease),
             _ => {}
         }
     }
@@ -2716,17 +3025,18 @@ fn want_more(
     target: &Target,
     client: &SessionWorkerClient,
     route: &SyncRoute,
+    renewal: &Renewal,
     state: &mut RoundState,
 ) {
     let instance = client.endpoint().instance.as_str();
-    let holder = lane.holder();
+    let holder = lane.claimant.as_str();
     let blocked = |hash: &str| object_blocked(&lane.key(&target.repo, false, hash));
     // First what this lane continues, or takes over from a source of ours
     // that cannot serve it, under the lease that holds it (module docs,
     // "Lease handoff").
     let taken = handoff_take(
         instance,
-        &holder,
+        holder,
         MAX_WANT_ITEMS,
         lane.options.window_bytes,
         &|hash| lane.spec.owns(hash) && !blocked(hash) && !state.planned_or_begun(hash),
@@ -2737,52 +3047,62 @@ fn want_more(
             continue;
         }
         fresh += 1;
+        renewal.activate();
         state.plan(Planned {
             item,
             lease,
-            adopted: true,
+            slot: None,
         });
     }
-    let lease = lane.next_lease(&target.repo);
-    let header = WantHeader {
-        route: route.clone(),
-        lane: lane.spec,
-        max_items: MAX_WANT_ITEMS as u32,
-        max_bytes: lane.options.window_bytes,
-        session: lease.clone(),
-    };
-    match client.want(&header, worker_client::deadlines::WANT) {
-        Ok(items) => {
-            for item in items {
-                if !lane.spec.owns(&item.hash) || state.planned_or_begun(&item.hash) {
-                    if state.begun.contains(&item.hash) {
-                        state.leftovers = true;
-                    }
-                    continue;
-                }
-                // An object in its backoff for this source is parked under
-                // this lease (another source may take it); one another
-                // source continues under this lease is left to it.
-                if !handoff_wanted(instance, &item, &lease, &holder, blocked(&item.hash)) {
-                    continue;
-                }
-                fresh += 1;
-                state.plan(Planned {
-                    item,
-                    lease: lease.clone(),
-                    adopted: false,
-                });
+    let idle = state.in_flight() == 0;
+    for (index, slot) in lane.want_order(&target.repo, idle).into_iter().enumerate() {
+        // The second id only when the first found nothing to move.
+        if index > 0 && fresh > 0 {
+            break;
+        }
+        let lease = lane.lease(slot);
+        let header = WantHeader {
+            route: route.clone(),
+            lane: lane.spec,
+            max_items: MAX_WANT_ITEMS as u32,
+            max_bytes: lane.options.window_bytes,
+            session: lease.clone(),
+        };
+        let items = match client.want(&header, worker_client::deadlines::WANT) {
+            Ok(items) => items,
+            Err(error) if is_unsupported(&error) => {
+                state.interim = Some(error);
+                return;
             }
-            if fresh == 0 {
-                state.want_dry = true;
+            Err(error) => {
+                state.local_error.get_or_insert(error);
+                return;
             }
+        };
+        lane.asked(&target.repo, slot, !items.is_empty());
+        for item in items {
+            if !lane.spec.owns(&item.hash) || state.planned_or_begun(&item.hash) {
+                if state.begun.contains(&item.hash) {
+                    state.leftovers = true;
+                }
+                continue;
+            }
+            // An object in its backoff for this source is parked under this
+            // lease (another source may take it); one another source
+            // continues under this lease is left to it.
+            if !handoff_wanted(instance, &item, &lease, holder, blocked(&item.hash)) {
+                continue;
+            }
+            fresh += 1;
+            state.plan(Planned {
+                item,
+                lease: lease.clone(),
+                slot: Some(slot),
+            });
         }
-        Err(error) if is_unsupported(&error) => {
-            state.interim = Some(error);
-        }
-        Err(error) => {
-            state.local_error.get_or_insert(error);
-        }
+    }
+    if fresh == 0 {
+        state.want_dry = true;
     }
 }
 
@@ -2797,6 +3117,7 @@ fn issue_pull<'scope, 'env>(
     sink: &'env LazySink,
     tx: &mpsc::Sender<RoundEvent>,
     abort: &'env AtomicBool,
+    renewal: &Renewal,
     state: &mut RoundState,
     scope: &'scope thread::Scope<'scope, 'env>,
 ) -> bool {
@@ -2806,7 +3127,11 @@ fn issue_pull<'scope, 'env>(
     let plan_bytes = state.plan_bytes();
     let min = plan_bytes.min(window / 2);
     let max = plan_bytes.min(window);
-    let stop = || lane.stopped();
+    // (Claims stay renewed while the round waits its turn.)
+    let stop = || {
+        renewal.tick(false);
+        lane.stopped()
+    };
     let budget = if first {
         lane.window.reserve(min, max, &stop)
     } else {
@@ -2921,16 +3246,18 @@ fn issue_pull<'scope, 'env>(
                             format!("objects.pull streamed {hash}, which it was not asked for"),
                         ));
                     };
+                    // In order from the start of its span, inside it.
                     let chunk_end = chunk.offset.saturating_add(len);
-                    if chunk.offset < start
+                    let next = ends.get(hash).copied().unwrap_or(start);
+                    if chunk.offset != next
                         || chunk_end > end
                         || received.saturating_add(len) > budget
-                        || ends.get(hash).is_some_and(|seen| chunk.offset != *seen)
                     {
                         return Err(ErrorWire::coded(
                             "PROTOCOL_VIOLATION",
                             format!(
-                                "objects.pull streamed {hash} [{}, {chunk_end}) outside [{start}, {end})",
+                                "objects.pull streamed {hash} [{}, {chunk_end}); its span [{start}, \
+                                 {end}) continues at {next}",
                                 chunk.offset
                             ),
                         ));
