@@ -268,7 +268,7 @@ The trait definitions are in §14 under WP0.4: `CatalogApi`, `FolderDirectory`, 
 
 - **Ownership:** thread `tkfs-catalog` acquires `orchestrator.lock`, then opens `folders.sqlite` with `journal_mode=WAL; synchronous=FULL`.
 - **Snapshot:** `CatalogSnapshot {generation, installation, folders, peers, verifier, verifier_generation, gates, peer_meta}`, indexed by state, repo, endpoint and installation.
-- **Commands:** `apply(CatalogCmd)` runs each command in one transaction, with `catch_unwind` per command and 3 retries on `SQLITE_BUSY`. The last good snapshot is kept on failure, and `CATALOG_UNAVAILABLE` is returned if the thread has died.
+- **Commands:** `apply(CatalogCmd)` runs each command in one transaction, with `catch_unwind` per command and 3 retries on `SQLITE_BUSY`. The last good snapshot is kept on failure, and `CATALOG_UNAVAILABLE` is returned if the thread has died. The caller waits at most `APPLY_WAIT` (5 s): a command that has not started by then is withdrawn (`CATALOG_UNAVAILABLE`, never applied), one that is running answers `REQUEST_TIMEOUT` (it may still be applied), and while one command has run that long new ones are refused at once. A slow catalog write therefore never parks a folder controller or a control connection (§2.3 Catalog row; WP2.INT post-integration re-review).
 - **Side tables** (§9): `folder_intents`, `mount_gates`, `peer_meta`, and the settings key `verifier_generation`. Existing tables are never ALTERed.
 - **Gate marker durability:** new code writes **both** `initial_sync` (legacy, positional `VALUES(?,?)`) and `mount_gates`, and deletes both after a successful attach. A downgrade therefore still sees the gate.
 - **Mount validation:** `validate_mount_path(snapshot, data_dir, state_dir, requested)` is pure. It keeps today's rules: absolute path; parent created; no overlap with data, state or other mounts; the path must not exist.
@@ -318,13 +318,15 @@ A worker in `Starting` (no RPC served yet) is killed directly. Store recovery is
 - `engine.stalled` (engine lock held > 120 s) marks the folder Degraded, with no automatic kill.
 - Spawned children report exit immediately through the exit-waiter thread. Adopted workers get a 1 Hz pid probe.
 
-**Adoption** (desired=1 at controller start):
+**Adoption** (at controller start whatever `desired`, and at every start; CCR-WP2.INT-2, ratified in WP2.INT):
 1. Read `STATE/worker.json`.
-2. Check the pid is alive and that `process_start` and `executable` equal the record (verified via OS APIs, §14 WP1.3).
+2. Check the pid is alive and that `process_start` and `executable` equal the record (verified via OS APIs, §14 WP1.3). This probe comes before any `maximum_running` accounting, and adopting a live worker always takes a slot, beyond the maximum if need be (the worker already runs).
 3. `hello` (2 s): repo, device and instance must match.
-   - Version equal: `Running{adopted}`.
-   - Version differs: graceful stop, wait for `owner.lock` to free (≤ 10 s), then spawn.
-   - Alive but silent: retry for 30 s, then `Failed{PREVIOUS_WORKER_UNRESPONSIVE}` (the user can ForceStop).
+   - Version equal: `Running{adopted}`. With `desired=0` (a stop that was StopBlocked when the daemon ended, a Shutdown that left the worker running), the stop ladder then runs again (graceful, StopBlocked with retries, ForceStop).
+   - Version differs: graceful stop, wait for `owner.lock` to free, then spawn.
+   - Alive but silent: retry for 30 s, then `Failed{PREVIOUS_WORKER_UNRESPONSIVE}` (the user can ForceStop). A graceful Stop or Restart sent before `hello` answered follows the same rule: a failed stop is retried, never followed by a probe and a kill.
+
+A wait for `owner.lock` is not a worker failure (nothing ran, nothing crashed): it never counts toward the breaker. Past 10 s the folder shows `PREVIOUS_WORKER_STOP_TIMEOUT` and keeps waiting in `Starting`; a `worker.json` published meanwhile (an orphan that finished its recovery) is adopted.
 
 Legacy orphans (a `runtime.json` without `worker.json`) keep today's path: status RPC, stop, wait for the lock, then spawn (`orchestrator.rs:500-518`). A spawn never happens while `owner.lock` is held by a live process (invariant 23).
 
@@ -334,7 +336,7 @@ Workers are not tied to daemon lifetime: no Job Object, no PDEATHSIG. A `--super
 
 | Attach result | Controller action |
 |---|---|
-| `Attached` | Delete the gate marker (`CatalogCmd::ClearGate`). |
+| `Attached` | Delete the gate marker (`CatalogCmd::ClearGate`). A folder with no mount requested (no path, or `mount_enabled` off) deletes it once the gate is `Satisfied` or `Overridden` (the legacy rule; a mount configured later attaches at once; CCR-WP2.INT-2). |
 | `AttachFailed`, class NeedsUserAction | Wait for an Attach action or ConfigureMount. |
 | `AttachFailed`, class Transient | Retry 2 s → 120 s. |
 
@@ -358,6 +360,8 @@ The new gate rule, in full. The source installation is `mount_gates.source_insta
 
 The gate never mounts before it is satisfied or overridden (invariant 26).
 
+The controller's own catalog writes that follow an event (`ClearGate`, `RetargetGate`) run on a helper thread and come back as a message: the actor never waits for the catalog (§2.3 Catalog row).
+
 **Published catalog.**
 - On Ready, whenever heartbeat `generations.branches` changes, and every 60 s while the entry is `unavailable`, the controller calls `published-summary` (3 s) and then `PublishedCatalogApi::update`.
 - The feed tip and content counters are refreshed from every heartbeat without an RPC.
@@ -375,7 +379,7 @@ The gate never mounts before it is satisfied or overridden (invariant 26).
 
 ### 3.5 Management API v2 (WP2.1 core and legacy actions with the compatibility projection; WP2.2 new actions, ControlClient, CLI)
 
-- **Transport:** blocking accept, one thread per connection, persistent request loop. Every request first checks `stopping`.
+- **Transport:** blocking accept, one thread per connection, persistent request loop. Every request first checks `stopping`. At most 64 connections outside a request, plus as many parked inside one (a write behind a slow catalog, a long Subscribe or Stop wait), so parked requests never lock List, Inspect and Status out (WP2.INT post-integration re-review).
 - **Reads** (List, Inspect, Peers, Status) are built from snapshots, FolderViews, the hub and `ctx.legacy()` with no waiting.
 - **Writes:** `catalog.apply`, then `FolderCmd`. Start returns immediately (`starting=true`). Stop waits ≤ 15 s for `Stopped|StopBlocked` (`wait:false` opts out).
 - **Create** runs `Store::initialize` on the request thread (no shared lock), then `CreateFolder`, then Start.
@@ -532,7 +536,8 @@ Failures before Ready print a `FatalLine` and exit with 73 (store), 75 (locked),
 - **Activator** (WP2.3):
   - loop: `wait(activation Notify | 1 s)` → `lock_engine` → `activate_slice{64, 25 ms}` → unlock → `Engine::after_activation(ids)` (refresh only sessions whose content revision changed; queue notifications only when attached) → status cell refresh → `generations.sync += n`;
   - a slow event yields a `SlowTicket`; `prepare_slow` runs **off-lock** on a dedicated read store; `commit_prepared` runs under the lock;
-  - `Stale` → re-queue with backoff (never inline). Starvation is reported in `activation.starved_since_ms`.
+  - `Stale` → re-queue with backoff. After 4 consecutive `Stale` outcomes the event is committed inline, alone in its slice (`Prepared::Inline`): one O(history) hold for that event instead of unbounded starvation behind a local writer that commits more often than a preparation takes (CCR-WP2.INT-1, ratified in WP2.INT). Starvation is reported in `activation.starved_since_ms`: the first `Stale` time of the oldest event still starving, cleared only when that event commits, is quarantined or leaves the inbox.
+  - The commit of a prepared ticket and the re-queues around it never wait for another connection's writer under the engine lock (up to 2 s of busy attempts, as a slice): the preparation is handed back and the commit retried.
 
 ### 4.5 Status cell and heartbeat (WP1.4 basic, WP2.3 full)
 
@@ -776,7 +781,7 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 - Start after `feed_out(P)`, P's last reported cursor of R's feed, validated by R.
   - Unknown: send a probe page (no entries, `after: None`).
   - Invalid: `reset: true, after: Start`.
-- Take entries with `seq > after.seq` in seq order: ≤ 4,096 entries, ≤ 1 MiB of payload.
+- Take entries with `seq > after.seq` in seq order: ≤ 4,096 entries, ≤ 1 MiB of payload, and ≤ 8 MiB of stored payloads read for the listed entries' digests, elided and `large` ones included (the page always lists its first entry; WP2.INT post-integration re-review).
   - The payload is elided (`event: None`) when `peer_known(P, id)`.
   - Events > 256 KiB are flagged `large`, and their payload is served only through `need` (control connection, chunked by the session layer, ≤ `MAX_EVENT` 8 MiB). This removes the 349,525-byte cliff.
 - `through` is the last scanned seq, or the tip if the feed is exhausted. `more` means the feed is not exhausted.
@@ -805,8 +810,9 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
   - If we don't hold it: insert into `feed_needs(P, id)`.
 - **`peer_known` and acks:** for every entry, payload or elided, whose digest equals our committed or staged payload, `INSERT OR IGNORE peer_known(P, id)`, and if it is committed locally, `UPDATE outbox SET acknowledged=1 WHERE event=id`. This is **per-id evidence that P committed `id`**, because P's feed contains only P's committed events. It is the same semantics as today's known-set acks (`remember_peer_inventory`), which "cover committed events only" (invariant 10). Responses stay bound by `reply_to == request` (`UNBOUND_PEER_RESPONSE`).
 - **Cursor advance:** `feed_in(P) = page.through`, contiguously, in the same transaction as staging.
-- **Need serving:** for `request.need`, serve committed shared events by id (total ≤ 16 MiB); unknown ids go in `unknown`.
-- **Regression detection by the sender:** if the reply's `CursorMismatch.expected.seq` or the reported `cursor.seq` is lower than the previously recorded `feed_out(P).seq` for the same epoch, P regressed. Then `DELETE peer_known WHERE peer=P` and recompute outbox acks.
+- **Need serving:** for `request.need`, serve committed shared events by id (total ≤ 16 MiB); unknown ids go in `unknown`. A payload that does not fit the budget is not read.
+- **Regression detection by the sender:** if the reply's `CursorMismatch.expected.seq` or the reported `cursor.seq` is lower than the previously recorded `feed_out(P).seq` for the same epoch, P regressed. Then `DELETE peer_known WHERE peer=P` and recompute outbox acks. A reply's report is compared with both channels' reports (the request channel's only if it was recorded before the request was built: a request-borne cursor may be newer than a reply under mutual dialing); a request's report only with its own channel (WP2.INT post-integration re-review, CCR-WP2.INT-4).
+- **Stage-time bounds:** an event whose `dependencies` or change `parents` are not valid ids (1–128 bytes) is rejected (`INVALID_EVENT`); a need list never carries such an id.
 
 #### 6.3.5 Exchange flow (dialer D, acceptor A, D's route `{peer: A_inst, repo, local: D_replica, remote: A_replica}`)
 
@@ -833,7 +839,7 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 #### 6.3.6 Caught-up and gate view (per peer P)
 
 - **`metadata.caught_up`:** `feed_in(P).seq == P.tip && !more` and no inbox rows sourced from P in `ready|waiting|retry|unclassified`.
-- **`gate.caught_up`:** the above, plus no `blocked|quarantined` rows from P, no `feed_rejected` rows from P, and `P.state.pending_active == 0`. `GateView.caught_up` is this full gate claim, and `GateView.blocked` means blocked, quarantined or rejected rows from P exist (CCR-WP2.7-5, ratified in WP2.INT): the FolderController reads `caught_up && !blocked` as satisfied and `caught_up && blocked` as the Blocked gate.
+- **`gate.caught_up`:** the above, plus no `blocked|quarantined` rows from P, no `feed_rejected` rows from P, and `P.state.pending_active == 0`. `GateView.caught_up` is this full gate claim, and `GateView.blocked` means blocked, quarantined or rejected rows from P exist (CCR-WP2.7-5, ratified in WP2.INT): the FolderController reads `caught_up && !blocked` as satisfied and `caught_up && blocked` as the Blocked gate. So `GateEvidence.caught_up` is `GateView.caught_up || (GateView.blocked && metadata.caught_up)`, on the dialer (`feed-apply`) and on the acceptor (`feed-exchange`'s `local`) alike (`meta_exchange::evidence_of`; WP2.INT post-integration re-review).
 - **`waiting_on`:** human-readable reasons, for example `"412 events remaining at source"`, `"3 events waiting for missing parents"`, `"source has 1 unactivated event"`, `"2 events quarantined"`.
 
 #### 6.3.7 Cost
@@ -1012,7 +1018,7 @@ List, Inspect and Peers keep their exact shapes and add a typed `status: FolderS
 
 | Field | Rule |
 |---|---|
-| `running` | `phase == Running` && gate ∉ {awaiting, blocked} && (no mount requested \|\| `!mount_enabled` \|\| mount ∈ {Attached, AttachFailed, Lost}) |
+| `running` | `phase == Running` && gate ∉ {awaiting, blocked} && (no mount requested \|\| `!mount_enabled` \|\| mount intent `Detach` (the user detached it, a Wave 2 action; CCR-WP2.INT-3) \|\| mount ∈ {Attached, AttachFailed, Lost}) |
 | `starting` | `phase == Starting` \|\| (`phase == Running` && `!running`) |
 | `mounted` | mount state `Attached` (actual) |
 | `initial_sync_pending` | a gate row exists |
@@ -1184,7 +1190,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
 | 23 | Single owner per data dir and state | Catalog holds `orchestrator.lock`. Adoption never spawns while `owner.lock` is held; pid kill verified. | `folder_controller::adoption_*` (WP1.2), `qual_wp2_1` |
 | 24 | Recovery before RPC | Listener opens after `Store::open` and `Engine::new`. Deferred activation is not recovery. | `worker_lifecycle::rpc_after_recovery` (WP1.4) |
 | 25 | Workers never dial | Unchanged: worker sessions are loopback, accepted only. | review |
-| 26 | Intent durable; gate | `desired=0` persisted first. Gate marker deleted only after attach. Shutdown never changes `desired_running`. | `folder_controller::gate_*`, `received_mount_waits…` (kept) |
+| 26 | Intent durable; gate | `desired=0` persisted first. Gate marker deleted only after attach (with no mount requested: once the gate is satisfied or overridden, CCR-WP2.INT-2). Shutdown never changes `desired_running`. | `folder_controller::gate_*`, `received_mount_waits…` (kept) |
 | 27 | Mount safety | `validate_mount_path`. FUSE recovery only for mounts proven ours. | `mount_lifecycle::foreign_mount_untouched` (WP1.5) |
 | 28 | Watchdog progress from the recovering thread | Backfills emit progress from the opening thread. Heartbeat is not startup progress. | `worker_lifecycle::backfill_reports_progress` (WP1.8/1.4) |
 | 29 | Interruptible waits; Shutdown reply flushed | `Cancel` everywhere; reply flushed before exit. | `qual_wp2_1::shutdown_*` |

@@ -50,6 +50,13 @@ struct Diverged {
 }
 
 fn diverged(history: usize, extra: usize) -> Diverged {
+    diverged_with(history, extra, false)
+}
+
+/// [`diverged`]; with `conflict`, A's first new event edits the file B
+/// edited (a concurrent edit: the slow event adds a conflict), instead of
+/// creating a directory (which leaves the conflict list unchanged).
+fn diverged_with(history: usize, extra: usize, conflict: bool) -> Diverged {
     let dir = tempfile::tempdir().unwrap();
     let repo = id();
     let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
@@ -63,6 +70,17 @@ fn diverged(history: usize, extra: usize) -> Diverged {
     )
     .unwrap();
     let known = b.shared_event_inventory().unwrap();
+    let mut extra = extra;
+    if conflict && extra > 0 {
+        let theirs = a.lookup("lin-000000.txt").unwrap();
+        a.write_revision(
+            &theirs.id,
+            theirs.revisions.get("content").cloned(),
+            b"concurrent edit on A",
+        )
+        .unwrap();
+        extra -= 1;
+    }
     for i in 0..extra {
         a.create(&format!("concurrent-{i:04}"), "directory")
             .unwrap();
@@ -325,6 +343,87 @@ fn lock_hold_slow_event_2k() {
     s.finish();
 }
 
+/// `lock_hold_slow_event_2k` with the slow event that changes the conflict
+/// list (A edits the file B edited) and the page staged on a secondary
+/// connection, as the feed and bulk paths stage (WP2.INT's post-integration
+/// re-review: the floor scenario's directory creation stays on the
+/// CCR-WP1.INT-4 delta path; this event takes the full `current_state`
+/// rewrite under the lock, and the staging commit by another connection
+/// makes the first slice reload the projection under the lock). Measured,
+/// no floor: the deviation is recorded in `docs/revamp/notes/wp2-int.md`.
+#[test]
+#[ignore = "WP2.4"]
+fn lock_hold_slow_conflict_event_2k() {
+    let mut s = Scenario::new(FILE, "lock_hold_slow_conflict_event_2k");
+    let d = diverged_with(scaled(2000), 1, true);
+    let b = Store::open(&d.b_state, Some(&d.repo)).unwrap();
+    let read = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    let stager = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    let allowed = BTreeSet::from([d.a_device.clone(), d.b_device.clone()]);
+    let target = d.events[0].id.clone();
+    let engine = Engine::new(b);
+    let probe = Probe::start(&engine);
+    thread::sleep(Duration::from_millis(100));
+    s.measure_from_now();
+    // Staged off the engine lock, on another connection.
+    let (_, stage_ms) = time_ms(|| {
+        stager
+            .stage_incoming(
+                d.events
+                    .iter()
+                    .cloned()
+                    .map(|event| StagedEvent {
+                        event,
+                        source: None,
+                    })
+                    .collect(),
+                &allowed,
+            )
+            .unwrap()
+    });
+    let run = activator(&engine, &read, s.deadline(), |s| {
+        s.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
+            [&target],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+    });
+    thread::sleep(Duration::from_millis(50));
+    let waits = probe.finish();
+    let summary = summarize(&waits);
+    let (committed, conflicts) = {
+        let b = engine.lock();
+        let committed = b.events().unwrap().iter().any(|e| e.id == target);
+        let conflicts: i64 =
+            b.db.query_row("SELECT count(*) FROM conflicts", [], |r| r.get(0))
+                .unwrap();
+        (committed, conflicts)
+    };
+    s.metric_with(
+        "max_blocked_ms",
+        summary.max,
+        "ms",
+        json!({"probe": summary.json(), "max_hold_ms": max(&run.holds),
+            "commit_prepared_ms": run.commit_holds, "prepare_ms": run.prepare_ms,
+            "stage_ms": stage_ms, "slow_commits": run.slow, "stale": run.stale,
+            "conflicts": conflicts}),
+    );
+    s.metric("max_hold_ms", max(&run.holds), "ms");
+    s.metric("commit_prepared_ms", max(&run.commit_holds), "ms");
+    s.check(run.slow == 1, format!("one slow commit ({run:?})"));
+    s.check(conflicts > 0, "the slow event added a conflict");
+    {
+        let mut b = engine.lock();
+        let diff = b.verify_derived_state().unwrap();
+        s.check(diff.is_empty(), format!("oracle {diff:?}"));
+    }
+    if !committed {
+        s.timeout("slow event not committed in budget");
+    }
+    s.finish();
+}
+
 /// Local commits racing prepared slow events make them `Stale`; they are
 /// re-queued and every remote event converges, with the oracle empty. The
 /// local writer saves in bursts for the whole run (a commit every 100 ms for
@@ -496,6 +595,85 @@ fn lock_hold_slow_event_2k_worker() {
     }
     if !committed {
         s.timeout("slow event not committed in budget");
+    }
+    s.finish();
+}
+
+/// The writer `stale_convergence_worker` replaced (WP2.INT deviation 6): a
+/// local import every 50 ms for the whole run, so a preparation (O(history),
+/// about 60 ms at 2K) never lands without a local commit in between. With
+/// CCR-WP2.INT-1 a ticket that went `Stale` `STALE_ESCALATE` times in a row
+/// is committed inline, so the slow events converge instead of starving
+/// (post-integration re-review, WP2.INT). 20 slow events (a causal chain):
+/// each waits about 4 s of re-queue backoff before its inline commit.
+#[test]
+#[ignore = "WP2.4"]
+fn stale_convergence_worker_steady_writer() {
+    let mut s = Scenario::new(FILE, "stale_convergence_worker_steady_writer");
+    let d = diverged(scaled(2000), 20);
+    let mut worker = WorkerProc::spawn(&d.b_state, &[], &[]).unwrap();
+    worker.wait_ready(Duration::from_secs(300)).unwrap();
+    if !activates_in_background(&worker) {
+        s.skip("the worker does not activate in the background in this build (WP2.3)");
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (stop, state) = (stop.clone(), d.b_state.clone());
+        thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = rpc_at(
+                    &state,
+                    json!({"op":"import","path":format!("local-{i:04}.txt"),"hex":hex::encode(format!("{i}"))}),
+                );
+                i += 1;
+                thread::sleep(Duration::from_millis(50));
+            }
+            i
+        })
+    };
+    s.measure_from_now();
+    let route = legacy_route(&id(), &d.repo, &d.b_device, &d.a_device);
+    let body = legacy_page(
+        &d.repo,
+        &d.a_device,
+        &d.b_device,
+        &d.events,
+        &BTreeSet::new(),
+    );
+    let _ = retry_busy(s.remaining(), || {
+        worker
+            .rpc(json!({"op":"published-exchange","route":route,"page":body,"metadata_only":true}))
+    });
+    let wanted: BTreeSet<String> = d.events.iter().map(|e| e.id.clone()).collect();
+    let watch = Stopwatch::start();
+    let converged = wait_until(s.remaining(), || {
+        worker.rpc(json!({"op":"events"})).is_ok_and(|events| {
+            let ids: BTreeSet<String> = events
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["id"].as_str().map(str::to_owned))
+                .collect();
+            wanted.is_subset(&ids)
+        })
+    });
+    stop.store(true, Ordering::Relaxed);
+    let local_writes = writer.join().unwrap();
+    let activation = worker
+        .rpc(json!({"op":"status"}))
+        .map(|status| status["activation"].clone())
+        .unwrap_or_default();
+    s.metric_with(
+        "converge_ms",
+        s.started.elapsed().as_secs_f64() * 1000.0,
+        "ms",
+        json!({"after_delivery_ms": watch.ms(), "local_writes": local_writes,
+            "activation": activation}),
+    );
+    if !converged {
+        s.timeout("remote events not all committed behind a steady local writer");
     }
     s.finish();
 }
