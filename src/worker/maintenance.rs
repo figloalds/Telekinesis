@@ -14,7 +14,8 @@
 //!   ([`checkpoint_wal`]), so the engine's commits seldom run SQLite's
 //!   automatic checkpoint under the engine lock. Not while the activator
 //!   drains a backlog: it checkpoints between its own slices then, and a
-//!   checkpoint here (a disk flush) would run concurrently with its commits;
+//!   checkpoint here (a disk flush) would run concurrently with its commits.
+//!   A large WAL that was copied in full is truncated ([`checkpoint_db`]);
 //! * **status cell**: `status_cell::refresh_full` about once a second, spaced
 //!   to at least four times its own duration (a cold content scan of a large
 //!   repository during active sync costs hundreds of ms; the spacing caps its
@@ -57,6 +58,12 @@ const CHECKPOINT_QUIET: Duration = Duration::from_secs(2);
 /// The status cell's full refresh is spaced at least this many times its own
 /// last duration.
 const FULL_REFRESH_SPACING: u32 = 4;
+/// A WAL of at least this many frames (64 MiB at 4 KiB pages) that a
+/// checkpoint copied in full is truncated ([`checkpoint_db`]).
+pub const WAL_TRUNCATE_FRAMES: i64 = 16_384;
+/// How long that truncation waits for readers still reading the WAL. It holds
+/// SQLite's writer lock meanwhile, so writers wait at most as long.
+pub const WAL_TRUNCATE_WAIT: Duration = Duration::from_millis(20);
 
 /// Starts the `maintenance` thread; it ends when the worker is stopping.
 pub fn spawn(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
@@ -223,12 +230,45 @@ impl Maintenance {
 /// frames copied, or `None`.
 pub(crate) fn checkpoint_wal(ctx: &WorkerCtx) -> Option<(i64, i64)> {
     let store = ctx.sync_stores.checkout().ok()?;
-    store
-        .db
+    checkpoint_db(&store.db)
+}
+
+/// [`checkpoint_wal`] on `db`: a `PASSIVE` checkpoint, then, when it copied
+/// a WAL of at least [`WAL_TRUNCATE_FRAMES`] frames in full, a `TRUNCATE`
+/// checkpoint that waits at most [`WAL_TRUNCATE_WAIT`] for readers still on
+/// the WAL (WP3.INT). Under a sustained catch-up the passive checkpoints keep
+/// up, but SQLite restarts the WAL only at a write that began after a full
+/// copy while no reader is still on the WAL: with commits every few
+/// milliseconds and readers of seconds (the status cell's full refresh of a
+/// large repository) that moment never came, and the WAL file of a
+/// 150K-event catch-up grew past 9 GiB (and kept that size on disk). The
+/// truncation restarts it at an idle moment instead and gives the space back.
+/// Best effort; returns the `PASSIVE` checkpoint's WAL frames and frames
+/// copied, or `None`.
+pub fn checkpoint_db(db: &rusqlite::Connection) -> Option<(i64, i64)> {
+    let (log, copied): (i64, i64) = db
         .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
             Ok((row.get(1)?, row.get(2)?))
         })
-        .ok()
+        .ok()?;
+    if log >= WAL_TRUNCATE_FRAMES && copied >= log {
+        truncate_wal(db);
+    }
+    Some((log, copied))
+}
+
+/// `PRAGMA wal_checkpoint(TRUNCATE)` with the connection's busy timeout
+/// lowered to [`WAL_TRUNCATE_WAIT`] for the attempt. A writer or a reader
+/// that outlasts it makes the attempt give up (`SQLITE_BUSY`, ignored).
+fn truncate_wal(db: &rusqlite::Connection) {
+    let Ok(timeout) = db.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u64>(0)) else {
+        return;
+    };
+    if db.busy_timeout(WAL_TRUNCATE_WAIT).is_err() {
+        return;
+    }
+    let _ = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    let _ = db.busy_timeout(Duration::from_millis(timeout));
 }
 
 fn log(site: &str, error: &anyhow::Error) {

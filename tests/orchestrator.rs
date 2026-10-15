@@ -557,9 +557,13 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
         .join(hash(local_bytes));
     fs::write(&local_object, vec![0; local_bytes.len()]).unwrap();
     a.call(Action::Start { state });
+    // WP3.INT (objects v3): A's folder restarts first, and the lane's error
+    // alternates between B's failed push (`NOT_AVAILABLE`, its copy is
+    // corrupt) and B's pull of the same object from A, which never had it
+    // (`NOT_PERMITTED`); 60 s timed out under load.
     wait_long(
         "the corrupt outbound object",
-        Duration::from_secs(60),
+        Duration::from_secs(120),
         || {
             b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["error"]
                 .as_str()
@@ -569,9 +573,14 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     write(&healthy, "still.txt", b"healthy during local failure");
     wait_for(|| has(&healthy_b, "still.txt", b"healthy during local failure"));
     fs::write(&local_object, local_bytes).unwrap();
+    // WP3.INT (objects v3): the repaired copy waits out the backoffs its
+    // failures started: B's per-object backoff for its failed pushes (30 s,
+    // doubling) and, at A, the lease of an object B's push session did not
+    // move (60 s without progress) and the stall backoff that follows (60 s).
+    // Measured: 119 s, and more than 120 s.
     wait_long(
         "the repaired outbound object",
-        Duration::from_secs(120),
+        Duration::from_secs(240),
         || has_content(&broken, "local-repair.txt", local_bytes),
     );
     wait_for(|| {

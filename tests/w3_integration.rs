@@ -254,3 +254,193 @@ fn a_view_survives_foreign_commits_that_leave_the_projection_alone() {
         "own commits patch the view; a foreign non-projection commit keeps it"
     );
 }
+
+/// The WP3.1 review's minor (WP3.INT): `compat::worker_call`, the `Folder`
+/// passthrough's bounded call that replaced `peering::DeadlineLane::call_as`
+/// and lost its test with it. A worker that never answers is
+/// `REQUEST_TIMEOUT` within the deadline, each call sends its request once
+/// (never replayed, invariant 16), and a reply within the deadline is the
+/// call's result.
+#[test]
+fn the_folder_passthrough_call_is_bounded_and_never_replayed() {
+    use std::{
+        net::TcpListener,
+        sync::{Arc, Mutex},
+        thread,
+        time::Instant,
+    };
+    use tkfs::{orchestrator::compat::worker_call, runtime::Discovery};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("ws://{}", listener.local_addr().unwrap());
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let server = {
+        let received = received.clone();
+        thread::spawn(move || {
+            for (index, stream) in listener.incoming().take(2).enumerate() {
+                let mut socket = tungstenite::accept(stream.unwrap()).unwrap();
+                let message = socket.read().unwrap();
+                received
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&message.into_data()).into_owned());
+                if index == 1 {
+                    let reply = json!({"ok": true, "result": {"answered": true}});
+                    socket
+                        .send(tungstenite::Message::text(reply.to_string()))
+                        .unwrap();
+                }
+                // The first connection never answers; both are held until
+                // the client leaves.
+                while socket.read().is_ok() {}
+            }
+        })
+    };
+    let info = Discovery {
+        format: 2,
+        address,
+        state: String::new(),
+        mount: None,
+        repo: String::new(),
+        device: String::new(),
+    };
+    let deadline = Duration::from_millis(400);
+    let started = Instant::now();
+    let error = worker_call(&info, "request-1", json!({"op": "status"}), deadline).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        format!("{error:#}").contains("REQUEST_TIMEOUT"),
+        "{error:#}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300) && elapsed < Duration::from_secs(3),
+        "answered after {elapsed:?} (deadline {deadline:?})"
+    );
+    let reply = worker_call(
+        &info,
+        "request-2",
+        json!({"op": "status"}),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(reply, json!({"answered": true}));
+    server.join().unwrap();
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 2, "one request per call: {received:?}");
+    assert!(received[0].contains("request-1"), "{received:?}");
+    assert!(received[1].contains("request-2"), "{received:?}");
+}
+
+/// WP3.INT: the worker's off-lock checkpoint (`maintenance::checkpoint_db`)
+/// truncates a WAL of at least `WAL_TRUNCATE_FRAMES` frames once a passive
+/// checkpoint copied it in full, but never waits long for a reader still on
+/// it (the reader keeps reading); a small WAL is left as it is.
+#[test]
+fn a_large_copied_wal_is_truncated_once_no_reader_is_on_it() {
+    use std::time::Instant;
+    use tkfs::worker::maintenance::{WAL_TRUNCATE_FRAMES, checkpoint_db};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), Some("w3-wal-truncate")).unwrap();
+    let path = dir.path().join("metadata.sqlite");
+    let wal = dir.path().join("metadata.sqlite-wal");
+    let wal_bytes = || fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer
+        .execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE w3_filler(b BLOB);")
+        .unwrap();
+    // About 80 MiB of frames, more than the threshold.
+    let blob = vec![7u8; 1024 * 1024];
+    for _ in 0..80 {
+        writer
+            .execute("INSERT INTO w3_filler VALUES(?)", [&blob])
+            .unwrap();
+    }
+    assert!(
+        wal_bytes() >= WAL_TRUNCATE_FRAMES as u64 * 4096,
+        "{}",
+        wal_bytes()
+    );
+    let checkpointer = rusqlite::Connection::open(&path).unwrap();
+    checkpointer.busy_timeout(Duration::from_secs(5)).unwrap();
+
+    // A reader on the WAL: everything is copied, nothing is truncated, and
+    // the attempt gives up quickly.
+    let reader = rusqlite::Connection::open(&path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let rows = |c: &rusqlite::Connection| -> i64 {
+        c.query_row("SELECT count(*) FROM w3_filler", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(rows(&reader), 80);
+    let started = Instant::now();
+    let (log, copied) = checkpoint_db(&checkpointer).unwrap();
+    assert!(
+        log >= WAL_TRUNCATE_FRAMES && copied == log,
+        "{log} {copied}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        wal_bytes() >= WAL_TRUNCATE_FRAMES as u64 * 4096,
+        "truncated under a reader"
+    );
+    assert_eq!(rows(&reader), 80, "the reader still reads its snapshot");
+    // The checkpointer's busy timeout is restored.
+    let timeout: i64 = checkpointer
+        .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(timeout, 5000);
+    reader.execute_batch("COMMIT").unwrap();
+
+    // No reader left: truncated.
+    checkpoint_db(&checkpointer).unwrap();
+    assert_eq!(wal_bytes(), 0, "the copied WAL is truncated");
+    assert_eq!(rows(&writer), 80);
+
+    // A small WAL is only copied.
+    writer
+        .execute("INSERT INTO w3_filler VALUES(x'00')", [])
+        .unwrap();
+    let small = wal_bytes();
+    assert!(small > 0);
+    checkpoint_db(&checkpointer).unwrap();
+    assert_eq!(wal_bytes(), small, "a small WAL is left as it is");
+    // The store still works.
+    drop(store);
+    let mut store = Store::open(dir.path(), Some("w3-wal-truncate")).unwrap();
+    store.create("after-truncation", "file").unwrap();
+}
+
+/// WP3.INT: a startup that resumes its snapshot replays the suffix against
+/// one loaded view, patched per event as a fast commit patches it, instead of
+/// reloading the whole projection for every suffix event (with suffixes of
+/// up to 1024 events since CCR-WP2.4-3, a 150K-entry folder took minutes to
+/// open); the reopened projection is the one before.
+#[test]
+fn a_startup_replays_the_snapshot_suffix_against_one_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), Some("w3-suffix")).unwrap();
+    for index in 0..200 {
+        store.create(&format!("s-{index:04}"), "file").unwrap();
+    }
+    let (cursor, _) = sealed(&store);
+    let tip: i64 = store
+        .db
+        .query_row("SELECT max(seq) FROM journal_sequence", [], |r| r.get(0))
+        .unwrap();
+    let suffix = tip - cursor;
+    assert!(suffix >= 32, "a suffix of {suffix} events");
+    let expected = store.projection(&store.active).unwrap();
+    drop(store);
+    let store = Store::open(dir.path(), Some("w3-suffix")).unwrap();
+    let loads = store.view_loads();
+    assert!(
+        loads <= 3,
+        "{loads} view loads to replay a {suffix}-event suffix"
+    );
+    assert_eq!(store.projection(&store.active).unwrap(), expected);
+    // The suffix was replayed (not rebuilt) and sealed.
+    assert_eq!(sealed(&store).0, tip);
+}
