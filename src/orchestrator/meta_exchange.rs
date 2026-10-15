@@ -82,7 +82,8 @@ pub struct ExchangeOutcome {
     pub gate: GateView,
     /// How the peer took our page.
     pub page_status: PageStatus,
-    /// A page continues on either side (`page.more`).
+    /// A page continues on either side (`page.more`), or the acceptor asked
+    /// for events our next request serves (`reply.need`).
     pub more: bool,
     /// The peer's page restarted its feed from the start.
     pub reset: bool,
@@ -294,7 +295,13 @@ fn run(
     let received =
         payload_entries(&reply.page.entries).saturating_add(len_u32(reply.need_served.len()));
     let page_status = reply.page_status.clone();
-    let more = request.page.more || reply.page.more;
+    // A need of the acceptor's is more work too (CCR-WP2.5-2, applied by
+    // WP3.1): its events go in our next request (`need_served`), so the
+    // scheduler books that request now instead of after the idle interval.
+    // No loop: an id we do not hold comes back `unknown` and is not asked
+    // again for `NEED_RETRY_MS`, and an exchange that moves nothing books
+    // no follow-up whatever `more` says.
+    let more = request.page.more || reply.page.more || !reply.need.is_empty();
     let reset = reply.page.reset;
 
     // 3. The local apply.
