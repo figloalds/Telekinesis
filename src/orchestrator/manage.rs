@@ -28,7 +28,7 @@ use crate::{
     core::{Store, id, name_key},
     model::{
         errors::{ErrorWire, Scope},
-        health::MountState,
+        health::{MountIntent, MountState},
         ipc::{StopMode, deadlines},
         orchestrator::{
             CatalogCmd, CatalogSnapshot, Ctx, FolderCmd, FolderPhase, FolderRecord, FolderView,
@@ -214,7 +214,7 @@ fn remote_list(ctx: &Ctx, endpoint: &str) -> Result<Vec<PublishedState>> {
 ///
 /// | member | rule |
 /// |---|---|
-/// | `running` | `Running` && gate ∉ {awaiting, blocked} && (no mount requested ‖ `!mount_enabled` ‖ mount ∈ {Attached, AttachFailed, Lost}) |
+/// | `running` | `Running` && gate ∉ {awaiting, blocked} && (no mount requested ‖ `!mount_enabled` ‖ the user detached it (mount intent `Detach`) ‖ mount ∈ {Attached, AttachFailed, Lost}) |
 /// | `starting` | `Starting` ‖ (`Running` && `!running`) |
 /// | `mounted` | the mount is `Attached` (actual) |
 /// | `initial_sync_pending` | a gate row exists |
@@ -237,7 +237,11 @@ pub fn project(record: &FolderRecord, view: &FolderView, gate_row: bool) -> Map<
         view.gate,
         GateState::Awaiting { .. } | GateState::Blocked { .. }
     );
-    let mount_requested = record.mount.is_some() && record.mount_enabled;
+    // A mount the user detached (WP2.2's Detach, a Wave 2 action the frozen
+    // table predates) is not requested: the folder runs headless until
+    // Attach, it is not "attaching" (post-integration re-review, WP2.INT).
+    let mount_requested =
+        record.mount.is_some() && record.mount_enabled && view.mount.intent != MountIntent::Detach;
     let mount_settled = matches!(
         view.mount.state,
         MountState::Attached { .. } | MountState::AttachFailed { .. } | MountState::Lost { .. }

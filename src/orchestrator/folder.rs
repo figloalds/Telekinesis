@@ -44,11 +44,11 @@ use crate::{
             WatchRequest, WorkerHeartbeat, WorkerRecord, deadlines, ops,
         },
         orchestrator::{
-            CallError, CatalogApi, CatalogCmd, EntryState, ExitRecord, FolderCmd, FolderPhase,
-            FolderRecord, FolderView, GateEvidence, GateRecord, GateState, LaunchSpec, PeerRecord,
-            ProcessEvent, ProcessSink, PublishedCatalogApi, PublishedEntry, ShutdownOutcome,
-            StatusSink, StopStage, WorkerClient, WorkerEndpoint, WorkerLauncher, WorkerProcess,
-            limits, outcomes,
+            CallError, CatalogApi, CatalogCmd, CatalogSnapshot, EntryState, ExitRecord, FolderCmd,
+            FolderPhase, FolderRecord, FolderView, GateEvidence, GateRecord, GateState, LaunchSpec,
+            PeerRecord, ProcessEvent, ProcessSink, PublishedCatalogApi, PublishedEntry,
+            ShutdownOutcome, StatusSink, StopStage, WorkerClient, WorkerEndpoint, WorkerLauncher,
+            WorkerProcess, limits, outcomes,
         },
         status::StatusEvent,
     },
@@ -190,10 +190,22 @@ pub(crate) enum Msg {
     WatchFailed(u64, CallError),
     /// The result of one worker RPC (the mount attach result among them).
     Rpc(u64, RpcKind, Result<Value, CallError>),
+    /// The result of a catalog write the controller issued on a helper
+    /// thread (it never waits for the catalog itself).
+    Catalog(CatalogWrite, Result<Arc<CatalogSnapshot>, ErrorWire>),
     /// Stop for daemon shutdown by the (real-time) deadline and report once.
     Shutdown(Instant, Sender<ShutdownOutcome>),
     /// The folder left the catalog.
     Retire,
+}
+
+/// A catalog write the controller runs on a helper thread
+/// ([`Controller::catalog_write`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CatalogWrite {
+    ClearGate,
+    /// Retarget the gate to this installation.
+    RetargetGate(String),
 }
 
 /// What the registry keeps per folder.
@@ -246,6 +258,17 @@ impl Slots {
         }
         slots.waiting.insert(state.to_owned());
         false
+    }
+
+    /// Takes a slot for `state` even beyond `maximum`: an adopted worker is
+    /// already running and already uses its resources, so it is never left
+    /// unsupervised for want of a slot (§2.3 Daemon row; post-integration
+    /// re-review, WP2.INT). Later starts wait until the count is below the
+    /// maximum again.
+    pub fn force_acquire(&self, state: &str) {
+        let mut slots = self.state.lock();
+        slots.held.insert(state.to_owned());
+        slots.waiting.remove(state);
     }
 
     /// Whether a start of `state` would get a slot right now.
@@ -354,7 +377,13 @@ enum StartPlan {
         rpc: Option<u64>,
     },
     /// Waiting for `owner.lock` to be free before spawning (invariant 23).
-    WaitLock { since: Instant, next_poll: Instant },
+    /// `warned`: the wait passed `limits::ADOPT_LOCK_WAIT` and its error is
+    /// shown (a lock wait never counts as a worker failure).
+    WaitLock {
+        since: Instant,
+        next_poll: Instant,
+        warned: bool,
+    },
     /// A spawned worker that has not printed Ready.
     Spawned {
         watchdog: Watchdog,
@@ -389,6 +418,11 @@ struct StopPlan {
     blocked: Option<Blocked>,
     retry_at: Option<Instant>,
     kills: u32,
+    /// The stop was sent to an adopted worker that never answered `hello`
+    /// (since this instant): a failed graceful stop is retried, never
+    /// followed by a probe and a kill, and after `adopt_patience` the folder
+    /// is `Failed{PREVIOUS_WORKER_UNRESPONSIVE}` like a silent adoption.
+    unverified_since: Option<Instant>,
 }
 
 struct BackoffState {
@@ -475,6 +509,9 @@ struct GateCtl {
     /// The source peer is gone; the next paired evidence source becomes it.
     retarget_pending: bool,
     clear_retry_at: Option<Instant>,
+    /// A `ClearGate` / `RetargetGate` write is in flight (helper thread).
+    clearing: bool,
+    retargeting: bool,
 }
 
 #[derive(Default)]
@@ -535,6 +572,10 @@ struct Controller {
     /// The instance of an adopted worker this controller replaced (version
     /// mismatch); its stale `worker.json` is never adopted again.
     replaced: Option<String>,
+    /// The `worker.json` instance last probed without an adoption (dead, not
+    /// the recorded image, or another identity): a lock wait re-probes the
+    /// file only when it names another instance.
+    probed: Option<String>,
 
     waiters: Vec<Waiter>,
     shutdown: Option<ShutdownCtl>,
@@ -712,6 +753,7 @@ impl Controller {
             backoff,
             failures: VecDeque::new(),
             replaced: None,
+            probed: None,
             waiters: Vec::new(),
             shutdown: None,
             slot_held: false,
@@ -910,7 +952,95 @@ impl Controller {
         self.mount = idle_mount(&self.record);
         if self.desired {
             let _ = self.begin_start();
+        } else {
+            self.adopt_to_stop();
         }
+    }
+
+    /// `desired=0` at controller start: a live, verified previous worker
+    /// (a stop that was StopBlocked when the daemon ended, a Shutdown that
+    /// left it running, a daemon crash) is adopted all the same, and the
+    /// stop the user asked for is driven again once it answers `hello`
+    /// (graceful stop, StopBlocked with retries, ForceStop available).
+    /// Otherwise it would run unsupervised behind a `Stopped` folder (§2.3
+    /// Daemon row, §3.3; post-integration re-review, WP2.INT).
+    fn adopt_to_stop(&mut self) {
+        if let Some((epoch, record, process)) = self.probe_previous_worker() {
+            self.take_slot_for_adoption();
+            self.start_since_ms = self.now_ms();
+            self.adopt_previous(epoch, record, process);
+        }
+    }
+
+    /// Reads `STATE/worker.json` and asks the launcher whether the recorded
+    /// worker is alive and verified (pid, start time, image). `None` when
+    /// there is no such record for this folder, or its process is gone or
+    /// not the recorded one (never killed: a foreign process may own the pid
+    /// now); such a record is remembered in `probed`.
+    fn probe_previous_worker(&mut self) -> Option<(u64, WorkerRecord, Box<dyn WorkerProcess>)> {
+        let record = read_worker_record(&self.record.directory)?;
+        let ours = record.repo == self.record.repo && record.device == self.record.device;
+        if !ours || self.replaced.as_deref() == Some(record.instance.as_str()) {
+            return None;
+        }
+        let epoch = self.next_epoch();
+        match self.deps.launcher.adopt(&record, self.sink(epoch)) {
+            Ok(Some(process)) => return Some((epoch, record, process)),
+            // Dead, or not the recorded image.
+            Ok(None) => {}
+            Err(error) => {
+                event!(warn, (error.code.as_str()), {
+                    "folder": self.state,
+                    "detail": "adoption probe failed",
+                    "message": error.message,
+                });
+            }
+        }
+        self.probed = Some(record.instance);
+        None
+    }
+
+    /// Holds a slot for an adopted worker, beyond `maximum_running` if need
+    /// be ([`Slots::force_acquire`]).
+    fn take_slot_for_adoption(&mut self) {
+        self.waiting_slot = false;
+        if !self.slot_held {
+            self.deps.slots.force_acquire(&self.state);
+            self.slot_held = true;
+        }
+    }
+
+    /// Becomes the controller of a probed previous worker; `hello` decides.
+    fn adopt_previous(
+        &mut self,
+        epoch: u64,
+        record: WorkerRecord,
+        process: Box<dyn WorkerProcess>,
+    ) {
+        let endpoint = WorkerEndpoint {
+            instance: record.instance.clone(),
+            pid: record.pid,
+            address: record.address.clone(),
+            version: record.version.clone(),
+            token: record.token.clone(),
+        };
+        let client = self.deps.launcher.client(&endpoint);
+        self.worker = Some(Worker {
+            epoch,
+            process,
+            record: Some(record),
+            endpoint: Some(endpoint),
+            client: Some(client),
+            watch: None,
+            fatal: None,
+            killed: false,
+        });
+        self.start = Some(StartPlan::Adopt {
+            since: self.now(),
+            next_hello: None,
+            rpc: None,
+        });
+        self.adopt_hello();
     }
 
     fn handle(&mut self, message: Msg) {
@@ -929,6 +1059,7 @@ impl Controller {
             Msg::Heartbeat(epoch, heartbeat) => self.on_heartbeat(epoch, heartbeat),
             Msg::WatchFailed(epoch, error) => self.on_watch_failed(epoch, error),
             Msg::Rpc(ticket, kind, result) => self.on_rpc(ticket, kind, result),
+            Msg::Catalog(kind, result) => self.on_catalog_write(kind, result),
             Msg::Shutdown(deadline, reply) => self.on_shutdown(deadline, reply),
             Msg::Retire => self.on_retire(),
         }
@@ -1072,8 +1203,23 @@ impl Controller {
             if self.want_attach() {
                 self.try_attach();
             }
-            if self.mount.state.is_attached()
+            // Invariant 26: the gate marker goes only after `Attached`, or,
+            // for a folder with no mount to attach, once the gate is
+            // satisfied or overridden (the legacy rule: a headless received
+            // folder is complete then; a mount configured later attaches at
+            // once). Otherwise a headless folder kept its marker for good:
+            // `initial_sync_pending` forever, and after a restart with the
+            // source unreachable an Awaiting gate that showed it "starting"
+            // (post-integration re-review, WP2.INT).
+            let complete = self.mount.state.is_attached()
+                || (!self.mount_requested()
+                    && matches!(
+                        self.gate,
+                        GateState::Satisfied { .. } | GateState::Overridden { .. }
+                    ));
+            if complete
                 && self.gate_record.is_some()
+                && !self.gate_ctl.clearing
                 && self.gate_ctl.clear_retry_at.is_none()
                 && self.running.is_some()
             {
@@ -1481,6 +1627,17 @@ impl Controller {
     }
 
     fn cmd_override_gate(&mut self) -> Result<Settle, ErrorWire> {
+        // The management action writes the catalog before it sends this
+        // command (WP2.2): the latest snapshot usually has the override, and
+        // then the controller writes nothing (its own write is bounded,
+        // `catalog::APPLY_WAIT`).
+        let latest = self.deps.catalog.snapshot().gates.get(&self.state).cloned();
+        if latest
+            .as_ref()
+            .is_some_and(|gate| gate.override_ms.is_some())
+        {
+            self.gate_record = latest;
+        }
         if let Some(gate) = &self.gate_record
             && gate.override_ms.is_none()
         {
@@ -1615,13 +1772,20 @@ impl Controller {
     // -- start ---------------------------------------------------------------
 
     /// Adoption, the legacy orphan path, or a spawn once `owner.lock` is free.
+    /// A live previous worker is probed before any slot accounting, and its
+    /// adoption always takes a slot: otherwise a fresh spawn could take the
+    /// last one and leave the live worker unsupervised (§2.3 Daemon row;
+    /// post-integration re-review, WP2.INT).
     fn begin_start(&mut self) -> Result<(), ErrorWire> {
         if self.shutdown.is_some() || self.retired || self.done {
             return Err(stopping_error());
         }
         self.failed = None;
         self.backoff_state = None;
-        if !self.acquire_slot() {
+        let previous = self.probe_previous_worker();
+        if previous.is_some() {
+            self.take_slot_for_adoption();
+        } else if !self.acquire_slot() {
             self.waiting_slot = true;
             let error = ErrorWire::new(
                 "WORKER_LIMIT",
@@ -1645,52 +1809,13 @@ impl Controller {
         self.running = None;
         self.heartbeat = None;
         self.start_since_ms = self.now_ms();
+        if let Some((epoch, record, process)) = previous {
+            self.adopt_previous(epoch, record, process);
+            return Ok(());
+        }
         let directory = self.record.directory.clone();
-        if let Some(record) = read_worker_record(&directory) {
-            let ours = record.repo == self.record.repo && record.device == self.record.device;
-            if ours && self.replaced.as_deref() != Some(record.instance.as_str()) {
-                let epoch = self.next_epoch();
-                match self.deps.launcher.adopt(&record, self.sink(epoch)) {
-                    Ok(Some(process)) => {
-                        let endpoint = WorkerEndpoint {
-                            instance: record.instance.clone(),
-                            pid: record.pid,
-                            address: record.address.clone(),
-                            version: record.version.clone(),
-                            token: record.token.clone(),
-                        };
-                        let client = self.deps.launcher.client(&endpoint);
-                        self.worker = Some(Worker {
-                            epoch,
-                            process,
-                            record: Some(record),
-                            endpoint: Some(endpoint),
-                            client: Some(client),
-                            watch: None,
-                            fatal: None,
-                            killed: false,
-                        });
-                        self.start = Some(StartPlan::Adopt {
-                            since: self.now(),
-                            next_hello: None,
-                            rpc: None,
-                        });
-                        self.adopt_hello();
-                        return Ok(());
-                    }
-                    // Dead, or not the recorded image: never killed (a foreign
-                    // process may own the pid now).
-                    Ok(None) => {}
-                    Err(error) => {
-                        event!(warn, (error.code.as_str()), {
-                            "folder": self.state,
-                            "detail": "adoption probe failed",
-                            "message": error.message,
-                        });
-                    }
-                }
-            }
-        } else if let Some(discovery) = read_discovery(&directory)
+        if read_worker_record(&directory).is_none()
+            && let Some(discovery) = read_discovery(&directory)
             && discovery.repo == self.record.repo
             && discovery.device == self.record.device
         {
@@ -1721,7 +1846,13 @@ impl Controller {
         Ok(())
     }
 
+    /// Spawns once `owner.lock` is free (invariant 23); never while the
+    /// folder is not desired (an adoption that ended without a worker).
     fn wait_lock_then_spawn(&mut self) {
+        if !self.desired {
+            self.start = None;
+            return;
+        }
         if owner_lock_free(&self.record.directory) {
             self.spawn_worker();
             return;
@@ -1730,34 +1861,60 @@ impl Controller {
         self.start = Some(StartPlan::WaitLock {
             since: now,
             next_poll: now + LOCK_POLL,
+            warned: false,
         });
     }
 
+    /// One look at `owner.lock` while waiting to spawn. A wait never counts
+    /// as a worker failure (nothing was launched, nothing crashed): it goes
+    /// on for as long as a live process holds the lock, and a previous
+    /// worker that publishes its `worker.json` meanwhile (an orphan that was
+    /// still recovering its store) is adopted. Past
+    /// `limits::ADOPT_LOCK_WAIT` the folder shows
+    /// `PREVIOUS_WORKER_STOP_TIMEOUT` (post-integration re-review, WP2.INT:
+    /// the wait used to end in a counted failure, five of which opened the
+    /// crash breaker without any worker having run).
     fn poll_lock(&mut self) {
-        let Some(StartPlan::WaitLock { since, .. }) = &self.start else {
+        let Some(StartPlan::WaitLock { since, warned, .. }) = &self.start else {
             return;
         };
-        let since = *since;
+        let (since, warned) = (*since, *warned);
+        if !self.desired {
+            self.start = None;
+            return;
+        }
         if owner_lock_free(&self.record.directory) {
             self.spawn_worker();
             return;
         }
+        let fresh = read_worker_record(&self.record.directory)
+            .is_some_and(|record| self.probed.as_deref() != Some(record.instance.as_str()));
+        if fresh && let Some((epoch, record, process)) = self.probe_previous_worker() {
+            self.take_slot_for_adoption();
+            self.adopt_previous(epoch, record, process);
+            return;
+        }
         let now = self.now();
-        if now.saturating_duration_since(since) >= limits::ADOPT_LOCK_WAIT {
-            self.start = None;
+        let waited = now.saturating_duration_since(since) >= limits::ADOPT_LOCK_WAIT;
+        if waited && !warned {
             let error = ErrorWire::new(
                 "PREVIOUS_WORKER_STOP_TIMEOUT",
                 format!(
                     "PREVIOUS_WORKER_STOP_TIMEOUT: {} is still locked by another process after {} s; \
-                     a second worker is not started",
+                     a second worker is not started: the folder waits for that process to exit",
                     self.record.directory.join("owner.lock").display(),
                     limits::ADOPT_LOCK_WAIT.as_secs()
                 ),
             );
-            let exit = self.no_exit();
-            self.fail(error, exit);
-        } else if let Some(StartPlan::WaitLock { next_poll, .. }) = self.start.as_mut() {
+            event!(warn, PREVIOUS_WORKER_STOP_TIMEOUT, { "folder": self.state });
+            self.observe_error(error);
+        }
+        if let Some(StartPlan::WaitLock {
+            next_poll, warned, ..
+        }) = self.start.as_mut()
+        {
             *next_poll = now + LOCK_POLL;
+            *warned |= waited;
         }
     }
 
@@ -1872,6 +2029,7 @@ impl Controller {
                         "detail": "the adopted process answered hello with another identity",
                         "instance": hello.instance,
                     });
+                    self.probed = Some(record.instance.clone());
                     self.start = None;
                     if let Some(worker) = self.worker.take()
                         && let Some(cancel) = worker.watch
@@ -1886,11 +2044,22 @@ impl Controller {
                         endpoint.version = hello.version;
                     }
                     self.enter_running(true);
+                    if !self.desired {
+                        // Adopted to be stopped (`adopt_to_stop`): the stop
+                        // ladder from here, as a Stop of a running folder.
+                        self.stop_worker(false, AfterStop::Stopped);
+                    }
                 } else {
-                    // Another version: graceful stop, then spawn once the lock is free.
+                    // Another version: graceful stop, then spawn once the lock
+                    // is free (if the folder is still wanted).
                     self.replaced = Some(record.instance.clone());
                     self.start = None;
-                    self.send_stop(false, AfterStop::Start);
+                    let after = if self.desired {
+                        AfterStop::Start
+                    } else {
+                        AfterStop::Stopped
+                    };
+                    self.send_stop(false, after);
                 }
             }
             Err(error) => {
@@ -2488,6 +2657,11 @@ impl Controller {
         let now = self.now();
         let now_ms = self.now_ms();
         let stage_deadline = deadline + RPC_GRACE;
+        // A worker being adopted has not answered `hello` yet.
+        let unverified_since = match &self.start {
+            Some(StartPlan::Adopt { since, .. }) => Some(*since),
+            _ => None,
+        };
         self.start = None;
         match self.stop.as_mut() {
             Some(plan) => {
@@ -2512,6 +2686,7 @@ impl Controller {
                     blocked: None,
                     retry_at: None,
                     kills: 0,
+                    unverified_since,
                 });
             }
         }
@@ -2523,10 +2698,12 @@ impl Controller {
             LeftRunning(ErrorWire),
             Blocked(ErrorWire),
             Uncertain,
+            Unverified(CallError),
         }
         let now = self.now();
         let now_ms = self.now_ms();
         let exit_wait = self.limits().stop_exit_wait;
+        let patience = self.limits().adopt_patience;
         let shutting_down = self.shutdown.is_some();
         let Some(plan) = self.stop.as_mut() else {
             return;
@@ -2540,6 +2717,12 @@ impl Controller {
             Err(_) if plan.force => Next::AwaitExit,
             // Graceful refusal (BUSY_VIEW: open files or dirty sessions).
             Err(CallError::Remote(error)) => Next::Blocked(error),
+            // A worker being adopted never answered `hello`: the adoption
+            // rule applies (§3.3: retry, then
+            // `Failed{PREVIOUS_WORKER_UNRESPONSIVE}`; only ForceStop kills
+            // it), not the liveness probe and kill of a verified worker
+            // (post-integration re-review, WP2.INT).
+            Err(error) if plan.unverified_since.is_some() => Next::Unverified(error),
             Err(_) => Next::Uncertain,
         };
         match next {
@@ -2589,6 +2772,31 @@ impl Controller {
                 plan.deadline = None;
                 plan.retry_at = Some(now + limits::STOP_BLOCKED_RETRY);
                 self.probe();
+            }
+            Next::Unverified(error) => {
+                plan.deadline = None;
+                let silent_for = plan
+                    .unverified_since
+                    .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+                if silent_for < patience {
+                    plan.retry_at = Some(now + limits::STOP_BLOCKED_RETRY);
+                    return;
+                }
+                let pid = self.worker.as_ref().map_or(0, |w| w.process.pid());
+                let error = ErrorWire::new(
+                    "PREVIOUS_WORKER_UNRESPONSIVE",
+                    format!(
+                        "PREVIOUS_WORKER_UNRESPONSIVE: worker pid {pid} is alive but has answered \
+                         neither hello nor stop for {} s ({error}); ForceStop kills it",
+                        patience.as_secs()
+                    ),
+                );
+                event!(warn, PREVIOUS_WORKER_UNRESPONSIVE, {
+                    "folder": self.state,
+                    "pid": pid,
+                });
+                self.stop = None;
+                self.enter_failed(error);
             }
         }
     }
@@ -2687,6 +2895,7 @@ impl Controller {
             blocked: None,
             retry_at: None,
             kills: kills + 1,
+            unverified_since: None,
         });
     }
 
@@ -2849,7 +3058,12 @@ impl Controller {
             .any(|peer| peer.installation == installation)
     }
 
+    /// Retargets the gate to `installation` (a catalog write on a helper
+    /// thread; the result arrives as `Msg::Catalog`).
     fn retarget(&mut self, installation: &str) {
+        if self.gate_ctl.retargeting {
+            return;
+        }
         let Some(endpoint) = self
             .peers
             .iter()
@@ -2858,17 +3072,87 @@ impl Controller {
         else {
             return;
         };
-        match self.deps.catalog.apply(CatalogCmd::RetargetGate {
-            state: self.state.clone(),
-            source_installation: Some(installation.to_owned()),
-            source_endpoint: endpoint,
-        }) {
-            Ok(snapshot) => {
+        self.gate_ctl.retargeting = true;
+        self.gate_ctl.retarget_pending = false;
+        self.catalog_write(
+            CatalogWrite::RetargetGate(installation.to_owned()),
+            CatalogCmd::RetargetGate {
+                state: self.state.clone(),
+                source_installation: Some(installation.to_owned()),
+                source_endpoint: endpoint,
+            },
+        );
+    }
+
+    /// Runs one catalog write on a helper thread and posts its result back
+    /// as `Msg::Catalog`: the controller never waits for the catalog, so a
+    /// slow catalog write cannot freeze this folder's lifecycle (worker
+    /// exits, commands, status; §2.3 Catalog row, RC10; post-integration
+    /// re-review, WP2.INT). `CatalogApi::apply` itself is bounded.
+    fn catalog_write(&mut self, kind: CatalogWrite, command: CatalogCmd) {
+        let catalog = self.deps.catalog.clone();
+        let tx = self.tx.clone();
+        let spawned = {
+            let kind = kind.clone();
+            thread::Builder::new()
+                .name(format!("folder-{}-catalog", self.state))
+                .spawn(move || {
+                    let result = catch_unwind(AssertUnwindSafe(|| catalog.apply(command)))
+                        .unwrap_or_else(|_| {
+                            Err(ErrorWire::new(
+                                "CATALOG_UNAVAILABLE",
+                                "CATALOG_UNAVAILABLE: the catalog client panicked",
+                            ))
+                        });
+                    let _ = tx.send(Msg::Catalog(kind, result));
+                })
+        };
+        if let Err(error) = spawned {
+            let _ = self.tx.send(Msg::Catalog(
+                kind,
+                Err(ErrorWire::new(
+                    "CATALOG_UNAVAILABLE",
+                    format!("CATALOG_UNAVAILABLE: cannot start a catalog thread: {error}"),
+                )),
+            ));
+        }
+    }
+
+    /// The result of a [`catalog_write`](Self::catalog_write). The gate and
+    /// the peers are taken from the latest snapshot (at least as new as the
+    /// write's, which a later catalog change may already have passed).
+    fn on_catalog_write(
+        &mut self,
+        kind: CatalogWrite,
+        result: Result<Arc<CatalogSnapshot>, ErrorWire>,
+    ) {
+        match kind {
+            CatalogWrite::ClearGate => self.gate_ctl.clearing = false,
+            CatalogWrite::RetargetGate(_) => self.gate_ctl.retargeting = false,
+        }
+        if self.done || self.retired {
+            return;
+        }
+        match (kind, result) {
+            (kind, Ok(_)) => {
+                let snapshot = self.deps.catalog.snapshot();
                 self.peers = snapshot.peers.clone();
-                self.gate_ctl.retarget_pending = false;
                 self.sync_gate(snapshot.gates.get(&self.state).cloned());
+                if self.gate_record.is_none() {
+                    self.gate_ctl = GateCtl::default();
+                } else if matches!(kind, CatalogWrite::RetargetGate(_)) {
+                    self.check_gate_source();
+                }
             }
-            Err(error) => {
+            (CatalogWrite::ClearGate, Err(error)) => {
+                event!(warn, (error.code.as_str()), {
+                    "folder": self.state,
+                    "detail": "clearing the gate marker failed; retried",
+                    "message": error.message,
+                });
+                self.gate_ctl.clear_retry_at = Some(self.now() + limits::STOP_BLOCKED_RETRY);
+            }
+            (CatalogWrite::RetargetGate(_), Err(error)) => {
                 event!(warn, (error.code.as_str()), {
                     "folder": self.state,
                     "detail": "gate retarget failed",
@@ -2929,30 +3213,27 @@ impl Controller {
         };
     }
 
+    /// Deletes the gate marker (a catalog write on a helper thread; the
+    /// result arrives as `Msg::Catalog`).
     fn clear_gate(&mut self) {
-        match self.deps.catalog.apply(CatalogCmd::ClearGate {
-            state: self.state.clone(),
-        }) {
-            Ok(snapshot) => {
-                self.peers = snapshot.peers.clone();
-                let record = snapshot.gates.get(&self.state).cloned();
-                self.sync_gate(record);
-                if self.gate_record.is_none() {
-                    self.gate_ctl = GateCtl::default();
-                }
-            }
-            Err(error) => {
-                event!(warn, (error.code.as_str()), {
-                    "folder": self.state,
-                    "detail": "clearing the gate marker failed; retried",
-                    "message": error.message,
-                });
-                self.gate_ctl.clear_retry_at = Some(self.now() + limits::STOP_BLOCKED_RETRY);
-            }
+        if self.gate_ctl.clearing {
+            return;
         }
+        self.gate_ctl.clearing = true;
+        self.catalog_write(
+            CatalogWrite::ClearGate,
+            CatalogCmd::ClearGate {
+                state: self.state.clone(),
+            },
+        );
     }
 
     // -- mount ---------------------------------------------------------------
+
+    /// Whether the folder has a mount to attach (a path, and the intent on).
+    fn mount_requested(&self) -> bool {
+        self.record.mount_enabled && self.record.mount.is_some()
+    }
 
     fn want_attach(&self) -> bool {
         self.running.is_some()
@@ -3005,7 +3286,7 @@ impl Controller {
                 self.mount = status;
                 self.mount_ctl.rearm();
                 // Invariant 26: the gate marker goes only after Attached.
-                if self.gate_record.is_some() {
+                if self.gate_record.is_some() && !self.gate_ctl.clearing {
                     self.clear_gate();
                 }
             }

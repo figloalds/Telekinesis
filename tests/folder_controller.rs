@@ -73,6 +73,9 @@ struct FakeCatalog {
     snapshot: Snapshot<CatalogSnapshot>,
     log: Arc<Log>,
     clock: Arc<ManualClock>,
+    /// Commands (by log entry, e.g. `clear_gate:a`) that block in `apply`
+    /// until removed: a slow catalog write.
+    held: Mutex<BTreeSet<String>>,
 }
 
 impl FakeCatalog {
@@ -113,6 +116,9 @@ impl CatalogApi for FakeCatalog {
             other => other.name().to_owned(),
         };
         self.log.push(format!("catalog:{entry}"));
+        while self.held.lock().unwrap().contains(&entry) {
+            thread::sleep(Duration::from_millis(5));
+        }
         Ok(self.mutate(|snapshot| match command {
             CatalogCmd::SetDesired { state, desired } => {
                 for folder in &mut snapshot.folders {
@@ -989,26 +995,7 @@ impl EnvBuilder {
     /// Writes `STATE/worker.json` naming a previous worker.
     fn worker_record(self, state: &str, pid: u32, version: &str) -> Self {
         let folder = self.folders.iter().find(|f| f.state == state).unwrap();
-        let record = WorkerRecord {
-            format: 1,
-            pid,
-            instance: format!("old-{state}"),
-            address: format!("fake://old-{state}"),
-            version: version.into(),
-            ipc: IPC_VERSION,
-            repo: folder.repo.clone(),
-            device: folder.device.clone(),
-            started_at_ms: 1,
-            process_start: 7,
-            executable: PathBuf::from("fake-tkfs"),
-            supervised: true,
-            token: None,
-        };
-        std::fs::write(
-            folder.directory.join("worker.json"),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        write_worker_record(folder, pid, version);
         self
     }
 
@@ -1026,6 +1013,7 @@ impl EnvBuilder {
             }),
             log: log.clone(),
             clock: clock.clone(),
+            held: Mutex::default(),
         });
         let published = Arc::new(FakePublished::default());
         let status = Arc::new(FakeStatus::default());
@@ -1060,6 +1048,32 @@ impl EnvBuilder {
             registry,
         }
     }
+}
+
+/// `STATE/worker.json` of a previous worker of `folder` (instance
+/// `old-<state>`, address `fake://old-<state>`).
+fn write_worker_record(folder: &FolderRecord, pid: u32, version: &str) {
+    let state = &folder.state;
+    let record = WorkerRecord {
+        format: 1,
+        pid,
+        instance: format!("old-{state}"),
+        address: format!("fake://old-{state}"),
+        version: version.into(),
+        ipc: IPC_VERSION,
+        repo: folder.repo.clone(),
+        device: folder.device.clone(),
+        started_at_ms: 1,
+        process_start: 7,
+        executable: PathBuf::from("fake-tkfs"),
+        supervised: true,
+        token: None,
+    };
+    std::fs::write(
+        folder.directory.join("worker.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
 }
 
 struct Env {
@@ -2215,10 +2229,16 @@ fn foreign_image_is_never_killed_and_a_held_owner_lock_blocks_the_spawn() {
         "never spawned while owner.lock is held"
     );
     env.advance(Duration::from_secs(6));
-    let view = env.wait_view("a", "backoff", |v| {
-        matches!(v.phase, FolderPhase::Backoff { .. })
+    // Post-integration re-review (WP2.INT): past the wait the folder shows
+    // the error but keeps waiting (Starting): a lock wait is not a worker
+    // failure, so it never backs off nor opens the crash breaker.
+    let view = env.wait_view("a", "the lock wait error, still waiting", |v| {
+        last_error(v) == Some("PREVIOUS_WORKER_STOP_TIMEOUT")
     });
-    assert_eq!(last_error(&view), Some("PREVIOUS_WORKER_STOP_TIMEOUT"));
+    assert!(
+        matches!(&view.phase, FolderPhase::Starting { phase, .. } if phase.contains("owner.lock")),
+        "{view:#?}"
+    );
     assert_eq!(env.launcher.launches(), 0);
     drop(lock);
     env.advance(Duration::from_secs(2));
@@ -2249,6 +2269,7 @@ fn legacy_orphan_is_stopped_before_the_spawn() {
         }),
         log: log.clone(),
         clock: clock.clone(),
+        held: Mutex::default(),
     });
     let launcher = Arc::new(FakeLauncher {
         log: log.clone(),
@@ -3009,4 +3030,292 @@ fn request_to_an_unknown_folder_is_not_found() {
     );
     assert!(env.registry.view("zzz").is_none());
     assert!(env.registry.by_repo("repo-zzz").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Post-integration re-review (WP2.INT): lifecycle isolation
+
+/// A slow catalog write never freezes a folder's lifecycle (§2.3 Catalog
+/// row): with the `ClearGate` that follows a gated attach held in the
+/// catalog, a worker exit is still handled at once, commands are answered,
+/// and Shutdown reports the dead worker as not running. Before the fix the
+/// controller waited for the write on its own thread: still `Running` for
+/// the dead worker, `Retry` answered only at its deadline, and Shutdown
+/// reported `left_running REQUEST_TIMEOUT`.
+#[test]
+fn a_slow_catalog_write_never_freezes_the_folder_lifecycle() {
+    let env = EnvBuilder::new()
+        .peer("p1")
+        .folder("a", true)
+        .mounted("a")
+        .gate("a", "p1")
+        .folder("b", true)
+        .start();
+    env.running("a");
+    env.running("b");
+    env.catalog
+        .held
+        .lock()
+        .unwrap()
+        .insert("clear_gate:a".into());
+    env.registry.send("a", evidence("p1", true, false)).unwrap();
+    wait_for("the ClearGate write in the catalog", || {
+        env.log.count("catalog:clear_gate:a") == 1
+    });
+    env.wait_view("a", "attached", |v| v.mount.state.is_attached());
+    // Both workers die while the write is held.
+    env.worker("a").exit(Some(70), None);
+    env.worker("b").exit(Some(70), None);
+    env.wait_view("b", "backoff", |v| {
+        matches!(v.phase, FolderPhase::Backoff { .. })
+    });
+    let started = Instant::now();
+    env.wait_view("a", "backoff while the write is held", |v| {
+        matches!(v.phase, FolderPhase::Backoff { .. })
+    });
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    let started = Instant::now();
+    let view = env
+        .registry
+        .request("a", FolderCmd::Tick, Duration::from_secs(2))
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        matches!(view.phase, FolderPhase::Backoff { .. }),
+        "{view:#?}"
+    );
+    // The marker is still there (the write did not finish), the attach result
+    // stands, nothing else was written twice.
+    assert_eq!(env.log.count("catalog:clear_gate:a"), 1);
+    let outcomes = env.registry.shutdown(Duration::from_secs(1));
+    let a = outcomes.iter().find(|o| o.state == "a").unwrap();
+    assert_eq!(a.outcome, outcomes::NOT_RUNNING, "{outcomes:?}");
+    env.catalog.held.lock().unwrap().clear();
+}
+
+/// A folder with `desired_running = 0` whose previous worker is still alive
+/// (a Stop that was StopBlocked when the daemon ended, a Shutdown that left
+/// it running) is adopted at controller start and the stop is driven again:
+/// graceful, StopBlocked with retries, ForceStop. Before the fix it showed
+/// `Stopped` with the worker running unsupervised, and ForceStop did
+/// nothing.
+#[test]
+fn a_live_worker_of_a_stopped_folder_is_adopted_and_stopped() {
+    let env = EnvBuilder::new()
+        .folder("a", false)
+        .worker_record("a", 4242, "0.1.0")
+        .adopt(AdoptPlan::Alive {
+            version: "0.1.0".into(),
+            behavior: Behavior {
+                stop: StopB::Busy,
+                ..Behavior::default()
+            },
+            mount: None,
+        })
+        .start();
+    let view = env.wait_view("a", "stop blocked", |v| {
+        matches!(v.phase, FolderPhase::StopBlocked { .. })
+    });
+    assert!(!view.record.desired_running);
+    assert!(
+        env.log.position("adopt:4242").is_some(),
+        "{:?}",
+        env.log.all()
+    );
+    assert!(env.log.position("rpc:stop:graceful:old-a").is_some());
+    assert_eq!(
+        env.registry.running_slots(),
+        1,
+        "the live worker holds a slot"
+    );
+    // StopBlocked retries the graceful stop.
+    let stops = env.log.count("rpc:stop:graceful");
+    env.advance(Duration::from_secs(3));
+    wait_for("a retried stop", || {
+        env.log.count("rpc:stop:graceful") > stops
+    });
+    // ForceStop now acts on the adopted worker.
+    env.registry.send("a", FolderCmd::ForceStop).unwrap();
+    env.wait_view("a", "stopped", |v| v.phase == FolderPhase::Stopped);
+    assert!(env.log.position("rpc:stop:force:old-a").is_some());
+    assert!(!env.worker("a").alive());
+    assert_eq!(env.kills(), 0);
+    assert_eq!(
+        env.launcher.launches(),
+        0,
+        "nothing is spawned for desired=0"
+    );
+    assert_eq!(env.registry.running_slots(), 0);
+}
+
+/// A received folder with no mount to attach clears its gate marker once the
+/// gate is satisfied (the legacy rule). Before the fix the marker stayed:
+/// `initial_sync_pending` for good, and after a restart with the source
+/// unreachable the folder read as starting ("synchronizing remote
+/// metadata").
+#[test]
+fn a_headless_received_folder_clears_its_gate_once_satisfied() {
+    let env = EnvBuilder::new()
+        .peer("p1")
+        .folder("a", true)
+        .gate("a", "p1")
+        .start();
+    env.running("a");
+    env.settle();
+    assert_eq!(
+        env.log.count("catalog:clear_gate"),
+        0,
+        "not before evidence"
+    );
+    env.registry.send("a", evidence("p1", true, false)).unwrap();
+    env.wait_view("a", "gate cleared", |v| v.gate == GateState::None);
+    assert_eq!(env.log.count("catalog:clear_gate:a"), 1);
+    assert!(!env.catalog.snapshot().gates.contains_key("a"));
+    assert_eq!(env.log.count("rpc:mount-attach"), 0);
+    // A mount configured later attaches at once (the metadata was complete).
+    env.catalog.mutate(|snapshot| {
+        let folder = &mut snapshot.folders[0];
+        folder.mount = Some(PathBuf::from("/m/a"));
+        folder.mount_enabled = true;
+    });
+    env.wait_view("a", "attached", |v| v.mount.state.is_attached());
+}
+
+/// A live previous worker is adopted even when every `maximum_running` slot
+/// is taken: it already runs. Before the fix the start took a slot first, so
+/// the folder showed `WORKER_LIMIT` (Stopped) and the live worker ran
+/// unsupervised.
+#[test]
+fn adoption_of_a_live_worker_takes_a_slot_beyond_the_limit() {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .folder("b", false)
+        .limits(|l| l.maximum_running = 1)
+        .adopt(alive("0.1.0"))
+        .start();
+    env.running("a");
+    assert_eq!(env.registry.running_slots(), 1);
+    // b's previous worker is alive; b is started while a holds the only slot.
+    write_worker_record(&env.catalog.folder("b"), 4343, "0.1.0");
+    env.catalog
+        .mutate(|snapshot| snapshot.folders[1].desired_running = true);
+    let view = env.wait_view("b", "adopted", |v| {
+        matches!(v.phase, FolderPhase::Running { adopted: true, .. })
+    });
+    assert_ne!(last_error(&view), Some("WORKER_LIMIT"), "{view:#?}");
+    assert!(env.log.position("adopt:4343").is_some());
+    assert_eq!(env.launcher.launches(), 1, "only a was spawned");
+    assert_eq!(env.registry.running_slots(), 2);
+    // Once b stops, the count is back under the limit.
+    env.registry
+        .request(
+            "b",
+            FolderCmd::Stop {
+                mode: StopMode::Graceful,
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    env.wait_view("b", "stopped", |v| v.phase == FolderPhase::Stopped);
+    assert_eq!(env.registry.running_slots(), 1);
+}
+
+/// A graceful Stop sent while a previous worker is being adopted (it has not
+/// answered `hello`) follows the adoption rule: the failed stop is retried,
+/// and after the adoption patience the folder is
+/// `Failed{PREVIOUS_WORKER_UNRESPONSIVE}`; it is never killed without
+/// ForceStop. Before the fix the failed stop led to a `hello` probe whose
+/// failure killed the worker without the `stop{force}` that persists its
+/// dirty sessions.
+#[test]
+fn a_failed_stop_of_a_worker_being_adopted_never_kills_it() {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .worker_record("a", 4242, "0.1.0")
+        .adopt(AdoptPlan::Alive {
+            version: "0.1.0".into(),
+            behavior: Behavior {
+                hello: Mode::Fail,
+                stop: StopB::Fail,
+                force: StopB::Exit,
+                ..Behavior::default()
+            },
+            mount: None,
+        })
+        .start();
+    env.wait_view("a", "adopting", |v| {
+        matches!(v.phase, FolderPhase::Starting { adopting: true, .. })
+    });
+    env.registry
+        .send(
+            "a",
+            FolderCmd::Stop {
+                mode: StopMode::Graceful,
+            },
+        )
+        .unwrap();
+    wait_for("the graceful stop", || {
+        env.log.count("rpc:stop:graceful:old-a") >= 1
+    });
+    let view = env.advance_until("a", "failed", Duration::from_secs(3), |v| {
+        error_code(&v.phase).is_some()
+    });
+    assert_eq!(
+        error_code(&view.phase),
+        Some("PREVIOUS_WORKER_UNRESPONSIVE"),
+        "{view:#?}"
+    );
+    assert!(env.log.count("rpc:stop:graceful:old-a") >= 2, "retried");
+    assert_eq!(env.kills(), 0, "{:?}", env.log.all());
+    assert!(env.worker("a").alive());
+    // ForceStop is the user's kill: stop{force} first.
+    env.registry.send("a", FolderCmd::ForceStop).unwrap();
+    env.wait_view("a", "stopped", |v| v.phase == FolderPhase::Stopped);
+    assert!(env.log.position("rpc:stop:force:old-a").is_some());
+    assert_eq!(env.kills(), 0);
+    assert_eq!(env.launcher.launches(), 0);
+}
+
+/// A live process that holds `owner.lock` without a `worker.json` (an orphan
+/// still recovering its store after a daemon crash) keeps the folder waiting
+/// without counting failures, and is adopted once it publishes its
+/// `worker.json`. Before the fix each 10 s wait was a counted failure: after
+/// five, `Failed{CRASH_LOOP}` with no worker ever launched.
+#[test]
+fn a_lock_wait_never_opens_the_crash_breaker_and_adopts_a_late_worker() {
+    let builder = EnvBuilder::new().folder("a", true).adopt(alive("0.1.0"));
+    let lock = tkfs::orchestrator::lock_state(&builder.dir("a")).unwrap();
+    let env = builder.start();
+    env.wait_view(
+        "a",
+        "waiting for the lock",
+        |v| matches!(&v.phase, FolderPhase::Starting { phase, .. } if phase.contains("owner.lock")),
+    );
+    for _ in 0..16 {
+        env.advance(Duration::from_secs(5));
+        thread::sleep(Duration::from_millis(20));
+    }
+    env.settle();
+    let view = env.view("a");
+    assert!(
+        matches!(&view.phase, FolderPhase::Starting { phase, .. } if phase.contains("owner.lock")),
+        "{view:#?}"
+    );
+    assert_eq!(last_error(&view), Some("PREVIOUS_WORKER_STOP_TIMEOUT"));
+    assert_eq!(view.restarts, 0);
+    assert_eq!(env.launcher.launches(), 0);
+    // The orphan finishes its recovery and publishes its worker.json.
+    write_worker_record(&env.catalog.folder("a"), 4242, "0.1.0");
+    env.advance(Duration::from_secs(1));
+    let view = env.wait_view("a", "adopted", |v| {
+        matches!(v.phase, FolderPhase::Running { adopted: true, .. })
+    });
+    assert!(view.last_error.as_ref().unwrap().is_resolved(), "{view:#?}");
+    assert_eq!(env.launcher.launches(), 0);
+    assert_eq!(env.kills(), 0);
+    drop(lock);
 }

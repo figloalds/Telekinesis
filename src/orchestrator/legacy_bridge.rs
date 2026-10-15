@@ -131,12 +131,48 @@ impl std::fmt::Debug for InboundSlot {
     }
 }
 
-/// One running lane: its token and its thread (a thread that ended without
-/// being retired, for example by a panic, is reaped and the lane respawned,
-/// as the legacy run loop did).
+/// One running lane: its token, its voice and its thread (a thread that
+/// ended without being retired, for example by a panic, is reaped and the
+/// lane respawned, as the legacy run loop did).
 struct Lane {
     cancel: Cancel,
+    voice: Arc<LaneVoice>,
+    peer: LanePeer,
+    lane: usize,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Whether a lane may still report: record status events (`LaneState`,
+/// `LegacyLink`, `ExchangeFinished`, `PeerCatalog`) and send gate evidence.
+///
+/// Cancelling a lane does not stop it at once: a lane parked in a local
+/// worker call (or, on Windows, in a peer read) ends only when that call
+/// returns, up to 15 s later. Its late events would land on the hub's
+/// `(installation, direction, lane)` entry after the peer's removal (which
+/// recreated the peer, offline, for good) or after its successor's `Ready`
+/// (which it overwrote with `Closed`). So the lane manager mutes a lane it
+/// retires before it records that lane `Closed` itself and then the peer's
+/// removal or the successor's start (post-integration re-review, WP2.INT;
+/// WP2.6's PeerManager follows the same order).
+#[derive(Default)]
+pub(crate) struct LaneVoice {
+    muted: Mutex<bool>,
+}
+
+impl LaneVoice {
+    /// Runs `report` unless the lane was muted. A report in progress
+    /// completes before [`mute`](Self::mute) returns (reports are in-memory
+    /// records and channel sends).
+    pub(crate) fn speak(&self, report: impl FnOnce()) {
+        let muted = crate::util::lock::lock(&self.muted);
+        if !*muted {
+            report();
+        }
+    }
+
+    fn mute(&self) {
+        *crate::util::lock::lock(&self.muted) = true;
+    }
 }
 
 /// The legacy network: `NetworkApi` (v2 pair, remote list, unpair) and the
@@ -324,31 +360,31 @@ impl LegacyBridge {
                 .filter(|key| !wanted.contains_key(*key))
                 .cloned()
                 .collect();
-            let retired: Vec<Cancel> = gone
-                .iter()
-                .filter_map(|key| lanes.remove(key))
-                .map(|lane| lane.cancel)
-                .collect();
-            let mut spawn: Vec<(String, LanePeer, usize, Cancel)> = Vec::new();
+            let retired: Vec<Lane> = gone.iter().filter_map(|key| lanes.remove(key)).collect();
+            let mut spawn: Vec<(String, LanePeer, usize, Cancel, Arc<LaneVoice>)> = Vec::new();
             for (key, (peer, lane)) in &wanted {
                 if !lanes.contains_key(key) {
                     let cancel = self.cancel.child();
+                    let voice = Arc::new(LaneVoice::default());
                     lanes.insert(
                         key.clone(),
                         Lane {
                             cancel: cancel.clone(),
+                            voice: voice.clone(),
+                            peer: peer.clone(),
+                            lane: *lane,
                             thread: None,
                         },
                     );
-                    spawn.push((key.clone(), peer.clone(), *lane, cancel));
+                    spawn.push((key.clone(), peer.clone(), *lane, cancel, voice));
                 }
             }
             (retired, spawn)
         };
-        for cancel in retired {
-            cancel.cancel();
-        }
-        for (key, peer, lane, cancel) in spawn {
+        // Retired lanes go quiet and are reported Closed before their peer's
+        // removal or their successors (`LaneVoice`).
+        self.silence(ctx, retired);
+        for (key, peer, lane, cancel, voice) in spawn {
             let bridge = self.clone();
             let lane_ctx = ctx.clone();
             let guard = self.lane_threads.enter();
@@ -356,7 +392,7 @@ impl LegacyBridge {
                 .name(format!("legacy-lane-{lane}"))
                 .spawn(move || {
                     let _guard = guard;
-                    lanes::run_lane(bridge, lane_ctx, peer, lane, cancel);
+                    lanes::run_lane(bridge, lane_ctx, peer, lane, cancel, voice);
                 });
             match spawned {
                 Ok(handle) => {
@@ -421,12 +457,40 @@ impl LegacyBridge {
     }
 
     fn retire_all(&self) {
-        let retired: Vec<Cancel> = std::mem::take(&mut *self.lanes.lock())
+        let retired: Vec<Lane> = std::mem::take(&mut *self.lanes.lock())
             .into_values()
-            .map(|lane| lane.cancel)
             .collect();
-        for cancel in retired {
-            cancel.cancel();
+        match self.ctx.upgrade() {
+            Some(ctx) => self.silence(&ctx, retired),
+            None => {
+                for lane in retired {
+                    lane.cancel.cancel();
+                    lane.voice.mute();
+                }
+            }
+        }
+    }
+
+    /// Cancels and mutes retired lanes, then records each one `Closed` (the
+    /// lane itself may report nothing more, `LaneVoice`).
+    fn silence(&self, ctx: &Ctx, retired: Vec<Lane>) {
+        for lane in retired {
+            lane.cancel.cancel();
+            lane.voice.mute();
+            let role = if lane.lane == 0 {
+                LaneRole::Control
+            } else {
+                LaneRole::Bulk
+            };
+            self.lane_state(
+                ctx,
+                &lane.peer,
+                u32::try_from(lane.lane).unwrap_or(u32::MAX),
+                role,
+                LaneState::Closed,
+                None,
+                None,
+            );
         }
     }
 

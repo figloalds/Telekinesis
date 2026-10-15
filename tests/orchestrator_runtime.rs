@@ -34,7 +34,7 @@ use tkfs::{
         },
     },
     orchestrator::{
-        Config, Network,
+        Config, Network, catalog,
         ctx::{BuildOptions, build_with},
         manage::{self, PHASE_ATTACHING, PHASE_GATED},
         serve_with, shutdown,
@@ -208,6 +208,23 @@ fn projection_follows_the_section_7_3_rules() {
             "running, mount intent off",
             &intent_off,
             view(running(), GateState::None, mount(MountState::Detached)),
+            false,
+            json!([true, false, false, null, null]),
+        ),
+        // Post-integration re-review (WP2.INT): a mount the user detached
+        // (Detach, intent `detach`) is not requested: the folder runs
+        // headless, it is not attaching.
+        (
+            "running, user detached",
+            &mounted,
+            view(
+                running(),
+                GateState::None,
+                MountStatus {
+                    intent: MountIntent::Detach,
+                    ..mount(MountState::Detached)
+                },
+            ),
             false,
             json!([true, false, false, null, null]),
         ),
@@ -1318,4 +1335,57 @@ fn a_hung_published_summary_never_slows_list() {
     }
     let summary = summarize(&samples);
     assert!(summary.p99 < 250.0, "list p99 {} ms", summary.p99);
+}
+
+/// Post-integration re-review (WP2.INT): management writes parked behind a
+/// slow catalog write never lock List and Status out (§2.3: a catalog fault
+/// may stop writes, never status), and each is answered within
+/// `catalog::APPLY_WAIT` (`CATALOG_UNAVAILABLE` or `REQUEST_TIMEOUT`), not
+/// when the catalog recovers. 64 clients send a write while a catalog write
+/// hangs for 12 s; a 65th connection's `list` and `status` are answered.
+/// Before the fix the writes waited for the catalog, and the 65th connection
+/// was refused (`too many open connections`).
+#[test]
+fn writes_behind_a_slow_catalog_never_lock_reads_out() {
+    let _serial = serial();
+    let daemon = InProcess::start(8);
+    let mut slow = FaultConfig::new(catalog::faults::SLOW_WRITE, FaultAction::Hang);
+    slow.ms = Some(12_000);
+    slow.count = Some(1);
+    fault::configure(Some(slow));
+    let writers: Vec<_> = (0..64)
+        .map(|_| {
+            let control = daemon.control.clone();
+            thread::spawn(move || {
+                let mut socket = ws::connect(&control).unwrap();
+                let started = Instant::now();
+                let answered = ws::call(&mut socket, &json!({"op":"reset-pairing-code"}));
+                (answered, started.elapsed())
+            })
+        })
+        .collect();
+    // Every writer is inside its request.
+    thread::sleep(Duration::from_millis(1500));
+    let (listed, ms) = time_ms(|| daemon.call(json!({"op":"list"})));
+    let listed = listed.expect("a new connection is served while writes wait");
+    assert_eq!(listed["folders"], json!([]));
+    assert!(ms < 2000.0, "list took {ms} ms");
+    daemon
+        .call(json!({"op":"status"}))
+        .expect("status is served while writes wait");
+    for writer in writers {
+        let (answered, took) = writer.join().unwrap();
+        assert!(
+            took < Duration::from_secs(9),
+            "a write waited {took:?} for the catalog"
+        );
+        if let Err(error) = answered {
+            let text = error.to_string();
+            assert!(
+                text.contains("CATALOG_UNAVAILABLE") || text.contains("REQUEST_TIMEOUT"),
+                "{text}"
+            );
+        }
+    }
+    fault::configure(None);
 }

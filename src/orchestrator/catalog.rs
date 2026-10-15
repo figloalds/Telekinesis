@@ -18,6 +18,9 @@
 //!   change is built inside the same transaction, published after the commit,
 //!   and returned. A command that changes nothing visible publishes nothing;
 //!   every other successful command bumps the generation by exactly one.
+//!   The caller waits at most [`APPLY_WAIT`] (a slow write never parks a
+//!   folder controller or a control connection for good: WP2.INT's
+//!   post-integration re-review).
 //! * If the thread has died, `apply` answers `CATALOG_UNAVAILABLE` and
 //!   `snapshot()` keeps serving the last good snapshot. The thread and the
 //!   [`Catalog`] handle share `orchestrator.lock`, so a dead thread never
@@ -67,7 +70,8 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, PoisonError,
-        mpsc::{self, Receiver, Sender, SyncSender},
+        atomic::{AtomicU8, AtomicU64, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -89,6 +93,22 @@ pub const BUSY_BACKOFF: Duration = Duration::from_millis(50);
 pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// Longest folder label the catalog accepts (the legacy `create()` rule).
 pub const MAX_LABEL_BYTES: usize = 200;
+/// How long [`CatalogApi::apply`] waits for its command's answer, the
+/// commands queued ahead of it included (§2.3: a catalog fault may stop
+/// management writes, never the threads that asked for them, a folder's
+/// lifecycle or status; post-integration re-review, WP2.INT). A command that
+/// has not started by then is withdrawn and never runs
+/// (`CATALOG_UNAVAILABLE`); one that is running is answered
+/// `REQUEST_TIMEOUT` (it may still be applied). While one command has been
+/// running this long, new ones are refused at once (`CATALOG_UNAVAILABLE`)
+/// instead of queueing behind it. Above the [`BUSY_RETRIES`] budget of a
+/// writer slot held by an external tool (about 4.3 s).
+pub const APPLY_WAIT: Duration = Duration::from_secs(5);
+
+/// A queued command's ticket ([`Request::ticket`]).
+const QUEUED: u8 = 0;
+const STARTED: u8 = 1;
+const WITHDRAWN: u8 = 2;
 
 /// Fault points of the catalog actor (`util::fault`).
 pub mod faults {
@@ -172,6 +192,9 @@ mod sql {
 struct Request {
     cmd: CatalogCmd,
     reply: SyncSender<Result<Arc<CatalogSnapshot>, ErrorWire>>,
+    /// `QUEUED` until the actor starts the command (`STARTED`), or until the
+    /// caller gave up first (`WITHDRAWN`: the actor skips it).
+    ticket: Arc<AtomicU8>,
 }
 
 /// The catalog actor's handle (implements [`CatalogApi`]). Dropping the last
@@ -190,6 +213,9 @@ pub struct Catalog {
     /// Dropped by a `close` that saw the thread exit, or with the handle, so
     /// the data directory stays owned for as long as either is alive.
     lock: Mutex<Option<Arc<File>>>,
+    /// When the command the actor is running started (`now_ms`), 0 while it
+    /// is idle ([`APPLY_WAIT`]).
+    busy_since_ms: Arc<AtomicU64>,
 }
 
 impl Catalog {
@@ -206,12 +232,14 @@ impl Catalog {
         let data_directory = config.data_directory.clone();
         let cell = Arc::new(Snapshot::new(CatalogSnapshot::default()));
         let exit = Arc::new(Exit::default());
+        let busy_since_ms = Arc::new(AtomicU64::new(0));
         let (mailbox, requests) = mpsc::channel::<Request>();
         let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<Arc<File>>>(1);
         let thread = {
             let data = data_directory.clone();
             let cell = cell.clone();
             let exit = ExitGuard(exit.clone());
+            let busy = busy_since_ms.clone();
             thread::Builder::new()
                 .name(THREAD_NAME.into())
                 .spawn(move || {
@@ -228,7 +256,7 @@ impl Catalog {
                     };
                     let _ = opened_tx.send(Ok(actor.lock.clone()));
                     drop(opened_tx);
-                    actor.run(requests);
+                    actor.run(requests, &busy);
                 })
                 .context("CATALOG_UNAVAILABLE: cannot spawn the catalog thread")?
         };
@@ -240,6 +268,7 @@ impl Catalog {
                 exit,
                 thread: Mutex::new(Some(thread)),
                 lock: Mutex::new(Some(lock)),
+                busy_since_ms,
             })),
             failed => {
                 let _ = thread.join();
@@ -298,23 +327,62 @@ impl CatalogApi for Catalog {
         self.cell.load()
     }
 
+    /// Bounded by [`APPLY_WAIT`] (see there).
     fn apply(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
         if self.exit.has_exited() {
             return Err(unavailable("the catalog thread has exited"));
         }
+        let wait_ms = u64::try_from(APPLY_WAIT.as_millis()).unwrap_or(u64::MAX);
+        let since = self.busy_since_ms.load(Ordering::Acquire);
+        if since != 0 && now_ms().saturating_sub(since) >= wait_ms {
+            return Err(unavailable(format!(
+                "a catalog write has been running for {} ms; {} was not queued behind it",
+                now_ms().saturating_sub(since),
+                cmd.name()
+            )));
+        }
+        let name = cmd.name();
+        let ticket = Arc::new(AtomicU8::new(QUEUED));
         let (reply, answer) = mpsc::sync_channel(1);
         {
             let mailbox = self.mailbox.lock();
             let Some(sender) = mailbox.as_ref() else {
                 return Err(unavailable("the catalog is closed"));
             };
-            if sender.send(Request { cmd, reply }).is_err() {
+            let request = Request {
+                cmd,
+                reply,
+                ticket: ticket.clone(),
+            };
+            if sender.send(request).is_err() {
                 return Err(unavailable("the catalog thread has exited"));
             }
         }
-        answer
-            .recv()
-            .unwrap_or_else(|_| Err(unavailable("the catalog thread died running the command")))
+        match answer.recv_timeout(APPLY_WAIT) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(unavailable("the catalog thread died running the command"))
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                let withdrawn = ticket
+                    .compare_exchange(QUEUED, WITHDRAWN, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                if withdrawn {
+                    Err(unavailable(format!(
+                        "the catalog did not take {name} within {wait_ms} ms; it was withdrawn \
+                         and not applied"
+                    )))
+                } else {
+                    Err(ErrorWire::coded(
+                        "REQUEST_TIMEOUT",
+                        format!(
+                            "the catalog command {name} did not finish within {wait_ms} ms; it \
+                             may still be applied"
+                        ),
+                    ))
+                }
+            }
+        }
     }
 
     fn wait_newer(&self, generation: u64, timeout: Duration) -> Arc<CatalogSnapshot> {
@@ -339,7 +407,7 @@ impl fmt::Debug for Catalog {
     }
 }
 
-fn unavailable(detail: &str) -> ErrorWire {
+fn unavailable(detail: impl fmt::Display) -> ErrorWire {
     ErrorWire::coded("CATALOG_UNAVAILABLE", detail)
 }
 
@@ -413,15 +481,26 @@ impl Actor {
         })
     }
 
-    fn run(mut self, requests: Receiver<Request>) {
+    fn run(mut self, requests: Receiver<Request>, busy_since_ms: &AtomicU64) {
         while let Ok(request) = requests.recv() {
+            // A command whose caller gave up waiting ([`APPLY_WAIT`]) never runs.
+            if request
+                .ticket
+                .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+            busy_since_ms.store(now_ms().max(1), Ordering::Release);
             // Outside the per-command guard on purpose: a `panic` action here
             // kills the thread, which is how tests reach CATALOG_UNAVAILABLE.
             if let Err(error) = fault::trigger(faults::ACTOR) {
+                busy_since_ms.store(0, Ordering::Release);
                 let _ = request.reply.send(Err(ErrorWire::from_error(&error)));
                 continue;
             }
             let result = self.execute(request.cmd);
+            busy_since_ms.store(0, Ordering::Release);
             let _ = request.reply.send(result);
         }
     }

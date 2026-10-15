@@ -21,7 +21,7 @@
 //! `supervisor.rs` and `catalog_db.rs` (and with them `link_key`) were
 //! deleted by WP2.INT (§14 WP2.INT task 1).
 use super::{
-    legacy_bridge::LegacyBridge,
+    legacy_bridge::{LaneVoice, LegacyBridge},
     peering::{dial_role, route},
 };
 use crate::{
@@ -347,12 +347,15 @@ pub(crate) fn summary_of(result: &Value, moved_up: u32, moved_down: u32) -> Exch
 
 /// One dialer lane: dial, then exchange every shared repository each pass
 /// until the lane is cancelled (peer removed or re-paired, daemon shutdown).
+/// Every status event and gate evidence goes through `voice`, which the lane
+/// manager mutes when it retires the lane (`LaneVoice`).
 pub(crate) fn run_lane(
     bridge: Arc<LegacyBridge>,
     ctx: Arc<Ctx>,
     peer: LanePeer,
     lane: usize,
     cancel: Cancel,
+    voice: Arc<LaneVoice>,
 ) {
     let key = peer.key(lane);
     let catalog_key = peer.key(0);
@@ -378,15 +381,17 @@ pub(crate) fn run_lane(
         // Set when the transport failed during one repository's exchange: that
         // repository is charged (and backs off), the lane only reconnects.
         let mut charged = false;
-        bridge.lane_state(
-            &ctx,
-            &peer,
-            lane_index,
-            role,
-            LaneState::Dialing,
-            None,
-            None,
-        );
+        voice.speak(|| {
+            bridge.lane_state(
+                &ctx,
+                &peer,
+                lane_index,
+                role,
+                LaneState::Dialing,
+                None,
+                None,
+            )
+        });
         let result = (|| -> Result<()> {
             let bulk_lane = (!metadata_only).then_some(crate::bulk_sync::Lane {
                 index: lane.saturating_sub(1),
@@ -416,7 +421,7 @@ pub(crate) fn run_lane(
                         serde_json::from_value(ws::call(&mut socket, &json!({"op":"list"}))?)?;
                     let value = serde_json::to_value(&catalog).unwrap_or(Value::Null);
                     if last_catalog.as_ref() != Some(&value) {
-                        bridge.peer_catalog(&ctx, &peer, &catalog);
+                        voice.speak(|| bridge.peer_catalog(&ctx, &peer, &catalog));
                         last_catalog = Some(value);
                     }
                     bridge.set_catalog(&catalog_key, catalog.clone());
@@ -431,7 +436,17 @@ pub(crate) fn run_lane(
                 bridge.update_link(&key, |status| status.connected = true);
                 if !ready {
                     ready = true;
-                    bridge.lane_state(&ctx, &peer, lane_index, role, LaneState::Ready, None, None);
+                    voice.speak(|| {
+                        bridge.lane_state(
+                            &ctx,
+                            &peer,
+                            lane_index,
+                            role,
+                            LaneState::Ready,
+                            None,
+                            None,
+                        )
+                    });
                 }
                 let snapshot = ctx.catalog.snapshot();
                 let interval = ctx.config.network.sync_interval_ms;
@@ -609,7 +624,7 @@ pub(crate) fn run_lane(
                     let transfer = exchange.as_ref().map(|result| &result["transfer"]).ok();
                     let wire_bytes =
                         |key: &str| transfer.and_then(|t| t[key].as_u64()).unwrap_or(0);
-                    ctx.status.record(exchange_event(
+                    let event = exchange_event(
                         &peer.installation,
                         &remote.repo,
                         lane_index,
@@ -623,10 +638,13 @@ pub(crate) fn run_lane(
                         ),
                         (moved.objects_up, moved.objects_down),
                         started.elapsed(),
-                    ));
-                    if metadata_only && caught_up {
-                        gate_evidence(&ctx, &snapshot.gates, local, &peer);
-                    }
+                    );
+                    voice.speak(|| {
+                        ctx.status.record(event);
+                        if metadata_only && caught_up {
+                            gate_evidence(&ctx, &snapshot.gates, local, &peer);
+                        }
+                    });
                     if let Err(error) = exchange
                         && connection_failed
                     {
@@ -641,7 +659,7 @@ pub(crate) fn run_lane(
                         .repositories
                         .retain(|repo, _| active_repositories.contains(repo));
                 });
-                bridge.publish_link(&ctx, &key);
+                voice.speak(|| bridge.publish_link(&ctx, &key));
                 connection.success(Instant::now());
                 // The configured interval is idle polling, not a bandwidth cap.
                 // Keep a small yield between active pages for fairness/recovery.
@@ -665,7 +683,7 @@ pub(crate) fn run_lane(
                 repository.metadata_caught_up = false;
             }
         });
-        bridge.publish_link(&ctx, &key);
+        voice.speak(|| bridge.publish_link(&ctx, &key));
         if active() {
             // A charged failure belongs to its repository: reconnect after the
             // base delay without escalating the lane backoff.
@@ -674,25 +692,30 @@ pub(crate) fn run_lane(
             } else {
                 connection.failure(Instant::now())
             };
-            bridge.lane_state(
-                &ctx,
-                &peer,
-                lane_index,
-                role,
-                LaneState::Backoff,
-                error.as_deref().map(|text| {
-                    ErrorWire::new(
-                        crate::model::errors::code_in(text).unwrap_or("CONNECTION_LOST"),
-                        text,
-                    )
-                }),
-                Some(now_ms().saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))),
-            );
+            voice.speak(|| {
+                bridge.lane_state(
+                    &ctx,
+                    &peer,
+                    lane_index,
+                    role,
+                    LaneState::Backoff,
+                    error.as_deref().map(|text| {
+                        ErrorWire::new(
+                            crate::model::errors::code_in(text).unwrap_or("CONNECTION_LOST"),
+                            text,
+                        )
+                    }),
+                    Some(
+                        now_ms()
+                            .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+                    ),
+                )
+            });
             let _ = lane_wait(&cancel, &ctx.stopping, delay, None, KEEPALIVE);
         }
     }
     bridge.retire_lane(&key, metadata_only.then_some(catalog_key.as_str()));
-    bridge.lane_state(&ctx, &peer, lane_index, role, LaneState::Closed, None, None);
+    voice.speak(|| bridge.lane_state(&ctx, &peer, lane_index, role, LaneState::Closed, None, None));
 }
 
 /// The legacy gate rule (§3.3, Wave 2): a control-lane exchange that left the

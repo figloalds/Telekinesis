@@ -5,7 +5,9 @@
 //!
 //! * `control-accept` blocks in `accept` on the loopback control listener and
 //!   gives each connection its own thread (at most
-//!   `limits::MAX_CONTROL_CONNECTIONS`): a persistent `receive → manage →
+//!   `limits::MAX_CONTROL_CONNECTIONS` outside a request, and as many more
+//!   parked inside one, so requests waiting on a slow catalog never lock
+//!   List, Inspect and Status out): a persistent `receive → manage →
 //!   reply` loop. A complete frame that is not JSON, or JSON that is not a
 //!   valid action, is answered (`INVALID_REQUEST`) and the connection stays
 //!   usable; a transport failure (including a binary envelope the codec
@@ -67,6 +69,10 @@ use std::{
 pub const DISCOVERY_FORMAT: u32 = 3;
 /// A persistent control connection idle this long is closed.
 pub const CONTROL_IDLE: Duration = Duration::from_secs(300);
+/// Control connection threads at most: `limits::MAX_CONTROL_CONNECTIONS`
+/// connections outside a request, plus as many parked inside one
+/// (`Connections::admits`).
+pub const MAX_CONTROL_THREADS: usize = 2 * limits::MAX_CONTROL_CONNECTIONS;
 
 /// Runs the daemon until a `Shutdown` action or a signal (§3.6).
 pub fn run(config: Config) -> Result<()> {
@@ -247,6 +253,22 @@ impl Connections {
         self.live.lock().len()
     }
 
+    /// Whether one more connection may be served: at most
+    /// `limits::MAX_CONTROL_CONNECTIONS` connections that are not inside a
+    /// request (idle, or reading one), and at most [`MAX_CONTROL_THREADS`] in
+    /// all. A connection parked in a request (a management write behind a
+    /// slow catalog, a long Subscribe or Stop wait) thus never takes the
+    /// place of a new List, Inspect or Status (§2.3: a catalog fault may stop
+    /// writes, never status; post-integration re-review, WP2.INT).
+    fn admits(&self) -> bool {
+        let live = self.live.lock();
+        let busy = live
+            .values()
+            .filter(|connection| connection.busy.load(Ordering::Acquire))
+            .count();
+        live.len() < MAX_CONTROL_THREADS && live.len() - busy < limits::MAX_CONTROL_CONNECTIONS
+    }
+
     fn remove(&self, id: u64) {
         self.live.lock().remove(&id);
         self.ended.poke();
@@ -340,10 +362,11 @@ fn accept_control(
                 continue;
             }
         };
-        if connections.count() >= limits::MAX_CONTROL_CONNECTIONS {
+        if !connections.admits() {
             event!(warn, BUSY, {
                 "detail": "control connection refused: too many open connections",
                 "limit": limits::MAX_CONTROL_CONNECTIONS,
+                "threads": MAX_CONTROL_THREADS,
             });
             continue;
         }
