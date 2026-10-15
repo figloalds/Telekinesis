@@ -51,8 +51,10 @@
 //!
 //! * **Session.** Dialed by [`SessionWorkerClient::connect`]; a session that
 //!   closed (the worker restarted its listener, a transport error) is redialed
-//!   by the next call. A call that was in flight on it is uncertain and is
-//!   never replayed (invariant 16).
+//!   by the next call, without the client's lock (§2.2): callers that need
+//!   the session meanwhile wait for that one dial, and share its failure. A
+//!   call that was in flight on it is uncertain and is never replayed
+//!   (invariant 16).
 //! * **Refusals.** A request the worker refused without running it
 //!   (`BUSY`/`WORKER_BUSY`, Contention: its handler queue was full; or the
 //!   local queue was full) is sent again after 10 ms → 250 ms, within the
@@ -494,10 +496,15 @@ pub mod deadlines {
     /// completes an object, the first read of an object, a report) is
     /// allowed this rate on top of the call's own deadline.
     pub const VERIFY_BYTES_PER_S: u64 = 64 * 1024 * 1024;
+    /// At most this much verification time is allowed (sizes may come from
+    /// a peer: a claimed size never buys an unbounded deadline). 30 min at
+    /// [`VERIFY_BYTES_PER_S`] covers objects of 112 GiB.
+    pub const MAX_VERIFY: Duration = Duration::from_secs(30 * 60);
 
-    /// `base` plus the time to verify an object of `size` bytes.
+    /// `base` plus the time to verify an object of `size` bytes (at most
+    /// [`MAX_VERIFY`]).
     pub fn with_verify(base: Duration, size: u64) -> Duration {
-        base + Duration::from_secs(size / VERIFY_BYTES_PER_S)
+        base + Duration::from_secs(size / VERIFY_BYTES_PER_S).min(MAX_VERIFY)
     }
 }
 
@@ -512,8 +519,22 @@ const MAX_CACHED_SESSIONS: usize = 256;
 pub struct SessionWorkerClient {
     endpoint: WorkerEndpoint,
     options: ConnOptions,
-    conn: Mutex<Option<Conn>>,
+    conn: Mutex<ConnSlot>,
+    /// A dial finished (see [`ConnSlot::dialing`]).
+    dialed: Condvar,
     dials: AtomicU64,
+}
+
+/// The current session of a [`SessionWorkerClient`]. Dials run without the
+/// lock (§2.2: no lock across I/O); callers that need a session meanwhile
+/// wait on the condvar for that one dial instead of dialing too.
+#[derive(Default)]
+struct ConnSlot {
+    conn: Option<Conn>,
+    dialing: bool,
+    /// Dials finished so far, and the error of the last one if it failed.
+    finished: u64,
+    failed: Option<CallError>,
 }
 
 impl fmt::Debug for SessionWorkerClient {
@@ -565,11 +586,12 @@ impl SessionWorkerClient {
         let client = Arc::new(Self {
             endpoint: ep.clone(),
             options,
-            conn: Mutex::new(None),
+            conn: Mutex::new(ConnSlot::default()),
+            dialed: Condvar::new(),
             dials: AtomicU64::new(0),
         });
         let conn = client.dial()?;
-        *lock(&client.conn) = Some(conn);
+        lock(&client.conn).conn = Some(conn);
         Ok(client)
     }
 
@@ -585,6 +607,7 @@ impl SessionWorkerClient {
     /// Whether the current session is open.
     pub fn is_open(&self) -> bool {
         lock(&self.conn)
+            .conn
             .as_ref()
             .is_some_and(|conn| conn.closed().is_none())
     }
@@ -592,7 +615,8 @@ impl SessionWorkerClient {
     /// Closes the current session (calls in flight fail `ConnectionLost`);
     /// the next call dials a new one.
     pub fn close(&self) {
-        if let Some(conn) = lock(&self.conn).take() {
+        let taken = lock(&self.conn).conn.take();
+        if let Some(conn) = taken {
             conn.close();
         }
     }
@@ -605,19 +629,59 @@ impl SessionWorkerClient {
         Ok(conn)
     }
 
-    /// The open session, dialing a new one when the last one closed.
+    /// The open session, dialing a new one when the last one closed. The
+    /// dial runs without the lock; concurrent callers wait for it (and get
+    /// its error if it fails) instead of each dialing.
     pub fn conn(&self) -> Result<Conn, CallError> {
         let mut slot = lock(&self.conn);
-        if let Some(conn) = slot.as_ref()
-            && conn.closed().is_none()
-        {
-            return Ok(conn.clone());
+        let mut waited_for: Option<u64> = None;
+        loop {
+            if let Some(conn) = slot.conn.as_ref()
+                && conn.closed().is_none()
+            {
+                return Ok(conn.clone());
+            }
+            if let Some(finished) = waited_for
+                && slot.finished != finished
+                && let Some(error) = &slot.failed
+            {
+                return Err(error.clone());
+            }
+            if !slot.dialing {
+                break;
+            }
+            waited_for = Some(slot.finished);
+            slot = self
+                .dialed
+                .wait(slot)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        // Dialed under the lock: concurrent callers wait for one dial
-        // (bounded by the dial attempt timeout) instead of each dialing.
-        let conn = self.dial()?;
-        *slot = Some(conn.clone());
-        Ok(conn)
+        slot.dialing = true;
+        drop(slot);
+        let dialed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.dial()))
+            .unwrap_or_else(|_| {
+                Err(CallError::Unavailable(format!(
+                    "LOCAL_WORKER_UNAVAILABLE: dialing worker {} panicked",
+                    self.endpoint.instance
+                )))
+            });
+        let mut slot = lock(&self.conn);
+        slot.dialing = false;
+        slot.finished += 1;
+        let result = match dialed {
+            Ok(conn) => {
+                slot.conn = Some(conn.clone());
+                slot.failed = None;
+                Ok(conn)
+            }
+            Err(error) => {
+                slot.failed = Some(error.clone());
+                Err(error)
+            }
+        };
+        drop(slot);
+        self.dialed.notify_all();
+        result
     }
 
     /// One request. A refusal that ran nothing (`BUSY`/`WORKER_BUSY`, a full
@@ -1071,16 +1135,29 @@ pub fn session_for(ep: &WorkerEndpoint) -> Result<Arc<SessionWorkerClient>, Call
         Err(error) => Err(error),
     };
     if map.len() > MAX_CACHED_SESSIONS {
-        let closed: Vec<String> = map
+        // Closed sessions go first. Whether one is open is asked without
+        // the cache's lock (each client's own lock is never held across
+        // I/O, but the cache's is everyone's).
+        let clients: Vec<(String, Arc<SessionWorkerClient>)> = map
             .iter()
-            .filter(|(_, entry)| match &entry.cached {
-                Cached::Client(client) => !client.is_open(),
-                Cached::Unsupported(_) => false,
+            .filter_map(|(instance, entry)| match &entry.cached {
+                Cached::Client(client) => Some((instance.clone(), client.clone())),
+                Cached::Unsupported(_) => None,
             })
-            .map(|(instance, _)| instance.clone())
             .collect();
-        for instance in closed {
-            evicted.extend(map.remove(&instance));
+        drop(map);
+        let closed: Vec<(String, Arc<SessionWorkerClient>)> = clients
+            .into_iter()
+            .filter(|(_, client)| !client.is_open())
+            .collect();
+        map = lock(sessions());
+        for (instance, client) in closed {
+            let same = map.get(&instance).is_some_and(|entry| {
+                matches!(&entry.cached, Cached::Client(cached) if Arc::ptr_eq(cached, &client))
+            });
+            if same {
+                evicted.extend(map.remove(&instance));
+            }
         }
         while map.len() > MAX_CACHED_SESSIONS {
             let Some(oldest) = map

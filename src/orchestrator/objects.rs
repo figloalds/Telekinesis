@@ -38,17 +38,17 @@
 //!
 //! 1. Worker `objects.want{route, lane, max_items 256, max_bytes 16 MiB,
 //!    session}`: wanted objects owned by the lane, with their durable spool
-//!    offsets. The lease session alternates between two ids per lane
-//!    ([`pull_lease`]), so a want issued while a pull is in flight never
-//!    returns that pull's objects (the worker excludes objects leased by
-//!    another session), and both ids are stable across reconnects: after a
-//!    connection loss the next want returns the object again, with its
-//!    durable offset, and the transfer resumes there (never a blind replay).
-//!    Objects owned by another lane, objects in their per-object backoff, and
-//!    objects already begun in this round are left out. (Objects in backoff
-//!    stay leased to one of the two sessions for the lease's TTL, so the
-//!    other session's wants see past them; CCR-WP3.3-4 asks for a direct
-//!    exclusion.)
+//!    offsets. The lease session alternates between two ids per lane and
+//!    repository ([`pull_lease`]), so a want issued while a pull is in
+//!    flight never returns that pull's objects (the worker excludes objects
+//!    leased by another session), and both ids are stable across
+//!    reconnects: after a connection loss the next want returns the object
+//!    again, with its durable offset, and the transfer resumes there (never
+//!    a blind replay). Objects owned by another lane and objects already
+//!    begun in this round are left out; an object in its per-object backoff
+//!    for this source is *parked* (see "Lease handoff"). Before the want,
+//!    the round takes what it continues or takes over from the handoff
+//!    table.
 //! 2. Peer `objects.pull{repo, sender, receiver, lane, items, budget}`
 //!    (`sender` is our replica, `receiver` the peer's, as in
 //!    `meta.exchange`): the lane's **window** (16 MiB, shared by its keys)
@@ -66,9 +66,14 @@
 //!    trusted once it is returned (invariant 2).
 //! 4. Per-object results: a worker hash mismatch (`CorruptAtSource`) is
 //!    reported to the peer (`objects.report{CORRUPT_AT_SOURCE}`), and that
-//!    object backs off for that source (30 s → 1 h); one bad object never
-//!    stops the others. `ObjectError` per failed object; a completed object
-//!    that had failed before resolves its error.
+//!    object backs off for that source (30 s → 1 h) and is parked for
+//!    another source; one bad object never stops the others, of this source
+//!    or of another. `ObjectError` per failed object; an object installed
+//!    here resolves the errors every source had for it.
+//!
+//! When the round ends, what arrived is written (also when the session
+//! ended: it is valid and contiguous, so the next session resumes after it),
+//! unless the lane is told to stop.
 //!
 //! # Upload round (one key)
 //!
@@ -78,6 +83,38 @@
 //! results. A `CorruptAtSource` result makes our worker re-verify its copy
 //! (`objects.report`).
 //!
+//! # Lease handoff (multi-source liveness)
+//!
+//! Every want leases what it returns to its session, and a session's next
+//! want renews those leases: a source that cannot serve an object (it lacks
+//! it: a relay with the metadata only; it failed it) would keep it leased,
+//! and so hidden from every other source of the daemon, for as long as its
+//! lane runs. All the sessions holding leases at a worker are this daemon's
+//! (our pull lanes, and the acceptor's push leases of the dialers it
+//! serves), so the daemon hands such objects on itself, within the frozen
+//! contract (a lease is a session id; a write with that id continues it):
+//!
+//! * an object a source cannot serve is **parked** in the handoff table
+//!   ([`handoff_park`], [`handoff_wanted`]): its lease, the worker's durable
+//!   offset, no holder. The source's own wants keep returning it (and
+//!   renewing its lease) but leave it alone;
+//! * any other transfer of the daemon (a pull lane to another peer, or the
+//!   acceptor offering it to another dialer) **takes it over**
+//!   ([`handoff_take`]) if its lane owns it and it is not in its own
+//!   backoff, and moves it **under the parked lease**; the table then names
+//!   it the holder, and the source's wants leave it to that holder;
+//! * a holder continues it in its next rounds ([`handoff_progress`]),
+//!   releases it once installed or another session's ([`handoff_release`]),
+//!   and parks it again if it cannot serve it either.
+//!
+//! Entries lapse with their lease (60 s without renewal). The worker remains
+//! the arbiter: a write under a lease another session now holds is
+//! `InFlightElsewhere`, and every append starts at the durable offset. The
+//! acceptor learns that a dialer did not serve an object from its own offer
+//! ([`super::inbound_objects`]). CCR-WP3.3-4 asks for the worker-side form
+//! (an exclusion list on `objects.want` that also drops this session's
+//! leases on what it excludes), which would make the table unnecessary.
+//!
 //! # Wire rules (both sides)
 //!
 //! * Requests are the JSON header (`ObjectsPull`, `ObjectsWantsRequest`,
@@ -86,7 +123,11 @@
 //! * **Allotment** ([`allot`]): the items of a pull or push cover, in order,
 //!   `[offset, offset + min(size − offset, budget left))`; an item's share is
 //!   fixed by the list whether or not it is served. A zero-size object is one
-//!   empty chunk. So both sides know exactly which bytes a request covers.
+//!   empty chunk. So both sides know exactly which bytes a request covers:
+//!   a receiver refuses (`PROTOCOL_VIOLATION`) a chunk outside its object's
+//!   share or not contiguous with its last one (invariant 22), and an object
+//!   with a share that got no bytes in a stream that ended normally is one
+//!   the sender could not (or would not) serve.
 //!
 //! # Status
 //!
@@ -125,10 +166,10 @@ use crate::{
             LaneRole, LaneSpec, deadlines,
             frame::ChunkHeader,
             objects::{
-                INFLIGHT_PULLS, INFLIGHT_READS, INFLIGHT_WRITES, MAX_READ_LEN, MAX_WANT_ITEMS,
-                ObjectOutcome, ObjectsPull, ObjectsPush, ObjectsReport, ObjectsResult,
-                ObjectsWantsReply, ObjectsWantsRequest, PULL_BUDGET_BYTES, REPOS_PER_LANE,
-                WantHeader, WantItem, WriteItem, WriteResult,
+                INFLIGHT_PULLS, INFLIGHT_READS, INFLIGHT_WRITES, LEASE_TTL, MAX_READ_LEN,
+                MAX_WANT_ITEMS, ObjectOutcome, ObjectsPull, ObjectsPush, ObjectsReport,
+                ObjectsResult, ObjectsWantsReply, ObjectsWantsRequest, PULL_BUDGET_BYTES,
+                REPOS_PER_LANE, WantHeader, WantItem, WantPriority, WriteItem, WriteResult,
             },
             ops,
         },
@@ -353,8 +394,15 @@ pub fn pull_lease(peer: &str, lane: LaneSpec, slot: u64) -> String {
     )
 }
 
+/// The handoff holder of a dialer's pulls on `lane` of `peer` (both lease
+/// sessions of the lane).
+pub fn pull_holder(peer: &str, lane: LaneSpec) -> String {
+    format!("pull:{peer}:{}/{}", lane.index, lane.count)
+}
+
 /// The lease session of the pushes an acceptor serves for `peer` on `lane`
-/// (its `objects.wants` takes the leases, its writes use them).
+/// (its `objects.wants` takes the leases, its writes use them); also the
+/// handoff holder of those pushes.
 pub fn push_lease(peer: &str, lane: LaneSpec) -> String {
     format!("push:{peer}:{}/{}", lane.index, lane.count)
 }
@@ -410,47 +458,269 @@ struct Held {
     code: String,
 }
 
-fn held() -> &'static Mutex<HashMap<String, Held>> {
-    static HELD: OnceLock<Mutex<HashMap<String, Held>>> = OnceLock::new();
+/// Per object (local installation, repository, direction, hash), per source
+/// peer.
+fn held() -> &'static Mutex<HashMap<String, HashMap<String, Held>>> {
+    static HELD: OnceLock<Mutex<HashMap<String, HashMap<String, Held>>>> = OnceLock::new();
     HELD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// A per-object backoff key: (local installation, peer, repository,
-/// direction, hash).
-pub(crate) fn object_key(local: &str, peer: &str, repo: &str, up: bool, hash: &str) -> String {
+/// A per-object backoff key: the object (local installation, repository,
+/// direction, hash) and the peer it moves from or to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObjectKey {
+    object: String,
+    peer: String,
+}
+
+pub(crate) fn object_key(local: &str, peer: &str, repo: &str, up: bool, hash: &str) -> ObjectKey {
     let direction = if up { "up" } else { "down" };
-    format!("{local}\u{1f}{peer}\u{1f}{repo}\u{1f}{direction}\u{1f}{hash}")
+    ObjectKey {
+        object: format!("{local}\u{1f}{repo}\u{1f}{direction}\u{1f}{hash}"),
+        peer: peer.to_owned(),
+    }
 }
 
 /// Whether `key` is inside its backoff.
-pub(crate) fn object_blocked(key: &str) -> bool {
+pub(crate) fn object_blocked(key: &ObjectKey) -> bool {
     lock(held())
-        .get(key)
+        .get(&key.object)
+        .and_then(|peers| peers.get(&key.peer))
         .is_some_and(|held| Instant::now() < held.until)
 }
 
 /// Records a failure of `key`; returns the delay before it is tried again.
-pub(crate) fn object_failed(key: &str, code: &str) -> Duration {
+/// An empty `code` is a backoff without an error in the hub (a source that
+/// did not serve an object, see "Lease handoff"); it keeps the code of an
+/// earlier failure.
+pub(crate) fn object_failed(key: &ObjectKey, code: &str) -> Duration {
     let now = Instant::now();
     let mut map = lock(held());
     if map.len() >= BACKOFF_PRUNE {
-        map.retain(|_, held| now < held.until + Duration::from_secs(3600));
+        let stale = |held: &Held| now >= held.until + Duration::from_secs(3600);
+        map.retain(|_, peers| {
+            peers.retain(|_, held| !stale(held));
+            !peers.is_empty()
+        });
     }
-    let held = map.entry(key.to_owned()).or_insert_with(|| Held {
-        backoff: Backoff::objects(),
-        until: now,
-        code: String::new(),
-    });
+    let held = map
+        .entry(key.object.clone())
+        .or_default()
+        .entry(key.peer.clone())
+        .or_insert_with(|| Held {
+            backoff: Backoff::objects(),
+            until: now,
+            code: String::new(),
+        });
     let delay = held.backoff.failure(now);
     held.until = now + delay;
-    held.code = code.to_owned();
+    if !code.is_empty() {
+        held.code = code.to_owned();
+    }
     delay
 }
 
-/// `key` completed: forgets its failures; returns the code of the failure
-/// it had, if any (to resolve in the hub).
-pub(crate) fn object_completed(key: &str) -> Option<String> {
-    lock(held()).remove(key).map(|held| held.code)
+/// `key` completed (with its peer): forgets its failures; returns the code
+/// of the failure it had, if any (to resolve in the hub).
+pub(crate) fn object_completed(key: &ObjectKey) -> Option<String> {
+    let mut map = lock(held());
+    let peers = map.get_mut(&key.object)?;
+    let held = peers.remove(&key.peer);
+    if peers.is_empty() {
+        map.remove(&key.object);
+    }
+    held.map(|held| held.code).filter(|code| !code.is_empty())
+}
+
+/// `key`'s object is installed here (from whichever source): forgets the
+/// failures of every source of it; returns their codes, each once (to
+/// resolve in the hub).
+pub(crate) fn object_installed(key: &ObjectKey) -> Vec<String> {
+    let mut codes: Vec<String> = lock(held())
+        .remove(&key.object)
+        .into_iter()
+        .flat_map(HashMap::into_values)
+        .map(|held| held.code)
+        .filter(|code| !code.is_empty())
+        .collect();
+    codes.sort();
+    codes.dedup();
+    codes
+}
+
+// ---------------------------------------------------------------------------
+// Lease handoff between this daemon's transfers (module docs)
+
+/// An object leased at one of our workers to a session that does not move
+/// it (its source cannot serve it: *parked*), or that a transfer of another
+/// source continues under that session's lease (*held*).
+#[derive(Clone, Debug)]
+struct Handoff {
+    /// Size, the worker's durable offset as it last reported it, priority.
+    item: WantItem,
+    /// The worker session that holds the lease.
+    lease: String,
+    /// The transfer moving it (`None`: parked, another source may take it).
+    holder: Option<String>,
+    /// When the lease lapses unless something renews it.
+    until: Instant,
+}
+
+/// Handoffs per worker instance (a worker's leases are its own).
+fn handoffs() -> &'static Mutex<HashMap<String, HashMap<String, Handoff>>> {
+    static HANDOFFS: OnceLock<Mutex<HashMap<String, HashMap<String, Handoff>>>> = OnceLock::new();
+    HANDOFFS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Handoffs remembered per worker instance (expired ones are dropped first;
+/// past this, nothing more is parked: those leases simply lapse).
+const MAX_HANDOFFS: usize = 64 * 1024;
+
+fn handoff_put(map: &mut HashMap<String, Handoff>, hash: &str, entry: Handoff, now: Instant) {
+    if map.len() >= MAX_HANDOFFS && !map.contains_key(hash) {
+        map.retain(|_, handoff| now < handoff.until);
+        if map.len() >= MAX_HANDOFFS {
+            return;
+        }
+    }
+    map.insert(hash.to_owned(), entry);
+}
+
+/// A worker want of session `lease` returned `item` (so `lease` holds it,
+/// renewed) for transfer `holder`; returns whether `holder` moves it. Not
+/// when another transfer continues it under that lease, nor when `blocked`
+/// (its source cannot serve it now): it is then parked, so another source of
+/// this daemon can continue it at once, under the same lease.
+pub(crate) fn handoff_wanted(
+    instance: &str,
+    item: &WantItem,
+    lease: &str,
+    holder: &str,
+    blocked: bool,
+) -> bool {
+    let now = Instant::now();
+    let mut all = lock(handoffs());
+    if let Some(map) = all.get_mut(instance) {
+        if let Some(entry) = map.get_mut(&item.hash)
+            && entry.lease == lease
+            && now < entry.until
+            && entry.holder.as_deref().is_some_and(|other| other != holder)
+        {
+            entry.until = now + LEASE_TTL;
+            return false;
+        }
+        if !blocked {
+            // This lease's own transfer moves it: nothing to hand off.
+            map.remove(&item.hash);
+            if map.is_empty() {
+                all.remove(instance);
+            }
+            return true;
+        }
+    }
+    if !blocked {
+        return true;
+    }
+    let entry = Handoff {
+        item: item.clone(),
+        lease: lease.to_owned(),
+        holder: None,
+        until: now + LEASE_TTL,
+    };
+    let map = all.entry(instance.to_owned()).or_default();
+    handoff_put(map, &item.hash, entry, now);
+    false
+}
+
+/// Parks `item` (`offset`: its durable offset as the worker reported it),
+/// leased to `lease`: its source cannot serve it; another may continue it.
+pub(crate) fn handoff_park(instance: &str, item: &WantItem, lease: &str) {
+    let now = Instant::now();
+    let mut all = lock(handoffs());
+    let map = all.entry(instance.to_owned()).or_default();
+    let entry = Handoff {
+        item: item.clone(),
+        lease: lease.to_owned(),
+        holder: None,
+        until: now + LEASE_TTL,
+    };
+    handoff_put(map, &item.hash, entry, now);
+}
+
+/// What `holder` moves next under leases its own wants do not return: its
+/// continuations, then parked objects `accept` allows (they become
+/// `holder`'s), at most `max_items` and about `max_bytes`. Each comes with
+/// the lease to write it under.
+pub(crate) fn handoff_take(
+    instance: &str,
+    holder: &str,
+    max_items: usize,
+    max_bytes: u64,
+    accept: &dyn Fn(&str) -> bool,
+) -> Vec<(WantItem, String)> {
+    let now = Instant::now();
+    let mut all = lock(handoffs());
+    let Some(map) = all.get_mut(instance) else {
+        return Vec::new();
+    };
+    map.retain(|_, handoff| now < handoff.until);
+    if map.is_empty() {
+        all.remove(instance);
+        return Vec::new();
+    }
+    let mut candidates: Vec<(bool, WantPriority, u64, String)> = map
+        .iter()
+        .filter_map(|(hash, handoff)| {
+            let mine = handoff.holder.as_deref() == Some(holder);
+            (mine || (handoff.holder.is_none() && accept(hash))).then(|| {
+                let remaining = handoff.item.size.saturating_sub(handoff.item.offset);
+                (!mine, handoff.item.priority, remaining, hash.clone())
+            })
+        })
+        .collect();
+    candidates.sort();
+    let mut taken = Vec::new();
+    let mut bytes = 0u64;
+    for (_, _, remaining, hash) in candidates {
+        if taken.len() >= max_items || (bytes >= max_bytes && !taken.is_empty()) {
+            break;
+        }
+        if let Some(handoff) = map.get_mut(&hash) {
+            handoff.holder = Some(holder.to_owned());
+            taken.push((handoff.item.clone(), handoff.lease.clone()));
+            bytes = bytes.saturating_add(remaining);
+        }
+    }
+    taken
+}
+
+/// `holder` continues `item` (`offset`: the worker's durable offset after
+/// its last write) under `lease`, which that write renewed.
+pub(crate) fn handoff_progress(instance: &str, item: &WantItem, lease: &str, holder: &str) {
+    let now = Instant::now();
+    let mut all = lock(handoffs());
+    let map = all.entry(instance.to_owned()).or_default();
+    let entry = Handoff {
+        item: item.clone(),
+        lease: lease.to_owned(),
+        holder: Some(holder.to_owned()),
+        until: now + LEASE_TTL,
+    };
+    handoff_put(map, &item.hash, entry, now);
+}
+
+/// `hash` no longer moves under `lease` here (installed, failed without a
+/// known offset, or the lease is another session's now).
+pub(crate) fn handoff_release(instance: &str, hash: &str, lease: &str) {
+    let mut all = lock(handoffs());
+    if let Some(map) = all.get_mut(instance)
+        && map.get(hash).is_some_and(|handoff| handoff.lease == lease)
+    {
+        map.remove(hash);
+        if map.is_empty() {
+            all.remove(instance);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -799,9 +1069,14 @@ pub(crate) struct SinkResult {
     /// The settled outcome (`None`: never settled; see `durable`).
     pub outcome: Option<ObjectOutcome>,
     /// The worker's durable offset as last reported (or the start offset).
+    /// Not known when `call` is set.
     pub durable: u64,
     /// Bytes written durably through this sink.
     pub written: u64,
+    /// A whole write call with this object failed (timed out, lost, refused,
+    /// the worker unreachable or erring for the call): a failure of the call,
+    /// not of the object, and what the worker kept is not known.
+    pub call: Option<CallError>,
 }
 
 /// Received object bytes on their way into the local worker (`objects.write`
@@ -854,6 +1129,8 @@ struct SinkObject {
     queued: bool,
     flush: bool,
     settled: Option<ObjectOutcome>,
+    /// See [`SinkResult::call`].
+    call: Option<CallError>,
     last_tag: u64,
 }
 
@@ -899,11 +1176,13 @@ impl SinkState {
         }
     }
 
+    /// `call`: the whole write call failed with this error (see
+    /// [`SinkResult::call`]).
     fn settle(
         &mut self,
         hash: &str,
         outcome: ObjectOutcome,
-        call: bool,
+        call: Option<CallError>,
         events: &mut Vec<SinkEvent>,
     ) {
         self.drop_data(hash, events);
@@ -918,8 +1197,9 @@ impl SinkState {
             hash: hash.to_owned(),
             tag: object.last_tag,
             outcome,
-            call,
+            call: call.is_some(),
         });
+        object.call = call;
     }
 
     fn dispatchable(&self, object: &SinkObject, max_write: usize) -> bool {
@@ -1093,19 +1373,26 @@ impl SinkState {
             }
             let end = item.offset + item.len;
             let (written, outcome, call) = match (&call_error, results.get(hash)) {
-                (Some(error), _) => (false, Some(ObjectOutcome::Failed(error.to_wire())), true),
-                (None, None) => (
+                (Some(error), _) => (
                     false,
-                    Some(ObjectOutcome::Failed(ErrorWire::coded(
+                    Some(ObjectOutcome::Failed(error.to_wire())),
+                    Some(error.clone()),
+                ),
+                (None, None) => {
+                    let error = ErrorWire::coded(
                         "INVALID_REPLY",
                         format!("objects.write returned no result for {hash}"),
-                    ))),
-                    true,
-                ),
+                    );
+                    (
+                        false,
+                        Some(ObjectOutcome::Failed(error.clone())),
+                        Some(CallError::Remote(error)),
+                    )
+                }
                 (None, Some(result)) => match &result.outcome {
-                    ObjectOutcome::Completed => (true, Some(ObjectOutcome::Completed), false),
+                    ObjectOutcome::Completed => (true, Some(ObjectOutcome::Completed), None),
                     ObjectOutcome::Progressed { durable_offset } if *durable_offset == end => {
-                        (true, None, false)
+                        (true, None, None)
                     }
                     // The worker kept less (or more) than this call wrote:
                     // its durable offset is the truth; resynchronize.
@@ -1114,9 +1401,9 @@ impl SinkState {
                         Some(ObjectOutcome::Progressed {
                             durable_offset: *durable_offset,
                         }),
-                        false,
+                        None,
                     ),
-                    other => (false, Some(other.clone()), false),
+                    other => (false, Some(other.clone()), None),
                 },
             };
             if let Some(object) = self.objects.get_mut(hash) {
@@ -1148,7 +1435,12 @@ impl SinkState {
                 .map(|(hash, _)| hash.clone())
                 .collect();
             for hash in open {
-                self.settle(&hash, ObjectOutcome::Failed(fatal.to_wire()), true, events);
+                self.settle(
+                    &hash,
+                    ObjectOutcome::Failed(fatal.to_wire()),
+                    Some(fatal.clone()),
+                    events,
+                );
             }
         }
     }
@@ -1217,6 +1509,7 @@ impl Sink {
                     queued: false,
                     flush: false,
                     settled: None,
+                    call: None,
                     last_tag: tag,
                 });
         });
@@ -1271,7 +1564,7 @@ impl Sink {
                     });
                 }
                 if *outcome == ObjectOutcome::SizeMismatch {
-                    state.settle(hash, ObjectOutcome::SizeMismatch, false, events);
+                    state.settle(hash, ObjectOutcome::SizeMismatch, None, events);
                 }
                 return verdict;
             }
@@ -1399,6 +1692,7 @@ impl Sink {
                             outcome: object.settled.clone(),
                             durable: object.durable,
                             written: object.written,
+                            call: object.call.clone(),
                         },
                     )
                 })
@@ -1520,9 +1814,10 @@ pub fn run_lane_with(
         repos: RepoGate::new(options.repos, Some(stats.clone())),
         stats,
         cancel: token.clone(),
+        outer: cancel.clone(),
         modes: Mutex::new(HashMap::new()),
         interim: InterimState::default(),
-        turn: AtomicU64::new(0),
+        turns: Mutex::new(HashMap::new()),
         options: options.clone(),
     });
     let up = Arc::new(UploadJob(run.clone()));
@@ -1582,12 +1877,16 @@ struct LaneRun {
     slots: Arc<Slots>,
     repos: RepoGate,
     stats: Arc<LaneStats>,
+    /// Ends both directions (the lane's cancel, the session's end).
     cancel: Cancel,
+    /// The lane's own cancel (the lane is told to stop).
+    outer: Cancel,
     /// Repositories on the interim path, until when.
     modes: Mutex<HashMap<String, Instant>>,
     interim: InterimState,
-    /// Alternates the pull lease sessions.
-    turn: AtomicU64,
+    /// Alternates the pull lease sessions, per repository (each repository
+    /// is one worker, with its own leases).
+    turns: Mutex<HashMap<String, u64>>,
     options: LaneOptions,
 }
 
@@ -1603,6 +1902,28 @@ impl LaneRun {
         self.cancel.is_cancelled()
             || self.conn.closed().is_some()
             || self.ctx.stopping.load(Ordering::Relaxed)
+    }
+
+    /// The lane (or the daemon) is told to stop: what arrived is dropped
+    /// rather than written. A session that merely ended is not that.
+    fn cancelled(&self) -> bool {
+        self.outer.is_cancelled() || self.ctx.stopping.load(Ordering::Relaxed)
+    }
+
+    /// The handoff holder of this lane's pulls (module docs, "Lease handoff").
+    fn holder(&self) -> String {
+        pull_holder(&self.peer.installation, self.spec)
+    }
+
+    /// The lease session of `repo`'s next want (alternating, per repository).
+    fn next_lease(&self, repo: &str) -> String {
+        let turn = {
+            let mut turns = lock(&self.turns);
+            let turn = turns.entry(repo.to_owned()).or_default();
+            *turn += 1;
+            *turn - 1
+        };
+        pull_lease(&self.peer.installation, self.spec, turn)
     }
 
     fn stop_error(&self) -> ExchangeError {
@@ -1712,7 +2033,7 @@ impl LaneRun {
         });
     }
 
-    fn key(&self, repo: &str, up: bool, hash: &str) -> String {
+    fn key(&self, repo: &str, up: bool, hash: &str) -> ObjectKey {
         object_key(
             &self.ctx.installation,
             &self.peer.installation,
@@ -1750,9 +2071,17 @@ impl LaneRun {
         });
     }
 
-    /// An object completed: clears its backoff and resolves its error.
+    /// An object completed: clears its backoff and resolves its errors. One
+    /// installed here (`up` false) resolves those of every source of it (a
+    /// source that could not serve it may have handed it to this one).
     fn object_done(&self, target: &Target, up: bool, hash: &str) {
-        if let Some(code) = object_completed(&self.key(&target.repo, up, hash)) {
+        let key = self.key(&target.repo, up, hash);
+        let codes = if up {
+            object_completed(&key).into_iter().collect()
+        } else {
+            object_installed(&key)
+        };
+        for code in codes {
             self.ctx.status.record(StatusEvent::Resolved {
                 scope: Scope::Object {
                     state: target.folder.record.state.clone(),
@@ -1899,6 +2228,8 @@ impl Job for UploadJob {
 struct Planned {
     item: WantItem,
     lease: String,
+    /// Taken from the handoff table: `lease` is not one of this lane's.
+    adopted: bool,
 }
 
 /// One pull of a round.
@@ -1929,6 +2260,12 @@ enum RoundEvent {
 struct RoundState {
     plan: VecDeque<Planned>,
     begun: HashSet<String>,
+    /// Every object planned in this round, as first planned (offset: where
+    /// the worker said it stood), with its lease and whether it was taken
+    /// from the handoff table (module docs, "Lease handoff").
+    planned: HashMap<String, Planned>,
+    /// Objects that failed for this source in this round (now in backoff).
+    failed: HashSet<String>,
     pulls: BTreeMap<u64, Pull>,
     next_tag: u64,
     want_dry: bool,
@@ -1943,6 +2280,17 @@ struct RoundState {
 }
 
 impl RoundState {
+    fn plan(&mut self, planned: Planned) {
+        self.planned
+            .entry(planned.item.hash.clone())
+            .or_insert_with(|| planned.clone());
+        self.plan.push_back(planned);
+    }
+
+    fn planned_or_begun(&self, hash: &str) -> bool {
+        self.begun.contains(hash) || self.plan.iter().any(|planned| planned.item.hash == hash)
+    }
+
     fn in_flight(&self) -> usize {
         self.pulls
             .values()
@@ -2061,12 +2409,13 @@ fn download_round(
             }
         }
     });
-    // The pulls are over: write what arrived (unless the lane stops), then
-    // account every byte.
+    // The pulls are over: write what arrived (valid and contiguous: also
+    // when the session ended, so the next one resumes after it; not when
+    // the lane is told to stop), then account every byte.
     let results = sink
         .cell
         .into_inner()
-        .map(|sink| sink.finish(!lane.stopped()))
+        .map(|sink| sink.finish(!lane.cancelled()))
         .unwrap_or_default();
     drop(tx);
     while let Ok(event) = rx.try_recv() {
@@ -2075,6 +2424,7 @@ fn download_round(
     if results.values().any(|result| result.outcome.is_none()) {
         state.leftovers = true;
     }
+    settle_handoffs(lane, client, &state, &results);
     for pull in state.pulls.values_mut() {
         pull.released = pull.released.max(pull.received);
     }
@@ -2202,6 +2552,7 @@ fn round_event(
                 ObjectOutcome::CorruptAtSource => {
                     state.corrupt.push(hash.clone());
                     lane.object_failed(target, false, &hash, &outcome);
+                    state.failed.insert(hash);
                 }
                 ObjectOutcome::Failed(error) if call => {
                     // The whole write call failed: the round's error, not
@@ -2215,7 +2566,12 @@ fn round_event(
                         .get_or_insert_with(|| CallError::Remote(error.clone()));
                 }
                 ObjectOutcome::Progressed { .. } => state.leftovers = true,
-                other => lane.object_failed(target, false, &hash, other),
+                other => {
+                    if is_failure(other) {
+                        lane.object_failed(target, false, &hash, other);
+                        state.failed.insert(hash);
+                    }
+                }
             }
         }
         RoundEvent::PullEnded {
@@ -2251,6 +2607,7 @@ fn round_event(
                     for result in &results.results {
                         if is_failure(&result.outcome) {
                             lane.object_failed(target, false, &result.hash, &result.outcome);
+                            state.failed.insert(result.hash.clone());
                         }
                     }
                 }
@@ -2300,6 +2657,59 @@ fn report_pulls(lane: &LaneRun, target: &Target, state: &mut RoundState) {
     }
 }
 
+/// Updates the handoff table after a download round (module docs, "Lease
+/// handoff"): an object its source failed here is parked under its lease,
+/// so another source of ours can continue it at once; one this lane took
+/// over is continued by its next round, and forgotten once installed or
+/// another session's.
+fn settle_handoffs(
+    lane: &LaneRun,
+    client: &SessionWorkerClient,
+    state: &RoundState,
+    results: &HashMap<String, SinkResult>,
+) {
+    let instance = client.endpoint().instance.as_str();
+    let holder = lane.holder();
+    for (hash, planned) in &state.planned {
+        let result = results.get(hash);
+        // Where the worker stands, as it last said (not known after a write
+        // call that failed as a whole).
+        let known = match result {
+            Some(result) if result.call.is_some() => None,
+            Some(result) => Some(result.durable),
+            None => Some(planned.item.offset),
+        };
+        let at = |offset: u64| WantItem {
+            offset,
+            ..planned.item.clone()
+        };
+        let gone = matches!(
+            result.and_then(|result| result.outcome.as_ref()),
+            Some(
+                ObjectOutcome::Completed
+                    | ObjectOutcome::Skipped
+                    | ObjectOutcome::InFlightElsewhere
+                    | ObjectOutcome::Unsolicited
+            )
+        );
+        match known {
+            _ if gone => {
+                if planned.adopted {
+                    handoff_release(instance, hash, &planned.lease);
+                }
+            }
+            Some(offset) if state.failed.contains(hash) => {
+                handoff_park(instance, &at(offset), &planned.lease);
+            }
+            Some(offset) if planned.adopted => {
+                handoff_progress(instance, &at(offset), &planned.lease, &holder);
+            }
+            None if planned.adopted => handoff_release(instance, hash, &planned.lease),
+            _ => {}
+        }
+    }
+}
+
 /// Asks the local worker for more wanted objects (module docs, step 1).
 fn want_more(
     lane: &LaneRun,
@@ -2308,8 +2718,32 @@ fn want_more(
     route: &SyncRoute,
     state: &mut RoundState,
 ) {
-    let turn = lane.turn.fetch_add(1, Ordering::Relaxed);
-    let lease = pull_lease(&lane.peer.installation, lane.spec, turn);
+    let instance = client.endpoint().instance.as_str();
+    let holder = lane.holder();
+    let blocked = |hash: &str| object_blocked(&lane.key(&target.repo, false, hash));
+    // First what this lane continues, or takes over from a source of ours
+    // that cannot serve it, under the lease that holds it (module docs,
+    // "Lease handoff").
+    let taken = handoff_take(
+        instance,
+        &holder,
+        MAX_WANT_ITEMS,
+        lane.options.window_bytes,
+        &|hash| lane.spec.owns(hash) && !blocked(hash) && !state.planned_or_begun(hash),
+    );
+    let mut fresh = 0;
+    for (item, lease) in taken {
+        if state.planned_or_begun(&item.hash) {
+            continue;
+        }
+        fresh += 1;
+        state.plan(Planned {
+            item,
+            lease,
+            adopted: true,
+        });
+    }
+    let lease = lane.next_lease(&target.repo);
     let header = WantHeader {
         route: route.clone(),
         lane: lane.spec,
@@ -2319,27 +2753,24 @@ fn want_more(
     };
     match client.want(&header, worker_client::deadlines::WANT) {
         Ok(items) => {
-            let mut fresh = 0;
             for item in items {
-                if !lane.spec.owns(&item.hash)
-                    || state.begun.contains(&item.hash)
-                    || state
-                        .plan
-                        .iter()
-                        .any(|planned| planned.item.hash == item.hash)
-                {
+                if !lane.spec.owns(&item.hash) || state.planned_or_begun(&item.hash) {
                     if state.begun.contains(&item.hash) {
                         state.leftovers = true;
                     }
                     continue;
                 }
-                if object_blocked(&lane.key(&target.repo, false, &item.hash)) {
+                // An object in its backoff for this source is parked under
+                // this lease (another source may take it); one another
+                // source continues under this lease is left to it.
+                if !handoff_wanted(instance, &item, &lease, &holder, blocked(&item.hash)) {
                     continue;
                 }
                 fresh += 1;
-                state.plan.push_back(Planned {
+                state.plan(Planned {
                     item,
                     lease: lease.clone(),
+                    adopted: false,
                 });
             }
             if fresh == 0 {
