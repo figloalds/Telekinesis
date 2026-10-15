@@ -2,10 +2,10 @@
     "schema":  1,
     "kind":  "wave-3",
     "wave":  3,
-    "generated_at":  "2026-10-15T15:08:42.9569577-03:00",
-    "duration_s":  4562.7,
+    "generated_at":  "2026-10-15T16:16:03.4188319-03:00",
+    "duration_s":  3302.6,
     "git":  {
-                "commit":  "f6f122c7fe238e34283c5d0a2fe11e1ab644e9c1",
+                "commit":  "0cd0b5e81329ee8821a49ead153a094c892b29f7",
                 "branch":  "revamp/wp3-int",
                 "dirty":  false,
                 "dirty_paths":  [
@@ -32,21 +32,20 @@
                     "ok":  false,
                     "scenarios":  77,
                     "by_status":  {
-                                      "pass":  71,
-                                      "fail":  5,
+                                      "pass":  73,
+                                      "fail":  3,
                                       "skipped":  1
                                   },
                     "floors_evaluated":  41,
-                    "floors_passed":  37,
-                    "floors_failed":  4,
+                    "floors_passed":  38,
+                    "floors_failed":  3,
                     "floors_missing":  0,
                     "floors_not_run":  0,
                     "floors_incomplete":  0,
                     "enforced_failures":  [
                                               "concurrent_namespace_ops_5k",
                                               "session_loopback_throughput",
-                                              "e2e_tiny_files_10k",
-                                              "e2e_idle_exchange_bytes"
+                                              "e2e_tiny_files_10k"
                                           ]
                 },
     "files":  [
@@ -369,16 +368,16 @@
                       "wave":  1,
                       "status":  "fail",
                       "exit_code":  101,
-                      "duration_s":  1397.4,
-                      "result":  "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1396.57s",
-                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-135238\\qual_wp1_7_derive.log",
+                      "duration_s":  1495.8,
+                      "result":  "test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1494.70s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-152059\\qual_wp1_7_derive.log",
                       "scenarios":  [
                                         {
                                             "scenario":  "qual_wp1_7_derive::concurrent_namespace_ops_5k",
                                             "status":  "fail",
-                                            "elapsed_ms":  13181,
+                                            "elapsed_ms":  16025,
                                             "failures":  [
-                                                             "FLOOR concurrent_namespace_ops_5k: max_op_ms \u003c= 500 (measured Some(678.1689))"
+                                                             "FLOOR concurrent_namespace_ops_5k: max_op_ms \u003c= 500 (measured Some(608.9187000000001))"
                                                          ],
                                             "notes":  [
 
@@ -389,12 +388,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "max_op_ms",
-                                                                "value":  678.1689,
+                                                                "value":  608.9187000000001,
                                                                 "unit":  "ms"
                                                             },
                                                             {
                                                                 "metric":  "p50_op_ms",
-                                                                "value":  256.5599,
+                                                                "value":  314.9799,
                                                                 "unit":  "ms"
                                                             },
                                                             {
@@ -409,7 +408,7 @@
                                                             },
                                                             {
                                                                 "metric":  "derive_ms_per_commit",
-                                                                "value":  22.27404,
+                                                                "value":  27.711,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -417,7 +416,7 @@
                                         {
                                             "scenario":  "qual_wp1_7_derive::two_way_backlog_2k",
                                             "status":  "pass",
-                                            "elapsed_ms":  138190,
+                                            "elapsed_ms":  177069,
                                             "failures":  [
 
                                                          ],
@@ -430,7 +429,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "per_event_ms",
-                                                                "value":  52.11964939999994,
+                                                                "value":  62.56659595000003,
                                                                 "unit":  "ms"
                                                             },
                                                             {
@@ -445,12 +444,12 @@
                                                             },
                                                             {
                                                                 "metric":  "derive_ms_per_commit",
-                                                                "value":  3.4445210000000004,
+                                                                "value":  4.276732,
                                                                 "unit":  "ms"
                                                             },
                                                             {
                                                                 "metric":  "oracle_ms",
-                                                                "value":  33911.7359,
+                                                                "value":  51890.4411,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -458,7 +457,7 @@
                                         {
                                             "scenario":  "qual_wp1_7_derive::two_way_backlog_6400",
                                             "status":  "pass",
-                                            "elapsed_ms":  1239592,
+                                            "elapsed_ms":  1294019,
                                             "failures":  [
 
                                                          ],
@@ -471,7 +470,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "per_event_ms",
-                                                                "value":  193.65741762499957,
+                                                                "value":  202.16019873437455,
                                                                 "unit":  "ms"
                                                             },
                                                             {
@@ -486,7 +485,7 @@
                                                             },
                                                             {
                                                                 "metric":  "derive_ms_per_commit",
-                                                                "value":  14.73409015625,
+                                                                "value":  15.946665000000001,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -613,14 +612,14 @@
                       "wave":  1,
                       "status":  "fail",
                       "exit_code":  101,
-                      "duration_s":  102.6,
-                      "result":  "test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 101.74s",
-                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-135238\\qual_wp1_9_session.log",
+                      "duration_s":  101.9,
+                      "result":  "test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 101.01s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-152059\\qual_wp1_9_session.log",
                       "scenarios":  [
                                         {
                                             "scenario":  "qual_wp1_9_session::dead_peer_detection",
                                             "status":  "pass",
-                                            "elapsed_ms":  20018,
+                                            "elapsed_ms":  20019,
                                             "failures":  [
 
                                                          ],
@@ -633,7 +632,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "detect_ms",
-                                                                "value":  20009.9972,
+                                                                "value":  20010.4648,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -641,7 +640,7 @@
                                         {
                                             "scenario":  "qual_wp1_9_session::duplex_32mib",
                                             "status":  "pass",
-                                            "elapsed_ms":  262,
+                                            "elapsed_ms":  286,
                                             "failures":  [
 
                                                          ],
@@ -654,12 +653,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "duplex_ms",
-                                                                "value":  121.19059999999999,
+                                                                "value":  72.5176,
                                                                 "unit":  "ms"
                                                             },
                                                             {
                                                                 "metric":  "duplex_wss_ms",
-                                                                "value":  89.2689,
+                                                                "value":  136.0142,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -680,12 +679,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "ping_after_idle_ms",
-                                                                "value":  0.35300000000000004,
+                                                                "value":  0.3835,
                                                                 "unit":  "ms"
                                                             },
                                                             {
                                                                 "metric":  "rtt_ms",
-                                                                "value":  0.0,
+                                                                "value":  1.0,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -693,9 +692,9 @@
                                         {
                                             "scenario":  "qual_wp1_9_session::loopback_throughput",
                                             "status":  "fail",
-                                            "elapsed_ms":  17870,
+                                            "elapsed_ms":  17256,
                                             "failures":  [
-                                                             "FLOOR session_loopback_throughput: mib_per_s \u003e= 300 (measured Some(282.75691192229885))"
+                                                             "FLOOR session_loopback_throughput: mib_per_s \u003e= 300 (measured Some(286.23181103758503))"
                                                          ],
                                             "notes":  [
                                                           "session::Conn streamed response, 1024 x 1 MiB chunks (plain WS), best of 3 runs; upload and WSS recorded too"
@@ -706,17 +705,17 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "mib_per_s",
-                                                                "value":  282.75691192229885,
+                                                                "value":  286.23181103758503,
                                                                 "unit":  "MiB/s"
                                                             },
                                                             {
                                                                 "metric":  "upload_mib_per_s",
-                                                                "value":  224.76169772694806,
+                                                                "value":  260.1722919862818,
                                                                 "unit":  "MiB/s"
                                                             },
                                                             {
                                                                 "metric":  "wss_mib_per_s",
-                                                                "value":  751.9704158389056,
+                                                                "value":  483.35564368928937,
                                                                 "unit":  "MiB/s"
                                                             }
                                                         ]
@@ -724,7 +723,7 @@
                                         {
                                             "scenario":  "qual_wp1_9_session::slow_does_not_block_fast",
                                             "status":  "pass",
-                                            "elapsed_ms":  3560,
+                                            "elapsed_ms":  3423,
                                             "failures":  [
 
                                                          ],
@@ -737,12 +736,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "fast_p99_ms",
-                                                                "value":  0.1752,
+                                                                "value":  0.1632,
                                                                 "unit":  "ms"
                                                             },
                                                             {
                                                                 "metric":  "control_queued_30mib_p99_ms",
-                                                                "value":  45.5265,
+                                                                "value":  44.486,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -752,16 +751,16 @@
                   {
                       "file":  "qual_wp1_12_legacy",
                       "wave":  1,
-                      "status":  "fail",
-                      "exit_code":  101,
-                      "duration_s":  136.3,
-                      "result":  "test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 135.51s",
-                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-135238\\qual_wp1_12_legacy.log",
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  137.9,
+                      "result":  "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 137.11s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-152059\\qual_wp1_12_legacy.log",
                       "scenarios":  [
                                         {
                                             "scenario":  "qual_wp1_12_legacy::crash_backoff",
                                             "status":  "pass",
-                                            "elapsed_ms":  20099,
+                                            "elapsed_ms":  20006,
                                             "failures":  [
 
                                                          ],
@@ -779,17 +778,17 @@
                                                             },
                                                             {
                                                                 "metric":  "list_p99_ms",
-                                                                "value":  2.7474000000000003,
+                                                                "value":  14.5497,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
                                         },
                                         {
                                             "scenario":  "qual_wp1_12_legacy::hung_remote_repo_charged",
-                                            "status":  "fail",
-                                            "elapsed_ms":  20791,
+                                            "status":  "pass",
+                                            "elapsed_ms":  25588,
                                             "failures":  [
-                                                             "the hung repository\u0027s failure is charged to it"
+
                                                          ],
                                             "notes":  [
 
@@ -800,12 +799,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "healthy_delay_ms",
-                                                                "value":  747.8695,
+                                                                "value":  593.631,
                                                                 "unit":  "ms"
                                                             },
                                                             {
                                                                 "metric":  "hung_repo_charged",
-                                                                "value":  0.0,
+                                                                "value":  1.0,
                                                                 "unit":  "bool"
                                                             }
                                                         ]
@@ -834,7 +833,7 @@
                                         {
                                             "scenario":  "qual_wp1_12_legacy::worker_busy_not_counted",
                                             "status":  "pass",
-                                            "elapsed_ms":  20141,
+                                            "elapsed_ms":  20138,
                                             "failures":  [
 
                                                          ],
@@ -1742,14 +1741,14 @@
                       "wave":  3,
                       "status":  "fail",
                       "exit_code":  101,
-                      "duration_s":  1516.8,
-                      "result":  "test result: FAILED. 11 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1515.73s",
-                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-135238\\qual_wp3_int_e2e.log",
+                      "duration_s":  1437,
+                      "result":  "test result: FAILED. 12 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1436.10s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-152059\\qual_wp3_int_e2e.log",
                       "scenarios":  [
                                         {
                                             "scenario":  "qual_wp3_int_e2e::catch_up_10k_events",
                                             "status":  "pass",
-                                            "elapsed_ms":  17201,
+                                            "elapsed_ms":  17467,
                                             "failures":  [
 
                                                          ],
@@ -1762,7 +1761,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "seconds",
-                                                                "value":  17.1986313,
+                                                                "value":  17.4645149,
                                                                 "unit":  "s"
                                                             }
                                                         ]
@@ -1770,7 +1769,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::feed_150k_daemons",
                                             "status":  "pass",
-                                            "elapsed_ms":  943059,
+                                            "elapsed_ms":  1013364,
                                             "failures":  [
 
                                                          ],
@@ -1788,18 +1787,17 @@
                                                             },
                                                             {
                                                                 "metric":  "events_per_s",
-                                                                "value":  166.5829873122884,
+                                                                "value":  154.14863832785431,
                                                                 "unit":  "events/s"
                                                             }
                                                         ]
                                         },
                                         {
                                             "scenario":  "qual_wp3_int_e2e::idle_exchange_daemons",
-                                            "status":  "fail",
-                                            "elapsed_ms":  30006,
+                                            "status":  "pass",
+                                            "elapsed_ms":  30004,
                                             "failures":  [
-                                                             "the feeds did not move during the window",
-                                                             "FLOOR e2e_idle_exchange_bytes: bytes_per_exchange \u003c= 4096 (measured Some(NaN))"
+
                                                          ],
                                             "notes":  [
 
@@ -1810,7 +1808,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "bytes_per_exchange",
-                                                                "value":  null,
+                                                                "value":  2701.8530020703934,
                                                                 "unit":  "bytes"
                                                             }
                                                         ]
@@ -1818,7 +1816,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::large_event_8mib_daemons",
                                             "status":  "pass",
-                                            "elapsed_ms":  6934,
+                                            "elapsed_ms":  6601,
                                             "failures":  [
 
                                                          ],
@@ -1839,7 +1837,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync",
                                             "status":  "pass",
-                                            "elapsed_ms":  296,
+                                            "elapsed_ms":  300,
                                             "failures":  [
 
                                                          ],
@@ -1852,7 +1850,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "sync_ms",
-                                                                "value":  230.6114,
+                                                                "value":  234.63649999999998,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -1860,7 +1858,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::mutual_pairing_duplicate_bytes",
                                             "status":  "pass",
-                                            "elapsed_ms":  407,
+                                            "elapsed_ms":  361,
                                             "failures":  [
 
                                                          ],
@@ -1873,7 +1871,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "wire_ratio",
-                                                                "value":  1.0014928579330444,
+                                                                "value":  1.0015248656272888,
                                                                 "unit":  "ratio"
                                                             }
                                                         ]
@@ -1881,7 +1879,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::object_256mib_loopback",
                                             "status":  "pass",
-                                            "elapsed_ms":  3641,
+                                            "elapsed_ms":  3678,
                                             "failures":  [
 
                                                          ],
@@ -1894,7 +1892,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "mib_per_s",
-                                                                "value":  89.31666298293581,
+                                                                "value":  96.77385820550647,
                                                                 "unit":  "MiB/s"
                                                             }
                                                         ]
@@ -1902,7 +1900,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::objects_before_activation",
                                             "status":  "pass",
-                                            "elapsed_ms":  1081,
+                                            "elapsed_ms":  944,
                                             "failures":  [
 
                                                          ],
@@ -1915,12 +1913,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "objects_ahead",
-                                                                "value":  22.0,
+                                                                "value":  85.0,
                                                                 "unit":  "objects"
                                                             },
                                                             {
                                                                 "metric":  "complete_ms",
-                                                                "value":  1080.9344999999998,
+                                                                "value":  943.4795,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -1928,7 +1926,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::one_gib_through_proxy",
                                             "status":  "pass",
-                                            "elapsed_ms":  88236,
+                                            "elapsed_ms":  88152,
                                             "failures":  [
 
                                                          ],
@@ -1941,7 +1939,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "link_utilization",
-                                                                "value":  0.9735277466349158,
+                                                                "value":  0.9744613020625995,
                                                                 "unit":  "ratio"
                                                             }
                                                         ]
@@ -1949,7 +1947,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::relay_with_objects",
                                             "status":  "pass",
-                                            "elapsed_ms":  344,
+                                            "elapsed_ms":  266,
                                             "failures":  [
 
                                                          ],
@@ -1962,7 +1960,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "relay_ms",
-                                                                "value":  340.4801,
+                                                                "value":  265.7157,
                                                                 "unit":  "ms"
                                                             }
                                                         ]
@@ -1970,9 +1968,9 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::tiny_files_10k",
                                             "status":  "fail",
-                                            "elapsed_ms":  42974,
+                                            "elapsed_ms":  44940,
                                             "failures":  [
-                                                             "FLOOR e2e_tiny_files_10k: files_per_s \u003e= 300 (measured Some(270.7759523392087))"
+                                                             "FLOOR e2e_tiny_files_10k: files_per_s \u003e= 300 (measured Some(282.56054005074714))"
                                                          ],
                                             "notes":  [
 
@@ -1983,7 +1981,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "files_per_s",
-                                                                "value":  270.7759523392087,
+                                                                "value":  282.56054005074714,
                                                                 "unit":  "files/s"
                                                             }
                                                         ]
@@ -1991,7 +1989,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::two_way_backlog_e2e",
                                             "status":  "pass",
-                                            "elapsed_ms":  154554,
+                                            "elapsed_ms":  5561,
                                             "failures":  [
 
                                                          ],
@@ -2004,7 +2002,7 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "seconds",
-                                                                "value":  154.5534401,
+                                                                "value":  5.5073077,
                                                                 "unit":  "s"
                                                             }
                                                         ]
@@ -2012,7 +2010,7 @@
                                         {
                                             "scenario":  "qual_wp3_int_e2e::v2_peer_fails_closed",
                                             "status":  "pass",
-                                            "elapsed_ms":  78,
+                                            "elapsed_ms":  65,
                                             "failures":  [
 
                                                          ],
@@ -2077,7 +2075,7 @@
                        "op":  "\u003c=",
                        "floor":  100,
                        "unit":  "ms",
-                       "measured":  52.11964939999994,
+                       "measured":  62.56659595000003,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "slow path, 15.9 s @2K"
@@ -2090,7 +2088,7 @@
                        "op":  "\u003c=",
                        "floor":  300,
                        "unit":  "ms",
-                       "measured":  193.65741762499957,
+                       "measured":  202.16019873437455,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "slow path, 218 s @6.4K"
@@ -2103,7 +2101,7 @@
                        "op":  "\u003c=",
                        "floor":  500,
                        "unit":  "ms",
-                       "measured":  678.1689,
+                       "measured":  608.9187000000001,
                        "verdict":  "fail",
                        "enforced":  true,
                        "baseline":  "O(N^2) seconds to minutes"
@@ -2168,7 +2166,7 @@
                        "op":  "\u003c",
                        "floor":  50,
                        "unit":  "ms",
-                       "measured":  0.1752,
+                       "measured":  0.1632,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "head-of-line blocking"
@@ -2181,7 +2179,7 @@
                        "op":  "\u003c",
                        "floor":  50,
                        "unit":  "ms",
-                       "measured":  45.5265,
+                       "measured":  44.486,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "head-of-line blocking (CCR-WP1.9-3)"
@@ -2194,7 +2192,7 @@
                        "op":  "\u003e=",
                        "floor":  300,
                        "unit":  "MiB/s",
-                       "measured":  282.75691192229885,
+                       "measured":  286.23181103758503,
                        "verdict":  "fail",
                        "enforced":  true,
                        "baseline":  "JSON+hex request/response"
@@ -2207,7 +2205,7 @@
                        "op":  "\u003c=",
                        "floor":  45000,
                        "unit":  "ms",
-                       "measured":  747.8695,
+                       "measured":  593.631,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "lane-wide resets, 30 s backoff"
@@ -2441,7 +2439,7 @@
                        "op":  "\u003e=",
                        "floor":  40,
                        "unit":  "MiB/s",
-                       "measured":  89.31666298293581,
+                       "measured":  96.77385820550647,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "2.0 MiB/s"
@@ -2454,7 +2452,7 @@
                        "op":  "\u003e=",
                        "floor":  0.8,
                        "unit":  "ratio",
-                       "measured":  0.9735277466349158,
+                       "measured":  0.9744613020625995,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "not measured"
@@ -2467,7 +2465,7 @@
                        "op":  "\u003e=",
                        "floor":  300,
                        "unit":  "files/s",
-                       "measured":  270.7759523392087,
+                       "measured":  282.56054005074714,
                        "verdict":  "fail",
                        "enforced":  true,
                        "baseline":  "page cliff above 10,031 parts"
@@ -2480,7 +2478,7 @@
                        "op":  "\u003c=",
                        "floor":  60,
                        "unit":  "s",
-                       "measured":  17.1986313,
+                       "measured":  17.4645149,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "hours"
@@ -2493,7 +2491,7 @@
                        "op":  "\u003e=",
                        "floor":  1,
                        "unit":  "objects",
-                       "measured":  22.0,
+                       "measured":  85.0,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "0-byte bulk rounds"
@@ -2506,7 +2504,7 @@
                        "op":  "\u003c=",
                        "floor":  1.1,
                        "unit":  "ratio",
-                       "measured":  1.0014928579330444,
+                       "measured":  1.0015248656272888,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "up to 2x"
@@ -2519,7 +2517,7 @@
                        "op":  "\u003c=",
                        "floor":  180,
                        "unit":  "s",
-                       "measured":  154.5534401,
+                       "measured":  5.5073077,
                        "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "slow path"
@@ -2532,8 +2530,8 @@
                        "op":  "\u003c=",
                        "floor":  4096,
                        "unit":  "bytes",
-                       "measured":  null,
-                       "verdict":  "fail",
+                       "measured":  2701.8530020703934,
+                       "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "251 KB @6.4K"
                    },
@@ -2564,6 +2562,17 @@
                        "baseline":  "permanent stall above 349,525 B"
                    }
                ],
-    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-135238",
-    "merged_from":  null
+    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-152059",
+    "merged_from":  {
+                        "generated_at":  "2026-10-15T15:08:42.9569577-03:00",
+                        "git":  {
+                                    "commit":  "f6f122c7fe238e34283c5d0a2fe11e1ab644e9c1",
+                                    "branch":  "revamp/wp3-int",
+                                    "dirty":  false,
+                                    "dirty_paths":  [
+
+                                                    ]
+                                },
+                        "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-135238"
+                    }
 }
