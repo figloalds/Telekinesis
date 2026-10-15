@@ -224,11 +224,14 @@ pub fn dial_expecting(
 /// WP3.1): an unpair, a respawn or a shutdown no longer waits for a dial to
 /// finish. `cancel` is checked before each step; while a socket exists, its
 /// cancellation shuts the socket down (a hook on a child token that lives
-/// only as long as the dial), so an upgrade or a handshake step in progress
-/// fails at once instead of running out its 5 s budget. Only a TCP connect
-/// in progress (at most `DIAL_ATTEMPT`, 3 s, per address) runs to its end. A
-/// cancelled dial fails with `DialError::Connect("… dial cancelled")`, and
-/// a session it may have completed meanwhile is closed, never returned.
+/// only as long as the dial, see `ws::connect_with_cancel`), so an upgrade
+/// or a handshake step in progress fails at once instead of running out its
+/// budget (on Windows: as soon as the peer answers our FIN by closing, as
+/// every tkfs server and relay does; a peer that ignores it is bounded by
+/// the step's timeout). A TCP connect in progress (at most `DIAL_ATTEMPT`,
+/// 3 s, per address) runs to its end. A cancelled dial fails with
+/// `DialError::Connect("dial cancelled")`, and a session it may have
+/// completed meanwhile is closed, never returned.
 pub fn dial_cancellable(
     endpoint: &str,
     hello: ClientHello,
@@ -1522,6 +1525,115 @@ mod tests {
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
         (client, server)
+    }
+
+    /// CCR-WP2.6-2 (applied by WP3.1): a dial whose token is cancelled
+    /// returns at once, inside its upgrade (a server that never answers the
+    /// upgrade, where the dial would otherwise wait its 3 s budget; it closes
+    /// when the dialer does, as every server does), and a dial whose token is
+    /// already cancelled connects nothing.
+    #[test]
+    fn a_cancelled_dial_returns_at_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let held = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            // Reads the upgrade request and never answers; closes on EOF.
+            let mut buffer = [0u8; 4096];
+            while matches!(stream.read(&mut buffer), Ok(n) if n > 0) {}
+        });
+        let cancel = Cancel::new();
+        let canceller = {
+            let cancel = cancel.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                cancel.cancel();
+            })
+        };
+        let started = Instant::now();
+        let result = dial_cancellable(
+            &endpoint,
+            client_hello("client", LaneRole::Control, None, 2),
+            &CodeAuth { code: "c".into() },
+            None,
+            None,
+            ConnOptions::default(),
+            &cancel,
+        );
+        let took = started.elapsed();
+        canceller.join().unwrap();
+        match result {
+            Err(DialError::Connect(detail)) => assert!(detail.contains("cancelled"), "{detail}"),
+            other => panic!("not cancelled: {:?}", other.map(|_| ())),
+        }
+        assert!(
+            took < Duration::from_millis(1500),
+            "the dial took {took:?} (its upgrade budget is 3 s)"
+        );
+
+        // An already cancelled token: nothing is dialed.
+        let quiet = TcpListener::bind("127.0.0.1:0").unwrap();
+        quiet.set_nonblocking(true).unwrap();
+        let endpoint = format!("ws://{}", quiet.local_addr().unwrap());
+        let result = dial_cancellable(
+            &endpoint,
+            client_hello("client", LaneRole::Control, None, 2),
+            &CodeAuth { code: "c".into() },
+            None,
+            None,
+            ConnOptions::default(),
+            &cancel,
+        );
+        assert!(
+            matches!(&result, Err(DialError::Connect(detail)) if detail.contains("cancelled")),
+            "{:?}",
+            result.map(|_| ())
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert!(quiet.accept().is_err(), "a cancelled dial connected");
+        held.join().unwrap();
+
+        // Unix: the shutdown ends the read in progress by itself, also when
+        // the server ignores our FIN and holds the connection.
+        #[cfg(unix)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let held = thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                thread::sleep(Duration::from_secs(4));
+                drop(stream);
+            });
+            let cancel = Cancel::new();
+            let canceller = {
+                let cancel = cancel.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(300));
+                    cancel.cancel();
+                })
+            };
+            let started = Instant::now();
+            let result = dial_cancellable(
+                &endpoint,
+                client_hello("client", LaneRole::Control, None, 2),
+                &CodeAuth { code: "c".into() },
+                None,
+                None,
+                ConnOptions::default(),
+                &cancel,
+            );
+            canceller.join().unwrap();
+            assert!(result.is_err());
+            assert!(
+                started.elapsed() < Duration::from_millis(1500),
+                "{:?}",
+                started.elapsed()
+            );
+            held.join().unwrap();
+        }
     }
 
     #[test]
