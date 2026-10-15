@@ -1403,6 +1403,7 @@ impl Store {
     /// it is. Pair with `rekey_view` around writes that touch no projection
     /// state (inbox rows, object bookkeeping, transaction boundaries).
     fn keep_view(&self) -> Option<i64> {
+        self.adopt_foreign_commits();
         let data_version = self.data_version().ok()?;
         self.view_cache
             .borrow()
@@ -1421,8 +1422,19 @@ impl Store {
         let Some(data_version) = kept else {
             return;
         };
-        let mut cache = self.view_cache.borrow_mut();
         if self.data_version().ok() != Some(data_version) {
+            // Another connection committed in between: kept only if it
+            // changed no projection row (`adopt_foreign_commits`).
+            if self.view_cache.try_borrow().is_ok_and(|cache| {
+                cache
+                    .as_ref()
+                    .is_some_and(|v| v.data_version == data_version)
+            }) {
+                self.adopt_foreign_commits();
+            }
+        }
+        let mut cache = self.view_cache.borrow_mut();
+        if self.data_version().ok() != cache.as_ref().map(|v| v.data_version) {
             *cache = None;
         } else if let Some(view) = cache.as_mut() {
             view.changes = self.db.total_changes();
