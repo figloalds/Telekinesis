@@ -368,6 +368,7 @@ impl Store {
                 delta = self.namespace_successor(&event)?;
             }
             let Some(delta) = delta else { return Ok(false) };
+            let written_from = self.db.total_changes();
             for (entity, entry) in &delta.entries {
                 let heads: BTreeMap<_, _> = delta
                     .heads
@@ -390,11 +391,44 @@ impl Store {
                 "INSERT INTO event_frontier VALUES(?,?)",
                 params![branch.id, event.id],
             )?;
+            self.patch_replayed_view(&branch.id, written_from, &event, delta);
             fault("startup_suffix_applied");
         }
         if !tail.is_empty() {
             persist(&self.db, &branch.id)?;
         }
         Ok(true)
+    }
+
+    /// Keeps the view the suffix's successors read in step with the rows one
+    /// replayed event just wrote (WP3.INT), as a fast commit patches it: the
+    /// writes move `total_changes`, so the next successor reloaded the whole
+    /// projection, O(entries) per suffix event (minutes for the 1024-event
+    /// suffix a large folder may have since CCR-WP2.4-3). Only a view that was
+    /// fresh right before those writes (`written_from`) is patched; any other
+    /// is dropped. The patched view lives only inside the startup replay
+    /// (`resume_snapshot` drops it), and it never adopts other connections'
+    /// commits (`projection_version: None`).
+    fn patch_replayed_view(
+        &self,
+        branch: &str,
+        written_from: u64,
+        event: &Event,
+        delta: Projection,
+    ) {
+        let mut cache = self.view_cache.borrow_mut();
+        let patched = cache.as_mut().is_some_and(|view| {
+            view.branch == branch
+                && view.changes == written_from
+                && super::commit::patch_view(view, event, delta).is_ok()
+        });
+        match cache.as_mut() {
+            Some(view) if patched => {
+                view.changes = self.db.total_changes();
+                view.transactional = !self.db.is_autocommit();
+                view.projection_version = None;
+            }
+            _ => *cache = None,
+        }
     }
 }

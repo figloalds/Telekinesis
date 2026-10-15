@@ -571,20 +571,55 @@ fn feed_150k_daemons() {
     let last_start = (n - 1) / 10_000 * 10_000;
     let last = format!("f{last_start:06}-{:06}.txt", n - 1 - last_start);
     let empty = tkfs::core::hash(b"");
-    let done = wait_until(s.remaining(), || has_hash(&pb, &last, &empty));
+    // WP3.INT: progress is read from B's worker `status` (its status cell: no
+    // projection is read). `has_hash` asks for the whole `state`, which for
+    // 150K entries (about 70 MB of JSON) exceeds the RPC's 64 MiB message
+    // limit, so it never held; and each 50 ms poll had the worker load and
+    // serialize the whole projection under a read transaction, which slowed
+    // the activation it measured and kept the WAL from being checkpointed.
+    let activated = |folder: &Value| -> Option<u64> {
+        let status = try_rpc(folder, json!({"op":"status"})).ok()?;
+        status["journal"]["events"].as_u64()
+    };
+    let mut seen = 0;
+    let synced = wait_until(s.remaining(), || {
+        seen = activated(&pb).unwrap_or(seen);
+        thread::sleep(Duration::from_millis(200));
+        seen >= n as u64
+    });
+    let seconds = s.started.elapsed().as_secs_f64();
+    // Then the last event's entry, read from B's store (folder stopped): the
+    // file exists, alive, with its (empty) content.
+    let entry = synced.then(|| {
+        b.with_stopped_folder(&pb, SETUP, |st| Ok(st.lookup(&last).ok()))
+            .unwrap_or_else(|error| panic!("cannot read B's store: {error:#}"))
+    });
+    let present = entry.as_ref().is_some_and(|entry| {
+        entry
+            .as_ref()
+            .is_some_and(|e| e.alive && e.content.as_deref() == Some(empty.as_str()))
+    });
+    let done = synced && present;
     s.metric_with(
         "completed",
         if done { 1.0 } else { 0.0 },
         "bool",
-        json!({"events": n, "seconds": s.started.elapsed().as_secs_f64()}),
+        json!({"events": n, "activated": seen, "seconds": seconds,
+            "last_entry": entry.map(|entry| entry.map(|e| json!({"alive": e.alive, "content": e.content})))}),
     );
-    if !done {
+    s.metric("events_per_s", seen as f64 / seconds, "events/s");
+    if !synced {
         let peers = b.raw_call(json!({"op":"peers"})).unwrap_or(Value::Null);
         s.note(format!(
             "lane 0 error: {}",
             peers[0]["lanes"][0]["repositories"]
         ));
         s.timeout("150K-event folder not synchronized");
+    } else {
+        s.check(
+            present,
+            format!("{last} is not an empty live file in B's store"),
+        );
     }
     s.finish();
 }

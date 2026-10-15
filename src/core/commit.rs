@@ -1461,7 +1461,7 @@ fn seal_due(tx: &Connection, branch: &str) -> Result<bool> {
 /// Patch `view` with a fast commit's `delta` (the changed entities' entries
 /// and head registers) and their slots. On an error the view is partly
 /// patched and must be dropped.
-fn patch_view(view: &mut ViewCache, event: &Event, delta: Projection) -> Result<()> {
+pub(super) fn patch_view(view: &mut ViewCache, event: &Event, delta: Projection) -> Result<()> {
     let entities: BTreeSet<_> = event.changes.iter().map(|c| &c.entity).collect();
     // A replacement moves one entry into another's old slot. Remove all old
     // slots first, independent of entity ID ordering.
