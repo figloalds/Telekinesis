@@ -575,12 +575,14 @@ pub const SPOOLS_MARKER: &str = "spools_v1";
 static DIR_SYNC_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// What phase C did with one complete spool.
-enum Finish {
+enum Verified {
     /// The bytes did not hash to the object: the spool was dropped.
     Corrupt,
-    /// In `objects/`: `barrier` when the call's directory fsync must still
-    /// make it durable before registration.
-    Installed { barrier: bool },
+    /// A verified copy is in `objects/` already (for example private bytes):
+    /// the spool was dropped; the copy is registered.
+    Present,
+    /// The spool holds the object: rename it into `objects/`.
+    Spool,
 }
 
 /// One `spool_state` row: the committed durable offset of a spool, and the
@@ -1039,38 +1041,84 @@ impl Store {
             }
         }
 
-        // Phase C: verify and install complete objects: renames into
-        // `objects/`, made durable together by one directory fsync before
-        // any is registered ("rename plus directory fsync", §6.4).
+        // Phase C: verify complete objects (whole-object hashes, outside the
+        // spool I/O gate), then install them, the gate taken once for all of
+        // the call's renames (WP3.INT: one turn per object made each rename
+        // wait behind other calls' whole appends, about 12 ms per tiny
+        // object). Renames into `objects/` are made durable together by one
+        // directory fsync before any is registered ("rename plus directory
+        // fsync", §6.4).
         let batched = !DIR_SYNC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
         let mut installed: Vec<(String, u64)> = vec![];
         let mut awaiting: Vec<usize> = vec![];
         let mut dropped: Vec<String> = vec![];
         let mut unfinished: Vec<(String, u64)> = vec![];
+        let mut verified: Vec<(usize, Verified)> = vec![];
+        let unfinish = |group: &Group,
+                        error: &anyhow::Error,
+                        unfinished: &mut Vec<(String, u64)>,
+                        results: &mut [Option<WriteResult>]| {
+            // The complete spool stays; the next write finalizes it.
+            let wire = ErrorWire::from_error(error);
+            unfinished.push((group.hash.clone(), group.total));
+            for &index in &group.pending {
+                results[index] = Some(failed(&group.hash, wire.clone(), group.committed));
+            }
+        };
         for (g, group) in groups.iter_mut().enumerate() {
             if group.settled || !group.complete {
                 continue;
             }
-            match self.finish_group(group, locks, batched) {
-                Ok(Finish::Installed { barrier }) => {
-                    installed.push((group.hash.clone(), group.total));
-                    if barrier {
-                        awaiting.push(g);
-                    }
-                }
-                Ok(Finish::Corrupt) => {
+            match self.verify_group(group) {
+                Ok(Verified::Corrupt) => {
                     dropped.push(group.hash.clone());
                     for &index in &group.pending {
                         results[index] =
                             Some(result(&group.hash, ObjectOutcome::CorruptAtSource, 0));
                     }
                 }
-                Err(error) => {
-                    // The complete spool stays; the next write finalizes it.
-                    let wire = ErrorWire::from_error(&error);
-                    unfinished.push((group.hash.clone(), group.total));
+                Ok(how) => verified.push((g, how)),
+                Err(error) => unfinish(group, &error, &mut unfinished, &mut results),
+            }
+        }
+        if !verified.is_empty() {
+            let _io = locks.spool_io();
+            let mut present = vec![];
+            for (g, how) in verified {
+                let group = &groups[g];
+                let done = match how {
+                    Verified::Spool => self.install_spool(&group.hash, batched),
+                    _ => {
+                        present.push(g);
+                        Ok(())
+                    }
+                };
+                match done {
+                    Ok(()) => {
+                        installed.push((group.hash.clone(), group.total));
+                        if batched {
+                            awaiting.push(g);
+                        }
+                    }
+                    Err(error) => unfinish(group, &error, &mut unfinished, &mut results),
+                }
+            }
+            // Without the batched barrier (a directory fsync failed before),
+            // a copy found present is made durable before it is registered
+            // too (WP3.INT; the WP3.2 review's minor): it may be the rename of
+            // a call whose barrier failed. If that fsync fails, they are not
+            // registered (still wanted).
+            if !batched
+                && !present.is_empty()
+                && let Err(error) = sync_dir(&self.root.join("objects"))
+            {
+                let wire =
+                    ErrorWire::coded("OBJECT_IO_ERROR", format!("objects/ fsync: {error:#}"));
+                for &g in &present {
+                    let group = &groups[g];
+                    installed.retain(|(hash, _)| *hash != group.hash);
                     for &index in &group.pending {
-                        results[index] = Some(failed(&group.hash, wire.clone(), group.committed));
+                        results[index] = Some(failed(&group.hash, wire.clone(), 0));
                     }
                 }
             }
@@ -1395,18 +1443,11 @@ impl Store {
             })?)
     }
 
-    /// Phase C of `write_object_items` for one complete spool (its lock held):
-    /// a whole-object hash, then the install. `batched`: the install is a
-    /// plain rename that the call's directory fsync makes durable (a verified
-    /// copy already present is covered by it too); otherwise a durable rename
-    /// of its own (`install_object`). The install takes the spool I/O gate;
-    /// the hash runs outside it.
-    fn finish_group(
-        &self,
-        group: &mut Group,
-        locks: &ObjectLocks,
-        batched: bool,
-    ) -> Result<Finish> {
+    /// Phase C of `write_object_items` for one complete spool (its lock held),
+    /// outside the spool I/O gate: the whole-object hash of the spool, and
+    /// whether a verified copy is present in `objects/` already (kept: this
+    /// transfer still proves the source's copy, I4).
+    fn verify_group(&self, group: &mut Group) -> Result<Verified> {
         let object = group.hash.clone();
         let path = spool_path(&self.root, &object);
         let mut file = match group.file.take() {
@@ -1417,26 +1458,32 @@ impl Store {
         if hash_from_start(&mut file, group.total)? != object {
             drop(file);
             fs::remove_file(&path)?;
-            return Ok(Finish::Corrupt);
+            return Ok(Verified::Corrupt);
         }
         drop(file);
         let dest = self.root.join("objects").join(&object);
         if dest.exists() && self.verify_object(&object).is_ok() {
-            // A verified copy is present already (for example private bytes):
-            // keep it; this transfer still proves the source's copy (I4).
             fs::remove_file(&path)?;
-        } else {
-            let _io = locks.spool_io();
-            if dest.exists() {
-                fs::rename(&dest, dest.with_extension(format!("corrupt-{}", id())))?;
-            }
-            if batched {
-                rename_object(&path, &dest)?;
-            } else {
-                install_object(&path, &dest)?;
-            }
+            return Ok(Verified::Present);
         }
-        Ok(Finish::Installed { barrier: batched })
+        Ok(Verified::Spool)
+    }
+
+    /// The install of a verified spool (its lock and the spool I/O gate held):
+    /// a corrupt file in its place is renamed aside; `batched`, a plain rename
+    /// that the call's directory fsync makes durable, otherwise a durable
+    /// rename of its own (`install_object`).
+    fn install_spool(&self, object: &str, batched: bool) -> Result<()> {
+        let path = spool_path(&self.root, object);
+        let dest = self.root.join("objects").join(object);
+        if dest.exists() {
+            fs::rename(&dest, dest.with_extension(format!("corrupt-{}", id())))?;
+        }
+        if batched {
+            rename_object(&path, &dest)
+        } else {
+            install_object(&path, &dest)
+        }
     }
 
     /// The rows of `register_received`, on the caller's transaction.

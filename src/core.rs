@@ -40,6 +40,9 @@ pub use derive::project;
 pub use objects::ScrubOutcome;
 pub(crate) use objects::install_object;
 pub use objects::{ObjectLocks, VerifyMode};
+/// The startup-snapshot seal cadence (CCR-WP2.4-3, applied by WP3.INT): read
+/// by the activator's seal forecast with the store's own rule.
+pub use snapshot::{MAX_SEAL_INTERVAL, MIN_SEAL_INTERVAL, SEALED_SQL, seal_interval};
 pub use transfer::{Bundle, ObjectPart, PartOutcome};
 pub use verify::DerivedDiff;
 

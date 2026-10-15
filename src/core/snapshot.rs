@@ -4,7 +4,38 @@ use std::borrow::Cow;
 
 // Bump when projection/validation semantics change, even without a SQL migration.
 const FORMAT: u32 = 1;
-const INTERVAL: i64 = 128;
+
+/// The shortest journal distance between two periodic seals of a branch.
+pub const MIN_SEAL_INTERVAL: i64 = 128;
+/// The longest: it also bounds a startup's replay after the last seal
+/// (`try_resume_snapshot` refuses a longer tail).
+pub const MAX_SEAL_INTERVAL: i64 = 1024;
+/// Sealed payload bytes per event of interval (see [`seal_interval`]).
+const SEAL_BYTES_PER_EVENT: i64 = 4096;
+
+/// The periodic seal interval of a branch whose last sealed payload has
+/// `saved_bytes` bytes (CCR-WP2.4-3, applied by WP3.INT). A seal serializes,
+/// hashes and stores the whole projection (O(entries)), so a fixed interval
+/// made seals the dominant cost of a large linear catch-up (at 10K files,
+/// 78 seals of 60-250 ms each took 15 s of a 36 s activation). The interval
+/// grows with the payload, `saved_bytes / 4 KiB` events (each event pays for
+/// about 4 KiB of sealing), from [`MIN_SEAL_INTERVAL`] (every payload under
+/// 512 KiB, unchanged) to [`MAX_SEAL_INTERVAL`] (from 4 MiB). No seal yet:
+/// the minimum. The snapshot stays disposable (the journal is
+/// authoritative); a longer interval only lengthens a startup's replay, at
+/// most `MAX_SEAL_INTERVAL` events.
+pub fn seal_interval(saved_bytes: Option<i64>) -> i64 {
+    saved_bytes.map_or(MIN_SEAL_INTERVAL, |bytes| {
+        (bytes / SEAL_BYTES_PER_EVENT).clamp(MIN_SEAL_INTERVAL, MAX_SEAL_INTERVAL)
+    })
+}
+
+/// The sealed cursor of a branch and its payload's length, which
+/// [`seal_interval`] reads (`octet_length` reads no payload). Every reader
+/// of the seal cadence uses this query: the decision (`maybe_persist`) and
+/// its mirrors (the fast commit's `seal_due`, the activator's forecast).
+pub const SEALED_SQL: &str =
+    "SELECT cursor,octet_length(payload) FROM startup_snapshots WHERE branch=?1";
 
 /// The sealed payload. `projection` is borrowed when the sealing commit holds
 /// it (the JSON is the same either way).
@@ -86,7 +117,7 @@ fn journal_hash(db: &Connection, branch: &str, cursor: i64) -> Result<String> {
 }
 
 /// Seals `branch` when `full` (a slow-path commit) or when the journal moved
-/// [`INTERVAL`] events past its last seal. A commit that holds the branch's
+/// [`seal_interval`] events past its last seal. A commit that holds the branch's
 /// whole projection as it has just stored it passes it as `known`: the seal
 /// serializes that instead of reading the ~7 MB (at 5K entries) back and
 /// parsing it (WP1.INT fix round 1, CCR-WP1.INT-4). The payload is the same.
@@ -96,12 +127,9 @@ pub(super) fn maybe_persist(
     full: bool,
     known: Option<&Projection>,
 ) -> Result<()> {
-    let saved: Option<i64> = db
-        .query_row(
-            "SELECT cursor FROM startup_snapshots WHERE branch=?",
-            [branch],
-            |r| r.get(0),
-        )
+    let saved: Option<(i64, Option<i64>)> = db
+        .prepare_cached(SEALED_SQL)?
+        .query_row([branch], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     // O(1) on each commit. The branch-specific cursor/digest is computed only
     // when sealing; activity on another branch may merely seal this one sooner.
@@ -110,7 +138,7 @@ pub(super) fn maybe_persist(
         [],
         |r| r.get(0),
     )?;
-    if full || saved.is_none_or(|saved| tip - saved >= INTERVAL) {
+    if full || saved.is_none_or(|(saved, bytes)| tip - saved >= seal_interval(bytes)) {
         persist_with(db, branch, known)?;
     }
     Ok(())
@@ -234,7 +262,7 @@ impl Store {
         let tail: Vec<(i64, String)> = self.db.prepare("SELECT s.seq,e.payload FROM journal_sequence s JOIN events e ON e.id=s.event WHERE e.branch=? AND s.seq>? ORDER BY s.seq")?
             .query_map(params![branch.id, saved_cursor], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         // Bound startup work even when an older writer never consolidated.
-        if tail.len() > INTERVAL as usize {
+        if tail.len() > MAX_SEAL_INTERVAL as usize {
             return Ok(false);
         }
         self.db
