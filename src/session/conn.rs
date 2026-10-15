@@ -252,9 +252,21 @@ const FAR: Duration = Duration::from_secs(30 * 24 * 3600);
 /// Received chunk bodies at least this large are copied into recycled
 /// buffers of `wire::MAX_CHUNK` bytes (see `Shared::chunk_body`).
 const POOLED_CHUNK: usize = 512 * 1024;
-/// Recycled chunk buffers a connection keeps (at most 4 MiB, only once it
-/// has received large stream chunks).
-const POOL_BUFFERS: usize = 4;
+/// Recycled chunk buffers the process keeps for all its connections (at
+/// most 32 MiB, only once large stream chunks were received). A stream keeps
+/// up to its receive bound (`data_queue_bytes`, 32 MiB by default) of chunks
+/// buffered while its consumer catches up, so a pool of 4 per connection
+/// freed and mapped buffers again on every such burst (WP3.INT: single runs
+/// of `qual_wp1_9_session::loopback_throughput` had a median of about 300
+/// MiB/s with it, about 400 with this pool, on a shared machine whose runs
+/// spread from 250 to 700). The pool is shared rather than per connection,
+/// so many connections never keep more than this idle between them; a
+/// recycled buffer belongs to its chunk alone (never a slice of a received
+/// message, WP1.INT's S1).
+const POOL_BUFFERS: usize = 32;
+
+/// See [`POOL_BUFFERS`].
+static CHUNK_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// Longest error message carried in a RESPONSE or GOAWAY header.
 const MAX_ERROR_MESSAGE: usize = 4096;
 
@@ -752,8 +764,6 @@ pub(crate) struct Shared {
     /// The I/O thread holds its reads: receivers are behind, or (server) the
     /// peer leaves our replies unread.
     pub(crate) rx_paused: AtomicBool,
-    /// (Client.) Recycled buffers for large chunk bodies.
-    chunk_pool: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Shared {
@@ -808,7 +818,7 @@ impl Shared {
         if body.len() < POOLED_CHUNK || body.len() > wire::MAX_CHUNK {
             return body.to_vec();
         }
-        let recycled = lock(&self.chunk_pool).pop();
+        let recycled = lock(&CHUNK_POOL).pop();
         let mut buffer = recycled.unwrap_or_else(|| Vec::with_capacity(wire::MAX_CHUNK));
         buffer.clear();
         buffer.extend_from_slice(body);
@@ -821,7 +831,7 @@ impl Shared {
         if body.capacity() < POOLED_CHUNK || body.capacity() > wire::MAX_CHUNK {
             return;
         }
-        let mut pool = lock(&self.chunk_pool);
+        let mut pool = lock(&CHUNK_POOL);
         if pool.len() < POOL_BUFFERS {
             pool.push(body);
         }
@@ -1432,7 +1442,6 @@ impl Conn {
             rx_buffered: AtomicUsize::new(0),
             rx_taken: AtomicU64::new(0),
             rx_paused: AtomicBool::new(false),
-            chunk_pool: Mutex::new(Vec::new()),
         });
         io::start(ws, shared.clone())?;
         Ok(Conn { inner: shared })
