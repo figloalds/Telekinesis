@@ -247,7 +247,7 @@ fn remote_list(ctx: &Ctx, endpoint: &str) -> Result<Vec<PublishedState>> {
 /// | `running` | `Running` && gate ∉ {awaiting, blocked} && (no mount requested ‖ `!mount_enabled` ‖ the user detached it (mount intent `Detach`) ‖ mount ∈ {Attached, AttachFailed, Lost}) |
 /// | `starting` | `Starting` ‖ (`Running` && `!running`) |
 /// | `mounted` | the mount is `Attached` (actual) |
-/// | `initial_sync_pending` | a gate row exists |
+/// | `initial_sync_pending` | a gate row exists, unless the folder runs and its controller is deleting it (mount `Attached`, or no mount requested and the gate satisfied or overridden) |
 /// | `startup_phase` | the `Starting` phase text; `"synchronizing remote metadata"` while gated; `"attaching filesystem"` while attaching; else null |
 /// | `error` | the lifecycle error (Failed, or an open controller error), else the mount `AttachFailed` message |
 /// | `publication_error` | the open `PUBLISHED_SUMMARY_FAILED` error |
@@ -298,7 +298,22 @@ pub fn project(record: &FolderRecord, view: &FolderView, gate_row: bool) -> Map<
     value.insert("running".into(), json!(running));
     value.insert("starting".into(), json!(starting));
     value.insert("mounted".into(), json!(view.mount.state.is_attached()));
-    value.insert("initial_sync_pending".into(), json!(gate_row));
+    // The controller deletes the gate marker on a helper thread once the
+    // folder runs complete (invariant 26, §3.3; off its thread since WP2.INT's
+    // post-integration re-review): a running, attached folder never reports
+    // its initial sync pending while that write is in flight, as before
+    // (CCR-WP2.INT-7, WP2.INT's confirmation review).
+    let marker_done = phase_running
+        && (view.mount.state.is_attached()
+            || (!(record.mount.is_some() && record.mount_enabled)
+                && matches!(
+                    view.gate,
+                    GateState::Satisfied { .. } | GateState::Overridden { .. }
+                )));
+    value.insert(
+        "initial_sync_pending".into(),
+        json!(gate_row && !marker_done),
+    );
     value.insert("startup_phase".into(), json!(startup_phase));
     value.insert("error".into(), json!(error));
     value.insert("publication_error".into(), json!(publication_error));

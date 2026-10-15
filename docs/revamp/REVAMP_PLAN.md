@@ -1022,7 +1022,7 @@ List, Inspect and Peers keep their exact shapes and add a typed `status: FolderS
 | `running` | `phase == Running` && gate ∉ {awaiting, blocked} && (no mount requested \|\| `!mount_enabled` \|\| mount intent `Detach` (the user detached it, a Wave 2 action; CCR-WP2.INT-3) \|\| mount ∈ {Attached, AttachFailed, Lost}) |
 | `starting` | `phase == Starting` \|\| (`phase == Running` && `!running`) |
 | `mounted` | mount state `Attached` (actual) |
-| `initial_sync_pending` | a gate row exists |
+| `initial_sync_pending` | a gate row exists, unless `phase == Running` and the controller is deleting it (mount `Attached`, or no mount requested and the gate `Satisfied`/`Overridden`): the marker is deleted off the controller thread, so the row can outlive the attach by one catalog write (CCR-WP2.INT-7) |
 | `startup_phase` | the `Starting` phase text; `"synchronizing remote metadata"` while gated; `"attaching filesystem"` while attaching; else null |
 | `error` | lifecycle error, or mount `AttachFailed` message |
 | `publication_error` | published entry error (`PUBLISHED_SUMMARY_FAILED: …`) |
