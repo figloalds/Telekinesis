@@ -147,13 +147,6 @@ fn slow_commit_view(
 /// The head registers a `current_parts` row stores for its entity.
 const PART_FIELDS: [&str; 5] = ["kind", "location", "alive", "content", "basic"];
 
-/// The journal distance between periodic seals of a fast commit; mirrors
-/// `snapshot::INTERVAL`, which decides. Used only to know beforehand that a
-/// seal is due, so the seal can serialize the projection the commit holds
-/// instead of reading it back (CCR-WP1.6-1 adapter); a mismatch would only
-/// cost that read.
-const SEAL_INTERVAL: i64 = 128;
-
 /// Upserts the `current_parts` row of `entity` (its entry and its head
 /// registers) from projection `p`, which must hold the entry.
 fn write_part(tx: &Connection, branch: &str, entity: &str, p: &Projection) -> Result<()> {
@@ -1423,22 +1416,23 @@ fn seal_prepared(
     Ok(true)
 }
 
-/// Whether a fast commit's periodic seal is due (mirrors `snapshot::maybe_persist`
-/// with [`SEAL_INTERVAL`], inside the commit's savepoint after its journal row).
+/// Whether a fast commit's periodic seal is due (mirrors `snapshot::maybe_persist`,
+/// which decides, with the same query and [`super::snapshot::seal_interval`],
+/// inside the commit's savepoint after its journal row). Used only to know
+/// beforehand that a seal is due, so the seal can serialize the projection
+/// the commit holds instead of reading it back (CCR-WP1.6-1 adapter); a
+/// mismatch would only cost that read.
 fn seal_due(tx: &Connection, branch: &str) -> Result<bool> {
-    let saved: Option<i64> = tx
-        .query_row(
-            "SELECT cursor FROM startup_snapshots WHERE branch=?",
-            [branch],
-            |r| r.get(0),
-        )
+    let saved: Option<(i64, Option<i64>)> = tx
+        .prepare_cached(super::snapshot::SEALED_SQL)?
+        .query_row([branch], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
     let tip: i64 = tx.query_row(
         "SELECT coalesce(max(seq),0) FROM journal_sequence",
         [],
         |r| r.get(0),
     )?;
-    Ok(saved.is_none_or(|saved| tip - saved >= SEAL_INTERVAL))
+    Ok(saved.is_none_or(|(saved, bytes)| tip - saved >= super::snapshot::seal_interval(bytes)))
 }
 
 /// Patch `view` with a fast commit's `delta` (the changed entities' entries

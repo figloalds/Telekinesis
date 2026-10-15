@@ -125,11 +125,12 @@ pub const BUSY_SLICE: SliceBudget = SliceBudget {
     max_ms: 25,
     inline_slow: false,
 };
-/// Journal sequences between two periodic startup-snapshot seals of a
-/// branch. Mirrors `core::snapshot::INTERVAL` (private to `core`,
-/// CCR-WP2.3-5): if the two ever differ, the seal is only no longer isolated
-/// in its own slice.
-pub const SEAL_INTERVAL: i64 = 128;
+/// The shortest journal distance between two periodic startup-snapshot
+/// seals of a branch (`core::snapshot::MIN_SEAL_INTERVAL`); the forecast
+/// reads each branch's own interval, `core::snapshot::seal_interval` of its
+/// sealed payload (CCR-WP2.4-3 and the read side of CCR-WP2.3-5, applied by
+/// WP3.INT), with the query the store decides with.
+pub const SEAL_INTERVAL: i64 = crate::core::MIN_SEAL_INTERVAL;
 /// At most this many head rows are looked at by [`seal_forecast`].
 pub const FORECAST_ROWS: usize = 8;
 /// [`seal_forecast`] parses a head row's payload only up to this size.
@@ -499,9 +500,7 @@ fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
     );
     head.sort();
     head.truncate(lookahead);
-    let mut cursor = store
-        .db
-        .prepare_cached("SELECT cursor FROM startup_snapshots WHERE branch=?1")?;
+    let mut cursor = store.db.prepare_cached(crate::core::SEALED_SQL)?;
     let mut distances: BTreeMap<String, i64> = BTreeMap::new();
     let mut rows = Vec::with_capacity(head.len());
     for (_, _, branch) in head {
@@ -514,8 +513,12 @@ fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
         let distance = match distances.get(&branch) {
             Some(distance) => *distance,
             None => {
-                let saved: Option<i64> = cursor.query_row([&branch], |r| r.get(0)).optional()?;
-                let distance = saved.map_or(0, |saved| SEAL_INTERVAL - (tip - saved));
+                let saved: Option<(i64, Option<i64>)> = cursor
+                    .query_row([&branch], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                let distance = saved.map_or(0, |(saved, bytes)| {
+                    crate::core::seal_interval(bytes) - (tip - saved)
+                });
                 distances.insert(branch, distance);
                 distance
             }
