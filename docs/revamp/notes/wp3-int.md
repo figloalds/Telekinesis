@@ -233,6 +233,25 @@ coordinator does that after review (§13 rule 6, rule 8 item 7).
    B's push session did not move, 60 s, and the stall backoff after it, 60
    s). Traced on Windows: delivered 119 s after the repair, and later than
    120 s in two of three runs. The assertions are unchanged.
+9. **`qual_wp1_12_legacy::hung_remote_repo_charged`'s charge window** (WP1.12's
+   scenario, changed by WP2.INT and WP3.1): after the healthy repository
+   moved, the scenario samples Peers for the hung repository's charge for 75
+   s (was 20 s). Since the cutover the hung exchange is charged at the
+   dialer's exchange deadline (`limits::EXCHANGE_DEADLINE`, 30 s), so the
+   charge came after the window and the scenario failed in the first
+   qualification run; WP3.1's own v3 scenario
+   (`qual_wp3_1_transport::hung_remote_repo_extra_delay`) waits 75 s for the
+   same reason. Measured after the change: charged about 25 s into the
+   scenario. The floor (`legacy_hung_repo_healthy_progress`) and the check
+   are unchanged.
+10. **`qual_wp3_int_e2e::idle_exchange_daemons`'s window starts with both feeds
+   at rest**: it slept 5 s after B's lane said `metadata_caught_up`, which
+   holds once B has received A's feed while B may still activate it; in the
+   first qualification run B's feed moved during the window (so the window
+   was not idle and the metric was NaN, as the WP0.5 fix requires). The
+   scenario now waits until neither side has events pending and both feeds
+   stayed put for 5 s. Measured after the change: 485 exchanges in the 30 s
+   window (the test daemons' 50 ms interval), 2,693 bytes each.
 
 ## Tests added
 
@@ -253,10 +272,12 @@ coordinator does that after review (§13 rule 6, rule 8 item 7).
 | `w3_integration::a_large_copied_wal_is_truncated_once_no_reader_is_on_it` | CCR-WP3.INT-3: not under a reader (and quickly), truncated once the reader left, a small WAL left alone, busy timeout restored | yes (the old checkpoint never truncates) |
 | `w3_integration::a_startup_replays_the_snapshot_suffix_against_one_view` | a reopen replays a 72-event suffix with at most 3 view loads, to the same projection, and seals it | yes (72 loads) |
 
-Changed: `qual_wp3_int_e2e::idle_exchange_daemons` (summary item 3),
-`::feed_150k_daemons` (deviation 6), `qual_wp1_9_session::loopback_throughput`
-(deviation 3), `orchestrator::failed_repository…`'s waits (deviations 5 and
-8); `tests/contracts.rs` and five `status_hub` literals gain `source: None`.
+Changed: `qual_wp3_int_e2e::idle_exchange_daemons` (summary item 3 and
+deviation 10), `::feed_150k_daemons` (deviation 6),
+`qual_wp1_9_session::loopback_throughput` (deviation 3),
+`qual_wp1_12_legacy::hung_remote_repo_charged` (deviation 9),
+`orchestrator::failed_repository…`'s waits (deviations 5 and 8);
+`tests/contracts.rs` and five `status_hub` literals gain `source: None`.
 
 ## VERIFY
 
