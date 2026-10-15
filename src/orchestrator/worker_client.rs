@@ -726,6 +726,10 @@ impl SessionWorkerClient {
             for _ in 0..inflight {
                 scope.spawn(|| read_loop(self, route, ranges, inflight, deadline, &shared));
             }
+            // Ends the readers however the consumer leaves (a panic too):
+            // the scope joins them, and one waiting for the window to move
+            // would otherwise wait forever.
+            let _stop = StopReaders(&shared);
             let mut index = 0;
             while index < ranges.len() {
                 let outcome = {
@@ -758,8 +762,6 @@ impl SessionWorkerClient {
                     ReadFlow::Stop => break,
                 }
             }
-            lock(&shared.state).stop = true;
-            shared.changed.notify_all();
         });
     }
 
@@ -926,6 +928,16 @@ struct ReadShared {
     changed: Condvar,
 }
 
+/// Stops a read stream's readers when dropped.
+struct StopReaders<'a>(&'a ReadShared);
+
+impl Drop for StopReaders<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.state).stop = true;
+        self.0.changed.notify_all();
+    }
+}
+
 /// One reader of [`SessionWorkerClient::read_stream`]: takes ranges in
 /// order while fewer than `window` are ahead of the consumer.
 fn read_loop(
@@ -965,7 +977,17 @@ fn read_loop(
                 offset: range.offset,
                 len: range.len,
             };
-            Some(client.read(&header, deadline))
+            // A panicking read is an error result, so the consumer, which
+            // waits for this range, is never left waiting.
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.read(&header, deadline)
+            }));
+            Some(read.unwrap_or_else(|_| {
+                Err(CallError::Remote(ErrorWire::coded(
+                    "UNKNOWN_ERROR",
+                    "objects.read panicked",
+                )))
+            }))
         };
         lock(&shared.state).results.insert(index, outcome);
         shared.changed.notify_all();
