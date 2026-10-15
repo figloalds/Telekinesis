@@ -129,6 +129,7 @@ fn slow_commit_view(
     changes: u64,
     data_version: i64,
     transactional: bool,
+    projection_version: Option<i64>,
 ) -> Option<ViewCache> {
     let slots = match slots {
         Some(slots) => slots,
@@ -139,6 +140,7 @@ fn slow_commit_view(
         changes,
         data_version,
         transactional,
+        projection_version,
         projection,
         slots,
     })
@@ -194,6 +196,8 @@ pub(crate) struct Cache {
     /// Views dropped because a commit was rolled back around the store
     /// (tests).
     rolled_back_views: Cell<u64>,
+    /// Full loads of the view from the stored projection (tests; WP3.INT).
+    view_loads: Cell<u64>,
 }
 
 /// Bumps the connection's commit counter inside the commit's savepoint and
@@ -533,6 +537,16 @@ impl Store {
     pub fn rolled_back_views(&self) -> u64 {
         self.caches.commit.rolled_back_views.get()
     }
+    /// How many times this handle loaded its view in full from the stored
+    /// projection (tests; WP3.INT).
+    #[doc(hidden)]
+    pub fn view_loads(&self) -> u64 {
+        self.caches.commit.view_loads.get()
+    }
+    pub(super) fn count_view_load(&self) {
+        let loads = &self.caches.commit.view_loads;
+        loads.set(loads.get().saturating_add(1));
+    }
     /// Drops the cached view if a commit of this connection was rolled back
     /// since its last commit (module docs, "Rolled-back commits and the
     /// view"). Call before the commit path reads the view. No query on a
@@ -742,6 +756,9 @@ impl Store {
         let branch = event.branch.id.clone();
         // Never patch (or seal) a view that holds a rolled-back commit.
         self.drop_rolled_back_view();
+        // Other connections' commits that changed no projection row keep the
+        // view (WP3.INT).
+        self.adopt_foreign_commits();
         // A fast commit patches the view if no other connection committed
         // since it was loaded (I6).
         let patchable = incremental && {
@@ -890,6 +907,9 @@ impl Store {
             }
         };
         let epoch = bump_commit_epoch(&tx, self.caches.commit.epoch.get())?;
+        // The projection counter this commit leaves, read inside it: no other
+        // connection's commit is in it (WP3.INT, see `adopt_foreign_commits`).
+        let projection_version = snapshot::projection_version(&tx);
         tx.commit()?;
         self.caches.commit.epoch.set(epoch);
         self.count_commit(&event.id, incremental);
@@ -902,6 +922,7 @@ impl Store {
                 Some(view) if Some(view.data_version) == data_version => {
                     view.changes = self.db.total_changes();
                     view.transactional = !self.db.is_autocommit();
+                    view.projection_version = projection_version;
                 }
                 _ => *cache = None,
             },
@@ -916,6 +937,7 @@ impl Store {
                 } else {
                     view.changes = self.db.total_changes();
                     view.transactional = !self.db.is_autocommit();
+                    view.projection_version = projection_version;
                 }
             }
             Plan::Slow(slow) => {
@@ -935,6 +957,7 @@ impl Store {
                             self.db.total_changes(),
                             version,
                             !self.db.is_autocommit(),
+                            projection_version,
                         )
                     }
                     None => None,

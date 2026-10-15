@@ -330,6 +330,9 @@ struct ViewCache {
     changes: u64,
     data_version: i64,
     transactional: bool,
+    /// `projection_version` when the view was loaded or last patched by this
+    /// connection's own commit (`None`: unknown, never adopted).
+    projection_version: Option<i64>,
     projection: Projection,
     slots: BTreeMap<(String, String), String>,
 }
@@ -585,11 +588,44 @@ impl Store {
             .prepare_cached("PRAGMA data_version")?
             .query_row([], |r| r.get(0))?)
     }
+    /// Keeps the cached view across other connections' commits that changed
+    /// no projection row (WP3.INT): when `PRAGMA data_version` moved but the
+    /// projection tables' counter (`snapshot::projection_version`) is the
+    /// one the view was built at, the view is re-keyed to the current
+    /// `data_version` instead of being reloaded in full (O(entries)) at its
+    /// next use. Read after `data_version`, so a projection change that
+    /// lands in between only costs a reload. Own writes are still keyed by
+    /// `total_changes` and the transaction state, as before.
+    pub(super) fn adopt_foreign_commits(&self) {
+        let Ok(data_version) = self.data_version() else {
+            return;
+        };
+        let stale = self.view_cache.try_borrow().is_ok_and(|cache| {
+            cache
+                .as_ref()
+                .is_some_and(|v| v.data_version != data_version && v.projection_version.is_some())
+        });
+        if !stale {
+            return;
+        }
+        let current = snapshot::projection_version(&self.db);
+        if current.is_none() {
+            return;
+        }
+        if let Ok(mut cache) = self.view_cache.try_borrow_mut()
+            && let Some(view) = cache.as_mut()
+            && view.data_version != data_version
+            && view.projection_version == current
+        {
+            view.data_version = data_version;
+        }
+    }
     fn view(&self, branch: &str) -> Result<Ref<'_, ViewCache>> {
         // CCR-WP2.4-6 (WP2.INT): a caller's rollback (`ROLLBACK`, `ROLLBACK
         // TO`) can undo a commit of this connection without moving the
         // freshness key below; drop such a view before any reader sees it.
         self.drop_rolled_back_view();
+        self.adopt_foreign_commits();
         let changes = self.db.total_changes();
         let data_version = self.data_version()?;
         let transactional = !self.db.is_autocommit();
@@ -600,7 +636,12 @@ impl Store {
                 && v.transactional == transactional
         });
         if !fresh {
+            // Read before the projection: a projection change that lands in
+            // between makes the recorded counter older (a later reload),
+            // never newer than what was loaded.
+            let projection_version = snapshot::projection_version(&self.db);
             let projection = snapshot::load_projection(&self.db, branch)?;
+            self.count_view_load();
             let slots = projection
                 .entries
                 .values()
@@ -612,6 +653,7 @@ impl Store {
                 changes,
                 data_version,
                 transactional,
+                projection_version,
                 projection,
                 slots,
             });

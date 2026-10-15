@@ -71,7 +71,51 @@ pub(super) fn initialize(db: &Connection) -> Result<()> {
             UPDATE journal_sequence SET event=NEW.id WHERE event=OLD.id;
         END;
         RELEASE snapshot_schema;")?;
+    projection_version_schema(db)
+}
+
+/// The projection tables' change counter (WP3.INT): every row written to or
+/// deleted from `current_state` or `current_parts`, by any connection or
+/// binary, bumps `projection_version.version` in the same transaction. A
+/// connection's cached view records the counter it was built at
+/// (`Store::adopt_foreign_commits`): another connection's commit that left
+/// the counter alone (feed staging, object registration, status writes)
+/// changed none of the rows the view was loaded from, so the view stays
+/// fresh instead of reloading the whole projection (O(entries)) after every
+/// such commit. A side table (§9): nothing is ALTERed, and a downgraded
+/// binary's writes keep it exact through the triggers.
+fn projection_version_schema(db: &Connection) -> Result<()> {
+    db.execute_batch("SAVEPOINT projection_version_schema;
+        CREATE TABLE IF NOT EXISTS projection_version(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
+        INSERT OR IGNORE INTO projection_version(id,version) VALUES(1,0);
+        CREATE TRIGGER IF NOT EXISTS projection_version_state_insert AFTER INSERT ON current_state BEGIN
+            UPDATE projection_version SET version=version+1 WHERE id=1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS projection_version_state_update AFTER UPDATE ON current_state BEGIN
+            UPDATE projection_version SET version=version+1 WHERE id=1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS projection_version_state_delete AFTER DELETE ON current_state BEGIN
+            UPDATE projection_version SET version=version+1 WHERE id=1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS projection_version_parts_insert AFTER INSERT ON current_parts BEGIN
+            UPDATE projection_version SET version=version+1 WHERE id=1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS projection_version_parts_update AFTER UPDATE ON current_parts BEGIN
+            UPDATE projection_version SET version=version+1 WHERE id=1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS projection_version_parts_delete AFTER DELETE ON current_parts BEGIN
+            UPDATE projection_version SET version=version+1 WHERE id=1;
+        END;
+        RELEASE projection_version_schema;")?;
     Ok(())
+}
+
+/// The projection tables' change counter as `db` sees it now (`None` if the
+/// table is missing: a handle on a store no current binary opened yet).
+pub(super) fn projection_version(db: &Connection) -> Option<i64> {
+    db.prepare_cached("SELECT version FROM projection_version WHERE id=1")
+        .and_then(|mut statement| statement.query_row([], |r| r.get(0)))
+        .ok()
 }
 
 pub(super) fn load_projection(db: &Connection, branch: &str) -> Result<Projection> {
