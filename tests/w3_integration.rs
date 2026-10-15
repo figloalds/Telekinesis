@@ -444,3 +444,81 @@ fn a_startup_replays_the_snapshot_suffix_against_one_view() {
     // The suffix was replayed (not rebuilt) and sealed.
     assert_eq!(sealed(&store).0, tip);
 }
+
+/// WP3.INT: a session's socket gets 4 MiB send and receive buffers on
+/// Windows (`session::io::SOCKET_BUFFER_BYTES`), on both sides. With the
+/// defaults (64 KiB) every 1 MiB frame waited for writable readiness and a
+/// loopback download ran at 270–360 MiB/s, below
+/// `session_loopback_throughput`'s 300 MiB/s floor; with them, 3.2–4.0
+/// GiB/s. The options are read through a duplicate of the socket's handle,
+/// which reports the send buffer as set but not the receive buffer, so only
+/// the send buffer is checked here; the qualification scenario measures the
+/// effect of both.
+#[cfg(windows)]
+#[test]
+fn session_sockets_get_large_buffers_on_windows() {
+    use std::{
+        net::{TcpListener, TcpStream},
+        os::windows::io::AsRawSocket,
+        thread,
+    };
+    use tkfs::{
+        model::protocol::LaneRole,
+        session::{Conn, ConnOptions, PeerInfo, Side, io::SOCKET_BUFFER_BYTES},
+    };
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn getsockopt(
+            socket: usize,
+            level: i32,
+            name: i32,
+            value: *mut u8,
+            length: *mut i32,
+        ) -> i32;
+    }
+    let option = |stream: &TcpStream, name: i32| -> i32 {
+        let mut value = [0u8; 4];
+        let mut length = 4i32;
+        // SAFETY: an open socket and a 4-byte buffer with its length.
+        let status = unsafe {
+            getsockopt(
+                stream.as_raw_socket() as usize,
+                0xffff,
+                name,
+                value.as_mut_ptr(),
+                &mut length,
+            )
+        };
+        assert_eq!(status, 0);
+        i32::from_ne_bytes(value)
+    };
+    let peer = || PeerInfo {
+        installation: "w3".into(),
+        role: LaneRole::Control,
+        lane: None,
+        session: "w3-session".into(),
+        verifier_generation: 1,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let clone = stream.try_clone().unwrap();
+        let ws = tungstenite::accept(tungstenite::stream::MaybeTlsStream::Plain(stream)).unwrap();
+        (ws, clone)
+    });
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let client_socket = stream.try_clone().unwrap();
+    assert_ne!(option(&client_socket, 0x1001), SOCKET_BUFFER_BYTES);
+    let ws =
+        tungstenite::client_tls_with_config(format!("ws://127.0.0.1:{port}/"), stream, None, None)
+            .unwrap()
+            .0;
+    let client = Conn::from_established(ws, Side::Client, peer(), ConnOptions::default()).unwrap();
+    let (ws, server_socket) = accepted.join().unwrap();
+    let server = Conn::from_established(ws, Side::Server, peer(), ConnOptions::default()).unwrap();
+    for socket in [&client_socket, &server_socket] {
+        assert_eq!(option(socket, 0x1001), SOCKET_BUFFER_BYTES, "SO_SNDBUF");
+    }
+    drop((client, server));
+}
