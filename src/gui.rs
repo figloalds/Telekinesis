@@ -9,8 +9,9 @@
 //! * one subscription thread (`ui_model::Feed` over a `ControlClient`) long
 //!   polls `subscribe(since, 10 s)` with a 15 s deadline, reconnects with
 //!   backoff, and starts the daemon (its output in
-//!   `DATA/logs/orchestrator.log`) when no daemon answers, except after a
-//!   Shutdown from this window;
+//!   `DATA/logs/orchestrator.log`) when no daemon answers, except one shut
+//!   down on purpose (from this window or the CLI) until the user asks for
+//!   one or another daemon answers;
 //! * commands run on a pool of threads, each with its own `ControlClient`
 //!   (`ui_model::CommandPool`), so they never wait behind the subscription
 //!   or behind each other; each row shows its own busy state.
@@ -505,6 +506,16 @@ fn set_status(ui: &AppWindow, error: bool, text: String) {
     ui.set_status(text.into());
 }
 
+/// Shows `dialog` (`""` closes it). Invariant 21: the one-time pairing code
+/// lives only in the host dialog that asked for it, so going anywhere else
+/// clears it (the window's `changed dialog` handler is the backstop).
+fn show_dialog(ui: &AppWindow, dialog: &str) {
+    if dialog != "host" {
+        ui.set_pairing_code(SharedString::default());
+    }
+    ui.set_dialog(dialog.into());
+}
+
 // ---------------------------------------------------------------------------
 // Rendering
 
@@ -827,7 +838,7 @@ fn on_folder_action(ui: &AppWindow, st: &mut State, state: &str, id: &str) {
             ui.set_selected_state(state.into());
             ui.set_selected_label(label.into());
             ui.set_mount_path(path.unwrap_or_default().into());
-            ui.set_dialog(if live { "stop-first" } else { "mount" }.into());
+            show_dialog(ui, if live { "stop-first" } else { "mount" });
         }
         ActionRoute::Confirm(action) => {
             ui.set_selected_state(state.into());
@@ -840,7 +851,7 @@ fn on_folder_action(ui: &AppWindow, st: &mut State, state: &str, id: &str) {
                 )
                 .into(),
             );
-            ui.set_dialog("confirm".into());
+            show_dialog(ui, "confirm");
         }
         ActionRoute::Send(action) => {
             let Some(command) = action.command(state) else {
@@ -948,11 +959,11 @@ fn on_outcome(ui: &AppWindow, st: &mut State, outcome: CommandOutcome) {
                     on_folder_reply(ui, st, state, payload, value);
                 }
                 Action::Create { .. } | Action::Receive { .. } | Action::ConfigureMount { .. } => {
-                    ui.set_dialog("".into());
+                    show_dialog(ui, "");
                 }
                 Action::Stop { .. } => {
                     if ui.get_dialog() == "stop-first" {
-                        ui.set_dialog("mount".into());
+                        show_dialog(ui, "mount");
                     }
                 }
                 Action::Pair { endpoint, .. } => {
@@ -969,7 +980,7 @@ fn on_outcome(ui: &AppWindow, st: &mut State, outcome: CommandOutcome) {
                 Action::Unpair { .. } => {
                     clear_remote(ui);
                     if ui.get_dialog() == "peer" {
-                        ui.set_dialog("".into());
+                        show_dialog(ui, "");
                     }
                 }
                 Action::RemoteList { endpoint } => {
@@ -997,14 +1008,15 @@ fn on_outcome(ui: &AppWindow, st: &mut State, outcome: CommandOutcome) {
                 }
                 Action::ResetPairingCode => {
                     // Invariant 21: the code is shown only here, once, and
-                    // cleared when the dialog closes.
+                    // cleared when the window leaves the host dialog
+                    // (`show_dialog`, `dismiss()`, `changed dialog`).
                     if ui.get_dialog() == "host" {
                         ui.set_pairing_code(value["code"].as_str().unwrap_or_default().into());
                     }
                 }
                 Action::Shutdown => {
                     st.shut_down = true;
-                    ui.set_dialog("".into());
+                    show_dialog(ui, "");
                 }
                 _ => {}
             }
@@ -1687,12 +1699,12 @@ fn render_to_file(config_path: &Path, config: Config, out: &Path) -> Result<()> 
         (Some("activity"), _, _) => ui.set_view("activity".into()),
         (Some("folder"), Some(selected), tab) => {
             ui.set_selected_state(selected.into());
-            ui.set_dialog("folder".into());
+            show_dialog(&ui, "folder");
             ui.set_detail_tab(tab.unwrap_or("overview").into());
         }
         (Some("peer"), Some(installation), _) => {
             ui.set_selected_peer(installation.into());
-            ui.set_dialog("peer".into());
+            show_dialog(&ui, "peer");
         }
         _ => {}
     }
@@ -1739,4 +1751,84 @@ fn write_bmp(path: &Path, width: u32, height: u32, pixels: &[slint::Rgb8Pixel]) 
     }
     std::fs::write(path, out)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tkfs::ui_model::Command;
+
+    /// The window without a screen (the render-to-file platform), on this
+    /// test's own thread.
+    fn window() -> AppWindow {
+        use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
+        slint::platform::set_platform(Box::new(RenderPlatform {
+            window: MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer),
+        }))
+        .expect("a platform for this thread");
+        AppWindow::new().expect("the window")
+    }
+
+    fn state(ui: &AppWindow) -> State {
+        let config: Config = toml::from_str(concat!(
+            "format_version = 2\n",
+            "data_directory = 'data'\n",
+            "default_mount_directory = 'mounts'\n",
+        ))
+        .expect("a config");
+        let st = State::new(config);
+        st.bind(ui);
+        st
+    }
+
+    fn reply(ui: &AppWindow, st: &mut State, id: u64, action: Action, value: Value) {
+        on_outcome(
+            ui,
+            st,
+            CommandOutcome {
+                command: Command {
+                    id,
+                    key: GLOBAL.into(),
+                    action,
+                },
+                result: Ok(value),
+                elapsed: Duration::ZERO,
+            },
+        );
+    }
+
+    /// Invariant 21 (§14 WP3.4): the code a Reset returns is shown in the
+    /// host dialog only until the window leaves it, whichever way it leaves.
+    #[test]
+    fn the_pairing_code_is_cleared_whenever_the_window_leaves_the_host_dialog() {
+        let ui = window();
+        let mut st = state(&ui);
+        let code = || json!({"code": "TKFS-ONE-TIME-CODE"});
+        slint::platform::update_timers_and_animations();
+
+        // Settings, then "Generate a new pairing code".
+        ui.set_dialog("host".into());
+        reply(&ui, &mut st, 1, Action::ResetPairingCode, code());
+        assert_eq!(ui.get_pairing_code(), "TKFS-ONE-TIME-CODE");
+        // "Shut down the daemon", then Shut down: the reply closes the
+        // dialog, and Settings opened later shows no code.
+        reply(&ui, &mut st, 2, Action::Shutdown, json!({}));
+        assert_eq!(ui.get_dialog(), "");
+        assert_eq!(ui.get_pairing_code(), "");
+
+        // Any other way to another dialog: the window clears it before the
+        // next frame.
+        ui.set_dialog("host".into());
+        slint::platform::update_timers_and_animations();
+        reply(&ui, &mut st, 3, Action::ResetPairingCode, code());
+        assert_eq!(ui.get_pairing_code(), "TKFS-ONE-TIME-CODE");
+        ui.set_dialog("shutdown".into());
+        slint::platform::update_timers_and_animations();
+        assert_eq!(ui.get_pairing_code(), "");
+
+        // A code that arrives once the host dialog is gone is never shown.
+        show_dialog(&ui, "");
+        reply(&ui, &mut st, 4, Action::ResetPairingCode, code());
+        assert_eq!(ui.get_pairing_code(), "");
+    }
 }

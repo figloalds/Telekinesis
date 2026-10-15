@@ -408,6 +408,15 @@ export component AppWindow inherits Window {
         root.pairing-code = "";
         root.dialog-closed();
     }
+    // Invariant 21: the one-time pairing code lives only while the host
+    // dialog that asked for it is open. Every way to another dialog clears
+    // it at once (dismiss(), the buttons below, show_dialog in gui.rs); this
+    // catches any other way before the next frame.
+    changed dialog => {
+        if root.dialog != "host" {
+            root.pairing-code = "";
+        }
+    }
     forward-focus: keyboard;
     keyboard := FocusScope {
         key-pressed(event) => {
@@ -453,7 +462,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout { spacing: 6px; Muted { text: "Installation"; width: 74px; } Muted { text: root.daemon-installation; horizontal-alignment: right; horizontal-stretch: 1; } }
                         HorizontalLayout { spacing: 6px;
                             Button { small: true; text: "Log"; quiet: true; clicked => { root.open-log(); } }
-                            Button { small: true; text: "Settings"; quiet: true; enabled: root.interactive; clicked => { root.dialog = "host"; } }
+                            Button { small: true; text: "Settings"; quiet: true; enabled: root.interactive; clicked => { root.pairing-code = ""; root.dialog = "host"; } }
                         }
                     }
                 }
@@ -818,7 +827,7 @@ export component AppWindow inherits Window {
                     Muted { text: "Closing this window leaves the daemon and its mounts running."; wrap: word-wrap; }
                     HorizontalLayout { spacing: 8px;
                         Button { text: "About Slint"; clicked => { about.show(); } }
-                        Button { text: "Shut down the daemon"; danger: true; enabled: root.idle && root.connected; clicked => { root.dialog = "shutdown"; } }
+                        Button { text: "Shut down the daemon"; danger: true; enabled: root.idle && root.connected; clicked => { root.pairing-code = ""; root.dialog = "shutdown"; } }
                     }
                 }
                 if root.dialog == "shutdown": VerticalLayout { spacing: 16px;
