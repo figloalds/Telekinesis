@@ -493,8 +493,6 @@ fn idle_exchange_daemons() {
             .is_ok_and(|p| p[0]["lanes"][0]["repositories"][&repo]["metadata_caught_up"] == true)
     });
     s.check(caught_up, "replicas caught up");
-    // Let the catch-up's last exchanges (acknowledgements) finish.
-    thread::sleep(Duration::from_secs(5));
     // The control lane's metadata exchanges so far, and both feeds' tips as
     // B sees them, from B's Peers reply (WP3.INT: `None` when it does not
     // answer, never a zero that a later sample would be subtracted from).
@@ -505,6 +503,22 @@ fn idle_exchange_daemons() {
         let progress = control["repositories"][&repo]["metadata_progress"].clone();
         Some((exchanges, progress))
     };
+    // Let the catch-up finish (WP3.INT): `metadata_caught_up` holds once B
+    // has received A's feed, while B may still be activating it (its feed
+    // still moves). The window starts once neither side has events pending
+    // and both feeds stayed where they were for 5 s.
+    let at_rest = |progress: &Value| {
+        !progress.is_null() && progress["local_pending"] == 0 && progress["remote_pending"] == 0
+    };
+    let rested = wait_until(SETUP, || {
+        let Some((_, first)) = sample(&b).filter(|(_, p)| at_rest(p)) else {
+            thread::sleep(Duration::from_secs(1));
+            return false;
+        };
+        thread::sleep(Duration::from_secs(5));
+        sample(&b).is_some_and(|(_, second)| second == first)
+    });
+    s.check(rested, "both feeds at rest before the window");
     let settled = |b: &Node| {
         let mut taken = None;
         wait_until(Duration::from_secs(30), || {
