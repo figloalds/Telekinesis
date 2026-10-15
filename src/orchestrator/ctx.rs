@@ -1,9 +1,9 @@
-//! Owned by WP2.1.
+//! Owned by WP2.1 (Wave 2) and WP3.1 (Wave 3).
 //!
 //! Construction of the daemon `Ctx` (`model::orchestrator::Ctx`, REVAMP_PLAN
-//! §3.1, §14 WP2.1 task 1). WP3.1 swaps in the v3 network.
+//! §3.1, §14 WP2.1 task 1, WP3.1 task 1).
 //!
-//! [`build`] wires the Wave 1 actors, in this order:
+//! [`build`] wires the actors, in this order:
 //!
 //! 1. `Catalog::open` (takes `orchestrator.lock`: a second daemon on the same
 //!    data directory fails here, before anything else starts) →
@@ -14,25 +14,39 @@
 //!    from `Config` (the worker version is `worker::version()`,
 //!    CCR-WP1.2-2): every desired folder adopts or starts its worker;
 //! 4. `Ctx`;
-//! 5. `LegacyBridge::start`, set as `ctx.network` and `ctx.legacy`.
+//! 5. the v3 network (WP3.1's cutover): [`HubLegacyView`] (the hub's §7.3
+//!    projection) is `ctx.legacy`, and [`DaemonNetwork`] over
+//!    `PeerManager::start` is `ctx.network`. `run::serve` starts the inbound
+//!    server (`inbound::start`) on the network listener and hands it to the
+//!    `DaemonNetwork`, whose `shutdown` stops both sides.
 //!
-//! Two small adapters live here, on WP2.1's side of frozen contracts:
+//! The v2 network (the legacy bridge, its lanes, its peering and its
+//! `LinkStatus`) is deleted (§14 WP3.1): a 6298d0b peer fails closed with
+//! `PEER_NEEDS_UPGRADE` on both sides (§6.2, invariant 20).
+//!
+//! Small adapters live here, on this side of frozen contracts:
 //!
 //! * [`DaemonLauncher`] wraps `RealLauncher` and fills an adopted worker's
 //!   empty `stderr_tail` from `STATE/worker.log` (CCR-WP1.3-2);
-//! * [`extras`] is a side table for what a daemon keeps beside its frozen
-//!   `Ctx`: the concrete hub (for `set_stopping`) and the shutdown latch
-//!   (CCR-WP2.1-1).
+//! * [`extras`] keeps what a daemon holds beside its frozen `Ctx` (the
+//!   concrete hub for `set_stopping`, the shutdown latch) in the context's
+//!   extension slot (`Ctx::extensions`, CCR-WP2.1-1 applied by WP3.1; it was
+//!   a side table keyed by the `Ctx` allocation);
+//! * [`DaemonNetwork`] is the daemon's `NetworkApi`: the v3 `PeerManager`
+//!   plus the inbound server's shutdown, and the dialer-side status of a
+//!   pairing that a legacy acceptor refused (see its docs).
 //!
 //! A `folder-slots` thread also re-sends `Tick` to folders that wait for a
 //! `maximum_running` slot every 2 s (WP1.2 review: a slot wake-up can be lost
 //! while the registry is still inserting a new controller).
 use super::{
     catalog::Catalog,
+    compat::HubLegacyView,
     config::Config,
     folder::LifecycleLimits,
     hub::{HubConfig, StatusHub},
-    legacy_bridge::LegacyBridge,
+    inbound::{self, InboundServer},
+    peer::PeerManager,
     process::{LogPolicy, RealLauncher, log_tail},
     published::PublishedCatalog,
     registry::{FolderRegistry, RegistryDeps},
@@ -40,13 +54,14 @@ use super::{
 };
 use crate::{
     model::{
-        errors::ErrorWire,
+        errors::{ErrorClass, ErrorWire, Scope},
         ipc::WorkerRecord,
         orchestrator::{
-            CatalogApi, Ctx, DaemonEndpoints, FolderCmd, FolderPhase, LaunchSpec, ProcessEvent,
-            ProcessSink, WorkerClient, WorkerEndpoint, WorkerLauncher, WorkerProcess,
+            CatalogApi, Ctx, DaemonEndpoints, FolderCmd, FolderPhase, LaunchSpec, NetworkApi,
+            PairResult, ProcessEvent, ProcessSink, PublishedEntry, StatusSink, WorkerClient,
+            WorkerEndpoint, WorkerLauncher, WorkerProcess,
         },
-        status::DaemonStatus,
+        status::{DaemonStatus, StatusEvent},
     },
     util::{
         cancel::Cancel,
@@ -58,12 +73,15 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
+    any::Any,
+    collections::VecDeque,
     net::TcpListener,
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
     time::Duration,
 };
 
@@ -78,8 +96,11 @@ pub struct Daemon {
     pub ctx: Arc<Ctx>,
     pub control: TcpListener,
     pub network: Option<TcpListener>,
-    /// `ctx.network` and `ctx.legacy`; `run` hands it inbound connections.
-    pub bridge: Arc<LegacyBridge>,
+    /// `ctx.network`: the v3 peer stack; `run` starts the inbound server on
+    /// `network` and hands it over ([`DaemonNetwork::serve_inbound`]).
+    pub net: Arc<DaemonNetwork>,
+    /// `ctx.legacy`.
+    pub legacy: Arc<HubLegacyView>,
     /// `ctx.status` and `ctx.status_source`.
     pub hub: Arc<StatusHub>,
     /// `ctx.catalog`.
@@ -179,7 +200,7 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
     let ctx = Arc::new(Ctx {
         installation: installation.clone(),
         config: Arc::new(config),
-        catalog: catalog_api,
+        catalog: catalog_api.clone(),
         folders: registry.clone(),
         published,
         status: hub.clone(),
@@ -191,10 +212,9 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
         stopping: Arc::new(AtomicBool::new(false)),
         started_at_ms,
         endpoints: Snapshot::new(endpoints.clone()),
+        extensions: OnceLock::new(),
     });
-    let bridge = LegacyBridge::start(ctx.clone());
-    let _ = ctx.network.set(bridge.clone());
-    let _ = ctx.legacy.set(bridge.clone());
+    let _ = extras(&ctx).hub.set(hub.clone());
     hub.set_daemon(DaemonStatus {
         installation,
         version: crate::worker::version().to_owned(),
@@ -206,21 +226,25 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
         log_path: endpoints.log_path,
         errors: Vec::new(),
     });
-    let _ = extras(&ctx).hub.set(hub.clone());
+    let legacy = HubLegacyView::new(hub.clone(), catalog_api);
+    let _ = ctx.legacy.set(legacy.clone());
+    let net = DaemonNetwork::start(&ctx);
+    let _ = ctx.network.set(net.clone());
     spawn_slot_ticker(&ctx);
     let _ = stop_ticker.disarm();
     Ok(Daemon {
         ctx,
         control,
         network,
-        bridge,
+        net,
+        legacy,
         hub,
         catalog,
         registry,
     })
 }
 
-/// Cancels a token when dropped (unless disarmed).
+// Cancels a token when dropped (unless disarmed).
 struct CancelOnDrop(Option<Cancel>);
 
 impl CancelOnDrop {
@@ -330,11 +354,10 @@ impl WorkerLauncher for DaemonLauncher {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon extras (CCR-WP2.1-1)
+// Daemon extras (CCR-WP2.1-1, applied by WP3.1)
 
-/// What a daemon keeps beside its `Ctx`, which is frozen (§3.1) and has no
-/// slot for it. Keyed by the `Ctx` allocation; an entry goes when its `Ctx`
-/// is dropped (pruned on the next lookup).
+/// What a daemon keeps beside its `Ctx`, which is frozen (§3.1): held in its
+/// extension slot (`Ctx::extensions`).
 #[derive(Default)]
 pub struct Extras {
     hub: OnceLock<Arc<StatusHub>>,
@@ -352,20 +375,243 @@ impl Extras {
     }
 }
 
-type ExtrasTable = Vec<(Weak<Ctx>, Arc<Extras>)>;
-static EXTRAS: Mutex<ExtrasTable> = Mutex::new(Vec::new());
-
-/// The extras of `ctx` (created on first use).
+/// The extras of `ctx` (created in its extension slot on first use; a
+/// context built by a test starts with an empty slot). The slot only ever
+/// holds `Extras`; were it to hold anything else, each call would get fresh
+/// extras (no shared hub, no shared latch) rather than fail.
 pub fn extras(ctx: &Arc<Ctx>) -> Arc<Extras> {
-    let mut table = lock(&EXTRAS);
-    table.retain(|(weak, _)| weak.strong_count() > 0);
-    if let Some((_, extras)) = table
-        .iter()
-        .find(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(ctx)))
-    {
-        return extras.clone();
+    let slot = ctx
+        .extensions
+        .get_or_init(|| Arc::new(Extras::default()) as Arc<dyn Any + Send + Sync>);
+    slot.clone()
+        .downcast::<Extras>()
+        .unwrap_or_else(|_| Arc::new(Extras::default()))
+}
+
+// ---------------------------------------------------------------------------
+// The daemon's network (WP3.1)
+
+/// Endpoints whose refused pairing is shown at most (the oldest is
+/// resolved beyond this).
+pub const MAX_REFUSED_PAIRINGS: usize = 16;
+
+/// The daemon's `NetworkApi` after the cutover (§3.1 `ctx.network`): the v3
+/// [`PeerManager`] (pair, remote list, unpair, reconfigure), plus
+///
+/// * the inbound server's lifecycle: `run::serve` starts it on the network
+///   listener and hands it over ([`serve_inbound`](Self::serve_inbound)), and
+///   [`NetworkApi::shutdown`] stops the outbound and inbound sides together,
+///   within one deadline (§3.6 step 2: GOAWAY to every session, lanes
+///   cancelled and joined, inbound sessions sent away);
+/// * the dialer-side status of a refused pairing. A `Pair` with a legacy
+///   (6298d0b) acceptor fails with `PEER_NEEDS_UPGRADE` before anything is
+///   sent (§6.2), and there is no catalog peer, hence no lane, to show it:
+///   the refusal is recorded as an error scoped to the endpoint
+///   (`Scope::Peer{installation: <endpoint>}`, the only identity a peer we
+///   never authenticated has), so Status shows it until that endpoint pairs
+///   (or a later pairing with it fails otherwise). A paired peer that turns
+///   out to be legacy shows on its lanes (`Incompatible`), as any peer state.
+///
+/// Both stacks hold the context (`Arc<Ctx>`), and the context holds this:
+/// `shutdown` lets go of them, which breaks that cycle once the daemon
+/// stopped.
+pub struct DaemonNetwork {
+    status: Arc<dyn StatusSink>,
+    peers: Mutex<Option<Arc<PeerManager>>>,
+    inbound: Mutex<Option<Arc<InboundServer>>>,
+    closed: AtomicBool,
+    /// Endpoints with an open refused-pairing error, oldest first.
+    refused: Mutex<VecDeque<String>>,
+}
+
+impl DaemonNetwork {
+    /// Starts the v3 peer stack (`PeerManager::start`): every catalog peer is
+    /// supervised from now on.
+    pub fn start(ctx: &Arc<Ctx>) -> Arc<DaemonNetwork> {
+        Self::with_peers(ctx, PeerManager::start(ctx.clone()))
     }
-    let extras = Arc::new(Extras::default());
-    table.push((Arc::downgrade(ctx), extras.clone()));
-    extras
+
+    /// A `DaemonNetwork` over an already started `PeerManager` (tests start
+    /// one with shorter timing).
+    pub fn with_peers(ctx: &Arc<Ctx>, peers: Arc<PeerManager>) -> Arc<DaemonNetwork> {
+        Arc::new(DaemonNetwork {
+            status: ctx.status.clone(),
+            peers: Mutex::new(Some(peers)),
+            inbound: Mutex::new(None),
+            closed: AtomicBool::new(false),
+            refused: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Starts the inbound v3 server (§3.8) on `listener` and keeps it for
+    /// [`NetworkApi::shutdown`]. `None` once the network is shut down (the
+    /// listener is dropped: nothing is served).
+    pub fn serve_inbound(
+        &self,
+        ctx: &Arc<Ctx>,
+        listener: TcpListener,
+    ) -> Option<Arc<InboundServer>> {
+        let mut slot = lock(&self.inbound);
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let server = inbound::start(ctx.clone(), listener);
+        *slot = Some(server.clone());
+        Some(server)
+    }
+
+    /// The outbound peer stack (until shutdown).
+    pub fn peers(&self) -> Option<Arc<PeerManager>> {
+        lock(&self.peers).clone()
+    }
+
+    /// The inbound server (once started, until shutdown).
+    pub fn inbound(&self) -> Option<Arc<InboundServer>> {
+        lock(&self.inbound).clone()
+    }
+
+    fn stopping() -> ErrorWire {
+        ErrorWire::coded("ORCHESTRATOR_STOPPING", "the orchestrator is shutting down")
+    }
+
+    fn manager(&self) -> Result<Arc<PeerManager>, ErrorWire> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Self::stopping());
+        }
+        self.peers().ok_or_else(Self::stopping)
+    }
+
+    fn refusal_scope(endpoint: &str) -> Scope {
+        Scope::Peer {
+            installation: endpoint.to_owned(),
+        }
+    }
+
+    /// Records a pairing `endpoint` refused as incompatible (dialer side of
+    /// invariant 20).
+    fn record_refusal(&self, endpoint: &str, error: &ErrorWire) {
+        let evicted = {
+            let mut refused = lock(&self.refused);
+            refused.retain(|known| known != endpoint);
+            refused.push_back(endpoint.to_owned());
+            if refused.len() > MAX_REFUSED_PAIRINGS {
+                refused.pop_front()
+            } else {
+                None
+            }
+        };
+        if let Some(evicted) = evicted {
+            self.status.record(StatusEvent::Resolved {
+                scope: Self::refusal_scope(&evicted),
+                code: String::new(),
+            });
+        }
+        let shown = ErrorWire::coded(
+            error.code.as_str(),
+            format!(
+                "pairing with {endpoint} refused: {}",
+                error
+                    .message
+                    .trim_start_matches(&format!("{}: ", error.code))
+            ),
+        );
+        self.status.record(StatusEvent::Error {
+            scope: Self::refusal_scope(endpoint),
+            error: shown,
+        });
+    }
+
+    /// Resolves the refused-pairing error of `endpoint`, if one is open.
+    fn clear_refusal(&self, endpoint: &str) {
+        let was = {
+            let mut refused = lock(&self.refused);
+            let before = refused.len();
+            refused.retain(|known| known != endpoint);
+            refused.len() != before
+        };
+        if was {
+            self.status.record(StatusEvent::Resolved {
+                scope: Self::refusal_scope(endpoint),
+                code: String::new(),
+            });
+        }
+    }
+}
+
+impl std::fmt::Debug for DaemonNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonNetwork")
+            .field("closed", &self.closed.load(Ordering::Relaxed))
+            .field("inbound", &self.inbound().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl NetworkApi for DaemonNetwork {
+    fn pair(
+        &self,
+        endpoint: &str,
+        code: &str,
+        connections: Option<u32>,
+    ) -> Result<PairResult, ErrorWire> {
+        let result = self.manager()?.pair(endpoint, code, connections);
+        match &result {
+            Ok(_) => self.clear_refusal(endpoint),
+            Err(error) if error.class == ErrorClass::Incompatible => {
+                self.record_refusal(endpoint, error);
+            }
+            // Another answer replaces an earlier refusal (the user's answer
+            // is now that error).
+            Err(_) => self.clear_refusal(endpoint),
+        }
+        result
+    }
+
+    fn remote_list(&self, endpoint: &str) -> Result<Vec<PublishedEntry>, ErrorWire> {
+        self.manager()?.remote_list(endpoint)
+    }
+
+    fn unpair(&self, endpoint: &str) -> Result<(), ErrorWire> {
+        self.clear_refusal(endpoint);
+        self.manager()?.unpair(endpoint)
+    }
+
+    fn reconfigure(&self) {
+        if let Ok(peers) = self.manager() {
+            peers.reconfigure();
+        }
+    }
+
+    /// Stops the outbound peer stack and the inbound server together, each
+    /// within `deadline`, then lets go of both. Idempotent.
+    fn shutdown(&self, deadline: Duration) {
+        self.closed.store(true, Ordering::Release);
+        let peers = lock(&self.peers).take();
+        let inbound = lock(&self.inbound).take();
+        let inbound = inbound.map(|server| {
+            let stopper = server.clone();
+            match thread::Builder::new()
+                .name("net-shutdown".into())
+                .spawn(move || stopper.shutdown(deadline))
+            {
+                Ok(handle) => Err(handle),
+                Err(_) => Ok(server),
+            }
+        });
+        if let Some(peers) = peers {
+            peers.shutdown(deadline);
+        }
+        match inbound {
+            // No thread: stop it here, after the outbound side.
+            Some(Ok(server)) => server.shutdown(deadline),
+            Some(Err(handle)) => {
+                if handle.join().is_err() {
+                    event!(warn, UNKNOWN_ERROR, {
+                        "detail": "the inbound server's shutdown panicked",
+                    });
+                }
+            }
+            None => {}
+        }
+    }
 }

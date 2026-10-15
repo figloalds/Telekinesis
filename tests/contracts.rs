@@ -441,6 +441,7 @@ fn feed_page() -> FeedPage {
         through: cursor(3902, "c0c1c2c3-0000-4000-8000-000000003902"),
         tip: 4096,
         more: true,
+        remaining: None,
     }
 }
 
@@ -465,6 +466,8 @@ fn exchange_request() -> MetaExchangeRequest {
         cursor: Some(cursor(120, "c0c1c2c3-0000-4000-8000-000000000120")),
         need: vec!["c0c1c2c3-0000-4000-8000-000000000077".into()],
         state: feed_state(),
+        need_served: vec![],
+        unknown: vec![],
     }
 }
 
@@ -517,6 +520,7 @@ fn exchange_reply() -> MetaExchangeReply {
             },
             tip: 130,
             more: false,
+            remaining: None,
         },
         staged: 1,
         rejected: vec![RejectedEvent {
@@ -534,6 +538,7 @@ fn exchange_reply() -> MetaExchangeReply {
             blocked: 0,
             quarantined: 0,
         },
+        need: vec![],
     }
 }
 
@@ -2815,6 +2820,7 @@ fn ctx_reports_network_not_ready_until_set() {
         stopping: Arc::new(AtomicBool::new(false)),
         started_at_ms: T0,
         endpoints: Snapshot::new(DaemonEndpoints::default()),
+        extensions: OnceLock::new(),
     };
     assert_eq!(ctx.network().err().unwrap().code, "NETWORK_NOT_READY");
     assert_eq!(ctx.legacy().err().unwrap().code, "NETWORK_NOT_READY");

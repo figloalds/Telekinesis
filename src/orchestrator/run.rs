@@ -1,4 +1,4 @@
-//! Owned by WP2.1 (WP1.12 in Wave 1).
+//! Owned by WP2.1 (WP1.12 in Wave 1, WP3.1 in Wave 3).
 //!
 //! The daemon's main loop (REVAMP_PLAN §2.5, §3.5, §3.6, §14 WP2.1 task 2),
 //! with no global lock and no polling loop:
@@ -12,9 +12,12 @@
 //!   valid action, is answered (`INVALID_REQUEST`) and the connection stays
 //!   usable; a transport failure (including a binary envelope the codec
 //!   rejects) closes the connection, as before.
-//! * `net-accept` blocks in `accept` on the peer listener and hands each
-//!   connection to `LegacyBridge::serve_inbound` on its own thread (at most
-//!   `limits::MAX_SESSIONS` at once; extra connections are closed at once).
+//! * the peer listener is served by the v3 inbound server (§3.8,
+//!   `inbound::start`, WP3.1's cutover): its own `net-accept` thread, at most
+//!   `limits::MAX_PREAUTH` handshakes and `limits::MAX_SESSIONS` sessions; a
+//!   legacy (v2) dialer is answered `PEER_NEEDS_UPGRADE` (invariant 20). The
+//!   server belongs to `ctx.network` ([`DaemonNetwork`](super::ctx::DaemonNetwork)),
+//!   whose `shutdown` (§3.6 step 2) stops it with the outbound peer stack.
 //! * `orchestrator.json` (`{format:3, pid, version, installation, control,
 //!   network, started_at_ms}`) is written atomically and removed by a drop
 //!   guard.
@@ -39,7 +42,6 @@ use super::{
     api::Action,
     config::Config,
     ctx::{self, Daemon},
-    legacy_bridge::LegacyBridge,
     manage::manage,
     shutdown,
 };
@@ -94,7 +96,7 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
         ctx,
         control,
         network,
-        bridge,
+        net,
         catalog,
         ..
     } = daemon;
@@ -117,17 +119,18 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
     )?;
     // A closed stdout (a launcher that went away) must not end the daemon.
     let _ = writeln!(std::io::stdout(), "{discovery}");
+    if let Some(listener) = network {
+        // The v3 inbound server (§3.8); `net` stops it in the shutdown
+        // sequence (§3.6 step 2).
+        net.serve_inbound(&ctx, listener);
+    }
     let controls = ControlServer::start(ctx.clone(), control)?;
-    let inbound = network
-        .map(|listener| InboundServer::start(bridge.clone(), listener))
-        .transpose()?;
     ctx.shutdown.wait();
     // The signal path runs the sequence here; after the Shutdown action this
-    // returns the result it already has.
+    // returns the result it already has. Either way the network (outbound
+    // lanes, inbound sessions) is stopped by now.
     let _ = shutdown::run(&ctx, limits::SHUTDOWN_FOLDERS);
-    if let Some(inbound) = inbound {
-        inbound.stop();
-    }
+    drop(net);
     controls.stop(limits::SHUTDOWN_CONTROL_JOIN);
     // The file goes first, while `orchestrator.lock` is still held: a
     // successor cannot have written its own yet.
@@ -452,78 +455,6 @@ fn receive_request(socket: &mut ws::Socket) -> Result<Result<Value, String>> {
             Some(syntax) => Ok(Err(syntax.to_string())),
             None => Err(error),
         },
-    }
-}
-
-/// The peer listener: one thread per inbound legacy connection.
-struct InboundServer {
-    address: SocketAddr,
-    stop: Arc<AtomicBool>,
-    accept: Option<thread::JoinHandle<()>>,
-}
-
-impl InboundServer {
-    fn start(bridge: Arc<LegacyBridge>, listener: TcpListener) -> Result<Self> {
-        let address = listener.local_addr()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let accept = {
-            let stop = stop.clone();
-            thread::Builder::new()
-                .name("net-accept".into())
-                .spawn(move || accept_inbound(bridge, listener, stop))?
-        };
-        Ok(Self {
-            address,
-            stop,
-            accept: Some(accept),
-        })
-    }
-
-    fn stop(mut self) {
-        if let Some(accept) = self.accept.take() {
-            stop_accept("network", &self.stop, self.address, accept);
-        }
-    }
-}
-
-fn accept_inbound(bridge: Arc<LegacyBridge>, listener: TcpListener, stop: Arc<AtomicBool>) {
-    let mut next = 0u64;
-    for stream in listener.incoming() {
-        if stop.load(Ordering::Acquire) {
-            return;
-        }
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(error) => {
-                event!(warn, WS_CONNECT_FAILED, {
-                    "detail": "peer accept failed",
-                    "error": error.to_string(),
-                });
-                thread::sleep(ACCEPT_ERROR_PAUSE);
-                continue;
-            }
-        };
-        // The slot is taken here, before the thread starts, so a burst of
-        // connections cannot exceed the cap; it is released when the
-        // connection ends (or with the closure if the thread cannot start).
-        let Some(slot) = bridge.reserve_inbound(limits::MAX_SESSIONS) else {
-            event!(warn, BUSY, {
-                "detail": "peer connection refused: too many sessions",
-                "limit": limits::MAX_SESSIONS,
-            });
-            continue;
-        };
-        next += 1;
-        let bridge = bridge.clone();
-        let spawned = thread::Builder::new()
-            .name(format!("net-conn-{next}"))
-            .spawn(move || bridge.serve_inbound_reserved(slot, stream));
-        if let Err(error) = spawned {
-            event!(warn, BUSY, {
-                "detail": "cannot start a peer connection thread",
-                "error": error.to_string(),
-            });
-        }
     }
 }
 

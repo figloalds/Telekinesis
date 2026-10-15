@@ -364,6 +364,7 @@ impl Node {
             stopping: Arc::new(AtomicBool::new(false)),
             started_at_ms: 1,
             endpoints: Snapshot::new(DaemonEndpoints::default()),
+            extensions: OnceLock::new(),
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -551,6 +552,8 @@ fn meta_request(repo: &str, receiver: &str) -> MetaExchangeRequest {
         cursor: None,
         need: Vec::new(),
         state: FeedState::default(),
+        need_served: Vec::new(),
+        unknown: Vec::new(),
     }
 }
 
@@ -579,6 +582,7 @@ fn feed_reply(request: &FeedExchangeRequest, caught_up: bool) -> FeedExchangeRep
             need_served: Vec::new(),
             unknown: Vec::new(),
             state: FeedState::default(),
+            need: Vec::new(),
         },
         local: FeedApplyResult {
             summary: ExchangeSummary {
@@ -2083,11 +2087,25 @@ fn the_serving_side_reports_status() {
         .filter(|event| matches!(event, StatusEvent::InboundSession { opened: true, .. }))
         .count();
     assert_eq!(opened, 2);
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, StatusEvent::ExchangeStarted { .. })),
-        "ExchangeStarted would read as outbound work"
+    // CCR-WP2.8-3 (switched on by WP3.1): the served exchange's start is
+    // booked on the inbound control lane, never as outbound work (the peer
+    // and the pair above stay `inbound`).
+    let started: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            StatusEvent::ExchangeStarted {
+                lane,
+                op,
+                direction,
+                ..
+            } => Some((*lane, op.clone(), *direction)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started,
+        [(0, "meta.exchange".to_owned(), Direction::Inbound)],
+        "an inbound start on the inbound lane only"
     );
     drop(control);
     drop(bulk);

@@ -61,7 +61,7 @@ use crate::{
         auth::{Transcript, decode_nonce, new_nonce, valid_id, verify_proof},
         conn::{AcceptedPeer, Conn, ConnOptions, PeerInfo, Side},
     },
-    util::hmac::ct_eq,
+    util::{cancel::Cancel, hmac::ct_eq},
     ws::{self, RawSocket, watchdog::Watchdog},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -209,10 +209,80 @@ pub fn dial_expecting(
     connector: Option<tungstenite::Connector>,
     o: ConnOptions,
 ) -> Result<(Conn, ServerHello), DialError> {
+    dial_with(
+        endpoint,
+        hello,
+        auth,
+        expected_installation,
+        connector,
+        o,
+        None,
+    )
+}
+
+/// [`dial_expecting`], interruptible by `cancel` (CCR-WP2.6-2, applied by
+/// WP3.1): an unpair, a respawn or a shutdown no longer waits for a dial to
+/// finish. `cancel` is checked before each step; while a socket exists, its
+/// cancellation shuts the socket down (a hook on a child token that lives
+/// only as long as the dial), so an upgrade or a handshake step in progress
+/// fails at once instead of running out its 5 s budget. Only a TCP connect
+/// in progress (at most `DIAL_ATTEMPT`, 3 s, per address) runs to its end. A
+/// cancelled dial fails with `DialError::Connect("… dial cancelled")`, and
+/// a session it may have completed meanwhile is closed, never returned.
+pub fn dial_cancellable(
+    endpoint: &str,
+    hello: ClientHello,
+    auth: &dyn ClientAuth,
+    expected_installation: Option<&str>,
+    connector: Option<tungstenite::Connector>,
+    o: ConnOptions,
+    cancel: &Cancel,
+) -> Result<(Conn, ServerHello), DialError> {
+    // The hooks the dial registers (socket shutdowns) live on this child
+    // and go with it when the dial returns.
+    let guard = cancel.child();
+    let dialed = dial_with(
+        endpoint,
+        hello,
+        auth,
+        expected_installation,
+        connector,
+        o,
+        Some(&guard),
+    );
+    if guard.is_cancelled() {
+        if let Ok((conn, _)) = &dialed {
+            conn.close();
+        }
+        return Err(cancelled());
+    }
+    dialed
+}
+
+fn cancelled() -> DialError {
+    DialError::Connect("dial cancelled".into())
+}
+
+fn dial_with(
+    endpoint: &str,
+    hello: ClientHello,
+    auth: &dyn ClientAuth,
+    expected_installation: Option<&str>,
+    connector: Option<tungstenite::Connector>,
+    o: ConnOptions,
+    cancel: Option<&Cancel>,
+) -> Result<(Conn, ServerHello), DialError> {
     let role = hello.role;
     let lane = hello.lane;
     let session = hello.session.clone();
-    let (ws, server) = connect_v3(endpoint, hello, auth, expected_installation, connector)?;
+    let (ws, server) = connect_v3_with(
+        endpoint,
+        hello,
+        auth,
+        expected_installation,
+        connector,
+        cancel,
+    )?;
     let peer = PeerInfo {
         installation: server.installation.clone(),
         role,
@@ -236,13 +306,41 @@ pub fn connect_v3(
     expected_installation: Option<&str>,
     connector: Option<tungstenite::Connector>,
 ) -> Result<(RawSocket, ServerHello), DialError> {
-    let (mut ws, response) = ws::connect_with(
+    connect_v3_with(
+        endpoint,
+        hello,
+        auth,
+        expected_installation,
+        connector,
+        None,
+    )
+}
+
+/// [`connect_v3`]; with `cancel`, interruptible as [`dial_cancellable`]
+/// describes (the caller passes a short-lived token).
+fn connect_v3_with(
+    endpoint: &str,
+    hello: ClientHello,
+    auth: &dyn ClientAuth,
+    expected_installation: Option<&str>,
+    connector: Option<tungstenite::Connector>,
+    cancel: Option<&Cancel>,
+) -> Result<(RawSocket, ServerHello), DialError> {
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        return Err(cancelled());
+    }
+    let (mut ws, response) = ws::connect_with_cancel(
         endpoint,
         &[(UPGRADE_HEADER, UPGRADE_V3)],
         connector,
         DIAL_ATTEMPT,
+        cancel,
     )
     .map_err(connect_error)?;
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        abandon_ws(&mut ws);
+        return Err(cancelled());
+    }
     match echoed(&response) {
         Some(UPGRADE_V3) => {}
         None => {
@@ -267,7 +365,14 @@ pub fn connect_v3(
             });
         }
     }
-    let (mut ws, server) = client_handshake(ws, hello, auth)?;
+    let handshake = client_handshake(ws, hello, auth);
+    if cancel.is_some_and(Cancel::is_cancelled) {
+        if let Ok((mut ws, _)) = handshake {
+            abandon_ws(&mut ws);
+        }
+        return Err(cancelled());
+    }
+    let (mut ws, server) = handshake?;
     if let Some(expected) = expected_installation
         && server.installation != expected
     {

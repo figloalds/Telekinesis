@@ -504,10 +504,14 @@ impl Drop for InProcess {
     }
 }
 
-/// Names of the orchestrator's own `Tracked` locks (§2.2 rule 2).
+/// Names of the orchestrator's own `Tracked` locks (§2.2 rule 2). WP3.1: the
+/// legacy bridge's locks went with it; the v3 network's (the peer manager,
+/// its supervisors and the inbound server) are checked instead.
 fn orchestrator_lock(name: &str) -> bool {
     [
-        "legacy-bridge.",
+        "peer-manager.",
+        "peer.",
+        "inbound.",
         "control.",
         "folder-registry",
         "folder-slots",
@@ -1001,6 +1005,11 @@ fn a_slow_stopping_folder_blocks_nothing_and_shutdown_reports_each_outcome() {
 /// peer keeps syncing within 45 s, and both daemons' APIs stay responsive.
 /// Replaces WP1.12's `runtime.json` redirect, which no longer reaches the
 /// daemon (it uses the controller's endpoint).
+///
+/// WP3.1: since the cutover the acceptor's worker op is `feed-exchange`
+/// (§3.8), so the hang is that op's fault point; the scenario and its
+/// assertions are unchanged (the hung exchange ends at the dialer's 30 s
+/// exchange deadline).
 #[test]
 fn a_hung_remote_folder_is_charged_while_the_other_keeps_syncing() {
     let _serial = serial();
@@ -1018,10 +1027,7 @@ fn a_hung_remote_folder_is_charged_while_the_other_keeps_syncing() {
         has_file(&bx, "x.txt", b"x") && has_file(&by, "y.txt", b"y")
     });
     a.restart_with_env(vec![
-        (
-            "TKFS_FAULT_POINT".into(),
-            "worker.rpc.published-exchange".into(),
-        ),
+        ("TKFS_FAULT_POINT".into(), "worker.rpc.feed-exchange".into()),
         ("TKFS_FAULT_ACTION".into(), "hang".into()),
         ("TKFS_FAULT_SCOPE".into(), state_id(&px)),
     ]);
@@ -1058,7 +1064,7 @@ fn a_hung_remote_folder_is_charged_while_the_other_keeps_syncing() {
         delay < Duration::from_secs(45),
         "healthy folder took {delay:?}"
     );
-    // The hung exchange ends at the 15 s per-request deadline.
+    // The hung exchange ends at the dialer's 30 s exchange deadline.
     let charged = charged
         || wait_until(Duration::from_secs(40), || {
             b.raw_call(json!({"op":"peers"})).is_ok_and(|peers| {
@@ -1376,26 +1382,49 @@ fn a_hung_published_summary_never_slows_list() {
         })
     });
     assert_eq!(a.inspect(&hung_state)["running"], true);
+    // WP3.1: the peer endpoint serves v3 sessions only (a v2 `pair` + `list`
+    // fails closed), so the listing is a v3 probe session's `catalog.list`.
+    // The catalog also lists folders that do not serve (the hung one is
+    // `unavailable`); the legacy `list`'s Running-only filter is RemoteList's.
     let code = a.code();
-    let mut socket = ws::connect(&a.endpoint()).unwrap();
-    ws::call(
-        &mut socket,
-        &json!({"op":"pair","version":2,"code":code,"installation":tkfs::core::id(),"lane":"control"}),
+    let hello =
+        tkfs::session::client_hello(&tkfs::core::id(), tkfs::session::LaneRole::Probe, None, 2);
+    let (conn, _) = tkfs::session::dial(
+        &a.endpoint(),
+        hello,
+        &tkfs::session::CodeAuth { code },
+        None,
+        tkfs::session::ConnOptions::for_role(tkfs::session::LaneRole::Probe),
     )
     .unwrap();
     let mut samples = vec![];
     for _ in 0..20 {
-        let (listed, ms) = time_ms(|| ws::call(&mut socket, &json!({"op":"list"})));
-        let repos: Vec<Value> = listed
-            .unwrap()
+        let (listed, ms) = time_ms(|| {
+            conn.call(
+                "catalog.list",
+                json!({}),
+                vec![],
+                tkfs::session::Priority::Control,
+                Duration::from_secs(10),
+            )
+        });
+        let reply = listed.unwrap();
+        let catalog: Value = if reply.body.is_empty() {
+            reply.header
+        } else {
+            serde_json::from_slice(&reply.body).unwrap()
+        };
+        let running: Vec<Value> = catalog["entries"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|p| p["repo"].clone())
+            .filter(|entry| entry["state"] == "running")
+            .map(|entry| entry["repo"].clone())
             .collect();
-        assert_eq!(repos, vec![healthy["repo"].clone()]);
+        assert_eq!(running, vec![healthy["repo"].clone()], "{catalog}");
         samples.push(ms);
     }
+    conn.close();
     let summary = summarize(&samples);
     assert!(summary.p99 < 250.0, "list p99 {} ms", summary.p99);
 }

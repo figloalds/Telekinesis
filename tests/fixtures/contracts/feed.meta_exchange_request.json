@@ -44,21 +44,17 @@
           "object_sizes": {
             "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0": 1048576
           }
-        },
-        "large": null
+        }
       },
       {
         "seq": 3901,
         "id": "c0c1c2c3-0000-4000-8000-000000003901",
-        "digest": "00112233aabbccdd",
-        "event": null,
-        "large": null
+        "digest": "00112233aabbccdd"
       },
       {
         "seq": 3902,
         "id": "c0c1c2c3-0000-4000-8000-000000003902",
         "digest": "8899aabbccddeeff",
-        "event": null,
         "large": 3145728
       }
     ],
