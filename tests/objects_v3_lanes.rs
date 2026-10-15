@@ -1278,6 +1278,60 @@ fn both_directions_complete_with_per_object_results() {
     assert_eq!(pushed, 3);
 }
 
+/// A push whose bytes fail the peer's hash check (`CorruptAtSource` in the
+/// peer's results) makes our worker re-verify its copy (`objects.report`);
+/// the object backs off on both sides instead of being pushed in a loop,
+/// and the other objects of the push complete.
+#[test]
+fn a_corrupt_push_is_reported_to_our_worker_and_backs_off() {
+    let (a, b) = pair(100);
+    let bad = a.worker.hold(content(60, 300_000));
+    let good = a.worker.hold(content(61, 200_000));
+    a.worker.faults().corrupt.insert(bad.clone());
+    b.worker.want(&bad, 300_000);
+    b.worker.want(&good, 200_000);
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let (options, _) = a.options();
+    let lane = a.run(conn, options);
+    assert!(wait_until(Duration::from_secs(20), || b.worker.has(&good)));
+    assert!(
+        wait_until(Duration::from_secs(10), || a
+            .worker
+            .reports()
+            .contains(&(bad.clone(), "CORRUPT_AT_SOURCE".into()))),
+        "our worker was not asked to re-verify: {:?}",
+        a.worker.reports()
+    );
+    // Rounds keep running (interval 100 ms), but the object is not pushed
+    // again within its backoff.
+    sleep_ms(1500);
+    drop(lane);
+    assert!(!b.worker.has(&bad));
+    let completing_writes = b
+        .worker
+        .write_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, hash, offset, len)| *hash == bad && offset + len == 300_000)
+        .count();
+    assert_eq!(completing_writes, 1, "the corrupt object was pushed again");
+    assert!(
+        a.world
+            .object_errors()
+            .contains(&(bad.clone(), "CORRUPT_AT_SOURCE".into())),
+        "{:?}",
+        a.world.object_errors()
+    );
+    assert!(
+        b.world
+            .object_errors()
+            .contains(&(bad.clone(), "CORRUPT_AT_SOURCE".into())),
+        "{:?}",
+        b.world.object_errors()
+    );
+}
+
 /// A zero-size object is one empty chunk, pulled or pushed.
 #[test]
 fn zero_size_objects_travel_both_ways() {
