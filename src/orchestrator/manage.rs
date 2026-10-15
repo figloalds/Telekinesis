@@ -19,7 +19,7 @@
 //!   `sync` member through `ctx.legacy()`.
 use super::{
     api::{Action, Project},
-    catalog::validate_mount_path,
+    catalog::{self, validate_mount_path},
     ctx,
     folder::initial_view,
     manage_v2, shutdown,
@@ -66,6 +66,15 @@ pub const FOLDER_OPS: &[&str] = &[
 ];
 /// How long Create waits for the registry to give a new folder its controller.
 pub const CONTROLLER_WAIT: Duration = Duration::from_secs(10);
+/// How long Create (and Receive) waits for its folder when the catalog
+/// answered `REQUEST_TIMEOUT` for `create_folder` (the command was running
+/// when `catalog::APPLY_WAIT` passed and may still be applied). The reply is
+/// the folder if it appears meanwhile; otherwise `REQUEST_TIMEOUT` naming
+/// its state, and the state directory is kept (WP2.INT's confirmation
+/// review).
+pub const CREATE_SETTLE_WAIT: Duration = Duration::from_secs(5);
+/// How often Create probes the catalog while it settles.
+const SETTLE_POLL: Duration = Duration::from_millis(250);
 /// How long Start, Create and Receive wait for the controller to take the
 /// command (it answers right after the step that handled it).
 pub const COMMAND_REPLY_WAIT: Duration = Duration::from_secs(2);
@@ -173,18 +182,39 @@ pub fn manage(ctx: &Arc<Ctx>, action: Action) -> Result<Value> {
     }
 }
 
-/// `catalog.apply`; a catalog that is gone is also a daemon-scoped status
-/// error (the failure matrix's "daemon-level ErrorRecord", §2.3).
-fn apply(ctx: &Ctx, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>> {
-    ctx.catalog.apply(cmd).map_err(|error| {
-        if error.code == "CATALOG_UNAVAILABLE" {
-            ctx.status.record(StatusEvent::Error {
-                scope: Scope::Daemon,
-                error: error.clone(),
-            });
+/// `catalog.apply`. A catalog that is gone (its thread exited, the handle
+/// closed) or a command that failed inside it (a panic) is also a
+/// daemon-scoped status error (the failure matrix's "daemon-level
+/// ErrorRecord", §2.3), resolved by the next management write that
+/// succeeds. A command refused because another write is slow
+/// (`catalog::is_refusal`) or answered `REQUEST_TIMEOUT` is only this
+/// caller's answer: the catalog is alive, and a daemon error recorded for it
+/// would outlive the slow write (WP2.INT's confirmation review).
+fn apply(ctx: &Arc<Ctx>, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>> {
+    let extras = ctx::extras(ctx);
+    match ctx.catalog.apply(cmd) {
+        Ok(snapshot) => {
+            if extras.catalog_error.swap(false, Ordering::AcqRel) {
+                ctx.status.record(StatusEvent::Resolved {
+                    scope: Scope::Daemon,
+                    code: "CATALOG_UNAVAILABLE".into(),
+                });
+            }
+            Ok(snapshot)
         }
-        error.into_anyhow()
-    })
+        Err(error) => {
+            if error.code == "CATALOG_UNAVAILABLE" && !catalog::is_refusal(&error) {
+                ctx.status.record(StatusEvent::Error {
+                    scope: Scope::Daemon,
+                    error: error.clone(),
+                });
+                // After the record: a write that succeeds meanwhile and sees
+                // the flag resolves an error the hub already holds.
+                extras.catalog_error.store(true, Ordering::Release);
+            }
+            Err(error.into_anyhow())
+        }
+    }
 }
 
 /// The published folders of a paired peer, in the legacy `PublishedState`
@@ -434,6 +464,9 @@ fn held_slots(ctx: &Ctx) -> usize {
 
 /// Create and Receive: validate, `Store::initialize` on this thread, the
 /// catalog row (and gate), then Start through the new folder's controller.
+/// The new state directory is removed only when the catalog did not apply
+/// the row; when its outcome is unknown (`REQUEST_TIMEOUT`), Create waits
+/// for it ([`CREATE_SETTLE_WAIT`]) and keeps the directory.
 fn create(
     ctx: &Arc<Ctx>,
     label: String,
@@ -494,10 +527,45 @@ fn create(
         created_ms: now_ms(),
         override_ms: None,
     });
-    if let Err(error) = apply(ctx, CatalogCmd::CreateFolder { record, gate }) {
-        // Nothing refers to the new state directory: do not leave it behind.
-        let _ = std::fs::remove_dir_all(&directory);
-        return Err(error);
+    match apply(ctx, CatalogCmd::CreateFolder { record, gate }) {
+        Ok(_) => {}
+        Err(error) if !outcome_unknown(&error) => {
+            // Not applied (refused, withdrawn, rolled back): nothing refers
+            // to the new state directory, do not leave it behind.
+            let _ = std::fs::remove_dir_all(&directory);
+            return Err(error);
+        }
+        // `REQUEST_TIMEOUT`: the command was still running and may commit.
+        // Never delete the store of a folder the catalog may yet list: its
+        // worker could not open it (a crash loop, then Failed). An orphaned
+        // state directory is harmless (WP2.INT's confirmation review).
+        Err(_) => match settle_create(ctx, &state) {
+            Settled::Created => {}
+            Settled::NotCreated => {
+                let _ = std::fs::remove_dir_all(&directory);
+                return Err(ErrorWire::coded(
+                    "CATALOG_UNAVAILABLE",
+                    format!(
+                        "the catalog command create_folder ran past {} ms and was not applied; \
+                         the folder was not created",
+                        catalog::APPLY_WAIT.as_millis()
+                    ),
+                )
+                .into_anyhow());
+            }
+            Settled::Unknown => {
+                return Err(ErrorWire::coded(
+                    "REQUEST_TIMEOUT",
+                    format!(
+                        "the catalog command create_folder did not finish within {} ms; folder \
+                         {state} may still be created: look for it in List before creating it \
+                         again",
+                        (catalog::APPLY_WAIT + CREATE_SETTLE_WAIT).as_millis()
+                    ),
+                )
+                .into_anyhow());
+            }
+        },
     }
     wait_for_controller(ctx, &state)?;
     // The controller starts a desired folder by itself; Start makes the reply
@@ -515,6 +583,61 @@ fn create(
             .context("FOLDER_UNAVAILABLE: the new folder has no controller")?,
     };
     inspect_view(ctx, &state, &view)
+}
+
+/// Whether a management write's error leaves its command's outcome unknown
+/// (`catalog::outcome_unknown`: `REQUEST_TIMEOUT`, it may still be applied).
+fn outcome_unknown(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ErrorWire>()
+        .is_some_and(catalog::outcome_unknown)
+}
+
+/// What became of a `create_folder` the catalog answered `REQUEST_TIMEOUT`.
+enum Settled {
+    Created,
+    NotCreated,
+    Unknown,
+}
+
+/// Waits at most [`CREATE_SETTLE_WAIT`] for the outcome of a `create_folder`
+/// that was still running when `catalog::APPLY_WAIT` passed: the folder
+/// appears in the catalog (created), or a later command the catalog ran
+/// finds no such folder (the catalog runs commands one at a time, in order,
+/// so ours had ended without being applied). The probe is a no-op on the new
+/// folder (`SetIntents` with nothing to change); while the slow write still
+/// runs it is refused at once, and the wait goes on. Anything else leaves
+/// the outcome unknown.
+fn settle_create(ctx: &Ctx, state: &str) -> Settled {
+    let deadline = Instant::now() + CREATE_SETTLE_WAIT;
+    loop {
+        let snapshot = ctx.catalog.snapshot();
+        if snapshot.folder(state).is_some() {
+            return Settled::Created;
+        }
+        let probe = CatalogCmd::SetIntents {
+            state: state.to_owned(),
+            sync_enabled: None,
+            mount_enabled: None,
+        };
+        match ctx.catalog.apply(probe) {
+            Ok(_) => return Settled::Created,
+            Err(error) if error.code == "FOLDER_NOT_FOUND" => return Settled::NotCreated,
+            Err(error) if catalog::is_refusal(&error) => {}
+            Err(_) if ctx.catalog.snapshot().folder(state).is_some() => return Settled::Created,
+            Err(_) => return Settled::Unknown,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return if ctx.catalog.snapshot().folder(state).is_some() {
+                Settled::Created
+            } else {
+                Settled::Unknown
+            };
+        }
+        ctx.catalog
+            .wait_newer(snapshot.generation, remaining.min(SETTLE_POLL));
+    }
 }
 
 /// Waits until the registry has spawned the controller of a new folder.

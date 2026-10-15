@@ -20,7 +20,10 @@
 //!   every other successful command bumps the generation by exactly one.
 //!   The caller waits at most [`APPLY_WAIT`] (a slow write never parks a
 //!   folder controller or a control connection for good: WP2.INT's
-//!   post-integration re-review).
+//!   post-integration re-review). Its errors say what happened to the
+//!   command: [`is_refusal`] (never ran, the catalog is alive) and
+//!   [`outcome_unknown`] (`REQUEST_TIMEOUT`: it may still be applied); any
+//!   other error means it was not applied.
 //! * If the thread has died, `apply` answers `CATALOG_UNAVAILABLE` and
 //!   `snapshot()` keeps serving the last good snapshot. The thread and the
 //!   [`Catalog`] handle share `orchestrator.lock`, so a dead thread never
@@ -98,12 +101,44 @@ pub const MAX_LABEL_BYTES: usize = 200;
 /// management writes, never the threads that asked for them, a folder's
 /// lifecycle or status; post-integration re-review, WP2.INT). A command that
 /// has not started by then is withdrawn and never runs
-/// (`CATALOG_UNAVAILABLE`); one that is running is answered
-/// `REQUEST_TIMEOUT` (it may still be applied). While one command has been
-/// running this long, new ones are refused at once (`CATALOG_UNAVAILABLE`)
-/// instead of queueing behind it. Above the [`BUSY_RETRIES`] budget of a
+/// (`CATALOG_UNAVAILABLE`, [`is_refusal`]); one that is running is answered
+/// `REQUEST_TIMEOUT` (it may still be applied, [`outcome_unknown`]). While
+/// one command has been running this long, new ones are refused at once
+/// (`CATALOG_UNAVAILABLE`, [`is_refusal`]) instead of queueing behind it.
+/// Above the [`BUSY_RETRIES`] budget of a
 /// writer slot held by an external tool (about 4.3 s).
 pub const APPLY_WAIT: Duration = Duration::from_secs(5);
+/// The `retry_after_ms` of a command [`CatalogApi::apply`] refused or
+/// withdrawn because another write was slow ([`APPLY_WAIT`]); see
+/// [`is_refusal`].
+pub const REFUSAL_RETRY_AFTER: Duration = Duration::from_secs(1);
+
+/// Whether `error`, from [`CatalogApi::apply`], refused a command that never
+/// ran because another write was slow: withdrawn after [`APPLY_WAIT`] in the
+/// queue, or not queued behind a write running that long. The catalog is
+/// alive and a later command may succeed, so this is the caller's answer,
+/// not a catalog fault (no daemon-level ErrorRecord; WP2.INT's confirmation
+/// review). These carry [`REFUSAL_RETRY_AFTER`]; a catalog that is gone
+/// (its thread exited, the handle closed) or a command that panicked does
+/// not.
+pub fn is_refusal(error: &ErrorWire) -> bool {
+    error.code == "CATALOG_UNAVAILABLE" && error.retry_after_ms.is_some()
+}
+
+/// Whether `error`, from [`CatalogApi::apply`], leaves its command's outcome
+/// unknown: the command was running when [`APPLY_WAIT`] passed
+/// (`REQUEST_TIMEOUT`) and may still be applied. Every other error means the
+/// command was not applied: refused or withdrawn before it ran, rolled back
+/// (a rejected, failed or panicked command), or never run because the thread
+/// had died (a panic outside the per-command guard, before the command).
+pub fn outcome_unknown(error: &ErrorWire) -> bool {
+    error.code == "REQUEST_TIMEOUT"
+}
+
+fn refusal(detail: impl fmt::Display) -> ErrorWire {
+    let retry_after = u64::try_from(REFUSAL_RETRY_AFTER.as_millis()).unwrap_or(u64::MAX);
+    unavailable(detail).with_retry_after(retry_after)
+}
 
 /// A queued command's ticket ([`Request::ticket`]).
 const QUEUED: u8 = 0;
@@ -335,7 +370,7 @@ impl CatalogApi for Catalog {
         let wait_ms = u64::try_from(APPLY_WAIT.as_millis()).unwrap_or(u64::MAX);
         let since = self.busy_since_ms.load(Ordering::Acquire);
         if since != 0 && now_ms().saturating_sub(since) >= wait_ms {
-            return Err(unavailable(format!(
+            return Err(refusal(format!(
                 "a catalog write has been running for {} ms; {} was not queued behind it",
                 now_ms().saturating_sub(since),
                 cmd.name()
@@ -368,7 +403,7 @@ impl CatalogApi for Catalog {
                     .compare_exchange(QUEUED, WITHDRAWN, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok();
                 if withdrawn {
-                    Err(unavailable(format!(
+                    Err(refusal(format!(
                         "the catalog did not take {name} within {wait_ms} ms; it was withdrawn \
                          and not applied"
                     )))

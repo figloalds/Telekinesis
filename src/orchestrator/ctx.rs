@@ -339,6 +339,9 @@ impl WorkerLauncher for DaemonLauncher {
 pub struct Extras {
     hub: OnceLock<Arc<StatusHub>>,
     pub(crate) shutdown: shutdown::Latch,
+    /// A management write recorded a daemon-level `CATALOG_UNAVAILABLE`
+    /// that no successful write has resolved yet (`manage::apply`).
+    pub(crate) catalog_error: AtomicBool,
 }
 
 impl Extras {

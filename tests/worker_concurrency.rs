@@ -2060,6 +2060,72 @@ fn status_after_a_mutation_refreshes_the_content_only() {
     ctx.stopping.store(true, Ordering::SeqCst);
 }
 
+/// WP2.INT's confirmation review: the `status` after a client mutation never
+/// computes the content on the caller. After another connection's commit
+/// the content scan reloads the projection (1.6–2.3 s at 50K events); here
+/// a fault point makes each background refresh take 1.5 s. While the last
+/// refresh was cheap the reply waits for the next one (it reads its
+/// writes); once one was slow, the reply answers from the cell at once with
+/// `content_pending: true` and current cheap counters, and the content
+/// catches up in the background. Before the fix every such reply computed
+/// the content itself and took the 1.5 s.
+#[test]
+fn status_after_a_mutation_never_waits_for_a_slow_content_refresh() {
+    use tkfs::util::fault::{FaultAction, FaultConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    drop(Store::initialize(&state, &id(), &id()).unwrap());
+    let engine: Shared = Arc::new(Mutex::new(Engine::new(
+        Store::open_existing(&state).unwrap(),
+    )));
+    let ctx = worker::build_ctx(engine, &state, false, None);
+    let server = runtime::server::start_rpc_server(ctx.clone()).unwrap();
+    let info = server.publish(None).unwrap();
+    let call = |payload: Value| runtime::rpc(&info, &id(), payload).unwrap();
+    let import = |name: &str| call(json!({"op":"import","path":name,"hex":hex::encode(name)}));
+    call(json!({"op":"status"}));
+    let point = format!(
+        "{}.{}",
+        worker::status_cell::faults::CONTENT_REFRESH,
+        ctx.repo
+    );
+    let _armed = Armed::new(FaultConfig {
+        ms: Some(1500),
+        ..FaultConfig::new(&point, FaultAction::Hang)
+    });
+    // The last full refresh was cheap: the reply waits for the content.
+    import("one.txt");
+    let (first, ms) = time_ms(|| call(json!({"op":"status"})));
+    assert_eq!(first["content"]["current_objects"], 1, "{first}");
+    assert!(first.get("content_pending").is_none(), "{first}");
+    assert!(
+        ms >= 1400.0,
+        "the reply did not wait for the refresh: {ms} ms"
+    );
+    // That refresh took 1.5 s: the next reply does not wait for one.
+    import("two.txt");
+    let (second, ms) = time_ms(|| call(json!({"op":"status"})));
+    assert!(ms < 1000.0, "the reply waited {ms} ms for the content");
+    assert_eq!(second["content_pending"], true, "{second}");
+    assert_eq!(second["content"]["current_objects"], 1, "{second}");
+    assert!(
+        second["journal"]["tip"].as_i64() > first["journal"]["tip"].as_i64(),
+        "the cheap counters are current: {second}"
+    );
+    // The background refresh catches the content up.
+    let mut last = Value::Null;
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let (status, ms) = time_ms(|| call(json!({"op":"status"})));
+            assert!(ms < 1000.0, "a reply waited {ms} ms for the content");
+            last = status;
+            last["content"]["current_objects"] == 2 && last.get("content_pending").is_none()
+        }),
+        "the content never caught up: {last}"
+    );
+    ctx.stopping.store(true, Ordering::SeqCst);
+}
+
 /// WP2.3 review (minor), fixed by WP2.INT: a panic in a maintenance tick is
 /// contained like the activator's (and the recovery loop's before it): the
 /// thread lives on, and its next ticks still refresh the status cell's
