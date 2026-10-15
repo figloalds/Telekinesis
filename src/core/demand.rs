@@ -1,8 +1,20 @@
 //! Object demand: locally queued requests and what each peer wants from us.
 //! Every check is an index lookup (`event_objects`, `object_availability`);
 //! nothing here parses the journal.
+//!
+//! Objects v3 (WP3.2, §6.4): `want_objects` builds the receiver-driven want
+//! list of one bulk lane (demand > current projection > history).
 use super::objects::CORRUPT;
 use super::*;
+use crate::model::protocol::{
+    LaneSpec,
+    objects::{MAX_WANT_ITEMS, WantItem, WantPriority},
+};
+use std::{
+    collections::{HashSet, VecDeque},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 /// Demand older than this is no longer advertised (`requested_ms` expiry).
 pub const DEMAND_TTL_MS: u64 = 24 * 60 * 60 * 1000;
@@ -76,5 +88,270 @@ impl Store {
             }
             Ok(())
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Objects v3 want lists (WP3.2, §6.4)
+
+/// The current-projection object set is recomputed at most this often while
+/// commits keep changing it: priority is a hint, correctness never depends on
+/// it, and one recomputation is O(projection).
+const CURRENT_REFRESH: Duration = Duration::from_secs(5);
+/// Largest share of a want list's byte budget that the smallest-first order
+/// fills before the fair slot (below) goes to the class's largest item.
+const FAIR_SHARE_NUM: u64 = 3;
+const FAIR_SHARE_DEN: u64 = 4;
+
+/// The objects of the active branch's current projection, per store root:
+/// `(active branch, journal rowid high-water mark)` it was computed at.
+struct CurrentSet {
+    key: (String, i64),
+    at: Instant,
+    objects: Arc<HashSet<String>>,
+}
+static CURRENT: Mutex<BTreeMap<PathBuf, CurrentSet>> = Mutex::new(BTreeMap::new());
+const MAX_CURRENT_ROOTS: usize = 64;
+
+/// One want candidate.
+struct Candidate {
+    item: WantItem,
+    /// Bytes still to transfer.
+    remaining: u64,
+    /// `object_requests.requested_ms` (demand only).
+    requested_ms: i64,
+}
+
+impl Store {
+    /// The objects the active branch's current projection references (alive
+    /// entries with content), read from the stored projection
+    /// (`current_state` overlaid with `current_parts`) without loading it,
+    /// and cached per store root (see [`CURRENT_REFRESH`]).
+    pub fn current_objects(&self) -> Result<Arc<HashSet<String>>> {
+        let key: (String, i64) = self.db.query_row(
+            "SELECT (SELECT value FROM config WHERE key='active'),
+                    coalesce((SELECT max(rowid) FROM events),0)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        {
+            let cache = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(cached) = cache.get(&self.root)
+                && cached.key.0 == key.0
+                && (cached.key.1 == key.1 || cached.at.elapsed() < CURRENT_REFRESH)
+            {
+                return Ok(cached.objects.clone());
+            }
+        }
+        let objects: HashSet<String> = self
+            .db
+            .prepare_cached(
+                "SELECT json_extract(e.value,'$.content') FROM current_state s,
+                     json_each(CASE WHEN json_valid(s.payload) THEN s.payload ELSE '{}' END,'$.entries') e
+                 WHERE s.branch=?1 AND json_extract(e.value,'$.alive')
+                   AND json_type(e.value,'$.content')='text'
+                   AND NOT EXISTS(SELECT 1 FROM current_parts p WHERE p.branch=?1 AND p.entity=e.key)
+                 UNION
+                 SELECT json_extract(p.entry,'$.content') FROM current_parts p
+                 WHERE p.branch=?1 AND json_valid(p.entry) AND json_extract(p.entry,'$.alive')
+                   AND json_type(p.entry,'$.content')='text'",
+            )?
+            .query_map([&key.0], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let objects = Arc::new(objects);
+        let mut cache = CURRENT.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= MAX_CURRENT_ROOTS && !cache.contains_key(&self.root) {
+            cache.pop_first();
+        }
+        cache.insert(
+            self.root.clone(),
+            CurrentSet {
+                key,
+                at: Instant::now(),
+                objects: objects.clone(),
+            },
+        );
+        Ok(objects)
+    }
+
+    /// Objects v3 `objects.want` (§6.4): what this replica wants on `lane`,
+    /// at most `max_items` items (≤ `MAX_WANT_ITEMS`) and about `max_bytes`
+    /// still to transfer (the item that crosses the budget ends the list).
+    ///
+    /// **Candidates:** objects referenced by committed shared events or by
+    /// validly staged ones (`event_objects` ∪ `staged_objects`, so objects
+    /// flow before their events activate) that are not already shareable and
+    /// available (a private copy is wanted, I4), owned by `lane`
+    /// (`LaneSpec::owns`, invariant 19), not `leased_elsewhere` (another
+    /// session's lease, or the caller's per-source backoff), and not inside
+    /// their transfer backoff (`object_error_state`; a local quarantine,
+    /// `CORRUPT_OBJECT`, never delays the download that repairs it).
+    ///
+    /// **Order:** demand (`object_requests` younger than 24 h, newest first: a
+    /// reader is waiting), then the active branch's current projection, then
+    /// history. Within current and history, smaller remaining bytes first,
+    /// with fair interleaving: once the list is about to fill (its last item,
+    /// or three quarters of its byte budget), its last slot goes to the
+    /// class's *largest* pending item, so a stream of small objects never
+    /// starves a large one (it gets the rest of every pull's budget).
+    ///
+    /// **Offsets** are the committed durable spool offsets (invariant 2). A
+    /// complete but unfinished spool (a crash before its install) is offered
+    /// one byte short, so the sender's last byte, checked against the spool,
+    /// finalizes it.
+    pub fn want_objects(
+        &self,
+        lane: LaneSpec,
+        max_items: usize,
+        max_bytes: u64,
+        leased_elsewhere: &dyn Fn(&str) -> bool,
+    ) -> Result<Vec<WantItem>> {
+        let max_items = max_items.min(MAX_WANT_ITEMS);
+        let max_bytes = max_bytes.max(1);
+        if max_items == 0 || !lane.is_valid() {
+            return Ok(vec![]);
+        }
+        let now = time();
+        let demand_since = now.saturating_sub(DEMAND_TTL_MS) as i64;
+        let mut statement = self.db.prepare_cached(
+            "WITH c(hash) AS (
+                 SELECT hash FROM event_objects WHERE shared=1
+                 UNION
+                 SELECT s.hash FROM staged_objects s JOIN incoming_events i ON i.id=s.event
+                 WHERE i.error IS NULL)
+             SELECT c.hash, z.size, a.state,
+                 EXISTS(SELECT 1 FROM published_objects p WHERE p.hash=c.hash)
+                     OR EXISTS(SELECT 1 FROM received_shared_objects r WHERE r.hash=c.hash),
+                 sp.durable, sp.total, q.requested_ms, e.retry_at_ms, e.code
+             FROM c
+             LEFT JOIN object_sizes z ON z.hash=c.hash
+             LEFT JOIN object_availability a ON a.hash=c.hash
+             LEFT JOIN spool_state sp ON sp.hash=c.hash
+             LEFT JOIN object_requests q ON q.hash=c.hash
+             LEFT JOIN object_error_state e ON e.hash=c.hash",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut classes: [Vec<Candidate>; 3] = [vec![], vec![], vec![]];
+        let mut undecided = vec![];
+        while let Some(row) = rows.next()? {
+            let object = row.get_ref(0)?.as_str()?;
+            if !lane.owns(object) || !super::objects::canonical_object(object) {
+                continue;
+            }
+            let shareable: bool = row.get(3)?;
+            if shareable && row.get::<_, Option<i64>>(2)? == Some(super::objects::AVAILABLE) {
+                continue;
+            }
+            let retry_at: Option<i64> = row.get(7)?;
+            let code: Option<String> = row.get(8)?;
+            if retry_at.is_some_and(|at| at > now as i64)
+                && code.as_deref() != Some("CORRUPT_OBJECT")
+            {
+                continue;
+            }
+            if leased_elsewhere(object) {
+                continue;
+            }
+            let size: Option<u64> = row
+                .get::<_, Option<i64>>(1)?
+                .and_then(|s| u64::try_from(s).ok());
+            let spool_total: Option<u64> = row
+                .get::<_, Option<i64>>(5)?
+                .and_then(|t| u64::try_from(t).ok());
+            let size = match size {
+                Some(size) => size,
+                None => match self.expected_object_sizes(object)?.first() {
+                    Some(size) => *size,
+                    None => spool_total.unwrap_or(0),
+                },
+            };
+            let durable = row
+                .get::<_, Option<i64>>(4)?
+                .and_then(|d| u64::try_from(d).ok())
+                .filter(|d| *d <= size && spool_total.is_none_or(|t| t == size))
+                .unwrap_or(0);
+            let offset = if durable == size && size > 0 {
+                size - 1
+            } else {
+                durable
+            };
+            let requested_ms: Option<i64> = row.get(6)?;
+            let demand = requested_ms.is_some_and(|at| at >= demand_since);
+            let candidate = Candidate {
+                remaining: size - offset,
+                requested_ms: requested_ms.unwrap_or(0),
+                item: WantItem {
+                    hash: object.to_owned(),
+                    size,
+                    offset,
+                    priority: if demand {
+                        WantPriority::Demand
+                    } else {
+                        WantPriority::History
+                    },
+                },
+            };
+            if demand {
+                classes[0].push(candidate);
+            } else {
+                undecided.push(candidate);
+            }
+        }
+        drop(rows);
+        drop(statement);
+        if !undecided.is_empty() {
+            let current = self.current_objects()?;
+            for mut candidate in undecided {
+                if current.contains(&candidate.item.hash) {
+                    candidate.item.priority = WantPriority::Current;
+                    classes[1].push(candidate);
+                } else {
+                    classes[2].push(candidate);
+                }
+            }
+        }
+        classes[0].sort_by(|a, b| {
+            (b.requested_ms, a.remaining, &a.item.hash).cmp(&(
+                a.requested_ms,
+                b.remaining,
+                &b.item.hash,
+            ))
+        });
+        for class in &mut classes[1..] {
+            class.sort_by(|a, b| (a.remaining, &a.item.hash).cmp(&(b.remaining, &b.item.hash)));
+        }
+        let fair_budget = max_bytes / FAIR_SHARE_DEN * FAIR_SHARE_NUM;
+        let mut list = Vec::new();
+        let mut bytes = 0u64;
+        for (index, class) in classes.into_iter().enumerate() {
+            let fair = index > 0;
+            let mut pending: VecDeque<Candidate> = class.into();
+            while let Some(front) = pending.front() {
+                if list.len() >= max_items || bytes >= max_bytes {
+                    return Ok(list);
+                }
+                // The fair slot: never the list's first item, and only while
+                // the class has more than the one item it would take.
+                let fair_slot = fair
+                    && pending.len() > 1
+                    && !list.is_empty()
+                    && (list.len() + 1 == max_items
+                        || bytes.saturating_add(front.remaining) >= max_bytes
+                        || bytes >= fair_budget);
+                let take = if fair_slot {
+                    pending.pop_back()
+                } else {
+                    pending.pop_front()
+                };
+                let Some(candidate) = take else { break };
+                bytes = bytes.saturating_add(candidate.remaining);
+                list.push(candidate.item);
+                if fair_slot {
+                    // The fair slot ends the list.
+                    return Ok(list);
+                }
+            }
+        }
+        Ok(list)
     }
 }
