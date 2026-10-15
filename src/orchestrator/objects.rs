@@ -193,7 +193,7 @@ use crate::{
             },
             ops,
         },
-        status::{Direction, StatusEvent},
+        status::{Direction, ObjectSource, StatusEvent},
     },
     paired_sync::SyncRoute,
     session::{self, Priority},
@@ -446,6 +446,13 @@ pub fn read_outcome(error: &CallError) -> ObjectOutcome {
         "SIZE_MISMATCH" => ObjectOutcome::SizeMismatch,
         _ => ObjectOutcome::Failed(error.to_wire()),
     }
+}
+
+/// Whether a failed write's code is a resume point of the worker
+/// (`RESUME_OFFSET_AHEAD`, `OBJECT_PART_CHANGED`): the object continues from
+/// the durable offset the worker answered (CCR-WP3.2-5).
+pub fn is_resume_point(code: &str) -> bool {
+    matches!(code, "RESUME_OFFSET_AHEAD" | "OBJECT_PART_CHANGED")
 }
 
 /// Whether an outcome is a per-object failure worth a backoff and an
@@ -1574,6 +1581,19 @@ impl SinkState {
                         }),
                         None,
                     ),
+                    // A resume point, not a failure of the object (WP3.2's
+                    // contract, CCR-WP3.2-5; WP3.INT): the write did not
+                    // start at the worker's durable offset, or the bytes
+                    // before it changed and the spool was reset. Resynchronize
+                    // from the offset the worker answered, as above: no
+                    // per-object backoff, no `ObjectError`.
+                    ObjectOutcome::Failed(error) if is_resume_point(&error.code) => (
+                        false,
+                        Some(ObjectOutcome::Progressed {
+                            durable_offset: result.durable_offset,
+                        }),
+                        None,
+                    ),
                     other => (false, Some(other.clone()), None),
                 },
             };
@@ -1912,11 +1932,12 @@ fn write_loop(inner: &SinkInner) {
         let items = std::mem::take(&mut batch.items);
         let body = std::mem::take(&mut batch.body);
         // A write that completes an object includes its whole-object hash.
+        // Totals may be a peer's (a push): saturating, never an overflow
+        // (`with_verify` caps the time anyway; WP3.INT, WP3.3 review minor).
         let verified: u64 = items
             .iter()
             .filter(|item| item.last)
-            .map(|item| item.total)
-            .sum();
+            .fold(0u64, |sum, item| sum.saturating_add(item.total));
         let result = inner.client.write_batch(
             &inner.route,
             &batch.lease,
@@ -2311,10 +2332,12 @@ impl LaneRun {
         } else {
             format!("pulling from peer {}", self.peer.installation)
         };
-        let Some(error) = outcome_error(hash, outcome, &detail) else {
+        let Some(mut error) = outcome_error(hash, outcome, &detail) else {
             return;
         };
         let delay = object_failed(&self.key(&target.repo, up, hash), &error.code);
+        // The record's next retry (§7.1) is this object's backoff here.
+        error.retry_after_ms = Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
         event!(debug, (error.code.as_str()), {
             "peer": self.peer.installation,
             "repo": target.repo,
@@ -2326,6 +2349,11 @@ impl LaneRun {
             state: target.folder.record.state.clone(),
             hash: hash.to_owned(),
             error,
+            source: Some(ObjectSource {
+                installation: self.peer.installation.clone(),
+                lane: self.status,
+                direction: Direction::Outbound,
+            }),
         });
     }
 
@@ -2837,7 +2865,15 @@ fn round_event(
             sink.flush(&hashes);
             match &result {
                 Ok(results) => {
+                    // Only the pull's own items, each once (invariant 22;
+                    // WP3.INT, WP3.3 review major): a peer's reply cannot make
+                    // us back off, or record errors for, objects we did not
+                    // ask it for.
+                    let mut listed: HashSet<&str> = hashes.iter().map(String::as_str).collect();
                     for result in &results.results {
+                        if !listed.remove(result.hash.as_str()) {
+                            continue;
+                        }
                         if is_failure(&result.outcome) {
                             lane.object_failed(target, false, &result.hash, &result.outcome);
                             state.failed.insert(result.hash.clone());
@@ -3364,8 +3400,10 @@ fn upload_round(
             Err(error) => return idle_or(moved, ExchangeError::peer(error)),
         };
         let mut seen = HashSet::new();
+        // At most the items we asked for (invariant 22; WP3.INT).
         let items: Vec<WantItem> = wanted
             .into_iter()
+            .take(MAX_WANT_ITEMS)
             .filter(|item| {
                 lane.spec.owns(&item.hash)
                     && seen.insert(item.hash.clone())
@@ -3480,6 +3518,9 @@ fn push(
     let mut sent = 0u64;
     let mut local: HashMap<String, ObjectOutcome> = HashMap::new();
     let mut failure: Option<ExchangeError> = None;
+    // Objects whose last byte this push sent: only those can be corrupt at
+    // their source here (WP3.INT, WP3.3 review major).
+    let mut through_end: HashSet<String> = HashSet::new();
     // A first read of an object may verify it whole (verify-on-first-serve).
     let largest = sizes.values().copied().max().unwrap_or(0);
     client.read_stream(
@@ -3506,9 +3547,13 @@ fn push(
                         total,
                         last: range.offset + range.len == total,
                     };
+                    let last = header.last;
                     match upload.chunk(header, &bytes) {
                         Ok(()) => {
                             sent += range.len;
+                            if last {
+                                through_end.insert(range.hash.clone());
+                            }
                             ReadFlow::Continue
                         }
                         Err(error) => {
@@ -3541,16 +3586,38 @@ fn push(
     };
     drop(slot);
     for (hash, outcome) in &local {
-        lane.object_failed(target, true, hash, outcome);
+        if matches!(outcome, ObjectOutcome::NotPermitted) {
+            // The peer wants an object we do not hold shareable (it never
+            // was ours to send, or we never received it): not serving it is
+            // no error of ours, as on the acceptor's side (WP3.INT). Its
+            // backoff keeps it out of the next pushes; no `ObjectError`.
+            object_failed(&lane.key(&target.repo, true, hash), "");
+        } else {
+            lane.object_failed(target, true, hash, outcome);
+        }
     }
     match result {
         Ok(results) => {
             let mut completed = 0;
+            // Only the push's own items, each once (invariant 22; WP3.INT,
+            // WP3.3 review major): a peer's reply cannot inflate what we
+            // count as uploaded, back off or report objects we did not push.
+            let mut listed: HashSet<&str> = sizes.keys().map(String::as_str).collect();
             for result in &results.results {
+                if !listed.remove(result.hash.as_str()) {
+                    continue;
+                }
                 match &result.outcome {
                     ObjectOutcome::Completed => {
                         completed += 1;
                         lane.object_done(target, true, &result.hash);
+                    }
+                    ObjectOutcome::CorruptAtSource if !through_end.contains(&result.hash) => {
+                        // Not sent through its end: the peer cannot have
+                        // checked the whole object. A protocol error of the
+                        // peer's, kept to this object (no report to our
+                        // worker, which would re-read it whole).
+                        lane.object_failed(target, true, &result.hash, &result.outcome);
                     }
                     ObjectOutcome::CorruptAtSource => {
                         // The peer's hash check failed on our bytes: our

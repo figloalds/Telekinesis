@@ -20,8 +20,7 @@
 //! 1. the session is a bulk session (`BULK_ON_CONTROL_LANE`; the inbound
 //!    router checks this first too);
 //! 2. the request parses (a v3 request that does not is answered
-//!    `UNSUPPORTED_OPERATION`, the answer of a pre-v3 acceptor, so a dialer
-//!    treats both alike; see the WP3.3 notes) and names the session's own
+//!    `INVALID_REQUEST`, CCR-WP3.3-3 applied by WP3.INT) and names the session's own
 //!    lane, the one the handshake authenticated (`BULK_LANE_MISMATCH`), so
 //!    one lane never carries another lane's objects (invariant 19); items
 //!    the lane does not own are answered `OBJECT_ON_WRONG_LANE` one by one;
@@ -128,7 +127,7 @@ use crate::{
             },
             ops,
         },
-        status::{Direction, StatusEvent},
+        status::{Direction, ObjectSource, StatusEvent},
     },
     paired_sync::SyncRoute,
     session::{self, Responder},
@@ -196,12 +195,10 @@ fn request_of<T: DeserializeOwned>(op: &str, header: &Value, body: &[u8]) -> Res
     } else {
         serde_json::from_slice(body)
     };
-    parsed.map_err(|error| {
-        ErrorWire::coded(
-            "UNSUPPORTED_OPERATION",
-            format!("{op}: not an objects v3 request this acceptor serves: {error}"),
-        )
-    })
+    // CCR-WP3.3-3 (applied by WP3.INT): a malformed objects v3 request is
+    // an invalid request, never "not served" (which would send a buggy v3
+    // dialer to the interim path without a trace).
+    parsed.map_err(|error| invalid_request(op, &error))
 }
 
 /// The JSON reply of an op: the header when it fits, else the body.
@@ -990,12 +987,19 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
             }
             other if is_failure(other) && !call => {
                 let detail = format!("pushed by peer {}", peer.installation);
-                if let Some(error) = outcome_error(&item.hash, other, &detail) {
-                    object_failed(&source.key(&item.hash), &error.code);
+                if let Some(mut error) = outcome_error(&item.hash, other, &detail) {
+                    let delay = object_failed(&source.key(&item.hash), &error.code);
+                    error.retry_after_ms =
+                        Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
                     ctx.status.record(StatusEvent::ObjectError {
                         state: bound.state.clone(),
                         hash: item.hash.clone(),
                         error,
+                        source: Some(ObjectSource {
+                            installation: peer.installation.clone(),
+                            lane: status_lane(peer),
+                            direction: Direction::Inbound,
+                        }),
                     });
                 }
             }

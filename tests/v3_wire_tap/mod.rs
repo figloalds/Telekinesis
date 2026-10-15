@@ -110,6 +110,14 @@ impl WireTap {
         self.seen().iter().filter(|seen| seen.op == op).count()
     }
 
+    /// Objects v3 transfers seen so far (`objects.pull`, `objects.push`;
+    /// WP3.INT). They carry no exchange identity: an interrupted one is never
+    /// replayed but resumed by a fresh request from the receiver's durable
+    /// offset (§6.4), which `objects_v3_lanes` checks byte for byte.
+    pub fn objects_v3(&self) -> usize {
+        self.count("objects.pull") + self.count("objects.push")
+    }
+
     /// Connections relayed so far.
     pub fn connections(&self) -> u64 {
         self.shared.next.load(Ordering::Relaxed) - 1

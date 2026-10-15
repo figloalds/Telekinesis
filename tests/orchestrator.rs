@@ -20,13 +20,17 @@ use tkfs::{
     model::{
         errors::ErrorWire,
         ipc::{FeedExchangeReply, PublishedSummary},
-        orchestrator::{EntryState, PublishedEntry},
+        orchestrator::{EntryState, PublishedEntry, WorkerEndpoint},
         protocol::{
             CatalogListReply,
             feed::{LARGE_EVENT_BYTES, MetaExchangeRequest},
+            objects::{
+                ObjectOutcome, ObjectResult, ObjectsPush, ObjectsResult, ObjectsWantsReply,
+                ObjectsWantsRequest, WantHeader, WriteItem,
+            },
         },
     },
-    orchestrator::{self, Action, Config},
+    orchestrator::{self, Action, Config, worker_client::SessionWorkerClient},
     paired_sync::SyncRoute,
     runtime::{self, Discovery},
     session::{
@@ -314,6 +318,7 @@ fn one_repository_uses_all_bulk_lanes_and_keeps_control_free_of_objects() {
         status["sync"][0]["connected"] == true && status["sync"][0]["remote_available"] == false
     });
 }
+#[track_caller]
 fn wait_for(mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !predicate() {
@@ -496,13 +501,25 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     let broken_b = b.receive(&a, &broken);
     let healthy_b = b.receive(&a, &healthy);
     let repo = broken["repo"].as_str().unwrap();
+    // WP3.INT (objects v3): a worker finds a corrupt copy when it first serves
+    // it (verify-on-first-serve, §6.4), quarantines it and answers
+    // NOT_AVAILABLE; bytes that reach the receiver first fail its whole-object
+    // check (CORRUPT_AT_SOURCE). 6298d0b's bulk page failed with
+    // CORRUPT_OBJECT. Either way the object fails alone, booked on the lane's
+    // repository (CCR-WP3.INT-1), and its retry waits for the per-object
+    // backoff (§8 objects: 30 s, then longer), hence the longer waits below.
+    let failed = |error: &str| {
+        ["NOT_AVAILABLE", "CORRUPT_AT_SOURCE", "CORRUPT_OBJECT"]
+            .iter()
+            .any(|code| error.contains(code))
+    };
     wait_for(|| {
         let peers = b.call(Action::Peers);
         let lane = &peers[0]["lanes"][1];
         lane["connected"] == true
             && lane["repositories"][repo]["error"]
                 .as_str()
-                .is_some_and(|e| e.contains("CORRUPT_OBJECT"))
+                .is_some_and(failed)
     });
     write(&healthy, "forward.txt", b"unblocked forward");
     write(&healthy_b, "reverse.txt", b"unblocked reverse");
@@ -522,7 +539,9 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
     );
     assert!(lane["repositories"][repo]["retry_at_ms"].is_u64());
     fs::write(&object, bytes).unwrap();
-    wait_for(|| has(&broken_b, "repair.txt", bytes));
+    wait_long("the repaired object", Duration::from_secs(120), || {
+        has_content(&broken_b, "repair.txt", bytes)
+    });
     wait_for(|| b.call(Action::Peers)[0]["lanes"][0]["repositories"][repo]["caught_up"] == true);
 
     // Corrupt outbound content must also leave the other folder and socket usable.
@@ -538,15 +557,23 @@ fn failed_repository_does_not_starve_healthy_folders_on_the_same_lane() {
         .join(hash(local_bytes));
     fs::write(&local_object, vec![0; local_bytes.len()]).unwrap();
     a.call(Action::Start { state });
-    wait_for(|| {
-        b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("CORRUPT_OBJECT"))
-    });
+    wait_long(
+        "the corrupt outbound object",
+        Duration::from_secs(60),
+        || {
+            b.call(Action::Peers)[0]["lanes"][1]["repositories"][repo]["error"]
+                .as_str()
+                .is_some_and(failed)
+        },
+    );
     write(&healthy, "still.txt", b"healthy during local failure");
     wait_for(|| has(&healthy_b, "still.txt", b"healthy during local failure"));
     fs::write(&local_object, local_bytes).unwrap();
-    wait_for(|| has(&broken, "local-repair.txt", local_bytes));
+    wait_long(
+        "the repaired outbound object",
+        Duration::from_secs(120),
+        || has_content(&broken, "local-repair.txt", local_bytes),
+    );
     wait_for(|| {
         let peers = b.call(Action::Peers);
         let status = &peers[0]["lanes"][1]["repositories"][repo];
@@ -950,9 +977,11 @@ fn legacy_peer_fails_closed_with_needs_upgrade() {
 
 /// A v3 acceptor emulated in the test (`session::accept`): its folder is an
 /// in-process worker (`runtime::start_rpc`) that serves the feed
-/// (`feed-exchange`) and the interim bulk pages (`published-bulk-exchange`),
-/// as a daemon's inbound server would. Its first bulk `objects.exchange`
-/// stalls for `stall` before it is served.
+/// (`feed-exchange`) and objects v3 over a loopback session (`objects.want`,
+/// `objects.write`), as a daemon's inbound server would for the dialer's
+/// `objects.wants` and `objects.push` (WP3.INT: the bulk lanes carry objects
+/// v3 since WP3.3, no longer the interim `objects.exchange`). Its first
+/// `objects.push` stalls for `stall` before its stream is read.
 struct V3Acceptor {
     endpoint: String,
     code: String,
@@ -986,11 +1015,30 @@ struct AcceptorHandler {
     blocked: mpsc::Sender<()>,
 }
 
+/// The emulated acceptor's lease session at its worker (one per test).
+const ACCEPTOR_LEASE: &str = "push:test-acceptor";
+
+impl AcceptorHandler {
+    /// The worker's loopback session (objects v3, binary bodies).
+    fn objects(&self) -> Result<Arc<SessionWorkerClient>, ErrorWire> {
+        SessionWorkerClient::connect(&WorkerEndpoint {
+            instance: format!("test-acceptor-{}", self.worker.device),
+            pid: std::process::id(),
+            address: self.worker.address.clone(),
+            version: "test".into(),
+            token: None,
+        })
+        .map_err(|error| error.to_wire())
+    }
+}
+
 impl Handler for AcceptorHandler {
     fn handle(&self, req: Incoming) {
         let Incoming {
             op,
+            header,
             body,
+            chunks,
             responder,
             ..
         } = req;
@@ -1038,16 +1086,78 @@ impl Handler for AcceptorHandler {
                     )
                 })
             }
-            "objects.exchange" => {
+            "objects.wants" => {
+                let request: ObjectsWantsRequest = serde_json::from_value(header).unwrap();
+                let want = WantHeader {
+                    route: route(&request.sender),
+                    lane: request.lane,
+                    max_items: request.max_items,
+                    max_bytes: request.max_bytes,
+                    session: ACCEPTOR_LEASE.into(),
+                };
+                self.objects().and_then(|client| {
+                    client
+                        .want(&want, Duration::from_secs(10))
+                        .map_err(|error| error.to_wire())
+                        .map(|items| {
+                            let reply = ObjectsWantsReply { items };
+                            (serde_json::to_value(reply).unwrap(), vec![])
+                        })
+                })
+            }
+            "objects.push" => {
                 if !self.stalled.swap(true, Ordering::SeqCst) {
                     let _ = self.blocked.send(());
                     thread::sleep(self.stall);
                 }
-                let page: tkfs::bulk_sync::Page = serde_json::from_slice(&body).unwrap();
-                let route = route(&page.sender);
-                worker(json!({"op":"published-bulk-exchange","route":route,"lane":page.lane,"page":page}))
-                    .map(|page| (json!({"repo": route.repo}), serde_json::to_vec(&page).unwrap()))
+                let request: ObjectsPush = serde_json::from_value(header).unwrap();
+                let route = route(&request.sender);
+                self.objects().map(|client| {
+                    // Each chunk is one write at its offset (the dialer sends
+                    // every object in order); the last write's outcome is the
+                    // object's.
+                    let mut results: Vec<ObjectResult> = Vec::new();
+                    for (chunk, bytes) in chunks.into_iter().flatten() {
+                        let hash = chunk.hash.clone().unwrap_or_default();
+                        let item = WriteItem {
+                            hash: hash.clone(),
+                            offset: chunk.offset,
+                            total: chunk.total,
+                            len: bytes.len() as u64,
+                            last: chunk.last,
+                        };
+                        let len = item.len;
+                        let outcome = match client.write_batch(
+                            &route,
+                            ACCEPTOR_LEASE,
+                            vec![item],
+                            bytes,
+                            Duration::from_secs(60),
+                        ) {
+                            Ok(mut written) => written.remove(0).outcome,
+                            Err(error) => ObjectOutcome::Failed(error.to_wire()),
+                        };
+                        match results.iter_mut().find(|result| result.hash == hash) {
+                            Some(result) => {
+                                result.outcome = outcome;
+                                result.bytes += len;
+                            }
+                            None => results.push(ObjectResult {
+                                hash,
+                                outcome,
+                                bytes: len,
+                            }),
+                        }
+                    }
+                    let reply = ObjectsResult { results };
+                    (serde_json::to_value(reply).unwrap(), vec![])
+                })
             }
+            // The dialer holds everything this acceptor has: nothing to serve.
+            "objects.pull" => Ok((
+                serde_json::to_value(ObjectsResult { results: vec![] }).unwrap(),
+                vec![],
+            )),
             other => Err(ErrorWire::coded("UNKNOWN_PEER_OPERATION", other)),
         };
         match reply {
@@ -1122,6 +1232,8 @@ impl V3Acceptor {
 /// 20 s (longer than the legacy lanes' 15 s timeout) while the control
 /// session's `meta.exchange` is served by the acceptor's feed. The event
 /// still arrives within 8 s, and no lane resets (no new session is dialed).
+/// WP3.INT: the stalled bulk request is the objects v3 `objects.push`
+/// (WP3.3 replaced the interim `objects.exchange` the WP3.1 version stalled).
 #[test]
 fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     use tkfs::{core::Store, runtime::Engine};
@@ -1181,7 +1293,7 @@ fn reserved_connection_delivers_events_while_bulk_is_blocked() {
     assert_eq!(peers[0]["lanes"][0]["role"], "control");
     assert_eq!(peers[0]["lanes"][1]["role"], "bulk");
     assert!(peers[0]["lanes"][0]["exchanges"].as_u64().unwrap() > 0);
-    // Once the stall ends the bulk page is served on the same session.
+    // Once the stall ends the push is served on the same session.
     wait_for(|| remote.lock().unwrap().store.content_status().unwrap()["complete"] == true);
     assert!(stalled_at.elapsed() >= Duration::from_secs(19));
     assert_eq!(acceptor.accepted(LaneRole::Probe), 1);
@@ -1542,6 +1654,7 @@ fn object_is(p: &Value, bytes: &[u8]) -> bool {
     .is_ok_and(|object| object["hex"] == hex::encode(bytes))
 }
 
+#[track_caller]
 fn wait_long(what: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !predicate() {
@@ -1648,7 +1761,10 @@ fn sync_survives_latency_bandwidth_stalls_and_resets_without_replays() {
 
     // Nothing was ever sent twice.
     assert!(tap.count("meta.exchange") > 0, "{:?}", tap.seen().len());
-    assert!(tap.count("objects.exchange") > 0);
+    // WP3.INT: objects travel as objects v3 (WP3.3), never through the
+    // interim `objects.exchange` fallback.
+    assert!(tap.objects_v3() > 0);
+    assert_eq!(tap.count("objects.exchange"), 0);
     assert_eq!(tap.malformed(), 0, "the tap lost the dialer's stream");
     // Every exchange request was identified, so the check below covers
     // replays across connections too (not only reused session ids).

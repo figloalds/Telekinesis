@@ -1463,9 +1463,12 @@ fn role_violations_and_route_violations_keep_their_codes() {
         ),
         "BULK_LANE_MISMATCH"
     );
+    // CCR-WP3.3-3 (WP3.INT): objects v3 is served since WP3.3, so a
+    // malformed `objects.pull` is an invalid request (it was the Wave 2
+    // stub's UNSUPPORTED_OPERATION).
     assert_eq!(
         bulk.call_code("objects.pull", json!({}), Vec::new()),
-        "UNSUPPORTED_OPERATION"
+        "INVALID_REQUEST"
     );
 
     // Routes.

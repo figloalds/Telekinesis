@@ -895,6 +895,7 @@ fn status_events() -> Vec<StatusEvent> {
             state: STATE.into(),
             hash: HASH_A.into(),
             error: ErrorWire::new("CORRUPT_AT_SOURCE", "CORRUPT_AT_SOURCE: hash mismatch"),
+            source: None,
         },
         StatusEvent::LegacyLink {
             key: format!("wss://peer.example:43180\u{1f}0\u{1f}{REPO}"),

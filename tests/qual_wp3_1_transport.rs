@@ -483,6 +483,7 @@ fn faulty_link_no_stuck_sync_no_replay() {
         json!({
             "meta_exchange": tap.count("meta.exchange"),
             "objects_exchange": tap.count("objects.exchange"),
+            "objects_v3": tap.objects_v3(),
             "connections": tap.connections(),
             "malformed": tap.malformed(),
             "unidentified": unidentified.len(),
@@ -495,9 +496,15 @@ fn faulty_link_no_stuck_sync_no_replay() {
         unidentified.is_empty(),
         "every exchange request carried its identity",
     );
+    // WP3.INT: objects travel as objects v3 (WP3.3), never through the
+    // interim `objects.exchange` fallback.
     s.check(
-        tap.count("meta.exchange") > 0 && tap.count("objects.exchange") > 0,
+        tap.count("meta.exchange") > 0 && tap.objects_v3() > 0,
         "exchanges were seen",
+    );
+    s.check(
+        tap.count("objects.exchange") == 0,
+        "no interim objects exchange",
     );
     s.finish();
 }
