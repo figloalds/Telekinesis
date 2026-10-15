@@ -980,6 +980,21 @@ fn errors_disappear_when_absent_from_a_snapshot() {
             .is_empty()
     );
 
+    // FOLDER_SYNC_PAUSED is the Paused state, never the row's error, and it
+    // never hides another open error.
+    let mut paused = s.clone();
+    paused.folders[0].errors = vec![
+        record(
+            "FOLDER_SYNC_PAUSED",
+            Scope::Folder { state: "a".into() },
+            NOW - SEC,
+        ),
+        record("WS_CLOSED", Scope::Folder { state: "a".into() }, NOW - MIN),
+    ];
+    assert_eq!(row(&paused).error.unwrap().code, "WS_CLOSED");
+    paused.folders[0].errors.truncate(1);
+    assert_eq!(row(&paused).error, None);
+
     // A resolved record stays in the history, muted, without a suggestion.
     let mut resolved = record("WS_CLOSED", Scope::Daemon, NOW - 5 * MIN);
     resolved.resolve(NOW - MIN);

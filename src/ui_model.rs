@@ -681,10 +681,12 @@ fn scope_text(scope: &Scope, names: &Names) -> Option<String> {
 
 /// The newest open error of a list (records arrive open-first, newest
 /// first, from the hub; this does not rely on it).
+/// `FOLDER_SYNC_PAUSED` is the Paused state, never shown as an error (§8 †).
 fn newest_open(records: &[ErrorRecord]) -> Option<&ErrorRecord> {
     records
         .iter()
         .filter(|record| !record.is_resolved())
+        .filter(|record| record.error.code != crate::orchestrator::hub_rules::PAUSED_CODE)
         .max_by_key(|record| (severity(record.error.class), record.last_at_ms))
 }
 
@@ -1039,9 +1041,7 @@ pub fn folder_row(folder: &FolderStatus, names: &Names, now: Now) -> FolderRowMo
     let sync = sync_chip(folder, names, now);
     let mount = mount_chip(folder, now);
     let lifecycle = lifecycle_chip(folder, now);
-    let error = newest_open(&folder.errors)
-        .filter(|record| record.error.code != crate::orchestrator::hub_rules::PAUSED_CODE)
-        .map(|record| error_line(record, names, now));
+    let error = newest_open(&folder.errors).map(|record| error_line(record, names, now));
     let open_errors = folder.errors.iter().filter(|r| !r.is_resolved()).count();
     let attention = matches!(
         folder.sync.state,
