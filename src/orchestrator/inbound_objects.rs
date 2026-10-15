@@ -356,13 +356,17 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     let mut sent = 0u64;
     let mut failure: Option<ErrorWire> = None;
     let done = Cancel::new();
+    // A first read of an object may verify it whole (verify-on-first-serve).
+    let largest = sizes.values().copied().max().unwrap_or(0);
+    let read_deadline =
+        worker_client::deadlines::with_verify(worker_client::deadlines::READ, largest);
     thread::scope(|scope| {
         scope.spawn(|| keepalive(&responder, &done, None));
         bound.client.read_stream(
             &bound.route,
             &ranges,
             INFLIGHT_READS,
-            worker_client::deadlines::READ,
+            read_deadline,
             &mut |range, result| {
                 if responder.cancelled() {
                     return ReadFlow::Stop;

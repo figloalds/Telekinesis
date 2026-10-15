@@ -490,6 +490,15 @@ pub mod deadlines {
     pub const WRITE: Duration = Duration::from_secs(60);
     /// `objects.report`: the sender re-verifies its copy.
     pub const REPORT: Duration = Duration::from_secs(60);
+    /// The whole-object hash a worker may do inside a call (the write that
+    /// completes an object, the first read of an object, a report) is
+    /// allowed this rate on top of the call's own deadline.
+    pub const VERIFY_BYTES_PER_S: u64 = 64 * 1024 * 1024;
+
+    /// `base` plus the time to verify an object of `size` bytes.
+    pub fn with_verify(base: Duration, size: u64) -> Duration {
+        base + Duration::from_secs(size / VERIFY_BYTES_PER_S)
+    }
 }
 
 /// First pause before a request the worker refused (`BUSY`) is sent again.

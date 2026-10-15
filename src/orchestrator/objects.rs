@@ -15,14 +15,18 @@
 //! * **upload** (`objects.push`, scope `objects.push#<lane>`): D pushes to A.
 //!
 //! So a stalled push never holds a pull of the same lane, and a failing
-//! direction backs off alone. Both directions run on the lane's one bulk
-//! session; the peer runs at most `PEER_CALLS` (2, its per-session exchange
-//! slots, `limits::BULK_HANDLERS`) of our `objects.*` calls at once, so the
-//! lane admits at most that many ([`LaneOptions::peer_calls`]): a first pull
-//! and a push wait their turn in order; a second (pipelined) pull is only
-//! taken when nobody waits. A key's round ends after [`ROUND_CAP`] (10 s)
-//! so other repositories get their turn; one that moved data runs again
-//! after [`CONTENT_YIELD`].
+//! direction backs off alone. At most `REPOS_PER_LANE` (2) repositories have
+//! rounds on the lane at once, both directions of one counting once
+//! ([`LaneOptions::repos`]; waiting repositories enter in order). Both
+//! directions run on the lane's one bulk session; the peer runs at most
+//! `PEER_CALLS` (2, its per-session exchange slots, `limits::BULK_HANDLERS`)
+//! of our `objects.*` calls at once, so the lane admits at most that many
+//! ([`LaneOptions::peer_calls`]): a first pull and a push wait their turn in
+//! order; a second (pipelined) pull is only taken when nobody waits
+//! (CCR-WP3.3-1). A key's round ends after [`ROUND_CAP`] (10 s) so other
+//! repositories get their turn; one that moved data runs again after
+//! [`CONTENT_YIELD`]. A round that finds nothing to pull starts no writer
+//! threads.
 //!
 //! Triggers: the local feed tip, the remote tip and content counters, and
 //! the local `generations.sync` (it moves when the metadata exchange stages
@@ -41,15 +45,20 @@
 //!    connection loss the next want returns the object again, with its
 //!    durable offset, and the transfer resumes there (never a blind replay).
 //!    Objects owned by another lane, objects in their per-object backoff, and
-//!    objects already begun in this round are left out.
-//! 2. Peer `objects.pull{repo, sender, receiver, lane, items, budget}`: the
-//!    lane's **window** (16 MiB, shared by its keys) bounds what is in
-//!    flight: a pull reserves its budget, and the budget comes back as its
-//!    bytes are written durably (or dropped) and, at its end, whatever it did
-//!    not deliver. At most 2 pulls are in flight; the second is issued when
-//!    half the window is free again ("re-pull at half"). A large object is
-//!    split across consecutive pulls; their chunks may interleave on the
-//!    wire, and the sink orders them.
+//!    objects already begun in this round are left out. (Objects in backoff
+//!    stay leased to one of the two sessions for the lease's TTL, so the
+//!    other session's wants see past them; CCR-WP3.3-4 asks for a direct
+//!    exclusion.)
+//! 2. Peer `objects.pull{repo, sender, receiver, lane, items, budget}`
+//!    (`sender` is our replica, `receiver` the peer's, as in
+//!    `meta.exchange`): the lane's **window** (16 MiB, shared by its keys)
+//!    bounds what is in flight: a pull reserves its budget (≤ 16 MiB), and
+//!    the budget comes back as its bytes are written durably (or dropped)
+//!    and, at its end, whatever it did not deliver. A pull is issued when
+//!    half the window is free ("re-pull at half"), and at most 2 are in
+//!    flight: when the link is the bottleneck the next pull starts while one
+//!    still streams. A large object is split across consecutive pulls; their
+//!    chunks may interleave on the wire, and the sink orders them.
 //! 3. Each CHUNK `{hash, offset, total, last}` goes to the [`Sink`]: at most
 //!    `INFLIGHT_WRITES` (4) worker `objects.write` calls in flight, one per
 //!    object at a time, each at the object's durable offset, ≤ 1 MiB, tiny
@@ -1432,12 +1441,18 @@ fn write_loop(inner: &SinkInner) {
         };
         let items = std::mem::take(&mut batch.items);
         let body = std::mem::take(&mut batch.body);
+        // A write that completes an object includes its whole-object hash.
+        let verified: u64 = items
+            .iter()
+            .filter(|item| item.last)
+            .map(|item| item.total)
+            .sum();
         let result = inner.client.write_batch(
             &inner.route,
             &batch.lease,
             items.clone(),
             body,
-            inner.options.deadline,
+            worker_client::deadlines::with_verify(inner.options.deadline, verified),
         );
         batch.items = items;
         let mut events = Vec::new();
@@ -2707,11 +2722,13 @@ fn push(
     let mut sent = 0u64;
     let mut local: HashMap<String, ObjectOutcome> = HashMap::new();
     let mut failure: Option<ExchangeError> = None;
+    // A first read of an object may verify it whole (verify-on-first-serve).
+    let largest = sizes.values().copied().max().unwrap_or(0);
     client.read_stream(
         route,
         &ranges,
         lane.options.reads,
-        worker_client::deadlines::READ,
+        worker_client::deadlines::with_verify(worker_client::deadlines::READ, largest),
         &mut |range, result| {
             if lane.stopped() {
                 failure = Some(lane.stop_error());
