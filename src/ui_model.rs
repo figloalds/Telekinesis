@@ -42,11 +42,7 @@ use crate::{
 use serde_json::Value;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex, MutexGuard, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -1171,8 +1167,7 @@ pub fn sync_chip(folder: &FolderStatus, names: &Names, now: Now) -> Chip {
         }
         F::Backoff => {
             let next = sharing(folder)
-                .filter_map(|p| retry_at(p, names))
-                .filter(|at| *at > now.ms)
+                .filter_map(|p| retry_at(p, names, now))
                 .min();
             let code = sharing(folder).find_map(|p| p.error.as_ref().map(|e| e.error.code.clone()));
             let mut out = match next {
@@ -1240,19 +1235,29 @@ fn join_nonempty(head: &str, tail: &str) -> String {
     }
 }
 
-/// When a pair retries: its own backoff, else its peer's earliest lane
-/// backoff, else its error's next retry.
-fn retry_at(p: &FolderPeerSync, names: &Names) -> Option<u64> {
+/// When a pair retries, if that is still ahead of `now`: its own backoff,
+/// else its peer's earliest lane backoff that is still ahead, else its
+/// error's next retry. A time already past never hides a later one (a lane
+/// whose backoff just ended does not hide another lane's retry).
+fn retry_at(p: &FolderPeerSync, names: &Names, now: Now) -> Option<u64> {
+    let ahead = |at: &u64| *at > now.ms;
     p.backoff_until_ms
+        .filter(ahead)
         .or_else(|| {
             names.peer_status(&p.installation).and_then(|peer| {
                 peer.lanes
                     .iter()
                     .filter_map(|lane| lane.backoff_until_ms)
+                    .filter(ahead)
                     .min()
             })
         })
-        .or_else(|| p.error.as_ref().and_then(|e| e.next_retry_at_ms))
+        .or_else(|| {
+            p.error
+                .as_ref()
+                .and_then(|e| e.next_retry_at_ms)
+                .filter(ahead)
+        })
 }
 
 /// `Waiting for office-nas (offline 5 min)`, or for several peers
@@ -1308,7 +1313,7 @@ fn peer_wait_reason(p: &FolderPeerSync, names: &Names, now: Now) -> String {
                 None => "offline".to_owned(),
             }
         }
-        FolderPeerState::Backoff => match retry_at(p, names).filter(|at| *at > now.ms) {
+        FolderPeerState::Backoff => match retry_at(p, names, now) {
             Some(at) => format!("retry in {}", format_duration(at - now.ms)),
             None => "retrying".to_owned(),
         },
@@ -2380,7 +2385,7 @@ pub fn folder_peer_chip(p: &FolderPeerSync, names: &Names, now: Now) -> Chip {
             )
         }
         S::Backoff => Chip::new(
-            match retry_at(p, names).filter(|at| *at > now.ms) {
+            match retry_at(p, names, now) {
                 Some(at) => format!("Backoff (retry in {})", format_duration(at - now.ms)),
                 None => "Backoff".to_owned(),
             },
@@ -3097,7 +3102,7 @@ pub struct FeedDown {
     pub started: Option<String>,
     pub start_error: Option<String>,
     /// Respawning is off: after a Shutdown from the desktop, or because the
-    /// daemon said it was shutting down ([`FeedDown::deliberate`]).
+    /// daemon said it was shutting down and went away (see [`Feed`]).
     pub respawn_off: bool,
     /// The daemon's last word was that it is shutting down (a `stopping`
     /// snapshot, or `ORCHESTRATOR_STOPPING`): someone stopped it on purpose,
@@ -3136,21 +3141,46 @@ impl Default for FeedOptions {
     }
 }
 
+/// Who may start a daemon, shared by the desktop and the feed thread.
+#[derive(Debug, Default)]
+struct RespawnGate {
+    /// The last daemon that answered (pid, start time).
+    daemon: Option<(u32, u64)>,
+    /// The desktop shut a daemon down ([`Feed::set_respawn`]): the daemon it
+    /// shut down (`None`: none had answered yet, so the next one to answer is
+    /// taken as it). No daemon is started until the user asks, or until a
+    /// different daemon answers (one started elsewhere, which is the one to
+    /// look after from then on).
+    hold: Option<Option<(u32, u64)>>,
+    /// The user asked for a daemon now ([`Feed::start_daemon`]); moot once a
+    /// daemon that is not shutting down answers.
+    start_now: bool,
+}
+
+fn gate(gate: &Mutex<RespawnGate>) -> MutexGuard<'_, RespawnGate> {
+    gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The status subscription (§7.2, §14 WP3.4 task 1): one thread long-polls
 /// `subscribe(since, wait)` and hands every newer snapshot to `sink`; on a
 /// failure it reconnects with backoff (250 ms → 5 s), and when no daemon
-/// answers it starts one (at most once per `start_every`). It never starts
-/// one while respawning is off: after a Shutdown from the desktop
-/// ([`Feed::set_respawn`]), or once the daemon said it was shutting down (a
-/// `stopping` snapshot or an `ORCHESTRATOR_STOPPING` reply: a shutdown from
-/// the CLI is not undone by an open window); [`Feed::start_daemon`] turns it
-/// back on. After any failure the next call asks for `since = 0`: the
-/// daemon may have restarted with fresh generations. A `sink` that returns
-/// `false` ends the thread.
+/// answers it starts one (at most once per `start_every`).
+///
+/// It never starts one that was shut down on purpose:
+/// * after a Shutdown from the desktop ([`Feed::set_respawn`]`(false)`),
+///   until the user asks for one ([`Feed::start_daemon`]) or a different
+///   daemon answers (one started from the CLI, say);
+/// * once the daemon said it was shutting down (a `stopping` snapshot or an
+///   `ORCHESTRATOR_STOPPING` reply: a shutdown from the CLI is not undone by
+///   an open window) and went away, until a daemon that is not shutting down
+///   answers again or the user asks for one.
+///
+/// After any failure the next call asks for `since = 0`: the daemon may have
+/// restarted with fresh generations. A `sink` that returns `false` ends the
+/// thread.
 pub struct Feed {
     cancel: Cancel,
-    respawn: Arc<AtomicBool>,
-    start_now: Arc<AtomicBool>,
+    gate: Arc<Mutex<RespawnGate>>,
 }
 
 impl Feed {
@@ -3161,12 +3191,10 @@ impl Feed {
         mut sink: Box<dyn FnMut(FeedUpdate) -> bool + Send>,
     ) -> Self {
         let cancel = Cancel::new();
-        let respawn = Arc::new(AtomicBool::new(true));
-        let start_now = Arc::new(AtomicBool::new(false));
+        let shared = Arc::new(Mutex::new(RespawnGate::default()));
         let feed = Self {
             cancel: cancel.clone(),
-            respawn: Arc::clone(&respawn),
-            start_now: Arc::clone(&start_now),
+            gate: Arc::clone(&shared),
         };
         let _ = thread::Builder::new()
             .name("gui-subscribe".into())
@@ -3177,12 +3205,30 @@ impl Feed {
                 let mut last_start: Option<Instant> = None;
                 // The daemon's last word was that it is shutting down.
                 let mut stopping = false;
+                // It said so and then went away: it stays down until a
+                // daemon answers again or the user asks for one.
+                let mut stayed_down = false;
                 while !cancel.is_cancelled() {
                     match transport.subscribe(since, options.wait) {
                         Ok(snapshot) => {
                             attempt = 0;
                             stopping = snapshot.daemon.stopping;
                             let identity = (snapshot.daemon.pid, snapshot.daemon.started_at_ms);
+                            {
+                                let mut g = gate(&shared);
+                                match g.hold {
+                                    Some(None) => g.hold = Some(Some(identity)),
+                                    Some(Some(held)) if held != identity => g.hold = None,
+                                    _ => {}
+                                }
+                                g.daemon = Some(identity);
+                                if !stopping {
+                                    // A daemon is up: an earlier shutdown is
+                                    // over and a pending start is moot.
+                                    g.start_now = false;
+                                    stayed_down = false;
+                                }
+                            }
                             let fresh = daemon != Some(identity) || snapshot.generation != since;
                             daemon = Some(identity);
                             since = snapshot.generation;
@@ -3198,14 +3244,18 @@ impl Feed {
                             if error.message().contains(STOPPING_CODE) {
                                 stopping = true;
                             }
-                            let forced = start_now.swap(false, Ordering::SeqCst);
+                            let (forced, held) = {
+                                let mut g = gate(&shared);
+                                (std::mem::take(&mut g.start_now), g.hold.is_some())
+                            };
                             if forced {
                                 stopping = false;
+                                stayed_down = false;
                             } else if stopping && gone {
                                 // Shut down on purpose: stay down.
-                                respawn.store(false, Ordering::SeqCst);
+                                stayed_down = true;
                             }
-                            let respawn_on = respawn.load(Ordering::SeqCst);
+                            let respawn_on = !held && !stayed_down;
                             let due = forced
                                 || last_start.is_none_or(|at| at.elapsed() >= options.start_every);
                             let mut down = FeedDown {
@@ -3242,7 +3292,7 @@ impl Feed {
                             // Sleep in slices, so `start_daemon` is prompt.
                             let until = Instant::now() + delay;
                             while Instant::now() < until {
-                                if start_now.load(Ordering::SeqCst) {
+                                if gate(&shared).start_now {
                                     break;
                                 }
                                 let slice = until
@@ -3259,17 +3309,20 @@ impl Feed {
         feed
     }
 
-    /// Whether the feed may start a daemon that is gone (off after a
-    /// Shutdown from the desktop).
+    /// `false`: the desktop is shutting the daemon down, so a daemon that is
+    /// gone is not started again until [`Feed::start_daemon`] or until a
+    /// different daemon answers. `true` lifts that (the Shutdown failed).
     pub fn set_respawn(&self, on: bool) {
-        self.respawn.store(on, Ordering::SeqCst);
+        let mut g = gate(&self.gate);
+        g.hold = if on { None } else { Some(g.daemon) };
     }
 
-    /// Turns respawning on and starts a daemon at the next failure, without
-    /// waiting for the backoff.
+    /// Lifts every reason not to start a daemon and starts one at the next
+    /// failure, without waiting for the backoff.
     pub fn start_daemon(&self) {
-        self.respawn.store(true, Ordering::SeqCst);
-        self.start_now.store(true, Ordering::SeqCst);
+        let mut g = gate(&self.gate);
+        g.hold = None;
+        g.start_now = true;
     }
 
     /// Ends the thread at its next wake-up (a long poll in flight finishes
