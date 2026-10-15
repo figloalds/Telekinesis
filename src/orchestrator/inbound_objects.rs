@@ -108,7 +108,7 @@ use super::{
         SinkOptions, SinkResult, allot, covered, handoff_park, handoff_progress, handoff_release,
         handoff_take, handoff_unclaim, handoff_unclaim_all, handoff_wanted, is_failure,
         is_unsupported, object_blocked, object_failed, object_installed, object_key, outcome_error,
-        push_lease, read_outcome, read_ranges,
+        push_lease, read_outcome, read_ranges, size_unknown,
     },
     worker_client::{self, ReadFlow, SessionWorkerClient},
 };
@@ -384,6 +384,13 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         .iter()
         .map(|item| (item.hash.clone(), item.size))
         .collect();
+    // Objects whose size the dialer does not know: their one empty read
+    // learns our total (module docs, "Pull").
+    let unknown: HashSet<String> = served
+        .iter()
+        .filter(|item| size_unknown(item))
+        .map(|item| item.hash.clone())
+        .collect();
     let ranges = read_ranges(&served, &served_spans);
     let mut sent_to: HashMap<String, u64> = HashMap::new();
     let mut sent = 0u64;
@@ -405,6 +412,22 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                     return ReadFlow::Stop;
                 }
                 match result {
+                    Ok((total, bytes)) if unknown.contains(&range.hash) && bytes.is_empty() => {
+                        // The dialer does not know this object's size: one
+                        // empty chunk carries our total (WP3.INT re-review);
+                        // it pulls the bytes next with that size.
+                        let chunk = ChunkHeader {
+                            id: 0,
+                            hash: Some(range.hash.clone()),
+                            offset: 0,
+                            total,
+                            last: total == 0,
+                        };
+                        if responder.chunk(chunk, &[]).is_err() {
+                            return ReadFlow::Stop;
+                        }
+                        ReadFlow::SkipObject
+                    }
                     Ok((total, bytes)) => {
                         let size = sizes.get(&range.hash).copied().unwrap_or(total);
                         if total != size || bytes.len() as u64 != range.len {
@@ -464,6 +487,8 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         .map(|item| {
             let end = sent_to.get(&item.hash).copied();
             let sent_outcome = match end {
+                // A size probe sends no bytes of the object.
+                _ if unknown.contains(&item.hash) => ObjectOutcome::Skipped,
                 Some(end) if end == item.size => ObjectOutcome::Completed,
                 Some(end) => ObjectOutcome::Progressed {
                     durable_offset: end,
@@ -970,6 +995,13 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
             },
         };
         let call = result.is_some_and(|result| result.call.is_some());
+        // Only an object we offered this dialer can fail here (WP3.INT
+        // re-review): a push may list any hash, and one we never offered
+        // (not wanted, `UNSOLICITED_OBJECT`; not this lane's,
+        // `OBJECT_ON_WRONG_LANE`) is answered in the result alone, with
+        // neither a backoff nor an `ObjectError`, so a peer cannot fill our
+        // status or our backoff table with hashes of its choosing.
+        let ours = offered.contains_key(item.hash.as_str());
         match &outcome {
             ObjectOutcome::Completed => {
                 objects_down += 1;
@@ -985,7 +1017,7 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                     });
                 }
             }
-            other if is_failure(other) && !call => {
+            other if is_failure(other) && !call && ours => {
                 let detail = format!("pushed by peer {}", peer.installation);
                 if let Some(mut error) = outcome_error(&item.hash, other, &detail) {
                     let delay = object_failed(&source.key(&item.hash), &error.code);
@@ -1006,6 +1038,14 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
             _ => {}
         }
         let unsent = whole && shares.get(&item.hash).is_some_and(|share| !share.got);
+        if !ours {
+            answer.push(ObjectResult {
+                hash: item.hash.clone(),
+                bytes: written,
+                outcome,
+            });
+            continue;
+        }
         settle_pushed(
             &source,
             item,

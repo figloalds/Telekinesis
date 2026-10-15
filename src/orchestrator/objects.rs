@@ -21,10 +21,12 @@
 //! directions run on the lane's one bulk session; the peer runs at most
 //! `PEER_CALLS` (2, its per-session exchange slots, `limits::BULK_HANDLERS`)
 //! of our `objects.*` calls at once, so the lane admits at most that many
-//! ([`LaneOptions::peer_calls`]): a first pull and a push wait their turn in
-//! order; a second (pipelined) pull is only taken when nobody waits
-//! (CCR-WP3.3-1). A key's round ends after [`ROUND_CAP`] (10 s) so other
-//! repositories get their turn; one that moved data runs again after
+//! ([`LaneOptions::peer_calls`]): pulls, pushes and reports wait their turn
+//! in order, and pushes (with their `objects.wants`) hold at most
+//! `peer_calls - 1` slots at once, so a push the peer stalls never keeps a
+//! pull or a report waiting (CCR-WP3.3-1; WP3.INT re-review). A key's round
+//! ends after [`ROUND_CAP`] (10 s) so other repositories get their turn; one
+//! that moved data runs again after
 //! [`CONTENT_YIELD`]. A round that finds nothing to pull starts no writer
 //! threads.
 //!
@@ -57,10 +59,13 @@
 //! 2. Peer `objects.pull{repo, sender, receiver, lane, items, budget}`
 //!    (`sender` is our replica, `receiver` the peer's, as in
 //!    `meta.exchange`): the lane's **window** (16 MiB, shared by its keys)
-//!    bounds what is in flight: a pull reserves its budget (≤ 16 MiB), and
-//!    the budget comes back as its bytes are written durably (or dropped)
-//!    and, at its end, whatever it did not deliver. A pull is issued when
-//!    half the window is free ("re-pull at half"), and at most 2 are in
+//!    bounds what is in flight: a pull reserves its budget (at most its
+//!    key's fair share of the window, `window / REPOS_PER_LANE`, so a pull
+//!    whose source stalls never takes the window from another repository;
+//!    WP3.INT re-review), and the budget comes back as its bytes are written
+//!    durably (or dropped) and, at its end, whatever it did not deliver. The
+//!    next pull is issued once the one in flight received half its budget
+//!    ("re-pull at half"), and at most 2 are in
 //!    flight: when the link is the bottleneck the next pull starts while one
 //!    still streams. A large object is split across consecutive pulls; their
 //!    chunks may interleave on the wire, and the sink orders them.
@@ -189,7 +194,8 @@ use crate::{
                 INFLIGHT_PULLS, INFLIGHT_READS, INFLIGHT_WRITES, LEASE_TTL, MAX_READ_LEN,
                 MAX_WANT_ITEMS, ObjectOutcome, ObjectsPull, ObjectsPush, ObjectsReport,
                 ObjectsResult, ObjectsWantsReply, ObjectsWantsRequest, PULL_BUDGET_BYTES,
-                REPOS_PER_LANE, WantHeader, WantItem, WantPriority, WriteItem, WriteResult,
+                REPOS_PER_LANE, ReadHeader, WantHeader, WantItem, WantPriority, WriteItem,
+                WriteResult,
             },
             ops,
         },
@@ -250,8 +256,16 @@ const MAX_WRITE_BYTES: usize = MAX_READ_LEN as usize;
 const MAX_WRITE_ITEMS: usize = MAX_WANT_ITEMS;
 /// Longest wait of a round's event loop before it re-checks its state.
 const EVENT_WAIT: Duration = Duration::from_millis(100);
-/// Per-object failures remembered before expired ones are pruned.
-const BACKOFF_PRUNE: usize = 16 * 1024;
+/// Per-object backoffs (object and source) remembered at most. Inserting
+/// past it prunes once: expired entries first, then the earliest-expiring
+/// ones down to [`BACKOFF_KEEP`] (so the pruning cost is amortized over the
+/// quarter of the table it frees; WP3.INT re-review).
+const BACKOFF_MAX: usize = 16 * 1024;
+const BACKOFF_KEEP: usize = BACKOFF_MAX / 4 * 3;
+/// The SHA-256 of no bytes: the only object whose size is 0. A want item of
+/// another object with size 0 has an unknown size (an event without a size
+/// descriptor; WP3.INT re-review), and its sender's total defines it.
+pub const EMPTY_OBJECT: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 // ---------------------------------------------------------------------------
 // Options and statistics
@@ -403,6 +417,15 @@ pub fn covered(item: &WantItem, span: (u64, u64)) -> bool {
     span.1 > span.0 || (item.size == 0 && item.offset == 0)
 }
 
+/// Whether a want item's size is unknown to its receiver: size 0 for an
+/// object that is not the empty one (an event without a size descriptor,
+/// which the core keeps for legacy journals). Such an item is sent like a
+/// zero-size object, one empty chunk, which carries the sender's total; the
+/// receiver then wants it with that size (WP3.INT re-review).
+pub fn size_unknown(item: &WantItem) -> bool {
+    item.size == 0 && item.offset == 0 && item.hash != EMPTY_OBJECT
+}
+
 /// The lease session of a dialer's pulls on `lane` of `peer` (`slot` 0 or
 /// 1): stable across reconnects, so a resumed transfer finds its own lease.
 pub fn pull_lease(peer: &str, lane: LaneSpec, slot: u64) -> String {
@@ -456,13 +479,17 @@ pub fn is_resume_point(code: &str) -> bool {
 }
 
 /// Whether an outcome is a per-object failure worth a backoff and an
-/// `ObjectError` (not success, not Contention).
+/// `ObjectError` (not success, not Contention). `Unsolicited` is none: the
+/// receiving worker no longer wants the object (its event was quarantined,
+/// or it never wanted it), which is nobody's failure; the object settles
+/// (WP3.INT re-review).
 pub fn is_failure(outcome: &ObjectOutcome) -> bool {
     match outcome {
         ObjectOutcome::Completed
         | ObjectOutcome::Progressed { .. }
         | ObjectOutcome::Skipped
-        | ObjectOutcome::InFlightElsewhere => false,
+        | ObjectOutcome::InFlightElsewhere
+        | ObjectOutcome::Unsolicited => false,
         ObjectOutcome::Failed(error) => error.class != ErrorClass::Contention,
         _ => true,
     }
@@ -488,10 +515,109 @@ struct Held {
 }
 
 /// Per object (local installation, repository, direction, hash), per source
-/// peer.
-fn held() -> &'static Mutex<HashMap<String, HashMap<String, Held>>> {
-    static HELD: OnceLock<Mutex<HashMap<String, HashMap<String, Held>>>> = OnceLock::new();
-    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+/// peer; `entries` counts the (object, peer) pairs, bounded by
+/// [`BACKOFF_MAX`].
+#[derive(Default)]
+struct HeldTable {
+    map: HashMap<String, HashMap<String, Held>>,
+    entries: usize,
+}
+
+impl HeldTable {
+    fn get(&self, key: &ObjectKey) -> Option<&Held> {
+        self.map.get(&key.object)?.get(&key.peer)
+    }
+
+    /// Room for one more entry: expired entries go first, then the
+    /// earliest-expiring ones, down to [`BACKOFF_KEEP`]. An entry dropped
+    /// early only loses its escalation (and the code it would resolve).
+    fn make_room(&mut self, now: Instant) {
+        if self.entries < BACKOFF_MAX {
+            return;
+        }
+        self.map.retain(|_, peers| {
+            peers.retain(|_, held| now < held.until);
+            !peers.is_empty()
+        });
+        self.entries = self.map.values().map(HashMap::len).sum();
+        if self.entries <= BACKOFF_KEEP {
+            return;
+        }
+        let mut until: Vec<Instant> = self
+            .map
+            .values()
+            .flat_map(|peers| peers.values().map(|held| held.until))
+            .collect();
+        let drop = self.entries - BACKOFF_KEEP;
+        until.select_nth_unstable(drop - 1);
+        let cut = until[drop - 1];
+        let mut left = drop;
+        self.map.retain(|_, peers| {
+            peers.retain(|_, held| {
+                if left > 0 && held.until <= cut {
+                    left -= 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            !peers.is_empty()
+        });
+        self.entries = self.map.values().map(HashMap::len).sum();
+    }
+
+    fn entry(&mut self, key: &ObjectKey, now: Instant) -> &mut Held {
+        let known = self
+            .map
+            .get(&key.object)
+            .is_some_and(|peers| peers.contains_key(&key.peer));
+        if !known {
+            self.make_room(now);
+            self.entries += 1;
+        }
+        self.map
+            .entry(key.object.clone())
+            .or_default()
+            .entry(key.peer.clone())
+            .or_insert_with(|| Held {
+                backoff: Backoff::objects(),
+                until: now,
+                code: String::new(),
+            })
+    }
+
+    fn remove(&mut self, key: &ObjectKey) -> Option<Held> {
+        let peers = self.map.get_mut(&key.object)?;
+        let held = peers.remove(&key.peer);
+        if peers.is_empty() {
+            self.map.remove(&key.object);
+        }
+        if held.is_some() {
+            self.entries -= 1;
+        }
+        held
+    }
+
+    fn remove_object(&mut self, object: &str) -> Vec<Held> {
+        let held: Vec<Held> = self
+            .map
+            .remove(object)
+            .into_iter()
+            .flat_map(HashMap::into_values)
+            .collect();
+        self.entries -= held.len();
+        held
+    }
+}
+
+fn held() -> &'static Mutex<HeldTable> {
+    static HELD: OnceLock<Mutex<HeldTable>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HeldTable::default()))
+}
+
+/// Per-object backoffs remembered now (diagnostics and tests).
+pub fn object_backoffs() -> usize {
+    lock(held()).entries
 }
 
 /// A per-object backoff key: the object (local installation, repository,
@@ -513,8 +639,7 @@ pub(crate) fn object_key(local: &str, peer: &str, repo: &str, up: bool, hash: &s
 /// Whether `key` is inside its backoff.
 pub(crate) fn object_blocked(key: &ObjectKey) -> bool {
     lock(held())
-        .get(&key.object)
-        .and_then(|peers| peers.get(&key.peer))
+        .get(key)
         .is_some_and(|held| Instant::now() < held.until)
 }
 
@@ -524,23 +649,8 @@ pub(crate) fn object_blocked(key: &ObjectKey) -> bool {
 /// earlier failure.
 pub(crate) fn object_failed(key: &ObjectKey, code: &str) -> Duration {
     let now = Instant::now();
-    let mut map = lock(held());
-    if map.len() >= BACKOFF_PRUNE {
-        let stale = |held: &Held| now >= held.until + Duration::from_secs(3600);
-        map.retain(|_, peers| {
-            peers.retain(|_, held| !stale(held));
-            !peers.is_empty()
-        });
-    }
-    let held = map
-        .entry(key.object.clone())
-        .or_default()
-        .entry(key.peer.clone())
-        .or_insert_with(|| Held {
-            backoff: Backoff::objects(),
-            until: now,
-            code: String::new(),
-        });
+    let mut table = lock(held());
+    let held = table.entry(key, now);
     let delay = held.backoff.failure(now);
     held.until = now + delay;
     if !code.is_empty() {
@@ -549,16 +659,39 @@ pub(crate) fn object_failed(key: &ObjectKey, code: &str) -> Duration {
     delay
 }
 
+/// The objects of `repo` moving in direction `up` between `local` and `peer`
+/// may be tried again at once, with their escalation reset (their codes stay,
+/// to be resolved when they complete): the peer now holds objects it lacked
+/// (its published content counters grew), so what it could not serve may now
+/// be served (WP3.INT re-review). Returns how many were in their backoff.
+pub(crate) fn object_backoffs_reset(local: &str, peer: &str, repo: &str, up: bool) -> usize {
+    let direction = if up { "up" } else { "down" };
+    let prefix = format!("{local}\u{1f}{repo}\u{1f}{direction}\u{1f}");
+    let now = Instant::now();
+    let mut reset = 0;
+    let mut table = lock(held());
+    for (object, peers) in table.map.iter_mut() {
+        if !object.starts_with(&prefix) {
+            continue;
+        }
+        if let Some(held) = peers.get_mut(peer)
+            && now < held.until
+        {
+            held.until = now;
+            held.backoff = Backoff::objects();
+            reset += 1;
+        }
+    }
+    reset
+}
+
 /// `key` completed (with its peer): forgets its failures; returns the code
 /// of the failure it had, if any (to resolve in the hub).
 pub(crate) fn object_completed(key: &ObjectKey) -> Option<String> {
-    let mut map = lock(held());
-    let peers = map.get_mut(&key.object)?;
-    let held = peers.remove(&key.peer);
-    if peers.is_empty() {
-        map.remove(&key.object);
-    }
-    held.map(|held| held.code).filter(|code| !code.is_empty())
+    lock(held())
+        .remove(key)
+        .map(|held| held.code)
+        .filter(|code| !code.is_empty())
 }
 
 /// `key`'s object is installed here (from whichever source): forgets the
@@ -566,9 +699,8 @@ pub(crate) fn object_completed(key: &ObjectKey) -> Option<String> {
 /// resolve in the hub).
 pub(crate) fn object_installed(key: &ObjectKey) -> Vec<String> {
     let mut codes: Vec<String> = lock(held())
-        .remove(&key.object)
+        .remove_object(&key.object)
         .into_iter()
-        .flat_map(HashMap::into_values)
         .map(|held| held.code)
         .filter(|code| !code.is_empty())
         .collect();
@@ -1088,13 +1220,6 @@ impl Slots {
         drop(state);
         self.changed.notify_all();
         slot
-    }
-
-    /// A slot if one is free and nobody waits.
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<Slot> {
-        let mut state = lock(&self.state);
-        (state.queue.waiting.is_empty() && state.used < self.capacity)
-            .then(|| self.grant(&mut state))
     }
 }
 
@@ -1802,6 +1927,36 @@ impl Sink {
         });
     }
 
+    /// `hash`, declared with size 0 because its size was unknown
+    /// ([`size_unknown`]), is `total` bytes: it takes that size if nothing of
+    /// it was received or settled yet (returns whether it did).
+    pub(crate) fn resize(&self, hash: &str, total: u64) -> bool {
+        self.with_state(|state, _| match state.objects.get_mut(hash) {
+            Some(object)
+                if object.total == 0
+                    && object.next == 0
+                    && object.written == 0
+                    && object.settled.is_none()
+                    && !object.writing
+                    && !object.empty_due =>
+            {
+                object.total = total;
+                object.limit = total;
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// Whether `hash` reached its final state in this sink (nothing more of
+    /// it is accepted).
+    pub(crate) fn settled(&self, hash: &str) -> bool {
+        lock(&self.inner.state)
+            .objects
+            .get(hash)
+            .is_some_and(|object| object.settled.is_some())
+    }
+
     /// Writes the partial data of `hashes` without waiting for a full call.
     pub(crate) fn flush(&self, hashes: &[String]) {
         let max_write = self.inner.options.max_write;
@@ -2009,6 +2164,10 @@ pub fn run_lane_with(
         status,
         window: Arc::new(Window::new(options.window_bytes, Some(stats.clone()))),
         slots: Slots::new(options.peer_calls, Some(stats.clone())),
+        // Pushes leave at least one peer slot to pulls and reports (WP3.INT
+        // re-review): a push held by the peer's stalled worker keeps its slot
+        // until the peer's write deadline.
+        pushes: Slots::new(options.peer_calls.saturating_sub(1).max(1), None),
         repos: RepoGate::new(options.repos, Some(stats.clone())),
         stats,
         cancel: token.clone(),
@@ -2016,6 +2175,7 @@ pub fn run_lane_with(
         modes: Mutex::new(HashMap::new()),
         interim: InterimState::default(),
         turns: Mutex::new(HashMap::new()),
+        remote_content: Mutex::new(HashMap::new()),
         claimant: format!(
             "{}#{}",
             pull_holder(&peer.installation, lane),
@@ -2078,6 +2238,9 @@ struct LaneRun {
     status: u32,
     window: Arc<Window>,
     slots: Arc<Slots>,
+    /// Pushes at once: one fewer than `slots` (when there are two or more),
+    /// so a stalled push never takes the last slot from pulls and reports.
+    pushes: Arc<Slots>,
     repos: RepoGate,
     stats: Arc<LaneStats>,
     /// Ends both directions (the lane's cancel, the session's end).
@@ -2090,6 +2253,9 @@ struct LaneRun {
     /// The pull lease ids, per repository (each repository is one worker,
     /// with its own leases).
     turns: Mutex<HashMap<String, Turns>>,
+    /// Per repository: the peer's published content counters (shared and
+    /// current objects available) as the last download round saw them.
+    remote_content: Mutex<HashMap<String, (u64, u64)>>,
     /// This lane run's name in the handoff table (module docs, "Lease
     /// handoff"): the lane's holder name and a number of its own, so a run
     /// gives back only its own claims.
@@ -2357,6 +2523,33 @@ impl LaneRun {
         });
     }
 
+    /// The peer's published content grew since the last download round of
+    /// `target` (it holds objects it lacked: a relay that got them, a copy
+    /// repaired): what it could not serve us is tried again at once instead of
+    /// after its backoff, up to an hour (WP3.INT re-review).
+    fn remote_content_grew(&self, target: &Target) {
+        // No counters published (yet) counts as nothing available.
+        let now = target.remote.content.map_or((0, 0), |content| {
+            (content.shared_available, content.current_available)
+        });
+        let before = lock(&self.remote_content).insert(target.repo.clone(), now);
+        if before.is_some_and(|(shared, current)| now.0 > shared || now.1 > current) {
+            let reset = object_backoffs_reset(
+                &self.ctx.installation,
+                &self.peer.installation,
+                &target.repo,
+                false,
+            );
+            if reset > 0 {
+                event!(debug, OBJECT_BACKOFF_RESET, {
+                    "peer": self.peer.installation,
+                    "repo": target.repo,
+                    "objects": reset,
+                });
+            }
+        }
+    }
+
     /// An object completed: clears its backoff and resolves its errors. One
     /// installed here (`up` false) resolves those of every source of it (a
     /// source that could not serve it may have handed it to this one).
@@ -2442,6 +2635,7 @@ impl Job for DownloadJob {
         let Some(client) = lane.local(target)? else {
             return lane.interim_exchange(target, retry_after);
         };
+        lane.remote_content_grew(target);
         bump(&lane.stats.v3_rounds, 1);
         match download_round(lane, target, &client)? {
             RoundEnd::Done(next) => Ok(next),
@@ -2531,6 +2725,9 @@ struct Pull {
     /// `(hash, start, end)` this pull covers.
     spans: Vec<(String, u64, u64)>,
     budget: u64,
+    /// Bytes received so far, counted as they stream (the next pull waits
+    /// for half the budget: "re-pull at half").
+    streamed: Arc<AtomicU64>,
     received: u64,
     released: u64,
     completed: u64,
@@ -2548,6 +2745,9 @@ enum RoundEvent {
         result: Result<ObjectsResult, CallError>,
         received: u64,
         ends: HashMap<String, u64>,
+        /// Objects whose size we did not know, with the total their
+        /// sender's empty chunk gave ([`size_unknown`]).
+        sized: HashMap<String, u64>,
     },
 }
 
@@ -2793,6 +2993,7 @@ struct SinkGone;
 trait SinkOps {
     fn cut(&self, hash: &str, at: u64);
     fn flush(&self, hashes: &[String]);
+    fn resize(&self, hash: &str, total: u64) -> bool;
 }
 
 impl SinkOps for Sink {
@@ -2801,6 +3002,9 @@ impl SinkOps for Sink {
     }
     fn flush(&self, hashes: &[String]) {
         Sink::flush(self, hashes);
+    }
+    fn resize(&self, hash: &str, total: u64) -> bool {
+        Sink::resize(self, hash, total)
     }
 }
 
@@ -2815,11 +3019,17 @@ impl SinkOps for LazySink {
             sink.flush(hashes);
         }
     }
+    fn resize(&self, hash: &str, total: u64) -> bool {
+        self.cell.get().is_some_and(|sink| sink.resize(hash, total))
+    }
 }
 
 impl SinkOps for SinkGone {
     fn cut(&self, _: &str, _: u64) {}
     fn flush(&self, _: &[String]) {}
+    fn resize(&self, _: &str, _: u64) -> bool {
+        false
+    }
 }
 
 fn round_event(
@@ -2840,8 +3050,26 @@ fn round_event(
             result,
             received,
             ends,
+            sized,
         } => {
             state.want_dry = false;
+            // Objects whose size we just learned are pulled again, whole,
+            // under the lease they were wanted under.
+            for (hash, total) in sized {
+                let Some(planned) = state.planned.get(&hash).cloned() else {
+                    continue;
+                };
+                if sink.resize(&hash, total) {
+                    state.plan.push_front(Planned {
+                        item: WantItem {
+                            size: total,
+                            offset: 0,
+                            ..planned.item
+                        },
+                        ..planned
+                    });
+                }
+            }
             let Some(pull) = state.pulls.get_mut(&tag) else {
                 return;
             };
@@ -2920,6 +3148,11 @@ fn sink_event(lane: &LaneRun, target: &Target, state: &mut RoundState, event: Si
             call,
         } => {
             state.want_dry = false;
+            // Settled in this round's sink: whatever of it is still planned
+            // would be read at the source, sent and dropped here (WP3.INT
+            // re-review). It continues, if at all, from the durable offset
+            // our worker gives in a later round.
+            state.plan.retain(|planned| planned.item.hash != hash);
             match &outcome {
                 ObjectOutcome::Completed => {
                     state.completed += 1;
@@ -3144,7 +3377,15 @@ fn want_more(
 
 /// Issues the next pull when the window and a peer slot allow (module docs,
 /// step 2). The first pull of a round waits its turn; a second one only
-/// goes when half the window is free and nobody waits.
+/// goes once the pull in flight received half its budget ("re-pull at
+/// half"), when its budget is free and nobody waits.
+///
+/// A pull reserves at most its key's fair share of the lane window
+/// (`window / repos`, 8 MiB): the window is shared by the lane's keys, and a
+/// pull whose source stalls (a first-serve verify, a slow disk) holds its
+/// reservation until it ends, so a whole-window pull would stop every other
+/// repository's downloads on the lane (§2.3; WP3.INT re-review). One key
+/// still uses the whole window with its two pulls once data flows.
 #[allow(clippy::too_many_arguments)]
 fn issue_pull<'scope, 'env>(
     lane: &'env LaneRun,
@@ -3158,11 +3399,20 @@ fn issue_pull<'scope, 'env>(
     scope: &'scope thread::Scope<'scope, 'env>,
 ) -> bool {
     let first = state.in_flight() == 0;
-    // A pull's budget never exceeds what the acceptor honours.
+    if !first
+        && state.pulls.values().any(|pull| {
+            pull.ended.is_none() && pull.streamed.load(Ordering::Relaxed) < pull.budget / 2
+        })
+    {
+        return false;
+    }
+    // A pull's budget never exceeds what the acceptor honours, nor the key's
+    // fair share of the window.
     let window = lane.window.capacity().min(PULL_BUDGET_BYTES);
+    let share = (window / lane.options.repos.max(1) as u64).max(1);
     let plan_bytes = state.plan_bytes();
-    let min = plan_bytes.min(window / 2);
-    let max = plan_bytes.min(window);
+    let min = plan_bytes.min(share / 2);
+    let max = plan_bytes.min(share);
     // (Claims stay renewed while the round waits its turn.)
     let stop = || {
         renewal.tick(false);
@@ -3176,10 +3426,19 @@ fn issue_pull<'scope, 'env>(
     let Some(budget) = budget else {
         return false;
     };
+    // A pipelined pull waits its turn for a peer slot too (behind a push or
+    // a wants call that holds the other one), but not past the moment its
+    // round could use it: it gives up after `EVENT_WAIT` × 10 and is tried
+    // again.
+    let until = Instant::now() + EVENT_WAIT * 10;
+    let pipelined = || {
+        renewal.tick(false);
+        lane.stopped() || abort.load(Ordering::Relaxed) || Instant::now() >= until
+    };
     let slot = if first {
         lane.slots.acquire(&stop)
     } else {
-        lane.slots.try_acquire()
+        lane.slots.acquire(&pipelined)
     };
     let Some(slot) = slot else {
         lane.window.release(budget);
@@ -3216,11 +3475,14 @@ fn issue_pull<'scope, 'env>(
         sink.expect(&item.hash, lease, item.size, *start, tag);
         state.begun.insert(item.hash.clone());
     }
-    let allowed: HashMap<String, (u64, u64)> = items
+    // Per item: its span, and whether its size is unknown (its sender's one
+    // empty chunk then gives the size).
+    let allowed: HashMap<String, (u64, u64, bool)> = items
         .iter()
         .zip(&spans)
-        .map(|(item, span)| (item.hash.clone(), *span))
+        .map(|(item, span)| (item.hash.clone(), (span.0, span.1, size_unknown(item))))
         .collect();
+    let streamed = Arc::new(AtomicU64::new(0));
     state.pulls.insert(
         tag,
         Pull {
@@ -3231,6 +3493,7 @@ fn issue_pull<'scope, 'env>(
                 .map(|(item, (start, end))| (item.hash.clone(), *start, *end))
                 .collect(),
             budget,
+            streamed: streamed.clone(),
             received: 0,
             released: 0,
             completed: 0,
@@ -3255,6 +3518,7 @@ fn issue_pull<'scope, 'env>(
         let _slot = slot;
         let mut received = 0u64;
         let mut ends: HashMap<String, u64> = HashMap::new();
+        let mut sized: HashMap<String, u64> = HashMap::new();
         let header = serde_json::to_value(&request).unwrap_or_default();
         let result = lane
             .conn
@@ -3276,17 +3540,26 @@ fn issue_pull<'scope, 'env>(
                             "an objects.pull stream carried a chunk without an object",
                         ));
                     };
-                    let Some(&(start, end)) = allowed.get(hash) else {
+                    let Some(&(start, end, unknown)) = allowed.get(hash) else {
                         return Err(ErrorWire::coded(
                             "PROTOCOL_VIOLATION",
                             format!("objects.pull streamed {hash}, which it was not asked for"),
                         ));
                     };
-                    // In order from the start of its span, inside it.
+                    // In order from the start of its span, inside it; an
+                    // empty chunk only as the one chunk of an empty span (a
+                    // zero-size object, or one whose size we do not know):
+                    // empty chunks carry no bytes but reset the call's idle
+                    // deadline, so a peer could hold the pull, its slot and
+                    // the window with them forever (invariant 22; WP3.INT
+                    // re-review).
                     let chunk_end = chunk.offset.saturating_add(len);
+                    let first_chunk = !ends.contains_key(hash);
                     let next = ends.get(hash).copied().unwrap_or(start);
+                    let sized_ok = len > 0 || (first_chunk && start == end);
                     if chunk.offset != next
                         || chunk_end > end
+                        || !sized_ok
                         || received.saturating_add(len) > budget
                     {
                         return Err(ErrorWire::coded(
@@ -3299,8 +3572,27 @@ fn issue_pull<'scope, 'env>(
                         ));
                     }
                     received += len;
+                    streamed.fetch_add(len, Ordering::Relaxed);
                     ends.insert(hash.to_owned(), chunk_end);
-                    let _ = sink.offer(hash, chunk.offset, chunk.total, bytes, tag);
+                    if unknown && chunk.total > 0 {
+                        // The sender's total of an object whose size we did
+                        // not know: it is pulled again with that size.
+                        sized.insert(hash.to_owned(), chunk.total);
+                        return Ok(());
+                    }
+                    if sink.offer(hash, chunk.offset, chunk.total, bytes, tag).is_err()
+                        && allowed.iter().all(|(hash, (_, end, _))| {
+                            ends.get(hash).is_some_and(|got| got >= end) || sink.settled(hash)
+                        })
+                    {
+                        // Every object of this pull settled here (a resume
+                        // point, a failed write): the rest of the stream
+                        // would only be dropped (WP3.INT re-review).
+                        return Err(ErrorWire::coded(
+                            "CANCELLED",
+                            "every object of the pull settled",
+                        ));
+                    }
                     Ok(())
                 },
             )
@@ -3310,6 +3602,7 @@ fn issue_pull<'scope, 'env>(
             result,
             received,
             ends,
+            sized,
         });
     });
     true
@@ -3370,6 +3663,12 @@ fn upload_round(
             }));
         }
         let stop = || lane.stopped();
+        // The push gate first, then a peer slot: at most `peer_calls - 1`
+        // pushes (with their wants) hold slots, so pulls and reports always
+        // find one (WP3.INT re-review).
+        let Some(gate) = lane.pushes.acquire(&stop) else {
+            return Err(lane.stop_error());
+        };
         let Some(slot) = lane.slots.acquire(&stop) else {
             return Err(lane.stop_error());
         };
@@ -3410,6 +3709,11 @@ fn upload_round(
                     && !object_blocked(&lane.key(&target.repo, true, &item.hash))
             })
             .collect();
+        // Objects whose size the peer does not know (an event without a size
+        // descriptor) are pushed with the size our worker reads: the receiver
+        // accepts any total when it knows none (WP3.INT re-review). One our
+        // worker refuses to read is left out (nothing of ours to send).
+        let items = sized_for_push(lane, client, &route, items);
         let spans = allot(&items, PUSH_BUDGET_BYTES);
         let (items, spans): (Vec<WantItem>, Vec<(u64, u64)>) = items
             .into_iter()
@@ -3423,6 +3727,7 @@ fn upload_round(
             }));
         }
         let pushed = push(lane, target, client, &route, items, &spans, slot);
+        drop(gate);
         match pushed {
             Ok(push) => {
                 moved |= push.sent > 0 || push.completed > 0;
@@ -3440,6 +3745,42 @@ fn upload_round(
             Err(PushError::Failed(error)) => return idle_or(moved, error),
         }
     }
+}
+
+/// The items of a push, each with its size: an item whose size the peer
+/// does not know ([`size_unknown`]) gets the total our worker reads for it,
+/// with a zero-length read; one that read fails is dropped (our worker
+/// cannot serve it: the peer learns that from the push, which does not send
+/// it).
+fn sized_for_push(
+    lane: &LaneRun,
+    client: &SessionWorkerClient,
+    route: &SyncRoute,
+    items: Vec<WantItem>,
+) -> Vec<WantItem> {
+    if !items.iter().any(size_unknown) {
+        return items;
+    }
+    items
+        .into_iter()
+        .filter_map(|mut item| {
+            if !size_unknown(&item) {
+                return Some(item);
+            }
+            if lane.stopped() {
+                return None;
+            }
+            let header = ReadHeader {
+                route: route.clone(),
+                hash: item.hash.clone(),
+                offset: 0,
+                len: 0,
+            };
+            let (total, _) = client.read(&header, worker_client::deadlines::READ).ok()?;
+            item.size = total;
+            Some(item)
+        })
+        .collect()
 }
 
 /// A failure that moved nothing is the key's; one after progress is left
@@ -3586,15 +3927,19 @@ fn push(
     };
     drop(slot);
     for (hash, outcome) in &local {
-        if matches!(outcome, ObjectOutcome::NotPermitted) {
+        if matches!(
+            outcome,
+            ObjectOutcome::NotPermitted | ObjectOutcome::NotAvailable
+        ) {
             // The peer wants an object we do not hold shareable (it never
             // was ours to send, or we never received it): not serving it is
-            // no error of ours, as on the acceptor's side (WP3.INT). Its
-            // backoff keeps it out of the next pushes; no `ObjectError`.
-            object_failed(&lane.key(&target.repo, true, hash), "");
-        } else {
-            lane.object_failed(target, true, hash, outcome);
+            // no error of ours, as on the acceptor's side (WP3.INT). Neither
+            // an `ObjectError` nor a backoff here (WP3.INT re-review): a
+            // peer's wants could name any hash, and the peer backs off what
+            // we did not send it (its offer).
+            continue;
         }
+        lane.object_failed(target, true, hash, outcome);
     }
     match result {
         Ok(results) => {
@@ -4107,4 +4452,46 @@ fn completed(page: &Page) -> impl Iterator<Item = &String> {
         let len = (part.hex.len() / 2) as u64;
         (part.offset.checked_add(len) == Some(part.total)).then_some(hash)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The per-object backoff table stays bounded (WP3.INT re-review): a
+    /// peer can make us back off as many objects as it names, and the table
+    /// pruned only entries an hour past their expiry, with a full scan on
+    /// every insert once it was large.
+    #[test]
+    fn the_object_backoff_table_is_bounded() {
+        let local = format!("bounded-{}", uuid::Uuid::new_v4());
+        let began = Instant::now();
+        for index in 0..(BACKOFF_MAX + BACKOFF_MAX / 2) {
+            let key = object_key(&local, "peer", "repo", false, &format!("{index:064x}"));
+            object_failed(&key, "NOT_AVAILABLE");
+        }
+        let entries = lock(held()).entries;
+        assert!(entries <= BACKOFF_MAX, "{entries} entries");
+        let counted: usize = lock(held()).map.values().map(HashMap::len).sum();
+        assert_eq!(counted, entries);
+        // The most recent failures are kept (the earliest-expiring go).
+        let last = object_key(
+            &local,
+            "peer",
+            "repo",
+            false,
+            &format!("{:064x}", BACKOFF_MAX + BACKOFF_MAX / 2 - 1),
+        );
+        assert!(object_blocked(&last));
+        assert!(
+            began.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            began.elapsed()
+        );
+        // An installed object forgets every source's entry, and the count
+        // follows.
+        let before = lock(held()).entries;
+        assert_eq!(object_installed(&last), vec!["NOT_AVAILABLE".to_owned()]);
+        assert_eq!(lock(held()).entries, before - 1);
+    }
 }
