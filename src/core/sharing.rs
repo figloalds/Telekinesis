@@ -128,17 +128,27 @@ pub const PAGE_READ_BUDGET: u64 = 8 * 1024 * 1024;
 /// request to it serves it (CCR-WP2.5-2). Process-wide like the offers (the
 /// apply and the next offer may run on different pooled stores); a need
 /// lost with a worker restart is asked again in the acceptor's next reply.
+/// Keyed by the local replica too: in a process holding several replicas
+/// of one repository that dial the same acceptor, one replica must not take
+/// (and serve, or report `unknown`) what the acceptor asked of another.
 struct PendingNeed {
     repo: String,
+    local: String,
     peer: String,
     ids: Vec<String>,
 }
 
+impl PendingNeed {
+    fn is(&self, repo: &str, local: &str, peer: &str) -> bool {
+        self.repo == repo && self.local == local && self.peer == peer
+    }
+}
+
 static PENDING_NEEDS: Mutex<VecDeque<PendingNeed>> = Mutex::new(VecDeque::new());
 
-fn remember_needs(repo: &str, peer: &str, ids: Vec<String>) {
+fn remember_needs(repo: &str, local: &str, peer: &str, ids: Vec<String>) {
     let mut pending = lock(&PENDING_NEEDS);
-    pending.retain(|need| !(need.repo == repo && need.peer == peer));
+    pending.retain(|need| !need.is(repo, local, peer));
     if ids.is_empty() {
         return;
     }
@@ -147,17 +157,15 @@ fn remember_needs(repo: &str, peer: &str, ids: Vec<String>) {
     }
     pending.push_back(PendingNeed {
         repo: repo.to_owned(),
+        local: local.to_owned(),
         peer: peer.to_owned(),
         ids,
     });
 }
 
-fn take_needs(repo: &str, peer: &str) -> Vec<String> {
+fn take_needs(repo: &str, local: &str, peer: &str) -> Vec<String> {
     let mut pending = lock(&PENDING_NEEDS);
-    match pending
-        .iter()
-        .position(|need| need.repo == repo && need.peer == peer)
-    {
+    match pending.iter().position(|need| need.is(repo, local, peer)) {
         Some(position) => pending
             .remove(position)
             .map(|need| need.ids)
@@ -915,7 +923,7 @@ impl Store {
     pub fn build_exchange_request(&self, route: &SyncRoute) -> Result<MetaExchangeRequest> {
         self.check_route(route)?;
         let peer = route.remote_replica.as_str();
-        let asked = take_needs(&self.repo, peer);
+        let asked = take_needs(&self.repo, &self.device, peer);
         let request = self.feed_read(|| {
             let out = self.out_row(peer)?;
             let page =
@@ -1137,7 +1145,7 @@ impl Store {
             .bytes
             .saturating_add(ENTRY_OVERHEAD * reply.page.entries.len() as u64 + MESSAGE_OVERHEAD);
         // The acceptor's needs, for our next request to it (CCR-WP2.5-2).
-        remember_needs(&self.repo, peer, reply.need.clone());
+        remember_needs(&self.repo, &self.device, peer, reply.need.clone());
         self.feed_read(|| self.apply_result(peer, &received, &sent, before))
     }
     /// Per-peer feed counters for the heartbeat (`PeerFeedCounters`).
