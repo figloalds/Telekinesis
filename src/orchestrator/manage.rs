@@ -8,8 +8,8 @@
 //! another folder:
 //!
 //! * **reads** (List, Inspect, Peers) are built from the catalog snapshot,
-//!   the controllers' `FolderView`s, the bridge's link maps and the hub, with
-//!   no waiting;
+//!   the controllers' `FolderView`s and the hub (its legacy projection since
+//!   WP3.1's cutover, `compat::HubLegacyView`), with no waiting;
 //! * **writes** are `catalog.apply` (one transaction on the catalog thread),
 //!   then a `FolderCmd` to that folder's controller. Start returns at once
 //!   (`starting:true`); Stop waits at most 15 s for `Stopped|StopBlocked`
@@ -31,8 +31,8 @@ use crate::{
         health::{MountIntent, MountState},
         ipc::{StopMode, deadlines},
         orchestrator::{
-            CatalogCmd, CatalogSnapshot, Ctx, FolderCmd, FolderPhase, FolderRecord, FolderView,
-            GateRecord, GateState, limits,
+            CatalogCmd, CatalogSnapshot, Ctx, EntryState, FolderCmd, FolderPhase, FolderRecord,
+            FolderView, GateRecord, GateState, limits,
         },
         status::{FolderStatus, StatusEvent, StatusSnapshot},
     },
@@ -218,7 +218,10 @@ fn apply(ctx: &Arc<Ctx>, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>> {
 }
 
 /// The published folders of a paired peer, in the legacy `PublishedState`
-/// shape (RemoteList's reply).
+/// shape (RemoteList's reply). As the legacy `list` did, only folders whose
+/// worker serves now (`EntryState::Running`): the v3 catalog also lists
+/// starting, paused and unavailable folders (WP3.1's cutover keeps the
+/// legacy reply, which RemoteList and Receive rely on).
 fn remote_list(ctx: &Ctx, endpoint: &str) -> Result<Vec<PublishedState>> {
     Ok(ctx
         .network()
@@ -226,6 +229,7 @@ fn remote_list(ctx: &Ctx, endpoint: &str) -> Result<Vec<PublishedState>> {
         .remote_list(endpoint)
         .map_err(ErrorWire::into_anyhow)?
         .into_iter()
+        .filter(|entry| entry.state == EntryState::Running)
         .map(|entry| PublishedState {
             repo: entry.repo,
             replica: entry.replica,
@@ -452,12 +456,9 @@ fn folder(ctx: &Ctx, state: &str, request: &str, payload: Value) -> Result<Value
         repo: record.repo,
         device: record.device,
     };
-    super::peering::DeadlineLane::default().call_as(
-        &info,
-        request,
-        payload,
-        deadlines::FOLDER_PASSTHROUGH,
-    )
+    // The legacy lanes' `DeadlineLane` went with them (WP3.1): the same
+    // bounded call, with the caller's request id, on a fresh connection.
+    super::compat::worker_call(&info, request, payload, deadlines::FOLDER_PASSTHROUGH)
 }
 
 /// Folders that hold (or are about to hold) a worker slot: anything but

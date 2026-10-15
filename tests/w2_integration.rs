@@ -824,16 +824,14 @@ fn running_view(ctx: &tkfs::model::orchestrator::Ctx, state: &str) -> bool {
 fn the_v3_stack_syncs_two_daemons_end_to_end() {
     use tkfs::{
         model::orchestrator::{CatalogCmd, FolderRecord, NetworkApi},
-        orchestrator::{Action, inbound, manage::manage, peer::PeerManager},
+        orchestrator::{Action, manage::manage},
         pairing_code::Verifier,
     };
     let (_root_a, a) = v3_daemon();
     let (_root_b, mut b) = v3_daemon();
-    // The daemons' legacy bridges stay out of the way (WP3.1 deletes them):
-    // otherwise A's legacy lanes would also dial B, which the v3 server
-    // answers PEER_NEEDS_UPGRADE, and report lanes of the same installation.
-    a.bridge.shutdown(Duration::from_secs(5));
-    b.bridge.shutdown(Duration::from_secs(5));
+    // Since WP3.1's cutover the daemons' network is this stack: A's
+    // `ctx.network` runs the PeerManager, and B serves its listener with the
+    // inbound server (what `run::serve` does with it).
 
     // B: a pairing code, the v3 inbound server on its listener, a folder.
     let (code, verifier) = Verifier::generate();
@@ -841,9 +839,12 @@ fn the_v3_stack_syncs_two_daemons_end_to_end() {
         .catalog
         .apply(CatalogCmd::SetVerifier { verifier })
         .unwrap();
-    let server = inbound::start(b.ctx.clone(), b.network.take().unwrap());
+    let server = b
+        .net
+        .serve_inbound(&b.ctx, b.network.take().unwrap())
+        .unwrap();
     let endpoint = format!("ws://{}", server.local_addr().unwrap());
-    let peers = PeerManager::start(a.ctx.clone());
+    let peers = a.net.peers().unwrap();
     // Whatever happens below, the peer stack and the workers are stopped
     // (the workers would otherwise outlive the test process).
     let _cleanup = V3Cleanup {

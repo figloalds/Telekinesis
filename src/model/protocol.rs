@@ -539,16 +539,18 @@ pub mod feed {
     }
 
     /// One feed entry. `event: None` means elided (the receiver is known to
-    /// hold it) or `large` (fetch it through `need`).
+    /// hold it) or `large` (fetch it through `need`). Absent members are left
+    /// out of the JSON (CCR-WP2.5-3, applied by WP3.1): an elided entry is
+    /// `{seq, id, digest}`, about 87 bytes on the wire instead of 113.
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub struct FeedEntry {
         pub seq: i64,
         pub id: String,
         pub digest: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub event: Option<Event>,
         /// Payload bytes of a large event.
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub large: Option<u64>,
     }
 
@@ -564,6 +566,13 @@ pub mod feed {
         pub through: Cursor,
         pub tip: i64,
         pub more: bool,
+        /// The sender's exact count of its feed entries after `through`,
+        /// capped at [`COUNT_CAP`] (CCR-WP2.5-4, applied by WP3.1): what the
+        /// receiver still has to read, for an exact `to_receive` (the tip
+        /// minus the cursor counts private events and deleted rows too).
+        /// `None` from a sender that does not count (left out of the JSON).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub remaining: Option<u64>,
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +620,17 @@ pub mod feed {
         #[serde(default)]
         pub need: Vec<String>,
         pub state: FeedState,
+        /// The receiver's needs from its previous reply (`reply.need`),
+        /// served from the sender's committed shared events (≤ 256 events,
+        /// ≤ [`MAX_NEED_BYTES`]). CCR-WP2.5-2 (applied by WP3.1): the acceptor
+        /// can ask the dialer too, so one-way pairing carries large events,
+        /// elided entries it lacks and missing parents in both directions.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub need_served: Vec<Event>,
+        /// Ids of the receiver's previous `need` that are not committed shared
+        /// events of the sender (CCR-WP2.5-2; ≤ 256).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub unknown: Vec<String>,
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -634,6 +654,10 @@ pub mod feed {
         #[serde(default)]
         pub unknown: Vec<String>,
         pub state: FeedState,
+        /// ≤ 256 ids the receiver wants from the sender (CCR-WP2.5-2, applied
+        /// by WP3.1), served in the sender's next request (`need_served`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub need: Vec<String>,
     }
 
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -40,6 +40,10 @@ fn repo_statuses(peers: &Value, repo: &str) -> Vec<Value> {
 /// is X's worker `published-exchange` (fault point, scoped to X), as in
 /// `orchestrator_runtime::a_hung_remote_folder_is_charged_while_the_other_keeps_syncing`.
 /// The metrics and the floor are unchanged.
+///
+/// WP3.1: the acceptor's worker op is `feed-exchange` since the cutover to v3
+/// (§3.8), so the hang is that op's fault point; same scenario, metrics and
+/// floor.
 #[test]
 #[ignore = "WP1.12"]
 fn hung_remote_repo_charged() {
@@ -58,10 +62,7 @@ fn hung_remote_repo_charged() {
         has_file(&bx, "x.txt", b"x") && has_file(&by, "y.txt", b"y")
     });
     a.restart_with_env(vec![
-        (
-            "TKFS_FAULT_POINT".into(),
-            "worker.rpc.published-exchange".into(),
-        ),
+        ("TKFS_FAULT_POINT".into(), "worker.rpc.feed-exchange".into()),
         ("TKFS_FAULT_ACTION".into(), "hang".into()),
         ("TKFS_FAULT_SCOPE".into(), state_id(&px)),
     ]);
@@ -89,7 +90,7 @@ fn hung_remote_repo_charged() {
         "healthy_delay_ms",
         if progressed { delay } else { f64::NAN },
         "ms",
-        json!({"hang": "worker.rpc.published-exchange"}),
+        json!({"hang": "worker.rpc.feed-exchange"}),
     );
     if !progressed {
         s.timeout("healthy repository did not progress");

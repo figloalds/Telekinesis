@@ -213,6 +213,25 @@ pub fn connect_with(
     connector: Option<Connector>,
     timeout: Duration,
 ) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
+    connect_with_cancel(endpoint, headers, connector, timeout, None)
+}
+
+/// [`connect_with`], interruptible by `cancel` (CCR-WP2.6-2, applied by
+/// WP3.1): it is checked before each address, and once an address's TCP
+/// connect returns, a hook on `cancel` shuts that socket down, so a TLS or
+/// WebSocket upgrade in progress fails at once. The hook stays registered
+/// for as long as `cancel` lives: a caller passes a short-lived token (a
+/// `child()` it drops after the dial, see `util::cancel`), so the session
+/// handshake that follows is interruptible too. A TCP connect itself is
+/// bounded by `timeout` but not interrupted. A cancelled dial fails with
+/// `WS_CONNECT_FAILED: dial cancelled`.
+pub fn connect_with_cancel(
+    endpoint: &str,
+    headers: &[(&str, &str)],
+    connector: Option<Connector>,
+    timeout: Duration,
+    cancel: Option<&crate::util::cancel::Cancel>,
+) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
     let uri = endpoint_uri(endpoint)?;
     let host = uri
         .host()
@@ -239,7 +258,12 @@ pub fn connect_with(
         .to_socket_addrs()
         .with_context(|| format!("WS_CONNECT_FAILED: cannot resolve {host}"))?
         .collect();
-    connect_any(&host, &addresses, &request, connector, timeout)
+    connect_any(&host, &addresses, &request, connector, timeout, cancel)
+}
+
+/// The error of a dial its token cancelled.
+fn dial_cancelled() -> anyhow::Error {
+    anyhow::anyhow!("WS_CONNECT_FAILED: dial cancelled")
 }
 
 /// [`connect_with`] over already-resolved `addresses`, in order.
@@ -249,10 +273,14 @@ fn connect_any(
     request: &tungstenite::handshake::client::Request,
     connector: Option<Connector>,
     timeout: Duration,
+    cancel: Option<&crate::util::cancel::Cancel>,
 ) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
     let mut connector = connector;
     let mut last = None;
     for (index, address) in addresses.iter().enumerate() {
+        if cancel.is_some_and(crate::util::cancel::Cancel::is_cancelled) {
+            return Err(dial_cancelled());
+        }
         let last_address = index + 1 == addresses.len();
         // A connector that cannot be copied is used once (never silently
         // replaced by the default trust store on a later address).
@@ -261,7 +289,7 @@ fn connect_any(
             Some(Some(copy)) if !last_address => (Some(copy), false),
             Some(_) => (connector.take(), true),
         };
-        match connect_one(*address, request, attempt, timeout) {
+        match connect_one(*address, request, attempt, timeout, cancel) {
             Ok(connected) => return Ok(connected),
             Err(error) => last = Some(error.context(format!("WS_CONNECT_FAILED: {address}"))),
         }
@@ -286,11 +314,22 @@ fn connect_one(
     request: &tungstenite::handshake::client::Request,
     connector: Option<Connector>,
     timeout: Duration,
+    cancel: Option<&crate::util::cancel::Cancel>,
 ) -> Result<(RawSocket, tungstenite::handshake::client::Response)> {
     // One deadline for the whole attempt: the upgrade gets what the TCP
     // connect left of `timeout`.
     let deadline = Instant::now() + timeout;
     let stream = TcpStream::connect_timeout(&address, timeout)?;
+    if let Some(cancel) = cancel {
+        // Runs at once if the token is already cancelled.
+        let killer = stream.try_clone()?;
+        cancel.on_cancel(Box::new(move || {
+            let _ = killer.shutdown(std::net::Shutdown::Both);
+        }));
+        if cancel.is_cancelled() {
+            return Err(dial_cancelled());
+        }
+    }
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(upgrade_timed_out().into());
@@ -877,8 +916,15 @@ mod tests {
         let request = format!("ws://{open}").into_client_request().unwrap();
         let budget = Duration::from_millis(800);
         let started = Instant::now();
-        let (_socket, response) =
-            connect_any("fallback", &[refused, silent, open], &request, None, budget).unwrap();
+        let (_socket, response) = connect_any(
+            "fallback",
+            &[refused, silent, open],
+            &request,
+            None,
+            budget,
+            None,
+        )
+        .unwrap();
         assert_eq!(response.headers()["X-Fallback"], "reached");
         // The silent address was abandoned once its budget ran out (the
         // refused one costs at most its own budget).
@@ -891,7 +937,7 @@ mod tests {
         drop(silent_listener);
 
         // Every address refused: WS_CONNECT_FAILED naming the last one tried.
-        let error = connect_any("fallback", &[silent, refused], &request, None, budget)
+        let error = connect_any("fallback", &[silent, refused], &request, None, budget, None)
             .expect_err("no address accepts");
         let text = format!("{error:#}");
         assert!(
@@ -899,8 +945,8 @@ mod tests {
             "{text}"
         );
         // No address at all.
-        let error =
-            connect_any("fallback", &[], &request, None, budget).expect_err("nothing to dial");
+        let error = connect_any("fallback", &[], &request, None, budget, None)
+            .expect_err("nothing to dial");
         assert!(format!("{error:#}").contains("WS_CONNECT_FAILED"));
     }
 

@@ -270,7 +270,8 @@ fn epoch_tip_and_cursors_cover_committed_shared_events_only() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(stamp, "1");
+    // 2 since WP3.1 (CCR-WP2.5-4 added `feed_remaining`).
+    assert_eq!(stamp, "2");
 
     a.create("one", "file").unwrap();
     let tip = a.feed_tip().unwrap();
@@ -1520,34 +1521,189 @@ fn a_3mib_event_travels_through_need() {
     assert_converged(&[&a, &b]);
 }
 
+/// CCR-WP2.5-2 (applied by WP3.1; until then a request page carried a large
+/// event inline, which this test pinned): a dialer's large event is flagged
+/// in its request page like in a reply page, the acceptor asks for it in its
+/// reply (`need`), and the dialer's next request serves it (`need_served`).
 #[test]
-fn a_dialer_large_event_travels_inline() {
-    // The acceptor cannot ask the dialer for anything (a reply has no need):
-    // a request page carries a large event inline, as its last payload.
+fn a_dialer_large_event_travels_through_the_acceptors_need() {
     let dir = tempfile::tempdir().unwrap();
     let repo = id();
     let mut a = create(&dir.path().join("a"), &repo);
     let mut b = create(&dir.path().join("b"), &repo);
+    // The first request is a probe (B has no report of A's cursor yet).
+    exchange(&b, &a);
     linear_history_named(&mut b, "small", 3).unwrap();
     let big = big_event(&b, "+", 400);
     let size = serde_json::to_string(&big).unwrap().len();
     assert!(size > LARGE_EVENT_BYTES);
     b.commit(big.clone(), true).unwrap();
     linear_history_named(&mut b, "after", 3).unwrap();
-    let mut inline = 0;
-    for _ in 0..6 {
-        let round = exchange(&b, &a);
-        let page = &round.request.page;
-        if let Some(position) = page.entries.iter().position(|e| e.id == big.id) {
-            assert_eq!(page.entries[position].event.as_ref(), Some(&big));
-            assert_eq!(position, page.entries.len() - 1, "the page stops after it");
-            inline += 1;
-        }
-        activate(&mut a);
-        activate(&mut b);
-    }
-    assert_eq!(inline, 1);
+    // B dials A (one-way): the page lists the big event without its payload.
+    let round = exchange(&b, &a);
+    let entry = round
+        .request
+        .page
+        .entries
+        .iter()
+        .find(|e| e.id == big.id)
+        .expect("the page lists the big event");
+    assert_eq!(entry.event, None);
+    assert_eq!(entry.large, Some(size as u64));
+    // A asks for it; the events after it are staged already.
+    assert_eq!(round.reply.need, vec![big.id.clone()]);
+    assert!(round.request.need_served.is_empty());
+    activate(&mut a);
+    // B's next request serves it.
+    let round = exchange(&b, &a);
+    assert_eq!(round.request.need_served, vec![big.clone()]);
+    assert!(round.request.unknown.is_empty());
+    assert!(round.reply.need.is_empty());
+    assert_eq!(round.local.summary.staged, 1);
+    activate(&mut a);
+    activate(&mut b);
+    settle(&mut b, &mut a);
     assert_converged(&[&a, &b]);
+}
+
+/// CCR-WP2.5-2: under one-way pairing the acceptor gets a missing parent from
+/// the dialer (its reply's `need`, the dialer's next `need_served`), and an
+/// id the dialer does not have comes back `unknown` (asked again only after
+/// the retry delay).
+#[test]
+fn an_acceptor_gets_a_missing_parent_from_the_dialer() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let mut d = create(&dir.path().join("d"), &repo);
+    // The first request is a probe (D has no report of A's cursor yet).
+    exchange(&d, &a);
+    d.create("parent", "directory").unwrap();
+    let parent = d.journal_id_at(d.feed_tip().unwrap()).unwrap().unwrap();
+    d.create("parent/child", "directory").unwrap();
+    // The request page that carried the parent loses it: the child arrives
+    // at A orphaned (A never dials D).
+    let mut request = d.build_exchange_request(&route(&d, &a)).unwrap();
+    request.page.entries.retain(|entry| entry.id != parent);
+    let (reply, local) = a.handle_exchange_request(&route(&a, &d), &request).unwrap();
+    assert_eq!(local.summary.staged, 1);
+    d.apply_exchange_reply(&route(&d, &a), &request.request, &reply)
+        .unwrap();
+    let mut asked = reply.need == vec![parent.clone()];
+    assert_eq!(activate(&mut a), 0);
+    assert_eq!(a.missing_parents(10).unwrap(), vec![parent.clone()]);
+    // A asks D for it in a reply; D serves it in its next request.
+    let mut served = None;
+    for _ in 0..3 {
+        let round = exchange(&d, &a);
+        if !round.request.need_served.is_empty() {
+            served = Some(round);
+            break;
+        }
+        asked |= round.reply.need == vec![parent.clone()];
+    }
+    assert!(asked, "A never asked D for the parent");
+    let round = served.expect("D never served the parent");
+    assert_eq!(round.request.need_served.len(), 1);
+    assert_eq!(round.request.need_served[0].id, parent);
+    assert_eq!(round.local.summary.staged, 1);
+    assert_eq!(activate(&mut a), 2);
+    settle(&mut d, &mut a);
+    assert_converged(&[&a, &d]);
+    assert!(a.missing_parents(10).unwrap().is_empty());
+
+    // A parent the dialer does not have either: reported unknown, and not
+    // asked again within the retry delay.
+    let mut orphan = mkdir_event(&d, "orphan");
+    orphan.dependencies.push("phantom-parent".into());
+    inject(&d, &orphan);
+    let phantom = vec!["phantom-parent".to_owned()];
+    let round = exchange(&d, &a);
+    let mut asked = round.reply.need == phantom;
+    activate(&mut a);
+    assert_eq!(a.missing_parents(10).unwrap(), phantom);
+    let mut reported = false;
+    for _ in 0..3 {
+        let round = exchange(&d, &a);
+        if round.request.unknown == phantom {
+            assert!(round.request.need_served.is_empty());
+            assert!(round.reply.need.is_empty(), "asked again at once");
+            reported = true;
+            break;
+        }
+        asked |= round.reply.need == phantom;
+    }
+    assert!(
+        asked && reported,
+        "asked {asked}, reported unknown {reported}"
+    );
+    let round = exchange(&d, &a);
+    assert!(
+        round.reply.need.is_empty(),
+        "asked again within the retry delay"
+    );
+    assert!(round.request.unknown.is_empty());
+}
+
+/// CCR-WP2.5-4 (applied by WP3.1): a page reports the sender's exact count of
+/// its feed entries after `through`, so `to_receive` is exact when the
+/// sender's journal interleaves private events (before, it was the upper
+/// bound `tip - cursor`, which counts every private seq).
+#[test]
+fn to_receive_is_exact_with_private_events_in_the_senders_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = create(&dir.path().join("a"), &repo);
+    let b = create(&dir.path().join("b"), &repo);
+    // B's first request is a probe; A's first page starts at B's cursor.
+    exchange(&b, &a);
+    let main = a.active.clone();
+    let private = a.fork("private", false).unwrap();
+    // 10 shared events, each followed by 3 private events.
+    for i in 0..10 {
+        a.checkout(&main).unwrap();
+        linear_history_named(&mut a, &format!("shared-{i}"), 1).unwrap();
+        a.checkout(&private.id).unwrap();
+        linear_history_named(&mut a, &format!("private-{i}"), 3).unwrap();
+    }
+    a.checkout(&main).unwrap();
+    let shared_total: u64 =
+        a.db.query_row("SELECT count(*) FROM feed_journal", [], |r| r.get(0))
+            .unwrap();
+    // A short page of A's feed (3 entries), as A builds it for B, in place
+    // of the full one.
+    let peer = b.device.clone();
+    let round = exchange_with(&b, &a, |reply| {
+        reply.page = a
+            .feed_page(reply.page.after.as_ref(), &peer, 3, MAX_PAGE_BYTES)
+            .unwrap();
+    });
+    let page = &round.reply.page;
+    assert!(page.more);
+    assert_eq!(page.entries.len(), 3);
+    let after: u64 =
+        a.db.query_row(
+            "SELECT count(*) FROM feed_journal WHERE seq>?",
+            [page.through.seq],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(after > 0 && after < shared_total);
+    assert_eq!(page.remaining, Some(after));
+    let summary = &round.applied.summary;
+    assert_eq!(summary.to_receive, after);
+    let bound = (summary.remote_tip - summary.cursor_in) as u64;
+    assert!(
+        summary.to_receive < bound,
+        "{} is the bound {bound}, not the exact count",
+        summary.to_receive
+    );
+    // The heartbeat's counters agree, and an exhausted feed reports 0.
+    assert_eq!(b.peer_feed_counters(&a.device).unwrap().to_receive, after);
+    let round = exchange(&b, &a);
+    assert!(!round.reply.page.more);
+    assert_eq!(round.reply.page.remaining, Some(0));
+    assert_eq!(round.applied.summary.to_receive, 0);
 }
 
 // ---------------------------------------------------------------------------
