@@ -218,13 +218,16 @@ pub fn connect_with(
 
 /// [`connect_with`], interruptible by `cancel` (CCR-WP2.6-2, applied by
 /// WP3.1): it is checked before each address, and once an address's TCP
-/// connect returns, a hook on `cancel` shuts that socket down, so a TLS or
-/// WebSocket upgrade in progress fails at once. The hook stays registered
-/// for as long as `cancel` lives: a caller passes a short-lived token (a
-/// `child()` it drops after the dial, see `util::cancel`), so the session
-/// handshake that follows is interruptible too. A TCP connect itself is
-/// bounded by `timeout` but not interrupted. A cancelled dial fails with
-/// `WS_CONNECT_FAILED: dial cancelled`.
+/// connect returns, a hook on `cancel` shuts that socket down (through a
+/// verified duplicate, as the watchdog's). The hook stays registered for as
+/// long as `cancel` lives: a caller passes a short-lived token (a `child()`
+/// it drops after the dial, see `util::cancel`), so the session handshake
+/// that follows is covered too. On Unix the shutdown ends a read in
+/// progress at once. On Windows it sends our FIN, which ends the read as
+/// soon as the peer closes in turn (any tkfs server, proxy or relay does);
+/// a peer that ignores it is still bounded by the step's socket timeout.
+/// A TCP connect itself is bounded by `timeout` but not interrupted. A
+/// cancelled dial fails with `WS_CONNECT_FAILED: dial cancelled`.
 pub fn connect_with_cancel(
     endpoint: &str,
     headers: &[(&str, &str)],
@@ -321,8 +324,11 @@ fn connect_one(
     let deadline = Instant::now() + timeout;
     let stream = TcpStream::connect_timeout(&address, timeout)?;
     if let Some(cancel) = cancel {
-        // Runs at once if the token is already cancelled.
-        let killer = stream.try_clone()?;
+        // A verified duplicate, as the watchdog's (on Windows a plain clone
+        // taken right after the connect can be stale, and its `shutdown`
+        // would fail). The hook runs at once if the token is already
+        // cancelled.
+        let killer = watchdog::watchdog_handle(&stream)?;
         cancel.on_cancel(Box::new(move || {
             let _ = killer.shutdown(std::net::Shutdown::Both);
         }));
@@ -625,7 +631,7 @@ pub(crate) mod watchdog {
     /// that fails verification three times is never used: its `shutdown`
     /// would fail when it matters. Elsewhere the first clone verifies, unless
     /// the connection is already gone.
-    fn watchdog_handle(stream: &TcpStream) -> io::Result<TcpStream> {
+    pub(crate) fn watchdog_handle(stream: &TcpStream) -> io::Result<TcpStream> {
         let mut last = None;
         for _ in 0..3 {
             let _ = stream.peer_addr();

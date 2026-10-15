@@ -1072,7 +1072,7 @@ impl Drop for Baseline {
 /// the old daemon's legacy actions. Run with `TKFS_BASELINE_BIN=<6298d0b tkfs>
 /// cargo test --test w2_integration -- --ignored interop`.
 #[test]
-#[ignore = "WP2.INT interop: needs TKFS_BASELINE_BIN (a 6298d0b tkfs binary)"]
+#[ignore = "WP2.INT interop (waves 1-2 only; since WP3.1 a 6298d0b peer fails closed, see qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides): needs TKFS_BASELINE_BIN"]
 fn interop_wave_2_with_a_6298d0b_peer() {
     let old = Baseline::start();
     let new = Node::new();
