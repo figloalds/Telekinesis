@@ -1174,6 +1174,19 @@ impl Store {
                         registered.insert(object.clone(), Ok(()));
                     }
                 }
+                Err(error) if crate::model::errors::code_of(&error) == "SQLITE_BUSY" => {
+                    // SQLite's writer stayed busy past the busy timeout: one
+                    // transaction per object would wait that long again for
+                    // each (WP3.INT; the WP3.2 review's minor). None is
+                    // registered: installed but not shareable, so each stays
+                    // wanted and its next transfer registers the present
+                    // copy (invariant 3, I4). The spool rows are left as
+                    // they are (the next open or write reconciles them).
+                    let wire = ErrorWire::from_error(&error);
+                    for (object, _) in &installed {
+                        registered.insert(object.clone(), Err(wire.clone()));
+                    }
+                }
                 Err(_) => {
                     // One object's registration (say a size descriptor that
                     // changed meanwhile) must not undo the others': each one

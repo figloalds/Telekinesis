@@ -24,8 +24,8 @@
 //! The desktop's two background loops live here too, written against small
 //! transport traits so they are tested with fakes: [`Feed`] (one status
 //! subscription, reconnect with backoff, daemon respawn) and [`CommandPool`]
-//! (commands on their own connections, so a slow subscription or a slow
-//! command never delays another command). [`MountSmoother`] is the
+//! (commands on their own connections, so a slow subscription never delays
+//! a command, and up to its thread count of commands run at once). [`MountSmoother`] is the
 //! display-side adapter for CCR-WP2.1-7 (see its documentation).
 use crate::{
     model::{
@@ -3001,8 +3001,9 @@ pub type Done = Arc<dyn Fn(CommandOutcome) + Send + Sync>;
 
 /// Commands on their own threads and connections (§7.2: commands never wait
 /// behind the subscription). Each worker thread owns one connection, made on
-/// first use; `workers` commands run at once, so a 15 s Stop never delays a
-/// Start of another folder.
+/// first use; `workers` commands run at once, so a 15 s Stop delays a Start
+/// of another folder only while `workers` slow commands are in flight
+/// together (they share one queue).
 pub struct CommandPool {
     tx: Option<mpsc::Sender<Command>>,
 }

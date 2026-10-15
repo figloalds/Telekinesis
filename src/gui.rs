@@ -48,7 +48,8 @@ use tkfs::{
 };
 slint::include_modules!();
 
-/// Command threads: enough that a 15 s Stop never delays another row.
+/// Command threads: up to this many commands run at once, so a 15 s Stop
+/// delays another row only while four slow commands are in flight.
 const COMMAND_THREADS: usize = 4;
 /// The busy key of dialog commands (create, pair, receive, …).
 const GLOBAL: &str = "global";
@@ -1105,7 +1106,7 @@ fn on_folder_reply(ui: &AppWindow, st: &mut State, state: &str, payload: &Value,
             set_status(ui, false, "Resolution recorded.".into());
             st.submit(
                 ui,
-                &format!("detail:{state}"),
+                &format!("detail:{state}:conflicts"),
                 "Loading conflicts",
                 folder_op(state, json!({"op": "folder-details"})),
             );
@@ -1197,7 +1198,7 @@ fn wire(ui: &AppWindow) {
                 st.worker_status = None;
                 st.submit(
                     &ui,
-                    &format!("detail:{state}"),
+                    &format!("detail:{state}:content"),
                     "Reading missing files",
                     folder_op(&state, json!({"op": "status"})),
                 );
@@ -1206,7 +1207,7 @@ fn wire(ui: &AppWindow) {
                 ui.set_conflict_summary("Loading conflicts…".into());
                 st.submit(
                     &ui,
-                    &format!("detail:{state}"),
+                    &format!("detail:{state}:conflicts"),
                     "Loading conflicts",
                     folder_op(&state, json!({"op": "folder-details"})),
                 );
@@ -1219,7 +1220,7 @@ fn wire(ui: &AppWindow) {
         let state = ui.get_selected_state().to_string();
         st.submit(
             &ui,
-            &format!("detail:{state}"),
+            &format!("detail:{state}:content"),
             "Reading missing files",
             folder_op(&state, json!({"op": "status"})),
         );
@@ -1371,7 +1372,7 @@ fn wire(ui: &AppWindow) {
         let state = ui.get_selected_state().to_string();
         st.submit(
             &ui,
-            &format!("detail:{state}"),
+            &format!("detail:{state}:conflicts"),
             "Loading conflicts",
             folder_op(&state, json!({"op": "folder-details", "offset": offset})),
         );
@@ -1442,7 +1443,7 @@ fn wire(ui: &AppWindow) {
             ui.set_conflict_preview("Loading and verifying the content…".into());
             st.submit(
                 &ui,
-                &format!("detail:{state}"),
+                &format!("detail:{state}:conflicts"),
                 "Loading the preview",
                 folder_op(
                     &state,
@@ -1464,7 +1465,7 @@ fn wire(ui: &AppWindow) {
         });
         st.submit(
             &ui,
-            &format!("detail:{state}"),
+            &format!("detail:{state}:conflicts"),
             "Recording the resolution",
             folder_op(&state, payload),
         );
@@ -1491,7 +1492,7 @@ fn wire(ui: &AppWindow) {
         });
         st.submit(
             &ui,
-            &format!("detail:{state}"),
+            &format!("detail:{state}:conflicts"),
             "Recovering the entry",
             folder_op(&state, payload),
         );
