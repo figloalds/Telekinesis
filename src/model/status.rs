@@ -222,6 +222,18 @@ pub enum Direction {
     Both,
 }
 
+/// The peer and lane of a failed object transfer
+/// ([`StatusEvent::ObjectError`], CCR-WP3.INT-1): `lane` is the status lane
+/// (`LaneState.lane`: 1 + the bulk lane index), `direction` the side that
+/// opened the session (outbound: this daemon dialed).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectSource {
+    pub installation: String,
+    pub lane: u32,
+    #[serde(default)]
+    pub direction: Direction,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderPeerSync {
     pub installation: String,
@@ -476,6 +488,12 @@ pub enum StatusEvent {
         state: String,
         hash: String,
         error: ErrorWire,
+        /// The transfer that failed (CCR-WP3.INT-1, applied by WP3.INT): the
+        /// legacy projection (§7.3) books the failure on that lane's
+        /// repository status, as 6298d0b's bulk lanes did. `None` (and absent
+        /// on the wire) for producers that do not know it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<ObjectSource>,
     },
     /// Pre-cutover passthrough of legacy `LinkStatus` JSON (Wave 2).
     LegacyLink {

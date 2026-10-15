@@ -140,6 +140,9 @@ struct Faults {
     hang_next_write: Option<Duration>,
     /// Every write call fails as a whole with this error (a store outage).
     fail_writes: Option<ErrorWire>,
+    /// The next N want replies report offset 0 whatever is durable (a
+    /// stale offset: another transfer advanced the spool meanwhile; WP3.INT).
+    stale_want_offsets: usize,
 }
 
 enum Held {
@@ -349,6 +352,16 @@ impl FakeWorker {
         self.state.lock().unwrap().held.contains_key(hash)
     }
 
+    /// Makes `bytes` the durable start of a wanted object's spool, as a
+    /// transfer of another session would have (no lease is left behind).
+    fn advance_spool(&self, hash: &str, bytes: &[u8]) {
+        let spool = self.state.lock().unwrap().wanted[hash].clone();
+        let mut spool = spool.lock().unwrap();
+        assert!(spool.file.is_none(), "a memory spool");
+        spool.data.extend_from_slice(bytes);
+        spool.durable += bytes.len() as u64;
+    }
+
     fn held_bytes(&self, hash: &str) -> Option<Vec<u8>> {
         let held = self.state.lock().unwrap().held.get(hash).cloned()?;
         Some(held.read(0, held.len()))
@@ -435,10 +448,17 @@ impl FakeWorker {
             })
             .collect();
         candidates.sort();
+        let stale = {
+            let mut faults = self.faults();
+            let stale = faults.stale_want_offsets > 0;
+            faults.stale_want_offsets = faults.stale_want_offsets.saturating_sub(1);
+            stale
+        };
         let mut state = self.state.lock().unwrap();
         let mut items = Vec::new();
         let mut bytes = 0u64;
         for (size, hash, durable) in candidates {
+            let durable = if stale { 0 } else { durable };
             let remaining = size - durable;
             if items.len() >= header.max_items as usize
                 || (!items.is_empty() && bytes + remaining > header.max_bytes)
@@ -1422,6 +1442,55 @@ fn zero_size_objects_travel_both_ways() {
     }
 }
 
+/// A write the worker answers with a resume point (`RESUME_OFFSET_AHEAD`,
+/// `OBJECT_PART_CHANGED`) is no failure of the object (CCR-WP3.2-5): the
+/// object resumes from the durable offset the worker answered, without a
+/// per-object backoff or an `ObjectError` (WP3.INT; the WP3.3 review's
+/// minor on the fake worker's parity with WP3.2's).
+#[test]
+fn a_resume_point_resynchronizes_the_object_without_a_backoff() {
+    let (a, b) = pair(100);
+    let data = content(4500, 3 * MIB as usize);
+    let hash = b.worker.hold(data.clone());
+    a.worker.want(&hash, 3 * MIB);
+    // Another transfer already made the first MiB durable; the lane's
+    // first want still reports offset 0, so its first write is refused.
+    a.worker.advance_spool(&hash, &data[..MIB as usize]);
+    a.worker.faults().stale_want_offsets = 1;
+    let started = Instant::now();
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let (options, _) = a.options();
+    let lane = a.run(conn, options);
+    assert!(
+        wait_until(Duration::from_secs(20), || a.worker.has(&hash)),
+        "not installed"
+    );
+    let took = started.elapsed();
+    drop(lane);
+    assert_eq!(a.worker.held_bytes(&hash).unwrap(), data);
+    assert!(
+        took < Duration::from_secs(10),
+        "resumed only after {took:?} (a per-object backoff is 24-36 s)"
+    );
+    let errors = a.world.object_errors();
+    assert!(errors.is_empty(), "{errors:?}");
+    // The refused write started at 0; the next writes resumed from 1 MiB.
+    let writes: Vec<u64> = a
+        .worker
+        .write_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, written, _, _)| *written == hash)
+        .map(|(_, _, offset, _)| *offset)
+        .collect();
+    assert_eq!(writes.first(), Some(&0), "{writes:?}");
+    assert!(
+        writes[1..].iter().all(|offset| *offset >= MIB),
+        "{writes:?}"
+    );
+}
+
 /// Invariant 18: object bytes never travel on the control session, and
 /// `objects.*` on a control session is refused.
 #[test]
@@ -1863,7 +1932,8 @@ fn inbound_checks_keep_their_codes() {
             Duration::from_secs(5),
         )
         .unwrap_err();
-    assert_eq!(malformed.code(), "UNSUPPORTED_OPERATION");
+    // CCR-WP3.3-3 (WP3.INT): a malformed v3 request is INVALID_REQUEST.
+    assert_eq!(malformed.code(), "INVALID_REQUEST");
     assert_eq!(
         b.worker.reads().len(),
         reads,
@@ -2935,6 +3005,186 @@ fn a_pull_stream_must_start_each_object_at_its_span() {
         a.worker.write_sessions(&hash).is_empty(),
         "bytes past a skipped span start were written"
     );
+    server.join().unwrap().close();
+}
+
+/// Invariant 22 at the dialer (WP3.INT; the WP3.3 review's major finding): a
+/// peer's per-object results count only for the objects the request listed,
+/// each once. Results naming other objects never back anything off, never
+/// record an `ObjectError`, never count as uploaded, and never make our
+/// worker re-verify (`objects.report`) an object; nor does a
+/// `CorruptAtSource` for an object the push did not send through its end.
+/// An object the peer wants that we may not serve gets no `ObjectError`
+/// either (a silent backoff, as the acceptor does).
+#[test]
+fn a_peer_reply_counts_only_for_the_objects_it_was_asked_for() {
+    struct LyingPeer {
+        wanted: Vec<WantItem>,
+        bogus: Vec<String>,
+        pulls: AtomicUsize,
+        pushes: AtomicUsize,
+    }
+    impl LyingPeer {
+        fn lies(&self, outcome: &ObjectOutcome) -> Vec<ObjectResult> {
+            self.bogus
+                .iter()
+                .flat_map(|hash| {
+                    [ObjectOutcome::CorruptAtSource, outcome.clone()]
+                        .into_iter()
+                        .map(|outcome| ObjectResult {
+                            hash: hash.clone(),
+                            outcome,
+                            bytes: 0,
+                        })
+                })
+                .collect()
+        }
+    }
+    impl Handler for LyingPeer {
+        fn handle(&self, req: Incoming) {
+            match req.op.as_str() {
+                "objects.pull" => {
+                    self.pulls.fetch_add(1, Ordering::SeqCst);
+                    let request: ObjectsPull = serde_json::from_value(req.header).unwrap();
+                    // Nothing of what was asked is served; every other
+                    // object fails or "completes".
+                    let mut results: Vec<ObjectResult> = request
+                        .items
+                        .iter()
+                        .map(|item| ObjectResult {
+                            hash: item.hash.clone(),
+                            outcome: ObjectOutcome::NotAvailable,
+                            bytes: 0,
+                        })
+                        .collect();
+                    results.extend(self.lies(&ObjectOutcome::NotPermitted));
+                    req.responder.reply(
+                        serde_json::to_value(ObjectsResult { results }).unwrap(),
+                        Vec::new(),
+                    );
+                }
+                "objects.wants" => req.responder.reply(
+                    serde_json::to_value(ObjectsWantsReply {
+                        items: self.wanted.clone(),
+                    })
+                    .unwrap(),
+                    Vec::new(),
+                ),
+                "objects.push" => {
+                    self.pushes.fetch_add(1, Ordering::SeqCst);
+                    let request: ObjectsPush = serde_json::from_value(req.header).unwrap();
+                    for _ in req.chunks.into_iter().flatten() {}
+                    // Every listed object "completes" except the large one,
+                    // which this push cannot have sent through its end; the
+                    // reply names other objects too, and the small one twice.
+                    let mut results: Vec<ObjectResult> = request
+                        .items
+                        .iter()
+                        .map(|item| ObjectResult {
+                            hash: item.hash.clone(),
+                            outcome: if item.size > objects::PUSH_BUDGET_BYTES {
+                                ObjectOutcome::CorruptAtSource
+                            } else {
+                                ObjectOutcome::Completed
+                            },
+                            bytes: 0,
+                        })
+                        .collect();
+                    results.extend(results.clone());
+                    results.extend(self.lies(&ObjectOutcome::Completed));
+                    req.responder.reply(
+                        serde_json::to_value(ObjectsResult { results }).unwrap(),
+                        Vec::new(),
+                    );
+                }
+                op => req.responder.error(ErrorWire::coded(
+                    "UNSUPPORTED_OPERATION",
+                    format!("{op}: not scripted"),
+                )),
+            }
+        }
+    }
+    let lane = LANE;
+    let owned = |seed: u64, len: usize| {
+        (seed..)
+            .map(|seed| content(seed, len))
+            .find(|bytes| lane.owns(&sha(bytes)))
+            .unwrap()
+    };
+    let worker = FakeWorker::start(REPLICA_A);
+    let small = worker.hold(owned(4100, 4096));
+    let large_len = objects::PUSH_BUDGET_BYTES + MIB;
+    let large = worker.hold(owned(4200, large_len as usize));
+    let missing = sha(&owned(4300, 1000));
+    worker.want(&missing, 1000);
+    // An object the peer wants that we may not serve (private): not serving
+    // it is no error of ours (WP3.INT), as on the acceptor's side.
+    let private = sha(&owned(4350, 64));
+    worker.state.lock().unwrap().private.insert(private.clone());
+    let bogus: Vec<String> = (0..3).map(|i| sha(&owned(4400 + i * 7, 64))).collect();
+    let item = |hash: &str, size: u64| WantItem {
+        hash: hash.into(),
+        size,
+        offset: 0,
+        priority: WantPriority::Current,
+    };
+    let peer = Arc::new(LyingPeer {
+        wanted: vec![
+            item(&small, 4096),
+            item(&large, large_len),
+            item(&private, 64),
+        ],
+        bogus: bogus.clone(),
+        pulls: AtomicUsize::new(0),
+        pushes: AtomicUsize::new(0),
+    });
+    let (remote, code, endpoint, server) = scripted_peer(peer.clone());
+    let a = Dialer::start(worker, &remote, &endpoint, 100);
+    let (options, _) = a.options();
+    let running = a.run(a.dial(&endpoint, &code, lane), options);
+    let pushed = || {
+        a.world
+            .finished()
+            .iter()
+            .any(|f| f.op == "objects.push" && f.ok)
+    };
+    let pulled = || {
+        a.world
+            .finished()
+            .iter()
+            .any(|f| f.op == "objects.pull" && f.ok)
+    };
+    assert!(
+        wait_until(Duration::from_secs(20), || pushed() && pulled()),
+        "{:?}",
+        a.world.finished()
+    );
+    drop(running);
+    assert!(peer.pulls.load(Ordering::SeqCst) >= 1);
+    assert!(peer.pushes.load(Ordering::SeqCst) >= 1);
+    // Errors only for what was asked: the pulled object, the large one.
+    let errors = a.world.object_errors();
+    assert!(
+        errors.iter().any(|(hash, _)| *hash == missing),
+        "{errors:?}"
+    );
+    for (hash, code) in &errors {
+        assert!(
+            *hash == missing || *hash == large,
+            "an ObjectError for {hash} ({code}), which was never asked for"
+        );
+    }
+    // The first push counted one object up (the small one, once).
+    let first = a
+        .world
+        .finished()
+        .into_iter()
+        .find(|f| f.op == "objects.push" && f.ok)
+        .unwrap();
+    assert_eq!(first.objects_up, 1, "{first:?}");
+    // Our worker re-verified nothing: the large object was not sent through
+    // its end, the others were never pushed.
+    assert!(a.worker.reports().is_empty(), "{:?}", a.worker.reports());
     server.join().unwrap().close();
 }
 

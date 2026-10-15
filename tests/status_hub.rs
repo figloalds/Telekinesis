@@ -35,8 +35,8 @@ use tkfs::{
         protocol::{LaneRole, feed::ExchangeSummary},
         status::{
             ActivityEntry, DaemonStatus, Direction, FolderPeerState, FolderStatus, FolderSyncState,
-            GateKind, LaneState, LifecyclePhase, PeerConnState, STATUS_SCHEMA, StatusEvent,
-            StatusSnapshot, policy,
+            GateKind, LaneState, LifecyclePhase, ObjectSource, PeerConnState, STATUS_SCHEMA,
+            StatusEvent, StatusSnapshot, policy,
         },
     },
     orchestrator::{
@@ -2158,6 +2158,7 @@ fn stall_triggers_names_the_culprit_and_clears() {
         state: STATE.into(),
         hash: "0123abcd".into(),
         error: ErrorWire::new("CORRUPT_OBJECT", "CORRUPT_OBJECT: hash mismatch"),
+        source: None,
     });
     fx.run(2);
     let folder = fx.folder();
@@ -2931,6 +2932,7 @@ fn object_errors_are_capped_and_resolve_when_content_completes() {
             state: STATE.into(),
             hash: format!("{index:064x}"),
             error: ErrorWire::new("SIZE_MISMATCH", "SIZE_MISMATCH: 3 != 4"),
+            source: None,
         });
     }
     let folder = fx.folder();
@@ -3318,6 +3320,7 @@ fn late_events_of_a_removed_folder_are_dropped() {
             state: STATE.into(),
             hash: "0123abcd".into(),
             error: revoked(),
+            source: None,
         });
         fx.rec(StatusEvent::Error {
             scope: Scope::FolderPeer {
@@ -3380,6 +3383,7 @@ fn unregistered_folder_state_is_pruned_after_the_grace() {
         state: state.into(),
         hash: "0123abcd".into(),
         error: ErrorWire::new("PEER_REVOKED", "PEER_REVOKED: detail"),
+        source: None,
     };
     let register = |state: &str, repo: &str| {
         StatusEvent::FolderLifecycle(Box::new(FolderView {
@@ -4367,6 +4371,7 @@ fn large_hub(folders: usize, peers: usize) -> Arc<StatusHub> {
                 state: state_of(f),
                 hash: format!("{index:064x}"),
                 error: ErrorWire::new("SIZE_MISMATCH", "SIZE_MISMATCH: 3 != 4"),
+                source: None,
             });
         }
     }
@@ -4711,6 +4716,252 @@ fn legacy_projection_reports_failures_like_the_legacy_lanes() {
     let peers_reply = fx.hub.legacy_peers(&unknown);
     assert_eq!(peers_reply[0]["connections"], 2);
     assert_eq!(peers_reply[0]["configured_connections"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// WP3.INT: the legacy projection of objects v3 (§14 WP3.INT task 1)
+
+fn object_failure(hash: &str, lane: u32, error: &ErrorWire) -> StatusEvent {
+    StatusEvent::ObjectError {
+        state: STATE.into(),
+        hash: hash.into(),
+        error: error.clone(),
+        source: Some(ObjectSource {
+            installation: PEER_A.into(),
+            lane,
+            direction: Direction::Outbound,
+        }),
+    }
+}
+
+/// CCR-WP3.INT-1: a failed object transfer is booked on its lane's legacy
+/// repository status (`error`, `consecutive_failures`, `retry_at_ms`, as
+/// 6298d0b's bulk lanes reported a failed object) while the folder's error
+/// for the object is open; an exchange that went well meanwhile does not
+/// hide it, and it is gone once the object is resolved (installed).
+#[test]
+fn legacy_projection_books_failed_objects_on_their_lane() {
+    let fx = legacy_fixture(false);
+    let record = record(STATE, REPO);
+    let peers = [peer_record("ABCD-EFGH-IJKL")];
+    let hash = format!("{:064x}", 7);
+    let error = ErrorWire::new(
+        "NOT_AVAILABLE",
+        format!("NOT_AVAILABLE: object {hash}: pulling from peer {PEER_A}"),
+    )
+    .with_retry_after(30_000);
+    fx.rec(object_failure(&hash, 2, &error));
+    let sync = fx.hub.legacy_folder_sync(&record, &peers);
+    let repo = &sync[0]["lanes"][2]["repository"];
+    assert_eq!(repo["error"], error.to_string());
+    assert_eq!(repo["consecutive_failures"], 1);
+    assert_eq!(repo["retry_at_ms"], fx.now() + 30_000);
+    assert_eq!(repo["caught_up"], false);
+    // Only that lane: the other bulk lane and the control lane are clean.
+    assert!(sync[0]["lanes"][1]["repository"]["error"].is_null());
+    assert!(sync[0]["metadata"]["error"].is_null());
+    let reply = fx.hub.legacy_peers(&peers);
+    assert_eq!(
+        reply[0]["lanes"][2]["repositories"][REPO]["error"],
+        error.to_string()
+    );
+    assert!(reply[0]["lanes"][2]["error"].is_null(), "not a lane error");
+    // The same object failing again counts; a pull that went well
+    // meanwhile does not hide it.
+    fx.advance(30_000);
+    fx.rec(object_failure(&hash, 2, &error));
+    fx.rec(finished(
+        PEER_A,
+        2,
+        "objects.pull",
+        Direction::Outbound,
+        None,
+        None,
+        4096,
+        1,
+    ));
+    let repo = &fx.hub.legacy_folder_sync(&record, &peers)[0]["lanes"][2]["repository"];
+    assert_eq!(repo["consecutive_failures"], 2);
+    assert_eq!(repo["retry_at_ms"], fx.now() + 30_000);
+    // Installed (the lane resolves the object's errors): gone.
+    fx.rec(StatusEvent::Resolved {
+        scope: Scope::Object {
+            state: STATE.into(),
+            hash: hash.clone(),
+        },
+        code: "NOT_AVAILABLE".into(),
+    });
+    let repo = &fx.hub.legacy_folder_sync(&record, &peers)[0]["lanes"][2]["repository"];
+    assert!(repo["error"].is_null(), "{repo}");
+    assert_eq!(repo["consecutive_failures"], 0);
+    assert!(repo["retry_at_ms"].is_null());
+    // Contention is never a failure (§8).
+    fx.rec(object_failure(
+        &hash,
+        1,
+        &ErrorWire::new("IN_FLIGHT_ELSEWHERE", "IN_FLIGHT_ELSEWHERE: leased"),
+    ));
+    let repo = &fx.hub.legacy_folder_sync(&record, &peers)[0]["lanes"][1]["repository"];
+    assert!(repo["error"].is_null(), "{repo}");
+}
+
+/// v3 bulk lanes report an exchange only when objects move: the legacy
+/// projection lists every repository both sides hold on every bulk lane
+/// (6298d0b's lanes exchanged each one every round) and reads the object
+/// inventory from the counters now, not from the last exchange (WP3.INT).
+#[test]
+fn legacy_bulk_lanes_list_idle_repositories_and_read_their_inventory_now() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: None,
+    });
+    for index in 0..3 {
+        fx.rec(lane(PEER_A, index, LaneState::Ready, None));
+    }
+    let remote = PublishedEntry {
+        content: Some(missing_bytes(0)),
+        ..entry(REPO, EntryState::Running)
+    };
+    fx.rec(catalog(PEER_A, &[remote]));
+    fx.rec(heartbeat(1, Some(missing_bytes(1000))));
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    let record = record(STATE, REPO);
+    let peers = [peer_record("ABCD-EFGH-IJKL")];
+    // No objects moved on the bulk lanes: still listed, in the legacy shape.
+    let sync = fx.hub.legacy_folder_sync(&record, &peers);
+    support::assert_same_shape(&support::golden("inspect_running_headless")["sync"], &sync);
+    for index in 1..3 {
+        let repo = &sync[0]["lanes"][index]["repository"];
+        assert_eq!(repo["caught_up"], false, "{repo}");
+        assert_eq!(repo["object_inventory"]["local_available"], 50);
+        assert_eq!(repo["object_inventory"]["remote_available"], 100);
+        assert_eq!(repo["object_inventory"]["remote_only"], 50);
+        assert_eq!(repo["transfer"]["object_lane"]["index"], index - 1);
+    }
+    let reply = fx.hub.legacy_peers(&peers);
+    support::assert_same_shape(&support::golden("peers_dialer"), &reply);
+    for index in 1..3 {
+        assert!(
+            reply[0]["lanes"][index]["repositories"][REPO].is_object(),
+            "{reply}"
+        );
+    }
+    // A repository the peer does not list is not invented.
+    let other = FolderRecord {
+        state: "state-other".into(),
+        repo: "repo-other".into(),
+        ..record.clone()
+    };
+    assert!(fx.hub.legacy_folder_sync(&other, &peers)[0]["lanes"][1]["repository"].is_null());
+    // An exchange books the counters of its time; the projection follows
+    // the counters after it (the download completed).
+    fx.rec(finished(
+        PEER_A,
+        1,
+        "objects.pull",
+        Direction::Outbound,
+        None,
+        None,
+        4096,
+        1,
+    ));
+    fx.rec(heartbeat(2, Some(missing_bytes(0))));
+    let sync = fx.hub.legacy_folder_sync(&record, &peers);
+    let repo = &sync[0]["lanes"][1]["repository"];
+    assert_eq!(repo["object_inventory"]["local_available"], 100);
+    assert_eq!(repo["object_inventory"]["remote_only"], 0);
+    // CCR-WP3.1-1: a bulk lane never claims caught_up, whatever moved.
+    assert_eq!(repo["caught_up"], false);
+    assert_eq!(repo["metadata_caught_up"], false);
+}
+
+/// CCR-WP3.1-2 (applied in the hub by WP3.INT): the legacy `caught_up` and
+/// `metadata_caught_up` are false while the remote still has events to
+/// activate (6298d0b's gated received folder), true once it has none.
+#[test]
+fn legacy_caught_up_waits_for_the_remote_pending_events() {
+    let fx = legacy_fixture(true);
+    let record = record(STATE, REPO);
+    let peers = [peer_record("ABCD-EFGH-IJKL")];
+    let pending = ExchangeSummary {
+        remote_pending: 3,
+        ..summary(0, 0)
+    };
+    assert!(pending.caught_up);
+    fx.rec(meta(PEER_A, pending));
+    let metadata = &fx.hub.legacy_folder_sync(&record, &peers)[0]["metadata"];
+    assert_eq!(metadata["caught_up"], false);
+    assert_eq!(metadata["metadata_caught_up"], false);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    let metadata = &fx.hub.legacy_folder_sync(&record, &peers)[0]["metadata"];
+    assert_eq!(metadata["caught_up"], true);
+    assert_eq!(metadata["metadata_caught_up"], true);
+}
+
+/// Objects flow before activation (§6.4): a transfer can fail while the
+/// folder's counters (committed references only) still say nothing is
+/// missing. A heartbeat's implicit clear therefore reaches the error of a
+/// failed transfer only once no staged work is left and
+/// `SOURCED_GRACE_MS` passed since the failure; an object error without a
+/// source keeps the immediate clear (WP3.INT).
+#[test]
+fn a_failed_transfer_is_not_cleared_by_counters_that_predate_its_object() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.rec(StatusEvent::PeerConfigured {
+        installation: PEER_A.into(),
+        endpoint: ENDPOINT_A.into(),
+        display_name: None,
+    });
+    let sourced = format!("{:064x}", 1);
+    let plain = format!("{:064x}", 2);
+    // A Fatal-class code, so the display policy shows it at once.
+    let error = ErrorWire::new("SIZE_MISMATCH", "SIZE_MISMATCH: 3 != 4");
+    fx.rec(object_failure(&sourced, 1, &error));
+    fx.rec(StatusEvent::ObjectError {
+        state: STATE.into(),
+        hash: plain.clone(),
+        error: error.clone(),
+        source: None,
+    });
+    let open = |fx: &Fx, hash: &str| {
+        fx.folder().errors.iter().any(|record| {
+            record.resolved_at_ms.is_none()
+                && record.scope
+                    == Scope::Object {
+                        state: STATE.into(),
+                        hash: hash.into(),
+                    }
+        })
+    };
+    assert!(open(&fx, &sourced) && open(&fx, &plain));
+    let beat = |seq: u64, ready: u64| StatusEvent::WorkerHeartbeat {
+        state: STATE.into(),
+        hb: Arc::new(WorkerHeartbeat {
+            instance: "instance-1".into(),
+            seq,
+            at_ms: T0,
+            content: Some(missing_bytes(0)),
+            inbox: Some(InboxCounts {
+                ready,
+                ..InboxCounts::default()
+            }),
+            ..WorkerHeartbeat::default()
+        }),
+    };
+    fx.rec(beat(1, 0));
+    assert!(open(&fx, &sourced), "counters that predate the failure");
+    assert!(!open(&fx, &plain), "an unsourced error clears at once");
+    // Past the grace, staged work still holds it.
+    fx.advance(tkfs::orchestrator::hub::SOURCED_GRACE_MS + 1);
+    fx.rec(beat(2, 1));
+    assert!(open(&fx, &sourced), "staged events may reference it");
+    // No staged work, past the grace: cleared.
+    fx.rec(beat(3, 0));
+    assert!(!open(&fx, &sourced));
 }
 
 /// Fix round 1: legacy published lists held only Running workers, so a

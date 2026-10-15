@@ -69,7 +69,7 @@ use crate::{
         status::{
             ActivationStatus, ActivityEntry, DaemonStatus, Direction, FolderPeerSync, FolderStatus,
             FolderSync, GateKind, GateStatus, InflightOp, Intents, LaneState, LaneStatus,
-            LifecyclePhase, LifecycleStatus, MetaProgress, PeerConnState, PeerStatus,
+            LifecyclePhase, LifecycleStatus, MetaProgress, ObjectSource, PeerConnState, PeerStatus,
             STATUS_SCHEMA, StartupProgress, StatusEvent, StatusSnapshot, StoreStatus,
             TransferProgress, policy,
         },
@@ -424,10 +424,19 @@ impl StatusHub {
             };
             let lane_error =
                 |lane: u32| peer.and_then(|peer| state.lane_error_text(&peer.installation, lane));
+            let live = state.legacy_live(&folder.repo, peer);
             let repository = |lane: u32| {
-                peer.and_then(|peer| peer.lanes.get(&LaneKey::outbound(lane)))
-                    .and_then(|entry| entry.repos.get(&folder.repo))
-                    .map(|repo| legacy_repo_value(repo, lane, pool))
+                let entry = peer.and_then(|peer| peer.lanes.get(&LaneKey::outbound(lane)))?;
+                match entry.repos.get(&folder.repo) {
+                    Some(repo) => Some(legacy_repo_value(repo, lane, pool, &live)),
+                    None if lane > 0 && live.shared => Some(legacy_repo_value(
+                        &LegacyRepo::idle_bulk(),
+                        lane,
+                        pool,
+                        &live,
+                    )),
+                    None => None,
+                }
             };
             let lanes: Vec<Value> = (0..pool)
                 .map(|lane| {
@@ -471,17 +480,38 @@ impl StatusHub {
             let lanes: Vec<Value> = (0..pool)
                 .map(|lane| {
                     let entry = peer.and_then(|peer| peer.lanes.get(&LaneKey::outbound(lane)));
-                    let repositories: Map<String, Value> = entry
+                    let mut repositories: Map<String, Value> = entry
                         .map(|entry| {
                             entry
                                 .repos
                                 .iter()
                                 .map(|(repo, status)| {
-                                    (repo.clone(), legacy_repo_value(status, lane, pool))
+                                    let live = state.legacy_live(repo, peer);
+                                    (repo.clone(), legacy_repo_value(status, lane, pool, &live))
                                 })
                                 .collect()
                         })
                         .unwrap_or_default();
+                    // A bulk lane serves every repository both sides hold,
+                    // whether or not objects moved on it yet (6298d0b's bulk
+                    // lanes exchanged each one every round).
+                    if lane > 0
+                        && entry.is_some()
+                        && let Some(catalog) = peer.and_then(|peer| peer.catalog.as_ref())
+                    {
+                        for published in catalog {
+                            if repositories.contains_key(&published.repo)
+                                || !state.repos.contains_key(&published.repo)
+                            {
+                                continue;
+                            }
+                            let live = state.legacy_live(&published.repo, peer);
+                            repositories.insert(
+                                published.repo.clone(),
+                                legacy_repo_value(&LegacyRepo::idle_bulk(), lane, pool, &live),
+                            );
+                        }
+                    }
                     json!({
                         "role": legacy_role(lane),
                         "connected": entry.is_some_and(|entry| entry.state == LaneState::Ready),
@@ -1180,10 +1210,22 @@ struct FolderEntry {
     mount: MountStatus,
     last_exit: Option<ExitRecord>,
     errors: ErrorBook,
+    /// Objects whose transfer failed (`ObjectError` with a source, WP3.INT):
+    /// hash → when it last failed (`Now::ms`). Their errors are resolved by
+    /// the lanes (`Resolved` once installed or pushed); the heartbeat's
+    /// implicit clear (`on_heartbeat`) reaches them only once the folder has
+    /// no staged work and [`SOURCED_GRACE_MS`] passed since the failure, so a
+    /// heartbeat whose counters predate the object's event never clears it.
+    sourced: BTreeMap<String, u64>,
     /// When the entry was created (monotonic): a folder that is never
     /// registered (no view) is pruned [`ORPHAN_GRACE`] later.
     created: u64,
 }
+
+/// See [`FolderEntry::sourced`]: objects flow before activation (§6.4), so a
+/// transfer can fail while the content counters (committed references only,
+/// refreshed in the background, §4.5) still say nothing is missing.
+pub const SOURCED_GRACE_MS: u64 = 10_000;
 
 impl FolderEntry {
     fn new(now: Now) -> Self {
@@ -1246,6 +1288,66 @@ struct LegacyRepo {
     error: Option<String>,
     consecutive_failures: u32,
     retry_at_ms: Option<u64>,
+    /// Objects whose transfer on this lane failed (`ObjectError` with a
+    /// source, CCR-WP3.INT-1). The projection shows them as the repository's
+    /// `error`, `consecutive_failures` and `retry_at_ms` (as 6298d0b's bulk
+    /// lanes reported a failed object) while the folder still has an open
+    /// error for the object (`legacy_repo_value`).
+    #[serde(skip)]
+    objects: BTreeMap<String, LegacyObjectFailure>,
+}
+
+impl LegacyRepo {
+    /// The status of a repository a bulk lane serves but has not moved
+    /// objects of yet (WP3.INT): v3 bulk lanes report an exchange only when
+    /// objects move, where 6298d0b's exchanged every repository each round.
+    fn idle_bulk() -> Self {
+        Self {
+            transfer: Some(json!({
+                "offer_ms": null,
+                "remote_exchange_ms": null,
+                "apply_ms": null,
+                "total_ms": null,
+                "sent_wire_bytes": 0,
+                "received_wire_bytes": 0,
+                "sent_object_bytes": 0,
+                "received_object_bytes": 0,
+                "transport": transport(),
+            })),
+            object_inventory: Some(json!({
+                "local_available": 0,
+                "local_only": 0,
+                "local_partial": 0,
+                "remote_available": 0,
+                "remote_only": 0,
+                "remote_partial": 0,
+            })),
+            ..Self::default()
+        }
+    }
+}
+
+/// One failed object of a [`LegacyRepo`].
+#[derive(Clone, Debug)]
+struct LegacyObjectFailure {
+    text: String,
+    attempts: u32,
+    at_ms: u64,
+    retry_at_ms: Option<u64>,
+}
+
+/// Failed objects a [`LegacyRepo`] keeps (the oldest goes first).
+const MAX_LEGACY_OBJECT_FAILURES: usize = 64;
+
+/// What the legacy projection of one repository reads at projection time
+/// rather than from the exchange that booked it: the folder (its content
+/// counters and its open object errors) and the peer's published content.
+struct LegacyLive<'a> {
+    state: &'a str,
+    folder: Option<&'a FolderEntry>,
+    remote: Option<ContentCounters>,
+    /// The peer's catalog lists the repository and we hold a folder of it.
+    shared: bool,
 }
 
 #[derive(Debug)]
@@ -1546,6 +1648,67 @@ impl HubState {
             })
     }
 
+    /// Books a failed object transfer on its lane's legacy repository status
+    /// (CCR-WP3.INT-1). Contention is never a failure (§8); a peer the hub
+    /// no longer lists is not recreated.
+    fn legacy_object_failed(
+        &mut self,
+        source: &ObjectSource,
+        repo: &str,
+        hash: &str,
+        error: &ErrorWire,
+        now: Now,
+    ) {
+        if !error.class.counts_as_failure() {
+            return;
+        }
+        let Some(peer) = self.peers.get_mut(&source.installation) else {
+            return;
+        };
+        let lane = peer
+            .lanes
+            .entry(LaneKey::of(source.direction, source.lane))
+            .or_insert_with(|| {
+                LaneEntry::new(source.lane, legacy_lane_role(source.lane), source.direction)
+            });
+        let legacy = lane.repos.entry(repo.to_owned()).or_default();
+        let attempts = legacy
+            .objects
+            .get(hash)
+            .map_or(0, |failure| failure.attempts);
+        if attempts == 0
+            && legacy.objects.len() >= MAX_LEGACY_OBJECT_FAILURES
+            && let Some(oldest) = legacy
+                .objects
+                .iter()
+                .min_by_key(|(_, failure)| failure.at_ms)
+                .map(|(hash, _)| hash.clone())
+        {
+            legacy.objects.remove(&oldest);
+        }
+        legacy.objects.insert(
+            hash.to_owned(),
+            LegacyObjectFailure {
+                text: error.to_string(),
+                attempts: attempts.saturating_add(1),
+                at_ms: now.ms,
+                retry_at_ms: error.retry_after_ms.map(|ms| now.ms.saturating_add(ms)),
+            },
+        );
+    }
+
+    /// The live inputs of `repo`'s legacy status for a peer (`LegacyLive`).
+    fn legacy_live<'a>(&'a self, repo: &str, peer: Option<&PeerEntry>) -> LegacyLive<'a> {
+        let state = self.repos.get(repo).map_or("", String::as_str);
+        let published = peer.and_then(|peer| peer.catalog_entry(repo));
+        LegacyLive {
+            state,
+            folder: self.folders.get(state),
+            remote: published.and_then(|entry| entry.content),
+            shared: published.is_some() && self.repos.contains_key(repo),
+        }
+    }
+
     fn peer_mut(&mut self, installation: &str) -> &mut PeerEntry {
         self.peers
             .entry(installation.to_owned())
@@ -1735,13 +1898,44 @@ impl HubState {
             StatusEvent::InboundIncompatible { address, detail } => {
                 self.on_inbound_incompatible(&address, &detail, now);
             }
-            StatusEvent::ObjectError { state, hash, error } => {
+            StatusEvent::ObjectError {
+                state,
+                hash,
+                error,
+                source,
+            } => {
+                let mut repo = None;
                 if let Some(folder) =
                     folder_for_event(&mut self.folders, &self.removed, &state, now)
                 {
-                    let key = (Scope::Object { state, hash }, String::new());
-                    folder.errors.observe(key, error, now, &mut self.ring);
+                    repo = folder.repo().map(str::to_owned);
+                    let key = (
+                        Scope::Object {
+                            state,
+                            hash: hash.clone(),
+                        },
+                        String::new(),
+                    );
+                    folder
+                        .errors
+                        .observe(key, error.clone(), now, &mut self.ring);
                     folder.errors.cap_items();
+                    if source.is_some() {
+                        if !folder.sourced.contains_key(&hash)
+                            && folder.sourced.len() >= MAX_ITEM_ERRORS
+                            && let Some(oldest) = folder
+                                .sourced
+                                .iter()
+                                .min_by_key(|(_, at)| **at)
+                                .map(|(hash, _)| hash.clone())
+                        {
+                            folder.sourced.remove(&oldest);
+                        }
+                        folder.sourced.insert(hash.clone(), now.ms);
+                    }
+                }
+                if let (Some(source), Some(repo)) = (source, repo) {
+                    self.legacy_object_failed(&source, &repo, &hash, &error, now);
                 }
             }
             StatusEvent::LegacyLink { key, value } => {
@@ -1879,16 +2073,32 @@ impl HubState {
         entry
             .errors
             .mirror(store_key, store_error, now, &mut self.ring);
-        // Implicit successes for item scopes.
+        // Implicit successes for item scopes. A failed transfer's object
+        // (`sourced`) clears only with no staged work left and after a grace:
+        // objects of staged events are transferred before the counters see
+        // them (WP3.INT).
         if hb
             .content
             .is_some_and(|content| rules::missing(&content) == (0, 0))
         {
+            let idle = hb.inbox.is_none_or(|inbox| inbox.pending_active() == 0);
+            let sourced = &entry.sourced;
             entry.errors.resolve(
-                |(scope, _), _| matches!(scope, Scope::Object { .. }),
+                |(scope, _), _| match scope {
+                    Scope::Object { hash, .. } => sourced
+                        .get(hash)
+                        .is_none_or(|at| idle && now.ms >= at.saturating_add(SOURCED_GRACE_MS)),
+                    _ => false,
+                },
                 now,
                 &mut self.ring,
             );
+            let errors = &entry.errors;
+            entry.sourced.retain(|hash, _| {
+                errors.open.keys().any(
+                    |(scope, _)| matches!(scope, Scope::Object { hash: open, .. } if open == hash),
+                )
+            });
         }
         if hb
             .inbox
@@ -3476,8 +3686,13 @@ fn update_legacy_repo(
         repo.retry_at_ms = None;
         match &x.summary {
             Some(summary) => {
-                repo.caught_up = summary.caught_up;
-                repo.metadata_caught_up = summary.caught_up;
+                // CCR-WP3.1-2 (applied by WP3.INT): 6298d0b reported a
+                // repository whose source still had events to activate (a
+                // gated received folder) as not caught up; the feed's
+                // `caught_up` is about our cursor only (§6.3.6).
+                let caught_up = summary.caught_up && summary.remote_pending == 0;
+                repo.caught_up = caught_up;
+                repo.metadata_caught_up = caught_up;
                 repo.metadata_progress = Some(json!({
                     "local_events": summary.local_tip,
                     "remote_events": summary.remote_tip,
@@ -3488,8 +3703,11 @@ fn update_legacy_repo(
                 }));
             }
             None if objects_op => {
+                // CCR-WP3.1-1 (applied by WP3.INT): a bulk lane never claims
+                // `caught_up` (its exchanges carry objects only; the claim is
+                // the control lane's), as 6298d0b's bulk lanes did.
                 repo.metadata_caught_up = false;
-                repo.caught_up = x.objects_up == 0 && x.objects_down == 0;
+                repo.caught_up = false;
             }
             None => {}
         }
@@ -3510,8 +3728,58 @@ fn update_legacy_repo(
 
 /// A legacy repository status as JSON; a bulk lane's transfer names its
 /// object lane `{index, count}` like the legacy bulk exchange did.
-fn legacy_repo_value(repo: &LegacyRepo, lane: u32, pool: u32) -> Value {
+///
+/// Read at projection time (`live`, WP3.INT): v3 bulk lanes report an
+/// exchange only when objects move, so the `object_inventory` booked with
+/// the last one would go stale once a transfer is done; it is recomputed from
+/// the folder's and the peer's content counters now. The lane's failed
+/// objects (CCR-WP3.INT-1) whose folder error is still open are its `error`
+/// (the newest), `consecutive_failures` (the most attempts of one object, on
+/// top of failed exchanges) and `retry_at_ms`; once none is open (installed,
+/// or the folder has nothing missing) they no longer show.
+fn legacy_repo_value(repo: &LegacyRepo, lane: u32, pool: u32, live: &LegacyLive<'_>) -> Value {
     let mut value = serde_json::to_value(repo).unwrap_or(Value::Null);
+    if lane > 0
+        && repo.object_inventory.is_some()
+        && let Some(local) = live.folder.and_then(FolderEntry::content)
+    {
+        let remote = live.remote.unwrap_or_default();
+        value["object_inventory"] = json!({
+            "local_available": local.shared_available,
+            "local_only": local.shared_available.saturating_sub(remote.shared_available),
+            "local_partial": local.downloading,
+            "remote_available": remote.shared_available,
+            "remote_only": remote.shared_available.saturating_sub(local.shared_available),
+            "remote_partial": remote.downloading,
+        });
+    }
+    let open = |hash: &str| {
+        live.folder.is_some_and(|folder| {
+            folder.errors.open.contains_key(&(
+                Scope::Object {
+                    state: live.state.to_owned(),
+                    hash: hash.to_owned(),
+                },
+                String::new(),
+            ))
+        })
+    };
+    let failing: Vec<&LegacyObjectFailure> = repo
+        .objects
+        .iter()
+        .filter(|(hash, _)| open(hash))
+        .map(|(_, failure)| failure)
+        .collect();
+    if let Some(newest) = failing.iter().max_by_key(|failure| failure.at_ms) {
+        let attempts = failing.iter().map(|failure| failure.attempts).max();
+        value["error"] = json!(newest.text);
+        value["consecutive_failures"] = json!(
+            repo.consecutive_failures
+                .saturating_add(attempts.unwrap_or(0))
+        );
+        value["retry_at_ms"] = json!(newest.retry_at_ms.or(repo.retry_at_ms));
+        value["caught_up"] = json!(false);
+    }
     if lane > 0
         && let Some(transfer) = value.get_mut("transfer").and_then(Value::as_object_mut)
     {

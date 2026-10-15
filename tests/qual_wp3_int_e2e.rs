@@ -493,26 +493,58 @@ fn idle_exchange_daemons() {
             .is_ok_and(|p| p[0]["lanes"][0]["repositories"][&repo]["metadata_caught_up"] == true)
     });
     s.check(caught_up, "replicas caught up");
-    let exchanges = |b: &Node| -> u64 {
-        b.raw_call(json!({"op":"peers"}))
-            .ok()
-            .and_then(|p| {
-                p[0]["lanes"]
-                    .as_array()
-                    .map(|l| l.iter().filter_map(|l| l["exchanges"].as_u64()).sum())
-            })
-            .unwrap_or(0)
+    // Let the catch-up's last exchanges (acknowledgements) finish.
+    thread::sleep(Duration::from_secs(5));
+    // The control lane's metadata exchanges so far, and both feeds' tips as
+    // B sees them, from B's Peers reply (WP3.INT: `None` when it does not
+    // answer, never a zero that a later sample would be subtracted from).
+    let sample = |b: &Node| -> Option<(u64, Value)> {
+        let peers = b.raw_call(json!({"op":"peers"})).ok()?;
+        let control = &peers[0]["lanes"][0];
+        let exchanges = control["exchanges"].as_u64()?;
+        let progress = control["repositories"][&repo]["metadata_progress"].clone();
+        Some((exchanges, progress))
+    };
+    let settled = |b: &Node| {
+        let mut taken = None;
+        wait_until(Duration::from_secs(30), || {
+            taken = sample(b);
+            taken.is_some()
+        });
+        taken
     };
     s.measure_from_now();
-    let (bytes0, ex0) = (proxy.bytes_up() + proxy.bytes_down(), exchanges(&b));
+    let before = settled(&b);
+    let bytes0 = proxy.bytes_up() + proxy.bytes_down();
     thread::sleep(Duration::from_secs(30).min(s.budget));
-    let (bytes1, ex1) = (proxy.bytes_up() + proxy.bytes_down(), exchanges(&b));
-    let per = (bytes1 - bytes0) as f64 / (ex1 - ex0).max(1) as f64;
+    let bytes1 = proxy.bytes_up() + proxy.bytes_down();
+    let after = settled(&b);
+    // WP3.INT (WP0.5 review major): the floor holds only for exchanges that
+    // happened, and were idle: at least `MIN_IDLE` metadata exchanges in the
+    // window, and neither feed moved (`metadata_progress` unchanged).
+    const MIN_IDLE: u64 = 10;
+    let exchanged = match (&before, &after) {
+        (Some((ex0, _)), Some((ex1, _))) => ex1.checked_sub(*ex0),
+        _ => None,
+    };
+    let bytes = bytes1.checked_sub(bytes0);
+    let idle =
+        matches!((&before, &after), (Some((_, p0)), Some((_, p1))) if p0 == p1 && !p0.is_null());
+    s.check(
+        exchanged.is_some_and(|exchanged| exchanged >= MIN_IDLE),
+        format!("at least {MIN_IDLE} idle exchanges in the window (saw {exchanged:?})"),
+    );
+    s.check(idle, "the feeds did not move during the window");
+    let per = match (bytes, exchanged) {
+        (Some(bytes), Some(exchanged)) if exchanged > 0 && idle => bytes as f64 / exchanged as f64,
+        _ => f64::NAN,
+    };
     s.metric_with(
         "bytes_per_exchange",
         per,
         "bytes",
-        json!({"bytes": bytes1 - bytes0, "exchanges": ex1 - ex0, "events": n}),
+        json!({"bytes": bytes, "exchanges": exchanged, "events": n,
+            "progress": after.map(|(_, progress)| progress)}),
     );
     s.finish();
 }

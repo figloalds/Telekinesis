@@ -9,10 +9,10 @@
 //!   the cutover they came verbatim from the legacy lanes' `LinkStatus`; the
 //!   keys are the same, `transport` is now `"tkfs-peer/3"`. The acceptor
 //!   lists no peer (`[]`), as it always did: only dialed peers are in the
-//!   catalog. Two values are kept as 6298d0b had them (adapters of
-//!   CCR-WP3.1-1 and CCR-WP3.1-2, see [`legacy_values`]): a bulk lane never
-//!   claims `caught_up`, and no lane claims it while the remote still has
-//!   events to activate.
+//!   catalog. The hub keeps the values 6298d0b reported (CCR-WP3.1-1 and
+//!   CCR-WP3.1-2, applied in `hub.rs` by WP3.INT, which removed this
+//!   module's adapters): a bulk lane never claims `caught_up`, and no lane
+//!   claims it while the remote still has events to activate.
 //! * [`worker_call`]: the `Folder` passthrough's loopback worker call, with
 //!   the caller's request id (the worker's receipts make a retried mutation
 //!   with the same id idempotent) and a hard deadline. It replaces the
@@ -57,60 +57,11 @@ impl std::fmt::Debug for HubLegacyView {
 
 impl LegacyNetworkView for HubLegacyView {
     fn folder_sync(&self, folder: &FolderRecord) -> Value {
-        let mut sync = self.hub.legacy_folder_sync(folder, &self.outbound_peers());
-        for link in sync.as_array_mut().into_iter().flatten() {
-            legacy_values(&mut link["metadata"], false);
-            for lane in link["lanes"].as_array_mut().into_iter().flatten() {
-                let bulk = lane["lane"].as_u64().is_some_and(|lane| lane > 0);
-                legacy_values(&mut lane["repository"], bulk);
-            }
-        }
-        sync
+        self.hub.legacy_folder_sync(folder, &self.outbound_peers())
     }
 
     fn peers(&self) -> Value {
-        let mut peers = self.hub.legacy_peers(&self.outbound_peers());
-        for peer in peers.as_array_mut().into_iter().flatten() {
-            for lane in peer["lanes"].as_array_mut().into_iter().flatten() {
-                let bulk = lane["role"] == "bulk";
-                if let Some(repositories) = lane["repositories"].as_object_mut() {
-                    for repository in repositories.values_mut() {
-                        legacy_values(repository, bulk);
-                    }
-                }
-            }
-        }
-        peers
-    }
-}
-
-/// A legacy `RepositoryStatus` with the values 6298d0b reported, where the
-/// hub's projection of the v3 exchanges differs (adapters until the hub's
-/// `update_legacy_repo` does it, CCRs for WP3.INT; the compat goldens of
-/// `harness_selftest` pin them):
-///
-/// * CCR-WP3.1-1: a bulk lane (`bulk`) never claimed `caught_up`: its pages
-///   carry objects only, the claim is the control lane's. The hub sets it
-///   after an object exchange that completed nothing.
-/// * CCR-WP3.1-2: `caught_up` and `metadata_caught_up` were false while the
-///   remote still had events to activate (`metadata_progress.remote_pending`
-///   above 0, the case of a gated received folder). The hub takes them from
-///   the feed's `caught_up`, which is about our cursor of the remote's
-///   committed feed only (§6.3.6 keeps the remote's pending for the gate).
-fn legacy_values(repository: &mut Value, bulk: bool) {
-    let Some(repository) = repository.as_object_mut() else {
-        return;
-    };
-    let remote_pending = repository
-        .get("metadata_progress")
-        .and_then(|progress| progress.get("remote_pending"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if (bulk || remote_pending > 0) && repository.contains_key("caught_up") {
-        repository.insert("caught_up".into(), Value::Bool(false));
-    }
-    if remote_pending > 0 && repository.contains_key("metadata_caught_up") {
-        repository.insert("metadata_caught_up".into(), Value::Bool(false));
+        self.hub.legacy_peers(&self.outbound_peers())
     }
 }
 
