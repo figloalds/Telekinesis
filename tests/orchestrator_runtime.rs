@@ -266,6 +266,60 @@ fn projection_follows_the_section_7_3_rules() {
             assert!(value.contains_key(key), "{name}: {key}");
         }
     }
+    // WP2.INT's confirmation review (CCR-WP2.INT-7): the controller deletes
+    // the gate marker on a helper thread once the folder runs complete, so
+    // the row can outlive the attach by a write. A running, attached folder
+    // (or a headless one whose gate is satisfied or overridden) does not
+    // report its initial sync pending meanwhile; one whose attach failed
+    // keeps the marker and still does.
+    let satisfied = GateState::Satisfied { at_ms: 1 };
+    for (name, record, view, pending) in [
+        (
+            "running, attached, marker being deleted",
+            &mounted,
+            view(
+                running(),
+                satisfied.clone(),
+                mount(MountState::Attached { since_ms: 1 }),
+            ),
+            false,
+        ),
+        (
+            "running headless, satisfied, marker being deleted",
+            &headless,
+            view(running(), satisfied.clone(), MountStatus::default()),
+            false,
+        ),
+        (
+            "running headless, overridden, marker being deleted",
+            &headless,
+            view(
+                running(),
+                GateState::Overridden { at_ms: 1 },
+                MountStatus::default(),
+            ),
+            false,
+        ),
+        (
+            "running, attach failed, marker kept",
+            &mounted,
+            view(running(), satisfied.clone(), mount(attach_failed.clone())),
+            true,
+        ),
+        (
+            "stopped, satisfied, marker kept",
+            &mounted,
+            view(
+                FolderPhase::Stopped,
+                satisfied.clone(),
+                mount(MountState::Detached),
+            ),
+            true,
+        ),
+    ] {
+        let value = manage::project(record, &view, true);
+        assert_eq!(value["initial_sync_pending"], json!(pending), "{name}");
+    }
     // An open controller error shows while backing off; a resolved one does not.
     let mut backoff = view(
         FolderPhase::Backoff {
