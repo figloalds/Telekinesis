@@ -445,14 +445,18 @@ fn a_startup_replays_the_snapshot_suffix_against_one_view() {
     assert_eq!(sealed(&store).0, tip);
 }
 
-/// WP3.INT: a session's socket gets 4 MiB send and receive buffers on
-/// Windows (`session::io::SOCKET_BUFFER_BYTES`), on both sides. With the
-/// defaults (64 KiB) every 1 MiB frame waited for writable readiness and a
-/// loopback download ran at 270–360 MiB/s, below
-/// `session_loopback_throughput`'s 300 MiB/s floor; with them, 3.2–4.0
-/// GiB/s. The options are read through a duplicate of the socket's handle,
-/// which reports the send buffer as set but not the receive buffer, so only
-/// the send buffer is checked here; the qualification scenario measures the
+/// WP3.INT: a session's socket gets a 4 MiB receive buffer on Windows
+/// (`session::io::SOCKET_BUFFER_BYTES`), and its send buffer grows to 4 MiB
+/// when the socket drains fast. With the defaults (64 KiB) every 1 MiB frame
+/// waited for writable readiness and a loopback download ran at 270–360
+/// MiB/s, below `session_loopback_throughput`'s 300 MiB/s floor; with them,
+/// 3.2–4.0 GiB/s. The send buffer starts at the system's own size and
+/// follows the drain rate (WP3.INT re-review: a fixed 4 MiB held control
+/// frames behind megabytes of data on a slow uplink; the drain rate test is
+/// `objects_v3_lanes::a_saturating_push_does_not_delay_pulls_on_a_slow_uplink`).
+/// The options are read through a duplicate of the socket's handle, which
+/// reports the send buffer as set but not the receive buffer, so only the
+/// send buffer is checked here; the qualification scenario measures the
 /// effect of both.
 #[cfg(windows)]
 #[test]
@@ -460,11 +464,14 @@ fn session_sockets_get_large_buffers_on_windows() {
     use std::{
         net::{TcpListener, TcpStream},
         os::windows::io::AsRawSocket,
+        sync::Arc,
         thread,
     };
     use tkfs::{
-        model::protocol::LaneRole,
-        session::{Conn, ConnOptions, PeerInfo, Side, io::SOCKET_BUFFER_BYTES},
+        model::protocol::{LaneRole, frame::ChunkHeader},
+        session::{
+            Conn, ConnOptions, Handler, Incoming, PeerInfo, Priority, Side, io::SOCKET_BUFFER_BYTES,
+        },
     };
     #[link(name = "ws2_32")]
     unsafe extern "system" {
@@ -492,6 +499,27 @@ fn session_sockets_get_large_buffers_on_windows() {
         assert_eq!(status, 0);
         i32::from_ne_bytes(value)
     };
+    /// Streams `MIB` 1 MiB chunks to the caller.
+    struct Download;
+    const MIB: usize = 1024 * 1024;
+    impl Handler for Download {
+        fn handle(&self, req: Incoming) {
+            let block = vec![7u8; MIB];
+            for index in 0..256u64 {
+                let header = ChunkHeader {
+                    id: 0,
+                    hash: None,
+                    offset: index * MIB as u64,
+                    total: 256 * MIB as u64,
+                    last: index == 255,
+                };
+                if req.responder.chunk(header, &block).is_err() {
+                    return;
+                }
+            }
+            req.responder.reply(json!({}), Vec::new());
+        }
+    }
     let peer = || PeerInfo {
         installation: "w3".into(),
         role: LaneRole::Control,
@@ -509,7 +537,8 @@ fn session_sockets_get_large_buffers_on_windows() {
     });
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let client_socket = stream.try_clone().unwrap();
-    assert_ne!(option(&client_socket, 0x1001), SOCKET_BUFFER_BYTES);
+    let default = option(&client_socket, 0x1001);
+    assert_ne!(default, SOCKET_BUFFER_BYTES);
     let ws =
         tungstenite::client_tls_with_config(format!("ws://127.0.0.1:{port}/"), stream, None, None)
             .unwrap()
@@ -517,8 +546,100 @@ fn session_sockets_get_large_buffers_on_windows() {
     let client = Conn::from_established(ws, Side::Client, peer(), ConnOptions::default()).unwrap();
     let (ws, server_socket) = accepted.join().unwrap();
     let server = Conn::from_established(ws, Side::Server, peer(), ConnOptions::default()).unwrap();
+    // Nothing sent yet: both send buffers are the system's.
     for socket in [&client_socket, &server_socket] {
-        assert_eq!(option(socket, 0x1001), SOCKET_BUFFER_BYTES, "SO_SNDBUF");
+        assert_eq!(option(socket, 0x1001), default, "SO_SNDBUF");
     }
+    // A fast download: the server's send buffer stays the system's while
+    // the kernel takes every frame at once, and grows to the largest size
+    // once the socket refuses bytes while draining fast (it never shrinks
+    // below the system's); the client, which sent almost nothing, keeps the
+    // system's.
+    server.serve(Arc::new(Download));
+    let mut received = 0usize;
+    client
+        .call_streaming(
+            "download",
+            json!({}),
+            Vec::new(),
+            Priority::Control,
+            Some(Duration::from_secs(120)),
+            Duration::from_secs(30),
+            &mut |_: ChunkHeader, bytes: &[u8]| {
+                received += bytes.len();
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(received, 256 * MIB);
+    let grown = option(&server_socket, 0x1001);
+    assert!(
+        [default, SOCKET_BUFFER_BYTES].contains(&grown),
+        "server SO_SNDBUF {grown}"
+    );
+    assert_eq!(option(&client_socket, 0x1001), default, "client SO_SNDBUF");
     drop((client, server));
+}
+
+/// The adaptive send buffer's rule (WP3.INT re-review): it grows to about two
+/// round trips of the drain rate on a fast link (the largest size on
+/// loopback), shrinks on a slow one, never below the system's own size, and
+/// a window in which the socket took everything changes nothing.
+#[test]
+fn the_send_buffer_follows_the_drain_rate() {
+    use std::time::Instant;
+    use tkfs::session::io::{SEND_BUFFER_MIN, SEND_BUFFER_WINDOW, SendBuffer};
+    const MIB: usize = 1024 * 1024;
+    let max = 4 * MIB;
+    let start = Instant::now();
+    let mut buffer = SendBuffer::new(max, start);
+    let mut at = start;
+    let mut window = |buffer: &mut SendBuffer, bytes: usize, saturated: bool, rtt: u64| {
+        buffer.took(bytes);
+        if saturated {
+            buffer.refused();
+        }
+        at += SEND_BUFFER_WINDOW;
+        buffer.resize(at, rtt)
+    };
+    // Not saturated: nothing changes, however fast.
+    assert_eq!(window(&mut buffer, 512 * MIB, false, 1), None);
+    assert_eq!(buffer.size(), None);
+    // Loopback, saturated at 300 MiB/s: the largest size.
+    assert_eq!(window(&mut buffer, 75 * MIB, true, 1), Some(max));
+    // The same again: no change.
+    assert_eq!(window(&mut buffer, 75 * MIB, true, 1), None);
+    // A slow uplink (128 KiB/s, short round trip): the smallest size.
+    assert_eq!(
+        window(&mut buffer, 32 * 1024, true, 1),
+        Some(SEND_BUFFER_MIN)
+    );
+    // A long fat link (12.5 MB/s at 200 ms): two round trips, 5 MB (the
+    // largest size).
+    let mut fat = SendBuffer::new(max, start);
+    fat.took(3_125_000);
+    fat.refused();
+    assert_eq!(fat.resize(start + SEND_BUFFER_WINDOW, 200), Some(max));
+    // A buffer-bound link grows (rate = size / round trip).
+    let mut slow = SendBuffer::new(max, start);
+    let mut at = start;
+    let mut size = 0usize;
+    for _ in 0..8 {
+        let current = slow.size().unwrap_or(SEND_BUFFER_MIN);
+        // 100 ms round trip: a quarter-second window moves 2.5 buffers.
+        slow.took(current * 5 / 2);
+        slow.refused();
+        at += SEND_BUFFER_WINDOW;
+        if let Some(next) = slow.resize(at, 100) {
+            assert!(next > size, "{next} after {size}");
+            size = next;
+        }
+    }
+    assert_eq!(size, max);
+    // A fresh buffer on a slow link keeps the system's size.
+    let mut fresh = SendBuffer::new(max, start);
+    fresh.took(16 * 1024);
+    fresh.refused();
+    assert_eq!(fresh.resize(start + SEND_BUFFER_WINDOW, 5), None);
+    assert_eq!(fresh.size(), None);
 }
