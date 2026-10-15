@@ -81,6 +81,13 @@ created: the coordinator does both after review (§13 rule 6, rule 8 item 7).
    breakage between the four packages was found; the stack is still not
    wired into the daemon (WP3.1).
 
+6. **Post-integration re-review and its confirmation review** (sections at
+   the end). The re-review's 20 issues were fixed in `dc56483`–`38fbb42`.
+   Its confirmation review found three new blockers and one minor (C1–C4),
+   and this round found one more issue (C5). All five are fixed in
+   `94381bf`–`3624ce2`, with CCR-WP2.INT-6 (§4.5) and CCR-WP2.INT-7 (§7.3)
+   ratified. The latest VERIFY and qualification are in the last section.
+
 ## CCRs
 
 ### Assigned to WP2.INT by WP1.INT
@@ -275,6 +282,10 @@ and the four unit tests of `supervisor.rs`
 replaced the Supervisor has its own (`folder_controller`, `orchestrator_runtime`).
 
 ## VERIFY
+
+(The latest VERIFY, on the final tree, is in *Confirmation review (re-review
+fix 2)* at the end; this section and the post-integration re-review's are
+kept as the record of their rounds.)
 
 Run on the tree of `7659915` (the product code and tests of every change
 above; later commits add the ignored interop test, the two qualification
@@ -544,7 +555,7 @@ ratified in REVAMP_PLAN as CCR-WP2.INT-1 to -4 (below).
 | W2 | **Major** (WP2.3; off-lock #3, minor). A `Stale` ticket was only re-queued: behind a local writer committing more often than a preparation takes, a slow event (and its descendants) never activated; `starved_since_ms` was cleared by any activation, so it was rarely reported. | **CCR-WP2.INT-1 (§4.4, ratified):** after `STALE_ESCALATE` (4) consecutive `Stale` outcomes the event is committed inline, alone (`Prepared::Inline`, through the same never-wait commit): one O(history) hold for that event instead of unbounded starvation. Starvation is tracked per event (first `Stale` time and count); `starved_since_ms` is the oldest still starving, cleared when that event commits, is quarantined or leaves the inbox (checked at most once a second on a pooled store), never by unrelated activations. | `worker_concurrency::a_starving_slow_event_is_committed_inline_and_reported_until_then` (a save through the engine every 3 ms, 200 events of history; side-branch events from C activate meanwhile). Before: "the slow event never committed behind 2510 local saves" in 60 s. After: committed after 4 `Stale` rounds (about 4 s), the report constant while it starved and through C's activations, cleared after. Release: `qual_wp2_4_offlock::stale_convergence_worker_steady_writer` (new; the 50 ms writer deviation 6 had replaced), *Qualification* below. |
 | W3 | **Major.** An idle worker's maintenance recomputed `journal_counters` and `inventory_match` (uncached, O(history)) every refresh: about 26 % of a core at 50K events. | Both are cached per connection under its change key (`total_changes`, `PRAGMA data_version`, open transaction, active branch; `core::status::Cache`), as the content scan already was; and `inventory_match` is index-only once the feed index is built (`feed_journal`'s row count, each peer's `peer_known` range, per feed row a `(peer, event)` key lookup), never the wide `events` rows. | `worker_concurrency::status_totals_are_cached_until_the_database_changes` (a WAL checkpoint by another connection is no change; another connection's commit is). With the cache lookups disabled: "recomputed while idle", 12 computations instead of 2. |
 | W4 | Minor. Since CCR-WP2.5-5 the cell's `tip` is the feed tip, but `inventory_tip` recorded the journal tip: once the newest event was private, every `status` re-ran the inventory match. | `inventory_tip` (and the new `inventory_epoch`) record the feed tip and epoch in both refreshes; `reply` compares like with like. | `worker_concurrency::a_private_journal_tip_does_not_recompute_the_inventory_match` (caught up, then a `branch` fork). Before: 20 of 20 calls recomputed it. After: 0. |
-| W5 | Minor. Read-your-writes made the `status` after any client mutation run a full refresh (content, journal counters, inventory match) on the caller, and concurrent callers each repeated it. | That refresh is content and cheap members only (maintenance brings the totals); one at a time per worker store (a lock keyed by the store root; `WorkerCtx` is frozen), a waiting caller finds the content caught up. The first reply still computes everything once. | `worker_concurrency::status_after_a_mutation_refreshes_the_content_only`. Before: "the inventory match was recomputed by the read-your-writes refresh". After: the content moved, the inventory untouched. |
+| W5 | Minor. Read-your-writes made the `status` after any client mutation run a full refresh (content, journal counters, inventory match) on the caller, and concurrent callers each repeated it. | That refresh is content and cheap members only (maintenance brings the totals); one at a time per worker store (a lock keyed by the store root; `WorkerCtx` is frozen), a waiting caller finds the content caught up. The first reply still computes everything once. *Only partly fixed here: the content scan itself stayed on the caller; re-review fix 2 moves it to a background thread (Confirmation review below).* | `worker_concurrency::status_after_a_mutation_refreshes_the_content_only`. Before: "the inventory match was recomputed by the read-your-writes refresh". After: the content moved, the inventory untouched. |
 
 ### WP2.5 and the feed protocol (`sharing.rs`, `inbound.rs`, `meta_exchange.rs`)
 
@@ -720,7 +731,8 @@ resumed 2.0 ms after Running, `crash_loop_reaches_failed` 14.8 s,
   `lock_hold_slow_conflict_event_2k`, not changed.
 - W5: the read-your-writes refresh still loads the projection on a pooled
   connection whose view the commit invalidated (cold, O(projection)); only
-  the totals and the repetition are gone.
+  the totals and the repetition are gone. **Fixed by re-review fix 2**
+  (*Confirmation review* below): that refresh no longer runs on the caller.
 - F5: the receiver's own reads of held payloads for elided entries are not
   budgeted (bounded by the sender's page budget for an honest sender).
 - L5: adopting live workers can hold more slots than `maximum_running` for
@@ -744,3 +756,176 @@ resumed 2.0 ms after Running, `crash_loop_reaches_failed` 14.8 s,
 - `212fbc3` WP2.INT: re-review fix - spec ratifications (CCR-WP2.INT-1 to
   -4) and off-lock qualification scenarios
 - the commit that adds this section and the merged qualification evidence
+
+## Confirmation review (re-review fix 2)
+
+A confirmation review of the re-review fixes (tree `38fbb42`) confirmed
+the 20 original fixes in code, and reported **three new blockers and one
+minor**. Two blockers came from the L1/L2 fix (the bounded
+`CatalogApi::apply`). The third was W5: that fix was only partial. The
+minor was a flaky pre-existing test. All four are fixed here, along with a
+fifth issue (C5) that my own full-suite run found: another consequence of
+L1. Each fix has a regression test that fails on the code before it (*How
+"before" was run* below).
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| C1 | **Blocker** (`manage.rs` Create/Receive). Since `apply` is bounded, it can answer `REQUEST_TIMEOUT` for a `create_folder` that is still running and may still commit. Create treated every error as "not applied" and deleted the new state directory. The catalog then listed a folder whose store was gone (its worker could not open it: a crash loop, then Failed), and a retried Create added a second folder. | Create deletes the directory only when the command was not applied. That covers every error except `REQUEST_TIMEOUT` (`catalog::outcome_unknown`): refused, withdrawn, rolled back, or a thread that died before running it. On `REQUEST_TIMEOUT` it waits up to `manage::CREATE_SETTLE_WAIT` (5 s) for the outcome (`settle_create`). If the folder appears in the snapshot, the reply is the folder, as for a normal Create. The catalog runs commands one at a time, in order, so a no-op probe on the new folder (`SetIntents` with nothing to change) that it answers `FOLDER_NOT_FOUND` proves the create ended without being applied. The directory is then removed, and the reply is `CATALOG_UNAVAILABLE: … the folder was not created`. Probes refused while the slow write still runs only continue the wait. Otherwise the reply is `REQUEST_TIMEOUT` naming the folder's state ("may still be created: look for it in List before creating it again"), and the directory is kept: an orphaned directory is harmless, a catalog row without its store is not. | `orchestrator_runtime::create_behind_a_slow_catalog_write_never_deletes_a_listed_folder_store` (in-process daemon, `catalog.slow_write` hangs 7 s, then 12 s). Before: "Create waits for a write that commits soon after APPLY_WAIT: REQUEST_TIMEOUT: the catalog command create_folder did not finish within 5000 ms; it may still be applied". After, at 7 s: Create answers with the folder (after more than `APPLY_WAIT`), and the listed folder's `metadata.sqlite` exists. At 12 s: `REQUEST_TIMEOUT` naming the state; the folder listed afterwards has its store. `orchestrator_runtime::create_behind_a_slow_rolled_back_write_leaves_nothing_behind` (`catalog.actor` holds the command 7 s, then `catalog.slow_write` fails it). Before: the reply was `REQUEST_TIMEOUT … it may still be applied`. After: `CATALOG_UNAVAILABLE … not created`, nothing listed, `states/` empty. |
+| C2 | **Blocker** (`manage::apply`). Since `apply` is bounded, `CATALOG_UNAVAILABLE` also means a transient refusal: a command withdrawn after 5 s in the queue, or not queued behind a write that has run that long. `manage::apply` recorded each refusal as a daemon-level `StatusEvent::Error`, and nothing resolved it, so after one slow write the daemon showed an open `CATALOG_UNAVAILABLE` until it restarted. | The refusals carry `retry_after_ms` (`catalog::REFUSAL_RETRY_AFTER`, 1 s; `catalog::is_refusal`). `manage::apply` records a daemon error only for a `CATALOG_UNAVAILABLE` that is not a refusal: a thread that exited, a closed handle, a command that panicked. When it records one, it sets a flag in the daemon's extras (`Extras::catalog_error`; `Ctx` is frozen). The next management write that succeeds records `StatusEvent::Resolved{Daemon, CATALOG_UNAVAILABLE}`. | `orchestrator_runtime::writes_behind_a_slow_catalog_never_lock_reads_out`, extended: after the 12 s write, a write succeeds and no daemon `CATALOG_UNAVAILABLE` is open. Before: one open error, `count` 199, "a catalog write has been running for 11995 ms; set_verifier was not queued behind it". After: none. New `orchestrator_runtime::a_failed_catalog_write_is_a_daemon_error_until_a_write_succeeds`: three `set_verifier` commands panic in the catalog, so the daemon error shows (Transient: three occurrences); then a write succeeds. Before: "a successful write did not resolve the daemon error" (open, `count` 3). After: resolved (`resolved_at_ms` set). |
+| C3 | **Blocker** (WP2.3 finding 5 / W5, only partly fixed). The read-your-writes path still ran `content_report` on the caller, on a pooled connection whose view the client's commit had invalidated. That is a cold reload of the projection: 1.6–2.3 s at 50K events per the review. | The content refresh after a client mutation runs on a background thread (`status-content`), one at a time per store, and never on the caller (`status_cell::catch_up_content`). The reply waits for it only when a refresh is expected to take at most `READ_YOUR_WRITES_BUDGET` (100 ms; bounded by `STATUS_CELL_STALE`), so small stores still read their writes. Otherwise the reply answers from the cell with current cheap counters and the additive key `content_pending: true`, and the content lands in the cell for a later call (or maintenance's refresh). The expected cost is a decaying maximum of the background refreshes' durations, seeded with the cell's first full refresh (`CellMeta::first_full_ms`, cold). It is a maximum because a refresh that finds a pooled view already reloaded by maintenance is fast without predicting the next one: a first version that used only the last duration still made 4 of 10 replies wait about 800 ms at 50K. On a store expected to be slow, a refresh starts only after one times the last one's duration has passed since it ended, and each call starts at most one. Ratified as **CCR-WP2.INT-6** in §4.5. The very first reply still computes everything once (the legacy shape has a `content` member). | `worker_concurrency::status_after_a_mutation_never_waits_for_a_slow_content_refresh` (fault point `worker.status_cell.content.<repo>` makes each refresh take 1.5 s). Before (the old caller path, with the same fault point): "the reply waited 1504.6 ms for the content". After: the first reply waits (the expected cost was the cheap startup refresh) and reads its write; the next answers in well under 1 s with `content_pending: true`, the old content and the new journal tip; the content catches up in the background, and every reply stays under 1 s. Release, new scenario `qual_wp2_3_worker::status_after_mutation_large` (50,000 files, ten imports, each followed by `status`). Before: replies p50 694 ms, max 1,061 ms. After: p50 1.0 ms, max 1.3 ms; all ten `content_pending`; the content showed each import after p50 718 ms, max 924 ms (a manual run; the qualification run is below). |
+| C4 | Minor (`orchestrator_runtime`, WP2.1's test `a_received_mount_attaches_in_place_once_its_gate_is_satisfied`, flaky). It waited on view-derived fields, then asserted the hub-derived lifecycle phase on a new Inspect. The hub's snapshot is throttled (4 a second), so under suite load it could still say `starting`. | The wait also requires `phase == "running"`, and the assertions use the Inspect that satisfied the wait. **Changed test, justified:** the assertions are unchanged; only the wait covers the hub's throttle. | Green in the full suites below. |
+| C5 | Found here (my first full suite of this round: `orchestrator::received_mount_waits_for_complete_metadata_across_daemon_restart`, a 6298d0b-era test, failed once). L1 moved the gate marker's deletion (`ClearGate`) off the controller thread, so the controller publishes the attached view before the row is gone. For one catalog write, Inspect showed `running: true` with `initial_sync_pending: true`, which no legacy daemon ever showed, and the test asserts the opposite right after `running`. | The §7.3 projection reports a marker the controller is deleting as not pending. That is the case when the folder runs and the controller's own rule holds: mount `Attached`, or no mount requested and the gate `Satisfied` or `Overridden`. A marker that stays (an attach that failed, a stopped folder) is still reported. Ratified as **CCR-WP2.INT-7** in §7.3. | New cases after the table in `orchestrator_runtime::projection_follows_the_section_7_3_rules`. Before: "running, attached, marker being deleted: left true, right false". After: false for that case and for the two headless ones (satisfied, overridden); true for "attach failed" and "stopped". The legacy test passed 3 isolated runs and every later full suite, unchanged. |
+
+### Spec
+
+- **CCR-WP2.INT-7 (§7.3, ratified):** `initial_sync_pending`, as in C5.
+- **CCR-WP2.INT-6 (§4.5, ratified):** content after a client mutation, as
+  in C3. The cheap members stay read-your-writes as specified. Content
+  read-your-writes was WP2.3's own extension: the spec has content refreshed
+  by maintenance at 1 Hz.
+- §3.2 (catalog commands): refusals carry `retry_after_ms` and are never a
+  daemon-level ErrorRecord. That record is resolved by the next write that
+  succeeds. A caller that got `REQUEST_TIMEOUT` never undoes the command's
+  effects as if it had failed (Create's settle wait). §3.3's Create line says
+  the same.
+- From the confirmation review's notes: the §14 WP2.4 acceptance line and the
+  §15 qualification table now name CCR-WP2.INT-5, the conflict-producing slow
+  event measured without a floor. The table also lists the new
+  `status_after_mutation_large` scenario.
+
+| CCR | Status | Change |
+|---|---|---|
+| CCR-WP2.INT-6 (§4.5 content after a client mutation) | **ratified** in REVAMP_PLAN §4.5 | the content refresh after a client mutation runs in the background; the reply waits only when it is expected to be cheap, else `content_pending: true` |
+| CCR-WP2.INT-7 (§7.3 `initial_sync_pending`) | **ratified** in REVAMP_PLAN §7.3 | a gate row the controller is deleting (running, attached or complete headless) is not pending |
+
+Public additions: `catalog::{REFUSAL_RETRY_AFTER, is_refusal,
+outcome_unknown}`, `manage::CREATE_SETTLE_WAIT`,
+`status_cell::{READ_YOUR_WRITES_BUDGET, faults::CONTENT_REFRESH}`, and
+`CellMeta::first_full_ms` (serde default). One signature changed:
+`status_cell::reply` takes `&Arc<WorkerCtx>, &Arc<EngineVitals>`, because the
+background refresh needs owned handles. It is not in WP2.3's *Provides*, and
+its only caller (`server.rs`) holds both as `Arc`s, so its source did not
+change. Crate-private: `Extras::catalog_error`. No `src/model/**` or
+`src/util/**` file changed.
+
+### How "before" was run
+
+- **C1, C2:** `catalog.rs`, `manage.rs` and `ctx.rs` were stashed on the
+  fixed tree, and the four orchestrator tests were run against them (the
+  tests use no new item). All four failed as quoted.
+- **C5:** `manage.rs` was stashed (only the projection change was
+  uncommitted then), and the projection test failed as quoted.
+- **C3:** `status_cell.rs` at `38fbb42`, with the new fault point added at
+  the start of its caller-side `refresh_content`, so that the same slow
+  refresh lands where the old code ran it. The release scenario's "before"
+  is `status_cell.rs` at `38fbb42`, unchanged; that code has no
+  `content_pending` key.
+
+### Tests added (confirmation review)
+
+- `orchestrator_runtime`: 3 new tests:
+  `a_failed_catalog_write_is_a_daemon_error_until_a_write_succeeds`,
+  `create_behind_a_slow_catalog_write_never_deletes_a_listed_folder_store`
+  and `create_behind_a_slow_rolled_back_write_leaves_nothing_behind`. Also
+  `writes_behind_a_slow_catalog_never_lock_reads_out` extended (C2),
+  `projection_follows_the_section_7_3_rules` given five
+  `initial_sync_pending` cases (C5), and
+  `a_received_mount_attaches_in_place_once_its_gate_is_satisfied`'s wait
+  changed (C4). The new tests arm their fault points through a guard that
+  disarms on drop, also when a test fails.
+- `worker_concurrency`: 1 new test,
+  `status_after_a_mutation_never_waits_for_a_slow_content_refresh`.
+- Release scenario (ignored): `qual_wp2_3_worker::status_after_mutation_large`,
+  no floor.
+
+The existing read-your-writes tests on small stores
+(`status_reuses_the_cell_and_reads_its_writes`,
+`status_after_a_mutation_refreshes_the_content_only`) pass unchanged.
+
+### Verification (confirmation review)
+
+Run on the final code tree, `3624ce2`. The commit after it adds only these
+notes and the qualification evidence. Windows
+`CARGO_TARGET_DIR=C:/tkfs-target/wp2-int`, WSL `$HOME/tkfs-target/wp2-int`
+for the check (the WSL tests: see their row).
+No other cargo, test or tkfs process of mine ran during the suites.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo build --all-targets` | pass (exit 0), no warnings |
+| `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` | **pass, SUITE_EXIT=0: 833 passed, 0 failed, 98 ignored** across 61 binaries. That is 829 + 4 new tests; ignored 97 + the new release scenario. Changed binaries: `orchestrator_runtime` 14 → 17, `worker_concurrency` 28 → 29 |
+| Earlier full suites of this round | Run 1 (`22baeb6`): `harness_selftest` failed (the new scenario's ignore named WP2.INT instead of the file's owner, WP2.3; fixed in `bbe6dd5`). `meta_scheduler` aborted on "memory allocation of 16908288 bytes failed" (`STATUS_STACK_BUFFER_OVERRUN`): the machine was out of commit memory, and the binary passed when rerun. Run 2 (`bbe6dd5`): 832 passed, 1 failed, C5's test (fixed in `3624ce2`) |
+| WSL `cargo check --all-targets` | pass (exit 0), with `-j 1`. Two earlier attempts with more jobs ended when the WSL VM restarted: the host had 0.4–6 GB of free commit memory |
+| WSL `cargo test -j 1 --no-fail-fast --test orchestrator_runtime --test worker_concurrency --test catalog_actor --test folder_controller --test management_api --test orchestrator --test w2_integration` | **pass, exit 0**: 17, 29, 19, 56, 27, 15, 13 + 1 ignored. **Deviation: target directory** `/mnt/c/tkfs-target/wp2-int-wsl` (Linux artefacts on the Windows disk), not `$HOME/tkfs-target/wp2-int`. Three attempts to build the tests in `$HOME/tkfs-target/wp2-int` (`-j 1` and `-j 2`) ended when the WSL VM restarted (uptime back to seconds; the host was out of commit memory). One of them left zero-length `tkfs` artefacts there, which `cargo clean -p tkfs` removed. The check above used `$HOME`, as specified. In an earlier attempt, `catalog_actor::validate_mount_path_matches_the_legacy_mount_path` failed once (`ALREADY_RUNNING` from the legacy oracle's `Supervisor::open` right after the fixture dropped its catalog). It passed in the rerun above and in every Windows run. This round changes nothing on that path (the lock and `Catalog::close`); I could not reproduce it, and it is noted for WP1.1's test |
+| Targeted, Windows, before the suites | `orchestrator_runtime` 17 (the new tests, then the binary twice), `worker_concurrency` 29, `catalog_actor` 19, `management_api` 27, `folder_controller` 56, `availability` 13, `orchestrator` 15 (and its C5 test 3 times alone), `harness_selftest` 18 + 2, `meta_scheduler` 24 + 1: all pass |
+
+### Qualification (release, `test-evidence/qualification-wave-2.json`)
+
+`scripts/qualify.ps1 -Wave 2 -Merge -BudgetS 2400 -FileTimeoutMin 150
+-Files qual_wp2_1_lifecycle,qual_wp2_3_worker` covers the two files whose
+code paths changed (catalog and management writes; the worker status
+cell). It ran on the clean final tree `3624ce2` (`dirty: false`). The other
+files keep the previous run's results (`merged_from` `212fbc3`). **Both
+files pass, 54 scenarios: 52 pass, 1 skipped (`sigterm_matches_shutdown`,
+Unix only), 1 fail (`qual_wp1_9_session`, not re-run: the environmental
+`session_loopback_throughput` of the first run); 27 floors, 26 pass.**
+
+| Floor | Floor | Before (re-review) | After |
+|---|---|---|---|
+| `api_p99_under_churn` | < 100 ms | 2.72 | 3.91 |
+| `subscribe_latency` | ≤ 1,000 ms | 63.0 | 63.3 |
+| `shutdown_busy_folder` | ≤ 30,000 ms | 232.2 | 79.9 |
+| `fs_p99_during_catchup` | < 50 ms | 27.8 | 23.7 |
+| `status_latency_during_activation` | < 20 ms | 2.95 | 2.95 |
+| `startup_with_5k_staged` | < 3,000 ms | 262 | 233 |
+
+New scenario, no floor: `status_after_mutation_large`. After each of ten
+imports into a 50,000-file store, `status` answered in **p50 0.98 ms, max
+1.31 ms**, all ten with `content_pending: true`. The content showed each
+import after p50 925 ms, max 1,132 ms. The same scenario on `38fbb42`'s
+status cell (manual release run): p50 694 ms, max 1,061 ms per reply. An
+earlier run of this round (`22baeb6`) measured `startup_with_5k_staged` at
+926 ms; three reruns gave 452, 247 and 248 ms, and the final run 233 ms.
+That was machine noise: no change of this round touches the startup path.
+
+### Known limitations (confirmation review)
+
+- A Create whose `create_folder` stays unconfirmed for `APPLY_WAIT` +
+  `CREATE_SETTLE_WAIT` (10 s) answers `REQUEST_TIMEOUT` and keeps the
+  state directory. If that command then fails, an orphaned
+  `states/<id>` directory with an empty store remains. Nothing refers to
+  it, and nothing sweeps it.
+- The other management writes that answer `REQUEST_TIMEOUT` (Start's and
+  Stop's `SetDesired`, ConfigureMount's `SetMount`) may still be applied
+  after the reply. The reply says so, and retrying them is idempotent.
+  Stop sends no stop command after a `REQUEST_TIMEOUT`.
+- On a store whose content refresh is expected to take longer than 100 ms,
+  a `status` right after a client mutation shows the content before it,
+  with `content_pending: true`. The content lands within about one refresh
+  plus its spacing (at 50K: about 1 s). A client that needs the new
+  content polls until `content_pending` is gone. The expected cost is a
+  heuristic (a decaying maximum). After a one-off slow refresh, a small
+  store answers `content_pending` for a few mutations until it decays.
+- The background refresh runs on a new thread per refresh (a few per
+  second at most, given the spacing on slow stores).
+- `qual_wp1_9_session`'s environmental floor failure (above) is unchanged.
+- Machine: free commit memory varied between 0.4 and 27 GB during this
+  round. Another user process held about 33 GB for part of it. Builds were
+  run with `-j 4` or fewer, and the WSL tests with a Windows-side target
+  directory (above).
+- Build artefacts outside the repository from this round:
+  `/mnt/c/tkfs-target/wp2-int-wsl` (`C:/tkfs-target/wp2-int-wsl`, the WSL
+  test build). It can be deleted.
+
+### Commits (confirmation review)
+
+- `94381bf` WP2.INT: re-review fix 2 - code, tests and spec (C1–C4)
+- `22baeb6` WP2.INT: re-review fix 2 - one background content refresh per
+  status call
+- `bbe6dd5` WP2.INT: re-review fix 2 - the new qual_wp2_3_worker scenario's
+  ignore names its file's owner
+- `3624ce2` WP2.INT: re-review fix 2 - initial_sync_pending follows the
+  marker deletion in flight (C5)
+- the commit that adds this section and the qualification evidence
