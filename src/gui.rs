@@ -1803,13 +1803,13 @@ mod tests {
     fn the_pairing_code_is_cleared_whenever_the_window_leaves_the_host_dialog() {
         let ui = window();
         let mut st = state(&ui);
-        let code = || json!({"code": "TKFS-ONE-TIME-CODE"});
+        let code = || json!({"code": "one-time-code-42"});
         slint::platform::update_timers_and_animations();
 
         // Settings, then "Generate a new pairing code".
         ui.set_dialog("host".into());
         reply(&ui, &mut st, 1, Action::ResetPairingCode, code());
-        assert_eq!(ui.get_pairing_code(), "TKFS-ONE-TIME-CODE");
+        assert_eq!(ui.get_pairing_code(), "one-time-code-42");
         // "Shut down the daemon", then Shut down: the reply closes the
         // dialog, and Settings opened later shows no code.
         reply(&ui, &mut st, 2, Action::Shutdown, json!({}));
@@ -1821,7 +1821,7 @@ mod tests {
         ui.set_dialog("host".into());
         slint::platform::update_timers_and_animations();
         reply(&ui, &mut st, 3, Action::ResetPairingCode, code());
-        assert_eq!(ui.get_pairing_code(), "TKFS-ONE-TIME-CODE");
+        assert_eq!(ui.get_pairing_code(), "one-time-code-42");
         ui.set_dialog("shutdown".into());
         slint::platform::update_timers_and_animations();
         assert_eq!(ui.get_pairing_code(), "");
