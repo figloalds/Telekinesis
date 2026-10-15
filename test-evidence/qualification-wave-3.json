@@ -2,10 +2,10 @@
     "schema":  1,
     "kind":  "wave-3",
     "wave":  3,
-    "generated_at":  "2026-10-15T18:44:11.0354751-03:00",
-    "duration_s":  117.8,
+    "generated_at":  "2026-10-15T18:46:27.0107078-03:00",
+    "duration_s":  113.1,
     "git":  {
-                "commit":  "a9bc00e402c14f6bd851e5bcad7b30f3c2f8435c",
+                "commit":  "9d78acfd761bf371ebd832ba9417bd1bce004d84",
                 "branch":  "revamp/wp3-int",
                 "dirty":  false,
                 "dirty_paths":  [
@@ -29,22 +29,20 @@
                      "profile":  "release"
                  },
     "summary":  {
-                    "ok":  false,
+                    "ok":  true,
                     "scenarios":  77,
                     "by_status":  {
-                                      "pass":  74,
-                                      "skipped":  1,
-                                      "fail":  2
+                                      "pass":  76,
+                                      "skipped":  1
                                   },
                     "floors_evaluated":  41,
-                    "floors_passed":  39,
-                    "floors_failed":  2,
+                    "floors_passed":  41,
+                    "floors_failed":  0,
                     "floors_missing":  0,
                     "floors_not_run":  0,
                     "floors_incomplete":  0,
                     "enforced_failures":  [
-                                              "objects_worker_256mib",
-                                              "objects_worker_tiny_10k"
+
                                           ]
                 },
     "files":  [
@@ -1658,22 +1656,22 @@
                   {
                       "file":  "qual_wp3_2_objects",
                       "wave":  3,
-                      "status":  "fail",
-                      "exit_code":  101,
-                      "duration_s":  116.7,
-                      "result":  "test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 116.00s",
-                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-184211\\qual_wp3_2_objects.log",
+                      "status":  "pass",
+                      "exit_code":  0,
+                      "duration_s":  112.1,
+                      "result":  "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 111.38s",
+                      "log":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-184432\\qual_wp3_2_objects.log",
                       "scenarios":  [
                                         {
                                             "scenario":  "qual_wp3_2_objects::crash_resume",
                                             "status":  "pass",
-                                            "elapsed_ms":  484,
+                                            "elapsed_ms":  441,
                                             "failures":  [
 
                                                          ],
                                             "notes":  [
-                                                          "first leg: Err(objects.write: CONNECTION_LOST: CONNECTION_LOST: IO error: Foi forçado o cancelamento de uma conexão existente pelo host remoto. (os error 10054)) in 194.2529ms",
-                                                          "killed with 20971520 spool bytes, 19922944 durable"
+                                                          "first leg: Err(objects.write: CONNECTION_LOST: CONNECTION_LOST: IO error: Foi forçado o cancelamento de uma conexão existente pelo host remoto. (os error 10054)) in 185.7827ms",
+                                                          "killed with 19922944 spool bytes, 18874368 durable"
                                                       ],
                                             "unsupported":  [
 
@@ -1688,13 +1686,13 @@
                                         },
                                         {
                                             "scenario":  "qual_wp3_2_objects::object_256mib_worker_to_worker",
-                                            "status":  "fail",
-                                            "elapsed_ms":  2642,
+                                            "status":  "pass",
+                                            "elapsed_ms":  2365,
                                             "failures":  [
-                                                             "FLOOR objects_worker_256mib: mib_per_s \u003e= 100 (measured Some(97.01394855941487))"
+
                                                          ],
                                             "notes":  [
-                                                          "time in objects.want 0.0 s, objects.read 0.6 s, objects.write 11.9 s (summed over threads)"
+                                                          "time in objects.want 0.0 s, objects.read 0.6 s, objects.write 10.8 s (summed over threads)"
                                                       ],
                                             "unsupported":  [
 
@@ -1702,20 +1700,20 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "mib_per_s",
-                                                                "value":  97.01394855941487,
+                                                                "value":  108.38233188482039,
                                                                 "unit":  "MiB/s"
                                                             }
                                                         ]
                                         },
                                         {
                                             "scenario":  "qual_wp3_2_objects::tiny_objects_10k",
-                                            "status":  "fail",
-                                            "elapsed_ms":  37103,
+                                            "status":  "pass",
+                                            "elapsed_ms":  35471,
                                             "failures":  [
-                                                             "FLOOR objects_worker_tiny_10k: objects_per_s \u003e= 300 (measured Some(296.07859809457125))"
+
                                                          ],
                                             "notes":  [
-                                                          "time in objects.want 1.5 s, objects.read 4.5 s, objects.write 120.2 s (summed over threads)"
+                                                          "time in objects.want 1.4 s, objects.read 4.0 s, objects.write 115.3 s (summed over threads)"
                                                       ],
                                             "unsupported":  [
 
@@ -1723,12 +1721,12 @@
                                             "metrics":  [
                                                             {
                                                                 "metric":  "fs_objects_per_s",
-                                                                "value":  326.8209757727372,
+                                                                "value":  333.5038721678949,
                                                                 "unit":  "objects/s"
                                                             },
                                                             {
                                                                 "metric":  "objects_per_s",
-                                                                "value":  296.07859809457125,
+                                                                "value":  309.9605745397721,
                                                                 "unit":  "objects/s"
                                                             }
                                                         ]
@@ -2412,8 +2410,8 @@
                        "op":  "\u003e=",
                        "floor":  100,
                        "unit":  "MiB/s",
-                       "measured":  97.01394855941487,
-                       "verdict":  "fail",
+                       "measured":  108.38233188482039,
+                       "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "about 2 MiB/s"
                    },
@@ -2425,8 +2423,8 @@
                        "op":  "\u003e=",
                        "floor":  300,
                        "unit":  "objects/s",
-                       "measured":  296.07859809457125,
-                       "verdict":  "fail",
+                       "measured":  309.9605745397721,
+                       "verdict":  "pass",
                        "enforced":  true,
                        "baseline":  "stop-and-wait pages"
                    },
@@ -2561,17 +2559,17 @@
                        "baseline":  "permanent stall above 349,525 B"
                    }
                ],
-    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-184211",
+    "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-184432",
     "merged_from":  {
-                        "generated_at":  "2026-10-15T18:40:54.4638041-03:00",
+                        "generated_at":  "2026-10-15T18:44:11.0354751-03:00",
                         "git":  {
-                                    "commit":  "d8e393f306c69005277ee62ecc3aac34fe5fb39a",
+                                    "commit":  "a9bc00e402c14f6bd851e5bcad7b30f3c2f8435c",
                                     "branch":  "revamp/wp3-int",
                                     "dirty":  false,
                                     "dirty_paths":  [
 
                                                     ]
                                 },
-                        "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-183441"
+                        "run_dir":  "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis-wt\\wp3-int\\test-runs\\qualify-wave-3-20261015-184211"
                     }
 }
