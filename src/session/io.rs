@@ -145,6 +145,43 @@ fn tcp(ws: &Socket) -> io::Result<&TcpStream> {
     }
 }
 
+/// The send and receive buffers of a session socket on Windows (WP3.INT).
+/// With the system's defaults (64 KiB each) every 1 MiB frame met
+/// `WouldBlock` part way and waited for writable readiness, so a loopback
+/// download moved about one frame per poller round trip
+/// (`qual_wp1_9_session` measured 270–360 MiB/s, its I/O threads idle most
+/// of the time); with 4 MiB each a frame fits and the same download ran at
+/// 3.2–4.0 GiB/s (the send buffer alone: 250–390 MiB/s). Kernel memory, used
+/// only while data is in flight; no user-space buffer is pinned (WP1.INT's
+/// S1). Linux sizes its socket buffers itself (setting them would turn that
+/// off).
+#[cfg(windows)]
+pub const SOCKET_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
+
+/// Sets [`SOCKET_BUFFER_BYTES`] as the socket's send and receive buffers.
+/// Best effort: a refusal keeps the system's defaults.
+#[cfg(windows)]
+fn size_socket_buffers(stream: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, length: i32) -> i32;
+    }
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_SNDBUF: i32 = 0x1001;
+    const SO_RCVBUF: i32 = 0x1002;
+    let socket = stream.as_raw_socket() as usize;
+    let value = SOCKET_BUFFER_BYTES.to_ne_bytes();
+    for name in [SO_SNDBUF, SO_RCVBUF] {
+        // SAFETY: `socket` is the open socket `stream` owns, and `value` is
+        // the 4-byte integer option the call reads, alive for the call.
+        unsafe { setsockopt(socket, SOL_SOCKET, name, value.as_ptr(), value.len() as i32) };
+    }
+}
+
+#[cfg(not(windows))]
+fn size_socket_buffers(_: &TcpStream) {}
+
 fn would_block(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -159,6 +196,7 @@ pub(crate) fn start(mut ws: Socket, shared: Arc<Shared>) -> io::Result<()> {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
         let _ = stream.set_nodelay(true);
+        size_socket_buffers(stream);
         stream.set_nonblocking(true)?;
     }
     let max_message = shared.receive_limits().max_message();
