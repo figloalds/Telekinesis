@@ -249,6 +249,41 @@ fn release(ctx: &WorkerCtx, leases: &mut BTreeMap<String, ObjectLease>, hash: &s
     lock(&LEASE_HOLDERS).remove(&(ctx.root.clone(), hash.to_owned()));
 }
 
+/// The lane set of one of the orchestrator's lease ids (§6.4 "Lease ids":
+/// `pull:<peer>:<i>/<n>:<a|b>` for a dialer's pulls, `push:<peer>:<i>/<n>`
+/// for the pushes an acceptor serves): its kind, peer and lane count. `None`
+/// for any other id.
+fn lane_set(session: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = session.splitn(4, ':');
+    let (kind, peer, lane) = (parts.next()?, parts.next()?, parts.next()?);
+    let (_, count) = lane.split_once('/')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (matches!(kind, "pull" | "push") && !peer.is_empty() && digits(count))
+        .then_some((kind, peer, count))
+}
+
+/// A lease of another lane set of the same peer that made no progress for
+/// this long may be taken over (see [`superseded`]).
+const SUPERSEDE_IDLE: Duration = Duration::from_secs(15);
+
+/// Whether `held` is a lease of a lane set that `session`'s replaced: the
+/// same kind and peer with another lane count, and no progress for
+/// [`SUPERSEDE_IDLE`]. A re-pairing with another `connections` restarts every
+/// lane of that peer, so the old ids' sessions are gone; their leases would
+/// hide the objects from the new lanes until they lapse (one TTL), and then
+/// back them off for a healthy source (WP3.INT re-review). The new lane set
+/// takes such a lease over, without a stall backoff, once it has been idle a
+/// quarter of a TTL (an old lane still moving it during the switch keeps it).
+fn superseded(held: &ObjectLease, session: &str, now: u64) -> bool {
+    let idle_since = held.expires_ms.saturating_sub(LEASE_TTL.as_millis() as u64);
+    now.saturating_sub(idle_since) >= SUPERSEDE_IDLE.as_millis() as u64
+        && matches!(
+            (lane_set(&held.session), lane_set(session)),
+            (Some((kind, peer, count)), Some((new_kind, new_peer, new_count)))
+                if kind == new_kind && peer == new_peer && count != new_count
+        )
+}
+
 /// Drops every lease that lapsed (reached its expiry without progress or
 /// release) and backs each object off for the source that held it, for
 /// `STALL_BACKOFF` (module docs).
@@ -305,6 +340,7 @@ fn want(ctx: &WorkerCtx, header: WantHeader) -> Result<(Value, Vec<u8>), ErrorWi
         sweep_lapsed(ctx, &mut leases, now);
         let (mine, others): (Vec<_>, Vec<_>) = leases
             .iter()
+            .filter(|(_, lease)| !superseded(lease, session, now))
             .partition(|(_, lease)| lease.session == session);
         (
             others.into_iter().map(|(hash, _)| hash.clone()).collect(),
@@ -335,6 +371,11 @@ fn want(ctx: &WorkerCtx, header: WantHeader) -> Result<(Value, Vec<u8>), ErrorWi
         sweep_lapsed(ctx, &mut leases, now);
         items.retain(|item| {
             match leases.get_mut(&item.hash) {
+                Some(lease) if superseded(lease, session, now) => {
+                    let offset = lease.offset.max(item.offset);
+                    grant(ctx, &mut leases, (&item.hash, session, source, offset), now);
+                    true
+                }
                 Some(lease) if lease.session != session => false,
                 Some(lease) => {
                     // Ours already: offered again, the expiry untouched. The
@@ -440,6 +481,10 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         sweep_lapsed(ctx, &mut leases, now);
         for hash in &hashes {
             match leases.get(*hash) {
+                Some(lease) if superseded(lease, &session, now) => {
+                    let offset = committed.get(hash).copied().unwrap_or(lease.offset);
+                    grant(ctx, &mut leases, (hash, &session, source, offset), now);
+                }
                 Some(lease) if lease.session != session => {
                     refused.insert(hash);
                 }

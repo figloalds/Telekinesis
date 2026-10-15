@@ -694,8 +694,9 @@ struct Group {
 ///   between the fsync and the commit, or before the fsync).
 /// * A row whose spool is gone, or a spool shorter than its row, records what
 ///   is there (the whole-object hash decides at completion).
-/// * The spool of an object that is already shareable and available, or whose
-///   length exceeds the object's known size, is dropped.
+/// * The spool of an object that is already shareable and available, that is
+///   no longer wanted (no committed or validly staged event references it),
+///   or whose length exceeds the object's known size, is dropped.
 pub(super) fn reconcile_spools(store: &Store) -> Result<()> {
     let folder = store.root.join("incoming-objects");
     let mut files = BTreeMap::new();
@@ -750,7 +751,15 @@ pub(super) fn reconcile_spools(store: &Store) -> Result<()> {
                     None => 0,
                 };
                 let finished = store.object_shareable(object)? && store.object_available(object);
-                if finished || durable == 0 || known.is_some_and(|size| durable > size) {
+                // An object no committed or validly staged event references
+                // any more (its staged event was quarantined, blocked or
+                // removed) is not wanted: its spool would never finish and
+                // would show as a download in progress forever (WP3.INT
+                // re-review). If a revalidation revives the event, the object
+                // is wanted, and transferred, again.
+                let unwanted = !finished && !store.object_wanted(object)?;
+                if finished || unwanted || durable == 0 || known.is_some_and(|size| durable > size)
+                {
                     fs::remove_file(&path)?;
                     store.delete_spool_row(object)?;
                     return Ok(());
