@@ -565,8 +565,10 @@ fn a_lane_backoff_already_past_never_hides_the_next_retry() {
         )],
         vec![home],
     );
-    // The folder's chip, the pair's chip and the peer's badge agree.
-    assert_eq!(row(&s).sync.text, "Retrying in 7 s");
+    // The folder's chip, the pair's chip and the peer's badge agree. The
+    // folder's chip names the peer whose connection backs off (WP3.INT
+    // re-review; it read "Retrying in 7 s").
+    assert_eq!(row(&s).sync.text, "Waiting for home (retry in 7 s)");
     let names = Names::of(&s);
     let now = Now::of(&s);
     assert_eq!(
@@ -584,9 +586,14 @@ fn a_lane_backoff_already_past_never_hides_the_next_retry() {
     // nothing is ahead, no time is shown.
     s.folders[0].sync.state = F::Backoff;
     s.folders[0].sync.peers[0].backoff_until_ms = Some(NOW - SEC);
-    assert_eq!(row(&s).sync.text, "Retrying in 7 s");
+    assert_eq!(row(&s).sync.text, "Waiting for home (retry in 7 s)");
     s.peers[0].lanes[1].backoff_until_ms = Some(NOW - 2 * SEC);
-    assert_eq!(row(&s).sync.text, "Retrying");
+    assert_eq!(row(&s).sync.text, "Waiting for home (retrying)");
+    // A key that backs off while its peer is online (an exchange that
+    // fails): the retry, with the error.
+    s.peers[0].state = PeerConnState::Online;
+    s.folders[0].sync.peers[0].backoff_until_ms = Some(NOW + 9 * SEC);
+    assert_eq!(row(&s).sync.text, "Retrying in 9 s");
 }
 
 // -- every PeerConnState -----------------------------------------------------
@@ -1420,7 +1427,9 @@ fn daemon_header_and_overview() {
         Some("C:\\data\\logs\\orchestrator.log")
     );
     assert_eq!(d.errors.len(), 1);
-    assert_eq!(d.errors[0].scope.as_deref(), Some("peer peer gone"));
+    // A peer the snapshot does not list: its id once (WP3.INT re-review:
+    // it read "peer peer gone").
+    assert_eq!(d.errors[0].scope.as_deref(), Some("peer gone"));
     s.daemon.stopping = true;
     assert_eq!(
         ui_model::daemon_model(&s, Now::of(&s)).status.text,
@@ -2167,4 +2176,302 @@ fn commands_answer_in_200ms_while_a_slow_subscribe_is_in_flight() {
     release.send(()).unwrap();
     assert_eq!(next_snapshot(&h).generation, 1);
     h.feed.stop();
+}
+
+// -- WP3.INT post-integration re-review ---------------------------------------
+
+/// A gated folder whose source cannot be reached says so (ux re-review
+/// major): the initial sync cannot progress, in the warning tone (an error
+/// for a source that needs an upgrade or a re-pair), not frozen progress.
+#[test]
+fn an_initial_sync_from_an_unreachable_source_says_why() {
+    use FolderPeerState as P;
+    let gated = |state: P, conn: PeerConnState| {
+        let mut f = folder("a", "Docs");
+        f.gate = GateStatus {
+            state: GateKind::Awaiting,
+            source: Some("office".into()),
+            since_ms: Some(NOW - 20 * MIN),
+            waiting_on: vec![],
+        };
+        let mut p = pair("office", state);
+        p.metadata.to_receive = 412;
+        p.metadata.cursor_seq = 1588;
+        p.metadata.remote_tip = 2000;
+        let f = with_sync(f, FolderSyncState::InitialSync, vec![p]);
+        let office = PeerStatus {
+            since_ms: Some(NOW - 20 * MIN),
+            ..peer("office", conn)
+        };
+        row(&snapshot(vec![f], vec![office]))
+    };
+    let offline = gated(P::Offline, PeerConnState::Offline);
+    assert_eq!(
+        offline.sync.text,
+        "Initial sync from office — waiting (offline 20 min) · 1,588 of 2,000 events"
+    );
+    assert_eq!(offline.sync.tone, Tone::Warn);
+    let incompatible = gated(P::Incompatible, PeerConnState::Incompatible);
+    assert_eq!(
+        incompatible.sync.text,
+        "Initial sync from office — waiting (needs upgrade) · 1,588 of 2,000 events"
+    );
+    assert_eq!(incompatible.sync.tone, Tone::Error);
+    // While it moves: progress.
+    let moving = gated(P::Metadata, PeerConnState::Online);
+    assert_eq!(
+        moving.sync.text,
+        "Initial sync from office · 1,588 of 2,000 events"
+    );
+    assert_eq!(moving.sync.tone, Tone::Progress);
+}
+
+/// Rejected events are shown, not blocked work (ux re-review major): an up
+/// to date folder lists them in its detail line.
+#[test]
+fn rejected_events_are_shown_on_an_up_to_date_folder() {
+    let mut f = folder("a", "Docs");
+    f.sync.peers[0].metadata.rejected = 1;
+    let r = row(&one(f));
+    assert_eq!(r.sync.text, "Up to date");
+    assert_eq!(r.sync.tone, Tone::Ok);
+    assert!(!r.attention);
+    assert!(
+        r.sync_detail.contains("1 event rejected"),
+        "{}",
+        r.sync_detail
+    );
+}
+
+/// A status the daemon no longer refreshes (ux re-review major): rows keep
+/// their last known states, greyed and labelled with the status's time,
+/// without live numbers or remedies.
+#[test]
+fn a_stale_status_is_shown_as_such() {
+    let mut f = folder("a", "Docs");
+    f.sync.state = FolderSyncState::Downloading;
+    f.sync.peers = vec![FolderPeerSync {
+        objects_down: TransferProgress {
+            bytes_remaining: GIB,
+            total_bytes: 3 * GIB,
+            rate_bps: 3 * MIB,
+            eta_s: Some(341),
+            ..TransferProgress::default()
+        },
+        ..pair("office", FolderPeerState::Downloading)
+    }];
+    let s = snapshot(
+        vec![f],
+        vec![PeerStatus {
+            rate_down_bps: 3 * MIB,
+            rtt_ms: Some(12),
+            ..peer("office", PeerConnState::Online)
+        }],
+    );
+    let later = Now::at(NOW + 5 * MIN);
+    let as_of = ui_model::as_of(later, s.at_ms);
+    assert_eq!(as_of, "as of 13:20:00 (5 min ago)");
+    let live = ui_model::folder_rows_at(&s, later).remove(0);
+    assert!(live.sync.text.contains("MiB/s"), "{}", live.sync.text);
+    let stale = ui_model::stale_folder_row(live, &as_of);
+    assert_eq!(
+        stale.sync.text,
+        "Last known: downloading (as of 13:20:00 (5 min ago))"
+    );
+    assert_eq!(stale.sync.tone, Tone::Muted);
+    assert_eq!(stale.mount.text, "Mounted (last known)");
+    assert_eq!(stale.mount.tone, Tone::Muted);
+    assert_eq!(stale.lifecycle.text, "Running (last known)");
+    assert!(stale.progress.is_none() && stale.actions.is_empty() && stale.primary.is_none());
+    let peer = ui_model::stale_peer_row(ui_model::peer_rows_at(&s, later).remove(0), &as_of);
+    assert!(
+        peer.badge.text.starts_with("Last known: Online"),
+        "{}",
+        peer.badge.text
+    );
+    assert_eq!(peer.badge.tone, Tone::Muted);
+    assert!(!peer.online);
+    assert_eq!(
+        (peer.rates.as_str(), peer.rtt.as_str()),
+        ("unknown", "unknown")
+    );
+}
+
+/// Transfer totals over several peers (ux re-review major): uploads to two
+/// peers are two jobs (their remainders add up, the ETA is the hub's, the
+/// longest); downloads from two peers done so far add up over one shared
+/// remainder.
+#[test]
+fn transfer_totals_and_eta_over_several_peers() {
+    let up = |installation: &str| FolderPeerSync {
+        objects_up: TransferProgress {
+            objects_remaining: 10,
+            bytes_remaining: GIB,
+            total_bytes: GIB,
+            rate_bps: MIB,
+            eta_s: Some(1024),
+            ..TransferProgress::default()
+        },
+        ..pair(installation, FolderPeerState::Uploading)
+    };
+    let s = snapshot(
+        vec![with_sync(
+            folder("a", "Docs"),
+            FolderSyncState::Uploading,
+            vec![up("office"), up("home")],
+        )],
+        vec![
+            peer("office", PeerConnState::Online),
+            peer("home", PeerConnState::Online),
+        ],
+    );
+    assert_eq!(
+        row(&s).sync.text,
+        "Uploading 2.0 GiB left · 20 files · 2.0 MiB/s · ETA 18 min"
+    );
+    // 3 GiB missing; 1 GiB from each peer so far, 1 GiB left.
+    let down = |installation: &str| FolderPeerSync {
+        objects_down: TransferProgress {
+            bytes_remaining: GIB,
+            total_bytes: 2 * GIB,
+            rate_bps: MIB,
+            eta_s: Some(512),
+            ..TransferProgress::default()
+        },
+        ..pair(installation, FolderPeerState::Downloading)
+    };
+    let s = snapshot(
+        vec![with_sync(
+            folder("a", "Docs"),
+            FolderSyncState::Downloading,
+            vec![down("office"), down("home")],
+        )],
+        vec![
+            peer("office", PeerConnState::Online),
+            peer("home", PeerConnState::Online),
+        ],
+    );
+    let r = row(&s);
+    assert_eq!(
+        r.sync.text,
+        "Downloading 2.0 GiB of 3.0 GiB · 2.0 MiB/s · ETA 9 min"
+    );
+    let progress = r.progress.unwrap();
+    assert!((progress - 2.0 / 3.0).abs() < 0.01, "{progress}");
+}
+
+/// The stall's duration is the hub's (ux re-review minor): after a long
+/// outage, from when the pair could progress again, not from its last
+/// progress; never less than the threshold when it was just crossed.
+#[test]
+fn the_stall_duration_follows_the_hubs_stall() {
+    let stalled = |last_progress: Option<u64>, stalled_since: Option<u64>| {
+        let mut p = pair("office", FolderPeerState::Stalled);
+        p.last_progress_ms = last_progress;
+        p.stalled_since_ms = stalled_since;
+        sync_text(with_sync(
+            folder("a", "Docs"),
+            FolderSyncState::Stalled,
+            vec![p],
+        ))
+        .0
+    };
+    // Progress 2 h ago, a 2 h outage, then 61 s without progress.
+    assert_eq!(
+        stalled(Some(NOW - 2 * 3600 * SEC - 61 * SEC), Some(NOW - SEC)),
+        "Stalled 1 min"
+    );
+    // Never progressed; the threshold was crossed just now.
+    assert_eq!(stalled(None, Some(NOW)), "Stalled 1 min");
+    // Progress 5 min ago, stalled since 4 min ago: 5 min.
+    assert_eq!(
+        stalled(Some(NOW - 5 * MIN), Some(NOW - 4 * MIN)),
+        "Stalled 5 min"
+    );
+}
+
+/// An error re-reported as a condition keeps its first time visible (ux
+/// re-review minor), and a scope of a peer the snapshot does not list reads
+/// its id once.
+#[test]
+fn error_lines_show_a_first_time_that_differs_and_unlisted_peers_once() {
+    let s = one(folder("a", "Docs"));
+    let names = Names::of(&s);
+    let now = Now::of(&s);
+    let mut r = record(
+        "WINFSP_MOUNT_FAILED",
+        Scope::Mount { state: "a".into() },
+        NOW - 10 * MIN,
+    );
+    r.last_at_ms = NOW - MIN;
+    let line = ui_model::error_line(&r, &names, now);
+    assert_eq!(r.count, 1);
+    assert!(line.first.is_some(), "{line:?}");
+    let refused = record(
+        "PEER_NEEDS_UPGRADE",
+        Scope::Peer {
+            installation: "ws://10.0.0.5:43180".into(),
+        },
+        NOW,
+    );
+    assert_eq!(
+        ui_model::error_line(&refused, &names, now).scope.as_deref(),
+        Some("peer ws://10.0.0.5:43180")
+    );
+    let listed = record(
+        "WS_CONNECT_FAILED",
+        Scope::Peer {
+            installation: "office".into(),
+        },
+        NOW,
+    );
+    assert_eq!(
+        ui_model::error_line(&listed, &names, now).scope.as_deref(),
+        Some("peer office")
+    );
+}
+
+/// The activation rate of a folder whose activator stopped reads idle (ux
+/// re-review minor), and the meter expires samples older than its window
+/// against the render clock.
+#[test]
+fn a_stopped_activator_reads_idle() {
+    let mut meter = RateMeter::default();
+    for step in 0..5u64 {
+        let mut f = folder("a", "Docs");
+        f.activation.counters.activated = step * 80;
+        f.activation.counters.running = true;
+        let mut s = one(f);
+        s.at_ms = NOW + step * SEC;
+        meter.observe(&s);
+    }
+    assert!(meter.per_second("a").unwrap() > 70.0);
+    let later = NOW + 10 * MIN;
+    assert_eq!(meter.per_second_at("a", later), Some(0.0));
+    let mut f = folder("a", "Docs");
+    f.activation.counters.running = false;
+    let mut s = one(f);
+    s.at_ms = later;
+    let d = ui_model::folder_detail_at(&s, "a", Now::at(later), meter.per_second("a")).unwrap();
+    let rate = d.activation.iter().find(|kv| kv.key == "Rate").unwrap();
+    assert_eq!(rate.value, "idle");
+}
+
+/// A blocked initial sync's mount chip does not read as progress (ux
+/// re-review minor).
+#[test]
+fn a_blocked_gate_mount_chip_is_not_progress() {
+    let mut f = folder("a", "Docs");
+    f.gate = GateStatus {
+        state: GateKind::Blocked,
+        source: Some("office".into()),
+        since_ms: Some(NOW - MIN),
+        waiting_on: vec!["3 events quarantined".into()],
+    };
+    f.mount.state = MountState::Detached;
+    f.sync.state = FolderSyncState::NeedsAttention;
+    let r = row(&one(f));
+    assert_eq!(r.mount.text, "Initial sync blocked");
+    assert_eq!(r.mount.tone, Tone::Warn);
+    assert_eq!(r.mount.action, Some(FolderAction::MountNow));
 }

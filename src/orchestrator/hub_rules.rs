@@ -209,8 +209,10 @@ pub struct PeerInputs {
     pub down_bytes: u64,
     pub up_objects: u64,
     pub up_bytes: u64,
-    /// `blocked + quarantined + rejected`: work that cannot progress without
-    /// Revalidate (never counted as remaining work).
+    /// `blocked + quarantined`: work that cannot progress without
+    /// Revalidate (never counted as remaining work). Rejected events are not
+    /// in it: Revalidate does not revive them, and a pair whose only
+    /// leftovers are rejected events is up to date (WP3.INT re-review).
     pub blocked: u64,
 }
 
@@ -281,7 +283,7 @@ pub fn transfer_state(meta: bool, down: bool, up: bool) -> Option<FolderPeerStat
 /// | 11 | `Backoff` | a visible Contention/Transient error: the key is retrying |
 /// | 12 | `Blocked` | a visible NeedsUserAction/Fatal error: the key does not retry |
 /// | 13 | transfer | `Metadata`, `Downloading`, `Uploading`, or `Syncing` if mixed |
-/// | 14 | `Blocked` | only blocked, quarantined or rejected work remains |
+/// | 14 | `Blocked` | only blocked or quarantined work remains |
 /// | 15 | `UpToDate` | none of the above |
 pub fn peer_state(i: &PeerInputs) -> FolderPeerState {
     use FolderPeerState as S;
@@ -634,6 +636,14 @@ pub fn folder_summary(state: FolderSyncState, i: &FolderInputs, f: &SummaryFacts
             if away > 0 {
                 text.push_str(&format!(" ({away} unreachable)"));
             }
+            // Rejected events are no remaining work (they never activate):
+            // shown, not counted (WP3.INT re-review).
+            if f.rejected > 0 {
+                text.push_str(&format!(
+                    " · {} rejected",
+                    plural_count(f.rejected, "event", "events")
+                ));
+            }
             text
         }
     }
@@ -726,11 +736,17 @@ pub fn missing(content: &ContentCounters) -> (u64, u64) {
 
 /// Whether `source` can likely supply some of what `target` misses: its
 /// counters are unknown (for a download, only a peer that [`may_supply`]
-/// gets this far), it is complete, or it misses strictly fewer bytes.
-/// Two replicas missing the same objects (lost everywhere) therefore owe each
-/// other nothing, so that case never shows as a transfer or a stall.
+/// gets this far), it is complete, it misses strictly fewer bytes, or it
+/// misses something else than `target` does while holding objects (WP3.INT
+/// re-review: each side missing different objects, as during a large upload
+/// one way and a download the other, hid the download). Two replicas missing
+/// the same objects (lost everywhere: the same objects and bytes missing)
+/// owe each other nothing, so that case never shows as a transfer or a stall.
 fn can_supply(source: Option<&ContentCounters>, target: &ContentCounters) -> bool {
-    source.is_none_or(|source| source.complete || missing(source).1 < missing(target).1)
+    source.is_none_or(|source| {
+        let (theirs, ours) = (missing(source), missing(target));
+        source.complete || theirs.1 < ours.1 || (theirs != ours && source.shared_available > 0)
+    })
 }
 
 /// Whether our missing content may be attributed to a peer as download work

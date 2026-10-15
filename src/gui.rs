@@ -167,8 +167,9 @@ struct State {
     utc_offset_min: i32,
     /// A fixed "now" (render-to-file), else the local clock.
     fixed_now: Option<u64>,
-    /// The worker `status` reply of the folder whose Content tab is open.
-    worker_status: Option<(String, Result<Value, String>)>,
+    /// The worker `status` reply of the folder whose Content tab is open,
+    /// and when it arrived.
+    worker_status: Option<(String, Result<Value, String>, u64)>,
     /// The worker `folder-details` reply of the open Conflicts tab.
     details: Value,
     folders: Rc<VecModel<FolderRow>>,
@@ -603,13 +604,33 @@ fn render(ui: &AppWindow, st: &mut State) {
         ui.set_stat_transfer_detail("No transfer in progress".into());
     }
 
-    let rows = ui_model::folder_rows_at(&snap, now);
+    // A status the daemon no longer refreshes is shown as such: greyed,
+    // labelled with its time, without live numbers (WP3.INT re-review).
+    let stale = st.down.as_ref().map(|_| ui_model::as_of(now, snap.at_ms));
+    if let Some(as_of) = &stale {
+        ui.set_stat_transfer("Unknown".into());
+        ui.set_stat_transfer_detail(as_of.as_str().into());
+        ui.set_stat_peers_detail(format!("Last known, {as_of}").into());
+    }
+    let mut rows = ui_model::folder_rows_at(&snap, now);
+    if let Some(as_of) = &stale {
+        rows = rows
+            .into_iter()
+            .map(|row| ui_model::stale_folder_row(row, as_of))
+            .collect();
+    }
     let shown = ui_model::filter_rows(&rows, &ui.get_search());
     sync_model(
         &st.folders,
         shown.iter().map(|r| folder_row(r, &st.busy)).collect(),
     );
-    let peers = ui_model::peer_rows_at(&snap, now);
+    let mut peers = ui_model::peer_rows_at(&snap, now);
+    if let Some(as_of) = &stale {
+        peers = peers
+            .into_iter()
+            .map(|row| ui_model::stale_peer_row(row, as_of))
+            .collect();
+    }
     sync_model(&st.peers, peers.iter().map(peer_row).collect());
     if ui.get_view() == "activity" {
         sync_model(
@@ -631,6 +652,15 @@ fn render(ui: &AppWindow, st: &mut State) {
                     ui.set_peer_detail(row);
                 }
                 sync_model(&st.peer_lanes, p.lanes.iter().map(lane_row).collect());
+            } else {
+                // Gone from the snapshot (unpaired, forgotten): its last
+                // details are not shown as current (WP3.INT re-review).
+                sync_model(&st.peer_lanes, Vec::new());
+                set_status(
+                    ui,
+                    true,
+                    "This peer is no longer listed by the daemon.".into(),
+                );
             }
         }
         _ => {}
@@ -639,22 +669,30 @@ fn render(ui: &AppWindow, st: &mut State) {
 
 fn render_banner(ui: &AppWindow, st: &State, now: Now) {
     let deliberate = st.down.as_ref().is_some_and(|down| down.deliberate);
+    // Every branch with a daemon that does not answer says how old the
+    // status below is (WP3.INT re-review).
+    let stale = st
+        .snapshot
+        .as_ref()
+        .map(|s| {
+            format!(
+                " Showing the last known status, {}.",
+                ui_model::as_of(now, s.at_ms)
+            )
+        })
+        .unwrap_or_default();
     let (text, tone, action, label) = if (st.shut_down || deliberate)
         && st.down.as_ref().is_some_and(|down| down.started.is_none())
     {
         (
-            "The daemon is shut down: folders are not syncing and their mounts are gone."
-                .to_owned(),
+            format!(
+                "The daemon is shut down: folders are not syncing and their mounts are gone.{stale}"
+            ),
             "warn",
             "start-daemon",
             "Start the daemon",
         )
     } else if let Some(down) = &st.down {
-        let stale = st
-            .snapshot
-            .as_ref()
-            .map(|s| format!(" Showing the status from {}.", ui_model::ago(now, s.at_ms)))
-            .unwrap_or_default();
         if let Some(log) = &down.started {
             (
                 format!("Starting the daemon (its output goes to {log})…{stale}"),
@@ -674,7 +712,7 @@ fn render_banner(ui: &AppWindow, st: &State, now: Now) {
             )
         } else if down.daemon_gone && down.respawn_off {
             (
-                "The daemon is not running.".to_owned(),
+                format!("The daemon is not running.{stale}"),
                 "warn",
                 "start-daemon",
                 "Start the daemon",
@@ -712,7 +750,8 @@ fn render_banner(ui: &AppWindow, st: &State, now: Now) {
 
 fn render_folder(ui: &AppWindow, st: &mut State, snap: &StatusSnapshot, now: Now) {
     let state = ui.get_selected_state().to_string();
-    let Some(d) = ui_model::folder_detail_at(snap, &state, now, st.rates.per_second(&state)) else {
+    let rate = st.rates.per_second_at(&state, now.ms);
+    let Some(d) = ui_model::folder_detail_at(snap, &state, now, rate) else {
         set_status(
             ui,
             true,
@@ -757,16 +796,18 @@ fn render_folder(ui: &AppWindow, st: &mut State, snap: &StatusSnapshot, now: Now
             .collect(),
     );
     let (missing, note) = match &st.worker_status {
-        Some((s, Ok(value))) if *s == state => {
+        Some((s, Ok(value), at)) if *s == state => {
             let items = ui_model::missing_items(value);
+            // The list is the worker's answer at one time, not live (WP3.INT
+            // re-review): it says when.
             let note = if items.is_empty() {
-                "No missing files.".to_owned()
+                format!("No missing files ({}).", ui_model::as_of(now, *at))
             } else {
-                String::new()
+                format!("Listed {}.", ui_model::as_of(now, *at))
             };
             (items, note)
         }
-        Some((s, Err(error))) if *s == state => (
+        Some((s, Err(error), _)) if *s == state => (
             Vec::new(),
             format!(
                 "Could not read the worker's status: {}",
@@ -935,7 +976,7 @@ fn on_outcome(ui: &AppWindow, st: &mut State, outcome: CommandOutcome) {
                     }
                 }
                 Action::Folder { state, payload, .. } if payload["op"] == "status" => {
-                    st.worker_status = Some((state.clone(), Err(error.clone())));
+                    st.worker_status = Some((state.clone(), Err(error.clone()), st.now().ms));
                 }
                 _ => {}
             }
@@ -1032,7 +1073,7 @@ fn on_outcome(ui: &AppWindow, st: &mut State, outcome: CommandOutcome) {
 fn on_folder_reply(ui: &AppWindow, st: &mut State, state: &str, payload: &Value, value: Value) {
     match payload["op"].as_str() {
         Some("status") => {
-            st.worker_status = Some((state.to_owned(), Ok(value)));
+            st.worker_status = Some((state.to_owned(), Ok(value), st.now().ms));
         }
         Some("folder-details") => {
             if state != ui.get_selected_state().as_str() {
@@ -1141,7 +1182,9 @@ fn endpoint_error(endpoint: &str) -> Option<&'static str> {
 }
 
 /// Opens the daemon's log (its `log_path`, else the file this window's
-/// daemon writes to).
+/// daemon writes to). The file check and the process spawn run on a thread
+/// of their own: the UI thread never blocks on I/O (WP3.INT re-review); the
+/// outcome comes back through the event loop.
 fn open_log(ui: &AppWindow, st: &State) {
     let log = st
         .snapshot
@@ -1149,20 +1192,28 @@ fn open_log(ui: &AppWindow, st: &State) {
         .and_then(|s| s.daemon.log_path.clone())
         .map(PathBuf::from)
         .unwrap_or_else(|| daemon_log(&st.config));
-    if !log.is_file() {
-        set_status(
-            ui,
-            true,
-            format!(
-                "No log yet at {} (the daemon writes it there when this window starts it).",
-                log.display()
-            ),
-        );
-        return;
-    }
-    match Process::new("explorer.exe").arg(&log).spawn() {
-        Ok(_) => set_status(ui, false, format!("Opened {}.", log.display())),
-        Err(error) => set_status(ui, true, format!("Cannot open {}: {error}", log.display())),
+    let weak = ui.as_weak();
+    let spawned = std::thread::Builder::new()
+        .name("open-log".into())
+        .spawn(move || {
+            let (error, text) = if !log.is_file() {
+                (
+                    true,
+                    format!(
+                        "No log yet at {} (the daemon writes it there when this window starts it).",
+                        log.display()
+                    ),
+                )
+            } else {
+                match Process::new("explorer.exe").arg(&log).spawn() {
+                    Ok(_) => (false, format!("Opened {}.", log.display())),
+                    Err(error) => (true, format!("Cannot open {}: {error}", log.display())),
+                }
+            };
+            let _ = weak.upgrade_in_event_loop(move |ui| set_status(&ui, error, text));
+        });
+    if let Err(error) = spawned {
+        set_status(ui, true, format!("Cannot open the log: {error}"));
     }
 }
 
@@ -1559,15 +1610,24 @@ pub fn run(config_path: &Path) -> Result<()> {
     with_state(|st| render(&ui, st));
 
     // Relative times ("3 min ago", "retry in 8 s") move on without a new
-    // snapshot.
+    // snapshot; the time zone's offset is read again each minute, so clock
+    // labels follow a daylight saving change while the window stays open
+    // (WP3.INT re-review).
     let weak = ui.as_weak();
     let timer = slint::Timer::default();
+    let mut ticks = 0u32;
     timer.start(
         slint::TimerMode::Repeated,
         Duration::from_secs(1),
         move || {
             if let Some(ui) = weak.upgrade() {
-                with_state(|st| render(&ui, st));
+                ticks = ticks.wrapping_add(1);
+                with_state(|st| {
+                    if ticks.is_multiple_of(60) && st.fixed_now.is_none() {
+                        st.utc_offset_min = utc_offset_min();
+                    }
+                    render(&ui, st)
+                });
             }
         },
     );
@@ -1831,5 +1891,93 @@ mod tests {
         show_dialog(&ui, "");
         reply(&ui, &mut st, 4, Action::ResetPairingCode, code());
         assert_eq!(ui.get_pairing_code(), "");
+    }
+
+    /// WP3.INT re-review (ux major): a status the daemon no longer
+    /// refreshes is shown as such, in every banner and on every row; a peer
+    /// gone from the snapshot is not shown as current.
+    #[test]
+    fn a_stale_status_is_labelled_on_the_banner_and_the_rows() {
+        use tkfs::model::{
+            health::{MountIntent, MountState, MountStatus},
+            status::{
+                FolderStatus, FolderSync, FolderSyncState, Intents, LifecyclePhase,
+                LifecycleStatus, PeerConnState, PeerStatus,
+            },
+        };
+        let ui = window();
+        let mut st = state(&ui);
+        let at = 1_792_070_400_000;
+        st.fixed_now = Some(at + 5 * 60_000);
+        st.utc_offset_min = 0;
+        st.snapshot = Some(Arc::new(StatusSnapshot {
+            schema: 2,
+            at_ms: at,
+            folders: vec![FolderStatus {
+                state: "a".into(),
+                label: "Docs".into(),
+                lifecycle: LifecycleStatus {
+                    phase: LifecyclePhase::Running,
+                    ..LifecycleStatus::default()
+                },
+                intents: Intents {
+                    desired_running: true,
+                    sync_enabled: true,
+                    mount_enabled: true,
+                },
+                mount: MountStatus {
+                    intent: MountIntent::Attach,
+                    path: Some(PathBuf::from("C:\\Docs")),
+                    state: MountState::Attached { since_ms: at },
+                },
+                sync: FolderSync {
+                    state: FolderSyncState::UpToDate,
+                    ..FolderSync::default()
+                },
+                ..FolderStatus::default()
+            }],
+            peers: vec![PeerStatus {
+                installation: "office".into(),
+                state: PeerConnState::Online,
+                ..PeerStatus::default()
+            }],
+            ..StatusSnapshot::default()
+        }));
+        let down = |deliberate: bool, daemon_gone: bool, respawn_off: bool| FeedDown {
+            error: "CONNECTION_LOST".into(),
+            attempt: 1,
+            retry_in_ms: 1000,
+            daemon_gone,
+            started: None,
+            start_error: None,
+            respawn_off,
+            deliberate,
+        };
+        for (deliberate, gone, respawn_off) in [
+            (true, true, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            st.down = Some(down(deliberate, gone, respawn_off));
+            render(&ui, &mut st);
+            let banner = ui.get_banner_text().to_string();
+            assert!(banner.contains("as of 13:20:00 (5 min ago)"), "{banner}");
+            let row = st.folders.row_data(0).expect("a row");
+            assert!(row.sync.text.starts_with("Last known"), "{}", row.sync.text);
+            assert_eq!(row.mount_chip.text, "Mounted (last known)");
+            let peer = st.peers.row_data(0).expect("a peer");
+            assert!(!peer.online);
+        }
+        // The peer dialog of a peer the snapshot no longer lists.
+        st.down = None;
+        ui.set_selected_peer("gone".into());
+        show_dialog(&ui, "peer");
+        render(&ui, &mut st);
+        assert!(ui.get_status_error());
+        assert!(
+            ui.get_status().contains("no longer listed"),
+            "{}",
+            ui.get_status()
+        );
     }
 }

@@ -3874,6 +3874,70 @@ fn a_saturating_push_does_not_delay_pulls_on_a_slow_uplink() {
     );
 }
 
+/// A dialer that unpaired us says so on its way out (`GOAWAY
+/// PEER_NOT_PAIRED`): the acceptor records a peer it does not dial itself
+/// as gone once its session closed (v3 network re-review minor: its folders
+/// read "Offline · Waiting for peers" for as long as the daemon ran). A peer
+/// it dials itself stays: its own pairing decides that.
+#[test]
+fn an_inbound_only_peer_that_unpairs_is_recorded_gone() {
+    let (a, b) = pair(100);
+    let me = a.ctx.installation.clone();
+    let removed = |world: &World| {
+        world
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(event, StatusEvent::PeerRemoved { installation } if *installation == me)
+            })
+            .count()
+    };
+    let closed = |world: &World| {
+        world
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(event, StatusEvent::InboundSession { installation, opened: false, .. }
+                    if *installation == me)
+            })
+            .count()
+    };
+    let unpair = || {
+        let conn = a.dial(&b.endpoint, &b.code, LANE);
+        conn.goaway("PEER_NOT_PAIRED", "this installation unpaired the peer");
+        sleep_ms(200);
+        conn.close();
+    };
+    unpair();
+    assert!(
+        wait_until(Duration::from_secs(10), || removed(&b.world) == 1),
+        "{:?}",
+        b.world.events()
+    );
+    // A session that merely closes records nothing.
+    a.dial(&b.endpoint, &b.code, LANE).close();
+    assert!(wait_until(Duration::from_secs(10), || closed(&b.world) == 2));
+    sleep_ms(200);
+    assert_eq!(removed(&b.world), 1);
+    // B dials A too (mutual pairing): A unpairing B leaves A in B's status.
+    b.world.catalog.update(|snapshot| {
+        let mut next = snapshot.clone();
+        next.peers.push(tkfs::model::orchestrator::PeerRecord {
+            endpoint: "ws://127.0.0.1:1".into(),
+            code: String::new(),
+            installation: me.clone(),
+            connections: 2,
+            revision: "r".into(),
+        });
+        next.generation += 1;
+        next
+    });
+    unpair();
+    assert!(wait_until(Duration::from_secs(10), || closed(&b.world) == 3));
+    sleep_ms(200);
+    assert_eq!(removed(&b.world), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Qualification (release, ignored): throughput of the data plane
 

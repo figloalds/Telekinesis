@@ -2161,9 +2161,23 @@ impl HubState {
                 attempt,
                 next_retry_at_ms,
             } => {
-                // The mount supervisor owns the attempt count.
-                let mut record = entry.errors.condition(&key, error, now);
-                record.count = u64::from((*attempt).max(1));
+                // The mount supervisor owns the attempt count, and an attempt
+                // happened once: re-reporting it (every heartbeat and view
+                // does) keeps its time (WP3.INT re-review: it read "just now"
+                // for hours).
+                let attempts = u64::from((*attempt).max(1));
+                let mut record = entry
+                    .errors
+                    .open
+                    .get(&key)
+                    .map(|open| &open.record)
+                    .filter(|open| open.error.code == error.code && open.count == attempts)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let mut record = entry.errors.condition(&key, error, now);
+                        record.count = attempts;
+                        record
+                    });
                 record.next_retry_at_ms = *next_retry_at_ms;
                 entry.errors.mirror(key, Some(record), now, &mut self.ring);
             }
@@ -2688,8 +2702,21 @@ impl HubState {
         let conn = rules::peer_conn_state(&lanes, peer.inbound_sessions(), revoked);
         if conn != peer.conn || peer.conn_since_ms.is_none() {
             let changed = conn != peer.conn;
+            // A peer that cannot be reached cycles its lanes through Dialing
+            // and Backoff (and Offline between runs): those flips keep the
+            // time it became unreachable, so its status says for how long
+            // (WP3.INT re-review).
+            let unreachable = |conn: PeerConnState| {
+                matches!(
+                    conn,
+                    PeerConnState::Connecting | PeerConnState::Backoff | PeerConnState::Offline
+                )
+            };
+            let keep = peer.conn_since_ms.is_some() && unreachable(peer.conn) && unreachable(conn);
             peer.conn = conn;
-            peer.conn_since_ms = Some(now.ms);
+            if !keep {
+                peer.conn_since_ms = Some(now.ms);
+            }
             if changed {
                 self.ring.push(
                     now.ms,
@@ -3032,11 +3059,20 @@ impl HubState {
             up_bytes,
             up_objects,
         };
+        // The pair works through whichever direction does (WP3.INT
+        // re-review): a peer whose sessions to us are up syncs the repo over
+        // them even while our own lanes to it are refused (it rotated its
+        // code: Unauthorized, a peer-level condition its badge shows). Its
+        // folder then reads its real state, not unreachable.
+        let pair_conn = match peer.conn {
+            PeerConnState::Unauthorized if peer.inbound_sessions() > 0 => PeerConnState::Online,
+            conn => conn,
+        };
         let mut inputs = PeerInputs {
             shared,
             sync_enabled: view.record.sync_enabled,
             local_running: folder.running(),
-            conn: peer.conn,
+            conn: pair_conn,
             remote: entry.map(|entry| entry.state),
             errors: flags,
             stalled: false,
@@ -3046,10 +3082,10 @@ impl HubState {
             down_bytes,
             up_objects,
             up_bytes,
-            blocked: meta
-                .blocked
-                .saturating_add(meta.quarantined)
-                .saturating_add(meta.rejected),
+            // Rejected events are shown, not blocked work (WP3.INT re-review:
+            // the rejected rows are never deleted, so counting them kept the
+            // folder Blocked for good, with no remedy).
+            blocked: meta.blocked.saturating_add(meta.quarantined),
         };
         let eligible = inputs.can_progress() && inputs.work_remaining();
         let stalled_since = pair.and_then(|pair| {
