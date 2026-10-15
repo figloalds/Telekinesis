@@ -479,7 +479,7 @@ fn startup_with_5k_staged() {
 /// is the reply time after each of ten imports, `content_catch_up_ms` how
 /// long the content took to show each import.
 #[test]
-#[ignore = "WP2.INT"]
+#[ignore = "WP2.3"]
 fn status_after_mutation_large() {
     let mut s = Scenario::new(FILE, "status_after_mutation_large");
     let dir = tempfile::tempdir().unwrap();
