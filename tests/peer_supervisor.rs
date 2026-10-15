@@ -265,6 +265,7 @@ fn local_with(wrap: impl FnOnce(Arc<Catalog>) -> Arc<dyn CatalogApi>) -> Local {
         stopping: Arc::new(AtomicBool::new(false)),
         started_at_ms: tkfs::util::time::now_ms(),
         endpoints: Snapshot::new(DaemonEndpoints::default()),
+        extensions: OnceLock::new(),
     });
     Local {
         _dir: dir,
@@ -1735,8 +1736,12 @@ fn unpair_joins_within_5s_while_the_peer_holds_a_request() {
     manager.shutdown(Duration::from_secs(5));
 }
 
+/// CCR-WP2.6-2 (applied by WP3.1; this test pinned its adapter before):
+/// lanes inside a dial are interrupted by the unpair instead of being
+/// detached at the join deadline. Nothing they dialed ever becomes a session,
+/// and nothing of them reaches the status sink after `PeerRemoved`.
 #[test]
-fn a_lane_detached_at_the_deadline_reports_nothing_after_peer_removed() {
+fn a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed() {
     let node = local();
     let (server, code) = FakePeer::start(SERVER);
     // Every dial through the proxy takes about 4.5 s: longer than the join.
@@ -1754,16 +1759,17 @@ fn a_lane_detached_at_the_deadline_reports_nothing_after_peer_removed() {
         LaneState::Dialing
     )));
 
-    // Both lanes are inside their dial: unpair waits for the deadline, then
-    // detaches them, reporting them Closed itself before PeerRemoved.
+    // Both lanes are inside their dial: the unpair interrupts them (their
+    // sockets are shut down), joins them well before the 2 s deadline, and
+    // they are reported Closed before PeerRemoved.
     let started = Instant::now();
     manager.unpair(&proxy).unwrap();
     let took = started.elapsed();
     assert!(
-        took >= Duration::from_millis(1900) && took < Duration::from_secs(3),
-        "unpair took {took:?} (the join deadline is 2 s here)"
+        took < Duration::from_millis(1500),
+        "unpair took {took:?} (the dials are interrupted at once)"
     );
-    assert_eq!(manager.detached_lanes(), 2);
+    assert_eq!(manager.detached_lanes(), 0, "every lane was joined");
     let removed = node.recorder.removed_at(SERVER);
     assert_eq!(
         node.recorder.last_lane_states(SERVER, 2, removed),
@@ -1773,14 +1779,12 @@ fn a_lane_detached_at_the_deadline_reports_nothing_after_peer_removed() {
         .peer_state(SERVER)
         .is_none()));
 
-    // The dials complete later (the server establishes both sessions) and
-    // the detached lanes close what they dialed at once; their late
-    // `Handshaking` and `Closed` never reach the status sink, so the hub
-    // does not bring the unpaired peer back.
-    assert!(wait_until(Duration::from_secs(10), || server.established()
-        == 2
-        && server.open_count() == 0));
-    thread::sleep(Duration::from_millis(500));
+    // Longer than an uninterrupted dial takes: none of them completed, and
+    // nothing reached the status sink, so the hub does not bring the
+    // unpaired peer back.
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(server.established(), 0, "an interrupted dial completed");
+    assert_eq!(server.open_count(), 0);
     let late = node.recorder.of_peer_from(SERVER, removed + 1);
     assert!(late.is_empty(), "status after PeerRemoved: {late:?}");
     assert_eq!(node.peer_state(SERVER), None, "no ghost peer in the hub");
@@ -1808,10 +1812,11 @@ fn a_respawn_is_not_overwritten_by_the_old_supervisors_late_lanes() {
 
     // Re-pairing the installation at its direct endpoint replaces the
     // proxied supervisor (respawn) while its lanes are inside their dial:
-    // they are detached at the deadline, and the successor runs the same
-    // (installation, lane) pairs.
+    // they are interrupted and joined (CCR-WP2.6-2, applied by WP3.1; they
+    // were detached at the deadline before), and the successor runs the
+    // same (installation, lane) pairs.
     manager.pair(&server.endpoint, &code, Some(2)).unwrap();
-    assert_eq!(manager.detached_lanes(), 2);
+    assert_eq!(manager.detached_lanes(), 0);
     assert_eq!(manager.peer(SERVER).unwrap().endpoint, server.endpoint);
     let respawned = node
         .recorder
@@ -1827,14 +1832,17 @@ fn a_respawn_is_not_overwritten_by_the_old_supervisors_late_lanes() {
         LaneState::Ready
     )));
 
-    // The old dials complete (two more sessions, closed at once: only the
-    // successor's two stay open; the fifth is pair's probe). Their late
-    // events are muted: since the respawn every lane event is the
-    // successor's, and the hub still shows both lanes Ready.
+    // The old dials never complete (they were interrupted): the server
+    // established the probe of the pairing and the successor's two lanes
+    // only, also after the time an uninterrupted dial takes. Nothing late of
+    // the old supervisor reaches the status sink: since the respawn every
+    // lane event is the successor's, and the hub still shows both lanes
+    // Ready.
     assert!(wait_until(Duration::from_secs(10), || server.established()
-        == 5
+        == 3
         && server.open_count() == 2));
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_secs(6));
+    assert_eq!(server.established(), 3, "an interrupted dial completed");
     let since: Vec<LaneState> = node
         .recorder
         .of_peer_from(SERVER, respawned + 1)
@@ -1884,17 +1892,14 @@ fn a_slow_supervisor_does_not_take_another_ones_stop_time() {
     assert!(all_lanes(&manager, "peer-a-slow", LaneState::Dialing));
 
     // One deadline, in phases: the holding peer is force-closed one second
-    // before it and joined, although the slow peer's lanes use the whole
-    // deadline (and are the only ones detached).
+    // before it and joined; the slow peer's lanes, inside their dial, are
+    // interrupted and joined too (CCR-WP2.6-2, applied by WP3.1: they were
+    // the ones detached at the deadline before).
     let started = Instant::now();
     manager.shutdown(Duration::from_secs(3));
     let took = started.elapsed();
     assert!(took < Duration::from_millis(3500), "shutdown took {took:?}");
-    assert_eq!(
-        manager.detached_lanes(),
-        2,
-        "only the slow peer's dialing lanes are detached"
-    );
+    assert_eq!(manager.detached_lanes(), 0, "every lane was joined");
     assert!(wait_until(Duration::from_secs(1), || holding.open_count() == 0));
     let all = node.recorder.events().len();
     assert_eq!(

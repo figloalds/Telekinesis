@@ -76,10 +76,12 @@
 //! afterwards. A reconciler retires a supervisor before it records
 //! `PeerRemoved` or spawns the replacement, so a late lane can neither
 //! recreate an unpaired peer in the hub nor overwrite its successor's lanes.
-//! Lane threads that have not ended by the deadline (a lane inside a dial,
-//! which cannot be interrupted, CCR-WP2.6-2) are detached, counted
-//! ([`PeerManager::detached_lanes`]) and logged; they close their new
-//! session as soon as the dial returns.
+//! A lane inside a dial is interrupted by the supervisor's token
+//! (`session::dial_cancellable`, CCR-WP2.6-2 applied by WP3.1): its socket is
+//! shut down at once, and only a TCP connect in progress (≤ 3 s per address)
+//! runs to its end. Lane threads that have still not ended by the deadline
+//! are detached, counted ([`PeerManager::detached_lanes`]) and logged; they
+//! close their new session as soon as the dial returns.
 //!
 //! Invariants: 16 (a probe and every lane session are fresh requests, nothing
 //! is replayed), 20 (a legacy endpoint is `Incompatible`, the code is never
@@ -394,8 +396,9 @@ impl PeerManager {
     }
 
     /// Lane threads that had not ended by their stop deadline and were
-    /// detached (a lane inside a dial, CCR-WP2.6-2), since the start. A lane
-    /// that ended in time was joined and is not counted.
+    /// detached (a lane inside a TCP connect, which a cancelled dial still
+    /// waits for, CCR-WP2.6-2), since the start. A lane that ended in time was
+    /// joined and is not counted.
     pub fn detached_lanes(&self) -> u64 {
         self.detached.load(Ordering::Acquire)
     }
@@ -557,7 +560,8 @@ impl PeerManager {
         pool: u32,
     ) -> Result<(Conn, session::ServerHello), ErrorWire> {
         let hello = session::client_hello(&self.ctx.installation, LaneRole::Probe, None, pool);
-        session::dial_expecting(
+        // A shutdown interrupts a probe in progress (CCR-WP2.6-2).
+        session::dial_cancellable(
             endpoint,
             hello,
             &CodeAuth {
@@ -566,6 +570,7 @@ impl PeerManager {
             expected,
             None,
             self.options.conn,
+            &self.cancel,
         )
         .map_err(|error| error.to_wire())
     }
@@ -1393,13 +1398,16 @@ impl Supervisor {
             inner: &code,
             on_key: &handshaking,
         };
-        session::dial_expecting(
+        // CCR-WP2.6-2 (applied by WP3.1): stopping the supervisor (unpair,
+        // respawn, shutdown) interrupts a dial in progress.
+        session::dial_cancellable(
             &self.record.endpoint,
             hello,
             &auth,
             Some(&self.record.installation),
             None,
             self.options.conn,
+            &self.cancel,
         )
     }
 

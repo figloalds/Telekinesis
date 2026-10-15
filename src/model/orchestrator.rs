@@ -86,7 +86,8 @@ pub mod limits {
     pub const EXCHANGE_SLOTS: usize = 4;
     pub const EXCHANGES_PER_REPO: usize = 1;
     pub const EXCHANGE_DEADLINE: Duration = Duration::from_secs(30);
-    /// Legacy gate rule: `metadata_caught_up` within this window (Wave 2).
+    /// Legacy gate rule: `metadata_caught_up` within this window (Wave 2;
+    /// unused since WP3.1 deleted the legacy rule with the legacy bridge).
     pub const LEGACY_GATE_FRESHNESS: Duration = Duration::from_secs(15);
     /// Pool size is `max(connections, MIN_POOL)`; lane 0 is control.
     pub const MIN_POOL: u32 = 2;
@@ -111,6 +112,12 @@ pub struct Ctx {
     pub started_at_ms: u64,
     /// Control/network URLs and the log path.
     pub endpoints: Snapshot<DaemonEndpoints>,
+    /// The daemon's private parts beside this frozen context (CCR-WP2.1-1,
+    /// applied by WP3.1): `orchestrator::ctx::extras` keeps its `Extras`
+    /// here (the concrete hub, the shutdown latch). A context built by a
+    /// test leaves it empty (`OnceLock::new()`); the first `extras` call
+    /// fills it.
+    pub extensions: OnceLock<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Ctx {

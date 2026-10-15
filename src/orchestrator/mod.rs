@@ -3,11 +3,12 @@ mod api;
 // The legacy `Supervisor` (`supervisor.rs`) and its catalog SQL
 // (`catalog_db.rs`) were deleted by WP2.INT (REVAMP_PLAN §14 WP2.INT task 1);
 // the daemon runs the Wave 1 actors since WP2.1.
+// WP3.1 deleted the legacy (v2) network: `legacy_bridge.rs`, `lanes.rs`,
+// `peering.rs` and `status.rs` (REVAMP_PLAN §14 WP3.1); the v3 peer stack
+// (`peer`, `scheduler`, `meta_exchange`, `objects`, `inbound`) is the only
+// network path.
 mod config;
-mod lanes;
-mod peering;
 mod run;
-mod status;
 
 // Seam modules landed by WP0.INT (REVAMP_PLAN §14 WP0.INT); each file names
 // its owner in its first line.
@@ -20,7 +21,6 @@ pub mod hub;
 pub mod hub_rules;
 pub mod inbound;
 pub mod inbound_objects;
-pub mod legacy_bridge;
 pub mod manage;
 pub mod manage_v2;
 pub mod meta_exchange;
