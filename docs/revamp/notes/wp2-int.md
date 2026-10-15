@@ -484,3 +484,263 @@ headless folders and small files, debug builds, one old and one new daemon.
 - `d2f0fa8` two qualification scenarios (deviation 6)
 - `d1f7a31` first qualification evidence and notes draft
 - `3cd5520` merged qualification evidence and these notes; then notes-only commits (the final VERIFY)
+
+## Post-integration re-review
+
+An independent re-review of the integrated tree at `839eb22` covered six
+areas: WP2.1, WP2.3 and WP2.5 (the packages whose review fixes the
+integrator applied), and three cross-package areas (lifecycle isolation,
+the feed protocol, off-lock determinism). All six came back *changes
+required*, with 23 findings: 14 majors and 9 minors. Three issues were
+reported twice, by a package area and by a cross-package area (the slow
+commit under the engine lock, the inbound gate evidence, slow-path
+starvation), so there are 20 distinct issues. All are fixed here except the
+off-lock area's second major, whose storage change is deferred with its
+measurement and a CCR (*Deviation* below). Each fix has a
+regression test that fails on the code before it (the failure is quoted;
+"before" means the file(s) of the fix reverted on the final tree, with a
+stub for a new public name a test refers to, see *How "before" was run*).
+
+Public signatures are unchanged (§13). Additions only:
+
+- `catalog::APPLY_WAIT` (`CatalogApi::apply` is now bounded),
+  `run::MAX_CONTROL_THREADS`;
+- `Store::commit_prepared_unless_busy` (beside `commit_prepared`, §13
+  rule 3), `Store::status_computations` (a test counter), the cache type
+  `core::status::Cache` in `StoreCaches`;
+- `sharing::PAGE_READ_BUDGET`, `meta_exchange::evidence_of`,
+  `activator::STALE_ESCALATE`;
+- crate-private: `Slots::force_acquire`, `legacy_bridge::LaneVoice`
+  (`lanes::run_lane` takes the lane's voice), the controller's
+  `Msg::Catalog`.
+
+No `src/model/**` or `src/util/**` file changed. The spec changes are
+ratified in REVAMP_PLAN as CCR-WP2.INT-1 to -4 (below).
+
+### WP2.1 (`legacy_bridge.rs`, `lanes.rs`, `manage.rs`)
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| R1 | **Major.** The legacy lane manager cancelled retired lanes but never muted them. A lane parked in a local worker call (or, on Windows, a peer read) kept recording into the hub for up to 15 s after its retirement: after Unpair its late `Closed` recreated the removed peer (`offline`, for good); after a re-pair its late `Closed` overwrote the new lane's `Ready` (for good). | Each lane has a `LaneVoice` (a mutex-guarded mute flag): every status event and gate evidence of `run_lane` goes through it. When `reconcile` (or `retire_all`) retires lanes it cancels and mutes them, records each one `Closed` itself, and only then records `PeerRemoved` or spawns the successors (the order of WP2.6's PeerManager). A report in progress finishes before the mute returns. | `w2_integration::unpair_removes_the_peer_from_status_for_good` (two daemons; the peer must leave `status` and stay gone 5 s). Before: "timeout waiting for the peer gone from status". `w2_integration::a_re_pair_keeps_the_new_lane_ready_while_the_old_one_ends_late` (the old control lane's first local `published-offer` hangs 10 s, then a re-pair; lane 0 sampled every 250 ms for 18 s). Before: `ready`, then `closed` from 8.65 s to the end (37 samples). After: `ready` throughout. |
+| R2 | Minor. The §7.3 projection ignored the mount intent: a folder the user detached (WP2.2's Detach) read `running:false, starting:true, startup_phase:"attaching filesystem"` while it ran. | `mount_requested` also needs the view's intent to be other than `Detach`; §7.3 records the rule (CCR-WP2.INT-3). | New case "running, user detached" in `orchestrator_runtime::projection_follows_the_section_7_3_rules`. Before: `[false, true, false, "attaching filesystem", null]`; after: `[true, false, false, null, null]`. |
+
+### Lifecycle isolation (`folder.rs`, `catalog.rs`, `run.rs`)
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| L1 | **Major.** The FolderController called `CatalogApi::apply` on its own thread, and `apply` had no deadline: a slow catalog write (typically the `ClearGate` after a gated attach) froze that folder's lifecycle: a dead worker stayed `Running`, commands waited their whole deadline, Shutdown reported `left_running REQUEST_TIMEOUT` for a dead worker. | The controller's event-driven writes (`ClearGate`, `RetargetGate`) run on a helper thread and come back as `Msg::Catalog` (in-flight flags prevent duplicates; the result is read against the latest snapshot). `Catalog::apply` waits at most `APPLY_WAIT` (5 s): a command not yet started is withdrawn (`CATALOG_UNAVAILABLE`, never applied), a running one answers `REQUEST_TIMEOUT`, and while one command has run that long new ones are refused at once. The command-path writes (`SetDesired`, `OverrideGate`) stay synchronous (the intent must be durable before the stop, invariant 26) but are bounded, and `OverrideGate` is skipped when the management action already wrote it (the usual case; `SetDesired` already was). | `folder_controller::a_slow_catalog_write_never_freezes_the_folder_lifecycle` (a `FakeCatalog` that holds `ClearGate`; both workers die). Before: "timed out waiting for a: backoff while the write is held". After: `Backoff` within 2 s, a command answered within 1 s, Shutdown reports `not_running`. |
+| L2 | **Major.** Management writes had no server-side deadline; parked write requests filled the 64 control connections and new List/Inspect/Status connections were refused. | `APPLY_WAIT` (L1) releases each write within 5 s; and the accept cap counts only connections outside a request (64), with at most `MAX_CONTROL_THREADS` (128) in all, so parked requests never take the place of a read. | `orchestrator_runtime::writes_behind_a_slow_catalog_never_lock_reads_out` (in-process daemon, `catalog.slow_write` hangs 12 s, 64 clients send `reset-pairing-code`). Before: the 65th connection was refused ("control connection refused: too many open connections") and the test process aborted. After: `list` and `status` answered (`list` well under 2 s), every write answered within 9 s with `CATALOG_UNAVAILABLE` or `REQUEST_TIMEOUT`. |
+| L3 | **Major.** A folder with `desired_running=0` whose worker was still alive (a Stop left StopBlocked at a Shutdown, a daemon crash) was never adopted: `Stopped`, ForceStop a no-op, the worker unsupervised. | At controller start a live, verified previous worker is adopted whatever `desired` is; once it answers `hello` with `desired=0` the stop ladder runs (graceful, StopBlocked with retries, ForceStop). A version mismatch stops it without a respawn; an adoption that ends without a worker never spawns while not desired. | `folder_controller::a_live_worker_of_a_stopped_folder_is_adopted_and_stopped`. Before: "timed out waiting for a: stop blocked" (`Stopped`, empty log). After: adopted, `StopBlocked`, retried, ForceStop → `stop{force}` → `Stopped`, no kill, no launch, its slot released. |
+| L4 | **Major.** A headless received folder never cleared its gate marker (deleted only after `Attached`): `initial_sync_pending` for good, and after a restart with the source unreachable the gate was `Awaiting` again (List: `starting`, "synchronizing remote metadata"). | With no mount requested (no path, or `mount_enabled` off) the marker is cleared once the gate is `Satisfied` or `Overridden` (the legacy rule; a mount configured later attaches at once). §3.3 and the invariant 26 row record it (CCR-WP2.INT-2). | `folder_controller::a_headless_received_folder_clears_its_gate_once_satisfied`. Before: "timed out waiting for a: gate cleared" (0 `clear_gate`). After: one `clear_gate`, no gate row, a later mount attaches. |
+| L5 | **Major.** `begin_start` took a `maximum_running` slot before looking at `worker.json`: a folder whose previous worker was alive could lose the slot to a fresh spawn, show `WORKER_LIMIT`, and leave its worker unsupervised. | The previous worker is probed first; adopting a live one always takes a slot (`Slots::force_acquire`, beyond the maximum: it already runs; later starts wait until the count is back under it). | `folder_controller::adoption_of_a_live_worker_takes_a_slot_beyond_the_limit` (`maximum_running=1`, a running, b started with a live worker). Before: "timed out waiting for b: adopted" (b `Stopped`, `WORKER_LIMIT`, no `adopt`). After: b `Running{adopted}`, two slots, back to one after b stops. |
+| L6 | Minor. A graceful Stop or Restart while a previous worker was being adopted (no `hello` yet) led, when the stop failed, to a `hello` probe and a kill without the `stop{force}` that persists dirty sessions. | A stop plan sent during adoption remembers it (`unverified_since`): a failed graceful stop is retried, and after the adoption patience the folder is `Failed{PREVIOUS_WORKER_UNRESPONSIVE}` (the adoption rule); only ForceStop kills, after `stop{force}`. | `folder_controller::a_failed_stop_of_a_worker_being_adopted_never_kills_it`. Before: the folder never reached `Failed` (the clock-advance loop timed out; the review's trace for the same case: a `hello` probe, then `kill:4242`, no `stop{force}`). After: `PREVIOUS_WORKER_UNRESPONSIVE`, stops retried, 0 kills; ForceStop → `stop{force}` → `Stopped`. |
+| L7 | Minor. Each 10 s wait for `owner.lock` ended in a counted failure: a live orphan without `worker.json` opened the crash breaker (`CRASH_LOOP`) without any worker launched. | A lock wait is not a failure: past 10 s the folder shows `PREVIOUS_WORKER_STOP_TIMEOUT` (once) and keeps waiting in `Starting`; each poll re-reads `worker.json` and adopts a worker that published one (a record probed once without an adoption is not probed again). | `folder_controller::a_lock_wait_never_opens_the_crash_breaker_and_adopts_a_late_worker` (80 s of waits, then a `worker.json`). Before: failed at the "still waiting" assertion (the folder had left `Starting`). After: still `Starting` with the error, 0 restarts, 0 launches; then adopted, the error resolved. **Changed assertion:** `foreign_image_is_never_killed_and_a_held_owner_lock_blocks_the_spawn` expected `Backoff` after the 10 s wait; it now expects `Starting` with `PREVIOUS_WORKER_STOP_TIMEOUT` (this finding's behaviour); its other checks (no spawn while locked, a spawn once free, the foreign process never killed) are unchanged. |
+
+### WP2.3 (`activator.rs`, `maintenance.rs`, `status_cell.rs`, `core/status.rs`) and off-lock determinism
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| W1 | **Major** (WP2.3 and off-lock #1). The slow ticket's `commit_prepared`, and the re-queues around it, waited for another connection's writer under the engine lock (the 5 s `poll_busy`; up to about 10 s with the re-queue). | `Store::commit_prepared_unless_busy`: a busy `BEGIN IMMEDIATE` hands the preparation back (nothing read or written). The activator's `commit` and `requeue` install `fail_busy` within `WRITER_PATIENCE` (2 s) and retry after `WRITER_RETRY` with the engine free, as a slice does; a busy attempt is neither `Stale` nor a failure, and a busy re-queue never fails the cycle. | `worker_concurrency::a_slow_commit_never_waits_for_another_writer_under_the_engine_lock` (a connection holds the writer 600 ms at a time, 20 ms apart; a probe takes the engine every 5 ms). Before: "the engine was held 606.7ms". After: under the 250 ms bound, the slow event committed. |
+| W2 | **Major** (WP2.3; off-lock #3, minor). A `Stale` ticket was only re-queued: behind a local writer committing more often than a preparation takes, a slow event (and its descendants) never activated; `starved_since_ms` was cleared by any activation, so it was rarely reported. | **CCR-WP2.INT-1 (§4.4, ratified):** after `STALE_ESCALATE` (4) consecutive `Stale` outcomes the event is committed inline, alone (`Prepared::Inline`, through the same never-wait commit): one O(history) hold for that event instead of unbounded starvation. Starvation is tracked per event (first `Stale` time and count); `starved_since_ms` is the oldest still starving, cleared when that event commits, is quarantined or leaves the inbox (checked at most once a second on a pooled store), never by unrelated activations. | `worker_concurrency::a_starving_slow_event_is_committed_inline_and_reported_until_then` (a save through the engine every 3 ms, 200 events of history; side-branch events from C activate meanwhile). Before: "the slow event never committed behind 2510 local saves" in 60 s. After: committed after 4 `Stale` rounds (about 4 s), the report constant while it starved and through C's activations, cleared after. Release: `qual_wp2_4_offlock::stale_convergence_worker_steady_writer` (new; the 50 ms writer deviation 6 had replaced), *Qualification* below. |
+| W3 | **Major.** An idle worker's maintenance recomputed `journal_counters` and `inventory_match` (uncached, O(history)) every refresh: about 26 % of a core at 50K events. | Both are cached per connection under its change key (`total_changes`, `PRAGMA data_version`, open transaction, active branch; `core::status::Cache`), as the content scan already was; and `inventory_match` is index-only once the feed index is built (`feed_journal`'s row count, each peer's `peer_known` range, per feed row a `(peer, event)` key lookup), never the wide `events` rows. | `worker_concurrency::status_totals_are_cached_until_the_database_changes` (a WAL checkpoint by another connection is no change; another connection's commit is). With the cache lookups disabled: "recomputed while idle", 12 computations instead of 2. |
+| W4 | Minor. Since CCR-WP2.5-5 the cell's `tip` is the feed tip, but `inventory_tip` recorded the journal tip: once the newest event was private, every `status` re-ran the inventory match. | `inventory_tip` (and the new `inventory_epoch`) record the feed tip and epoch in both refreshes; `reply` compares like with like. | `worker_concurrency::a_private_journal_tip_does_not_recompute_the_inventory_match` (caught up, then a `branch` fork). Before: 20 of 20 calls recomputed it. After: 0. |
+| W5 | Minor. Read-your-writes made the `status` after any client mutation run a full refresh (content, journal counters, inventory match) on the caller, and concurrent callers each repeated it. | That refresh is content and cheap members only (maintenance brings the totals); one at a time per worker store (a lock keyed by the store root; `WorkerCtx` is frozen), a waiting caller finds the content caught up. The first reply still computes everything once. | `worker_concurrency::status_after_a_mutation_refreshes_the_content_only`. Before: "the inventory match was recomputed by the read-your-writes refresh". After: the content moved, the inventory untouched. |
+
+### WP2.5 and the feed protocol (`sharing.rs`, `inbound.rs`, `meta_exchange.rs`)
+
+| # | Finding | Fix | Regression test: before → after |
+|---|---|---|---|
+| F1 | **Major.** Regression detection per channel missed an acceptor restored from a backup when the higher report came from the other channel (from when it used to dial): with only the dialer dialing, every page got `CursorMismatch` for good (I2 "never stuck"). | **CCR-WP2.INT-4 (§6.3.4, ratified):** a reply's report (`cursor`, or a `CursorMismatch.expected`) is compared with the request channel's report too, when that one was recorded before our request was built (`Offer.at_ms`; an unknown offer counts as before): lower, same epoch and still valid means the peer regressed, and it is forgotten as `observe_report` does. A request-borne report recorded after our offer may be newer than the reply (mutual dialing) and is not compared. | `feed_v7::a_restored_acceptor_is_found_through_the_other_channel`. Before: "A received 0 of D's 8 events", 20 × `CursorMismatch { seq: 0 }`. After: A has all 8, caught up, `peer_known` complete. `feed_v7::mutual_dialing_converges_without_false_regressions` stays green. |
+| F2 | **Major** (feed protocol; WP2.5 minor). The inbound server forwarded the acceptor's raw `GateView`, whose `caught_up` is false whenever `blocked`: an acceptor-side gate never reached `Blocked`. | One helper for both directions, `meta_exchange::evidence_of` (`caught_up = gate.caught_up \|\| (gate.blocked && metadata caught_up)`); §6.3.6 says so. | `inbound_v3::a_caught_up_but_blocked_source_view_is_blocked_evidence`. Before: `caught_up: false, blocked: true` (the dialer's mapping gives `true, true`). After: equal to the dialer's. |
+| F3 | **Major.** An event with a malformed parent id (empty or over 128 bytes) was staged `waiting`, and its parent went into every need list to every peer, which every acceptor refused whole (`PROTOCOL_VIOLATION`): no metadata moved again. | `precheck` rejects an event whose `dependencies` or change `parents` are not valid ids (`INVALID_EVENT` into `feed_rejected`); `MISSING_PARENTS_SQL` takes only parents of 1–128 bytes, and the need list drops any invalid id (a row staged by another path). | `feed_v7::a_malformed_parent_never_reaches_a_need_list`. Before: the event was staged (`staged: 1`). After: rejected; a legacy-staged row with such a parent waits but never reaches a request; A's and M's exchanges keep working. |
+| F4 | Minor. Need serving read every requested payload, served or not: draining N large needs read about N²/2 payloads. | The stored length first (`octet_length`, no payload read); a payload is read only when it fits the budget. | `feed_v7::need_serving_reads_only_the_payloads_it_serves` (24 × 774 KB). Before: 24 payloads read for 16 served. After: reads equal served, two rounds. |
+| F5 | Minor. A page read and canonicalized every listed payload (elided and `large` included) with no budget: up to 4,096 × 8 MiB, past the exchange deadline, and the next exchange rebuilt the same page. | `PAGE_READ_BUDGET` (8 MiB) of stored payloads per page: the page selects `octet_length` only, reads a listed payload by id, and ends before the budget is passed (always listing its first entry; `through` the last listed, `more` set). §6.3.3 says so. | `feed_v7::a_page_reads_its_entries_within_a_budget` (40 × 774 KB). Before: one page of 40 entries. After: pages of at most 11, contiguous, all 40 listed, reads equal entries. |
+
+### Deviation: the lock-hold floor and conflict-producing slow events (off-lock #2)
+
+The `lock_hold_slow_event_2k` floor (< 50 ms) is met by its scenario,
+whose slow event (a concurrent directory creation) leaves the projection's
+conflict list unchanged and so stays on the CCR-WP1.INT-4 delta path. A slow
+event that adds or changes a conflict (a concurrent edit of the same file,
+the canonical two-way event) takes the full `current_state` rewrite under
+the lock (2.8 MB at 2K, plus the forced seal), and a page staged by another
+connection makes the first slice reload the projection under the lock.
+
+**Not fixed here; measured and recorded.** Keeping a conflict change on the
+delta path needs the conflicts and the pending list stored outside
+`current_state`. A `current_parts` row cannot carry them: 6298d0b's
+`load_projection` reads every `current_parts` row as an `Entry` (a
+downgrade would fail to load, or load a wrong projection), and a new side
+table would leave a downgraded binary reading a stale conflict list from
+`current_state`. That is a storage-format decision with downgrade
+consequences, outside an integration fix. **CCR-WP2.INT-5 (deferred to
+Wave 3/4, with CCR-WP2.4-2/-3):** store the projection's conflicts and
+pending list so that a conflict change is a delta, with a downgrade story;
+move the forced seal's O(projection) write and hash out of the critical
+section. The new release scenario
+`qual_wp2_4_offlock::lock_hold_slow_conflict_event_2k` (A edits the file B
+edited; the page staged on a secondary connection) measures it; it has no
+floor, and the existing floor keeps its scenario (*Qualification* below).
+
+### CCRs filed by the post-integration re-review
+
+| CCR | Status | Change |
+|---|---|---|
+| CCR-WP2.INT-1 (§4.4 starvation bound) | **ratified** in REVAMP_PLAN §4.4 | after 4 consecutive `Stale` outcomes an event is committed inline, alone; `starved_since_ms` per event |
+| CCR-WP2.INT-2 (§3.3 adoption, lock wait, headless gate) | **ratified** in §3.3 and the invariant 26 row | adoption at every controller start whatever `desired` (then the stop ladder for `desired=0`), adoption before slot accounting with a forced slot, a lock wait never counted, the stop of an unverified adopted worker follows the adoption rule, the marker of a folder with no mount requested cleared once satisfied or overridden, the controller's event-driven catalog writes off its thread |
+| CCR-WP2.INT-3 (§7.3 `running`) | **ratified** in §7.3 | a mount with intent `Detach` is not requested |
+| CCR-WP2.INT-4 (§6.3.3–6.3.6) | **ratified** in §6.3 | a reply's report is compared across channels; page read budget; need payloads read only when served; malformed references rejected at staging, never in a need list; the gate evidence mapping on both sides |
+| CCR-WP2.INT-5 (conflict changes as a projection delta) | **deferred to Wave 3/4** (with CCR-WP2.4-2/-3) | above |
+
+`REVAMP_PLAN.md` also records the catalog's bounded `apply` (§3.2) and the
+control connection cap (§3.5); neither changes a contract.
+
+### How "before" was run
+
+Each fix's files were reverted with `git stash` on the final tree and the
+new tests run against them; afterwards the stash was restored. Tests that
+name a new public item got a stub for it in the reverted file, removed
+again afterwards: `sharing::PAGE_READ_BUDGET` (F4/F5 run), and
+`activator::STALE_ESCALATE` (W1/W2 run). W3's test needs the new counter, so
+its "before" is the final code with the two cache lookups disabled
+(`&& false`). F2's "before" is `inbound.rs` reverted with the new helper kept
+(the test compares with it). F3's second layer (the need-list filter) was
+checked separately: with only the `precheck` fix (the SQL filter and the
+`retain` reverted), the legacy-staged row's 200-byte parent was in D's
+request and the test failed at the need assertion.
+
+### Tests added (post-integration re-review)
+
+19 new tests (and one new case in an existing test), each failing before its fix (tables above):
+`folder_controller` 6 (`a_slow_catalog_write_never_freezes_the_folder_lifecycle`,
+`a_live_worker_of_a_stopped_folder_is_adopted_and_stopped`,
+`a_headless_received_folder_clears_its_gate_once_satisfied`,
+`adoption_of_a_live_worker_takes_a_slot_beyond_the_limit`,
+`a_failed_stop_of_a_worker_being_adopted_never_kills_it`,
+`a_lock_wait_never_opens_the_crash_breaker_and_adopts_a_late_worker`);
+`orchestrator_runtime` 1 (`writes_behind_a_slow_catalog_never_lock_reads_out`)
+plus one case in `projection_follows_the_section_7_3_rules`;
+`w2_integration` 2 (`unpair_removes_the_peer_from_status_for_good`,
+`a_re_pair_keeps_the_new_lane_ready_while_the_old_one_ends_late`);
+`worker_concurrency` 5 (`a_slow_commit_never_waits_for_another_writer_under_the_engine_lock`,
+`a_starving_slow_event_is_committed_inline_and_reported_until_then`,
+`status_totals_are_cached_until_the_database_changes`,
+`a_private_journal_tip_does_not_recompute_the_inventory_match`,
+`status_after_a_mutation_refreshes_the_content_only`);
+`feed_v7` 4 (`a_restored_acceptor_is_found_through_the_other_channel`,
+`a_malformed_parent_never_reaches_a_need_list`,
+`need_serving_reads_only_the_payloads_it_serves`,
+`a_page_reads_its_entries_within_a_budget`);
+`inbound_v3` 1 (`a_caught_up_but_blocked_source_view_is_blocked_evidence`).
+Release scenarios (ignored): `qual_wp2_4_offlock::{lock_hold_slow_conflict_event_2k,
+stale_convergence_worker_steady_writer}`.
+
+### Verification (post-integration re-review)
+
+Run on the final code tree (`212fbc3`; the notes and evidence commits after
+it change no code). Windows `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int`, WSL
+`$HOME/tkfs-target/wp2-int`. No other cargo, test or tkfs process of mine
+ran during the suites. The machine had little free commit memory during
+this work (another user process held about 34 GB): two builds with the
+default job count failed in the linker or in rustc with out-of-memory
+errors (`LNK1102`, `STATUS_STACK_BUFFER_OVERRUN`), so the test binaries
+were built with `-j 2` before the suite, which then built nothing.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass (exit 0) |
+| `cargo build --all-targets` | pass (exit 0), no warnings |
+| `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
+| `CARGO_TARGET_DIR=C:/tkfs-target/wp2-int powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **pass, SUITE_EXIT=0: 829 passed, 0 failed, 97 ignored** across 61 binaries. That is 810 + 19 new tests; ignored 95 + the 2 new release scenarios. Changed binaries: `folder_controller` 50 → 56, `orchestrator_runtime` 13 → 14, `w2_integration` 11 → 13 (+1 ignored), `worker_concurrency` 23 → 28, `feed_v7` 37 → 41, `inbound_v3` 19 → 20, `qual_wp2_4_offlock` 4 → 6 ignored |
+| WSL `cargo check --all-targets` | pass (exit 0) |
+| WSL `cargo clippy --all-targets -- -D warnings` | pass (exit 0) |
+| WSL `cargo test --test orchestrator --test orchestrator_runtime --test folder_controller --test session_core --test session_handshake --test worker_lifecycle --test mount_lifecycle --test worker_concurrency --test feed_v7 --test inbound_v3 --test activation_inbox --test offlock_commit --test catalog_actor --test w2_integration` | **pass, exit 0**: 15, 14, 56, 59, 21, 25, 17 (`/dev/fuse`), 28, 41, 20, 21, 20 + 1 ignored, 19, 13 + 1 ignored |
+| Before the full suite, the touched binaries on Windows | `folder_controller` 56, `orchestrator_runtime` 14, `orchestrator` 15, `catalog_actor` 19, `management_api` 27, `legacy_stabilizers` 3 + 4 ignored, `feed_v7` 41, `inbound_v3` 20, `meta_scheduler` 24 + 1, `peer_supervisor` 25, `activation_inbox` 21, `availability` 13, `core` 16, `derive_oracle` 11 + 2, `offlock_commit` 20 + 1, `paired_sync` 9, `partial_content` 8, `replication_regressions` 9, `scalability` 5, `startup_snapshots` 8, `w1_integration` 4 + 1, `worker_concurrency` 28, `worker_lifecycle` 25: all pass |
+
+### Qualification (release, `test-evidence/qualification-wave-2.json`)
+
+`scripts/qualify.ps1 -Wave 2 -NoBuild -Merge -BudgetS 2400 -FileTimeoutMin
+150` over the files whose code paths changed: `qual_wp1_6_activation`,
+`qual_wp1_12_legacy`, `qual_wp2_1_lifecycle`, `qual_wp2_3_worker`,
+`qual_wp2_4_offlock`, `qual_wp2_5_feed`, on the clean tree `212fbc3`
+(`dirty: false`; the release binaries were built first with `-j 3`, see
+above). The other files keep the first run's results (`merged_from`:
+`d1f7a31`). **All six files pass; 53 scenarios: 51 pass, 1 skipped
+(`sigterm_matches_shutdown`, Unix only), 1 fail (`qual_wp1_9_session`, not
+re-run: the environmental `session_loopback_throughput` of the first run);
+27 floors, 26 pass.**
+
+| Floor | Floor | Before (first run) | After |
+|---|---|---|---|
+| `api_p99_under_churn` | < 100 ms | 2.33 | 2.72 |
+| `subscribe_latency` | ≤ 1,000 ms | 62.5 | 63.0 |
+| `shutdown_busy_folder` | ≤ 30,000 ms | 100.3 | 232.2 |
+| `fs_p99_during_catchup` | < 50 ms | 17.4 | 27.8 |
+| `status_latency_during_activation` | < 20 ms | 3.34 | 2.95 |
+| `startup_with_5k_staged` | < 3,000 ms | 234 | 262 |
+| `lock_hold_slow_event_2k` | < 50 ms | 14.8 | 15.2 |
+| `feed_150k_events` | completed | 951 events/s | 1,123 events/s |
+| `idle_exchange_50k_cpu` / `_bytes` | ≤ 10 ms, ≤ 4 KiB | 1.56, 1,593 | 3.91 (note), 1,593 |
+| `large_event_8mib` | completed | completed | completed |
+| `remote_linear_create_2k` / `_10k` | | 0.94 / 2.01 ms/event | 0.87 / 1.65 |
+| `local_create_after_resolved_conflict` p90 | | 2.53 | 1.88 |
+| `legacy_hung_repo_healthy_progress` | ≤ 45,000 ms | 697 | 869 |
+| `legacy_interval_20s_reconnects` / `legacy_crash_backoff` | 0 / ≤ 5 | 0 / 5 | 0 / 5 |
+
+Note: an idle exchange gained one point query on the dialer
+(`check_reply_report`) and none on the acceptor; the rest of the CPU
+difference is the machine (see *Verification*), and the floor holds.
+
+New scenarios (no floor):
+
+- `lock_hold_slow_conflict_event_2k`: **max engine wait 61.2 ms**
+  (`commit_prepared` 63.1 ms, preparation 75.0 ms off-lock, staging 2.3 ms on
+  the secondary connection, one conflict row, oracle empty). Against 15.2 ms
+  for the floor's directory event in the same run: the full rewrite of the
+  deviation above.
+- `stale_convergence_worker_steady_writer`: **20 slow events converge in
+  126.9 s** behind 668 local imports at 50 ms: 80 `Stale` outcomes (4 per
+  event, then the inline commit), `starved_since_ms` null at the end.
+
+Scenarios without a floor otherwise: `lock_hold_slow_event_2k_worker` 66.0 ms
+(56 before; it probes during a legacy `published-exchange`, deviation 7),
+`stale_convergence` 33.9 s (68 stale), `stale_convergence_worker` 62.5 s,
+`fs_p99_during_legacy_catchup` 178.8 ms, `adoption_after_daemon_kill`
+resumed 2.0 ms after Running, `crash_loop_reaches_failed` 14.8 s,
+`hung_worker_restarted` 11.2 s, `peer_restore` 70 ms,
+`staged_events_not_resent` 0.
+
+### Known limitations (post-integration re-review)
+
+- **CCR-WP2.INT-5**: a conflict-producing slow event holds the engine about
+  60 ms at 2K (the deviation above).
+- The first activation slice after another connection's commit still
+  reloads the projection under the engine lock before it hands out a slow
+  ticket (off-lock #2's second point); measured inside
+  `lock_hold_slow_conflict_event_2k`, not changed.
+- W5: the read-your-writes refresh still loads the projection on a pooled
+  connection whose view the commit invalidated (cold, O(projection)); only
+  the totals and the repetition are gone.
+- F5: the receiver's own reads of held payloads for elided entries are not
+  budgeted (bounded by the sender's page budget for an honest sender).
+- L5: adopting live workers can hold more slots than `maximum_running` for
+  as long as those workers run (new starts wait meanwhile).
+- W2: an escalated event is committed inline: one O(history) engine hold
+  (about 100 ms at 2K, `inline_slow_commit_ms` 118.5 ms in this run) after
+  about 4 s of starvation.
+- The WP2.3 review's three lower-value observations (the `failures` map
+  evicts the smallest id; `published-bulk-*` never bumps
+  `status_generation`; a non-busy slice error counts as a pass) are not
+  addressed.
+
+### Commits (post-integration re-review)
+
+- `dc56483` WP2.INT: re-review fix - orchestrator: lifecycle isolation,
+  retired legacy lanes muted, Detach projection (R1, R2, L1–L7)
+- `6d7d046` WP2.INT: re-review fix - feed: cross-channel regression, shared
+  gate evidence, bounded needs and page reads (F1–F5)
+- `db0be5e` WP2.INT: re-review fix - worker: never-wait slow commits,
+  bounded starvation, cached status totals (W1–W5)
+- `212fbc3` WP2.INT: re-review fix - spec ratifications (CCR-WP2.INT-1 to
+  -4) and off-lock qualification scenarios
+- the commit that adds this section and the merged qualification evidence
