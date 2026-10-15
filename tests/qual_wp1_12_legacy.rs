@@ -95,8 +95,12 @@ fn hung_remote_repo_charged() {
     if !progressed {
         s.timeout("healthy repository did not progress");
     }
-    // Keep sampling briefly so the charge can be observed after Y moved.
-    let _ = wait_until(Duration::from_secs(20).min(s.remaining()), || {
+    // Keep sampling so the charge can be observed after Y moved. WP3.INT:
+    // since the cutover (WP3.1) the hung exchange is charged at the dialer's
+    // exchange deadline (`limits::EXCHANGE_DEADLINE`, 30 s), so the window is
+    // 75 s, as `qual_wp3_1_transport::hung_remote_repo_extra_delay` waits (it
+    // was 20 s, which the legacy lanes' earlier charge fitted).
+    let _ = wait_until(Duration::from_secs(75).min(s.remaining()), || {
         if let Ok(peers) = b.raw_call(json!({"op":"peers"})) {
             charged |= repo_statuses(&peers, &x_repo).iter().any(|r| {
                 !r["error"].is_null() || r["consecutive_failures"].as_u64().unwrap_or(0) > 0
