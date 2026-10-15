@@ -72,10 +72,15 @@ fn lanes_ready(node: &Node, installation: &str) -> bool {
     })
 }
 
-/// `name` holds `bytes` and the folder's content is complete (the object is
-/// installed, not only its metadata).
+/// `name` holds `bytes`, and the object is installed (read back from the
+/// store; the status cell's `content.complete` may lag a new event).
 fn has_content(folder: &Value, name: &str, bytes: &[u8]) -> bool {
-    has_file(folder, name, bytes) && content_status(folder)["complete"] == true
+    has_file(folder, name, bytes)
+        && try_rpc(
+            folder,
+            json!({"op":"cat-object","object":tkfs::core::hash(bytes)}),
+        )
+        .is_ok_and(|object| object["hex"] == hex::encode(bytes))
 }
 
 /// A hung remote worker for repo X adds < 2 s to repo Y's propagation on the
