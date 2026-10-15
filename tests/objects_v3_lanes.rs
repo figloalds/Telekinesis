@@ -39,7 +39,7 @@ use tkfs::{
     bulk_sync::{self, Page},
     model::{
         errors::{ErrorWire, Scope},
-        health::Generations,
+        health::{ContentCounters, Generations},
         ipc::WorkerHeartbeat,
         orchestrator::{
             CallError, CatalogApi, CatalogCmd, CatalogSnapshot, Ctx, DaemonEndpoints, EntryState,
@@ -143,6 +143,9 @@ struct Faults {
     /// The next N want replies report offset 0 whatever is durable (a
     /// stale offset: another transfer advanced the spool meanwhile; WP3.INT).
     stale_want_offsets: usize,
+    /// Reads of objects wait while this is set (a source verifying a large
+    /// object on its first serve, a slow disk; WP3.INT re-review).
+    stall_reads: bool,
 }
 
 enum Held {
@@ -174,7 +177,10 @@ impl Held {
 
 /// A wanted object's spool.
 struct Spool {
+    /// 0 with `size_unknown`: not known (an event without a size descriptor);
+    /// the first write's total defines it.
     size: u64,
+    size_unknown: bool,
     durable: u64,
     data: Vec<u8>,
     file: Option<(PathBuf, fs::File)>,
@@ -341,11 +347,26 @@ impl FakeWorker {
             hash.into(),
             Arc::new(Mutex::new(Spool {
                 size,
+                size_unknown: false,
                 durable: 0,
                 data: Vec::new(),
                 file,
             })),
         );
+    }
+
+    /// Wants `hash` without knowing its size (its event carries no size
+    /// descriptor): wanted with size 0 until a write's total defines it.
+    fn want_unsized(&self, hash: &str) {
+        self.want(hash, 0);
+        let spool = self.state.lock().unwrap().wanted[hash].clone();
+        spool.lock().unwrap().size_unknown = true;
+    }
+
+    /// Stops wanting `hash` (its event was quarantined): writes of it are
+    /// `Unsolicited` from now on.
+    fn unwant(&self, hash: &str) {
+        self.state.lock().unwrap().wanted.remove(hash);
     }
 
     fn has(&self, hash: &str) -> bool {
@@ -486,6 +507,9 @@ impl FakeWorker {
     fn op_read(&self, header: Value) -> Result<(Value, Vec<u8>), ErrorWire> {
         let header: ReadHeader = parse(header)?;
         self.route_check(&header.route)?;
+        while self.faults().stall_reads && !self.stopped.load(Ordering::Relaxed) {
+            sleep_ms(10);
+        }
         let held = {
             let state = self.state.lock().unwrap();
             match state.held.get(&header.hash) {
@@ -600,6 +624,12 @@ impl FakeWorker {
             spool
         };
         let mut spool = spool.lock().unwrap();
+        if spool.size_unknown {
+            // Any total completes an object of unknown size (the whole-object
+            // hash decides), as the real worker's write does.
+            spool.size = item.total;
+            spool.size_unknown = false;
+        }
         if item.total != spool.size {
             return result(ObjectOutcome::SizeMismatch, spool.durable);
         }
@@ -2262,13 +2292,24 @@ fn a_source_that_cannot_serve_hands_its_push_lease_on() {
         "A1 was never offered Y: lease {:?}",
         b.worker.lease_of(&hash)
     );
-    // A1 tried and could not read it.
+    // A1 tried and could not read it: its push went through without Y.
+    // Not serving an object is no error of A1's (WP3.INT re-review: a
+    // peer's wants may name any hash; this sync point was A1's
+    // `NOT_AVAILABLE` ObjectError).
     assert!(
         wait_until(Duration::from_secs(10), || a1
             .world
+            .finished()
+            .iter()
+            .any(|f| f.op == "objects.push" && f.ok)),
+        "{:?}",
+        a1.world.finished()
+    );
+    assert!(
+        !a1.world
             .object_errors()
             .iter()
-            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+            .any(|(object, _)| *object == hash),
         "{:?}",
         a1.world.object_errors()
     );
@@ -2718,14 +2759,16 @@ fn a_holder_that_goes_away_hands_the_pushed_object_on() {
     let (options, _) = a1.options();
     let lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
     let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
+    // A1 pushed without Y (it cannot read it; no error of A1's, WP3.INT
+    // re-review: this sync point was A1's `NOT_AVAILABLE` ObjectError).
     assert!(
         wait_until(Duration::from_secs(10), || a1
             .world
-            .object_errors()
+            .finished()
             .iter()
-            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+            .any(|f| f.op == "objects.push" && f.ok)),
         "{:?}",
-        a1.world.object_errors()
+        a1.world.finished()
     );
     // C takes Y over, and its session resets mid-push.
     let proxy = FaultProxy::start(&b.endpoint);
@@ -3186,6 +3229,599 @@ fn a_peer_reply_counts_only_for_the_objects_it_was_asked_for() {
     // its end, the others were never pushed.
     assert!(a.worker.reports().is_empty(), "{:?}", a.worker.reports());
     server.join().unwrap().close();
+}
+
+// ---------------------------------------------------------------------------
+// WP3.INT post-integration re-review
+
+/// The reply of a raw `objects.push` (header or body).
+fn push_result(reply: session::Reply) -> ObjectsResult {
+    if reply.body.is_empty() {
+        serde_json::from_value(reply.header).unwrap()
+    } else {
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+}
+
+/// A push may list any hash (WP3.3 re-review major): one the acceptor never
+/// offered this dialer (its worker does not want it: `UNSOLICITED_OBJECT`)
+/// is answered in the push's result alone, with neither an `ObjectError`
+/// nor a per-object backoff at the acceptor, so a peer cannot push the
+/// acceptor's genuine object errors out of its status with hashes of its
+/// choosing.
+#[test]
+fn a_push_of_objects_never_offered_records_no_errors() {
+    let (a, b) = pair(100);
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    for round in 0..4u64 {
+        let hashes: Vec<String> = (0..64)
+            .map(|index| sha(format!("never wanted {round} {index}").as_bytes()))
+            .collect();
+        let request = ObjectsPush {
+            repo: REPO.into(),
+            sender: REPLICA_A.into(),
+            receiver: REPLICA_B.into(),
+            lane: LANE,
+            items: hashes
+                .iter()
+                .map(|hash| WantItem {
+                    hash: hash.clone(),
+                    size: 0,
+                    offset: 0,
+                    priority: WantPriority::History,
+                })
+                .collect(),
+        };
+        let mut upload = conn
+            .upload(
+                "objects.push",
+                serde_json::to_value(&request).unwrap(),
+                Priority::Control,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+        for hash in &hashes {
+            let header = ChunkHeader {
+                id: 0,
+                hash: Some(hash.clone()),
+                offset: 0,
+                total: 0,
+                last: true,
+            };
+            upload.chunk(header, &[]).unwrap();
+        }
+        let result = push_result(upload.finish().unwrap());
+        assert_eq!(result.results.len(), hashes.len());
+        assert!(
+            result
+                .results
+                .iter()
+                .all(|result| result.outcome == ObjectOutcome::Unsolicited),
+            "{:?}",
+            result.results.first()
+        );
+    }
+    sleep_ms(200);
+    let errors = b.world.object_errors();
+    assert!(
+        errors.is_empty(),
+        "{} ObjectErrors for objects never offered, e.g. {:?}",
+        errors.len(),
+        errors.first()
+    );
+    conn.close();
+}
+
+/// The same on the dialer (WP3.3 re-review major): an acceptor's
+/// `objects.wants` may name any hash; one our worker refuses to read (it
+/// is not available here, or not ours to serve) is not sent, with neither an
+/// `ObjectError` nor a backoff of ours (the acceptor backs off what it
+/// offered and we did not send).
+#[test]
+fn wants_for_objects_we_cannot_serve_record_no_errors() {
+    struct WantingPeer {
+        wanted: Vec<WantItem>,
+        pushes: AtomicUsize,
+    }
+    impl Handler for WantingPeer {
+        fn handle(&self, req: Incoming) {
+            match req.op.as_str() {
+                "objects.wants" => req.responder.reply(
+                    serde_json::to_value(ObjectsWantsReply {
+                        items: self.wanted.clone(),
+                    })
+                    .unwrap(),
+                    Vec::new(),
+                ),
+                "objects.push" => {
+                    self.pushes.fetch_add(1, Ordering::SeqCst);
+                    let request: ObjectsPush = serde_json::from_value(req.header).unwrap();
+                    for _ in req.chunks.into_iter().flatten() {}
+                    let results = request
+                        .items
+                        .iter()
+                        .map(|item| ObjectResult {
+                            hash: item.hash.clone(),
+                            outcome: ObjectOutcome::Skipped,
+                            bytes: 0,
+                        })
+                        .collect();
+                    req.responder.reply(
+                        serde_json::to_value(ObjectsResult { results }).unwrap(),
+                        Vec::new(),
+                    );
+                }
+                "objects.pull" => req.responder.reply(
+                    serde_json::to_value(ObjectsResult { results: vec![] }).unwrap(),
+                    Vec::new(),
+                ),
+                op => req.responder.error(ErrorWire::coded(
+                    "UNSUPPORTED_OPERATION",
+                    format!("{op}: not scripted"),
+                )),
+            }
+        }
+    }
+    let worker = FakeWorker::start(REPLICA_A);
+    let private = sha(b"a private object of ours");
+    worker.state.lock().unwrap().private.insert(private.clone());
+    let mut wanted: Vec<WantItem> = (0..32)
+        .map(|index| WantItem {
+            hash: sha(format!("not held here {index}").as_bytes()),
+            size: 1000,
+            offset: 0,
+            priority: WantPriority::History,
+        })
+        .collect();
+    wanted.push(WantItem {
+        hash: private,
+        size: 64,
+        offset: 0,
+        priority: WantPriority::History,
+    });
+    let peer = Arc::new(WantingPeer {
+        wanted,
+        pushes: AtomicUsize::new(0),
+    });
+    let (remote, code, endpoint, server) = scripted_peer(peer.clone());
+    let a = Dialer::start(worker, &remote, &endpoint, 100);
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&endpoint, &code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || peer
+            .pushes
+            .load(Ordering::SeqCst)
+            >= 2),
+        "{:?}",
+        a.world.finished()
+    );
+    drop(lane);
+    let errors = a.world.object_errors();
+    assert!(
+        errors.is_empty(),
+        "{} ObjectErrors: {errors:?}",
+        errors.len()
+    );
+    server.join().unwrap().close();
+}
+
+/// §14 WP3.3, with two repositories (WP3.3 re-review major): pushes leave a
+/// peer slot to pulls and reports. Both repositories push to a peer whose
+/// workers stall every write (the peer keeps each push alive with PROGRESS
+/// until its 60 s write deadline); pulls on the same lane still complete.
+#[test]
+fn stalled_pushes_of_two_repositories_leave_a_slot_to_pulls() {
+    let (code, verifier) = Verifier::generate();
+    let b_world = World::new(&format!("b-{}", uuid()), Some(verifier));
+    let a_world = World::new(&format!("a-{}", uuid()), None);
+    let mut workers = Vec::new();
+    let mut entries = Vec::new();
+    for index in 0..2u64 {
+        let repo = format!("repo-{index}");
+        let (replica_a, replica_b) = (format!("replica-a-{index}"), format!("replica-b-{index}"));
+        let worker_a = FakeWorker::start(&replica_a);
+        let worker_b = FakeWorker::start(&replica_b);
+        a_world.folder_of(&format!("state-a-{index}"), &repo, &replica_a, &worker_a);
+        b_world.folder_of(&format!("state-b-{index}"), &repo, &replica_b, &worker_b);
+        // A holds a 4 MiB object B wants; B's worker stalls its writes.
+        let up = worker_a.hold(content(5000 + index, 4 * MIB as usize));
+        worker_b.want(&up, 4 * MIB);
+        worker_b.faults().stall_writes = true;
+        entries.push(entry_of(&repo, &replica_b));
+        workers.push((worker_a, worker_b));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = inbound::start_with(ctx(&b_world, 1000), listener, InboundOptions::default());
+    let a_ctx = ctx(&a_world, 100);
+    let peer = Arc::new(PeerContext {
+        installation: b_world.installation.clone(),
+        endpoint: endpoint.clone(),
+        local_installation: a_ctx.installation.clone(),
+        pool: 2,
+        catalog: Snapshot::new(RemoteCatalog {
+            generation: 1,
+            at_ms: 0,
+            entries,
+        }),
+    });
+    let dialer = Dialer {
+        world: a_world.clone(),
+        worker: workers[0].0.clone(),
+        ctx: a_ctx,
+        peer,
+    };
+    let (options, stats) = dialer.options();
+    let lane = dialer.run(dialer.dial(&endpoint, &code, LANE), options);
+    assert!(wait_until(Duration::from_secs(10), || a_world
+        .events()
+        .iter()
+        .any(
+            |event| matches!(event, StatusEvent::ExchangeStarted { op, .. } if op == "objects.push")
+        )));
+    // (Time for a second push to take the other slot, as it did.)
+    sleep_ms(500);
+    let (worker_a, worker_b) = &workers[0];
+    let mut down = Vec::new();
+    for index in 0..6 {
+        let hash = worker_b.hold(content(5100 + index, 1536 * 1024));
+        worker_a.want(&hash, 1536 * 1024);
+        down.push(hash);
+    }
+    a_world.bump_sync("state-a-0");
+    let pulled = wait_until(Duration::from_secs(20), || {
+        down.iter().all(|hash| worker_a.has(hash))
+    });
+    let peak = LaneStats::get(&stats.peer_calls_peak);
+    for (_, worker_b) in &workers {
+        worker_b.faults().stall_writes = false;
+    }
+    assert!(
+        pulled,
+        "the pulls waited behind two stalled pushes (pulls {}, peer calls peak {peak})",
+        LaneStats::get(&stats.pulls)
+    );
+    assert!(peak <= objects::PEER_CALLS as u64);
+    drop(lane);
+    server.shutdown(Duration::from_secs(5));
+    for (a, b) in workers {
+        a.shutdown();
+        b.shutdown();
+    }
+}
+
+/// An object that settles in a round's sink (here a resume point: the
+/// worker's durable offset is ahead of the want's) is no longer pulled in
+/// that round (WP3.3 re-review minor): the rest of it would be read at the
+/// source, sent and dropped. It resumes from the durable offset.
+#[test]
+fn a_settled_object_is_not_pulled_again_in_its_round() {
+    let (a, b) = pair(100);
+    let size = 48 * MIB;
+    let data = content(5200, size as usize);
+    let hash = b.worker.hold(data.clone());
+    a.worker.want(&hash, size);
+    a.worker.advance_spool(&hash, &data[..MIB as usize]);
+    a.worker.faults().stale_want_offsets = 1;
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(60), || a.worker.has(&hash)),
+        "not installed"
+    );
+    drop(lane);
+    assert_eq!(a.worker.held_bytes(&hash).unwrap(), data);
+    let read = b.worker.bytes_read.load(Ordering::Relaxed);
+    assert!(
+        read <= size + 24 * MIB,
+        "the source read {} MiB for a {} MiB object",
+        read / MIB,
+        size / MIB
+    );
+}
+
+/// Invariant 22 at the dialer (WP3.3 re-review minor): a pull stream's
+/// empty chunk is accepted only as the one chunk of an empty span (a
+/// zero-size object). Empty chunks carry no bytes but reset the call's idle
+/// deadline, so a peer streaming them could hold the pull, its slot and the
+/// lane's window forever; the first one ends the pull `PROTOCOL_VIOLATION`.
+#[test]
+fn empty_chunks_cannot_hold_a_pull() {
+    struct DrippingPeer {
+        hash: String,
+        data: Vec<u8>,
+    }
+    impl Handler for DrippingPeer {
+        fn handle(&self, req: Incoming) {
+            match req.op.as_str() {
+                "objects.pull" => {
+                    let size = self.data.len() as u64;
+                    let chunk = |offset: u64, last: bool| ChunkHeader {
+                        id: 0,
+                        hash: Some(self.hash.clone()),
+                        offset,
+                        total: size,
+                        last,
+                    };
+                    for _ in 0..30 {
+                        if req.responder.cancelled()
+                            || req.responder.chunk(chunk(0, false), &[]).is_err()
+                        {
+                            return;
+                        }
+                        sleep_ms(200);
+                    }
+                    if req.responder.chunk(chunk(0, true), &self.data).is_err() {
+                        return;
+                    }
+                    let result = ObjectsResult {
+                        results: vec![ObjectResult {
+                            hash: self.hash.clone(),
+                            bytes: size,
+                            outcome: ObjectOutcome::Completed,
+                        }],
+                    };
+                    req.responder
+                        .reply(serde_json::to_value(result).unwrap(), Vec::new());
+                }
+                "objects.wants" => req.responder.reply(
+                    serde_json::to_value(ObjectsWantsReply { items: vec![] }).unwrap(),
+                    Vec::new(),
+                ),
+                op => req.responder.error(ErrorWire::coded(
+                    "UNSUPPORTED_OPERATION",
+                    format!("{op}: not scripted"),
+                )),
+            }
+        }
+    }
+    let data = content(5300, 100_000);
+    let hash = sha(&data);
+    let (remote, code, endpoint, server) = scripted_peer(Arc::new(DrippingPeer {
+        hash: hash.clone(),
+        data,
+    }));
+    let a = Dialer::start(FakeWorker::start(REPLICA_A), &remote, &endpoint, 100);
+    a.worker.want(&hash, 100_000);
+    let (mut options, _) = a.options();
+    options.idle = Duration::from_secs(2);
+    let lane = a.run(a.dial(&endpoint, &code, LANE), options);
+    let ended = || {
+        a.world
+            .finished()
+            .into_iter()
+            .find(|f| f.op == "objects.pull")
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || ended().is_some()),
+        "no pull ended"
+    );
+    drop(lane);
+    let first = ended().unwrap();
+    assert!(
+        !first.ok
+            && first
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "PROTOCOL_VIOLATION"),
+        "{first:?}"
+    );
+    assert!(first.duration_ms < 2000, "{first:?}");
+    assert!(!a.worker.has(&hash));
+    server.join().unwrap().close();
+}
+
+/// §2.3 (v3 network re-review major): one repository whose source stalls
+/// (here every read of its worker waits, as a first-serve verify of a large
+/// object does) never stops another repository's downloads on the same
+/// lane: a pull reserves at most its key's share of the lane window.
+#[test]
+fn a_stalled_source_leaves_the_window_to_other_repositories() {
+    let (code, verifier) = Verifier::generate();
+    let b_world = World::new(&format!("b-{}", uuid()), Some(verifier));
+    let a_world = World::new(&format!("a-{}", uuid()), None);
+    let mut workers = Vec::new();
+    let mut entries = Vec::new();
+    for index in 0..2u64 {
+        let repo = format!("repo-{index}");
+        let (replica_a, replica_b) = (format!("replica-a-{index}"), format!("replica-b-{index}"));
+        let worker_a = FakeWorker::start(&replica_a);
+        let worker_b = FakeWorker::start(&replica_b);
+        a_world.folder_of(&format!("state-a-{index}"), &repo, &replica_a, &worker_a);
+        b_world.folder_of(&format!("state-b-{index}"), &repo, &replica_b, &worker_b);
+        entries.push(entry_of(&repo, &replica_b));
+        workers.push((worker_a, worker_b));
+    }
+    // Repository 0: a 24 MiB object whose source stalls every read.
+    let (x_a, x_b) = (workers[0].0.clone(), workers[0].1.clone());
+    let large = x_b.hold(content(5400, 24 * MIB as usize));
+    x_a.want(&large, 24 * MIB);
+    x_b.faults().stall_reads = true;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = inbound::start_with(ctx(&b_world, 1000), listener, InboundOptions::default());
+    let a_ctx = ctx(&a_world, 100);
+    let peer = Arc::new(PeerContext {
+        installation: b_world.installation.clone(),
+        endpoint: endpoint.clone(),
+        local_installation: a_ctx.installation.clone(),
+        pool: 2,
+        catalog: Snapshot::new(RemoteCatalog {
+            generation: 1,
+            at_ms: 0,
+            entries,
+        }),
+    });
+    let dialer = Dialer {
+        world: a_world.clone(),
+        worker: x_a.clone(),
+        ctx: a_ctx,
+        peer,
+    };
+    let (options, stats) = dialer.options();
+    let lane = dialer.run(dialer.dial(&endpoint, &code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            a_world.events().iter().any(|event| matches!(
+            event,
+            StatusEvent::ExchangeStarted { op, repo, .. } if op == "objects.pull" && repo == "repo-0"
+        ))
+        }),
+        "repository 0 never pulled"
+    );
+    sleep_ms(300);
+    // Repository 1 wants three small objects from a healthy source.
+    let (y_a, y_b) = (workers[1].0.clone(), workers[1].1.clone());
+    let small: Vec<String> = (0..3)
+        .map(|index| {
+            let hash = y_b.hold(content(5500 + index, 256 * 1024));
+            y_a.want(&hash, 256 * 1024);
+            hash
+        })
+        .collect();
+    let began = Instant::now();
+    a_world.bump_sync("state-a-1");
+    let arrived = wait_until(Duration::from_secs(10), || {
+        small.iter().all(|hash| y_a.has(hash))
+    });
+    let took = began.elapsed();
+    let window_peak = LaneStats::get(&stats.window_peak);
+    x_b.faults().stall_reads = false;
+    assert!(
+        arrived && took < Duration::from_secs(5),
+        "repository 1 waited {took:?} behind repository 0's stalled pull (window peak {window_peak})"
+    );
+    assert!(window_peak <= 16 * MIB);
+    drop(lane);
+    server.shutdown(Duration::from_secs(5));
+    for (a, b) in workers {
+        a.shutdown();
+        b.shutdown();
+    }
+}
+
+/// An object whose size nothing records (a legacy event without a size
+/// descriptor; the worker wants it with size 0) moves both ways (objects
+/// re-review major): its sender's one empty chunk (a pull) or our worker's
+/// read (a push) gives its size, and the receiving worker accepts any total
+/// when it knows none.
+#[test]
+fn objects_of_unknown_size_travel_both_ways() {
+    for up in [false, true] {
+        let (a, b) = pair(100);
+        let (holder, wanter) = if up {
+            (&a.worker, &b.worker)
+        } else {
+            (&b.worker, &a.worker)
+        };
+        let data = content(5600, 300_000);
+        let hash = holder.hold(data.clone());
+        wanter.want_unsized(&hash);
+        let (options, _) = a.options();
+        let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+        assert!(
+            wait_until(Duration::from_secs(20), || wanter.has(&hash)),
+            "up: {up}: not installed; errors {:?} {:?}",
+            a.world.object_errors(),
+            b.world.object_errors()
+        );
+        drop(lane);
+        assert_eq!(wanter.held_bytes(&hash).unwrap(), data);
+        assert!(
+            a.world.object_errors().is_empty(),
+            "{:?}",
+            a.world.object_errors()
+        );
+        assert!(
+            b.world.object_errors().is_empty(),
+            "{:?}",
+            b.world.object_errors()
+        );
+    }
+}
+
+/// A source that could not serve an object is asked again as soon as its
+/// published content grows (v3 network re-review major, a relay): not after
+/// its per-object backoff (30 s, doubling up to 1 h).
+#[test]
+fn a_source_whose_content_grows_is_asked_again_at_once() {
+    let (a, b) = pair(100);
+    let data = content(5700, 200_000);
+    let hash = sha(&data);
+    a.worker.want(&hash, 200_000);
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+    // B lacks it: A's pull fails and backs the object off for B.
+    assert!(
+        wait_until(Duration::from_secs(10), || a
+            .world
+            .object_errors()
+            .iter()
+            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+        "{:?}",
+        a.world.object_errors()
+    );
+    sleep_ms(300);
+    // B gets it (a relay that received it), and its catalog entry says so.
+    b.worker.hold(data.clone());
+    let began = Instant::now();
+    a.peer.catalog.update(|catalog| {
+        let mut next = catalog.clone();
+        next.generation += 1;
+        for entry in &mut next.entries {
+            entry.content = Some(ContentCounters {
+                shared_objects: 1,
+                shared_available: 1,
+                ..ContentCounters::default()
+            });
+        }
+        next
+    });
+    assert!(
+        wait_until(Duration::from_secs(10), || a.worker.has(&hash)),
+        "the object waited for its backoff after B got it"
+    );
+    assert!(began.elapsed() < Duration::from_secs(10));
+    drop(lane);
+    assert_eq!(a.worker.held_bytes(&hash).unwrap(), data);
+}
+
+/// An object our worker stops wanting while it moves (its staged event was
+/// quarantined: the write answers `Unsolicited`) settles without an
+/// `ObjectError` or a backoff (objects re-review minor): it is nobody's
+/// failure.
+#[test]
+fn an_object_no_longer_wanted_settles_without_an_error() {
+    let (a, b) = pair(100);
+    let hash = b.worker.hold(content(5800, 2 * MIB as usize));
+    a.worker.want(&hash, 2 * MIB);
+    a.worker.faults().stall_writes = true;
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(10), || b
+            .worker
+            .reads()
+            .iter()
+            .any(|(read, _, _)| *read == hash)),
+        "never pulled"
+    );
+    a.worker.unwant(&hash);
+    a.worker.faults().stall_writes = false;
+    assert!(
+        wait_until(Duration::from_secs(10), || a
+            .worker
+            .write_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, written, _, _)| *written == hash)),
+        "never written"
+    );
+    sleep_ms(1000);
+    drop(lane);
+    let errors = a.world.object_errors();
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 // ---------------------------------------------------------------------------
