@@ -340,6 +340,7 @@ pub(crate) struct StoreCaches {
     pub(crate) commit: commit::Cache,
     pub(crate) derive: derive::Cache,
     pub(crate) sharing: sharing::Cache,
+    pub(crate) status: status::Cache,
 }
 impl Store {
     /// Initialize an operation-owned new store with identities chosen by its caller.

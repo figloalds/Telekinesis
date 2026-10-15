@@ -1664,6 +1664,402 @@ fn a_panic_while_idle_is_contained() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Post-integration re-review (WP2.INT)
+
+/// A worker state B whose author A edited `shared.txt` while B edited it too
+/// (a two-way edit: A's event needs the slow path on B), after `history`
+/// shared events; plus `side` events of a third replica C on another shared
+/// branch (`side`, forked by C, then `side` directories): nothing local to B
+/// touches that branch, so they activate whatever B's own branch does.
+struct TwoWay {
+    _dir: tempfile::TempDir,
+    state: PathBuf,
+    edit: tkfs::core::Bundle,
+    side: Vec<Event>,
+    allowed: BTreeSet<String>,
+}
+
+fn two_way_edit(history: usize, side: usize) -> TwoWay {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let state = dir.path().join("b");
+    let mut b = Store::initialize(&state, &repo, &id()).unwrap();
+    let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
+    let mut c = Store::open(&dir.path().join("c"), Some(&repo)).unwrap();
+    a.create("shared.txt", "file").unwrap();
+    linear_history_named(&mut a, "history", history).unwrap();
+    let allowed = devices([&a, &b, &c]);
+    sync_into(&a, &mut b, &allowed).unwrap();
+    let write = |s: &mut Store, bytes: &[u8]| {
+        let entry = s.lookup("shared.txt").unwrap();
+        s.write_revision(&entry.id, entry.revisions.get("content").cloned(), bytes)
+            .unwrap();
+    };
+    write(&mut b, b"from b");
+    sync_into(&b, &mut c, &allowed).unwrap();
+    write(&mut a, b"from a");
+    if side > 0 {
+        let branch = c.fork("side", true).unwrap();
+        c.checkout(&branch.id).unwrap();
+        for i in 0..side {
+            c.create(&format!("side-{i}"), "directory").unwrap();
+        }
+    }
+    let edit = missing_bundle(&a, &b).unwrap();
+    assert_eq!(edit.events.len(), 1);
+    let side = metadata_bundle(&c, &b).unwrap().events;
+    drop(b);
+    TwoWay {
+        _dir: dir,
+        state,
+        edit,
+        side,
+        allowed,
+    }
+}
+
+impl Worker {
+    /// Whether event `id` is committed (secondary connection).
+    fn has_committed(&self, event: &str) -> bool {
+        self.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE id=?)",
+                [event],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+    /// Puts the objects of `bundle` into the store (as a bulk lane would).
+    fn put_objects(&self, bundle: &tkfs::core::Bundle) {
+        let store = self.ctx.sync_stores.checkout().unwrap();
+        for bytes in bundle.objects.values() {
+            store.put_object(&hex::decode(bytes).unwrap()).unwrap();
+        }
+    }
+}
+
+/// The slow path's prepared commit (and the re-queues around it) never wait
+/// for another connection's writer under the engine lock, as a slice never
+/// does: a connection holds SQLite's writer 600 ms at a time (20 ms apart)
+/// while a slow event is prepared and committed, and the filesystem's engine
+/// waits stay short. Before the fix the commit polled for the writer under
+/// the lock: one engine wait of most of a hold (the review measured 295–301
+/// ms with 300 ms holds).
+#[test]
+fn a_slow_commit_never_waits_for_another_writer_under_the_engine_lock() {
+    let t = two_way_edit(40, 0);
+    let w = Worker::start(&t.state, false);
+    w.put_objects(&t.edit);
+    w.stage(&t.edit.events, &t.allowed);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (ctx, stop) = (w.ctx.clone(), stop.clone());
+        thread::spawn(move || {
+            let store = ctx.sync_stores.checkout().unwrap();
+            store.db.busy_timeout(Duration::from_secs(10)).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                store.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+                thread::sleep(Duration::from_millis(600));
+                store.db.execute_batch("COMMIT").unwrap();
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(50));
+    worker::activator::try_spawn(w.ctx.clone()).unwrap();
+    let edit = t.edit.events[0].id.clone();
+    let started = Instant::now();
+    let mut longest = Duration::ZERO;
+    while !w.has_committed(&edit) && started.elapsed() < Duration::from_secs(60) {
+        let asked = Instant::now();
+        drop(lock_engine(&w.engine));
+        longest = longest.max(asked.elapsed());
+        thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+    assert!(w.has_committed(&edit), "the slow event never committed");
+    let status = w.status();
+    assert!(
+        status["activation"]["slow"].as_u64().unwrap() >= 1,
+        "{status}"
+    );
+    assert!(
+        longest < Duration::from_millis(250),
+        "the engine was held {longest:?} while another connection held the writer"
+    );
+}
+
+/// A slow event that keeps going `Stale` behind a local writer that commits
+/// more often than a preparation takes is committed inline after
+/// `STALE_ESCALATE` stale rounds (CCR-WP2.INT-1), and its starvation is
+/// reported for as long as it lasts: unrelated activations (C's events on
+/// another branch) do not clear `starved_since_ms`. Before the fix the event
+/// never committed while the writer ran, and any activation reset the
+/// starvation report.
+#[test]
+fn a_starving_slow_event_is_committed_inline_and_reported_until_then() {
+    let t = two_way_edit(200, 20);
+    let w = Worker::start(&t.state, false);
+    w.put_objects(&t.edit);
+    w.stage(&t.edit.events, &t.allowed);
+    let stop = Arc::new(AtomicBool::new(false));
+    // A local writer: a save through the engine every few milliseconds.
+    let writer = {
+        let (engine, stop) = (w.engine.clone(), stop.clone());
+        thread::spawn(move || {
+            let mut n = 0u64;
+            while !stop.load(Ordering::SeqCst) {
+                {
+                    let mut e = lock_engine(&engine);
+                    let create = (n == 0).then_some("file");
+                    let (h, _) = e.open("local.txt", create, true).unwrap();
+                    e.write(h, 0, format!("save {n}").as_bytes(), false, false)
+                        .unwrap();
+                    e.close(h).unwrap();
+                }
+                n += 1;
+                thread::sleep(Duration::from_millis(3));
+            }
+            n
+        })
+    };
+    worker::activator::try_spawn(w.ctx.clone()).unwrap();
+    let edit = t.edit.events[0].id.clone();
+    let starved =
+        || -> Option<u64> { w.ctx.status_cell.load()["activation"]["starved_since_ms"].as_u64() };
+    // The first Stale round: the starvation is reported.
+    assert!(
+        wait_until(Duration::from_secs(30), || starved().is_some()),
+        "no starvation reported: {}",
+        w.status()
+    );
+    let since = starved().unwrap();
+    // Unrelated events activate meanwhile; the report stays.
+    w.stage(&t.side, &t.allowed);
+    let mut samples = vec![];
+    let mut seen_unrelated = false;
+    let started = Instant::now();
+    while !w.has_committed(&edit) && started.elapsed() < Duration::from_secs(60) {
+        let side = t.side.iter().all(|e| w.has_committed(&e.id));
+        let report = starved();
+        if side && !w.has_committed(&edit) {
+            seen_unrelated = true;
+            samples.push(report);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let committed = w.has_committed(&edit);
+    stop.store(true, Ordering::SeqCst);
+    let saves = writer.join().unwrap();
+    assert!(
+        committed,
+        "the slow event never committed behind {saves} local saves: {}",
+        w.status()
+    );
+    assert!(
+        seen_unrelated,
+        "the unrelated events did not activate while the event starved"
+    );
+    let cleared: Vec<_> = samples
+        .iter()
+        .filter(|s| **s != Some(since))
+        .collect::<Vec<_>>();
+    assert!(
+        cleared.len() <= 1,
+        "the starvation report changed while the event starved: {cleared:?}"
+    );
+    let status = w.status();
+    assert!(
+        status["activation"]["stale"].as_u64().unwrap()
+            >= u64::from(worker::activator::STALE_ESCALATE),
+        "{status}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || starved().is_none()),
+        "the starvation report outlived the event: {}",
+        w.status()
+    );
+}
+
+/// The status totals a refresh reads (journal counters, per-peer inventory
+/// match) are cached per connection until the database changes: an idle
+/// store's maintenance refresh no longer scans the journal and `peer_known`
+/// at every tick. A WAL checkpoint is no change; another connection's commit
+/// is.
+#[test]
+fn status_totals_are_cached_until_the_database_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let state = dir.path().join("state");
+    let mut s = Store::initialize(&state, &repo, &id()).unwrap();
+    linear_history(&mut s, 50).unwrap();
+    let device = s.device.clone();
+    let reader = Store::open_secondary(&state, &repo, &device).unwrap();
+    let journal = reader.journal_counters().unwrap();
+    let inventory = reader.inventory_match().unwrap();
+    let computed = reader.status_computations();
+    assert_eq!(computed, 2);
+    let other = Store::open_secondary(&state, &repo, &device).unwrap();
+    let _ = other
+        .db
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()));
+    for _ in 0..5 {
+        assert_eq!(reader.journal_counters().unwrap(), journal);
+        assert_eq!(reader.inventory_match().unwrap(), inventory);
+    }
+    assert_eq!(
+        reader.status_computations(),
+        computed,
+        "recomputed while idle"
+    );
+    s.create("one-more", "directory").unwrap();
+    assert_eq!(
+        reader.journal_counters().unwrap().events,
+        journal.events + 1
+    );
+    assert_eq!(reader.status_computations(), computed + 1);
+}
+
+/// The per-peer inventory match is recomputed only when the feed tip moves
+/// (shared events): a private commit (a fork) moves the journal tip, not the
+/// cell's feed `tip`. Before the fix the cell compared the feed tip with the
+/// journal tip it recorded, so once the newest event was private every
+/// `status` recomputed the match.
+#[test]
+fn a_private_journal_tip_does_not_recompute_the_inventory_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = id();
+    let (da, db) = (id(), id());
+    let mut a = Engine::new(Store::initialize(&temp.path().join("a"), &repo, &da).unwrap());
+    let b_state = temp.path().join("b");
+    drop(Store::initialize(&b_state, &repo, &db).unwrap());
+    let ga = tkfs::paired_sync::SyncRoute {
+        peer: id(),
+        repo: repo.clone(),
+        local_replica: da.clone(),
+        remote_replica: db.clone(),
+    };
+    let gb = tkfs::paired_sync::SyncRoute {
+        peer: id(),
+        repo: repo.clone(),
+        local_replica: db.clone(),
+        remote_replica: da.clone(),
+    };
+    // No maintenance thread: only `status` calls refresh the cell.
+    let engine: Shared = Arc::new(Mutex::new(Engine::new(
+        Store::open_existing(&b_state).unwrap(),
+    )));
+    let ctx = worker::build_ctx(engine, &b_state, false, None);
+    let server = runtime::server::start_rpc_server(ctx.clone()).unwrap();
+    let info = server.publish(None).unwrap();
+    let call = |payload: Value| runtime::rpc(&info, &id(), payload).unwrap();
+    let file = a.store.create("one.txt", "file").unwrap();
+    a.store
+        .write_revision(&file.id, file.revisions.get("content").cloned(), b"one")
+        .unwrap();
+    let roundtrip = |a: &mut Engine| {
+        let page: tkfs::paired_sync::SyncPage = serde_json::from_value(
+            tkfs::paired_sync::worker_control(
+                a,
+                &json!({"op":"published-offer","route":ga,"metadata_only":true}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let sent: BTreeSet<_> = page.bundle.events.iter().map(|e| e.id.clone()).collect();
+        let response =
+            call(json!({"op":"published-exchange","route":gb,"page":page,"metadata_only":true}));
+        tkfs::paired_sync::worker_control(
+            a,
+            &json!({"op":"published-apply","route":ga,"page":response,"request":page.request,"sent":sent,"metadata_only":true}),
+        )
+        .unwrap();
+        let page: tkfs::paired_sync::SyncPage = serde_json::from_value(call(
+            json!({"op":"published-offer","route":gb,"metadata_only":true}),
+        ))
+        .unwrap();
+        let sent: BTreeSet<_> = page.bundle.events.iter().map(|e| e.id.clone()).collect();
+        let response = tkfs::paired_sync::worker_control(
+            a,
+            &json!({"op":"published-exchange","route":ga,"page":page,"metadata_only":true}),
+        )
+        .unwrap();
+        call(
+            json!({"op":"published-apply","route":gb,"page":response,"request":page.request,"sent":sent,"metadata_only":true}),
+        )
+    };
+    roundtrip(&mut a);
+    roundtrip(&mut a);
+    // A private commit on B: its journal tip moves, its feed tip does not.
+    call(json!({"op":"branch","name":"private"}));
+    roundtrip(&mut a);
+    assert!(
+        wait_until(
+            Duration::from_secs(10),
+            || call(json!({"op":"status"}))["caught_up"] == true
+        ),
+        "{}",
+        call(json!({"op":"status"}))
+    );
+    let status = call(json!({"op":"status"}));
+    assert!(
+        status["journal"]["tip"].as_i64() > status["tip"]["seq"].as_i64(),
+        "the newest event is private: {status}"
+    );
+    let computed = ctx.status_cell.load()["cell"]["inventory_at_ms"].clone();
+    let mut recomputed = 0;
+    for _ in 0..20 {
+        assert_eq!(call(json!({"op":"status"}))["caught_up"], true);
+        if ctx.status_cell.load()["cell"]["inventory_at_ms"] != computed {
+            recomputed += 1;
+        }
+    }
+    assert_eq!(recomputed, 0, "the inventory match was recomputed");
+    ctx.stopping.store(true, Ordering::SeqCst);
+}
+
+/// The `status` after a client mutation reads its writes (the content
+/// moved) without recomputing the journal counters and the inventory match
+/// (maintenance brings those): a mutation no longer makes the next `status`
+/// pay for them.
+#[test]
+fn status_after_a_mutation_refreshes_the_content_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    drop(Store::initialize(&state, &id(), &id()).unwrap());
+    let engine: Shared = Arc::new(Mutex::new(Engine::new(
+        Store::open_existing(&state).unwrap(),
+    )));
+    let ctx = worker::build_ctx(engine, &state, false, None);
+    let server = runtime::server::start_rpc_server(ctx.clone()).unwrap();
+    let info = server.publish(None).unwrap();
+    let call = |payload: Value| runtime::rpc(&info, &id(), payload).unwrap();
+    let meta = || ctx.status_cell.load()["cell"].clone();
+    call(json!({"op":"status"}));
+    let before = meta();
+    call(json!({"op":"import","path":"one.txt","hex":hex::encode(b"one")}));
+    let after = call(json!({"op":"status"}));
+    assert_eq!(after["content"]["current_objects"], 1, "{after}");
+    assert!(meta()["content_at_ms"].as_u64() >= before["content_at_ms"].as_u64());
+    assert!(
+        meta()["content_generation"].as_u64() > before["content_generation"].as_u64(),
+        "{}",
+        meta()
+    );
+    assert_eq!(
+        meta()["inventory_at_ms"],
+        before["inventory_at_ms"],
+        "the inventory match was recomputed by the read-your-writes refresh"
+    );
+    ctx.stopping.store(true, Ordering::SeqCst);
+}
+
 /// WP2.3 review (minor), fixed by WP2.INT: a panic in a maintenance tick is
 /// contained like the activator's (and the recovery loop's before it): the
 /// thread lives on, and its next ticks still refresh the status cell's

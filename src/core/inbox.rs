@@ -1348,6 +1348,34 @@ impl Store {
         // Opening the transaction changes no data: keep a fresh view fresh.
         let view = self.keep_view();
         let outer = begin_write(&self.db, name)?;
+        self.in_write(name, outer, view, f)
+    }
+    /// `with_write`, except that when its `BEGIN IMMEDIATE` finds SQLite's
+    /// writer held by another connection (`SQLITE_BUSY` after the
+    /// connection's busy handler gave up), `f` does not run and comes back:
+    /// `Ok(Err(f))`. Nothing was read or written then.
+    fn try_with_write<T, F: FnOnce(&mut Self) -> Result<T>>(
+        &mut self,
+        name: &str,
+        f: F,
+    ) -> Result<std::result::Result<T, F>> {
+        self.drop_rolled_back_view();
+        let view = self.keep_view();
+        let outer = match begin_write(&self.db, name) {
+            Ok(outer) => outer,
+            Err(error) if writer_busy(&error) => return Ok(Err(f)),
+            Err(error) => return Err(error),
+        };
+        self.in_write(name, outer, view, f).map(Ok)
+    }
+    /// The body of `with_write` once its transaction is open.
+    fn in_write<T>(
+        &mut self,
+        name: &str,
+        outer: bool,
+        view: Option<i64>,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         self.rekey_view(view);
         let result = f(self);
         // A view that is fresh at the end of the transaction is exactly the
@@ -1532,6 +1560,40 @@ impl Store {
             }
             Prepared::Computed(prepared) => {
                 self.with_write("inbox_prepared", |store| store.commit_computed(*prepared))
+            }
+        }
+    }
+    /// `commit_prepared`, giving the preparation back (`Ok(Err(p))`) when
+    /// the commit's `BEGIN IMMEDIATE` finds SQLite's writer held by another
+    /// connection: nothing was read or written, and the caller retries later
+    /// with the same preparation (the commit re-checks the branch's journal
+    /// sequence then, so a later commit is as correct as an immediate one).
+    /// With a busy handler that gives up at once, the caller never waits for
+    /// another writer under its own lock (the activator: WP2.INT's
+    /// post-integration re-review). Added beside `commit_prepared` (§13
+    /// rule 3).
+    pub fn commit_prepared_unless_busy(
+        &mut self,
+        p: Prepared,
+    ) -> Result<std::result::Result<CommitOutcome, Prepared>> {
+        match p {
+            Prepared::Inline(ticket) => Ok(self
+                .try_with_write("inbox_prepared", |store: &mut Store| {
+                    store.commit_inline(&ticket)
+                })?
+                .map_err(|_| Prepared::Inline(ticket.clone()))),
+            Prepared::Computed(prepared) => {
+                let mut slot = Some(*prepared);
+                let outcome = self.try_with_write("inbox_prepared", |store: &mut Store| {
+                    let prepared = slot.take().expect("a preparation is committed once");
+                    store.commit_computed(prepared)
+                })?;
+                Ok(match outcome {
+                    Ok(outcome) => Ok(outcome),
+                    Err(_) => Err(Prepared::Computed(Box::new(
+                        slot.take().expect("an unrun commit keeps its preparation"),
+                    ))),
+                })
             }
         }
     }
@@ -1800,6 +1862,18 @@ impl Store {
         )?;
         Ok(())
     }
+}
+
+/// Whether `error` is SQLite's `SQLITE_BUSY` (another connection holds the
+/// writer).
+fn writer_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    })
 }
 
 /// `BEGIN IMMEDIATE` (from autocommit) plus `SAVEPOINT name`. Returns whether

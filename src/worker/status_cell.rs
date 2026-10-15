@@ -13,9 +13,12 @@
 //!   every activator slice;
 //! * [`refresh_full`]: everything, including the content scan (the legacy
 //!   `content` member and `content_counters`), the pending causal events, the
-//!   journal counters and the per-peer inventory match. Run by maintenance
-//!   (about 1 Hz) and by a `status` call that finds the content older than a
-//!   client mutation that changed it.
+//!   journal counters and the per-peer inventory match (the last two cached
+//!   per connection until the database changes, `core::status::Cache`). Run
+//!   by maintenance (about 1 Hz) and by the first `status` call. A `status`
+//!   call that finds the content older than a client mutation that changed
+//!   it refreshes the content and cheap members only, one computation for
+//!   concurrent callers (WP2.INT's post-integration re-review).
 //!
 //! Each refresh records the `ctx.status_generation` it read before reading the
 //! store; a merge never replaces newer data with an older computation. A
@@ -39,8 +42,9 @@
 //! `upload_state`). `caught_up` follows the legacy rule except that staged
 //! rows count through `incoming_active` (`pending_active`): quarantined and
 //! blocked rows no longer hold it false forever (CCR-WP1.6-3). Its per-peer
-//! inventory match is recomputed when an exchange was observed or the
-//! journal tip moved since it was computed. It never sets
+//! inventory match is recomputed when an exchange was observed or the feed
+//! tip (shared events only, like the cell's `tip`) moved since it was
+//! computed. It never sets
 //! `busy`; `stale` only when the cell is older than `STATUS_CELL_STALE` and
 //! could not be refreshed.
 use crate::{
@@ -88,9 +92,15 @@ pub struct CellMeta {
     pub full_ms: u64,
     /// When the per-peer inventory match was computed.
     pub inventory_at_ms: u64,
-    /// The journal tip the per-peer inventory match was computed at (read
-    /// before it): a new committed event can change the match.
+    /// The feed tip (shared events only, like the cell's `tip`) the per-peer
+    /// inventory match was computed at (read before it): a new shared
+    /// committed event can change the match, a private one cannot. It was
+    /// the journal tip, which never equals the cell's feed tip once the
+    /// newest event is private, so every `status` recomputed the match
+    /// (post-integration re-review, WP2.INT).
     pub inventory_tip: i64,
+    /// The feed epoch of `inventory_tip`.
+    pub inventory_epoch: String,
     /// The engine's store revision (`EngineVitals::store_revision`, read
     /// before the store) that the cheap counters reflect at least; `None`
     /// when the refresh did not know it. A `status` reply recomputes the
@@ -175,42 +185,52 @@ fn compute_cheap(store: &Store, target: u64, revision: Option<u64>) -> Result<Ch
     })
 }
 
-/// The content part of a refresh.
+/// The content part of a refresh; the journal counters and the inventory
+/// match only in a full one (`totals`).
 struct Full {
     content: ContentCounters,
     legacy: Value,
     pending: Vec<String>,
-    journal: JournalCounters,
-    inventory: InventoryMatch,
-    inventory_at_ms: u64,
+    totals: Option<(JournalCounters, InventoryMatch, u64)>,
 }
 
-fn compute_full(store: &Store) -> Result<Full> {
+/// `totals`: also the journal counters and the per-peer inventory match
+/// (both cached per connection until the database changes,
+/// `core::status::Cache`).
+fn compute_full(store: &Store, totals: bool) -> Result<Full> {
     let (content, legacy) = store.content_report()?;
     // The content scan loaded the view: the pending list is a borrow of it.
     let pending = store.pending_causal_events()?;
-    let inventory_at_ms = now_ms();
+    let totals = if totals {
+        let inventory_at_ms = now_ms();
+        Some((
+            store.journal_counters()?,
+            store.inventory_match()?,
+            inventory_at_ms,
+        ))
+    } else {
+        None
+    };
     Ok(Full {
         content,
         legacy,
         pending,
-        journal: store.journal_counters()?,
-        inventory: store.inventory_match()?,
-        inventory_at_ms,
+        totals,
     })
 }
 
 /// Recomputes the per-peer inventory match (`caught_up`'s last check).
 fn refresh_inventory(ctx: &WorkerCtx) -> Result<()> {
     let at_ms = now_ms();
-    let (tip, inventory) = {
+    let (feed, inventory) = {
         let store = ctx.sync_stores.checkout()?;
-        // The tip first: an event committed meanwhile leaves it older.
-        let tip: i64 = store
-            .db
-            .prepare_cached("SELECT coalesce(max(seq),0) FROM journal_sequence")?
-            .query_row([], |r| r.get(0))?;
-        (tip, store.inventory_match()?)
+        // The tip first: an event committed meanwhile leaves it older. The
+        // feed tip, as the cell's `tip`: the match counts shared events only.
+        let feed = FeedTip {
+            epoch: store.feed_epoch()?,
+            seq: store.feed_tip()?,
+        };
+        (feed, store.inventory_match()?)
     };
     ctx.status_cell.update(|prev| {
         let mut next = object_or_empty(prev);
@@ -218,7 +238,8 @@ fn refresh_inventory(ctx: &WorkerCtx) -> Result<()> {
         if at_ms >= meta.inventory_at_ms {
             next["inventory"] = json!(inventory);
             meta.inventory_at_ms = at_ms;
-            meta.inventory_tip = tip;
+            meta.inventory_tip = feed.seq;
+            meta.inventory_epoch.clone_from(&feed.epoch);
         }
         next["cell"] = json!(meta);
         next
@@ -305,6 +326,22 @@ pub fn refresh_full(ctx: &WorkerCtx) -> Result<()> {
 /// [`refresh_full`], recording the engine's store revision it reflects
 /// when `vitals` are given.
 pub fn refresh_full_with(ctx: &WorkerCtx, vitals: Option<&EngineVitals>) -> Result<()> {
+    refresh_content_with(ctx, vitals, true)
+}
+
+/// The content members (and the cheap ones) for a `status` call that must
+/// read a client's writes: no journal counters and no inventory match (the
+/// maintenance refresh brings those), so a mutation never makes the next
+/// `status` wait for them (post-integration re-review, WP2.INT).
+fn refresh_content(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<()> {
+    refresh_content_with(ctx, Some(vitals), false)
+}
+
+fn refresh_content_with(
+    ctx: &WorkerCtx,
+    vitals: Option<&EngineVitals>,
+    totals: bool,
+) -> Result<()> {
     let target = ctx.status_generation.load(Ordering::SeqCst);
     let revision = vitals.map(EngineVitals::store_revision);
     let started = Instant::now();
@@ -312,7 +349,7 @@ pub fn refresh_full_with(ctx: &WorkerCtx, vitals: Option<&EngineVitals>) -> Resu
         let store = ctx.sync_stores.checkout()?;
         (
             compute_cheap(&store, target, revision)?,
-            compute_full(&store)?,
+            compute_full(&store, totals)?,
         )
     };
     let full_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -329,22 +366,28 @@ pub fn refresh_full_with(ctx: &WorkerCtx, vitals: Option<&EngineVitals>) -> Resu
             next["content"] = full.legacy.clone();
             next["content_counters"] = json!(full.content);
             next["pending_causal_events"] = json!(full.pending);
-            let mut journal = full.journal.clone();
-            if target < meta.generation {
-                // Newer cheap counters are already merged: keep them.
-                let current: JournalCounters =
-                    serde_json::from_value(next["journal"].clone()).unwrap_or_default();
-                journal.tip = current.tip;
-                journal.outgoing_unacknowledged = current.outgoing_unacknowledged;
-                journal.unresolved_conflicts = current.unresolved_conflicts;
+            if let Some((journal, inventory, inventory_at_ms)) = &full.totals {
+                let mut journal = journal.clone();
+                if target < meta.generation {
+                    // Newer cheap counters are already merged: keep them.
+                    let current: JournalCounters =
+                        serde_json::from_value(next["journal"].clone()).unwrap_or_default();
+                    journal.tip = current.tip;
+                    journal.outgoing_unacknowledged = current.outgoing_unacknowledged;
+                    journal.unresolved_conflicts = current.unresolved_conflicts;
+                }
+                next["journal"] = json!(journal);
+                if *inventory_at_ms >= meta.inventory_at_ms {
+                    next["inventory"] = json!(inventory);
+                    meta.inventory_at_ms = *inventory_at_ms;
+                    // The feed tip, as the cell's `tip` (`inventory_tip`).
+                    meta.inventory_tip = cheap.feed.seq;
+                    meta.inventory_epoch.clone_from(&cheap.feed.epoch);
+                }
+                meta.full_ms = full_ms;
             }
-            next["journal"] = json!(journal);
-            next["inventory"] = json!(full.inventory);
-            meta.inventory_at_ms = full.inventory_at_ms;
-            meta.inventory_tip = cheap.counters.tip;
             meta.content_generation = target;
             meta.content_at_ms = now_ms();
-            meta.full_ms = full_ms;
         }
         next["cell"] = json!(meta);
         next
@@ -438,8 +481,23 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
         meta = CellMeta::of(&cell);
     }
     if meta.content_generation < meta.content_wanted || cell.get("content").is_none() {
-        if let Err(error) = refresh_full_with(ctx, Some(vitals)) {
-            failure.get_or_insert(error);
+        // One computation for concurrent callers: each waits for the one in
+        // progress and finds the content caught up.
+        let flight = content_flight(ctx);
+        let _flight = crate::util::lock::lock(&flight);
+        let current = ctx.status_cell.load();
+        let current_meta = CellMeta::of(&current);
+        let first = current.get("content").is_none();
+        if first || current_meta.content_generation < current_meta.content_wanted {
+            // The very first reply computes everything once.
+            let refreshed = if first {
+                refresh_full_with(ctx, Some(vitals))
+            } else {
+                refresh_content(ctx, vitals)
+            };
+            if let Err(error) = refreshed {
+                failure.get_or_insert(error);
+            }
         }
         cell = ctx.status_cell.load();
         meta = CellMeta::of(&cell);
@@ -459,8 +517,12 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
         .filter_map(|observation| observation["at"].as_u64())
         .max()
         .unwrap_or(0);
+    // Like with like: the cell's `tip` is the feed tip, as `inventory_tip`.
     let tip = cell["tip"]["seq"].as_i64().unwrap_or(0);
-    if (latest_exchange >= meta.inventory_at_ms || tip != meta.inventory_tip)
+    let epoch = cell["tip"]["epoch"].as_str().unwrap_or_default();
+    if (latest_exchange >= meta.inventory_at_ms
+        || tip != meta.inventory_tip
+        || epoch != meta.inventory_epoch)
         && cheap_caught_up(&cell, vitals)
     {
         if let Err(error) = refresh_inventory(ctx) {
@@ -471,6 +533,20 @@ pub fn reply(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<Value> {
     }
     let stale = now_ms().saturating_sub(meta.refreshed_at_ms) > stale_ms;
     Ok(compose(&cell, &meta, ctx, vitals, stale))
+}
+
+/// The lock that makes one content refresh at a time per worker store
+/// (`reply`): concurrent `status` calls after a mutation share one
+/// computation instead of each repeating it (post-integration re-review,
+/// WP2.INT). Keyed by the store root (`WorkerCtx` is frozen).
+fn content_flight(ctx: &WorkerCtx) -> std::sync::Arc<std::sync::Mutex<()>> {
+    static FLIGHTS: std::sync::Mutex<
+        std::collections::BTreeMap<std::path::PathBuf, std::sync::Arc<std::sync::Mutex<()>>>,
+    > = std::sync::Mutex::new(std::collections::BTreeMap::new());
+    crate::util::lock::lock(&FLIGHTS)
+        .entry(ctx.root.clone())
+        .or_default()
+        .clone()
 }
 
 /// Every `caught_up` condition except the per-peer inventory match.

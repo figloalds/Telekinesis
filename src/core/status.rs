@@ -84,6 +84,31 @@ impl InventoryMatch {
     }
 }
 
+/// The status cache of one connection (`StoreCaches::status`): the journal
+/// counters and the per-peer inventory match, each with the change key it
+/// was computed under. An idle store's status refresh therefore reads them
+/// back instead of scanning the journal and `peer_known` again (WP2.3's
+/// maintenance did both at about 1 Hz forever: about a fifth of a core per
+/// idle folder of 20K+ events; post-integration re-review, WP2.INT).
+#[derive(Default)]
+pub(crate) struct Cache {
+    journal: std::cell::RefCell<Option<(ChangeKey, JournalCounters)>>,
+    inventory: std::cell::RefCell<Option<(ChangeKey, InventoryMatch)>>,
+    /// Computations of either (a counter for tests).
+    computed: std::cell::Cell<u64>,
+}
+
+/// Whether the database changed for this connection: its own writes
+/// (`total_changes`), other connections' commits (`PRAGMA data_version`), an
+/// open transaction (whose reads may roll back), and the active branch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChangeKey {
+    changes: u64,
+    data_version: i64,
+    transactional: bool,
+    branch: String,
+}
+
 /// Most missing-content items in `content_status`.
 pub const CONTENT_ITEMS: usize = 20;
 /// A cached scan is recomputed at least this often.
@@ -177,9 +202,40 @@ impl Store {
     pub fn pending_causal_events(&self) -> Result<Vec<String>> {
         Ok(self.view(&self.active)?.projection.pending.clone())
     }
+    /// The change key the status cache is valid under (see [`Cache`]).
+    fn change_key(&self) -> Result<ChangeKey> {
+        Ok(ChangeKey {
+            changes: self.db.total_changes(),
+            data_version: self.data_version()?,
+            transactional: !self.db.is_autocommit(),
+            branch: self.active.clone(),
+        })
+    }
+    /// How many times this handle computed the journal counters or the
+    /// inventory match (not counting cached answers).
+    pub fn status_computations(&self) -> u64 {
+        self.caches.status.computed.get()
+    }
+    fn count_status_computation(&self) {
+        let computed = &self.caches.status.computed;
+        computed.set(computed.get().saturating_add(1));
+    }
     /// Journal counters (§4.5); `epoch` is the feed epoch (`journal_epoch`,
-    /// WP2.5; wired by WP2.INT, CCR-WP2.5-5).
+    /// WP2.5; wired by WP2.INT, CCR-WP2.5-5). Cached until the database
+    /// changes ([`Cache`]).
     pub fn journal_counters(&self) -> Result<JournalCounters> {
+        let key = self.change_key()?;
+        if let Some((cached, counters)) = self.caches.status.journal.borrow().as_ref()
+            && *cached == key
+        {
+            return Ok(counters.clone());
+        }
+        let counters = self.compute_journal_counters()?;
+        self.count_status_computation();
+        *self.caches.status.journal.borrow_mut() = Some((key, counters.clone()));
+        Ok(counters)
+    }
+    fn compute_journal_counters(&self) -> Result<JournalCounters> {
         let counters = self.status_counters()?;
         let count = |sql: &str| -> Result<u64> {
             let n: i64 = self.db.prepare_cached(sql)?.query_row([], |r| r.get(0))?;
@@ -201,8 +257,65 @@ impl Store {
     /// shared committed inventory (`shared_event_inventory() ==
     /// known_by_peer(peer)`), by counts: `peer_known` rows are unique per
     /// `(peer, event)`, so equal counts of the shared inventory, of the
-    /// peer's rows and of their intersection mean equal sets.
+    /// peer's rows and of their intersection mean equal sets. Cached until
+    /// the database changes ([`Cache`]).
     pub fn inventory_match(&self) -> Result<InventoryMatch> {
+        let key = self.change_key()?;
+        if let Some((cached, inventory)) = self.caches.status.inventory.borrow().as_ref()
+            && *cached == key
+        {
+            return Ok(inventory.clone());
+        }
+        let inventory = self.compute_inventory_match()?;
+        self.count_status_computation();
+        *self.caches.status.inventory.borrow_mut() = Some((key, inventory.clone()));
+        Ok(inventory)
+    }
+    /// [`inventory_match`](Self::inventory_match), computed. Once the feed
+    /// index (`feed_journal`, the shared committed events) is built, the
+    /// counts are index-only: the feed's row count, each peer's
+    /// `peer_known` range, and per feed row a lookup of the peer's
+    /// `(peer, event)` key; the wide `events` rows are never read (the join
+    /// through them was about 4× slower than the legacy set comparison at
+    /// 50K events; post-integration re-review, WP2.INT).
+    fn compute_inventory_match(&self) -> Result<InventoryMatch> {
+        let indexed: bool = self
+            .db
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM config WHERE key=?1)")?
+            .query_row([super::sharing::FEED_JOURNAL_MARKER], |r| r.get(0))?;
+        if !indexed {
+            return self.inventory_match_by_join();
+        }
+        let shared: i64 = self
+            .db
+            .prepare_cached("SELECT count(*) FROM feed_journal")?
+            .query_row([], |r| r.get(0))?;
+        let peers: Vec<(String, i64)> = self
+            .db
+            .prepare_cached("SELECT peer,count(*) FROM peer_known GROUP BY peer")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut matches = BTreeMap::new();
+        for (peer, known) in peers {
+            let both: i64 = if known == shared {
+                self.db
+                    .prepare_cached(
+                        "SELECT count(*) FROM feed_journal f WHERE EXISTS(SELECT 1 FROM peer_known k WHERE k.peer=?1 AND k.event=f.event)",
+                    )?
+                    .query_row([&peer], |r| r.get(0))?
+            } else {
+                -1
+            };
+            matches.insert(peer, known == shared && both == shared);
+        }
+        Ok(InventoryMatch {
+            shared_events: shared.max(0) as u64,
+            peers: matches,
+        })
+    }
+    /// The inventory match through `events` (a store whose feed index is
+    /// still being built).
+    fn inventory_match_by_join(&self) -> Result<InventoryMatch> {
         let shared: i64 = self
             .db
             .prepare_cached(
