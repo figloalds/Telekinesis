@@ -528,8 +528,10 @@ impl Core {
         body: Vec<u8>,
     ) -> Result<(Value, Vec<u8>), ErrorWire> {
         let wire = |error: anyhow::Error| ErrorWire::from_error(&error);
-        fault::trigger(&format!("worker.rpc.{op}")).map_err(wire)?;
         if op.starts_with(ops::OBJECTS_PREFIX) {
+            // The JSON ops below reach `worker.rpc.<op>` in `route`, once,
+            // as over the JSON RPC.
+            fault::trigger(&format!("worker.rpc.{op}")).map_err(wire)?;
             return objects_rpc::dispatch(&self.ctx, op, &header, &body);
         }
         if op == ops::STOP {

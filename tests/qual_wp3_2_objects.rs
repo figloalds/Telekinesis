@@ -18,6 +18,7 @@ mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::Write,
     path::Path,
     sync::{
         Arc, Mutex,
@@ -378,7 +379,57 @@ fn object_256mib_worker_to_worker() {
     s.finish();
 }
 
-/// 10K tiny objects (64 B) ≥ 300 objects/s.
+/// The directory fsync of `raw_fs_rate` (as `core::objects::sync_dir`).
+#[cfg(windows)]
+fn sync_dir(dir: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .and_then(|dir| dir.sync_all())
+        .unwrap();
+}
+#[cfg(not(windows))]
+fn sync_dir(dir: &Path) {
+    fs::File::open(dir).and_then(|dir| dir.sync_all()).unwrap();
+}
+
+/// The bare filesystem rate of the receiver's literal data plane on this disk
+/// (objects/s), measured next to the scenario as evidence for its floor:
+/// `count` 64-byte files, each created, written and fsynced (one data fsync
+/// per object, §6.4), then renamed into another directory, with one
+/// directory fsync per 64 renames (one write call's install barrier). No
+/// database, no hashing, no sessions: the worker cannot beat it.
+fn raw_fs_rate(dir: &Path, count: usize) -> f64 {
+    let (spool, objects) = (dir.join("raw-spool"), dir.join("raw-objects"));
+    fs::create_dir_all(&spool).unwrap();
+    fs::create_dir_all(&objects).unwrap();
+    let started = Instant::now();
+    for i in 0..count {
+        let name = format!("{i:064x}");
+        let path = spool.join(&name);
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&[i as u8; 64]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        fs::rename(&path, objects.join(&name)).unwrap();
+        if i % 64 == 63 || i + 1 == count {
+            sync_dir(&objects);
+        }
+    }
+    let rate = count as f64 / started.elapsed().as_secs_f64();
+    let _ = fs::remove_dir_all(&spool);
+    let _ = fs::remove_dir_all(&objects);
+    rate
+}
+
+/// 10K tiny objects (64 B) ≥ 300 objects/s. The bare filesystem rate of the
+/// same data plane is measured right before and after (`fs_objects_per_s`,
+/// no floor): on a disk that cannot do 300 fsynced creates per second the
+/// floor cannot be met by any worker, and the two numbers side by side say
+/// which of the two a miss is.
 #[test]
 #[ignore = "WP3.2"]
 fn tiny_objects_10k() {
@@ -389,9 +440,17 @@ fn tiny_objects_10k() {
     });
     let (_wa, wb) = workers(&setup);
     let pump = Pump::new(&setup);
+    let raw_before = raw_fs_rate(setup.dir.path(), 1000);
     s.measure_from_now();
     let result = pump.run(&s, None);
     let secs = s.started.elapsed().as_secs_f64();
+    let raw_after = raw_fs_rate(setup.dir.path(), 1000);
+    s.metric_with(
+        "fs_objects_per_s",
+        (raw_before + raw_after) / 2.0,
+        "objects/s",
+        json!({"before": raw_before, "after": raw_after, "files": 1000}),
+    );
     let done = complete(&wb);
     let available = wb
         .rpc(json!({"op":"status"}))
