@@ -51,9 +51,9 @@ use tkfs::{
             LaneRole, LaneSpec,
             frame::{ChunkHeader, ClientHello},
             objects::{
-                ObjectOutcome, ObjectsPull, ObjectsResult, ReadHeader, ReadReply, ReportHeader,
-                WantHeader, WantItem, WantPriority, WantReply, WriteHeader, WriteItem, WriteReply,
-                WriteResult,
+                ObjectOutcome, ObjectsPull, ObjectsPush, ObjectsResult, ReadHeader, ReadReply,
+                ReportHeader, WantHeader, WantItem, WantPriority, WantReply, WriteHeader,
+                WriteItem, WriteReply, WriteResult,
             },
         },
         status::{Direction, StatusEvent, StatusSnapshot},
@@ -135,6 +135,8 @@ struct Faults {
     busy_writes: usize,
     /// The next write call sleeps this long before it answers.
     hang_next_write: Option<Duration>,
+    /// Every write call fails as a whole with this error (a store outage).
+    fail_writes: Option<ErrorWire>,
 }
 
 enum Held {
@@ -358,6 +360,27 @@ impl FakeWorker {
         self.state.lock().unwrap().reports.clone()
     }
 
+    /// The session holding a live lease on `hash`.
+    fn lease_of(&self, hash: &str) -> Option<String> {
+        let state = self.state.lock().unwrap();
+        state
+            .leases
+            .get(hash)
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(session, _)| session.clone())
+    }
+
+    /// The sessions of every write of `hash`.
+    fn write_sessions(&self, hash: &str) -> BTreeSet<String> {
+        self.write_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, written, _, _)| written == hash)
+            .map(|(session, ..)| session.clone())
+            .collect()
+    }
+
     fn reads(&self) -> Vec<(String, u64, u64)> {
         self.read_log.lock().unwrap().clone()
     }
@@ -477,6 +500,9 @@ impl FakeWorker {
             if faults.busy_writes > 0 {
                 faults.busy_writes -= 1;
                 return Err(ErrorWire::coded("BUSY", "test: the handler queue is full"));
+            }
+            if let Some(error) = &faults.fail_writes {
+                return Err(error.clone());
             }
             (faults.write_delay, faults.hang_next_write.take())
         };
@@ -1022,10 +1048,31 @@ struct Dialer {
 
 impl Dialer {
     fn start(worker: Arc<FakeWorker>, remote: &str, endpoint: &str, interval_ms: u64) -> Dialer {
+        Self::start_as(worker, REPLICA_A, remote, endpoint, interval_ms)
+    }
+
+    /// A dialer whose folder (served by `worker`) is replica `replica`.
+    fn start_as(
+        worker: Arc<FakeWorker>,
+        replica: &str,
+        remote: &str,
+        endpoint: &str,
+        interval_ms: u64,
+    ) -> Dialer {
         let world = World::new(&format!("a-{}", uuid()), None);
-        world.folder(STATE_A, REPLICA_A, &worker);
+        world.folder(STATE_A, replica, &worker);
         let ctx = ctx(&world, interval_ms);
-        let peer = Arc::new(PeerContext {
+        let peer = Self::peer_context(&ctx, remote, endpoint);
+        Dialer {
+            world,
+            worker,
+            ctx,
+            peer,
+        }
+    }
+
+    fn peer_context(ctx: &Ctx, remote: &str, endpoint: &str) -> Arc<PeerContext> {
+        Arc::new(PeerContext {
             installation: remote.into(),
             endpoint: endpoint.into(),
             local_installation: ctx.installation.clone(),
@@ -1035,12 +1082,16 @@ impl Dialer {
                 at_ms: 0,
                 entries: vec![entry()],
             }),
-        });
+        })
+    }
+
+    /// The same daemon (world, folder, worker) facing another peer.
+    fn to_peer(&self, remote: &str, endpoint: &str) -> Dialer {
         Dialer {
-            world,
-            worker,
-            ctx,
-            peer,
+            world: self.world.clone(),
+            worker: self.worker.clone(),
+            ctx: self.ctx.clone(),
+            peer: Self::peer_context(&self.ctx, remote, endpoint),
         }
     }
 
@@ -2042,6 +2093,383 @@ fn at_most_two_repositories_share_a_lane() {
     }
 }
 
+/// Multi-source liveness, push side (a hub): B wants Y; A1 cannot serve it,
+/// C can. A1's lane is offered Y first (B's worker leases Y to A1's push
+/// session, and A1's lane keeps renewing that lease with every
+/// `objects.wants`); A1 does not send it, so B backs Y off for A1 (no
+/// error), parks it under A1's lease and offers it to C's lane, whose push
+/// installs it under that lease: well inside the lease's 60 s, with A1's
+/// lane still running.
+#[test]
+fn a_source_that_cannot_serve_hands_its_push_lease_on() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let bytes = content(3000, 1536 * 1024);
+    let hash = sha(&bytes);
+    b.worker.want(&hash, bytes.len() as u64);
+    let a1 = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let c = Dialer::start_as(
+        FakeWorker::start("replica-c"),
+        "replica-c",
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    c.worker.hold(bytes.clone());
+    let (options, _) = a1.options();
+    let lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
+    let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
+    assert!(
+        wait_until(Duration::from_secs(10), || b
+            .worker
+            .lease_of(&hash)
+            .is_some_and(|lease| lease == a1_lease)),
+        "A1 was never offered Y: lease {:?}",
+        b.worker.lease_of(&hash)
+    );
+    // A1 tried and could not read it.
+    assert!(
+        wait_until(Duration::from_secs(10), || a1
+            .world
+            .object_errors()
+            .iter()
+            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+        "{:?}",
+        a1.world.object_errors()
+    );
+    let began = Instant::now();
+    let (options, _) = c.options();
+    let lane_c = c.run(c.dial(&b.endpoint, &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || b.worker.has(&hash)),
+        "B never got Y while A1's lane held its lease ({:?})",
+        b.worker.lease_of(&hash)
+    );
+    assert!(began.elapsed() < Duration::from_secs(30));
+    assert_eq!(b.worker.held_bytes(&hash).unwrap(), bytes);
+    // C's push wrote it under A1's lease (the handoff), and A1's lane was
+    // still running (renewing that lease) the whole time.
+    assert_eq!(
+        b.worker.write_sessions(&hash),
+        BTreeSet::from([a1_lease.clone()])
+    );
+    assert!(!lane_a1.finished());
+    // A source that does not serve an object is no error at B.
+    assert!(
+        !b.world
+            .object_errors()
+            .iter()
+            .any(|(object, _)| *object == hash),
+        "{:?}",
+        b.world.object_errors()
+    );
+    drop(lane_c);
+    drop(lane_a1);
+}
+
+/// Multi-source liveness, pull side: D wants X from B (which lacks it) and
+/// C (which has it). D's lane to B leases X first (D's worker), its pull
+/// fails `NOT_AVAILABLE`, and the lane keeps renewing the lease with its
+/// wants; D parks X under that lease, and its lane to C takes it over and
+/// installs it under that lease, well inside the lease's 60 s.
+#[test]
+fn a_source_that_cannot_serve_hands_its_pull_lease_on() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let c = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let bytes = content(3100, 1536 * 1024);
+    let hash = c.worker.hold(bytes.clone());
+    let to_b = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    to_b.worker.want(&hash, bytes.len() as u64);
+    let to_c = to_b.to_peer(&c.installation(), &c.endpoint);
+    let (options, _) = to_b.options();
+    let lane_b = to_b.run(to_b.dial(&b.endpoint, &b.code, LANE), options);
+    let b_lanes = objects::pull_holder(&b.installation(), LANE);
+    assert!(
+        wait_until(Duration::from_secs(10), || to_b
+            .world
+            .object_errors()
+            .iter()
+            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+        "{:?}",
+        to_b.world.object_errors()
+    );
+    assert!(
+        to_b.worker
+            .lease_of(&hash)
+            .is_some_and(|lease| lease.starts_with(&b_lanes)),
+        "{:?}",
+        to_b.worker.lease_of(&hash)
+    );
+    let began = Instant::now();
+    let (options, _) = to_c.options();
+    let lane_c = to_c.run(to_c.dial(&c.endpoint, &c.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || to_b.worker.has(&hash)),
+        "D never got X while its lane to B held the lease ({:?})",
+        to_b.worker.lease_of(&hash)
+    );
+    assert!(began.elapsed() < Duration::from_secs(30));
+    assert_eq!(to_b.worker.held_bytes(&hash).unwrap(), bytes);
+    let sessions = to_b.worker.write_sessions(&hash);
+    assert!(
+        sessions.len() == 1 && sessions.iter().all(|lease| lease.starts_with(&b_lanes)),
+        "{sessions:?}"
+    );
+    assert!(!lane_b.finished());
+    // Installed: B's error for it is resolved too.
+    assert!(
+        wait_until(Duration::from_secs(5), || to_b.world.events().iter().any(
+            |event| matches!(event, StatusEvent::Resolved { scope, code }
+                if *scope == object_scope(&hash) && code == "NOT_AVAILABLE")
+        )),
+        "the NOT_AVAILABLE error from B was not resolved"
+    );
+    drop(lane_c);
+    drop(lane_b);
+}
+
+/// Invariant 22 on the acceptor's push: a chunk of an object without a
+/// share of the push, out of order (a gap), or past its share of the push
+/// budget (the allotment rule) ends the push `PROTOCOL_VIOLATION`, before
+/// anything of it is buffered or written; the session stays usable.
+#[test]
+fn a_push_outside_its_shares_is_refused() {
+    let (a, b) = pair(100);
+    let size = 3 * MIB;
+    let data = content(3200, size as usize);
+    let hash = sha(&data);
+    b.worker.want(&hash, size);
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let push = |items: Vec<WantItem>, chunks: Vec<(String, u64, u64, Vec<u8>)>| {
+        let request = ObjectsPush {
+            repo: REPO.into(),
+            sender: REPLICA_A.into(),
+            receiver: REPLICA_B.into(),
+            lane: LANE,
+            items,
+        };
+        let mut upload = conn.upload(
+            "objects.push",
+            serde_json::to_value(&request).unwrap(),
+            Priority::Control,
+            Duration::from_secs(10),
+        )?;
+        for (hash, offset, total, bytes) in chunks {
+            let header = ChunkHeader {
+                id: 0,
+                hash: Some(hash),
+                offset,
+                total,
+                last: offset + bytes.len() as u64 == total,
+            };
+            if let Err(error) = upload.chunk(header, &bytes) {
+                // The acceptor may already have answered (and ended it).
+                return Err(upload.finish().err().unwrap_or(error));
+            }
+        }
+        upload.finish().map(|reply| -> ObjectsResult {
+            if reply.body.is_empty() {
+                serde_json::from_value(reply.header).unwrap()
+            } else {
+                serde_json::from_slice(&reply.body).unwrap()
+            }
+        })
+    };
+    let item = |hash: &str, size: u64| WantItem {
+        hash: hash.into(),
+        size,
+        offset: 0,
+        priority: WantPriority::History,
+    };
+    let part = |at: u64, len: u64| data[at as usize..(at + len) as usize].to_vec();
+    let violation = |result: Result<ObjectsResult, CallError>| {
+        let error = result.unwrap_err();
+        assert_eq!(error.code(), "PROTOCOL_VIOLATION", "{error}");
+    };
+    // A gap: the second MiB first.
+    violation(push(
+        vec![item(&hash, size)],
+        vec![(hash.clone(), MIB, size, part(MIB, MIB))],
+    ));
+    // An object that is not in the push.
+    let other = sha(b"not in the push");
+    violation(push(
+        vec![item(&hash, size)],
+        vec![(other, 0, 10, vec![7; 10])],
+    ));
+    // Past the object's share: a claimed 32 MiB object gets 16 MiB of the
+    // push budget; its 17th MiB is refused.
+    let big = sha(b"a claimed large object");
+    let chunks = (0..17)
+        .map(|index| (big.clone(), index * MIB, 32 * MIB, vec![1; MIB as usize]))
+        .collect();
+    violation(push(vec![item(&big, 32 * MIB)], chunks));
+    // Nothing of the refused chunks reached the worker.
+    assert!(
+        b.worker
+            .write_log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, written, offset, _)| *written != hash
+                && (*written != big || *offset < 16 * MIB)),
+        "{:?}",
+        b.worker.write_log.lock().unwrap()
+    );
+    // The session is still usable: a push in order completes.
+    let chunks = (0..3)
+        .map(|index| (hash.clone(), index * MIB, size, part(index * MIB, MIB)))
+        .collect();
+    let result = push(vec![item(&hash, size)], chunks).unwrap();
+    assert_eq!(result.results[0].outcome, ObjectOutcome::Completed);
+    assert_eq!(b.worker.held_bytes(&hash).unwrap(), data);
+    conn.close();
+}
+
+/// §2.3: a write call that fails as a whole at the acceptor (its worker's
+/// store is down) fails the push, not its objects: no `ObjectError` and no
+/// per-object backoff on either side (a backoff would hold them 30 s); once
+/// the store is back, the next push completes them.
+#[test]
+fn a_failed_worker_call_fails_the_push_not_its_objects() {
+    let (a, b) = pair(100);
+    let hashes: Vec<String> = [300_000usize, 200_000]
+        .iter()
+        .enumerate()
+        .map(|(index, size)| {
+            let hash = a.worker.hold(content(3300 + index as u64, *size));
+            b.worker.want(&hash, *size as u64);
+            hash
+        })
+        .collect();
+    b.worker.faults().fail_writes = Some(ErrorWire::coded("SQLITE_BUSY", "test: store down"));
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+    let failed_push = || {
+        b.world.finished().iter().any(|f| {
+            f.op == "objects.push"
+                && f.direction == Direction::Inbound
+                && !f.ok
+                && f.error
+                    .as_ref()
+                    .is_some_and(|error| error.code == "SQLITE_BUSY")
+        })
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), failed_push),
+        "{:?}",
+        b.world.finished()
+    );
+    assert!(
+        a.world
+            .finished()
+            .iter()
+            .any(|f| f.op == "objects.push" && !f.ok),
+        "the dialer's push did not fail"
+    );
+    b.worker.faults().fail_writes = None;
+    let healed = Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(20), || hashes
+            .iter()
+            .all(|hash| b.worker.has(hash))),
+        "the objects did not complete once the store was back"
+    );
+    assert!(healed.elapsed() < Duration::from_secs(25));
+    for world in [&a.world, &b.world] {
+        assert!(
+            !world
+                .object_errors()
+                .iter()
+                .any(|(hash, _)| hashes.contains(hash)),
+            "{:?}",
+            world.object_errors()
+        );
+    }
+    drop(lane);
+}
+
+/// §2.2 rule 2: the session client dials without holding its lock. While a
+/// dial hangs (a worker that accepts TCP but never answers the upgrade),
+/// `is_open` answers at once, and concurrent callers share that one dial's
+/// failure instead of each dialing in turn.
+#[test]
+fn the_session_client_dials_without_its_lock() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("ws://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    {
+        let accepted = accepted.clone();
+        thread::spawn(move || {
+            let mut sessions = Vec::new();
+            let mut hanging = Vec::new();
+            for (index, stream) in listener.incoming().flatten().enumerate() {
+                if index == 0 {
+                    // The first dial gets a session (closed below).
+                    if let Ok(conn) = session::accept_loopback(stream, None, ConnOptions::default())
+                    {
+                        sessions.push(conn);
+                    }
+                    continue;
+                }
+                // Later dials hang: accepted, never answered.
+                accepted.fetch_add(1, Ordering::SeqCst);
+                hanging.push(stream);
+            }
+        });
+    }
+    let endpoint = WorkerEndpoint {
+        instance: format!("hanging-{}", uuid()),
+        pid: 1,
+        address,
+        version: "test".into(),
+        token: None,
+    };
+    let client = SessionWorkerClient::connect(&endpoint).unwrap();
+    client.close();
+    let began = Instant::now();
+    let callers: Vec<_> = (0..6)
+        .map(|_| {
+            let client = client.clone();
+            thread::spawn(move || client.conn().map(|_| ()))
+        })
+        .collect();
+    assert!(wait_until(Duration::from_secs(5), || accepted
+        .load(Ordering::SeqCst)
+        >= 1));
+    let asked = Instant::now();
+    assert!(!client.is_open());
+    assert!(
+        asked.elapsed() < Duration::from_millis(500),
+        "is_open waited for the dial: {:?}",
+        asked.elapsed()
+    );
+    for caller in callers {
+        assert!(caller.join().unwrap().is_err());
+    }
+    // One dial (rarely two: a caller that came after the first failed),
+    // not one per caller.
+    assert!(
+        accepted.load(Ordering::SeqCst) <= 2,
+        "{} dials",
+        accepted.load(Ordering::SeqCst)
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(12),
+        "{:?}",
+        began.elapsed()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Qualification (release, ignored): throughput of the data plane
 
@@ -2111,12 +2539,25 @@ fn record(scenario: &str, metric: &str, value: f64, unit: &str, extra: Value) {
     support::qual(scenario, metric, value, unit, extra);
 }
 
-fn large_object(link: Option<Link>, scenario: &str, disk: bool) {
-    let size = std::env::var("TKFS_QUAL_LARGE_MIB")
+/// The §15.1 W3 floors these scenarios check (at their default sizes; an
+/// override of `TKFS_QUAL_LARGE_MIB` / `TKFS_QUAL_TINY_COUNT` only records).
+const FLOOR_LOOPBACK_MIB_S: f64 = 40.0;
+const FLOOR_LINK_UTILIZATION: f64 = 0.80;
+const FLOOR_TINY_FILES_S: f64 = 300.0;
+
+/// What a large-object scenario measured.
+struct Large {
+    mib_s: f64,
+    link_utilization: Option<f64>,
+    /// The default 1 GiB (the size the floors are defined for).
+    default_size: bool,
+}
+
+fn large_object(link: Option<Link>, scenario: &str, disk: bool) -> Large {
+    let configured = std::env::var("TKFS_QUAL_LARGE_MIB")
         .ok()
-        .and_then(|mib| mib.parse::<u64>().ok())
-        .unwrap_or(1024)
-        * MIB;
+        .and_then(|mib| mib.parse::<u64>().ok());
+    let size = configured.unwrap_or(1024) * MIB;
     let root = tempfile::tempdir().unwrap();
     let (a, b) = qual_pair(disk.then(|| root.path()));
     let hash = if disk {
@@ -2142,28 +2583,32 @@ fn large_object(link: Option<Link>, scenario: &str, disk: bool) {
             "fake (memory spool, SHA-256 on completion)"
         },
     });
+    let mut link_utilization = None;
     if let Some(link) = &link {
         let link_mib_s = link.bytes_per_s as f64 / MIB as f64;
         extra["rtt_ms"] = json!(link.rtt_ms);
         extra["link_bytes_per_s"] = json!(link.bytes_per_s);
         if link.bytes_per_s > 0 {
-            record(
-                scenario,
-                "link_utilization",
-                mib_s / link_mib_s,
-                "ratio",
-                extra.clone(),
-            );
+            let ratio = mib_s / link_mib_s;
+            link_utilization = Some(ratio);
+            record(scenario, "link_utilization", ratio, "ratio", extra.clone());
         }
     }
     record(scenario, "mib_per_s", mib_s, "MiB/s", extra);
+    Large {
+        mib_s,
+        link_utilization,
+        default_size: configured.is_none(),
+    }
 }
 
-fn tiny_files(link: Option<Link>, scenario: &str, disk: bool) {
-    let count = std::env::var("TKFS_QUAL_TINY_COUNT")
+/// What a tiny-files scenario measured: files/s, and whether it ran the
+/// default 10K files.
+fn tiny_files(link: Option<Link>, scenario: &str, disk: bool) -> (f64, bool) {
+    let configured = std::env::var("TKFS_QUAL_TINY_COUNT")
         .ok()
-        .and_then(|count| count.parse::<usize>().ok())
-        .unwrap_or(10_000);
+        .and_then(|count| count.parse::<usize>().ok());
+    let count = configured.unwrap_or(10_000);
     let root = tempfile::tempdir().unwrap();
     let (a, b) = qual_pair(disk.then(|| root.path()));
     let hashes: Vec<String> = (0..count)
@@ -2190,19 +2635,22 @@ fn tiny_files(link: Option<Link>, scenario: &str, disk: bool) {
         extra["rtt_ms"] = json!(link.rtt_ms);
         extra["link_bytes_per_s"] = json!(link.bytes_per_s);
     }
-    record(
-        scenario,
-        "files_per_s",
-        count as f64 / seconds,
-        "files/s",
-        extra,
-    );
+    let files_s = count as f64 / seconds;
+    record(scenario, "files_per_s", files_s, "files/s", extra);
+    (files_s, configured.is_none())
 }
 
 #[test]
 #[ignore = "WP3.3 qualification (release)"]
 fn qual_large_object_loopback() {
-    large_object(None, "objects_v3_lanes::large_object_loopback", true);
+    let large = large_object(None, "objects_v3_lanes::large_object_loopback", true);
+    if large.default_size {
+        assert!(
+            large.mib_s >= FLOOR_LOOPBACK_MIB_S,
+            "1 GiB on loopback at {:.1} MiB/s, below the {FLOOR_LOOPBACK_MIB_S} MiB/s floor",
+            large.mib_s
+        );
+    }
 }
 
 #[test]
@@ -2215,10 +2663,12 @@ fn qual_large_object_loopback_memory() {
     );
 }
 
+/// §14 WP3.3 acceptance: through FaultProxy (50 ms RTT, 100 Mbit) ≥ 80 % of
+/// the link rate.
 #[test]
 #[ignore = "WP3.3 qualification (release)"]
 fn qual_large_object_rtt50_100mbit() {
-    large_object(
+    let large = large_object(
         Some(Link {
             rtt_ms: 50,
             bytes_per_s: 12_500_000,
@@ -2226,6 +2676,14 @@ fn qual_large_object_rtt50_100mbit() {
         "objects_v3_lanes::large_object_rtt50_100mbit",
         true,
     );
+    if large.default_size {
+        let ratio = large.link_utilization.unwrap_or(0.0);
+        assert!(
+            ratio >= FLOOR_LINK_UTILIZATION,
+            "1 GiB through 50 ms / 100 Mbit at {ratio:.3} of the link rate, below the \
+             {FLOOR_LINK_UTILIZATION} floor"
+        );
+    }
 }
 
 #[test]
@@ -2244,7 +2702,15 @@ fn qual_large_object_rtt50() {
 #[test]
 #[ignore = "WP3.3 qualification (release)"]
 fn qual_tiny_files_10k_loopback() {
-    tiny_files(None, "objects_v3_lanes::tiny_files_10k_loopback", true);
+    let (files_s, default_count) =
+        tiny_files(None, "objects_v3_lanes::tiny_files_10k_loopback", true);
+    if default_count {
+        assert!(
+            files_s >= FLOOR_TINY_FILES_S,
+            "10K × 4 KiB on loopback at {files_s:.0} files/s, below the {FLOOR_TINY_FILES_S} \
+             files/s floor"
+        );
+    }
 }
 
 #[test]
@@ -2283,8 +2749,7 @@ fn qual_tiny_files_10k_rtt50_100mbit() {
     );
 }
 
-/// Keeps `Scope` imported for status assertions in future scenarios.
-#[allow(dead_code)]
+/// The status scope of `hash` in A's folder.
 fn object_scope(hash: &str) -> Scope {
     Scope::Object {
         state: STATE_A.into(),
