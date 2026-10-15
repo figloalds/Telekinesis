@@ -999,6 +999,7 @@ fn ctx(world: &Arc<World>, interval_ms: u64) -> Arc<Ctx> {
         status_source: world.clone(),
         network: OnceLock::new(),
         legacy: OnceLock::new(),
+        extensions: OnceLock::new(),
         clock: Arc::new(SystemClock),
         shutdown: Cancel::new(),
         stopping: Arc::new(AtomicBool::new(false)),
