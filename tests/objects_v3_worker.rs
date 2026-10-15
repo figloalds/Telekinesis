@@ -829,14 +829,14 @@ fn legacy_spool_is_adopted_once() {
         })
     );
     assert_eq!(spool_len(&legacy.state, &hash), Some(offset));
-    if let Some(item) = store
+    // The partial object is wanted, from the adopted offset.
+    let item = store
         .want_objects(LaneSpec::new(0, 1), 256, u64::MAX, &no_leases)
         .unwrap()
         .into_iter()
         .find(|i| i.hash == hash)
-    {
-        assert_eq!((item.offset, item.size), (offset, total));
-    }
+        .expect("the fixture's partial object is wanted");
+    assert_eq!((item.offset, item.size), (offset, total));
     drop(store);
     // Once: a later row-less spool is not adopted.
     let other = "ab".repeat(32);
@@ -1220,6 +1220,262 @@ fn a_corrupt_source_is_backed_off_for_that_source_only() {
     let route_c = json!({"peer": "peer-c", "repo": w.route_b["repo"], "local_replica": w.route_b["local_replica"],
         "remote_replica": "replica-c"});
     assert_eq!(want_op(&w, &route_c, "s2").len(), 1);
+}
+
+/// The lease of `hash` (it must exist).
+fn lease(w: &Worker, hash: &str) -> tkfs::runtime::ctx::ObjectLease {
+    w.ctx
+        .inflight_objects
+        .lock()
+        .unwrap()
+        .get(hash)
+        .cloned()
+        .unwrap_or_else(|| panic!("no lease on {hash}"))
+}
+
+/// The want-list item for `hash`, if offered.
+fn offered<'a>(items: &'a [Value], hash: &str) -> Option<&'a Value> {
+    items.iter().find(|item| item["hash"] == hash)
+}
+
+/// Another source of the same repository (`replica-c`).
+fn route_c(w: &Worker) -> Value {
+    json!({"peer": "peer-c", "repo": w.route_b["repo"], "local_replica": w.route_b["local_replica"],
+        "remote_replica": "replica-c"})
+}
+
+/// Moves the expiry of the lease on `hash` back by one `LEASE_TTL`: the
+/// state one TTL later, since nothing but progress moves an expiry (the
+/// test below asserts that).
+fn age_one_ttl(w: &Worker, hash: &str) {
+    let ttl = tkfs::model::protocol::objects::LEASE_TTL.as_millis() as u64;
+    let mut leases = w.ctx.inflight_objects.lock().unwrap();
+    let lease = leases.get_mut(hash).unwrap();
+    lease.expires_ms = lease.expires_ms.saturating_sub(ttl);
+}
+
+#[test]
+fn want_never_renews_a_lease_only_progress_does() {
+    let content = vec![6u8; 300_000];
+    let w = worker(|a| {
+        file(a, "r.bin", &content);
+    });
+    let hash = tkfs::core::hash(&content);
+    let route_c = route_c(&w);
+    // S1 is offered the object and leased it.
+    assert!(offered(&want_op(&w, &w.route_b, "s1"), &hash).is_some());
+    let granted = lease(&w, &hash);
+    assert_eq!(granted.session, "s1");
+    // S1 keeps asking without writing: offered again (its own lease: a
+    // reconnect resumes it), but the expiry never moves; another source's
+    // session is never offered it meanwhile.
+    for _ in 0..3 {
+        thread::sleep(Duration::from_millis(20));
+        let again = want_op(&w, &w.route_b, "s1");
+        assert_eq!(offered(&again, &hash).unwrap()["offset"], 0);
+        assert_eq!(
+            lease(&w, &hash).expires_ms,
+            granted.expires_ms,
+            "objects.want renewed the lease"
+        );
+        assert!(offered(&want_op(&w, &route_c, "c1"), &hash).is_none());
+    }
+    // Progress renews it.
+    thread::sleep(Duration::from_millis(20));
+    let progressed = write_op(&w, &w.route_b, "s1", &hash, 0, 300_000, &content[..100_000]);
+    assert_eq!(
+        progressed["outcome"]["progressed"]["durable_offset"], 100_000,
+        "{progressed}"
+    );
+    let renewed = lease(&w, &hash);
+    assert!(renewed.expires_ms > granted.expires_ms, "{renewed:?}");
+    assert_eq!(renewed.offset, 100_000);
+    // A failed write does not: bytes that differ from the durable spool reset
+    // it (the writer resumes at 0, the lease stays S1's).
+    thread::sleep(Duration::from_millis(20));
+    let changed = write_op(&w, &w.route_b, "s1", &hash, 0, 300_000, &vec![7u8; 100_000]);
+    assert_eq!(
+        changed["outcome"]["failed"]["code"], "OBJECT_PART_CHANGED",
+        "{changed}"
+    );
+    assert_eq!(changed["durable_offset"], 0);
+    let after = lease(&w, &hash);
+    assert_eq!(
+        (after.session.as_str(), after.expires_ms, after.offset),
+        ("s1", renewed.expires_ms, 0)
+    );
+    // A want list never moves a held lease's offset back: the store's scan
+    // can predate a write that has since advanced it.
+    let progressed = write_op(&w, &w.route_b, "s1", &hash, 0, 300_000, &content[..100_000]);
+    assert_eq!(
+        progressed["outcome"]["progressed"]["durable_offset"],
+        100_000
+    );
+    w.ctx
+        .inflight_objects
+        .lock()
+        .unwrap()
+        .get_mut(&hash)
+        .unwrap()
+        .offset = 200_000;
+    let again = want_op(&w, &w.route_b, "s1");
+    assert_eq!(offered(&again, &hash).unwrap()["offset"], 100_000);
+    assert_eq!(lease(&w, &hash).offset, 200_000);
+}
+
+#[test]
+fn a_stalled_lease_moves_the_object_to_another_source() {
+    let (x, y) = (vec![8u8; 200_000], vec![9u8; 150_000]);
+    let w = worker(|a| {
+        file(a, "x.bin", &x);
+        file(a, "y.bin", &y);
+    });
+    let (hx, hy) = (tkfs::core::hash(&x), tkfs::core::hash(&y));
+    let source_a = w.route_b["remote_replica"].as_str().unwrap().to_owned();
+    let route_c = route_c(&w);
+    // A's session S1 holds both and makes progress on X only, then stalls:
+    // it keeps asking (a source that cannot serve them, say) but never
+    // writes again.
+    let first = want_op(&w, &w.route_b, "s1");
+    assert!(offered(&first, &hx).is_some() && offered(&first, &hy).is_some());
+    let done = write_op(&w, &w.route_b, "s1", &hx, 0, 200_000, &x[..50_000]);
+    assert_eq!(done["outcome"]["progressed"]["durable_offset"], 50_000);
+    for _ in 0..3 {
+        let again = want_op(&w, &w.route_b, "s1");
+        assert!(offered(&again, &hx).is_some() && offered(&again, &hy).is_some());
+        assert!(want_op(&w, &route_c, "c1").is_empty(), "held by S1");
+    }
+    // One TTL without progress later, both leases have lapsed. S1 asking
+    // again does not keep them: each object is backed off for source A (any
+    // of A's sessions), and C's session is offered them, from the durable
+    // offsets.
+    age_one_ttl(&w, &hx);
+    age_one_ttl(&w, &hy);
+    let again = want_op(&w, &w.route_b, "s1");
+    assert!(offered(&again, &hx).is_none() && offered(&again, &hy).is_none());
+    assert!(want_op(&w, &w.route_b, "s1-other").is_empty());
+    for hash in [&hx, &hy] {
+        let retry_at = objects_rpc::source_retry_at(&w.ctx, &source_a, hash).unwrap();
+        let stall = objects_rpc::STALL_BACKOFF.as_millis() as u64;
+        assert!(retry_at <= tkfs::util::time::now_ms() + stall, "{retry_at}");
+    }
+    let from_c = want_op(&w, &route_c, "c1");
+    assert_eq!(offered(&from_c, &hx).unwrap()["offset"], 50_000);
+    assert_eq!(offered(&from_c, &hy).unwrap()["offset"], 0);
+    assert_eq!(lease(&w, &hx).session, "c1");
+    let finished = write_op(&w, &route_c, "c1", &hx, 50_000, 200_000, &x[50_000..]);
+    assert_eq!(finished["outcome"], "completed", "{finished}");
+    // A write from A's session for Y while C holds it touches nothing.
+    let late = write_op(&w, &w.route_b, "s1", &hy, 0, 150_000, &y);
+    assert_eq!(late["outcome"], "in_flight_elsewhere");
+    // C stalls on Y too: after its TTL Y is backed off for C as well, and
+    // free. A write from A then takes the lease (a slow transfer continues)
+    // and, while it holds it, A's session is offered Y despite A's backoff
+    // (it resumes); C's is not.
+    age_one_ttl(&w, &hy);
+    assert!(want_op(&w, &route_c, "c1").is_empty());
+    assert!(want_op(&w, &w.route_b, "s1").is_empty());
+    let resumed = write_op(&w, &w.route_b, "s1", &hy, 0, 150_000, &y[..10_000]);
+    assert_eq!(resumed["outcome"]["progressed"]["durable_offset"], 10_000);
+    assert_eq!(
+        offered(&want_op(&w, &w.route_b, "s1"), &hy).unwrap()["offset"],
+        10_000
+    );
+    assert!(want_op(&w, &route_c, "c2").is_empty());
+}
+
+#[test]
+fn failed_writes_back_their_object_off() {
+    let (m, l) = (vec![10u8; 4000], vec![11u8; 5000]);
+    let w = worker(|a| {
+        file(a, "m.bin", &m);
+        file(a, "l.bin", &l);
+    });
+    let (hm, hl) = (tkfs::core::hash(&m), tkfs::core::hash(&l));
+    let source_a = w.route_b["remote_replica"].as_str().unwrap().to_owned();
+    let route_c = route_c(&w);
+    let wanted = want_op(&w, &w.route_b, "s");
+    assert!(offered(&wanted, &hm).is_some() && offered(&wanted, &hl).is_some());
+    // A size the source claims and nothing here agrees with (two parts of it
+    // in one call): backed off for that source, one attempt per object
+    // (escalating, like a corrupt copy: 30 s first), the lease released.
+    let (reply, _) = op(
+        &w.ctx,
+        "objects.write",
+        json!({"route": w.route_b, "session": "s", "items": [
+            {"hash": hm, "offset": 0, "total": 4001, "len": 2000, "last": false},
+            {"hash": hm, "offset": 2000, "total": 4001, "len": 2001, "last": true}]}),
+        &[10u8; 4001],
+    )
+    .unwrap();
+    for result in reply["results"].as_array().unwrap() {
+        assert_eq!(result["outcome"], "size_mismatch", "{reply}");
+    }
+    let retry_at = objects_rpc::source_retry_at(&w.ctx, &source_a, &hm).unwrap();
+    assert!(
+        retry_at <= tkfs::util::time::now_ms() + 30_000,
+        "one attempt for the object: {retry_at}"
+    );
+    assert!(w.ctx.inflight_objects.lock().unwrap().get(&hm).is_none());
+    assert!(offered(&want_op(&w, &w.route_b, "s"), &hm).is_none());
+    assert!(offered(&want_op(&w, &route_c, "c"), &hm).is_some());
+    // A local failure (the spool cannot be created): the object backoff
+    // (`object_error_state`), honored for every source; the lease released.
+    fs::create_dir_all(w.ctx.root.join("incoming-objects").join(&hl)).unwrap();
+    let local = write_op(&w, &w.route_b, "s", &hl, 0, 5000, &l);
+    assert!(local["outcome"]["failed"]["code"].is_string(), "{local}");
+    assert_ne!(local["outcome"]["failed"]["code"], "RESUME_OFFSET_AHEAD");
+    assert!(w.ctx.inflight_objects.lock().unwrap().get(&hl).is_none());
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hl).is_none());
+    let store = w.ctx.sync_stores.checkout().unwrap();
+    assert!(store.object_backoff(&hl).unwrap().is_some());
+    drop(store);
+    assert!(offered(&want_op(&w, &w.route_b, "s"), &hl).is_none());
+    assert!(offered(&want_op(&w, &route_c, "c"), &hl).is_none());
+}
+
+#[test]
+fn json_ops_over_a_session_fire_their_fault_point_once() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    let p = pair(|a| {
+        file(a, "f", b"f");
+    });
+    let root = p.a.root.clone();
+    let engine: runtime::Shared = Arc::new(Mutex::new(Engine::new(p.a)));
+    let info = runtime::start_rpc(engine.clone(), &root, None).unwrap();
+    let conn = session::dial_loopback(&info.address, None, ConnOptions::default()).unwrap();
+    // Two hangs of 1.5 s on `worker.rpc.mount-status` (an op no other test
+    // of this binary sends): one per call, as over the JSON RPC. A
+    // session that fired the point twice per call would spend both hangs
+    // on the first call and none on the second.
+    let hang = Duration::from_millis(1500);
+    fault::configure(Some(FaultConfig {
+        point: "worker.rpc.mount-status".into(),
+        scope: None,
+        action: FaultAction::Hang,
+        ms: Some(hang.as_millis() as u64),
+        count: Some(2),
+    }));
+    let mut took = vec![];
+    for _ in 0..2 {
+        let started = Instant::now();
+        let status = conn.call(
+            "mount-status",
+            json!({}),
+            vec![],
+            Priority::Control,
+            Duration::from_secs(20),
+        );
+        took.push(started.elapsed());
+        assert!(status.is_ok(), "{status:?}");
+    }
+    fault::configure(None);
+    assert!(took.iter().all(|t| *t >= hang), "{took:?}");
+    engine
+        .lock()
+        .unwrap()
+        .stopping
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[test]

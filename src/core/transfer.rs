@@ -13,9 +13,9 @@
 //! lives in `spool_state` (invariant 2), whole-object verification before
 //! install (invariant 1), and one registration transaction per call after the
 //! installs (invariant 3). The legacy page receiver (`receive_part`) keeps
-//! its semantics and records its spools in `spool_state` too, so one spool
-//! never has two notions of its durable length.
-use super::objects::{AVAILABLE, STAMP_SECS, stamp};
+//! its semantics and records its spools that span parts in `spool_state` too,
+//! so one spool never has two notions of its durable length.
+use super::objects::{AVAILABLE, STAMP_SECS, rename_object, stamp, sync_dir};
 use super::*;
 use crate::model::errors::ErrorWire;
 pub use crate::model::protocol::objects::{
@@ -312,8 +312,9 @@ impl Store {
         }
         self.in_savepoint("register_received", || self.register_rows(completed))
     }
-    /// File I/O only: the caller registers completed objects on its serialized
-    /// metadata connection. This avoids SQLite snapshot-upgrade races.
+    /// File I/O, apart from the spool rows (`receive_part`): the caller
+    /// registers completed objects on its serialized metadata connection. This
+    /// avoids SQLite snapshot-upgrade races.
     pub fn receive_parts_data(
         &self,
         parts: BTreeMap<String, ObjectPart>,
@@ -338,9 +339,11 @@ impl Store {
             None => Ok(completed),
         }
     }
-    /// Receive each part independently (file I/O; the only writes are index
-    /// heals). Page-level checks (`UNAUTHORIZED_EVENT`) fail the call; every
-    /// per-object problem becomes `PartOutcome::Failed` for that object only.
+    /// Receive each part independently (file I/O; the only database writes
+    /// are index heals and the `spool_state` row of a spool that spans parts,
+    /// see `receive_part`). Page-level checks (`UNAUTHORIZED_EVENT`) fail the
+    /// call; every per-object problem becomes `PartOutcome::Failed` for that
+    /// object only.
     ///
     /// An object is authorized when a committed shared event, or one of
     /// `events`, references it. After taking the object lock, an object that
@@ -416,9 +419,12 @@ impl Store {
         };
         // Re-checked under the object lock: another lane may have just finished.
         if self.object_shareable(object)? && self.object_available_for_demand(object) {
-            // Duplicate part: no re-hash. Drop an orphaned spool, if any.
-            let _ = fs::remove_file(&path);
-            let _ = self.delete_spool_row(object);
+            // Duplicate part: no re-hash. Drop an orphaned spool, if any (a
+            // row without its spool is harmless: every reader clamps it to
+            // the file, and the next open drops it).
+            if fs::remove_file(&path).is_ok() {
+                let _ = self.delete_spool_row(object);
+            }
             return Ok(skipped());
         }
         ensure!(
@@ -438,6 +444,9 @@ impl Store {
             "INVALID_OBJECT_PART"
         );
         let existing = OpenOptions::new().read(true).write(true).open(&path);
+        // Whether this spool may have a `spool_state` row (it existed before
+        // this part); a spool this part creates has none.
+        let mut row = existing.is_ok();
         let mut file = match existing {
             Ok(file) => file,
             // A peer may retain a pre-crash resume cursor. Never create a spool
@@ -495,11 +504,14 @@ impl Store {
             synced = true;
             length += bytes.len() as u64;
         }
-        if synced {
+        if synced && length != part.total {
             // Each append is fsynced before it is reported (the legacy rule);
             // the row keeps the v3 path and the startup reconciliation in step.
-            // Best effort: a missing row only costs a re-transfer.
-            let _ = self.upsert_spool(object, length, Some(part.total));
+            // Best effort: a missing row only costs a re-transfer. One
+            // autocommit per part that leaves its object incomplete; an
+            // object received in one part (every tiny one) costs none: it is
+            // completed, or its spool dropped, right below.
+            row = self.upsert_spool(object, length, Some(part.total)).is_ok() || row;
         }
         if length != part.total {
             return Ok(PartOutcome::Appended {
@@ -517,7 +529,9 @@ impl Store {
         if stream_hash(&mut file)? != object {
             drop(file);
             fs::remove_file(&path)?;
-            let _ = self.delete_spool_row(object);
+            if row {
+                let _ = self.delete_spool_row(object);
+            }
             bail!("CORRUPT_OBJECT: {object}");
         }
         stamp(&file)?;
@@ -535,7 +549,9 @@ impl Store {
             #[cfg(unix)]
             fs::File::open(&folder)?.sync_all()?;
         }
-        let _ = self.delete_spool_row(object);
+        if row {
+            let _ = self.delete_spool_row(object);
+        }
         // A crash here leaves an installed, unregistered object. It is not
         // shareable, so it stays wanted and is safely transferred again (I4).
         fault("object_installed");
@@ -554,6 +570,18 @@ pub const MAX_WRITE_ITEMS: usize = 4096;
 /// `config` marker: legacy spools (written before `spool_state` existed) were
 /// adopted at their file length, once (§6.4).
 pub const SPOOLS_MARKER: &str = "spools_v1";
+/// Set once the directory fsync of a batch of installs failed: from then on
+/// this process installs each object with its own durable rename.
+static DIR_SYNC_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What phase C did with one complete spool.
+enum Finish {
+    /// The bytes did not hash to the object: the spool was dropped.
+    Corrupt,
+    /// In `objects/`: `barrier` when the call's directory fsync must still
+    /// make it durable before registration.
+    Installed { barrier: bool },
+}
 
 /// One `spool_state` row: the committed durable offset of a spool, and the
 /// object's total size when known (`-1` in the table otherwise).
@@ -873,15 +901,22 @@ impl Store {
     ///    An append must start at that offset (`RESUME_OFFSET_AHEAD`
     ///    otherwise); bytes before it are compared byte for byte with the
     ///    spool, and a mismatch resets the spool (`OBJECT_PART_CHANGED`). A
-    ///    spool that changed is fsynced once.
+    ///    spool that changed is fsynced once. The appends and fsyncs of
+    ///    concurrent calls take turns (the spool I/O gate of `ObjectLocks`).
     /// 2. **Phase B, commit**: one transaction records the new durable offset
     ///    of every incomplete spool. Only after it commits is an offset
     ///    advertised (`Progressed{durable_offset}`, invariant 2).
     /// 3. **Phase C, verify and install** each complete object: a full re-read
     ///    SHA-256 of the spool; a mismatch drops the spool and answers
-    ///    `CorruptAtSource` (nothing is installed, invariant 1). A match is
-    ///    stamped and installed (`MoveFileExW` WRITE_THROUGH, or a rename plus
-    ///    directory fsync).
+    ///    `CorruptAtSource` (nothing is installed, invariant 1). A match
+    ///    (stamped before its data fsync) is renamed into `objects/`, and one
+    ///    fsync of `objects/` makes the call's renames durable before any of
+    ///    them is registered ("rename plus directory fsync"; on Windows
+    ///    `FlushFileBuffers` on the directory). If that directory fsync ever
+    ///    fails, the call's renamed objects are answered `OBJECT_IO_ERROR`
+    ///    (not registered, still wanted) and this process installs each
+    ///    object with its own durable rename from then on (`MoveFileExW`
+    ///    WRITE_THROUGH, or rename plus directory fsync).
     /// 4. **Phase D, registration** of every object installed by this call in
     ///    one transaction (sizes, `received_shared_objects`, requests and error
     ///    state cleared, availability, spool rows dropped). A crash between
@@ -938,8 +973,10 @@ impl Store {
             })
             .collect();
 
-        // Phase A: append and fsync.
+        // Phase A: append and fsync (the spool I/O gate held: concurrent
+        // calls take turns at the disk, see `ObjectLocks`).
         let mut groups = Vec::with_capacity(by_object.len());
+        let io = locks.spool_io();
         for (object, indices) in &by_object {
             match self.append_group(object, indices, items, &slices, &mut results) {
                 Ok(group) => groups.push(group),
@@ -957,6 +994,7 @@ impl Store {
                 }
             }
         }
+        drop(io);
         // A crash here leaves fsynced bytes past the recorded offset: never
         // advertised, cut back at the next open (invariant 2).
         fault("object_spool_synced");
@@ -1001,14 +1039,26 @@ impl Store {
             }
         }
 
-        // Phase C: verify and install complete objects.
+        // Phase C: verify and install complete objects: renames into
+        // `objects/`, made durable together by one directory fsync before
+        // any is registered ("rename plus directory fsync", §6.4).
+        let batched = !DIR_SYNC_FAILED.load(std::sync::atomic::Ordering::Relaxed);
         let mut installed: Vec<(String, u64)> = vec![];
+        let mut awaiting: Vec<usize> = vec![];
         let mut dropped: Vec<String> = vec![];
         let mut unfinished: Vec<(String, u64)> = vec![];
-        for group in groups.iter_mut().filter(|g| !g.settled && g.complete) {
-            match self.finish_group(group) {
-                Ok(true) => installed.push((group.hash.clone(), group.total)),
-                Ok(false) => {
+        for (g, group) in groups.iter_mut().enumerate() {
+            if group.settled || !group.complete {
+                continue;
+            }
+            match self.finish_group(group, locks, batched) {
+                Ok(Finish::Installed { barrier }) => {
+                    installed.push((group.hash.clone(), group.total));
+                    if barrier {
+                        awaiting.push(g);
+                    }
+                }
+                Ok(Finish::Corrupt) => {
                     dropped.push(group.hash.clone());
                     for &index in &group.pending {
                         results[index] =
@@ -1021,6 +1071,27 @@ impl Store {
                     unfinished.push((group.hash.clone(), group.total));
                     for &index in &group.pending {
                         results[index] = Some(failed(&group.hash, wire.clone(), group.committed));
+                    }
+                }
+            }
+        }
+        if !awaiting.is_empty() {
+            let synced = {
+                let _io = locks.spool_io();
+                sync_dir(&self.root.join("objects"))
+            };
+            if let Err(error) = synced {
+                // Not known durable: not registered. They stay wanted, and the
+                // next transfer verifies the present copy and registers it.
+                DIR_SYNC_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+                let wire =
+                    ErrorWire::coded("OBJECT_IO_ERROR", format!("objects/ fsync: {error:#}"));
+                for &g in &awaiting {
+                    let group = &groups[g];
+                    installed.retain(|(hash, _)| *hash != group.hash);
+                    dropped.push(group.hash.clone());
+                    for &index in &group.pending {
+                        results[index] = Some(failed(&group.hash, wire.clone(), 0));
                     }
                 }
             }
@@ -1146,12 +1217,13 @@ impl Store {
         let path = spool_path(&self.root, object);
         let facts = self.write_facts(object)?;
         if facts.shareable && self.object_available_for_demand(object) {
-            // Already ours: drop an orphaned spool, nothing to transfer.
-            if facts.row.is_some() || path.exists() {
-                let _ = fs::remove_file(&path);
-                self.delete_spool_row(object)?;
-            }
+            // Already ours: drop an orphaned spool, nothing to transfer. Its
+            // row goes in phase B's transaction, not in an autocommit under
+            // the spool I/O gate.
+            let _ = fs::remove_file(&path);
             settle(ObjectOutcome::Skipped, total);
+            group.record = facts.row.is_some();
+            group.settled = !group.record;
             return Ok(group);
         }
         if !facts.referenced {
@@ -1324,9 +1396,17 @@ impl Store {
     }
 
     /// Phase C of `write_object_items` for one complete spool (its lock held):
-    /// `Ok(true)` once installed, `Ok(false)` when the bytes do not hash to the
-    /// object (the spool is dropped).
-    fn finish_group(&self, group: &mut Group) -> Result<bool> {
+    /// a whole-object hash, then the install. `batched`: the install is a
+    /// plain rename that the call's directory fsync makes durable (a verified
+    /// copy already present is covered by it too); otherwise a durable rename
+    /// of its own (`install_object`). The install takes the spool I/O gate;
+    /// the hash runs outside it.
+    fn finish_group(
+        &self,
+        group: &mut Group,
+        locks: &ObjectLocks,
+        batched: bool,
+    ) -> Result<Finish> {
         let object = group.hash.clone();
         let path = spool_path(&self.root, &object);
         let mut file = match group.file.take() {
@@ -1337,7 +1417,7 @@ impl Store {
         if hash_from_start(&mut file, group.total)? != object {
             drop(file);
             fs::remove_file(&path)?;
-            return Ok(false);
+            return Ok(Finish::Corrupt);
         }
         drop(file);
         let dest = self.root.join("objects").join(&object);
@@ -1346,14 +1426,17 @@ impl Store {
             // keep it; this transfer still proves the source's copy (I4).
             fs::remove_file(&path)?;
         } else {
+            let _io = locks.spool_io();
             if dest.exists() {
                 fs::rename(&dest, dest.with_extension(format!("corrupt-{}", id())))?;
             }
-            // `install_object` makes the rename durable (WRITE_THROUGH, or
-            // the destination directory's fsync) before registration.
-            install_object(&path, &dest)?;
+            if batched {
+                rename_object(&path, &dest)?;
+            } else {
+                install_object(&path, &dest)?;
+            }
         }
-        Ok(true)
+        Ok(Finish::Installed { barrier: batched })
     }
 
     /// The rows of `register_received`, on the caller's transaction.
