@@ -534,6 +534,61 @@ fn every_folder_peer_state_has_its_chip() {
     }
 }
 
+#[test]
+fn a_lane_backoff_already_past_never_hides_the_next_retry() {
+    use FolderPeerState as P;
+    use FolderSyncState as F;
+    // One lane's backoff ended a moment ago; another retries in 7 s.
+    let home = PeerStatus {
+        lanes: vec![
+            LaneStatus {
+                lane: 0,
+                state: LaneState::Backoff,
+                backoff_until_ms: Some(NOW - 5 * SEC),
+                ..LaneStatus::default()
+            },
+            LaneStatus {
+                lane: 1,
+                role: LaneRole::Bulk,
+                state: LaneState::Backoff,
+                backoff_until_ms: Some(NOW + 7 * SEC),
+                ..LaneStatus::default()
+            },
+        ],
+        ..peer("home", PeerConnState::Backoff)
+    };
+    let mut s = snapshot(
+        vec![with_sync(
+            folder("a", "Docs"),
+            F::Backoff,
+            vec![pair("home", P::Backoff)],
+        )],
+        vec![home],
+    );
+    // The folder's chip, the pair's chip and the peer's badge agree.
+    assert_eq!(row(&s).sync.text, "Retrying in 7 s");
+    let names = Names::of(&s);
+    let now = Now::of(&s);
+    assert_eq!(
+        ui_model::folder_peer_chip(&s.folders[0].sync.peers[0], &names, now).text,
+        "Backoff (retry in 7 s)"
+    );
+    assert_eq!(
+        ui_model::peer_rows(&s)[0].badge.text,
+        "Backoff (retry in 7 s)"
+    );
+    // A folder waiting for that peer names the same retry.
+    s.folders[0].sync.state = F::Offline;
+    assert_eq!(row(&s).sync.text, "Waiting for home (retry in 7 s)");
+    // The pair's own backoff, when it is past, falls back the same way; when
+    // nothing is ahead, no time is shown.
+    s.folders[0].sync.state = F::Backoff;
+    s.folders[0].sync.peers[0].backoff_until_ms = Some(NOW - SEC);
+    assert_eq!(row(&s).sync.text, "Retrying in 7 s");
+    s.peers[0].lanes[1].backoff_until_ms = Some(NOW - 2 * SEC);
+    assert_eq!(row(&s).sync.text, "Retrying");
+}
+
 // -- every PeerConnState -----------------------------------------------------
 
 #[test]
@@ -1667,6 +1722,8 @@ enum Step {
     Fail,
     /// Blocks until the test sends on the channel, then answers the snapshot.
     Hold(mpsc::Receiver<()>, StatusSnapshot),
+    /// Blocks until the test sends on the channel, then answers like `Gone`.
+    GoneAfter(mpsc::Receiver<()>),
 }
 
 #[derive(Clone)]
@@ -1690,6 +1747,12 @@ impl StatusTransport for FakeStatus {
             Some(Step::Hold(release, s)) => {
                 let _ = release.recv_timeout(Duration::from_secs(20));
                 Ok(s)
+            }
+            Some(Step::GoneAfter(release)) => {
+                let _ = release.recv_timeout(Duration::from_secs(20));
+                Err(TransportError::DaemonGone(
+                    "ORCHESTRATOR_NOT_RUNNING".into(),
+                ))
             }
             None => {
                 thread::sleep(wait.min(Duration::from_millis(50)));
@@ -1810,12 +1873,15 @@ fn feed_respawns_a_gone_daemon_and_reconnects_with_backoff() {
 #[test]
 fn feed_never_respawns_after_a_desktop_shutdown_until_asked() {
     let (release, hold) = mpsc::channel();
+    let (asked, ask) = mpsc::channel();
     let h = harness(
         vec![
             Step::Hold(hold, gen_snapshot(1, 1)),
             Step::Gone,
             Step::Gone,
-            Step::Gone,
+            // Answers only once the test has asked for a daemon, however
+            // late the test thread gets there.
+            Step::GoneAfter(ask),
         ],
         fast(),
     );
@@ -1833,11 +1899,108 @@ fn feed_never_respawns_after_a_desktop_shutdown_until_asked() {
     assert_eq!(h.starts.load(Ordering::SeqCst), 0);
     // "Start daemon" starts one at the next failure, whatever the interval.
     h.feed.start_daemon();
+    asked.send(()).unwrap();
     let FeedUpdate::Down(down) = next(&h) else {
         panic!("down")
     };
     assert!(down.started.is_some());
     assert_eq!(h.starts.load(Ordering::SeqCst), 1);
+    h.feed.stop();
+}
+
+fn down(h: &Harness) -> ui_model::FeedDown {
+    match next(h) {
+        FeedUpdate::Down(down) => down,
+        FeedUpdate::Snapshot(s) => panic!("a down, not snapshot {}", s.generation),
+    }
+}
+
+#[test]
+fn feed_desktop_shutdown_holds_until_another_daemon_answers() {
+    let (straggler, release_straggler) = mpsc::channel();
+    let (restarted, release_restarted) = mpsc::channel();
+    let h = harness(
+        vec![
+            Step::Snap(gen_snapshot(1, 1)),
+            Step::Hold(release_straggler, gen_snapshot(2, 1)),
+            Step::Gone,
+            Step::Hold(release_restarted, gen_snapshot(1, 2)),
+            Step::Gone,
+        ],
+        fast(),
+    );
+    assert_eq!(next_snapshot(&h).daemon.pid, 1);
+    // Shut down from the window; the daemon being shut down still answers
+    // once (a long poll that was in flight), then goes away.
+    h.feed.set_respawn(false);
+    straggler.send(()).unwrap();
+    assert_eq!(next_snapshot(&h).generation, 2);
+    let gone = down(&h);
+    assert!(gone.daemon_gone && gone.respawn_off, "{gone:?}");
+    assert_eq!(gone.started, None, "the shut-down daemon stays down");
+    // The user starts a daemon from the CLI and the window reconnects; when
+    // that daemon crashes, it is started again.
+    restarted.send(()).unwrap();
+    assert_eq!(next_snapshot(&h).daemon.pid, 2);
+    let crashed = down(&h);
+    assert!(crashed.daemon_gone && !crashed.respawn_off, "{crashed:?}");
+    assert!(crashed.started.is_some(), "{crashed:?}");
+    assert_eq!(h.starts.load(Ordering::SeqCst), 1);
+    h.feed.stop();
+}
+
+#[test]
+fn feed_respawns_again_once_a_daemon_answers_after_a_cli_shutdown() {
+    // `tkfs manage shutdown` (a stopping snapshot, then gone), a daemon
+    // started again from the CLI (a new pid), then that daemon crashes.
+    let mut stopping = gen_snapshot(4, 1);
+    stopping.daemon.stopping = true;
+    let h = harness(
+        vec![
+            Step::Snap(stopping),
+            Step::Gone,
+            Step::Snap(gen_snapshot(1, 2)),
+            Step::Gone,
+        ],
+        fast(),
+    );
+    assert!(next_snapshot(&h).daemon.stopping);
+    let shut = down(&h);
+    assert!(shut.deliberate && shut.respawn_off && shut.started.is_none());
+    assert_eq!(next_snapshot(&h).daemon.pid, 2);
+    let crashed = down(&h);
+    assert!(!crashed.deliberate && !crashed.respawn_off, "{crashed:?}");
+    assert!(crashed.started.is_some(), "{crashed:?}");
+    assert_eq!(h.starts.load(Ordering::SeqCst), 1);
+    h.feed.stop();
+}
+
+#[test]
+fn feed_drops_a_start_request_that_a_reconnect_made_moot() {
+    // "Try again" is clicked while the feed is down, but the daemon answers
+    // before the next failure; later it is shut down on purpose.
+    let (release, hold) = mpsc::channel();
+    let mut stopping = gen_snapshot(2, 1);
+    stopping.daemon.stopping = true;
+    let h = harness(
+        vec![
+            Step::Hold(hold, gen_snapshot(1, 1)),
+            Step::Snap(stopping),
+            Step::Gone,
+            Step::Gone,
+        ],
+        fast(),
+    );
+    h.feed.start_daemon();
+    release.send(()).unwrap();
+    assert_eq!(next_snapshot(&h).generation, 1);
+    assert!(next_snapshot(&h).daemon.stopping);
+    for _ in 0..2 {
+        let shut = down(&h);
+        assert!(shut.deliberate && shut.respawn_off, "{shut:?}");
+        assert_eq!(shut.started, None, "the stale request does not undo it");
+    }
+    assert_eq!(h.starts.load(Ordering::SeqCst), 0);
     h.feed.stop();
 }
 
