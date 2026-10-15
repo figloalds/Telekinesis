@@ -18,7 +18,11 @@
 //! * **status cell**: `status_cell::refresh_full` about once a second, spaced
 //!   to at least four times its own duration (a cold content scan of a large
 //!   repository during active sync costs hundreds of ms; the spacing caps its
-//!   CPU share at about 20 %);
+//!   CPU share at about 20 %). On an idle store it reads back what the
+//!   connection computed before: the content scan, the journal counters and
+//!   the inventory match are cached until the database changes (WP2.INT's
+//!   post-integration re-review; the last two were recomputed every tick,
+//!   about a fifth of a core per idle folder of 20K+ events);
 //! * **scrubber**: `Store::scrub_step` at most [`SCRUB_RATE`] bytes per
 //!   second, only while the background activator runs and has been idle for
 //!   [`SCRUB_QUIET`], and only when some available object is unverified or

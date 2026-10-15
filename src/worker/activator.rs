@@ -39,15 +39,24 @@
 //!    activator never waits for another writer while holding the engine
 //!    (`fail_busy`, up to [`WRITER_PATIENCE`]);
 //! 4. a `SlowTicket` is prepared off-lock (`Store::prepare_slow` on a pooled
-//!    `SyncStore`) and committed under the lock (`commit_prepared`;
-//!    `Prepared::Inline` runs the slow path there until WP2.4's off-lock
-//!    preparation lands). A `Stale` ticket is re-queued with a per-event
-//!    backoff (250 ms → 30 s), never committed inline; while tickets keep
-//!    going stale, `activation.starved_since_ms` is set. A ticket whose
-//!    preparation (or commit) fails is re-queued with the same per-event
-//!    backoff, so one bad event never stalls the others behind it; only a
-//!    store-wide failure (no secondary connection, a failing re-queue, a
-//!    failing slice) backs the whole loop off;
+//!    `SyncStore`) and committed under the lock
+//!    (`commit_prepared_unless_busy`). Like a slice, the commit and the
+//!    re-queues around it never wait for another connection's writer under
+//!    the engine lock (up to [`WRITER_PATIENCE`]): a busy writer hands the
+//!    preparation back, and it is committed after [`WRITER_RETRY`]
+//!    (WP2.INT's post-integration re-review). A `Stale` ticket is re-queued
+//!    with a per-event backoff (250 ms → 30 s); after [`STALE_ESCALATE`]
+//!    consecutive `Stale` outcomes the event is committed inline, alone, the
+//!    next time it comes up (`Prepared::Inline`: one O(history) hold for that
+//!    event instead of starving behind a local writer that commits more
+//!    often than a preparation takes; CCR-WP2.INT-1, §4.4).
+//!    `activation.starved_since_ms` is the first `Stale` time of the oldest
+//!    event still starving: it clears when that event commits, is
+//!    quarantined or leaves the inbox, never on unrelated activations. A
+//!    ticket whose preparation (or commit) fails is re-queued with the same
+//!    per-event backoff, so one bad event never stalls the others behind it;
+//!    only a store-wide failure (no secondary connection, a failing
+//!    re-queue, a failing slice) backs the whole loop off;
 //! 5. record the counters, bump `ctx.status_generation` and refresh the
 //!    status cell (which wakes the heartbeat: `generations.sync` moves);
 //! 6. after a seal (and every [`CHECKPOINT_EVERY`] committing slices) the
@@ -156,6 +165,12 @@ pub const WRITER_PATIENCE: Duration = Duration::from_secs(2);
 /// Per-event re-queue backoff (`Stale` tickets, failed preparations).
 const EVENT_BASE: Duration = Duration::from_millis(250);
 const EVENT_CAP: Duration = Duration::from_secs(30);
+/// Consecutive `Stale` outcomes after which an event is committed inline
+/// (CCR-WP2.INT-1; about 3.75 s of re-queue backoff before it).
+pub const STALE_ESCALATE: u32 = 4;
+/// How often the starving events are checked against the inbox (an event
+/// that left it no longer starves).
+const STARVING_CHECK: Duration = Duration::from_secs(1);
 /// Events whose failure count is remembered (oldest forgotten first).
 const EVENTS_TRACKED: usize = 1024;
 /// The pause after a slice that left more rows but committed nothing.
@@ -686,6 +701,19 @@ struct Activator {
     /// Since when slices keep finding SQLite's writer held by another
     /// connection.
     writer_busy_since: Option<Instant>,
+    /// Events whose last slow commit was `Stale`: when they first went
+    /// stale (`now_ms`) and how many times in a row (`starved_since_ms`,
+    /// [`STALE_ESCALATE`]).
+    starving: BTreeMap<String, Starving>,
+    /// When `starving` was last checked against the inbox.
+    starving_checked: Option<Instant>,
+}
+
+/// One event whose slow commit keeps going `Stale`.
+#[derive(Clone, Copy, Debug)]
+struct Starving {
+    since_ms: u64,
+    stale: u32,
 }
 
 impl Activator {
@@ -700,7 +728,58 @@ impl Activator {
             since_checkpoint: 0,
             cache_raised: false,
             writer_busy_since: None,
+            starving: BTreeMap::new(),
+            starving_checked: None,
         }
+    }
+
+    /// `activation.starved_since_ms`: the first `Stale` time of the oldest
+    /// event still starving.
+    fn refresh_starved(&mut self) {
+        self.counters.starved_since_ms = self.starving.values().map(|s| s.since_ms).min();
+    }
+
+    /// Events that committed or were quarantined no longer starve.
+    fn settled(&mut self, ids: impl IntoIterator<Item = impl AsRef<str>>) {
+        if self.starving.is_empty() {
+            return;
+        }
+        for id in ids {
+            self.starving.remove(id.as_ref());
+        }
+        self.refresh_starved();
+    }
+
+    /// Drops starving events that left the inbox (committed by another
+    /// path, revalidated away, deleted), at most every [`STARVING_CHECK`].
+    /// Point lookups on a pooled secondary store.
+    fn check_starving(&mut self, ctx: &WorkerCtx) {
+        if self.starving.is_empty()
+            || self
+                .starving_checked
+                .is_some_and(|at| at.elapsed() < STARVING_CHECK)
+        {
+            return;
+        }
+        self.starving_checked = Some(Instant::now());
+        let Ok(store) = ctx.sync_stores.checkout() else {
+            return;
+        };
+        let gone: Vec<String> = self
+            .starving
+            .keys()
+            .filter(|id| {
+                store
+                    .db
+                    .prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM incoming_events WHERE id=?1 AND state IN ('ready','retry'))",
+                    )
+                    .and_then(|mut statement| statement.query_row([id.as_str()], |r| r.get(0)))
+                    .is_ok_and(|pending: bool| !pending)
+            })
+            .cloned()
+            .collect();
+        self.settled(gone);
     }
 
     /// Nothing to do: a notification batch still open (its last slice
@@ -788,8 +867,11 @@ impl Activator {
         self.counters.quarantined += slice.quarantined.len() as u64;
         if !slice.activated.is_empty() {
             self.counters.last_activation_at_ms = Some(now_ms());
-            self.counters.starved_since_ms = None;
         }
+        // Only the starving events themselves end their starvation.
+        self.settled(slice.activated.iter());
+        self.settled(slice.quarantined.iter().map(|(id, _)| id));
+        self.check_starving(ctx);
         let journaled = slice.fast + slice.slow > 0;
         self.sealed |= sealed;
         let mut more = slice.more;
@@ -843,9 +925,24 @@ impl Activator {
     /// whether the store changed. A failed preparation or commit re-queues
     /// the ticket's event with its own backoff (the other events go on);
     /// only a store-wide failure (no secondary connection, a failing
-    /// re-queue) fails the cycle.
+    /// re-queue) fails the cycle. An event that went `Stale`
+    /// [`STALE_ESCALATE`] times in a row is committed inline instead
+    /// (`Prepared::Inline`, alone; CCR-WP2.INT-1).
     fn slow(&mut self, ctx: &WorkerCtx, ticket: SlowTicket) -> Result<bool> {
-        let prepared = {
+        let escalated = self
+            .starving
+            .get(&ticket.id)
+            .is_some_and(|starving| starving.stale >= STALE_ESCALATE);
+        let prepared = if escalated {
+            crate::util::log::event!(warn, STALE, {
+                "site": "worker.activator",
+                "event": ticket.id,
+                "branch": ticket.branch,
+                "detail": "the event keeps going stale behind local writes: committed inline",
+                "stale": self.starving.get(&ticket.id).map_or(0, |s| s.stale),
+            });
+            Ok(crate::core::inbox::Prepared::Inline(ticket.clone()))
+        } else {
             let read = ctx.sync_stores.checkout()?;
             // Fault point `worker.activator.prepare.<repo>` (tests): scoped
             // to one in-process worker's repository, so arming it never
@@ -860,29 +957,15 @@ impl Activator {
                 return Ok(true);
             }
         };
-        self.others.yield_to(&ctx.gauges, &self.vitals);
-        let outcome = {
-            let mut engine = lock_engine(&ctx.engine);
-            let _holding = engine.vitals.activator_hold();
-            self.begin_batch(&engine);
-            let outcome = engine.store.commit_prepared(prepared);
-            match &outcome {
-                Ok(CommitOutcome::Committed { id, .. }) => {
-                    self.activated(&mut engine, std::slice::from_ref(id));
-                }
-                Ok(CommitOutcome::Stale) | Err(_) => {
-                    let delay = self.event_backoff(&ticket.id);
-                    engine.store.requeue(&ticket.id, delay)?;
-                }
-                Ok(CommitOutcome::Failed(_)) => {}
-            }
-            outcome
+        let Some(outcome) = self.commit(ctx, prepared) else {
+            // Stopping: the row stays staged for the next start.
+            return Ok(false);
         };
-        self.others.released(&ctx.gauges, &self.vitals);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
-                // Re-queued above, under the same lock.
+                let delay = self.event_backoff(&ticket.id);
+                self.requeue(ctx, &ticket.id, delay)?;
                 self.counters.retried += 1;
                 log_event_failure(&ticket, "commit", &error);
                 return Ok(true);
@@ -891,6 +974,7 @@ impl Activator {
         Ok(match outcome {
             CommitOutcome::Committed { slow, .. } => {
                 self.failures.remove(&ticket.id);
+                self.settled([&ticket.id]);
                 self.counters.activated += 1;
                 if slow {
                     self.counters.slow += 1;
@@ -898,14 +982,20 @@ impl Activator {
                     self.counters.fast += 1;
                 }
                 self.counters.last_activation_at_ms = Some(now_ms());
-                self.counters.starved_since_ms = None;
                 // Every slow-path commit seals the snapshot (REVAMP_PLAN P4).
                 self.sealed = true;
                 true
             }
             CommitOutcome::Stale => {
+                let delay = self.event_backoff(&ticket.id);
+                self.requeue(ctx, &ticket.id, delay)?;
                 self.counters.stale += 1;
-                self.counters.starved_since_ms.get_or_insert_with(now_ms);
+                let starving = self.starving.entry(ticket.id.clone()).or_insert(Starving {
+                    since_ms: now_ms(),
+                    stale: 0,
+                });
+                starving.stale = starving.stale.saturating_add(1);
+                self.refresh_starved();
                 crate::util::log::event!(info, STALE, {
                     "site": "worker.activator",
                     "event": ticket.id,
@@ -915,6 +1005,7 @@ impl Activator {
             }
             CommitOutcome::Failed(error) => {
                 self.failures.remove(&ticket.id);
+                self.settled([&ticket.id]);
                 if error.class == ErrorClass::Fatal || error.class == ErrorClass::NeedsUserAction {
                     self.counters.quarantined += 1;
                 } else {
@@ -923,6 +1014,87 @@ impl Activator {
                 true
             }
         })
+    }
+
+    /// Commits `prepared` under the engine lock without waiting there for
+    /// another connection's writer: within [`WRITER_PATIENCE`] the commit's
+    /// `BEGIN IMMEDIATE` gives up at once (`fail_busy`), the preparation
+    /// comes back and the commit is retried after [`WRITER_RETRY`] with the
+    /// engine free meanwhile (as a slice is; WP2.INT's post-integration
+    /// re-review: the commit used to poll for the writer for up to 5 s under
+    /// the lock). A busy attempt is neither `Stale` nor a failure. `None`
+    /// when the worker is stopping.
+    fn commit(
+        &mut self,
+        ctx: &WorkerCtx,
+        mut prepared: crate::core::inbox::Prepared,
+    ) -> Option<Result<CommitOutcome>> {
+        let since = Instant::now();
+        loop {
+            self.others.yield_to(&ctx.gauges, &self.vitals);
+            let attempt = {
+                let mut engine = lock_engine(&ctx.engine);
+                let _holding = engine.vitals.activator_hold();
+                self.begin_batch(&engine);
+                let fail_fast = since.elapsed() < WRITER_PATIENCE;
+                if fail_fast {
+                    let _ = engine.store.db.busy_handler(Some(fail_busy));
+                }
+                let attempt = engine.store.commit_prepared_unless_busy(prepared);
+                if fail_fast {
+                    let _ = engine.store.db.busy_handler(Some(poll_busy));
+                }
+                if let Ok(Ok(CommitOutcome::Committed { id, .. })) = &attempt {
+                    self.activated(&mut engine, std::slice::from_ref(id));
+                }
+                attempt
+            };
+            self.others.released(&ctx.gauges, &self.vitals);
+            match attempt {
+                Ok(Err(back)) => {
+                    if ctx.stopping.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    prepared = back;
+                    thread::sleep(WRITER_RETRY);
+                }
+                Ok(Ok(outcome)) => return Some(Ok(outcome)),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+    }
+
+    /// Re-queues `id` (due in `delay_ms`) under the engine lock, without
+    /// waiting there for another connection's writer within
+    /// [`WRITER_PATIENCE`] (as [`commit`](Self::commit)). A failure other
+    /// than a busy writer is store-wide: it fails the cycle.
+    fn requeue(&mut self, ctx: &WorkerCtx, id: &str, delay_ms: u64) -> Result<()> {
+        let since = Instant::now();
+        loop {
+            let attempt = {
+                let mut engine = lock_engine(&ctx.engine);
+                let _holding = engine.vitals.activator_hold();
+                let fail_fast = since.elapsed() < WRITER_PATIENCE;
+                if fail_fast {
+                    let _ = engine.store.db.busy_handler(Some(fail_busy));
+                }
+                let attempt = engine.store.requeue(id, delay_ms);
+                if fail_fast {
+                    let _ = engine.store.db.busy_handler(Some(poll_busy));
+                }
+                attempt
+            };
+            self.others.released(&ctx.gauges, &self.vitals);
+            match attempt {
+                Err(error) if writer_busy(&error) => {
+                    if ctx.stopping.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    thread::sleep(WRITER_RETRY);
+                }
+                attempt => return attempt,
+            }
+        }
     }
 
     /// A ticket whose preparation failed: its event goes back to `retry`
@@ -936,12 +1108,7 @@ impl Activator {
         error: &anyhow::Error,
     ) -> Result<()> {
         let delay = self.event_backoff(&ticket.id);
-        {
-            let mut engine = lock_engine(&ctx.engine);
-            let _holding = engine.vitals.activator_hold();
-            engine.store.requeue(&ticket.id, delay)?;
-        }
-        self.others.released(&ctx.gauges, &self.vitals);
+        self.requeue(ctx, &ticket.id, delay)?;
         self.counters.retried += 1;
         log_event_failure(ticket, "prepare", error);
         Ok(())
