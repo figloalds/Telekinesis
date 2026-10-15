@@ -623,6 +623,9 @@ fn catch_up_content(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>, meta: &Cel
         } else {
             Duration::ZERO
         };
+    // At most one refresh per call: one that ends without catching up (it
+    // failed, or a newer mutation came) leaves the next one to a later call.
+    let mut started = false;
     loop {
         // Under the job lock: a refresh that ended has merged its result.
         if caught_up() {
@@ -633,9 +636,10 @@ fn catch_up_content(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>, meta: &Cel
                 || state.last.is_none_or(|(took, ended)| {
                     ended.elapsed() >= took.saturating_mul(SLOW_REFRESH_SPACING)
                 });
-            if !spaced || ctx.stopping.load(Ordering::SeqCst) {
+            if started || !spaced || ctx.stopping.load(Ordering::SeqCst) {
                 return;
             }
+            started = true;
             if let Err(error) = spawn_content_refresh(ctx, vitals, &job) {
                 crate::util::log::event!(warn, UNKNOWN_ERROR, {
                     "site": "worker.status_cell",
