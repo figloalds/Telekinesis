@@ -2814,6 +2814,78 @@ pub struct WriteResult { pub hash: String, pub outcome: ObjectOutcome, pub durab
 
 ---
 
+### 14.5a Wave 4 addendum (coordinator, after WP3.INT)
+
+Wave 3 deferred several CCRs to Wave 4 that the original WP4.1–WP4.3 do not own. Two
+packages are added so that nothing deferred is dropped. Both depend on WP3.INT and run
+in parallel with WP4.1–WP4.3. **WP4.INT merge order becomes 4.2, 4.1, 4.4, 4.5, 4.3.**
+The CCR texts are in `docs/revamp/notes/wp2-int.md` and `docs/revamp/notes/wp3-int.md`.
+
+#### WP4.4 Seal path and inbox staging cost
+
+- **Goal:** startup-snapshot seals cost O(change), not O(projection), and never hold the
+  engine/commit lock for long; inbox staging cost stays bounded at scale.
+- **Owned:** `src/core/snapshot.rs`, `src/core/commit.rs`, `src/core/derive.rs`,
+  `src/core/inbox.rs`, `src/worker/activator.rs`, `tests/startup_snapshots.rs`,
+  `tests/seal_path.rs` (new), `tests/qual_wp4_4_seal.rs` (new, release scenarios).
+- **Tasks (CCRs):**
+  1. CCR-WP3.INT-4: a seal currently rewrites the whole projection (~1.4 KB/entry; 210 MB at
+     150K entries; a 150K catch-up writes ~15 GB of seals). Make seals incremental (a delta
+     chain or per-entry rows keyed by the acceptance cursor, compacted occasionally) with a
+     bounded per-seal cost.
+  2. CCR-WP2.3-2 / CCR-WP2.4-2 / CCR-WP2.3-5: prepare the seal off the commit lock and
+     commit it with a short critical section; keep `Store::seal_due_in` semantics.
+  3. CCR-WP2.INT-5: record conflict changes as a projection delta so slow commits with
+     conflicts do not rewrite the full conflict set.
+  4. CCR-WP2.5-6: bound `stage_incoming` cost at large inboxes (indexed lookups only).
+  5. Bump the snapshot format version (the §"Startup snapshots" rule) and keep the
+     fallback to full reconstruction for old, damaged or incompatible snapshots.
+- **Invariants:** 4 (atomic commit), 5 (snapshots are disposable), 11 (determinism).
+- **Acceptance:** crash tests with fault points at every seal step (before/after each
+  write, inside the commit) prove that restart either replays correctly or reconstructs;
+  the oracle (`verify_derived_state`) is empty after random workloads and crashes;
+  `qual_wp4_4_seal`: bytes written by seals during a 150K-event catch-up reduced ≥ 10×
+  versus WP3.INT and the engine-lock hold for any seal < 50 ms at 150K entries; all
+  existing `startup_snapshots`, `derive_oracle`, `qual_wp2_4_offlock` scenarios still pass.
+
+#### WP4.5 Objects v3 cleanup and tuning
+
+- **Goal:** remove the interim bulk path, close the deferred objects-v3 contract gaps and
+  tune the data plane for WAN use.
+- **Owned:** `src/orchestrator/objects.rs`, `src/orchestrator/inbound_objects.rs`,
+  `src/orchestrator/scheduler.rs`, `src/runtime/objects_rpc.rs`, `src/runtime/content.rs`,
+  `src/runtime/ctx.rs`, `src/core/transfer.rs`, `src/core/objects.rs`,
+  `src/core/demand.rs`, `src/session/io.rs`, `src/model/protocol.rs` (objects section,
+  additive only), `tests/objects_v3_worker.rs`, `tests/objects_v3_lanes.rs`,
+  `tests/qual_wp3_2_objects.rs`, and the interim-path tests in `tests/meta_scheduler.rs`
+  and `tests/inbound_v3.rs`. If interim-path code lives in a WP4.1-owned file
+  (`inbound.rs`, `peer.rs`), file a CCR for WP4.INT instead of editing it.
+- **Tasks (CCRs):**
+  1. CCR-WP3.3-2: delete the interim `objects.exchange` fallback (worker `published-bulk-*`
+     network use) and rewrite its tests; old peers already fail closed.
+  2. CCR-WP3.3-4: add `WantHeader.exclude` (or an explicit lease release) so a source that
+     cannot serve an object hands it to another source without waiting for lease expiry.
+  3. CCR-WP3.3-1: evaluate bulk exchange slots 4 vs the `PEER_CALLS = 2` adapter; keep the
+     setting that measures better on loopback and through FaultProxy at 50 ms RTT.
+  4. CCR-WP3.2-1: `fetch_verified` quarantines corrupt bytes through `Store::quarantine`
+     without holding the install lock across the engine store call.
+  5. CCR-WP3.2-3: move the per-root objects state statics into `WorkerCtx`.
+  6. CCR-WP3.INT-5: the fixed 4 MiB `SO_SNDBUF`/`SO_RCVBUF` disables Windows receive-window
+     autotuning on WAN sessions and queues data ahead of control frames; apply it only where
+     it measurably helps (e.g. loopback) and verify control latency under load.
+- **Invariants:** 1–3, 13, 19, 22.
+- **Acceptance:** all objects-v3 tests and the Wave 3 objects/e2e floors still pass;
+  a two-source scenario hands an object over without waiting for lease expiry; a
+  FaultProxy scenario at 50 ms RTT and 20 MiB/s link rate reaches ≥ 80 % utilisation;
+  control-frame latency under a saturated bulk lane stays < 100 ms.
+
+**WP4.INT additions:** apply CCR-WP3.1-3 (status scope for a non-paired endpoint),
+CCR-WP3.4-1 (hub prefers the controller's mount) and optionally CCR-WP2.8-4; reconcile
+WP4.5's CCRs against WP4.1-owned files; copy the two-machine lab results
+(`C:/tkfs-build/lab/results-*.{json,md}`, produced by the coordinator) into
+`test-evidence/lab/` and summarise them in `docs/VALIDATION.md`.
+
+
 ### 14.6 Qualification scenario catalog (created by WP0.5; owner un-ignores)
 
 | File | Scenarios (floors in §15) |
