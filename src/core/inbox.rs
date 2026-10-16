@@ -35,8 +35,9 @@
 //! row stays `ready`). `Store::prepare_slow` then computes that commit on a
 //! read handle, in a read transaction of its own, without the engine lock or
 //! the SQLite writer (`commit::Store::compute_slow`: event cache, projection,
-//! pure derivation, stored-projection delta, the projection's JSON and the
-//! seal's journal hash). `commit_prepared` re-checks the row, its links, the
+//! pure derivation, stored-projection delta and, when its write or an
+//! inline seal needs it, the projection's JSON; WP4.4). `commit_prepared`
+//! re-checks the row, its links, the
 //! commit validations and the branch's journal sequence under the lock and
 //! writes the computation; if the branch moved since the read the ticket is
 //! `Stale`, nothing is written and the caller re-queues it (`requeue`), never
@@ -69,6 +70,29 @@ const PREPARE_ROLLBACK_FAULT: &str = "core.prepare.rollback";
 
 /// Rows loaded per slice, both for classification and for the ready window.
 const WINDOW: usize = 512;
+/// A staging call of at least this many events raises its connection's page
+/// cache to [`STAGE_CACHE_KIB`] for its transaction (`stage_events`).
+const STAGE_CACHE_EVENTS: usize = 64;
+/// The page cache of a large staging transaction (KiB).
+const STAGE_CACHE_KIB: i64 = 32 * 1024;
+
+/// Raises `db`'s page cache to `kib` KiB unless it is that large already;
+/// returns the previous `cache_size` setting to restore (`None`: unchanged).
+fn raise_cache(db: &Connection, kib: i64) -> Option<i64> {
+    let previous: i64 = db.query_row("PRAGMA cache_size", [], |r| r.get(0)).ok()?;
+    let page: i64 = db.query_row("PRAGMA page_size", [], |r| r.get(0)).ok()?;
+    let current_kib = if previous < 0 {
+        -previous
+    } else {
+        previous.saturating_mul(page) / 1024
+    };
+    if current_kib >= kib {
+        return None;
+    }
+    db.execute_batch(&format!("PRAGMA cache_size=-{kib}"))
+        .ok()?;
+    Some(previous)
+}
 /// Retry backoff: `min(RETRY_CAP_MS, 2^attempts s)`, i.e. 1 s → 5 min.
 const RETRY_CAP_MS: u64 = 300_000;
 /// `schema:inbox` stamp.
@@ -391,6 +415,7 @@ pub(super) fn startup_drain(store: &mut Store, defer_activation: bool) -> Result
         // Fast-path activations seal the startup snapshot only every 128
         // events; seal once after the drain so the next start resumes at the
         // tip, as it did when every remote namespace event took the slow path.
+        // The seal writes what changed since the last one (WP4.4).
         let mut branches = BTreeSet::new();
         for id in &incremental {
             let branch: Option<String> = store
@@ -401,7 +426,7 @@ pub(super) fn startup_drain(store: &mut Store, defer_activation: bool) -> Result
         }
         for branch in branches {
             crate::startup::progress("sealing startup snapshot");
-            store.with_write("inbox_seal", |store| snapshot::persist(&store.db, &branch))?;
+            store.with_write("inbox_seal", |store| store.seal_branch(&branch))?;
         }
     }
     Ok(())
@@ -546,9 +571,27 @@ impl Store {
         strict: bool,
     ) -> Result<StageOutcome> {
         let view = self.keep_view();
+        // A large page is staged with a page cache sized for the inbox's
+        // random-key indexes, for this call only (CCR-WP2.5-6): with SQLite's
+        // default 2 MiB the index pages of a large inbox no longer fit, and
+        // each staged row's inserts re-read them (about 450 us per event at
+        // 40K staged rows against 50 us at an empty inbox; about 110 us with
+        // this cache, measured in release). The setting is restored after
+        // the call (a pooled connection keeps no extra memory).
+        let cache = if events.len() >= STAGE_CACHE_EVENTS {
+            raise_cache(&self.db, STAGE_CACHE_KIB)
+        } else {
+            None
+        };
         let outer = begin_write(&self.db, "inbox_stage")?;
         let result = self.stage_inner(events, allowed, strict);
         let result = finish_write(&self.db, "inbox_stage", outer, result);
+        if let Some(previous) = cache {
+            // Best effort: only a page cache size.
+            let _ = self
+                .db
+                .execute_batch(&format!("PRAGMA cache_size={previous}"));
+        }
         if result.is_ok() {
             self.rekey_view(view);
         }
@@ -616,18 +659,17 @@ impl Store {
                 continue;
             }
             if staged.is_none() {
-                self.db.execute(
-                    "INSERT INTO incoming_events(id,payload,state,received_ms,attempts) VALUES(?,?,?,?,0)",
-                    params![event.id, payload, WAITING, now],
-                )?;
+                // Classified before the insert, so the row is written once,
+                // in its state (CCR-WP2.5-6).
                 let class = self.classify_links(&event)?;
-                self.apply_class(&event.id, class)?;
+                self.insert_staged(&event.id, &payload, now, class)?;
             }
             if let Some((peer, seq)) = &source {
-                self.db.execute(
-                    "INSERT INTO incoming_sources(event,peer,seq) VALUES(?,?,?) ON CONFLICT(event,peer) DO UPDATE SET seq=excluded.seq",
-                    params![event.id, peer, seq],
-                )?;
+                self.db
+                    .prepare_cached(
+                        "INSERT INTO incoming_sources(event,peer,seq) VALUES(?,?,?) ON CONFLICT(event,peer) DO UPDATE SET seq=excluded.seq",
+                    )?
+                    .execute(params![event.id, peer, seq])?;
             }
             if staged.is_some() {
                 out.already_staged.push(event.id);
@@ -1017,21 +1059,80 @@ impl Store {
         }
         Ok(())
     }
+    /// Insert a new staged row already in its class's state: `ready` or
+    /// `waiting` (with its waits) in one insert, as `apply_class` would
+    /// leave it (CCR-WP2.5-6: no second write of the row and its state
+    /// index per event); a blocked or quarantined one through `apply_class`.
+    fn insert_staged(&self, id: &str, payload: &str, now: i64, class: Class) -> Result<()> {
+        let state = match &class {
+            Class::Ready => READY,
+            Class::Waiting(_) => WAITING,
+            Class::Blocked(_) | Class::Quarantined(_) => {
+                self.db
+                    .prepare_cached(
+                        "INSERT INTO incoming_events(id,payload,state,received_ms,attempts) VALUES(?,?,?,?,0)",
+                    )?
+                    .execute(params![id, payload, WAITING, now])?;
+                return self.apply_class(id, class);
+            }
+        };
+        self.db
+            .prepare_cached(
+                "INSERT INTO incoming_events(id,payload,state,received_ms,attempts) VALUES(?,?,?,?,0)",
+            )?
+            .execute(params![id, payload, state, now])?;
+        self.db
+            .prepare_cached("DELETE FROM incoming_waits WHERE child=?")?
+            .execute([id])?;
+        if let Class::Waiting(parents) = &class {
+            for parent in parents {
+                self.db
+                    .prepare_cached(
+                        "INSERT OR IGNORE INTO incoming_waits(child,parent) VALUES(?,?)",
+                    )?
+                    .execute(params![id, parent])?;
+            }
+        }
+        self.unblock(id)?;
+        if let Class::Waiting(parents) = &class {
+            self.quarantine_if_cycle(id, parents)?;
+        }
+        Ok(())
+    }
+    /// Quarantine `id`, now waiting on `parents`, if it closes a causal
+    /// cycle of staged rows.
+    fn quarantine_if_cycle(&self, id: &str, parents: &BTreeSet<String>) -> Result<()> {
+        // A cycle closes only when this event already has waiting
+        // children; then search its staged ancestry for itself.
+        if self.closes_cycle(id, parents)? {
+            let wire = ErrorWire {
+                code: "CAUSAL_CYCLE".into(),
+                class: ErrorClass::Fatal,
+                message: format!("CAUSAL_CYCLE: {id} is its own causal ancestor"),
+                retry_after_ms: None,
+            };
+            self.quarantine_event(id, &wire)?;
+        }
+        Ok(())
+    }
     /// Write a classification to an existing row (and its waits).
     fn apply_class(&self, id: &str, class: Class) -> Result<()> {
         match class {
             Class::Ready => {
                 self.db
-                    .execute("DELETE FROM incoming_waits WHERE child=?", [id])?;
-                self.db.execute(
-                    "UPDATE incoming_events SET state='ready',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL WHERE id=?",
-                    [id],
-                )?;
+                    .prepare_cached("DELETE FROM incoming_waits WHERE child=?")?
+                    .execute([id])?;
+                self.db
+                    .prepare_cached(
+                        "UPDATE incoming_events SET state='ready',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL WHERE id=?",
+                    )?
+                    .execute([id])?;
                 self.unblock(id)?;
             }
             Class::Waiting(parents) => {
                 self.db
-                    .execute("DELETE FROM incoming_waits WHERE child=?", [id])?;
+                    .prepare_cached("DELETE FROM incoming_waits WHERE child=?")?
+                    .execute([id])?;
                 for parent in &parents {
                     self.db
                         .prepare_cached(
@@ -1039,22 +1140,13 @@ impl Store {
                         )?
                         .execute(params![id, parent])?;
                 }
-                self.db.execute(
-                    "UPDATE incoming_events SET state='waiting',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL WHERE id=?",
-                    [id],
-                )?;
+                self.db
+                    .prepare_cached(
+                        "UPDATE incoming_events SET state='waiting',error=NULL,code=NULL,error_class=NULL,blocked_on=NULL WHERE id=?",
+                    )?
+                    .execute([id])?;
                 self.unblock(id)?;
-                // A cycle closes only when this event already has waiting
-                // children; then search its staged ancestry for itself.
-                if self.closes_cycle(id, &parents)? {
-                    let wire = ErrorWire {
-                        code: "CAUSAL_CYCLE".into(),
-                        class: ErrorClass::Fatal,
-                        message: format!("CAUSAL_CYCLE: {id} is its own causal ancestor"),
-                        retry_after_ms: None,
-                    };
-                    self.quarantine_event(id, &wire)?;
-                }
+                self.quarantine_if_cycle(id, &parents)?;
             }
             Class::Blocked(root) => {
                 self.set_blocked(id, &root)?;
@@ -1491,7 +1583,7 @@ impl Store {
             }
             open.set(false);
             // Copy the WAL into the database here, off-lock, so that the
-            // commit (a forced seal writes the whole projection) does not
+            // commit (a full rewrite or an inline seal writes megabytes) does not
             // run SQLite's automatic checkpoint under the engine lock: with
             // every frame checkpointed and no reader left on them, the next
             // write restarts the WAL. Best effort (PASSIVE never waits).

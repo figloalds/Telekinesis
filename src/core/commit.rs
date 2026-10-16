@@ -41,12 +41,24 @@
 //! (`compute_slow`) reads the branch's events from the event cache, projects
 //! them, derives the conflict records (`derive::derive_conflicts`, pure) and
 //! works out how the projection is stored (the `current_parts` delta of
-//! CCR-WP1.INT-4, or the precomputed `current_state` JSON of a full
-//! rewrite). It needs no lock and no writer, so `inbox::prepare_slow` runs
-//! it on a read store. The write (`write_commit`) is the same for the inline
-//! and the prepared path: the journal rows, the stored projection, the
-//! records (`derive::write_projection`), the frontier and the forced
-//! snapshot seal of the projection the commit holds, in one savepoint.
+//! CCR-WP1.INT-4, with the header row of CCR-WP2.INT-5 when only the
+//! conflict or pending list changed besides, or the precomputed
+//! `current_state` JSON of a full rewrite). It needs no lock and no writer,
+//! so `inbox::prepare_slow` runs it on a read store. The write
+//! (`write_commit`) is the same for the inline and the prepared path: the
+//! journal rows, the stored projection, the records
+//! (`derive::write_projection`), the frontier and the forced snapshot seal
+//! of the projection the commit holds, in one savepoint.
+//!
+//! # Seals (WP4.4)
+//!
+//! Every seal is written by `snapshot::seal` (one writer of the payload; the
+//! WP2.4 mirror of it here is gone, CCR-WP2.4-2). A fast commit seals when
+//! the branch's interval is due (`snapshot::seal_due`), a slow commit always
+//! (REVAMP_PLAN P4), passing the entities its projection changed, so a
+//! large projection's seal writes only the rows that changed since the
+//! previous seal (see `snapshot`'s module docs). The journal hash continues
+//! from the previous seal's stored state, so no seal hashes the history.
 //!
 //! # Event cache (`Cache::events`)
 //!
@@ -122,7 +134,7 @@ fn view_slots(projection: &Projection) -> Option<BTreeMap<(String, String), Stri
 /// The view of `branch` after a slow commit stored `projection` (`None` if a
 /// name cannot be keyed, which a committed projection never has). `slots`
 /// are its view slots when already computed (off-lock).
-fn slow_commit_view(
+pub(super) fn slow_commit_view(
     branch: &str,
     projection: Projection,
     slots: Option<BTreeMap<(String, String), String>>,
@@ -146,21 +158,25 @@ fn slow_commit_view(
     })
 }
 
-/// The head registers a `current_parts` row stores for its entity.
-const PART_FIELDS: [&str; 5] = ["kind", "location", "alive", "content", "basic"];
+use super::snapshot::PART_FIELDS;
+/// The snapshot seal API (WP4.4), reachable through this public module
+/// (`core::snapshot` is private to `core`).
+pub use super::snapshot::{
+    INLINE_LIMIT, SealMode, SealStats, SnapshotCheck, inline_limit, set_thread_inline_limit,
+};
+
+/// The largest projection (in entries) a slow commit folds back into
+/// `current_state` with a full rewrite (`Store::projection_delta`): such a
+/// rewrite costs about 1.4 MB under the lock at this size; a larger
+/// projection keeps its parts instead (WP4.4).
+pub const FOLD_MAX_ENTRIES: usize = 1024;
 
 /// Upserts the `current_parts` row of `entity` (its entry and its head
 /// registers) from projection `p`, which must hold the entry.
 fn write_part(tx: &Connection, branch: &str, entity: &str, p: &Projection) -> Result<()> {
-    let heads: BTreeMap<_, _> = PART_FIELDS
-        .into_iter()
-        .filter_map(|field| {
-            let key = register(entity, field);
-            p.heads.get(&key).map(|v| (key, v))
-        })
-        .collect();
-    tx.execute("INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads",
-        params![branch, entity, serde_json::to_string(&p.entries[entity])?, serde_json::to_string(&heads)?])?;
+    let (entry, heads) = snapshot::part_texts(p, entity)?;
+    tx.prepare_cached("INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads")?
+        .execute(params![branch, entity, entry, heads])?;
     Ok(())
 }
 
@@ -188,8 +204,13 @@ pub(crate) struct Cache {
     /// (CCR-WP1.6-1 adapter).
     known_seals: Cell<u64>,
     /// Forced seals of prepared slow commits written from their off-lock
-    /// parts (`seal_prepared`; tests).
+    /// parts (the projection's JSON; tests).
     prepared_seals: Cell<u64>,
+    /// Every seal written through this handle (WP4.4; `Store::seal_stats`).
+    seal_stats: Cell<SealStats>,
+    /// Branches this handle's open resumed from their startup snapshot
+    /// (the others were reconstructed; tests).
+    resumed: Cell<u64>,
     /// The `temp.tkfs_commit_epoch` value this connection's own commits left
     /// (0: none yet; module docs, "Rolled-back commits and the view").
     epoch: Cell<i64>,
@@ -236,10 +257,6 @@ struct EventCache {
     /// The rows the cache covers that are not known committed (`None`: all
     /// are).
     tentative: Option<Tentative>,
-    /// The startup-snapshot journal hash state over the branch's rows (in
-    /// sequence order) and the last sequence number it covers (0: none),
-    /// kept with the rows: the off-lock part of a prepared commit's seal.
-    journal: (Sha256, i64),
 }
 
 /// Journal rows an event cache entry covers that may still roll back.
@@ -297,18 +314,38 @@ pub(super) struct SlowPlan {
     pub(super) projection: Projection,
     /// Its conflict records (`derive::derive_conflicts`).
     pub(super) derived: DeriveOutput,
-    /// CCR-WP1.INT-4: the entities whose `current_parts` rows make the
-    /// stored projection read `projection`, or `None` for the full rewrite.
-    delta: Option<BTreeSet<String>>,
+    /// How the stored projection becomes `projection`.
+    stored: Stored,
     /// The projection's JSON, serialized off-lock: the `current_state`
-    /// payload of a full rewrite and the sealed snapshot's `projection`.
+    /// payload of a full rewrite and an inline seal's `projection`. Only
+    /// computed when one of them needs it (a rows seal of a delta does not).
     json: Option<String>,
-    /// The startup-snapshot journal hash over the branch's rows up to the
-    /// computation's state, and the last of those sequence numbers (from the
-    /// event cache), extended by the event under the lock (`seal_prepared`).
-    journal: Option<(Sha256, i64)>,
     /// The view slots of `projection`, computed off-lock.
     slots: Option<BTreeMap<(String, String), String>>,
+}
+
+/// How a slow commit stores its projection (`Store::projection_delta`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Stored {
+    /// CCR-WP1.INT-4: the `current_parts` rows of `changed` make the stored
+    /// projection read the new one; `header`: the conflict or pending list
+    /// changed too, stored as the `current_meta` row (CCR-WP2.INT-5).
+    Delta {
+        changed: BTreeSet<String>,
+        header: bool,
+    },
+    /// The full `current_state` rewrite that folds the parts back; the
+    /// projection differs from the stored one in `changed` (and possibly
+    /// its lists).
+    Fold { changed: BTreeSet<String> },
+    /// The full rewrite, with what changed not known.
+    Rewrite,
+}
+
+impl Stored {
+    fn is_delta(&self) -> bool {
+        matches!(self, Stored::Delta { .. })
+    }
 }
 
 impl std::fmt::Debug for SlowPlan {
@@ -316,12 +353,17 @@ impl std::fmt::Debug for SlowPlan {
         f.debug_struct("SlowPlan")
             .field("entries", &self.projection.entries.len())
             .field("conflicts", &self.derived.conflicts().len())
-            .field("delta", &self.delta.as_ref().map(BTreeSet::len))
-            .field("json_bytes", &self.json.as_ref().map(String::len))
             .field(
-                "journal_through",
-                &self.journal.as_ref().map(|(_, seq)| seq),
+                "stored",
+                &match &self.stored {
+                    Stored::Delta { changed, header } => {
+                        format!("delta {} {header}", changed.len())
+                    }
+                    Stored::Fold { changed } => format!("fold {}", changed.len()),
+                    Stored::Rewrite => "rewrite".into(),
+                },
             )
+            .field("json_bytes", &self.json.as_ref().map(String::len))
             .finish()
     }
 }
@@ -508,7 +550,7 @@ impl Store {
     /// replay would refuse it with `NAMESPACE_HISTORY_LIMIT` (module docs).
     fn check_namespace_successor(&self, event: &Event, committed_view: bool) -> Result<()> {
         let branch = event.branch.id.as_str();
-        self.with_branch_events(branch, Some(event), committed_view, |events, _| {
+        self.with_branch_events(branch, Some(event), committed_view, |events| {
             let new = events.len() - 1;
             if !derive::successor_may_add_cuts(events, new) {
                 return Ok(());
@@ -579,42 +621,49 @@ impl Store {
         }
     }
     /// How a slow-path commit stores its projection `p` on `branch`
-    /// (WP1.INT fix round 1, CCR-WP1.INT-4): `Some(entities)` when writing
-    /// the `current_parts` rows of those entities makes the stored projection
-    /// (`snapshot::load_projection`: `current_state` overlaid with
-    /// `current_parts`) read exactly `p`; `None` for the full rewrite of
-    /// `current_state` (`persist_projection`).
+    /// (WP1.INT fix round 1, CCR-WP1.INT-4; CCR-WP2.INT-5 in WP4.4):
+    /// `Stored::Delta` when writing the `current_parts` rows of the changed
+    /// entities (and, when the conflict or pending list changed, the
+    /// `current_meta` header row) makes the stored projection
+    /// (`snapshot::load_projection`: `current_state`, its lists replaced by
+    /// `current_meta`'s, overlaid with `current_parts`) read exactly `p`;
+    /// otherwise a full rewrite of `current_state` (`persist_projection`).
     ///
     /// The full rewrite stores the whole projection (about 7 MB at 5K
-    /// entries) on every slow commit, as much again as the forced snapshot
-    /// seal, and that I/O made slow commits spike past the
-    /// `concurrent_namespace_ops_5k` floor. A delta is possible when the
-    /// stored projection (the connection's view, fresh by its own contract,
-    /// else loaded) differs from `p` only in entries and their head
-    /// registers, with no key removed, every changed register belonging to an
-    /// entry of `p` and to one of the [`PART_FIELDS`], and the same
-    /// `conflicts` and `pending`. Otherwise (no stored projection yet, any
-    /// other difference, or a read error), and whenever the branch's parts
-    /// would outnumber half of its entries, the full rewrite runs, which also
-    /// folds the parts back into `current_state` (`load_projection` cost
-    /// stays bounded; the rewrites happen as the entries double, so their
-    /// cost is amortized). The derived-state oracle (`verify_derived_state`)
-    /// compares exactly this stored projection with a rebuild.
+    /// entries) on every slow commit, and that I/O made slow commits spike
+    /// past the `concurrent_namespace_ops_5k` floor. A delta is possible when
+    /// the stored projection (the connection's view, fresh by its own
+    /// contract, else loaded) differs from `p` only in entries and their head
+    /// registers and in its two lists, with no key removed and every changed
+    /// register belonging to an entry of `p` and to one of the
+    /// [`PART_FIELDS`]. A conflict-producing event (a concurrent edit) is a
+    /// delta too since WP4.4: its new conflict list goes to the header row
+    /// instead of a rewrite of the whole projection (CCR-WP2.INT-5).
+    /// Otherwise (no stored projection yet, a removed key, or a read error)
+    /// the full rewrite runs (`Stored::Rewrite`). A small projection (at
+    /// most [`FOLD_MAX_ENTRIES`] entries) whose parts would outnumber half
+    /// of its entries is also rewritten in full, folding the parts back into
+    /// `current_state` (`Stored::Fold`, the entities that changed known); a
+    /// larger one keeps its parts (at most one row per entity), so no slow
+    /// commit rewrites a large projection under the lock. The derived-state
+    /// oracle (`verify_derived_state`) compares exactly this stored
+    /// projection with a rebuild.
     ///
     /// WP2.4: a prepared commit computes this on the read store, against the
     /// stored projection of the branch state it derived from; the write
     /// happens only if the branch is still in that state (`commit_prepared`).
-    fn projection_delta(&self, branch: &str, p: &Projection) -> Option<BTreeSet<String>> {
+    fn projection_delta(&self, branch: &str, p: &Projection) -> Stored {
         self.drop_rolled_back_view();
-        let view = self.view(branch).ok()?;
+        let Ok(view) = self.view(branch) else {
+            return Stored::Rewrite;
+        };
         let stored = &view.projection;
-        if stored.conflicts != p.conflicts
-            || stored.pending != p.pending
-            || !stored.entries.keys().all(|id| p.entries.contains_key(id))
+        if !stored.entries.keys().all(|id| p.entries.contains_key(id))
             || !stored.heads.keys().all(|key| p.heads.contains_key(key))
         {
-            return None;
+            return Stored::Rewrite;
         }
+        let header = stored.conflicts != p.conflicts || stored.pending != p.pending;
         let mut changed: BTreeSet<String> = p
             .entries
             .iter()
@@ -625,31 +674,43 @@ impl Store {
             if stored.heads.get(key) == Some(versions) {
                 continue;
             }
-            let (entity, field) = key.rsplit_once('/')?;
+            let Some((entity, field)) = key.rsplit_once('/') else {
+                return Stored::Rewrite;
+            };
             if !PART_FIELDS.contains(&field) || !p.entries.contains_key(entity) {
-                return None;
+                return Stored::Rewrite;
             }
             changed.insert(entity.to_owned());
         }
         drop(view);
-        let parts: i64 = self
+        if p.entries.len() > FOLD_MAX_ENTRIES {
+            return Stored::Delta { changed, header };
+        }
+        let parts: Option<usize> = self
             .db
             .query_row(
                 "SELECT count(*) FROM current_parts WHERE branch=?",
                 [branch],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
-            .ok()?;
-        let parts = usize::try_from(parts).ok()?;
-        (parts.saturating_add(changed.len()) <= p.entries.len() / 2).then_some(changed)
+            .ok()
+            .and_then(|parts| usize::try_from(parts).ok());
+        match parts {
+            None => Stored::Rewrite,
+            Some(parts) if parts.saturating_add(changed.len()) <= p.entries.len() / 2 => {
+                Stored::Delta { changed, header }
+            }
+            Some(_) => Stored::Fold { changed },
+        }
     }
     /// The slow path's computation for `event` (WP2.4): the branch's events
     /// (the event cache) plus `event`, projected; `None` when the projection
     /// is pending (a prerequisite outside the branch's journal); then the
     /// stored rows `event` reviews, the derived records and how the
-    /// projection is stored. Reads only; with `precompute` also serializes a
-    /// full rewrite's `current_state` and computes the view slots, so that
-    /// the write does no O(projection) work. Errors are the slow path's
+    /// projection is stored. Reads only; with `precompute` also serializes
+    /// the projection when its write or its seal needs the JSON (a full
+    /// rewrite, or a branch sealed inline) and computes the view slots, so
+    /// that the write does no O(projection) work. Errors are the slow path's
     /// refusals, as the historical inline path raised them.
     pub(super) fn compute_slow(
         &self,
@@ -659,7 +720,7 @@ impl Store {
     ) -> Result<Option<Box<SlowPlan>>> {
         let branch = event.branch.id.as_str();
         let computed =
-            self.with_branch_events(branch, Some(event), committed_view, |events, journal| {
+            self.with_branch_events(branch, Some(event), committed_view, |events| {
                 let projection = project(branch, events)?;
                 if !projection.pending.is_empty() {
                     return Ok(None);
@@ -672,27 +733,25 @@ impl Store {
                     new_event: Some(&event.id),
                     reviewed: &reviewed,
                 })?;
-                let journal = precompute.then(|| journal.clone());
-                Ok::<_, anyhow::Error>(Some((projection, derived, journal)))
+                Ok::<_, anyhow::Error>(Some((projection, derived)))
             })??;
-        let Some((projection, derived, journal)) = computed else {
+        let Some((projection, derived)) = computed else {
             return Ok(None);
         };
-        let delta = self.projection_delta(branch, &projection);
+        let stored = self.projection_delta(branch, &projection);
         let (json, slots) = if precompute {
-            (
-                Some(serde_json::to_string(&projection)?),
-                view_slots(&projection),
-            )
+            let json = (!stored.is_delta() || !snapshot::sealed_as_rows(&self.db, branch))
+                .then(|| serde_json::to_string(&projection))
+                .transpose()?;
+            (json, view_slots(&projection))
         } else {
             (None, None)
         };
         Ok(Some(Box::new(SlowPlan {
             projection,
             derived,
-            delta,
+            stored,
             json,
-            journal,
             slots,
         })))
     }
@@ -798,19 +857,16 @@ impl Store {
             "INSERT OR IGNORE INTO branches VALUES(?,?,?)",
             params![event.branch.id, event.branch.name, event.branch.shared],
         )?;
-        // A prepared seal checks the branch's journal against the one its
-        // hash covers (`seal_prepared`): the branch's newest sequence before
-        // this commit.
-        let prior = match &plan {
-            Plan::Slow(slow) if slow.json.is_some() && slow.journal.is_some() => {
-                Some(frontier_seq(&tx, &branch)?)
-            }
-            _ => None,
-        };
         tx.execute(
             "INSERT INTO events VALUES(?,?,?)",
             params![event.id, event.branch.id, payload],
         )?;
+        // The event's journal row (the `journal_sequence` trigger) is the
+        // journal's newest, so its sequence is the branch's new tip: the
+        // cursor of a seal in this commit.
+        let seq: i64 = tx
+            .prepare_cached("SELECT seq FROM journal_sequence WHERE event=?")?
+            .query_row([&event.id], |r| r.get(0))?;
         if event.branch.shared {
             tx.execute("INSERT INTO outbox(event) VALUES(?)", [&event.id])?;
         }
@@ -826,11 +882,15 @@ impl Store {
                 }
             }
             Plan::Slow(slow) => {
-                if let Some(changed) = &slow.delta {
+                if let Stored::Delta { changed, header } = &slow.stored {
                     // The stored projection becomes `projection` through the
-                    // rows of the entities that changed (CCR-WP1.INT-4).
+                    // rows of the entities that changed (CCR-WP1.INT-4) and,
+                    // when its lists changed, its header row (CCR-WP2.INT-5).
                     for entity in changed {
                         write_part(&tx, &branch, entity, &slow.projection)?;
+                    }
+                    if *header {
+                        snapshot::write_header(&tx, &branch, &slow.projection)?;
                     }
                 } else {
                     let state = match &slow.json {
@@ -839,6 +899,7 @@ impl Store {
                     };
                     tx.execute("DELETE FROM current_parts WHERE branch=?", [&branch])?;
                     tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload", params![branch, state])?;
+                    snapshot::clear_header(&tx, &branch)?;
                 }
                 derive::write_projection(&tx, &branch, &slow.derived)?;
             }
@@ -860,48 +921,72 @@ impl Store {
         let mut patched = false;
         let plan = match plan {
             Plan::Fast(delta) => {
-                // A periodic seal serializes the projection the commit holds
-                // (the view, patched now) instead of reading it back and
-                // parsing it (CCR-WP1.6-1 adapter; the payload is the same).
+                // A periodic seal (when the branch's interval is due) seals
+                // the projection the commit holds (the view, patched now)
+                // instead of reading it back (CCR-WP1.6-1 adapter): an inline
+                // seal serializes it, a rows seal the marked entities of it.
                 let mut delta = Some(delta);
-                if patchable && seal_due(&tx, &branch)? {
-                    let mut cache = self.view_cache.borrow_mut();
-                    if let (Some(view), Some(delta)) = (cache.as_mut(), delta.take()) {
-                        if patch_view(view, &event, delta).is_ok() {
-                            patched = true;
-                            let seals = &self.caches.commit.known_seals;
-                            seals.set(seals.get().saturating_add(1));
-                        } else {
-                            *cache = None;
+                if snapshot::seal_due(&tx, &branch, seq)? {
+                    if patchable {
+                        let mut cache = self.view_cache.borrow_mut();
+                        if let (Some(view), Some(delta)) = (cache.as_mut(), delta.take()) {
+                            if patch_view(view, &event, delta).is_ok() {
+                                patched = true;
+                            } else {
+                                *cache = None;
+                            }
                         }
                     }
+                    let cache = self.view_cache.borrow();
+                    let known = cache
+                        .as_ref()
+                        .filter(|_| patched)
+                        .map(|view| &view.projection);
+                    let report = snapshot::seal(
+                        &tx,
+                        &branch,
+                        snapshot::Seal {
+                            cursor: Some(seq),
+                            projection: known,
+                            json: None,
+                            changed: snapshot::Changed::Marked,
+                        },
+                    )?;
+                    drop(cache);
+                    record_seal(&self.caches.commit, &report);
+                    if patched {
+                        let seals = &self.caches.commit.known_seals;
+                        seals.set(seals.get().saturating_add(1));
+                    }
                 }
-                let cache = self.view_cache.borrow();
-                let known = cache
-                    .as_ref()
-                    .filter(|_| patched)
-                    .map(|view| &view.projection);
-                snapshot::maybe_persist(&tx, &branch, false, known)?;
-                drop(cache);
                 Plan::Fast(delta.unwrap_or_default())
             }
             Plan::Slow(slow) => {
                 // The forced seal after a slow-path commit is kept (REVAMP_PLAN
                 // P4). It seals the projection this commit holds (and has just
-                // stored); a prepared commit brings its payload's expensive
-                // parts computed off-lock.
-                let sealed = match (&slow.json, &slow.journal, prior) {
-                    (Some(json), Some(journal), Some(prior)) => {
-                        seal_prepared(&tx, &branch, &event, &payload, json, journal, prior)?
+                // stored): the entities it changed besides the marked ones
+                // (WP4.4); an inline seal uses the JSON a prepared commit
+                // serialized off-lock.
+                let changed = match &slow.stored {
+                    Stored::Delta { changed, .. } | Stored::Fold { changed } => {
+                        snapshot::Changed::Plus(changed)
                     }
-                    _ => false,
+                    Stored::Rewrite => snapshot::Changed::All,
                 };
-                if sealed {
+                let report = snapshot::seal(
+                    &tx,
+                    &branch,
+                    snapshot::Seal {
+                        cursor: Some(seq),
+                        projection: Some(&slow.projection),
+                        json: slow.json.as_deref(),
+                        changed,
+                    },
+                )?;
+                record_seal(&self.caches.commit, &report);
+                if report.used_json {
                     let seals = &self.caches.commit.prepared_seals;
                     seals.set(seals.get().saturating_add(1));
-                }
-                if !sealed {
-                    snapshot::maybe_persist(&tx, &branch, true, Some(&slow.projection))?;
                 }
                 Plan::Slow(slow)
             }
@@ -1025,8 +1110,7 @@ impl Store {
     }
     /// Runs `f` over `branch`'s events in `id` order (exactly
     /// `Store::events()` filtered by branch), with `extra` appended last
-    /// when given, and the journal hash state over those rows (without
-    /// `extra`), through the event cache (module docs). `committed_view`:
+    /// when given, through the event cache (module docs). `committed_view`:
     /// the connection reads committed state only (a read transaction of its
     /// own, as `prepare_slow` runs), so nothing it reads can roll back; in
     /// autocommit that holds anyway.
@@ -1035,7 +1119,7 @@ impl Store {
         branch: &str,
         extra: Option<&Event>,
         committed_view: bool,
-        f: impl FnOnce(&[Event], &(Sha256, i64)) -> T,
+        f: impl FnOnce(&[Event]) -> T,
     ) -> Result<T> {
         let committed = committed_view || self.db.is_autocommit();
         let (tip, total): (i64, i64) = self
@@ -1065,7 +1149,7 @@ impl Store {
         if let Some(extra) = extra {
             cache.events.push(extra.clone());
         }
-        let result = f(&cache.events, &cache.journal);
+        let result = f(&cache.events);
         if extra.is_some() {
             cache.events.pop();
         }
@@ -1093,18 +1177,12 @@ impl Store {
         let loads = &self.caches.commit.event_loads;
         loads.set(loads.get().saturating_add(1));
         let mut events: Vec<Event> = vec![];
-        let mut journal = (Sha256::new(), 0);
-        let mut statement = self.db.prepare_cached(
-            "SELECT s.seq,e.id,e.payload FROM events e JOIN journal_sequence s ON s.event=e.id WHERE e.branch=? ORDER BY s.seq",
-        )?;
+        let mut statement = self
+            .db
+            .prepare_cached("SELECT payload FROM events WHERE branch=?")?;
         let mut rows = statement.query([branch])?;
         while let Some(row) = rows.next()? {
-            let seq: i64 = row.get(0)?;
-            let id: String = row.get(1)?;
-            let payload: String = row.get(2)?;
-            journal_row(&mut journal.0, seq, &id, &payload);
-            journal.1 = seq;
-            events.push(serde_json::from_str(&payload)?);
+            events.push(serde_json::from_str(row.get_ref(0)?.as_str()?)?);
         }
         drop(rows);
         // `Store::events()` order.
@@ -1115,7 +1193,6 @@ impl Store {
             upto: tip,
             total,
             tentative: None,
-            journal,
         };
         if committed {
             return Ok((cache, true));
@@ -1176,10 +1253,7 @@ impl Store {
             let seq: i64 = row.get(0)?;
             let id: String = row.get(1)?;
             if row.get::<_, bool>(2)? {
-                let payload: String = row.get(3)?;
-                added.push(serde_json::from_str(&payload)?);
-                journal_row(&mut cache.journal.0, seq, &id, &payload);
-                cache.journal.1 = seq;
+                added.push(serde_json::from_str(row.get_ref(3)?.as_str()?)?);
             }
             // Any row read here may roll back, and its sequence number then
             // go to a row of this branch: all of them are tentative.
@@ -1278,7 +1352,7 @@ impl Store {
     /// equal `events()` filtered by branch, in the same order).
     #[doc(hidden)]
     pub fn cached_branch_events(&self, branch: &str) -> Result<Vec<Event>> {
-        self.with_branch_events(branch, None, false, |events, _| events.to_vec())
+        self.with_branch_events(branch, None, false, |events| events.to_vec())
     }
     /// How many times this handle loaded a branch's events in full into
     /// the event cache (tests).
@@ -1293,11 +1367,36 @@ impl Store {
     pub fn prepared_seals(&self) -> u64 {
         self.caches.commit.prepared_seals.get()
     }
+    /// Every seal written through this handle (WP4.4): how many of each
+    /// layout, their bytes (anchors plus rows) and durations. A seal whose
+    /// transaction rolled back counts too. A rebuild's seal (`core.rs`,
+    /// `snapshot::persist`) is not counted.
+    #[doc(hidden)]
+    pub fn seal_stats(&self) -> SealStats {
+        self.caches.commit.seal_stats.get()
+    }
+    pub(super) fn record_seal(&self, report: &snapshot::SealReport) {
+        record_seal(&self.caches.commit, report);
+    }
+    /// How many branches this handle's open resumed from their startup
+    /// snapshot instead of reconstructing them (tests).
+    #[doc(hidden)]
+    pub fn startup_resumes(&self) -> u64 {
+        self.caches.commit.resumed.get()
+    }
+    pub(super) fn count_resume(&self) {
+        let resumed = &self.caches.commit.resumed;
+        resumed.set(resumed.get().saturating_add(1));
+    }
 }
 
-/// `snapshot::FORMAT`, which `seal_prepared` writes (a unit test pins the
-/// payload to `snapshot::persist`'s, byte for byte).
-const SEAL_FORMAT: u32 = 1;
+/// Adds `report` to `cache`'s seal counters (a free function: the commit
+/// path holds the store's connection mutably while it seals).
+fn record_seal(cache: &Cache, report: &snapshot::SealReport) {
+    let mut stats = cache.seal_stats.get();
+    stats.add(report);
+    cache.seal_stats.set(stats);
+}
 
 /// The newest journal sequence among `branch`'s frontier events (0: none):
 /// two index lookups per frontier event (`event_frontier`'s key, the
@@ -1319,143 +1418,6 @@ pub(super) fn frontier_seq(db: &Connection, branch: &str) -> Result<i64> {
             "SELECT coalesce(max(s.seq),0) FROM event_frontier f JOIN journal_sequence s ON s.event=f.event WHERE f.branch=?",
         )?
         .query_row([branch], |r| r.get(0))?)
-}
-
-/// One journal row in the startup-snapshot journal hash.
-fn journal_row(digest: &mut Sha256, seq: i64, id: &str, payload: &str) {
-    digest.update(seq.to_le_bytes());
-    for value in [id, payload] {
-        digest.update((value.len() as u64).to_le_bytes());
-        digest.update(value.as_bytes());
-    }
-}
-
-/// The payload `snapshot::persist` seals for `branch` at `cursor`, with the
-/// projection given as its JSON and the journal hash given: the same bytes
-/// (`Snapshot`'s fields in order, compact JSON), the rest read from `db`.
-fn seal_payload(
-    db: &Connection,
-    branch: &str,
-    cursor: i64,
-    journal_hash: &str,
-    projection_json: &str,
-) -> Result<String> {
-    let mut conflicts = Vec::new();
-    let mut statement =
-        db.prepare_cached("SELECT payload,resolved_by FROM conflicts WHERE branch=? ORDER BY id")?;
-    let mut rows = statement.query([branch])?;
-    while let Some(row) = rows.next()? {
-        let mut conflict: Conflict = serde_json::from_str(&row.get::<_, String>(0)?)?;
-        conflict.resolved_by = row.get(1)?;
-        conflicts.push(conflict);
-    }
-    let repo: String = db.query_row("SELECT value FROM config WHERE key='repo'", [], |r| {
-        r.get(0)
-    })?;
-    let device: String = db.query_row("SELECT value FROM config WHERE key='device'", [], |r| {
-        r.get(0)
-    })?;
-    let descriptor = db.query_row(
-        "SELECT id,name,shared FROM branches WHERE id=?",
-        [branch],
-        |r| {
-            Ok(Branch {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                shared: r.get(2)?,
-            })
-        },
-    )?;
-    let frontier: Vec<String> = db
-        .prepare_cached("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
-        .query_map([branch], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut payload = String::with_capacity(projection_json.len() + 1024);
-    payload.push_str(&format!("{{\"format\":{SEAL_FORMAT},\"repo\":"));
-    payload.push_str(&serde_json::to_string(&repo)?);
-    payload.push_str(",\"device\":");
-    payload.push_str(&serde_json::to_string(&device)?);
-    payload.push_str(",\"branch\":");
-    payload.push_str(&serde_json::to_string(&descriptor)?);
-    payload.push_str(&format!(",\"cursor\":{cursor},\"journal_hash\":"));
-    payload.push_str(&serde_json::to_string(journal_hash)?);
-    payload.push_str(",\"projection\":");
-    payload.push_str(projection_json);
-    payload.push_str(",\"conflicts\":");
-    payload.push_str(&serde_json::to_string(&conflicts)?);
-    payload.push_str(",\"frontier\":");
-    payload.push_str(&serde_json::to_string(&frontier)?);
-    payload.push('}');
-    Ok(payload)
-}
-
-/// The forced seal of a prepared slow commit (WP2.4): what
-/// `snapshot::maybe_persist(.., true, ..)` writes, but with the projection's
-/// JSON and the journal hash over the branch's earlier rows computed
-/// off-lock; under the lock only the event's row is hashed, the small parts
-/// read and the row written. `false` (nothing written; the caller seals
-/// normally) unless the branch's journal is exactly that prefix plus this
-/// event. Same fault points as `snapshot::persist`.
-///
-/// `prior` is [`frontier_seq`] of the branch just before this commit's
-/// journal row. The branch's journal is that prefix plus the event when the
-/// event's row is the journal's newest (so its branch's newest) and `prior`
-/// equals `through`, the newest branch row the hash covers: a branch row
-/// committed after the computation read the branch (above `through`) is a
-/// frontier event when it commits and leaves the frontier only for a newer
-/// branch row, so `prior` would be at least its sequence; and no row can
-/// appear at or below `through` afterwards (sequences above a committed tip
-/// only). A few index lookups, whatever the distance from the journal's tip
-/// to the branch's previous row.
-fn seal_prepared(
-    tx: &Connection,
-    branch: &str,
-    event: &Event,
-    payload: &str,
-    projection_json: &str,
-    (prefix, through): &(Sha256, i64),
-    prior: i64,
-) -> Result<bool> {
-    let seq: i64 = tx.query_row(
-        "SELECT seq FROM journal_sequence WHERE event=?",
-        [&event.id],
-        |r| r.get(0),
-    )?;
-    let tip: i64 = tx.query_row(
-        "SELECT coalesce(max(seq),0) FROM journal_sequence",
-        [],
-        |r| r.get(0),
-    )?;
-    if tip != seq || prior != *through {
-        return Ok(false);
-    }
-    let mut digest = prefix.clone();
-    journal_row(&mut digest, seq, &event.id, payload);
-    let journal_hash = hex::encode(digest.finalize());
-    let sealed = seal_payload(tx, branch, seq, &journal_hash, projection_json)?;
-    fault("before_startup_snapshot");
-    tx.execute("INSERT INTO startup_snapshots VALUES(?,?,?,?) ON CONFLICT(branch) DO UPDATE SET cursor=excluded.cursor,payload=excluded.payload,checksum=excluded.checksum", params![branch, seq, sealed, hash(sealed.as_bytes())])?;
-    fault("startup_snapshot_written");
-    Ok(true)
-}
-
-/// Whether a fast commit's periodic seal is due (mirrors `snapshot::maybe_persist`,
-/// which decides, with the same query and [`super::snapshot::seal_interval`],
-/// inside the commit's savepoint after its journal row). Used only to know
-/// beforehand that a seal is due, so the seal can serialize the projection
-/// the commit holds instead of reading it back (CCR-WP1.6-1 adapter); a
-/// mismatch would only cost that read.
-fn seal_due(tx: &Connection, branch: &str) -> Result<bool> {
-    let saved: Option<(i64, Option<i64>)> = tx
-        .prepare_cached(super::snapshot::SEALED_SQL)?
-        .query_row([branch], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let tip: i64 = tx.query_row(
-        "SELECT coalesce(max(seq),0) FROM journal_sequence",
-        [],
-        |r| r.get(0),
-    )?;
-    Ok(saved.is_none_or(|(saved, bytes)| tip - saved >= super::snapshot::seal_interval(bytes)))
 }
 
 /// Patch `view` with a fast commit's `delta` (the changed entities' entries
@@ -1898,32 +1860,51 @@ fn injected_busy() -> rusqlite::Error {
 mod tests {
     use super::*;
 
-    /// `seal_payload` (with `journal_prefix`) writes exactly the payload of
-    /// `snapshot::persist`: empty and populated branches, with register
-    /// conflicts, a resolved one and a deleted entry.
+    /// WP4.4 (CCR-WP2.4-2): every seal is written by `snapshot::seal`, so a
+    /// prepared commit's seal from the JSON it serialized off-lock is the
+    /// seal of the projection itself, byte for byte (it replaces WP2.4's
+    /// pin of the payload mirror this module no longer has), on empty and
+    /// populated branches with register conflicts, a resolved one and a
+    /// deleted entry; and the seal is a valid snapshot.
     #[test]
-    fn seal_payload_is_snapshot_persist_byte_for_byte() {
+    fn a_seal_from_prepared_json_is_the_seal_of_the_projection() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Store::open(dir.path(), None).unwrap();
         let check = |s: &Store| {
             let branch = s.active.clone();
-            let (prefix, through) = s
-                .with_branch_events(&branch, None, true, |_, journal| journal.clone())
-                .unwrap();
             let projection = snapshot::load_projection(&s.db, &branch).unwrap();
             let json = serde_json::to_string(&projection).unwrap();
-            snapshot::persist(&s.db, &branch).unwrap();
-            let (cursor, expected): (i64, String) =
+            let anchor = |s: &Store| -> (i64, String, String) {
                 s.db.query_row(
-                    "SELECT cursor,payload FROM startup_snapshots WHERE branch=?",
+                    "SELECT cursor,payload,checksum FROM startup_snapshots WHERE branch=?",
                     [&branch],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
-                .unwrap();
-            assert_eq!(cursor, through);
-            let journal_hash = hex::encode(prefix.finalize());
-            let mine = seal_payload(&s.db, &branch, cursor, &journal_hash, &json).unwrap();
-            assert_eq!(mine, expected);
+                .unwrap()
+            };
+            let seal = |json: Option<&str>| {
+                snapshot::seal(
+                    &s.db,
+                    &branch,
+                    snapshot::Seal {
+                        cursor: None,
+                        projection: Some(&projection),
+                        json,
+                        changed: snapshot::Changed::All,
+                    },
+                )
+                .unwrap()
+            };
+            s.db.execute_batch("SAVEPOINT a").unwrap();
+            assert!(!seal(None).used_json);
+            let expected = anchor(s);
+            s.db.execute_batch("ROLLBACK TO a").unwrap();
+            assert!(seal(Some(&json)).used_json);
+            assert_eq!(anchor(s), expected);
+            s.db.execute_batch("RELEASE a").unwrap();
+            let checked = s.check_startup_snapshot(&branch).unwrap();
+            assert_eq!(checked.projection, projection);
+            assert!(!checked.rows, "a small projection is sealed inline");
         };
         check(&s);
         let file = s.create("f.txt", "file").unwrap();
