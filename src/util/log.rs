@@ -1415,7 +1415,8 @@ mod stdio {
     /// of the pipe that is now the stream's standard handle, so C code's
     /// output is captured like Rust's, then closes `previous` (when
     /// `release`) unless something still holds it. `_dup2` closes the handle
-    /// the descriptor held (the runtime's copy of the inherited one), or
+    /// the descriptor held (at startup the runtime took the inherited
+    /// standard handle itself, so usually `previous`), or
     /// leaves it to the other descriptor while that one still holds the same
     /// handle; such a handle is never closed here, so it is closed exactly
     /// once, and never while a descriptor or a standard handle refers to it
