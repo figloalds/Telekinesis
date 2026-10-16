@@ -211,46 +211,179 @@ fn rotate_if_larger_moves_only_a_file_past_the_limit() {
     assert!(!log::rotated_path(&path, 3).exists(), "three files at most");
 }
 
-/// Windows: a reader without delete sharing blocks the rename; the writer
-/// keeps appending (with a note), then rotates once the reader is gone.
-#[cfg(windows)]
+/// A rotation fills the first missing generation instead of dropping the
+/// oldest; with none missing, the oldest goes. A missing live file is not
+/// rotated (the history stays as it is).
 #[test]
-fn a_blocked_rotation_keeps_appending_and_rotates_later() {
+fn a_rotation_fills_a_gap_before_dropping_the_oldest() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gap.log");
+    let read = |n: usize| fs::read_to_string(log::rotated_path(&path, n)).ok();
+    fs::write(log::rotated_path(&path, 1), "A").unwrap();
+    fs::write(log::rotated_path(&path, 3), "C").unwrap();
+    log::rotate_files(&path, 4).unwrap();
+    assert_eq!(
+        (read(0), read(1), read(2), read(3)),
+        (None, Some("A".into()), None, Some("C".into())),
+        "no live file: nothing moves"
+    );
+    fs::write(&path, "L").unwrap();
+    log::rotate_files(&path, 4).unwrap();
+    assert_eq!(
+        (read(0), read(1), read(2), read(3)),
+        (None, Some("L".into()), Some("A".into()), Some("C".into())),
+        "the gap at .2 is filled; nothing is dropped"
+    );
+    fs::write(&path, "M").unwrap();
+    log::rotate_files(&path, 4).unwrap();
+    assert_eq!(
+        (read(0), read(1), read(2), read(3)),
+        (None, Some("M".into()), Some("L".into()), Some("A".into())),
+        "no gap: the oldest is dropped"
+    );
+    let names: Vec<String> = fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names.len(), 3, "no stray file: {names:?}");
+}
+
+/// The files in `dir`, by name.
+#[cfg(windows)]
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Windows: opens `path` the way a log viewer without delete sharing does
+/// (its rename then fails).
+#[cfg(windows)]
+fn open_without_delete_sharing(path: &Path) -> fs::File {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_SHARE_READ: u32 = 1;
     const FILE_SHARE_WRITE: u32 = 2;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(path)
+        .unwrap()
+}
+
+/// Windows: a reader without delete sharing blocks the rename; the writer
+/// keeps appending (with a note), retries after another max(max/8, 64 KiB),
+/// never loses history to the failed attempts, and rotates once the reader
+/// is gone.
+#[cfg(windows)]
+#[test]
+fn a_blocked_rotation_keeps_appending_and_rotates_later() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("blocked.log");
     let rotation = Rotation {
         max_bytes: 4096,
         files: 3,
     };
+    fs::write(log::rotated_path(&path, 1), "history one\n").unwrap();
+    fs::write(log::rotated_path(&path, 2), "history two\n").unwrap();
     let mut file = RotatingFile::open(&path, rotation).unwrap();
     let line = format!("{}\n", "z".repeat(100));
     file.write_all(line.as_bytes()).unwrap();
-    let blocker = fs::OpenOptions::new()
-        .read(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-        .open(&path)
-        .unwrap();
-    for _ in 0..100 {
+    let blocker = open_without_delete_sharing(&path);
+    // About 200 KB: the first attempt and at least two retries fail.
+    for _ in 0..2000 {
         file.write_all(line.as_bytes()).unwrap();
     }
     assert_eq!(file.rotations(), 0);
-    assert!(!log::rotated_path(&path, 1).exists());
     let text = fs::read_to_string(&path).unwrap();
-    assert!(
-        text.contains("log rotation failed"),
-        "the failure is noted in the file"
+    let notes = text.matches("log rotation failed").count();
+    assert!(notes >= 3, "every failed attempt is noted ({notes})");
+    assert!(text.len() > 200_000, "still appending");
+    assert_eq!(
+        (
+            fs::read_to_string(log::rotated_path(&path, 1)).unwrap(),
+            fs::read_to_string(log::rotated_path(&path, 2)).unwrap()
+        ),
+        ("history one\n".to_owned(), "history two\n".to_owned()),
+        "failed attempts never touch the history"
     );
-    assert!(text.len() > 4096, "still appending");
+    assert_eq!(
+        file_names(dir.path()),
+        ["blocked.log", "blocked.log.1", "blocked.log.2"]
+    );
     drop(blocker);
-    // The retry comes after another max(max/8, 64 KiB) bytes.
-    for _ in 0..800 {
+    // The next retry rotates.
+    for _ in 0..1000 {
+        if file.rotations() > 0 {
+            break;
+        }
         file.write_all(line.as_bytes()).unwrap();
     }
-    assert!(file.rotations() >= 1);
-    assert!(log::rotated_path(&path, 1).exists());
+    assert_eq!(file.rotations(), 1);
+    let rotated = fs::read_to_string(log::rotated_path(&path, 1)).unwrap();
+    assert!(rotated.contains("log rotation failed") && rotated.len() > 200_000);
+    assert_eq!(
+        fs::read_to_string(log::rotated_path(&path, 2)).unwrap(),
+        "history one\n",
+        "one rotation drops one generation"
+    );
+}
+
+/// Windows: an older file held without delete sharing stops the history
+/// from moving. The live file is put back (appending continues), the first
+/// attempt costs the oldest generation, and the retries fill the gap it left
+/// instead of dropping another one.
+#[cfg(windows)]
+#[test]
+fn a_blocked_older_file_costs_at_most_one_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("held.log");
+    let rotation = Rotation {
+        max_bytes: 4096,
+        files: 4,
+    };
+    for (n, text) in [(1, "one\n"), (2, "two\n"), (3, "three\n")] {
+        fs::write(log::rotated_path(&path, n), text).unwrap();
+    }
+    let blocker = open_without_delete_sharing(&log::rotated_path(&path, 1));
+    let mut file = RotatingFile::open(&path, rotation).unwrap();
+    let line = format!("{}\n", "h".repeat(100));
+    for _ in 0..2000 {
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    assert_eq!(file.rotations(), 0);
+    let text = fs::read_to_string(&path).unwrap();
+    let notes = text.matches("log rotation failed").count();
+    assert!(notes >= 3, "every failed attempt is noted ({notes})");
+    assert!(text.len() > 200_000, "the live file was put back each time");
+    let read = |n: usize| fs::read_to_string(log::rotated_path(&path, n)).ok();
+    assert_eq!(
+        (read(1), read(2), read(3)),
+        (Some("one\n".into()), None, Some("two\n".into())),
+        "only the oldest generation went, once"
+    );
+    assert_eq!(
+        file_names(dir.path()),
+        ["held.log", "held.log.1", "held.log.3"]
+    );
+    drop(blocker);
+    for _ in 0..1000 {
+        if file.rotations() > 0 {
+            break;
+        }
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    assert_eq!(file.rotations(), 1);
+    assert!(read(1).is_some_and(|t| t.contains("log rotation failed")));
+    assert_eq!(
+        (read(2), read(3)),
+        (Some("one\n".into()), Some("two\n".into())),
+        "the gap was filled"
+    );
 }
 
 // ===========================================================================
@@ -351,43 +484,91 @@ fn foreign_lines_are_redacted() {
 fn desktop_mode_daemon_output_goes_to_the_rotating_log() {
     const TEST: &str = "desktop_mode_daemon_output_goes_to_the_rotating_log";
     if child_mode().as_deref() == Some("desktop") {
-        let _launcher = RealLauncher::new(LogPolicy::default());
-        let installed = log::file_log().expect("the desktop log is adopted");
-        assert!(installed.captured_stdout && installed.captured_stderr);
-        assert!(!installed.tee_stderr);
-        assert_eq!(installed.rotation.max_bytes, 4096);
-        println!(
-            "{}",
-            json!({"format":3,"pid":1,"control":"ws://127.0.0.1:1","token":"tok-leak-0123456789"})
-        );
-        eprintln!("plain stderr line");
-        log::event!(warn, WS_CLOSED, {"detail": "an event through the sink", "token": "tok-event-0123456789"});
-        log::register_secret("registered-secret-value");
-        eprintln!("a raw line that mentions registered-secret-value");
-        for i in 0..150 {
-            println!("stdout filler {i:04} {}", "x".repeat(80));
-            eprintln!("stderr filler {i:04} {}", "y".repeat(80));
-        }
-        let _ = thread::spawn(|| panic!("child panic kept by the log")).join();
-        println!("stdout end marker");
-        eprintln!("stderr end marker");
-        let live = installed.path.clone();
-        let drained = wait_until(Duration::from_secs(20), || {
-            let text: String = log::rotated_files(&live, 50)
-                .iter()
-                .map(|p| fs::read_to_string(p).unwrap_or_default())
-                .collect();
-            text.contains("stdout end marker") && text.contains("stderr end marker")
-        });
-        assert!(drained, "the capture threads drained");
+        desktop_child();
         return;
     }
     if child_mode().is_some() {
         return;
     }
+    run_desktop_child(TEST, None);
+}
+
+/// The first start after an upgrade: the inherited `orchestrator.log` holds
+/// the earlier daemon's unbounded raw output and is already past the rotation
+/// size. The standard streams are still recognized as the log (they are
+/// classified before the file rotates), so both are captured, nothing is teed
+/// into the renamed legacy file, and that file stops growing.
+#[test]
+fn desktop_mode_adopts_an_oversized_legacy_log() {
+    const TEST: &str = "desktop_mode_adopts_an_oversized_legacy_log";
+    if child_mode().as_deref() == Some("desktop") {
+        desktop_child();
+        return;
+    }
+    if child_mode().is_some() {
+        return;
+    }
+    run_desktop_child(TEST, Some(&legacy_log(6500)));
+}
+
+/// Raw output of a daemon from before WP4.2 (no JSON events), at least `len`
+/// bytes.
+fn legacy_log(len: usize) -> String {
+    let mut text = String::new();
+    let mut n = 0;
+    while text.len() < len {
+        text.push_str(&format!(
+            "legacy raw output line {n:04} {}\n",
+            "l".repeat(60)
+        ));
+        n += 1;
+    }
+    text
+}
+
+/// The child side of the desktop-mode tests (stdout and stderr are the log).
+fn desktop_child() {
+    let _launcher = RealLauncher::new(LogPolicy::default());
+    let installed = log::file_log().expect("the desktop log is adopted");
+    assert!(installed.captured_stdout && installed.captured_stderr);
+    assert!(!installed.tee_stderr);
+    assert_eq!(installed.rotation.max_bytes, 4096);
+    println!(
+        "{}",
+        json!({"format":3,"pid":1,"control":"ws://127.0.0.1:1","token":"tok-leak-0123456789"})
+    );
+    eprintln!("plain stderr line");
+    log::event!(warn, WS_CLOSED, {"detail": "an event through the sink", "token": "tok-event-0123456789"});
+    log::register_secret("registered-secret-value");
+    eprintln!("a raw line that mentions registered-secret-value");
+    for i in 0..150 {
+        println!("stdout filler {i:04} {}", "x".repeat(80));
+        eprintln!("stderr filler {i:04} {}", "y".repeat(80));
+    }
+    let _ = thread::spawn(|| panic!("child panic kept by the log")).join();
+    println!("stdout end marker");
+    eprintln!("stderr end marker");
+    let live = installed.path.clone();
+    let drained = wait_until(Duration::from_secs(20), || {
+        let text: String = log::rotated_files(&live, 50)
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap_or_default())
+            .collect();
+        text.contains("stdout end marker") && text.contains("stderr end marker")
+    });
+    assert!(drained, "the capture threads drained");
+}
+
+/// Runs `test`'s desktop child with stdout and stderr appended to a
+/// `logs/orchestrator.log` that starts with `legacy` (if any), and checks the
+/// rotated log it leaves.
+fn run_desktop_child(test: &str, legacy: Option<&str>) {
     let dir = tempfile::tempdir().unwrap();
     let log_path = log::daemon_log_path(&dir.path().join("data"));
     fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    if let Some(legacy) = legacy {
+        fs::write(&log_path, legacy).unwrap();
+    }
     // Exactly as the desktop's Spawner: one file, appended, for both streams.
     let out = fs::OpenOptions::new()
         .create(true)
@@ -395,25 +576,57 @@ fn desktop_mode_daemon_output_goes_to_the_rotating_log() {
         .open(&log_path)
         .unwrap();
     let err = out.try_clone().unwrap();
-    let status = child(TEST, "desktop")
+    let status = child(test, "desktop")
         .env(log::ROTATE_BYTES_ENV, "4096")
         .env(log::ROTATE_FILES_ENV, "50")
         .stdout(out)
         .stderr(err)
         .status()
         .unwrap();
-    let files = rotated_oldest_first(&log_path, 50);
+    let mut files = rotated_oldest_first(&log_path, 50);
     let all: String = files
         .iter()
         .map(|p| fs::read_to_string(p).unwrap())
         .collect();
     assert!(status.success(), "child failed: {status}\n{all}");
+    if let Some(legacy) = legacy {
+        // The renamed legacy file holds what it held, plus only what libtest
+        // printed before the child adopted the log (`running 1 test`,
+        // `test NAME ... `): no event, no captured line, no teed copy.
+        let oldest = files.remove(0);
+        let text = fs::read_to_string(&oldest).unwrap();
+        assert!(
+            text.starts_with(legacy),
+            "{} is not the legacy file",
+            oldest.display()
+        );
+        let after = &text[legacy.len()..];
+        assert!(
+            after.len() < 512,
+            "the legacy file kept growing ({} bytes more):\n{after}",
+            after.len()
+        );
+        for line in after.lines() {
+            assert!(
+                serde_json::from_str::<Value>(line).is_err() && !line.contains("filler"),
+                "an event or a captured line reached the legacy file: {line}"
+            );
+        }
+        let rest: String = files
+            .iter()
+            .map(|p| fs::read_to_string(p).unwrap())
+            .collect();
+        assert!(
+            !rest.contains("legacy raw output"),
+            "the legacy output stays in its own file"
+        );
+    }
     assert!(files.len() >= 5, "rotated: {files:?}");
     let mut events = vec![];
     for (n, file) in files.iter().enumerate() {
         let len = fs::metadata(file).unwrap().len();
         assert!(len <= 4096, "{} has {len} bytes", file.display());
-        let lines = if n == 0 {
+        let lines = if n == 0 && legacy.is_none() {
             // libtest's own output reached the file before the child adopted
             // it (`running 1 test`, `test NAME ... `); everything after is ours.
             let text = fs::read_to_string(file).unwrap();
@@ -463,9 +676,16 @@ fn desktop_mode_daemon_output_goes_to_the_rotating_log() {
     assert!(events.iter().any(|e| e["code"] == "stderr"
         && e["level"] == "warn"
         && e["text"] == "plain stderr line"));
-    assert!(events.iter().any(|e| e["code"] == "WS_CLOSED"
-        && e["detail"] == "an event through the sink"
-        && e["token"] == REDACTED));
+    let sink_events: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["code"] == "WS_CLOSED" && e["detail"] == "an event through the sink")
+        .collect();
+    assert_eq!(
+        sink_events.len(),
+        1,
+        "the event is written once (no teed copy): {sink_events:?}"
+    );
+    assert_eq!(sink_events[0]["token"], REDACTED);
     assert!(
         events
             .iter()
@@ -786,7 +1006,12 @@ fn logs_of(node: &Node) -> Vec<(PathBuf, String)> {
 
 /// Two paired daemons with a synchronized folder: their logs and status hold
 /// no secret, and each diagnostics bundle has every part and no secret even
-/// after a pairing code and a token were planted in a worker log.
+/// after a pairing code and a token were planted in a worker log. Until
+/// CCR-WP4.2-1 these daemons log to the harness's `daemon.log` only (no
+/// installed log): the reply's `log_path` is null, and a
+/// `DATA/logs/orchestrator.log` left by an earlier daemon is bundled only as
+/// `orchestrator.log.not-installed.tail`. With the CCR applied, `log_path` is
+/// `DATA/logs/orchestrator.log` and its tail is `orchestrator.log.tail`.
 #[test]
 fn diagnostics_bundles_have_every_part_and_no_secret() {
     let a = Node::new();
@@ -827,8 +1052,20 @@ fn diagnostics_bundles_have_every_part_and_no_secret() {
         writeln!(worker_log, "a leaked line with {code} in it").unwrap();
         writeln!(worker_log, "{}", json!({"token": planted_token, "x": 1})).unwrap();
     }
+    // An earlier daemon's log in A's DATA/logs, when A writes none itself
+    // (until CCR-WP4.2-1 every harness daemon logs to `daemon.log` only).
+    let stale_token = "stale-token-0123456789".to_owned();
+    let a_log = log::daemon_log_path(&a.data_dir());
+    let stale_planted = !a_log.exists();
+    if stale_planted {
+        fs::create_dir_all(a_log.parent().unwrap()).unwrap();
+        let event = json!({"at_ms": 1, "level": "warn", "code": "WS_CLOSED",
+            "detail": "stale event marker", "token": stale_token});
+        fs::write(&a_log, format!("{event}\nstale raw output marker\n")).unwrap();
+    }
     let mut planted = secrets.clone();
     planted.push(planted_token);
+    planted.push(stale_token);
     for (node, folder) in [(&a, &pa), (&b, &pb)] {
         let reply = node.call(json!({"op":"diagnostics"}));
         assert_eq!(reply["schema"], 1, "{reply}");
@@ -846,7 +1083,6 @@ fn diagnostics_bundles_have_every_part_and_no_secret() {
             "activity.json".to_owned(),
             "catalog.redacted.json".to_owned(),
             "versions.json".to_owned(),
-            "logs/orchestrator.log.tail".to_owned(),
             format!("folders/{state}.heartbeat.json"),
             format!("logs/{state}.worker.log.tail"),
         ] {
@@ -859,6 +1095,42 @@ fn diagnostics_bundles_have_every_part_and_no_secret() {
                     .any(|f| f["path"] == file.as_str()),
                 "{file} not listed: {reply}"
             );
+        }
+        let listed = |file: &str| {
+            reply["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f["path"] == file)
+        };
+        let own_tail = "logs/orchestrator.log.tail";
+        let not_installed = "logs/orchestrator.log.not-installed.tail";
+        if reply["log_path"].is_null() {
+            // No installed log: no tail claims to be this daemon's log, and a
+            // DATA/logs file is bundled under a name that says it is not.
+            assert!(!dir.join(own_tail).exists() && !listed(own_tail));
+            if std::ptr::eq(node, &a) && stale_planted {
+                let tail = fs::read_to_string(dir.join(not_installed)).unwrap();
+                assert!(listed(not_installed), "{reply}");
+                assert!(
+                    tail.contains("stale event marker") && tail.contains("stale raw output marker"),
+                    "{tail}"
+                );
+                assert!(
+                    tail.contains(&format!("\"token\":\"{REDACTED}\"")),
+                    "{tail}"
+                );
+            } else {
+                assert!(!dir.join(not_installed).exists() && !listed(not_installed));
+            }
+        } else {
+            // An installed log (CCR-WP4.2-1): DATA/logs/orchestrator.log.
+            assert_eq!(
+                fs::canonicalize(reply["log_path"].as_str().unwrap()).unwrap(),
+                fs::canonicalize(log::daemon_log_path(&node.data_dir())).unwrap()
+            );
+            assert!(dir.join(own_tail).is_file() && listed(own_tail), "{reply}");
+            assert!(!dir.join(not_installed).exists() && !listed(not_installed));
         }
         let status: StatusSnapshot =
             serde_json::from_slice(&fs::read(dir.join("status.json")).unwrap()).unwrap();
@@ -880,6 +1152,12 @@ fn diagnostics_bundles_have_every_part_and_no_secret() {
         let versions: Value =
             serde_json::from_slice(&fs::read(dir.join("versions.json")).unwrap()).unwrap();
         assert_eq!(versions["protocol"], 3);
+        assert_eq!(
+            versions["log"].is_null(),
+            reply["log_path"].is_null(),
+            "{}",
+            versions["log"]
+        );
         assert!(versions["tkfs"].as_str().is_some_and(|v| !v.is_empty()));
         assert_eq!(versions["workers"][0]["state"], state);
         let worker_tail =
@@ -925,6 +1203,18 @@ fn diagnostics_bundles_have_every_part_and_no_secret() {
 /// diagnostics bundle carries its tail, and the pairing code is nowhere.
 #[test]
 fn a_desktop_started_daemon_writes_a_rotating_log() {
+    run_desktop_daemon(None);
+}
+
+/// The same daemon started on an `orchestrator.log` already past the rotation
+/// size (the first start after an upgrade): both streams are still captured,
+/// nothing is teed, and the renamed legacy file never grows.
+#[test]
+fn a_desktop_started_daemon_adopts_an_oversized_legacy_log() {
+    run_desktop_daemon(Some(&legacy_log(6500)));
+}
+
+fn run_desktop_daemon(legacy: Option<&str>) {
     let root = tempfile::tempdir().unwrap();
     let config = root.path().join("orchestrator.toml");
     fs::write(
@@ -935,6 +1225,9 @@ fn a_desktop_started_daemon_writes_a_rotating_log() {
     let data = root.path().join("data");
     let log_path = log::daemon_log_path(&data);
     fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    if let Some(legacy) = legacy {
+        fs::write(&log_path, legacy).unwrap();
+    }
     let out = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -962,6 +1255,14 @@ fn a_desktop_started_daemon_writes_a_rotating_log() {
             .map(|p| fs::read_to_string(p).unwrap_or_default())
             .collect()
     };
+    // The legacy file (renamed by the first rotation) and its size once the
+    // daemon answers.
+    let legacy_file = |legacy: &str| -> Option<(PathBuf, String)> {
+        log::rotated_files(&log_path, 20).into_iter().find_map(|p| {
+            let text = fs::read_to_string(&p).unwrap_or_default();
+            text.starts_with(legacy).then_some((p, text))
+        })
+    };
     assert!(
         wait_until(Duration::from_secs(30), || control
             .call(&json!({"op":"list"}))
@@ -969,6 +1270,11 @@ fn a_desktop_started_daemon_writes_a_rotating_log() {
         "the daemon answers\n{}",
         all_logs()
     );
+    let legacy_at_start = legacy.map(|legacy| {
+        let (path, text) = legacy_file(legacy).expect("the legacy file is kept");
+        assert_ne!(path, log_path, "the oversized legacy log was rotated");
+        text.len()
+    });
     let code = control.call(&json!({"op":"reset-pairing-code"})).unwrap()["code"]
         .as_str()
         .unwrap()
@@ -1000,12 +1306,38 @@ fn a_desktop_started_daemon_writes_a_rotating_log() {
     let bundle = PathBuf::from(reply["path"].as_str().unwrap());
     let tail = fs::read_to_string(bundle.join("logs/orchestrator.log.tail")).unwrap();
     assert!(tail.contains("inbound handshake failed"), "{tail}");
+    let versions: Value =
+        serde_json::from_slice(&fs::read(bundle.join("versions.json")).unwrap()).unwrap();
+    assert_eq!(
+        (
+            &versions["log"]["captured_stdout"],
+            &versions["log"]["captured_stderr"],
+            &versions["log"]["tee_stderr"],
+        ),
+        (&json!(true), &json!(true), &json!(false)),
+        "both streams are captured, nothing is teed: {}",
+        versions["log"]
+    );
     let _ = control.call(&json!({"op":"shutdown"}));
     let exited = wait_until(Duration::from_secs(30), || {
         daemon.0.try_wait().ok().flatten().is_some()
     });
     assert!(exited, "the daemon exits\n{}", all_logs());
-    let files = log::rotated_files(&log_path, 20);
+    let mut files = log::rotated_files(&log_path, 20);
+    if let (Some(legacy), Some(at_start)) = (legacy, legacy_at_start) {
+        let (path, text) = legacy_file(legacy).expect("the legacy file is kept");
+        assert_eq!(
+            text.len(),
+            at_start,
+            "the renamed legacy file stopped growing:\n{}",
+            &text[legacy.len()..]
+        );
+        assert!(
+            !text[legacy.len()..].contains("handshake"),
+            "no event reached the legacy file"
+        );
+        files.retain(|file| *file != path);
+    }
     assert!(files.len() >= 2, "the log rotated: {files:?}");
     let mut events = vec![];
     for file in &files {
