@@ -93,7 +93,7 @@
 //! rewrite deletes the row. Older binaries never read it: they reconstruct
 //! (above), which rewrites `current_state` with the lists.
 use super::*;
-use std::{borrow::Cow, cell::Cell, sync::OnceLock, time::Instant};
+use std::{borrow::Cow, cell::Cell, collections::HashMap, sync::OnceLock, time::Instant};
 
 // Bump when projection/validation semantics or the sealed layout change,
 // even without a SQL migration. 2: incremental seals (WP4.4).
@@ -1603,6 +1603,9 @@ pub(super) fn persist(db: &Connection, branch: &str) -> Result<()> {
 /// A rows anchor's rows as read back and checked against its digest.
 struct SealedRows {
     entries: BTreeMap<String, (Entry, BTreeMap<String, Vec<Version>>)>,
+    /// Each entity row's digest (`entity_digest`), which the restore
+    /// compares with the stored `current_parts` rows.
+    digests: HashMap<String, [u8; 32]>,
     conflicts: Vec<(String, String, Option<String>)>,
 }
 
@@ -1612,6 +1615,7 @@ fn read_rows(db: &Connection, branch: &str, expected: &RowSet) -> Result<SealedR
     let mut digest = RowsDigest::default();
     let mut found = RowSet::default();
     let mut entries = BTreeMap::new();
+    let mut digests = HashMap::new();
     {
         let mut statement =
             db.prepare("SELECT entity,entry,heads FROM snapshot_entries WHERE branch=?")?;
@@ -1621,7 +1625,8 @@ fn read_rows(db: &Connection, branch: &str, expected: &RowSet) -> Result<SealedR
             let entity = row.get_ref(0)?.as_str()?;
             let entry = row.get_ref(1)?.as_str()?;
             let heads = row.get_ref(2)?.as_str()?;
-            digest.toggle(entity_digest(branch, entity, entry, heads));
+            let row_digest = entity_digest(branch, entity, entry, heads);
+            digest.toggle(row_digest);
             found.entries += 1;
             found.bytes += (entry.len() + heads.len()) as u64;
             let parsed: Entry = serde_json::from_str(entry)?;
@@ -1631,6 +1636,7 @@ fn read_rows(db: &Connection, branch: &str, expected: &RowSet) -> Result<SealedR
             );
             let heads: BTreeMap<String, Vec<Version>> = serde_json::from_str(heads)?;
             entries.insert(entity.to_owned(), (parsed, heads));
+            digests.insert(entity.to_owned(), row_digest);
         }
     }
     let mut conflicts = vec![];
@@ -1664,7 +1670,11 @@ fn read_rows(db: &Connection, branch: &str, expected: &RowSet) -> Result<SealedR
         found == *expected,
         "SNAPSHOT_CHECKSUM: the sealed rows differ from the anchor's digest"
     );
-    Ok(SealedRows { entries, conflicts })
+    Ok(SealedRows {
+        entries,
+        digests,
+        conflicts,
+    })
 }
 
 /// What [`Store::check_startup_snapshot`] found: the sealed state, as a
@@ -1841,10 +1851,17 @@ impl Store {
         );
         let snapshot: Anchor = serde_json::from_str(&payload)?;
         drop(payload);
+        // The cursor lies within the branch's journal: its newest row in the
+        // per-branch index (one index probe; the journal hash below checks
+        // every row up to the cursor against the journal itself, and a tip
+        // the index were missing could only refuse the snapshot).
+        let tip: i64 = self.db.query_row(
+            "SELECT coalesce(max(seq),0) FROM journal_branch WHERE branch=?",
+            [&branch.id],
+            |r| r.get(0),
+        )?;
         ensure!(
-            snapshot.cursor == saved_cursor
-                && saved_cursor >= 0
-                && saved_cursor <= cursor(&self.db, &branch.id)?,
+            snapshot.cursor == saved_cursor && saved_cursor >= 0 && saved_cursor <= tip,
             "SNAPSHOT_CURSOR"
         );
         let journal = journal_hash(&self.db, &branch.id, saved_cursor)?;
@@ -1866,8 +1883,11 @@ impl Store {
         }
         let restored = self.restore_snapshot(branch, snapshot)?;
         // The restored projection is the view the replay's successors read
-        // (no reload of what was just written).
-        self.seed_view(&branch.id, restored)?;
+        // (no reload of what was just written). Without a tail nothing reads
+        // it (`resume_snapshot` drops the view).
+        if !tail.is_empty() {
+            self.seed_view(&branch.id, restored)?;
+        }
         let mut last = saved_cursor;
         for (seq, payload) in &tail {
             crate::startup::progress("replaying snapshot suffix");
@@ -2000,12 +2020,11 @@ impl Store {
                     // A large one is stored as the header plus one
                     // `current_parts` row per entity, equal to the sealed
                     // rows. Only what differs from them is written (the
-                    // rows changed since the seal, normally the marked
-                    // ones): an open at the tip rewrites nothing, instead
-                    // of every row (each with its triggers) and its commit.
+                    // rows changed since the seal): an open at the tip
+                    // rewrites nothing, instead of every row (each with its
+                    // triggers) and the commit of all those pages.
                     self.db.execute("INSERT INTO current_state VALUES(?1,?2) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload WHERE current_state.payload IS NOT excluded.payload", params![id, header])?;
-                    self.db.execute("DELETE FROM current_parts WHERE branch=?1 AND NOT EXISTS(SELECT 1 FROM snapshot_entries s WHERE s.branch=?1 AND s.entity=current_parts.entity AND s.entry IS current_parts.entry AND s.heads IS current_parts.heads)", [id])?;
-                    self.db.execute("INSERT INTO current_parts(branch,entity,entry,heads) SELECT s.branch,s.entity,s.entry,s.heads FROM snapshot_entries s WHERE s.branch=?1 AND NOT EXISTS(SELECT 1 FROM current_parts p WHERE p.branch=?1 AND p.entity=s.entity)", [id])?;
+                    self.restore_parts(id, sealed.digests)?;
                 }
                 // The conflict rows, likewise: those that differ from the
                 // sealed ones are replaced.
@@ -2024,6 +2043,59 @@ impl Store {
         clear_marks(&self.db, id)?;
         fault("startup_snapshot_restored");
         Ok(projection)
+    }
+
+    /// Makes `branch`'s `current_parts` rows exactly its sealed entity rows,
+    /// whose digests (`entity_digest`, checked against the anchor) are
+    /// `sealed`: one pass over the stored rows compares each one's digest
+    /// with its sealed row's; a row that differs, is not UTF-8 text or has
+    /// no sealed row is deleted, and every sealed row without an equal
+    /// stored one is copied from `snapshot_entries`. An open at the tip
+    /// writes nothing; after a tail, the tail's entities.
+    fn restore_parts(&self, branch: &str, mut sealed: HashMap<String, [u8; 32]>) -> Result<()> {
+        let mut stale = vec![];
+        {
+            let mut statement = self
+                .db
+                .prepare("SELECT rowid,entity,entry,heads FROM current_parts WHERE branch=?")?;
+            let mut rows = statement.query([branch])?;
+            while let Some(row) = rows.next()? {
+                crate::startup::progress("loading startup snapshot");
+                let rowid: i64 = row.get(0)?;
+                let texts = (
+                    row.get_ref(1)?.as_str(),
+                    row.get_ref(2)?.as_str(),
+                    row.get_ref(3)?.as_str(),
+                );
+                let equal = match texts {
+                    (Ok(entity), Ok(entry), Ok(heads))
+                        if sealed.get(entity)
+                            == Some(&entity_digest(branch, entity, entry, heads)) =>
+                    {
+                        Some(entity)
+                    }
+                    _ => None,
+                };
+                match equal {
+                    // Kept: the sealed row needs no copy.
+                    Some(entity) => {
+                        sealed.remove(entity);
+                    }
+                    None => stale.push(rowid),
+                }
+            }
+        }
+        let mut delete = self
+            .db
+            .prepare_cached("DELETE FROM current_parts WHERE rowid=?")?;
+        for rowid in stale {
+            delete.execute([rowid])?;
+        }
+        let mut copy = self.db.prepare_cached("INSERT INTO current_parts(branch,entity,entry,heads) SELECT branch,entity,entry,heads FROM snapshot_entries WHERE branch=? AND entity=?")?;
+        for entity in sealed.keys() {
+            copy.execute(params![branch, entity])?;
+        }
+        Ok(())
     }
 
     /// Makes `projection`, just restored as `branch`'s stored projection,

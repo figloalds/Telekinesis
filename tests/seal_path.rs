@@ -1035,6 +1035,7 @@ fn random_op(s: &mut Store, rng: &mut StdRng) {
 /// steps. After every step B's derived state is exactly a rebuild's (strict
 /// oracle) and every snapshot is valid.
 fn random_workload(seed: u64, rows: bool, steps: usize) {
+    let started = std::time::Instant::now();
     let _layout = Layout::of(rows);
     let limit = if rows { 0 } else { usize::MAX };
     let dir = tempfile::tempdir().unwrap();
@@ -1127,6 +1128,12 @@ fn random_workload(seed: u64, rows: bool, steps: usize) {
     );
     assert_oracle(s, "converged");
     assert_oracle(&mut a, "converged A");
+    let events = journal(s, &s.active.clone()).len();
+    eprintln!(
+        "workload seed {seed} {}: {steps} steps, {events} events, {:.1} s",
+        if rows { "rows" } else { "inline" },
+        started.elapsed().as_secs_f64()
+    );
 }
 
 #[test]
@@ -1137,11 +1144,20 @@ fn random_workloads_and_crashes_keep_derived_state_exact() {
     }
 }
 
-/// More seeds and steps (release).
+/// More seeds and steps (release): seeds `TKFS_SEAL_SEED_START` (default 0)
+/// to `+ TKFS_SEAL_SEEDS` (default 20), each in both layouts (40 workloads
+/// by default; shards run in parallel with disjoint ranges).
 #[test]
 #[ignore = "release: cargo test --release --test seal_path -- --ignored"]
 fn random_workloads_and_crashes_release() {
-    for seed in 0..20 {
+    let env = |key: &str, default: u64| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let start = env("TKFS_SEAL_SEED_START", 0);
+    for seed in start..start + env("TKFS_SEAL_SEEDS", 20) {
         random_workload(seed, true, 200);
         random_workload(seed + 1000, false, 150);
     }
