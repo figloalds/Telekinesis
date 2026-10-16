@@ -729,4 +729,101 @@ Per binary (WSL): `lib` 55+2i, `availability` 10, `contracts` 40, `feed_v7` 44, 
 | `9733604` | an object a dialer did not send backs off 5 s → 5 min (the relay delay the qualification found) |
 | `3aa6936` | qualification evidence, merged re-run on `9733604` (summary ok, 41 of 41) |
 | `cc6d449` | busy databases are no object failures; a pull carries at most 256 items (the tiny-files stalls) |
-| (this commit) | qualification evidence (merged re-run on `cc6d449`) and these notes |
+| `227a402` | qualification evidence (merged re-run on `cc6d449`) and these notes |
+
+## Re-review 2 (confirmation review of the re-review fixes)
+
+The confirmation review of `b150dff..227a402` returned `changes_required`
+with four blockers: three fixes of the re-review were incomplete or
+introduced a new defect, and one held only until a restart. Each is fixed
+here with a regression test that fails on the code before this round (the
+new tests run with the touched source files at `227a402`; the exceptions
+are said below). No frozen contract changed: `src/model/**` and
+`src/util/**` are untouched, so no CCR is filed. `hub_rules` gains new
+public functions; `download_work` and `upload_work` keep their signatures
+as the rules without per-pair evidence (§13 rule 3). The plan records the
+changed rules (§3.3 published catalog, §6.4 peer slots and sizes not
+recorded, §7.1 object work).
+
+### Fixes
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| blocker (`objects.rs`): the push gate was taken inside the repository's turn. With three or more repositories, an upload round (one with nothing to push too: the gate came before its `objects.wants`) parked behind a stalled push while holding a turn, so both turns were held and a third repository's downloads waited for the peer's 60 s write deadline (58.4 s with one stalled push and with two) | `UploadJob::run` takes the gate before `RepoGate::enter` and holds it for the round (`upload_round` no longer takes it): no upload round ever waits for the gate while holding a turn. A push the peer stalls holds the gate, one turn and one peer slot; every other upload round waits for the gate without a turn, so the other turn and the other slot stay with downloads and reports, whatever the number of repositories | `objects_v3_lanes::one_stalled_push_leaves_a_third_repository_its_turn`, `::two_stalled_pushes_leave_a_third_repository_its_turn` (the review's two probes as tests: a third repository joins and pulls six 1.5 MiB objects in < 15 s; at `227a402` both waited the whole 30 s of the test) |
+| blocker (`objects.rs`, `inbound_objects.rs`): an object of unknown size that its source failed after partial progress was parked as `{size 0, offset > 0}` (the round's record kept the probe's size 0), which no source that took it over could move (zero-byte pulls every round, the entry kept alive, the lane's own want skipped); the acceptor built the same item from its offer | Three parts. (1) When a size probe resizes an object, the round's record of it (`RoundState::planned`) takes the size, so `settle_handoffs` parks, continues or gives back the object with it. (2) `settle_pushed` builds the parked item with the size the dialer pushed the object with, once our worker took bytes of an object offered with an unknown size (every chunk carried that total, and our worker's first write took it). (3) The handoff table never keeps a size-0 item past offset 0 of a non-empty object (`handoff_item`): it keeps the size it knew, or the item goes back to offset 0, a size probe again (a worker answers a write behind its durable offset with that offset, and the round, which now records the probed size, continues from there) | `objects_v3_lanes::an_object_of_unknown_size_is_handed_on_after_partial_progress` (the review's probe: at `227a402` C served 0 reads in 30 s), `::an_object_of_unknown_size_pushed_in_part_is_handed_on` (the acceptor side: A1 cannot serve Y and goes away, C pushes 3 MiB of it and its session resets, E completes it in < 20 s; at `227a402` E's pushes could not cover Y for the whole 30 s), lib `orchestrator::objects::tests::the_handoff_table_keeps_no_unmovable_item` (part 3; a new private function, so it does not apply to the old code) |
+| blocker (`hub_rules.rs`, `hub.rs`): the re-review's rule (a peer that misses something else than we do while holding objects may supply) also held for a peer that misses a strict superset of what we miss (one object lost on both sides plus what it still receives from us): `1 file to download` from it for the whole upload | A side may supply what the other misses when its counters are unknown, it is complete, or it misses strictly fewer objects **or** fewer bytes (then the other misses something it holds). When it misses at least as many objects and bytes, the totals cannot tell the two cases apart: it may supply only while it demonstrably does, its objects having reached the other side within the stall threshold (per-pair evidence: `pair.supplied` for downloads, the new `pair.served` for uploads), and while the totals differ and it holds objects. The hub attributes each direction's work by that rule (`supplying`, the new `serving`), so work that leaves with its evidence is no progress. New: `hub_rules::download_work_with_evidence`, `upload_work_with_evidence`, `supplies_download`, `supplies_upload`, `lately` | `status_hub::download_work_shows_when_each_side_misses_different_objects` (extended with the superset case, a peer missing fewer objects and more bytes, and the evidence), `::a_peer_missing_more_than_we_do_downloads_only_while_its_objects_arrive` (the hub: no download from the superset peer; one while its objects arrive; gone a stall threshold later without counting as progress. At `227a402` the pair showed 1 object to download at once; with the evidence but without the attribution, the expiry counted as progress) |
+| blocker (`folder.rs`): the re-review kept an entry published `unavailable` when a worker stopped, but a folder stopped when the daemon starts was never published (nor a running one before its worker's summary), so after the stopped side restarted its peers read "Not shared" again | `publish_unavailable` (every controller step): while no worker's entry exists (starting, stopped, failed, from the controller's start on), the folder is published `unavailable` from its record (repo, replica, label); its label follows the record while no worker runs; the worker's summary replaces it (`maybe_refresh_published` already refreshes an unavailable entry); only leaving the catalog removes it | `folder_controller::a_folder_stopped_at_start_is_published_unavailable` (stopped at start: published unavailable from its record; renamed; started: the summary replaces it; stopped: unavailable; retired: removed, the other folder's entry kept. At `227a402`: no entry) |
+
+### Existing assertions changed
+
+- `status_hub::download_work_shows_when_each_side_misses_different_objects` (added by the re-review): `download_work(&ours, Some(&theirs))` for the peer that misses three objects we hold is `(0, 0)` now (was `(1, 64 KiB)`): the review showed that the totals alone cannot tell this case from a peer missing a superset of ours, so the evidence decides; `download_work_with_evidence(…, true)` asserts the `(1, 64 KiB)`, and the new hub-level test shows the download while the peer's objects arrive.
+- `folder_controller::graceful_stop_persists_desired_before_the_stop_rpc` and `::published_entry_taken_before_the_first_heartbeat_is_refreshed_once`: their sync point "an entry is published" waits for the worker's entry (`Running`), since the unavailable entry now exists from the controller's start (`is_some()` no longer means the worker answered; the second test's `fake-b0` label would race). Their assertions are unchanged.
+
+### Deviations
+
+1. **The push gate is held for the whole upload round** (at most `ROUND_CAP` plus one push), not per push as in the re-review: two repositories uploading on one lane take turns by round instead of by push. A lane still runs one push at a time with the default two peer slots (deviation 4 of the re-review), and repositories already take their lane turns by round, so throughput does not change; the review's alternative (try the gate, end the round when busy) could starve one repository's uploads behind another's.
+2. **Download work from a peer that misses at least as much as we do shows only while its objects arrive** (within the stall threshold), the review's first example of per-pair evidence. Such a download shows from its first object (seconds after it starts), and a stall of it shows as the lane's errors but no longer as the pair's stall once the evidence is a threshold old. The review's second example (our last pulls from that peer were not all answered `NOT_AVAILABLE`) needs per-object outcomes the hub does not keep. A peer that misses a superset of ours and supplied us within the threshold (both directions moving at once) still reads as a download source until the threshold passes.
+3. **The placeholder entry is `unavailable`, also while a worker starts** (the review: "`unavailable` (or `starting`)"): the peers' hub treats both alike (`WaitingForRemote`), and one state keeps the refresh rule (an unavailable entry is refreshed once a worker runs).
+
+### Tests added
+
+`objects_v3_lanes`: `one_stalled_push_leaves_a_third_repository_its_turn`, `two_stalled_pushes_leave_a_third_repository_its_turn`, `an_object_of_unknown_size_is_handed_on_after_partial_progress`, `an_object_of_unknown_size_pushed_in_part_is_handed_on`. `status_hub`: `a_peer_missing_more_than_we_do_downloads_only_while_its_objects_arrive` (and the superset case in `download_work_shows_when_each_side_misses_different_objects`). `folder_controller`: `a_folder_stopped_at_start_is_published_unavailable`. lib: `orchestrator::objects::tests::the_handoff_table_keeps_no_unmovable_item`.
+
+Checked against `227a402` (the touched source files restored from it, the new tests kept): the four lanes tests fail (each waited its whole 30 s), the hub-level test fails (1 object to download from the superset peer), and the folder test fails (no entry). The extended rules test and the lib test use new functions and do not compile there. With the hub's evidence rule but without the work attribution, the hub test's last assertion fails (the expiry counted as progress).
+
+### VERIFY (re-review 2)
+
+Run on the code of `2a59aad` (the commits after it hold only the evidence
+and these notes), Windows 11, `CARGO_TARGET_DIR=C:/tkfs-target/wp3-int`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo build --all-targets` | ok |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` | **ok: 65 test binaries, 967 passed, 0 failed, 104 ignored** (960 after the re-review + 7 new tests; the ignored are unchanged) |
+| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp3-int`) | ok |
+| WSL: `cargo test --no-fail-fast --lib` and `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle` (FUSE), `objects_v3_worker`, `objects_v3_lanes`, `status_hub`, `gui_model`, `w3_integration`, `meta_scheduler`, `folder_controller`, `inbound_v3`, `peer_supervisor`, `contracts`, `feed_v7`, `partial_content`, `availability` | **ok: 19 binaries, 652 passed, 0 failed, 11 ignored** (645 after the re-review + 7) |
+
+Per binary (Windows), where it changed: `lib` 51+2i, `folder_controller` 57, `objects_v3_lanes` 43+8i, `status_hub` 95; every other binary as in *VERIFY (re-review)*. WSL: `lib` 56+2i, `folder_controller` 57, `objects_v3_lanes` 43+8i, `status_hub` 95, the others as before.
+
+### Qualification (re-review 2)
+
+`scripts/qualify.ps1 -Wave 3 -Merge -Files qual_wp3_int_e2e -BudgetS 2400 -FileTimeoutMin 150 -Priority Normal`
+(release, `TKFS_BASELINE_BIN` the WP2.INT baseline build, as before) on the
+code of `2a59aad`, each run merged into the evidence of the one before (the
+other files' results are those listed under *Qualification (re-review)*;
+this round changes nothing they run but the lanes, which only the e2e file
+runs between daemons):
+
+| Run (`test-runs/qualify-wave-3-…`) | Result |
+|---|---|
+| `20261016-034935` | 1 floor failed: `e2e_tiny_files_10k` 209.9 files/s (47.6 s); every other scenario passed |
+| `20261016-042206` | 1 floor failed: `e2e_tiny_files_10k` 297.7 files/s (33.6 s); every other scenario passed |
+| `20261016-044205` | **ok: summary ok, 77 scenarios (76 pass, 1 skipped), 41 of 41 floors** (the evidence): tiny files 315.4 files/s, 256 MiB loopback 108.7 MiB/s, link utilization 0.978, relay 0.26 s, two-way backlog 2.4 s, 10K catch-up 17.8 s, 150K feed 204.6 events/s, mutual pairing wire ratio 1.002, `objects_ahead` 60 |
+
+The tiny-files scenario is the floor this machine runs nearest (it is bound
+by fsynced creates; *Known limitations (re-review)*). Between the first two
+runs it ran standalone 11 times on the same release binary: 286.2, 297.7,
+300.6, 301.0, 303.2, 303.7, 304.5, 305.2, 308.6, 310.0 and 319.5 files/s
+(31.3–34.9 s), the distribution of the re-review's runs (296–319 files/s in
+8 runs on `cc6d449`), so the 47.6 s run is an outlier of the shared machine
+rather than this round's code: the scenario is one dialer pulling from one
+repository, where the upload round's gate and turn order, the handoff sizes
+(objects of known size) and the status and catalog changes do not act on
+the data path.
+
+### Known limitations (re-review 2)
+
+- The confirmation review's observations were not changed here: (1) a dialer that cancels a pull whose objects all settled makes the acceptor record an inbound `CANCELLED` (Transient) error in that pair's book, visible after three in a row; (2) `object_backoffs_reset` gives reset entries the failures' schedule, so an acceptor's unserved entry for the same peer moves to 30 s after a reset; (3) an unknown-size probe or a push's size read uses the plain 60 s read deadline, so a first-serve verify of a very large object of unknown size can time out once before it is retried; (4) deviation 3 of the re-review, as documented.
+- Deviation 2 above: a peer missing a superset of our objects that supplied us within the stall threshold reads as a download source until the threshold passes.
+
+### Commits (re-review 2)
+
+| Commit | What |
+|---|---|
+| `8aea796` | objects lanes: the push gate before the turn; unknown sizes handed on with their size |
+| `871889a` | status: object work from per-pair evidence when the counters cannot tell |
+| `ccb05c3` | folders without a worker's entry are published unavailable |
+| `2a59aad` | plan: push gate, sizes handed on, object work, unavailable entries |
+| (this commit) | qualification evidence (merged re-run of `qual_wp3_int_e2e` on `2a59aad`) and these notes |
