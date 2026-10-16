@@ -37,7 +37,10 @@
 //! `UNSUPPORTED_OPERATION` from its objects ops) is answered
 //! `UNSUPPORTED_OPERATION` too: the dialer then takes the interim path.
 //!
-//! **Pull.** The items cover the bytes of the allotment rule
+//! **Pull.** An item whose size the dialer does not know (size 0, not the
+//! empty object) gets one empty chunk carrying our total, and the result
+//! `Skipped`: the dialer pulls it next with that size (WP3.INT re-review).
+//! The items cover the bytes of the allotment rule
 //! ([`super::objects::allot`]): an item that fails sends nothing, and its
 //! share is not given to later items. Per item the result is `Completed`
 //! (sent through its end), `Progressed{durable_offset}` (sent up to there,
@@ -55,9 +58,12 @@
 //! worker writes (at most [`PUSH_BUFFERED_BYTES`] wait that the writers
 //! take without more input), so the session holds the dialer back. A
 //! PROGRESS follows every write, so the dialer's idle deadline measures our
-//! progress, not its queue. Objects that failed here (for example
-//! `CorruptAtSource`) back off for that peer: `objects.wants` does not list
-//! them until then. A write call that fails as a whole (our worker timed
+//! progress, not its queue. Objects of our offer that failed here (for
+//! example `CorruptAtSource`) back off for that peer: `objects.wants` does
+//! not list them until then. A push may list any hash: one we never offered
+//! this dialer (not wanted: `UNSOLICITED_OBJECT`; not this lane's:
+//! `OBJECT_ON_WRONG_LANE`) is answered in the result alone, with neither a
+//! backoff nor an `ObjectError` (WP3.INT re-review). A write call that fails as a whole (our worker timed
 //! out, went away, refused or erred for the call) fails the push with that
 //! error, not its objects: no per-object backoff or `ObjectError` (§2.3).
 //!

@@ -300,7 +300,35 @@ fn set_send_buffer(stream: &TcpStream, bytes: usize) {
 #[cfg(not(windows))]
 fn set_send_buffer(_: &TcpStream, _: usize) {}
 
-#[cfg(not(windows))]
+/// Unsent bytes a Linux session socket holds at most (`TCP_NOTSENT_LOWAT`;
+/// WP3.INT re-review). Linux sizes its socket buffers itself, and its
+/// autotuning grew the send buffer to megabytes on a slow uplink, so control
+/// frames waited behind them (18 s for a pull's request at 256 KiB/s); the
+/// low-water mark bounds only what TCP has not sent yet, so the buffer still
+/// holds the bandwidth-delay product in flight.
+#[cfg(target_os = "linux")]
+pub const NOTSENT_LOWAT_BYTES: i32 = 256 * 1024;
+
+/// Sets [`NOTSENT_LOWAT_BYTES`] (best effort: a kernel without it keeps its
+/// own behaviour).
+#[cfg(target_os = "linux")]
+fn size_socket_buffers(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let value: libc::c_int = NOTSENT_LOWAT_BYTES;
+    // SAFETY: the descriptor is the open socket `stream` owns, and `value` is
+    // the integer option the call reads, alive for the call.
+    unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NOTSENT_LOWAT,
+            (&value as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn size_socket_buffers(_: &TcpStream) {}
 
 fn would_block(error: &io::Error) -> bool {
