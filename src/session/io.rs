@@ -163,8 +163,46 @@ fn tcp(ws: &Socket) -> io::Result<&TcpStream> {
 /// 128 KiB/s: 32 s). It starts at the system's own size and follows the
 /// rate the socket drains at ([`SendBuffer`]): about two round trips of
 /// data (at least 100 ms), between [`SEND_BUFFER_MIN`] and this.
+///
+/// **Loopback sockets only** (CCR-WP3.INT-5, applied by WP4.5): setting
+/// `SO_RCVBUF` turns Windows' receive-window autotuning off for the socket
+/// (a fixed 4 MiB window carries at most 4 MiB per round trip: 40 MiB/s at
+/// 100 ms), and setting `SO_SNDBUF` turns its dynamic send buffering off
+/// (the system sizes the send buffer to its own estimate of the link's
+/// bandwidth-delay product, where the rule above, with its 50 ms horizon,
+/// sizes a LAN socket's buffer to 100 ms of data ahead of every control
+/// frame). Both helped only on loopback, where the system's sizes are
+/// small (64 KiB) and were measured to cap a download at 270–360 MiB/s. A
+/// session whose peer is another host (a LAN, a WAN, the TLS proxy in front
+/// of a peer) keeps the system's own sizing ([`socket_tuning`]). A session
+/// to a proxy on this machine is loopback and keeps the rule above, which
+/// then follows the proxy's drain rate.
 #[cfg(windows)]
 pub const SOCKET_BUFFER_BYTES: i32 = 4 * 1024 * 1024;
+
+/// How a session socket's buffers are sized (CCR-WP3.INT-5, WP4.5): on a
+/// loopback socket (the peer's address is this machine's loopback) Windows
+/// gets the fixed receive buffer and the adaptive send buffer
+/// ([`SOCKET_BUFFER_BYTES`], [`SendBuffer`]); any other socket keeps the
+/// system's autotuning. Linux bounds the unsent bytes of every socket
+/// ([`NOTSENT_LOWAT_BYTES`]) and sizes its buffers itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SocketTuning {
+    /// Loopback: the large receive buffer and the adaptive send buffer
+    /// (Windows).
+    Loopback,
+    /// Another host: the system's own sizing.
+    System,
+}
+
+/// The [`SocketTuning`] of a socket whose peer is `peer` (`None`: unknown,
+/// which keeps the system's sizing).
+pub fn socket_tuning(peer: Option<std::net::SocketAddr>) -> SocketTuning {
+    match peer {
+        Some(peer) if peer.ip().to_canonical().is_loopback() => SocketTuning::Loopback,
+        _ => SocketTuning::System,
+    }
+}
 
 /// The largest send buffer [`SendBuffer`] sets.
 #[cfg(windows)]
@@ -180,6 +218,10 @@ pub const SEND_BUFFER_WINDOW: Duration = Duration::from_millis(250);
 const SEND_BUFFER_RTT_MS: u64 = 100;
 /// The shortest round trip the send buffer is sized for (it holds two).
 const SEND_BUFFER_HORIZON_MS: u64 = 50;
+/// The round trip a loopback socket's send buffer is sized for
+/// ([`SendBuffer::for_loopback`]; WP4.5): about 20 ms of data at the drain
+/// rate.
+pub const LOOPBACK_SEND_HORIZON_MS: u64 = 10;
 
 /// The adaptive send buffer of a session socket (WP3.INT re-review): the
 /// bytes the kernel took in a window while the socket refused more (it was
@@ -188,6 +230,16 @@ const SEND_BUFFER_HORIZON_MS: u64 = 50;
 /// (the buffer is at least the bandwidth-delay product) while a control
 /// frame never waits behind more than that. A window in which the socket
 /// took everything changes nothing.
+///
+/// A loopback socket's buffer ([`SendBuffer::for_loopback`], the only kind
+/// a session sizes since WP4.5: [`SocketTuning`]) is sized for
+/// [`LOOPBACK_SEND_HORIZON_MS`] instead of the session's round trip: the
+/// socket's own round trip is loopback's, whatever the session's is (a
+/// session to a TLS proxy or a test's link emulator on this machine has the
+/// far link's round trip, and a buffer of two of those queued 100 to 200 ms
+/// of data ahead of every control frame; the proxy's own buffers cover the
+/// far link). It stays large where the drain rate is high (4 MiB on
+/// loopback at GiB/s).
 #[derive(Debug)]
 pub struct SendBuffer {
     /// The size set (`None`: the system's own).
@@ -197,6 +249,8 @@ pub struct SendBuffer {
     flushed: usize,
     saturated: bool,
     min_rtt_ms: Option<u64>,
+    /// The fixed round trip it is sized for (`None`: the session's).
+    horizon_ms: Option<u64>,
 }
 
 impl SendBuffer {
@@ -208,6 +262,17 @@ impl SendBuffer {
             flushed: 0,
             saturated: false,
             min_rtt_ms: None,
+            horizon_ms: None,
+        }
+    }
+
+    /// The send buffer of a loopback socket: two [`LOOPBACK_SEND_HORIZON_MS`]
+    /// of data at the drain rate, whatever round trip the session measures
+    /// (see the type's docs).
+    pub fn for_loopback(max: usize, now: Instant) -> Self {
+        Self {
+            horizon_ms: Some(LOOPBACK_SEND_HORIZON_MS),
+            ..Self::new(max, now)
         }
     }
 
@@ -245,10 +310,13 @@ impl SendBuffer {
         if !saturated {
             return None;
         }
-        let rtt = self
-            .min_rtt_ms
-            .unwrap_or(SEND_BUFFER_RTT_MS)
-            .max(SEND_BUFFER_HORIZON_MS);
+        let rtt = match self.horizon_ms {
+            Some(horizon) => horizon,
+            None => self
+                .min_rtt_ms
+                .unwrap_or(SEND_BUFFER_RTT_MS)
+                .max(SEND_BUFFER_HORIZON_MS),
+        };
         let rate = flushed as f64 / elapsed.as_secs_f64();
         let target = (rate * 2.0 * rtt as f64 / 1000.0) as usize;
         let target = target.clamp(SEND_BUFFER_MIN, self.max);
@@ -263,11 +331,13 @@ impl SendBuffer {
     }
 }
 
-/// Sets [`SOCKET_BUFFER_BYTES`] as the socket's receive buffer. Best effort:
-/// a refusal keeps the system's default.
+/// Sets [`SOCKET_BUFFER_BYTES`] as a loopback socket's receive buffer (see
+/// [`SocketTuning`]). Best effort: a refusal keeps the system's default.
 #[cfg(windows)]
-fn size_socket_buffers(stream: &TcpStream) {
-    set_buffer(stream, SO_RCVBUF, SOCKET_BUFFER_BYTES as usize);
+fn size_socket_buffers(stream: &TcpStream, tuning: SocketTuning) {
+    if tuning == SocketTuning::Loopback {
+        set_buffer(stream, SO_RCVBUF, SOCKET_BUFFER_BYTES as usize);
+    }
 }
 
 #[cfg(windows)]
@@ -312,7 +382,7 @@ pub const NOTSENT_LOWAT_BYTES: i32 = 256 * 1024;
 /// Sets [`NOTSENT_LOWAT_BYTES`] (best effort: a kernel without it keeps its
 /// own behaviour).
 #[cfg(target_os = "linux")]
-fn size_socket_buffers(stream: &TcpStream) {
+fn size_socket_buffers(stream: &TcpStream, _: SocketTuning) {
     use std::os::fd::AsRawFd;
     let value: libc::c_int = NOTSENT_LOWAT_BYTES;
     // SAFETY: the descriptor is the open socket `stream` owns, and `value` is
@@ -329,7 +399,7 @@ fn size_socket_buffers(stream: &TcpStream) {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn size_socket_buffers(_: &TcpStream) {}
+fn size_socket_buffers(_: &TcpStream, _: SocketTuning) {}
 
 fn would_block(error: &io::Error) -> bool {
     matches!(
@@ -340,14 +410,16 @@ fn would_block(error: &io::Error) -> bool {
 
 /// Takes over `ws` and starts the connection's I/O thread.
 pub(crate) fn start(mut ws: Socket, shared: Arc<Shared>) -> io::Result<()> {
-    {
+    let tuning = {
         let stream = tcp(&ws)?;
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
         let _ = stream.set_nodelay(true);
-        size_socket_buffers(stream);
+        let tuning = socket_tuning(stream.peer_addr().ok());
+        size_socket_buffers(stream, tuning);
         stream.set_nonblocking(true)?;
-    }
+        tuning
+    };
     let max_message = shared.receive_limits().max_message();
     ws.set_config(|config| {
         config.max_message_size = Some(max_message);
@@ -356,7 +428,7 @@ pub(crate) fn start(mut ws: Socket, shared: Arc<Shared>) -> io::Result<()> {
     // SAFETY: `Io` owns the socket and deletes it from the poller in `Drop`,
     // before the socket itself is dropped.
     unsafe { shared.poller.add(tcp(&ws)?, Readiness::readable(KEY))? };
-    let io = Io::new(ws, shared.clone());
+    let io = Io::new(ws, shared.clone(), tuning);
     thread::Builder::new()
         .name(shared.name.clone())
         .spawn(move || io.run_guarded())?;
@@ -490,8 +562,10 @@ struct Io {
     /// Cost of the parts (channel and overflow) of streams no handler has
     /// taken yet.
     waiting_bytes: usize,
-    /// The socket's adaptive send buffer.
+    /// The socket's adaptive send buffer (loopback sockets only: see
+    /// [`SocketTuning`]).
     send_buffer: SendBuffer,
+    tuning: SocketTuning,
 }
 
 impl Drop for Io {
@@ -503,7 +577,7 @@ impl Drop for Io {
 }
 
 impl Io {
-    fn new(ws: Socket, shared: Arc<Shared>) -> Self {
+    fn new(ws: Socket, shared: Arc<Shared>, tuning: SocketTuning) -> Self {
         let now = Instant::now();
         Self {
             ws,
@@ -531,7 +605,8 @@ impl Io {
             uploads: HashMap::new(),
             overflow_bytes: 0,
             waiting_bytes: 0,
-            send_buffer: SendBuffer::new(SEND_BUFFER_MAX, now),
+            send_buffer: SendBuffer::for_loopback(SEND_BUFFER_MAX, now),
+            tuning,
         }
     }
 
@@ -1838,8 +1913,12 @@ impl Io {
     }
 
     /// Resizes the socket's send buffer to the rate it drains at (once per
-    /// [`SEND_BUFFER_WINDOW`]; see [`SendBuffer`]).
+    /// [`SEND_BUFFER_WINDOW`]; see [`SendBuffer`]). Loopback sockets only: on
+    /// any other the system's dynamic send buffering stays ([`SocketTuning`]).
     fn pace(&mut self) {
+        if self.tuning != SocketTuning::Loopback {
+            return;
+        }
         let rtt = self.shared.rtt_ms.load(Ordering::Relaxed);
         if let Some(bytes) = self.send_buffer.resize(Instant::now(), rtt)
             && let Ok(stream) = tcp(&self.ws)
