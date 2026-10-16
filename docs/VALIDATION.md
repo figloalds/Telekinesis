@@ -1,276 +1,246 @@
 # Validation
 
-## Live mount failure and sync visibility (2026-10-12)
+How this release is checked, how to run the checks, and what they measured.
+Four layers:
 
-The remote Docker worker repeatedly exited with `MOUNT_PATH_MUST_NOT_EXIST` while
-all four outbound lanes remained connected with no repository exchanges. Read-only
-SQLite snapshots found 1,593 local shared events versus 920 remote events, no
-quarantines or missing prerequisites absent from both peers, and 102 missing
-objects referenced by the remote's already accepted metadata. This was a different
-failure from the earlier replica's missing history.
+1. the **test suite** (`cargo test`): unit, integration and multi-daemon tests,
+   about a thousand tests on Windows, a subset on Linux;
+2. the **qualification scenarios** (`scripts/qualify.ps1`, `scripts/qualify.sh`):
+   release-build scenarios with performance and behaviour floors, recorded
+   as evidence JSON;
+3. the **desktop manual checklist** (below), for what the window itself does;
+4. the **soak** and the **two-machine lab**, run for the final integration.
 
-Stopped the failed worker's retry loop, verified that `/app/mounts/Projetos` was an
-empty ordinary directory and not a mount or symlink, removed it with nonrecursive
-`rmdir`, then started the same worker state. No backing objects or metadata were
-removed. The mount succeeded and all three bulk lanes resumed. A later snapshot
-contained 1,027 accepted events, 367 pending events and all 239 objects referenced
-by accepted shared history. Metadata was still catching up; full convergence was
-not claimed. Reports are under `test-evidence/live-sync-*.json` (local, ignored).
-
-The desktop now separates synchronization details from conflict review, displays
-current and shared-history availability, metadata backlogs, per-lane object
-inventories, transfer totals/timings and observation ages. Folder rows distinguish
-remote unavailability from network connection health. The API includes the last
-advertised remote-folder availability and per-repository lane observations.
-Four Windows GUI unit tests and all 15 orchestrator integration tests passed,
-including a connected peer whose worker stops and disappears from discovery.
-All-target checking, strict Clippy and formatting passed. These UI/API source
-changes have not been deployed; physical desktop interaction was not validated.
-The independent-mount design in `ARCHITECTURE.md` is a study, not an implemented
-lifecycle refactor.
-
-## Parallel object lanes and binary gzip transport (2026-10-12)
-
-The full Windows Cargo suite passed 128 tests, with one opt-in codec benchmark
-ignored by the normal suite. That benchmark was run separately in release mode
-and passed. The Ubuntu/WSL release run passed 53 tests across the library,
-`bulk_lanes`, `runtime_lanes`, `paired_sync`, `partial_content` and `orchestrator`
-targets, with the same benchmark ignored. `/dev/fuse` was available for the real
-mount cases. All-target checking, strict Clippy, formatting and diff whitespace
-checks passed on Windows. Windows and Linux release binaries were built.
-
-The new regressions verify concurrent transfer of different objects from one
-repository, progress while another object's lock and the engine lock are held,
-control-only metadata acknowledgements, bounded activation with durable pending
-events, lane-pool changes and overlapping partial-file recovery. Codec tests cover
-binary/gzip round trips, malformed and oversized frames, truncated streams, legacy
-JSON fallback, and negotiated binary messages over WSS.
-
-An isolated Windows release comparison transferred three 4 MiB objects through
-two daemons and independently verified their bytes. The installed baseline took
-10.311 seconds; the new build took 4.352 seconds (about 2.37 times faster). Each
-of the three bulk lanes received exactly 4 MiB; the control lane received zero
-object bytes. This is one local loopback comparison, not a WAN bandwidth or
-sustained throughput qualification. Objects are partitioned across lanes; a
-single large object is not striped across connections.
-
-The release codec fixture reduced 1,110,000 bytes of repetitive text to a
-7,843-byte binary/gzip message. A 1,048,576-byte seeded random fixture used a raw
-binary message of 1,048,719 bytes, avoiding gzip expansion and hex wire overhead.
-Full envelope encode/decode timings were respectively 5.69/3.76 ms for the text
-fixture and 9.01/3.12 ms for random data. These include JSON/hex conversion and
-allocation, not just gzip. Compression is adaptive and has measurable CPU cost;
-the repetitive fixture does not predict compression ratios for project files.
-
-Local ignored evidence is in `test-evidence/parallel-gzip-windows-tests.log`,
-`parallel-gzip-linux-tests.log`, `parallel-gzip-codec-benchmark.log` and
-`parallel-gzip-transport-benchmark.json`. Release artifacts are
-`target/release/tkfs.exe` and `target/runnables/linux-x86_64/tkfs`. Neither the
-installed local application nor the remote Docker service was replaced or
-restarted by this validation. The missing-history findings below describe an
-earlier replica; the user subsequently recreated the repositories, so those
-counts must not be used to diagnose the current live state.
-
-## Worker transport pacing (2026-10-12)
-
-The full Windows suite passed 118 tests. After final connection/validation cleanup,
-the 14 orchestrator tests and 19 paired-sync, partial-content and worker-lane tests
-passed again. Coverage includes control delivery during a blocked bulk transfer,
-persistent worker requests after application errors, no automatic replay after
-an uncertain disconnect, and a multi-page transfer with a five-second idle poll
-interval. Strict Clippy and release builds pass.
-
-An isolated two-daemon release benchmark transferred and independently verified
-an 8 MiB object at the default 500 ms polling interval: 8.08 seconds using the
-previously installed Windows binary, 3.99 seconds with persistent worker lanes,
-reduced repeated availability scans, and a 10 ms yield during active content.
-This single loopback comparison is not a WAN throughput qualification. Evidence:
-`test-evidence/transport-benchmark.json` (local, ignored).
-
-Read-only inspection of the live Projetos peers found matching 844-event accepted
-journals and projections, but 1,273 pending remote events requiring 1,018 event IDs
-absent from both samples. Both replicas lacked the same 51 content objects.
-Remote ping median was 11.86 ms; no object download was active. The receiving mount
-remained unpublished because its initial metadata readiness condition was not met.
-Increasing connections cannot recover missing history or content. Live binaries
-were not replaced by this validation.
-
-The folder-first rewrite was checked on Windows and Ubuntu/WSL on 2026-10-11.
-The reboot results below describe commit `26ab12d`; the outbound WSS follow-up
-has separate results at the end.
-
-```sh
-cargo check --locked --lib --bin tkfs
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-python scripts/orchestrator_e2e.py --exe target/debug/tkfs.exe
-```
-
-The full Windows suite passes all 74 tests, with no failures or ignored tests.
-On Linux, select the Linux executable for the Python harness. The targeted Linux
-run covers the library, `orchestrator` and `paired_sync` test targets (12 tests).
-Strict Clippy checks pass on both platforms, including the older Rust 1.88 Linux
-toolchain. The public CLI harness passes on Windows and Linux using four persistent
-WS lanes and bidirectional sync between two headless orchestrators.
-
-The six process integration tests exercise:
-
-- Independent orchestrator/worker processes, two repositories, three persistent
-  WS lanes, bidirectional sync with only one side dialing, and restart.
-- Server-persisted salted verifier, code-only pairing, wrong-code refusal, code
-  rotation invalidating existing sessions, re-pairing and local pool removal.
-- A/B/C relay with events from three origins and private branches remaining local.
-- Real WinFsp and FUSE mounts: filesystem write/read, cooperative stop, changed
-  mount path, and remount with the original bytes intact. The FUSE test skips
-  hosts without `/dev/fuse`; it ran with a real FUSE device in this validation.
-- Version 2 configuration defaults and rejection of removed credential fields.
-- A 6 MiB file transferred through bounded pages after a daemon crash, recovery
-  of a surviving worker, and receiving-daemon restart with the same verifier.
-
-Linux integration fixtures use ordinary group/world-writable parent directories,
-confirming that the daemon does not impose private storage modes.
-
-Retained tests cover causal conflicts, branches, snapshots, basic/POSIX metadata,
-atomic save/recovery boundaries, acknowledgement correctness, object segmentation,
-large files, bounded replication pages and 10,000 durable saves. Removed tests
-were specific to encrypted transport, OPAQUE, credential stores and the previous
-supervisor/desktop contracts. The new process and public CLI suites exercise the
-replacement architecture.
-
-The Windows Slint desktop compiles against the new management API. Physical UI
-interaction, real separate-machine networking, operator reverse proxies and
-unattended installed services are not qualified by these local tests. Test data
-is disposable; no user data/configuration is migrated or deployed by validation.
-
-## Outbound WSS follow-up
-
-On 2026-10-11, `cargo test --locked` passed all 80 Windows tests with no failures
-or ignored tests. Formatting and strict Clippy checks passed, and the public CLI
-harness passed its four-lane bidirectional WS scenario.
-
-The new transport tests cover WS/WSS endpoint validation, persistent WSS messages,
-preserved paths/query strings, rejection of an untrusted server certificate and
-rejection of a hostname mismatch with a trusted test CA. The test connector trusts
-the fixture CA in memory only. These tests do not install certificates or restore
-the retired enrollment, credential storage or ACL mechanisms.
-
-The follow-up Ubuntu/WSL run (`cargo test --locked --lib --test orchestrator
---test paired_sync --target-dir target/linux-review`) stopped during the OpenSSL
-dependency build because `pkg-config` was unavailable. It did not run the Linux
-tests; install the build prerequisites in the [Linux guide](LINUX.md) before
-repeating it. The earlier reboot's Linux results do not qualify the WSS change.
-
-## Independent metadata and content availability
-
-Validated on Windows and Ubuntu/WSL on 2026-10-12. The full Windows suite passed
-99 tests during implementation. After adding two further regressions and the
-final mount/cursor fixes, the Windows `orchestrator`, `paired_sync` and
-`partial_content` targets passed all 27 tests. The final Linux `paired_sync`
-and `partial_content` targets passed all 15 tests. An earlier Linux run passed
-35 tests across the library and those three integration targets.
-
-The new real-mount regression passed on both WinFsp and FUSE: a replica mounts
-with absent content, exposes its namespace and file size, waits for a remote
-read while creating an unrelated directory, and completes the read after the
-source reconnects. Other coverage includes metadata acknowledgements without
-bytes, three-peer relay, restart with missing/corrupt objects, bounded independent
-content transfers, resumed partial cursors, read deadlines, control RPCs during
-bulk installation, and stale conflict-review rejection.
-
-Formatting, diff whitespace checks and strict all-target Clippy passed on both
-platforms (Linux Rust 1.88). The Windows public CLI orchestrator harness passed
-four-lane bidirectional WS synchronization. The Windows Slint desktop compiles;
-physical interaction with its new conflict/status panel has not been qualified.
-
-The additional Git compatibility harness stopped at its first `git status`
-because Git rejected the mounted directory's Everyone ownership as dubious.
-Its remaining scenarios therefore have no result from this run. No user/global
-Git trust configuration was changed. These tests use disposable repositories
-and do not update the separately installed application.
-
-Performance improvements remove redundant passes and move bulk receipt/read
-verification outside the engine mutex. No comparative throughput benchmark or
-parallel hashing implementation is claimed by this validation.
-
-## Startup snapshot validation
-
-`cargo test --locked --test startup_snapshots` exercises suffix replay against the
-full reducer, historical conflict reviews, damaged/incompatible snapshot fallback,
-multiple branches, unavailable content, outer transaction rollback, monotonic
-journal cursors and process crashes during replay or snapshot replacement. Existing
-recovery/replication tests also cover staged saves, out-of-order incoming events and
-legacy journal evacuation with startup snapshots enabled.
-
-For an existing state, build with `cargo build --locked --release`, then run:
+## The test suite
 
 ```powershell
-python scripts/benchmark_startup.py --state STATE_DIRECTORY --exe target/release/tkfs.exe --baseline-exe OLD_TKFS_EXE
+$env:CARGO_TARGET_DIR = "C:\tkfs-target\main"
+cargo fmt --check
+cargo build --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
 
-The harness reads the source through SQLite's backup API, copies content/staging
-into an isolated fixture, and runs real mount workers without an orchestrator or
-remote connection. It records baseline mount time, first-open migration, three
-snapshot remounts, and a remount after writing a file to produce a real event suffix.
-It compares canonical projections, historical conflicts, frontiers, events, outbox
-and peer acknowledgements across opens. Timings include process launch through the
-mounted worker's ready response; OS caches are not flushed. The JSON report includes
-binary hashes and is written to `test-evidence/startup-benchmark.json`. Add
-`--keep-artifacts` to retain the copied state and worker logs.
+- Windows needs the WinFsp SDK (`WINFSP_DIR`) and builds the Slint desktop.
+  On a shared machine, run the full suite through
+  `scripts\suite-lock.ps1 cargo test --all-targets` so only one full suite
+  runs at a time (the multi-daemon tests are timing-sensitive under load).
+- Linux (or WSL) runs the same targets; FUSE tests skip without `/dev/fuse`.
+  The subset that matters most there:
+  `cargo test --test orchestrator --test session_core --test session_handshake --test worker_lifecycle --test mount_lifecycle`.
+- Long scenarios are `#[ignore]`d in the normal suite; they are the
+  qualification scenarios below.
+- `tests/docs_cli.rs` checks that every command in [CLI](CLI.md) exists with
+  the options it shows, and that every command of the binary is documented.
 
-On 2026-10-12, a Windows release-build benchmark of a copied state with 4,798
-events, 530 current objects and 554 stored objects measured 120.161 seconds for
-the previously installed executable's mount. The final build's first open took
-102.808 seconds to reconstruct and seed its snapshot. Three subsequent real
-WinFsp mounts took 333.772, 333.716 and 308.837 ms (333.716 ms median). A remount
-replaying two events added through the mounted filesystem took 409.978 ms. All
-semantic and acknowledgement comparisons passed. These are local warm-cache
-measurements, not cold-disk guarantees. Reports are in
-`test-evidence/startup-benchmark.json` and `startup-benchmark-final.json`.
+What the suite covers, by area (file names under `tests/`):
 
-The full Windows Cargo suite passed, followed by the final targeted recovery,
-replication and eight snapshot tests. Strict all-target Clippy and formatting
-checks passed. No separately installed executable or original state was replaced.
+| Area | Tests |
+|---|---|
+| Store, activation, conflicts | `core`, `activation_inbox`, `derive_oracle` (randomized histories checked against the full reducer), `offlock_commit`, `startup_snapshots`, `recovery`, `directory_progress`, `availability_index` |
+| Metadata feed | `feed_v7` (acks from evidence only, rejections, regressions, private branches, forged origins, large events) |
+| Objects | `objects_v3_worker` (durability, crash resume, authorization, leases), `objects_v3_lanes` (both directions, backoffs, handoff, slow links), `partial_content`, `availability` |
+| Sessions | `session_core` (framing, multiplexing, heartbeats, deadlines, WSS), `session_handshake` (HMAC, replay, legacy detection both ways) |
+| Daemon | `catalog_actor` (including the 6298d0b catalog upgrade and downgrade), `folder_controller` (lifecycle, adoption, gate), `management_api`, `peer_supervisor`, `meta_scheduler`, `inbound_v3`, `status_hub`, `orchestrator` (real daemons over the network), `w1/w2/w3_integration` |
+| Worker | `worker_lifecycle`, `worker_process`, `worker_concurrency`, `mount_lifecycle` (WinFsp and FUSE) |
+| Desktop | `gui_model` (every chip, row and action from status snapshots), the binary's own window tests |
+| Contracts | `contracts` (frozen wire shapes, error-code table), `harness_selftest`, `seam_stubs` |
 
-## Visual Studio directory-cleanup stall
+## Qualification
 
-Investigated on Windows on 2026-10-12 using an isolated SQLite backup and object
-copy of state `614d6b81-4ef5-4e56-bfbc-0c628849a4a7` (6,405 events and 2,154
-entries). The source state and installed executable were not modified.
+The scenarios live in `tests/qual_*.rs`, run in release with
+`--ignored --test-threads=1`, and print `QUAL {json}` records that
+`scripts/qualify.ps1` compares with `tests/qualification-floors.json`.
 
-The installed binary passed 3,480 hash-verified mounted reads over the solution
-files, in groups of 870 with 1, 8, 32 and 64 readers. A single empty-directory
-deletion then stalled. Opening the copied EnroSistemas solution in Visual Studio
-with the pre-fix release build reproduced the stall. Debugger stacks showed
-`Engine::cleanup` / `Store::delete` inside history reconstruction, with another
-WinFsp thread waiting in `FspFileSystemOpEnter` for its shared namespace lock.
-The worker consumed about 95 seconds of CPU before this isolated reproduction
-was terminated. This establishes a long computation holding the engine and
-namespace locks; it does not establish a circular read deadlock.
-This matches WinFsp's documented exclusive namespace guard for delete cleanup
-([WinFsp operation guards](https://winfsp.dev/doc/WinFsp-API-winfsp.h/#fsp_file_system_operation_guard_strategy)).
+```powershell
+$env:CARGO_TARGET_DIR = "C:\tkfs-target\qual"
+powershell -NoProfile -File scripts\qualify.ps1 -All                      # every scenario and floor
+powershell -NoProfile -File scripts\qualify.ps1 -Wave 3                   # floors of waves 1-3
+powershell -NoProfile -File scripts\qualify.ps1 -Wave 3 -Files qual_wp3_int_e2e -Merge
+powershell -NoProfile -File scripts\qualify.ps1 -SelfTest                 # the runner itself
+```
 
-The directory successor fix allows sequential, conflict-free directory moves
-and empty-directory deletions after the complete frontier to update the current
-projection without reconstructing historical cuts. It validates ancestry and
-empty-directory constraints; cycles, deletion of parents with live children,
-reviews and competing history still use the full reducer.
+```sh
+CARGO_TARGET_DIR=$HOME/tkfs-target/qual bash scripts/qualify.sh --wave 3   # Linux subset
+```
 
-On the same copied state the fixed release build completed the directory rename
-in 28.273 ms and deletion in 19.753 ms. Another 870 hash-verified reads with 64
-readers completed in 0.819 seconds. Visual Studio subsequently opened the same
-solution, and its DTE reported `Solution.IsOpen=true` and two projects. The worker
-successfully committed deletion of `.vs/EnroSistemas/FileContentIndex/merges`,
-reported complete content with no health error, and stayed responsive. Visual
-Studio closed through DTE normally. These tests used local content without a
-remote peer and did not validate build/debug operations in the IDE.
-Two contexts remained open after the IDE exited, so cooperative worker stop
-returned `BUSY_VIEW`. Only the isolated test worker was then terminated, after
-confirming zero unflushed files and no health error.
+| Option | Meaning |
+|---|---|
+| `-Wave N` / `-All` | Run the files of waves ≤ N (all) and enforce their floors. |
+| `-Files a,b` / `-Filter NAME` | Only these files / scenarios. |
+| `-Merge` | Keep the other files' results from the existing evidence and replace only those run now. |
+| `-BudgetS S` | Measured-phase budget per scenario (`TKFS_QUAL_BUDGET_S`, default 120). |
+| `-FileTimeoutMin M` | Kill a file's run after M minutes (default 90). |
+| `-Priority` | `Idle`, `BelowNormal` (default) or `Normal` for the test processes. |
+| `-Baseline` | Record every floor without enforcing it (`qualification-baseline.json`). |
+| `-NoBuild` | Reuse the release test binaries. |
 
-`cargo test --locked --tests` passed all 112 tests. The three new
-`directory_progress` regressions cover descendant identities and restart/full
-recovery equivalence, conflict retention for unsafe direct directory commits,
-and bounded directory cleanup with 2,000 unrelated historical events. Formatting
-and diff whitespace checks passed. Local debugger traces and measurements are
-under `test-runs/hang-investigation`; the corrected binary is
-`target/release/tkfs.exe`, not the separately installed application.
+- Evidence goes to `test-evidence/qualification-<kind>.json` (the git commit
+  and dirty files at the start, toolchain, hardware, every file's exit code
+  and result line, every scenario's metrics, every floor's verdict); logs to
+  `test-runs/qualify-<kind>-<time>/`.
+- A file passes only if cargo exits 0 and its last `test result:` line says
+  `ok.`. A floor is `pass`, `fail`, `missing`, `incomplete` (its scenario
+  timed out) or `not_run`. The script exits 0 only when every enforced floor
+  holds and every selected scenario passed or was skipped.
+- `TKFS_BASELINE_BIN` (a `tkfs` binary built from `6298d0b`) enables the
+  scenario that upgrades one of two previous-release daemons and checks that
+  both sides fail closed; without it that scenario is skipped.
+- `TKFS_QUAL_SCALE` (default 1) scales scenario sizes down for quick dry runs;
+  `TKFS_QUAL_ENFORCE=0` reports a scenario's floors without failing it.
+
+### Floors and the latest measurements
+
+Release build, Windows 11, AMD Ryzen 9 7950X3D (16 cores, 128 GB), a shared
+development machine. Measured on 2026-10-16 for the Wave 3 integration
+(`test-evidence/qualification-wave-3.json`: 77 scenarios, 76 passed, 1 skipped
+— SIGTERM has no Windows equivalent — and 41 of 41 floors held). The
+baseline column is the previous release (`6298d0b`).
+
+| Floor | Scenario | Baseline | Floor | Measured |
+|---|---|---|---|---|
+| Remote linear create, per event, 2K / 10K | `qual_wp1_6_activation` | 15.9 s @2K | ≤ 5 ms | 0.91 / 0.88 ms |
+| Local create after a resolved conflict (p90) | `qual_wp1_6_activation` | 4.2 s | ≤ 10 ms | 2.2 ms |
+| Two-way backlog, per event, 2K / 6.4K | `qual_wp1_7_derive` | 15.9 s / 218 s | ≤ 100 / 300 ms | 62 / 237 ms |
+| 50 concurrent namespace ops on 5K history (max) | `qual_wp1_7_derive` | seconds to minutes | ≤ 500 ms | 412 ms |
+| Restart to Ready at 20K objects | `qual_wp1_8_objects` | full re-hash | ≤ 3 s | 1.6 s |
+| `content_status` at 50K objects | `qual_wp1_8_objects` | 6.5 s | < 50 ms | 0.07 ms |
+| 12K tiny pending objects complete | `qual_wp1_8_objects` | page cliff | completes | completes |
+| Worker `watch` latency | `qual_wp1_4_worker` | no `watch` op | ≤ 1.5 s | 1.0 s |
+| Fast call behind a slow one (p99) / control under 30 MiB queued | `qual_wp1_9_session` | head-of-line blocking | < 50 ms | 0.3 / 4.3 ms |
+| Session loopback throughput | `qual_wp1_9_session` | JSON+hex request/response | ≥ 300 MiB/s | 2,406 MiB/s |
+| Healthy repo beside a hung one (legacy lanes) | `qual_wp1_12_legacy` | lane-wide resets, 30 s backoff | ≤ 45 s | 0.9 s |
+| Reconnects at `sync_interval_ms = 20000` over 60 s (legacy, v3) | `qual_wp1_12_legacy`, `qual_wp3_1_transport` | every idle cycle | 0 | 0 / 0 |
+| Restarts of a crashing worker in 20 s | `qual_wp1_12_legacy` | every 2 s | ≤ 5 | 5 |
+| Management API p99 under lifecycle churn | `qual_wp2_1_lifecycle` | 23–41 s | < 100 ms | 3.1 ms |
+| Status subscription latency | `qual_wp2_1_lifecycle` | 5 s poll | ≤ 1 s | 76 ms |
+| Shutdown with a busy folder | `qual_wp2_1_lifecycle` | aborts on the first busy folder | ≤ 30 s | 0.49 s |
+| File-system op p99 during a 2K catch-up | `qual_wp2_3_worker` | seconds | < 50 ms | 16 ms |
+| Status p99 during activation | `qual_wp2_3_worker` | blanked | < 20 ms | 3.4 ms |
+| Ready with 5K staged events | `qual_wp2_3_worker` | unbounded startup drain | < 3 s | 0.28 s |
+| Engine-lock hold for a slow event at 2K | `qual_wp2_4_offlock` | full replay | < 50 ms | 16 ms |
+| 150K-event feed / 8 MiB event | `qual_wp2_5_feed` | `INVENTORY_TOO_LARGE` / stall | completes | completes |
+| Idle exchange at 50K events (CPU per side / bytes) | `qual_wp2_5_feed` | 1.13 s / 251 KB @6.4K | ≤ 10 ms / 4 KiB | 3.1 ms / 1,621 B |
+| Extra delay of a healthy repo beside a hung one (v3) | `qual_wp3_1_transport` | 30 s backoff | < 2 s | 0.5 ms |
+| Worker to worker, 256 MiB object / 10K tiny objects | `qual_wp3_2_objects` | about 2 MiB/s / stop-and-wait pages | ≥ 100 MiB/s / ≥ 300/s | 108 MiB/s / 310/s |
+| 256 MiB object between daemons on loopback | `qual_wp3_int_e2e` | 2.0 MiB/s | ≥ 40 MiB/s | 109 MiB/s |
+| 1 GiB through a 100 Mbit/s, 50 ms RTT proxy | `qual_wp3_int_e2e` | not measured | ≥ 80 % of the link | 97.8 % |
+| 10K × 4 KiB files between daemons | `qual_wp3_int_e2e` | page cliff | ≥ 300 files/s | 315 files/s |
+| 10K-event catch-up between daemons | `qual_wp3_int_e2e` | hours | ≤ 60 s | 17.8 s |
+| Objects before activation | `qual_wp3_int_e2e` | 0-byte bulk rounds | ≥ 1 | 60 |
+| Mutual pairing, duplicate bytes | `qual_wp3_int_e2e` | up to 2× | ≤ 1.1× | 1.002× |
+| Two-way backlog between daemons | `qual_wp3_int_e2e` | slow path | ≤ 180 s | 2.4 s |
+| Idle exchange between daemons | `qual_wp3_int_e2e` | 251 KB @6.4K | ≤ 4 KiB | 2,695 B |
+| 150K-event feed / 8 MiB event between daemons | `qual_wp3_int_e2e` | stall | completes | completes (150K at 205 events/s) |
+
+The Wave 4 floors (`qual_scale`: startup to Ready at 50K objects < 10 s, idle
+worker CPU ≤ 1 %, management API p99 under churn, 1 GiB object, 10K tiny
+files, 150K feed, remote linear and two-way activation) are defined in
+`tests/qualification-floors.json` and are not measured in this build yet.
+
+Floors bound by fsync latency (tiny files, the 256 MiB worker transfer) and by
+single slow operations (`fs_p99_during_catchup`, `concurrent_namespace_ops_5k`)
+can miss on a busy machine; the WP3.INT notes list every run of the day,
+including the misses.
+
+### Interoperability and upgrade checks
+
+- `qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides`
+  (needs `TKFS_BASELINE_BIN`): two previous-release daemons paired both ways,
+  one upgraded in place: the upgraded dialer shows the peer `incompatible`
+  with `PEER_NEEDS_UPGRADE` within milliseconds and never offers the code; the
+  old side's lanes report `PEER_NEEDS_UPGRADE` within a second; the upgraded
+  side lists the old side's attempts.
+- `qual_wp3_1_transport::v2_peer_fails_closed`, `qual_wp3_int_e2e::v2_peer_fails_closed`:
+  both directions against the legacy client.
+- `qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync`: a data directory
+  written by the previous release (`tests/fixtures/legacy/datadir`) is opened
+  by the new daemon and its folder syncs to a new host and back.
+- `catalog_actor` opens the previous release's catalog, checks every folder,
+  gate, peer and the verifier survive, and runs a previous-release daemon on
+  the migrated catalog.
+
+## Desktop manual checklist
+
+The window's flows are tested through the view model (`gui_model`) and the
+command pool; these checks cover the window itself. Run them on Windows with
+two hosts (or two data directories on one machine).
+
+1. Start `tkfs gui` with no daemon running: the banner says it is starting the
+   daemon and names `DATA/logs/orchestrator.log`; the folders appear.
+2. Create a folder (**New folder**): the row shows `Starting…` (busy), then
+   `Running`, `Mounted`, `Not shared with any peer`.
+3. Pair with a second host (**Pair with a host**, with the code from its
+   **Settings**), browse and receive a folder: the received row shows
+   `Initial sync from <host>` and `Waiting for initial sync [Mount now]`, then
+   `Up to date` and `Mounted`.
+4. Copy a large file into one side: the other side's row shows
+   `Downloading x of y · rate · ETA` with a progress bar, then `Up to date`.
+5. Stop the other host's daemon: the row shows `Waiting for <host> (offline N
+   min)`; the sidebar badge `Offline N min`.
+6. Create a folder whose mount path already exists: `Mount failed [Retry]`
+   with `[needs action] MOUNT_PATH_MUST_NOT_EXIST` and its suggestion.
+7. Open a file in a mounted folder and stop it: `Stopping — 1 file open
+   [Force stop]`; Force stop asks for confirmation.
+8. Pause sync: `Paused [Resume]`.
+9. Generate a new pairing code in Settings: it is shown once and cleared when
+   Settings closes; the other host's badge becomes `Unauthorized — re-pair`.
+   Then generate another code and leave Settings through **Shut down the
+   daemon** (both Cancel, and Shut down followed by **Start the daemon**):
+   reopening Settings shows no code.
+10. Pair with a host running the previous release: its badge reads
+    `Peer needs upgrade`.
+11. Shut the daemon down from Settings: the banner offers `Start the daemon`;
+    nothing restarts it until clicked. `tkfs manage shutdown` from a terminal
+    has the same effect on an open window. Then start the daemon from a
+    terminal (`tkfs orchestrator`): the window reconnects; end that daemon's
+    process: the window starts a new one.
+12. While a Stop is in flight (a folder with open files), Start another
+    folder: it starts at once.
+13. Screenshots for documentation are rendered without a window:
+
+    ```powershell
+    $env:TKFS_GUI_RENDER = "out.bmp"
+    $env:TKFS_GUI_RENDER_VIEW = "folder:<state>:sync"    # or folders, activity, peer:<installation>
+    tkfs gui
+    ```
+
+    `TKFS_GUI_RENDER_SNAPSHOT=status.json` renders a saved
+    `manage status --json` snapshot instead of the running daemon's;
+    `TKFS_GUI_RENDER_SIZE=WxH` sets the size.
+
+## Soak
+
+The final integration runs a two-hour soak: two daemons connected through a
+fault-injecting proxy (`tests/support/proxy.rs`, `FaultProxy`: latency,
+bandwidth limits, stalls, connection resets) whose faults change
+periodically, with continuous edits on both sides. It passes when, after the
+edits stop and the link is healthy:
+
+- both folders read `Up to date` (no `stalled`, `blocked` or `needs attention`
+  state, no open errors other than resolved ones);
+- both replicas hold the same shared events (`metadata caught up` both ways,
+  and `accepted_metadata_equal` from `scripts/inspect_metadata.py --compare`
+  of the two states);
+- every object is available on both sides (`content complete`) and every event
+  is acknowledged (`journal.outgoing_unacknowledged` = 0);
+- the derived-state oracle (`Store::verify_derived_state`) finds no difference
+  on either store, checked on the stopped folders.
+
+The proxy and the oracle are test-support and library APIs; there is no
+command-line soak tool.
+
+## Two-machine lab
+
+The final integration (WP4.INT) adds the results of the two-machine lab run
+(a desktop and a server over WSS behind a TLS proxy) under
+`test-evidence/lab/` and summarises them here.
+
+## Earlier validation records
+
+The validation records of the previous release (October 2026: the mount
+failure that blocked a server's sync, the parallel object lanes, the
+startup-snapshot benchmark, the Visual Studio directory-cleanup stall) are in
+the git history of this file. Their findings fed the root-cause analysis in
+`docs/revamp/ROOT_CAUSES.md`; their measurements describe the previous
+release, not this one.
