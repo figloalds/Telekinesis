@@ -471,6 +471,35 @@ mod tests {
     }
 
     #[test]
+    fn only_the_newest_bundles_are_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let mut made = vec![];
+        for n in 0..(KEEP_BUNDLES + 3) {
+            let dir = bundle_directory(root.path(), 1_792_154_096_000 + n as u64).unwrap();
+            fs::write(dir.join("status.json"), "{}").unwrap();
+            made.push(dir);
+        }
+        // Not bundles: never removed.
+        fs::create_dir(root.path().join("notes")).unwrap();
+        fs::write(root.path().join("19700101T000000.000Z"), "a file").unwrap();
+        let newest = made.last().unwrap().clone();
+        prune(root.path(), &newest);
+        let kept: Vec<_> = made.iter().filter(|dir| dir.exists()).collect();
+        assert_eq!(kept.len(), KEEP_BUNDLES);
+        assert!(
+            kept.iter().all(|dir| made[3..].contains(dir)),
+            "the oldest go"
+        );
+        assert!(root.path().join("notes").is_dir());
+        assert!(root.path().join("19700101T000000.000Z").is_file());
+        // Two bundles in the same millisecond get distinct directories.
+        let a = bundle_directory(root.path(), 5).unwrap();
+        let b = bundle_directory(root.path(), 5).unwrap();
+        assert_ne!(a, b);
+        assert!(is_bundle_name(b.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
     fn sensitive_strings_are_found_at_any_depth() {
         let value = json!({"pid": 1, "token": "tok-0123456789", "nested": {"secret": "s3cr3t-value"},
             "list": [{"credential": "cred-abcdefgh"}], "other": "visible"});
