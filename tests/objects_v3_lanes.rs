@@ -3523,6 +3523,280 @@ fn stalled_pushes_of_two_repositories_leave_a_slot_to_pulls() {
     }
 }
 
+/// Three repositories on one lane: `stalled` of them push to a peer whose
+/// workers stall every write; then the third joins (the peer publishes it)
+/// and wants six objects from the peer. Returns how long its pulls took.
+fn third_repository_behind_stalled_pushes(stalled: u64) -> Duration {
+    let (code, verifier) = Verifier::generate();
+    let b_world = World::new(&format!("b-{}", uuid()), Some(verifier));
+    let a_world = World::new(&format!("a-{}", uuid()), None);
+    let mut workers = Vec::new();
+    let mut entries = Vec::new();
+    for index in 0..3u64 {
+        let repo = format!("repo-{index}");
+        let (replica_a, replica_b) = (format!("replica-a-{index}"), format!("replica-b-{index}"));
+        let worker_a = FakeWorker::start(&replica_a);
+        let worker_b = FakeWorker::start(&replica_b);
+        a_world.folder_of(&format!("state-a-{index}"), &repo, &replica_a, &worker_a);
+        b_world.folder_of(&format!("state-b-{index}"), &repo, &replica_b, &worker_b);
+        if index < stalled {
+            // A holds a 4 MiB object B wants; B's worker stalls its writes.
+            let up = worker_a.hold(content(9000 + index, 4 * MIB as usize));
+            worker_b.want(&up, 4 * MIB);
+            worker_b.faults().stall_writes = true;
+        }
+        if index < 2 {
+            entries.push(entry_of(&repo, &replica_b));
+        }
+        workers.push((worker_a, worker_b));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = inbound::start_with(ctx(&b_world, 1000), listener, InboundOptions::default());
+    let a_ctx = ctx(&a_world, 100);
+    let peer = Arc::new(PeerContext {
+        installation: b_world.installation.clone(),
+        endpoint: endpoint.clone(),
+        local_installation: a_ctx.installation.clone(),
+        pool: 2,
+        catalog: Snapshot::new(RemoteCatalog {
+            generation: 1,
+            at_ms: 0,
+            entries,
+        }),
+    });
+    let dialer = Dialer {
+        world: a_world.clone(),
+        worker: workers[0].0.clone(),
+        ctx: a_ctx,
+        peer: peer.clone(),
+    };
+    let (options, stats) = dialer.options();
+    let lane = dialer.run(dialer.dial(&endpoint, &code, LANE), options);
+    assert!(wait_until(Duration::from_secs(10), || a_world
+        .events()
+        .iter()
+        .any(
+            |event| matches!(event, StatusEvent::ExchangeStarted { op, .. } if op == "objects.push")
+        )));
+    // (Time for every other repository's rounds to take what they would.)
+    sleep_ms(1500);
+    let (worker_a, worker_b) = &workers[2];
+    let mut down = Vec::new();
+    for index in 0..6 {
+        let hash = worker_b.hold(content(9100 + index, 1536 * 1024));
+        worker_a.want(&hash, 1536 * 1024);
+        down.push(hash);
+    }
+    peer.catalog.update(|catalog| {
+        let mut next = catalog.clone();
+        next.generation += 1;
+        next.entries.push(entry_of("repo-2", "replica-b-2"));
+        next
+    });
+    a_world.bump_sync("state-a-2");
+    let began = Instant::now();
+    let pulled = wait_until(Duration::from_secs(30), || {
+        down.iter().all(|hash| worker_a.has(hash))
+    });
+    let took = began.elapsed();
+    let (repos_peak, calls_peak) = (
+        LaneStats::get(&stats.repos_peak),
+        LaneStats::get(&stats.peer_calls_peak),
+    );
+    for (_, worker_b) in &workers {
+        worker_b.faults().stall_writes = false;
+    }
+    drop(lane);
+    server.shutdown(Duration::from_secs(5));
+    for (a, b) in workers {
+        a.shutdown();
+        b.shutdown();
+    }
+    assert!(
+        pulled,
+        "the third repository's pulls waited behind {stalled} stalled push(es) for {took:?}"
+    );
+    assert!(repos_peak <= 2 && calls_peak <= objects::PEER_CALLS as u64);
+    took
+}
+
+/// One stalled push and three repositories (WP3.INT re-review 2): an upload
+/// round waits for the push gate without holding its repository's turn, so
+/// a repository with nothing to push never parks behind the stalled push
+/// with a turn, and a third repository's downloads get the other turn (they
+/// waited 58 s, the peer's write deadline, when the gate was taken inside
+/// the turn).
+#[test]
+fn one_stalled_push_leaves_a_third_repository_its_turn() {
+    let took = third_repository_behind_stalled_pushes(1);
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
+/// Two stalled pushes and three repositories (WP3.INT re-review 2): the
+/// second waits for the push gate without a turn, so the third repository's
+/// downloads get the other turn (58 s before).
+#[test]
+fn two_stalled_pushes_leave_a_third_repository_its_turn() {
+    let took = third_repository_behind_stalled_pushes(2);
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
+/// An object of unknown size (an event without a size descriptor) that its
+/// first source fails after partial progress is handed on to a second
+/// source, which completes it (WP3.INT re-review 2). The round parks it with
+/// the size its probe learned: parked with size 0 past offset 0, no source
+/// that took it over moved it (C served nothing for 100 s).
+#[test]
+fn an_object_of_unknown_size_is_handed_on_after_partial_progress() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let c = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let size = 24 * MIB;
+    let bytes = content(9200, size as usize);
+    let hash = b.worker.hold(bytes.clone());
+    c.worker.hold(bytes.clone());
+    let to_b = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    to_b.worker.want_unsized(&hash);
+    to_b.worker.faults().write_delay = Some(Duration::from_millis(300));
+    let to_c = to_b.to_peer(&c.installation(), &c.endpoint);
+    let (options, _) = to_b.options();
+    let mut lane_b = to_b.run(to_b.dial(&b.endpoint, &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || to_b
+            .worker
+            .durable(&hash)
+            .is_some_and(|durable| durable > 0)),
+        "no progress from B"
+    );
+    // B loses its copy: its reads answer NOT_AVAILABLE from now on.
+    b.worker.state.lock().unwrap().held.remove(&hash);
+    assert!(
+        wait_until(Duration::from_secs(20), || to_b
+            .world
+            .object_errors()
+            .iter()
+            .any(|(object, code)| *object == hash && code == "NOT_AVAILABLE")),
+        "{:?}",
+        to_b.world.object_errors()
+    );
+    // B goes away before its lane runs another round (whose want would
+    // refresh the parked item from our worker's word).
+    lane_b.stop();
+    to_b.worker.faults().write_delay = None;
+    let durable = to_b.worker.durable(&hash);
+    assert!(
+        durable.is_some_and(|durable| durable > 0 && durable < size),
+        "{durable:?}"
+    );
+    let began = Instant::now();
+    let (options, _) = to_c.options();
+    let lane_c = to_c.run(to_c.dial(&c.endpoint, &c.code, LANE), options);
+    let done = wait_until(Duration::from_secs(30), || to_b.worker.has(&hash));
+    let took = began.elapsed();
+    let (lease, now) = (to_b.worker.lease_of(&hash), to_b.worker.durable(&hash));
+    drop(lane_c);
+    assert!(
+        done && took < Duration::from_secs(20),
+        "never installed from C ({took:?}): durable {durable:?} when B went away, {now:?} now; \
+         C served {} reads; lease {lease:?}",
+        c.worker.reads().len()
+    );
+    assert_eq!(to_b.worker.held_bytes(&hash).unwrap(), bytes);
+}
+
+/// The push side (a hub): B wants Y without knowing its size. A1 cannot
+/// serve it (B parks Y under A1's push lease) and goes away; C takes Y over,
+/// pushes part of it with the size its worker reads, and its session resets;
+/// E holds Y. B hands Y on with the size C pushed it with (WP3.INT re-review
+/// 2: it parked Y with the offer's size 0 at C's durable offset, which no
+/// push could cover until the lease lapsed a minute later).
+#[test]
+fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let size = 8 * MIB;
+    let bytes = content(9300, size as usize);
+    let hash = sha(&bytes);
+    b.worker.want_unsized(&hash);
+    b.worker.faults().write_delay = Some(Duration::from_millis(20));
+    let a1 = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let c = Dialer::start_as(
+        FakeWorker::start("replica-c"),
+        "replica-c",
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    c.worker.hold(bytes.clone());
+    let e = Dialer::start_as(
+        FakeWorker::start("replica-e"),
+        "replica-e",
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    e.worker.hold(bytes.clone());
+    let (options, _) = a1.options();
+    let mut lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
+    let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
+    // A1 is offered Y a few times and pushes none of it (its worker cannot
+    // read Y's size), then goes away.
+    assert!(
+        wait_until(Duration::from_secs(10), || b
+            .worker
+            .want_calls
+            .load(Ordering::Relaxed)
+            >= 4),
+        "A1 never asked for B's wants"
+    );
+    assert_eq!(b.worker.lease_of(&hash).as_deref(), Some(a1_lease.as_str()));
+    lane_a1.stop();
+    // C takes Y over, and its session resets mid-push.
+    let proxy = FaultProxy::start(&b.endpoint);
+    proxy.reset_after(3 * MIB);
+    let (options, _) = c.options();
+    let mut lane_c = c.run(c.dial(&proxy.endpoint(), &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(20), || lane_c.finished()),
+        "C's lane did not end with its session"
+    );
+    lane_c.stop();
+    assert!(!b.worker.has(&hash), "C delivered Y before it went away");
+    assert!(
+        b.worker
+            .durable(&hash)
+            .is_some_and(|durable| durable > 0 && durable < size),
+        "C moved none of Y: durable {:?}, sessions {:?}",
+        b.worker.durable(&hash),
+        b.worker.write_sessions(&hash)
+    );
+    let began = Instant::now();
+    let (options, _) = e.options();
+    let lane_e = e.run(e.dial(&b.endpoint, &b.code, LANE), options);
+    let done = wait_until(Duration::from_secs(30), || b.worker.has(&hash));
+    let took = began.elapsed();
+    let (lease, durable) = (b.worker.lease_of(&hash), b.worker.durable(&hash));
+    drop(lane_e);
+    assert!(
+        done && took < Duration::from_secs(20),
+        "E never delivered Y ({took:?}): lease {lease:?}, durable {durable:?}"
+    );
+    assert_eq!(b.worker.held_bytes(&hash).unwrap(), bytes);
+    assert_eq!(
+        b.worker.write_sessions(&hash),
+        BTreeSet::from([a1_lease.clone()])
+    );
+}
+
 /// An object that settles in a round's sink (here a resume point: the
 /// worker's durable offset is ahead of the want's) is no longer pulled in
 /// that round (WP3.3 re-review minor): the rest of it would be read at the

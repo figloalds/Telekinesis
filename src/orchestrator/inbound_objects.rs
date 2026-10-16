@@ -1172,8 +1172,19 @@ fn settle_pushed(
         _ => offered.map(|offered| offered.item.offset),
     };
     let base = offered.map_or(item, |offered| &offered.item);
+    // An object whose size we did not know (offered with size 0,
+    // `size_unknown`) has the size the dialer pushed it with once our worker
+    // took bytes of it: every chunk carried that total (`admit`), and our
+    // worker's first write took it as the object's size. Parked or handed on
+    // with size 0 past offset 0, no source could move it again (WP3.INT
+    // re-review 2).
     let at = known.map(|offset| WantItem {
         offset,
+        size: if size_unknown(base) && offset > 0 {
+            item.size
+        } else {
+            base.size
+        },
         ..base.clone()
     });
     match at {
