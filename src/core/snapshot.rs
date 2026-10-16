@@ -2252,20 +2252,23 @@ mod tests {
             )
             .unwrap();
         }
+        // (Lower case: `tests/contracts.rs` takes upper-case literals for
+        // error codes.)
         let plan: Vec<String> = db
-            .prepare(&format!("EXPLAIN QUERY PLAN {BRANCH_JOURNAL_SQL}"))
+            .prepare(&format!("explain query plan {BRANCH_JOURNAL_SQL}"))
             .unwrap()
-            .query_map(params![0, 1000, "own"], |r| r.get(3))
+            .query_map(params![0, 1000, "own"], |r| r.get::<_, String>(3))
             .unwrap()
+            .map(|step| step.map(|step| step.to_lowercase()))
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(plan.len(), 3, "{plan:?}");
         assert!(
-            plan[0].contains("journal_branch_order") && plan[0].contains("branch=? AND seq>?"),
+            plan[0].contains("journal_branch_order") && plan[0].contains("branch=? and seq>?"),
             "{plan:?}"
         );
-        assert!(plan[1].contains("PRIMARY KEY"), "{plan:?}");
-        assert!(plan[2].contains("USING INDEX"), "{plan:?}");
+        assert!(plan[1].contains("primary key"), "{plan:?}");
+        assert!(plan[2].contains("using index"), "{plan:?}");
         // And it reads exactly the branch's rows in the range.
         let (hash, hashed) = extend_journal(&db, "own", JournalHash::default(), 50, 150).unwrap();
         assert_eq!(hashed, 10);
