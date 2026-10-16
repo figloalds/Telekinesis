@@ -159,14 +159,13 @@ pub fn read_control_token(data_directory: &Path) -> Option<String> {
 /// with a fresh local token (WP4.1): writes `DATA/orchestrator.token`
 /// (owner-only; the catalog holds `orchestrator.lock`, so no other daemon
 /// writes it) and makes `ws::accept` on that address require the token for
-/// as long as the returned hold is kept and `alive` is not cancelled. A
-/// token file that cannot be written is logged and the endpoint is still
-/// protected (fail closed: clients then cannot connect). `None` for an
-/// endpoint that is not a loopback address (nothing to protect).
+/// as long as the returned hold is kept. A token file that cannot be written
+/// is logged and the endpoint is still protected (fail closed: clients then
+/// cannot connect). `None` for an endpoint that is not a loopback address
+/// (nothing to protect).
 pub fn install_control_token(
     catalog: &super::catalog::Catalog,
     control: &str,
-    alive: crate::util::cancel::Cancel,
 ) -> Option<Arc<ws::tokens::Hold>> {
     let addresses = ws::tokens::addresses(control);
     let address = *addresses.first()?;
@@ -179,7 +178,7 @@ pub fn install_control_token(
             "error": format!("{error:#}"),
         });
     }
-    ws::tokens::protect(address, &token, Some(alive))
+    ws::tokens::protect(address, &token, None)
 }
 
 /// One request to the running daemon: [`ControlClient::connect`], then
