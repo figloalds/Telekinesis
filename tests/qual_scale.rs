@@ -1,8 +1,14 @@
 //! Scale qualification (WP4.2 list, REVAMP_PLAN §14 WP4.2 and §15): every
 //! floor re-checked at daemon level in release builds.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP4.2"]`.
+//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP4.2"]`;
+//! owned and run by WP4.2 (the scenarios stay `#[ignore]`: they are release
+//! qualification runs, `scripts/qualify.ps1 -All`).
 //! `cargo test --release --test qual_scale -- --ignored --test-threads=1 --nocapture`
+//!
+//! The 150K feed reads its progress from the worker's status cell, not from
+//! the whole `state` (see `feed_150k`); `TKFS_QUAL_BUDGET_S` must cover it
+//! (`qualify.ps1 -All` passes `-BudgetS 2400`).
 mod support;
 
 use serde_json::{Value, json};
@@ -151,20 +157,54 @@ fn feed_150k() {
         Ok(())
     })
     .unwrap();
+    // Every event of A's folder (its own setup events included).
+    let total = event_count(&pa).expect("source event count") as u64;
     b.pair(&a, &a.code());
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let last_start = (n - 1) / 10_000 * 10_000;
     let last = format!("f{last_start:06}-{:06}.txt", n - 1 - last_start);
-    let done = wait_until(s.remaining(), || has_hash(&pb, &last, &empty()));
+    // WP4.2 (as WP3.INT's `feed_150k_daemons`): progress is read from B's
+    // worker `status` (its status cell; no projection is read). `has_hash`
+    // asks for the whole `state`: about 70 MB of JSON at 150K entries, over
+    // the RPC's 64 MiB message limit, so it never held, and every poll made
+    // the worker load the whole projection, which slowed what it measured.
+    let mut seen = 0;
+    let activated = wait_until(s.remaining(), || {
+        seen = try_rpc(&pb, json!({"op":"status"}))
+            .ok()
+            .and_then(|status| status["journal"]["events"].as_u64())
+            .unwrap_or(seen);
+        thread::sleep(Duration::from_millis(200));
+        seen >= total
+    });
+    let seconds = s.started.elapsed().as_secs_f64();
+    // Then the last event's entry, read from B's store (folder stopped): it
+    // must be a live file with the (empty) content.
+    let entry = activated.then(|| {
+        b.with_stopped_folder(&pb, SETUP, |st| Ok(st.lookup(&last).ok()))
+            .unwrap_or_else(|error| panic!("cannot read B's store: {error:#}"))
+    });
+    let present = entry.as_ref().is_some_and(|entry| {
+        entry
+            .as_ref()
+            .is_some_and(|e| e.alive && e.content.as_deref() == Some(empty().as_str()))
+    });
+    let done = activated && present;
     s.metric_with(
         "completed",
         if done { 1.0 } else { 0.0 },
         "bool",
-        json!({"events": n, "seconds": s.started.elapsed().as_secs_f64()}),
+        json!({"events": n, "total": total, "activated": seen, "seconds": seconds}),
     );
-    if !done {
-        s.timeout("not synchronized");
+    s.metric("events_per_s", seen as f64 / seconds, "events/s");
+    if !activated {
+        s.timeout(format!("{seen} of {total} events activated"));
+    } else {
+        s.check(
+            present,
+            format!("{last} is not an empty live file in B's store"),
+        );
     }
     s.finish();
 }

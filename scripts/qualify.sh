@@ -19,11 +19,19 @@
 # when cargo exits 0 and its last `test result:` line says `ok.`; exit code and
 # result line are recorded. Exit 0 when every enforced floor holds and every
 # selected file passed (--baseline: always 0).
+#
+# The Linux subset (WP4.2): every qual file runs; a floor whose `platforms`
+# list (tests/qualification-floors.json) does not name "linux" is evaluated
+# and recorded but not enforced here (a floor that depends on Windows-only
+# machinery or on the Windows dev box's disk). --all gives the long scenarios
+# their budget (--budget-s 2400, --file-timeout-min 150) unless given. The
+# evidence records the disk of the temporary directory and the machine's load
+# at the start.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(pwd)
 
-wave=0; kind=""; files=""; filter=""; budget=120; file_timeout=90; evidence=""; build=1; baseline=0
+wave=0; kind=""; files=""; filter=""; budget=""; file_timeout=""; evidence=""; build=1; baseline=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --wave) wave="$2"; shift 2 ;;
@@ -39,6 +47,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ "$wave" -lt 1 ] || [ "$wave" -gt 4 ]; then echo "use --wave 1..4, --all or --baseline" >&2; exit 2; fi
+if [ "$kind" = "all" ]; then
+  [ -n "$budget" ] || budget=2400
+  [ -n "$file_timeout" ] || file_timeout=150
+fi
+[ -n "$budget" ] || budget=120
+[ -n "$file_timeout" ] || file_timeout=90
 [ -n "$kind" ] || kind="wave-$wave"
 [ -n "$evidence" ] || evidence="$root/test-evidence/qualification-$kind-linux.json"
 
@@ -66,6 +80,9 @@ started=$(date +%s)
 git -C "$root" rev-parse HEAD >"$run_dir/git-head.txt" 2>/dev/null || true
 git -C "$root" rev-parse --abbrev-ref HEAD >"$run_dir/git-branch.txt" 2>/dev/null || true
 git -C "$root" status --porcelain >"$run_dir/git-status.txt" 2>/dev/null || true
+# What else ran when this run started (the machine may be shared).
+{ cat /proc/loadavg 2>/dev/null || true; } >"$run_dir/loadavg.txt"
+{ ps -eo comm= 2>/dev/null | grep -cE '^(cargo|rustc|tkfs|ld|cc)$' || true; } >"$run_dir/build-processes.txt"
 echo "qualify: $kind (linux), files: ${selected[*]}"
 if [ "$build" = 1 ]; then
   args=(test --release --no-run)
@@ -146,8 +163,10 @@ for fl in floors:
     elif status in ("timeout", "killed", "incomplete"): verdict = "incomplete"
     elif measured is not None and ops[fl["op"]](measured, fl["value"]): verdict = "pass"
     else: verdict = "fail"
-    enforced = (not baseline) and fl["wave"] <= wave and (ran or not flt)
+    platform_ok = "platforms" not in fl or "linux" in fl["platforms"]
+    enforced = (not baseline) and fl["wave"] <= wave and (ran or not flt) and platform_ok
     results.append({**{k: fl[k] for k in ("id", "wave", "scenario", "metric", "op", "unit", "baseline")},
+                    "platforms": fl.get("platforms"),
                     "floor": fl["value"], "measured": measured, "verdict": verdict, "enforced": enforced})
 scen = [s for f in files for s in f["scenarios"]]
 by_status = {}
@@ -159,6 +178,25 @@ try: cpu = [l.split(":", 1)[1].strip() for l in open("/proc/cpuinfo") if l.start
 except Exception: cpu = platform.processor()
 try: mem = round(int(open("/proc/meminfo").readline().split()[1]) / 1048576, 1)
 except Exception: mem = None
+def disk(role, path):
+    info = {"role": role, "path": path}
+    try:
+        st = os.statvfs(path)
+        info["free_gb"] = round(st.f_bavail * st.f_frsize / 2**30, 1)
+        info["size_gb"] = round(st.f_blocks * st.f_frsize / 2**30, 1)
+        out = subprocess.run(["df", "-T", path], capture_output=True, text=True).stdout.splitlines()
+        if len(out) > 1:
+            fields = out[1].split()
+            info["device"], info["file_system"] = fields[0], fields[1]
+    except Exception as e:
+        info["error"] = str(e)
+    return info
+import tempfile
+disks = [disk("temp", tempfile.gettempdir()),
+         disk("target", os.environ.get("CARGO_TARGET_DIR") or os.path.join(root, "target"))]
+try: wsl = "microsoft" in open("/proc/version").read().lower()
+except Exception: wsl = False
+load = {"loadavg": started_git("loadavg.txt"), "build_processes": started_git("build-processes.txt")}
 doc = {
     "schema": 1, "kind": kind, "platform": "linux", "wave": wave,
     "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "duration_s": int(time.time()) - int(started),
@@ -167,7 +205,8 @@ doc = {
             "dirty_paths": started_git("git-status.txt").splitlines()[:50]},
     "toolchain": subprocess.run(["rustc", "-V"], capture_output=True, text=True).stdout.strip(),
     "hardware": {"cpu": cpu, "threads": os.cpu_count(), "memory_gb": mem, "os": platform.platform(),
-                 "fuse": os.path.exists("/dev/fuse")},
+                 "fuse": os.path.exists("/dev/fuse"), "wsl": wsl, "disks": disks},
+    "load_at_start": load,
     "settings": {"budget_s": int(budget), "file_timeout_min": int(file_timeout), "filter": flt,
                  "profile": "release"},
     "summary": {"ok": None if baseline else ok, "scenarios": len(scen), "by_status": by_status,
