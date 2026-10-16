@@ -610,7 +610,8 @@ impl HeldTable {
         self.entries = self.map.values().map(HashMap::len).sum();
     }
 
-    fn entry(&mut self, key: &ObjectKey, now: Instant) -> &mut Held {
+    /// The entry of `key`; a new one backs off on `schedule`.
+    fn entry(&mut self, key: &ObjectKey, now: Instant, schedule: fn() -> Backoff) -> &mut Held {
         let known = self
             .map
             .get(&key.object)
@@ -624,7 +625,7 @@ impl HeldTable {
             .or_default()
             .entry(key.peer.clone())
             .or_insert_with(|| Held {
-                backoff: Backoff::objects(),
+                backoff: schedule(),
                 until: now,
                 code: String::new(),
             })
@@ -694,12 +695,38 @@ pub(crate) fn object_blocked(key: &ObjectKey) -> bool {
 pub(crate) fn object_failed(key: &ObjectKey, code: &str) -> Duration {
     let now = Instant::now();
     let mut table = lock(held());
-    let held = table.entry(key, now);
+    let held = table.entry(key, now, Backoff::objects);
     let delay = held.backoff.failure(now);
     held.until = now + delay;
     if !code.is_empty() {
         held.code = code.to_owned();
     }
+    delay
+}
+
+/// The backoff of an object a peer did not send although we offered it to
+/// that peer (it lacks the object, or may not serve it): no failure, and
+/// often over soon (a relay that receives it a moment later), so a short
+/// schedule, 5 s → 5 min, instead of the failures' 30 s → 1 h (WP3.INT
+/// re-review: a relay delivered such an object 28 s late).
+fn unserved_backoff() -> Backoff {
+    Backoff::new(
+        Duration::from_secs(5),
+        Duration::from_secs(300),
+        0.2,
+        Duration::ZERO,
+    )
+}
+
+/// Records that `key`'s peer did not serve its object (see
+/// [`unserved_backoff`]); an object already backing off for a failure keeps
+/// its schedule and its code. Returns the delay.
+pub(crate) fn object_unserved(key: &ObjectKey) -> Duration {
+    let now = Instant::now();
+    let mut table = lock(held());
+    let held = table.entry(key, now, unserved_backoff);
+    let delay = held.backoff.failure(now);
+    held.until = now + delay;
     delay
 }
 

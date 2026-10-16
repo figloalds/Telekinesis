@@ -113,8 +113,9 @@ use super::{
         KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, Renewal, Sink, SinkEvent,
         SinkOptions, SinkResult, allot, covered, handoff_park, handoff_progress, handoff_release,
         handoff_take, handoff_unclaim, handoff_unclaim_all, handoff_wanted, is_failure,
-        is_unsupported, object_blocked, object_failed, object_installed, object_key, outcome_error,
-        push_lease, read_outcome, read_ranges, size_unknown, wire_pieces,
+        is_unsupported, object_blocked, object_failed, object_installed, object_key,
+        object_unserved, outcome_error, push_lease, read_outcome, read_ranges, size_unknown,
+        wire_pieces,
     },
     worker_client::{self, ReadFlow, SessionWorkerClient},
 };
@@ -643,7 +644,7 @@ impl<'a> Source<'a> {
     /// or it backs it off): no error here, but a backoff for this source,
     /// and the object is parked under its lease for another source.
     fn not_served(&self, offered: &Offered) {
-        object_failed(&self.key(&offered.item.hash), "");
+        object_unserved(&self.key(&offered.item.hash));
         self.park(&offered.item, &offered.lease);
     }
 
@@ -1198,7 +1199,7 @@ fn settle_pushed(
         _ if unsent && settled.is_none() => {
             // Our own lease, where our worker stands not known: a backoff
             // for this source; our worker's next want parks it.
-            object_failed(&source.key(&item.hash), "");
+            object_unserved(&source.key(&item.hash));
         }
         _ => {}
     }
