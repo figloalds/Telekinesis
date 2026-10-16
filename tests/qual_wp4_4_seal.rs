@@ -158,10 +158,9 @@ fn catch_up(dir: &Path, repo: &str, n: usize, inline: bool) -> CatchUp {
     let store = Store::initialize(dir, repo, "device-b").unwrap();
     store
         .db
-        .execute_batch(
-            "PRAGMA wal_autocheckpoint=16384; PRAGMA cache_size=-32768; PRAGMA temp_store=MEMORY;",
-        )
+        .execute_batch("PRAGMA wal_autocheckpoint=16384; PRAGMA cache_size=-32768;")
         .unwrap();
+    store.set_temp_store_memory(true).unwrap();
     let stager = Store::open_secondary(dir, repo, "device-b").unwrap();
     let engine = Arc::new(Mutex::new(store));
     let allowed: BTreeSet<String> = [SOURCE.to_string()].into();

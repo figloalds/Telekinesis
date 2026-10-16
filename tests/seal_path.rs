@@ -1757,3 +1757,70 @@ fn a_restart_writes_only_the_rows_that_differ_from_the_snapshot() {
     assert_eq!(assert_snapshots(&s, "after the tail's replay"), 1);
     assert_oracle(&mut s, "after the tail's replay");
 }
+
+// ---------------------------------------------------------------------------
+// The engine connection's in-memory sub-journal
+
+/// `Store::set_temp_store_memory`, which the activator uses on the engine
+/// connection: the setting changes, the view survives the change in both
+/// directions (no reload at the next commit, although the pragma drops the
+/// connection's TEMP commit-epoch table), and a commit rolled back around
+/// the store before the change is still detected after it.
+#[test]
+fn the_engine_connection_keeps_its_view_across_temp_store_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = open(dir.path());
+    let temp_store = |s: &Store| -> i64 {
+        s.db.query_row("PRAGMA temp_store", [], |r| r.get(0))
+            .unwrap()
+    };
+    for i in 0..5 {
+        s.create(&format!("f{i}"), "file").unwrap();
+    }
+    // The baseline: what a save and a lookup cost in view loads here
+    // (a save registers its object on another connection, so the view is
+    // reloaded once whatever the setting).
+    let loads_of = |s: &mut Store, label: &str| -> u64 {
+        let before = s.view_loads();
+        save(s, "f1", label.as_bytes());
+        s.lookup("f1").unwrap();
+        s.view_loads() - before
+    };
+    loads_of(&mut s, "warm");
+    let baseline = loads_of(&mut s, "baseline");
+    let rolled = s.rolled_back_views();
+    for memory in [true, false, true] {
+        let before = s.view_loads();
+        s.set_temp_store_memory(memory).unwrap();
+        assert_eq!(temp_store(&s), if memory { 2 } else { 0 });
+        s.lookup("f1").unwrap();
+        assert_eq!(s.view_loads(), before, "the change keeps the view");
+        let loads = loads_of(&mut s, &format!("{memory}"));
+        assert!(
+            loads <= baseline,
+            "the next commit loads no more than without the change: {loads} > {baseline}"
+        );
+        assert_eq!(
+            s.rolled_back_views(),
+            rolled,
+            "the commit epoch was carried over"
+        );
+    }
+    // A commit rolled back around the store, then the change: detected.
+    s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    s.create("rolled-back", "file").unwrap();
+    s.db.execute_batch("ROLLBACK").unwrap();
+    s.set_temp_store_memory(false).unwrap();
+    save(&mut s, "f2", b"after the rollback");
+    assert_eq!(
+        s.rolled_back_views(),
+        rolled + 1,
+        "the rolled-back commit is still detected"
+    );
+    assert!(s.lookup("rolled-back").is_err());
+    // Refused inside a transaction (the caller's best effort).
+    s.db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(s.set_temp_store_memory(true).is_err());
+    s.db.execute_batch("ROLLBACK").unwrap();
+    assert_oracle(&mut s, "after the changes");
+}

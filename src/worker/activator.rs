@@ -319,11 +319,11 @@ impl Drop for Running<'_> {
 ///   measured on the 150K catch-up, where it was every seal over 30 ms and
 ///   most of the commit holds' tail). A commit's sub-journal is the pages it
 ///   touches (a few MB: a slow commit on a projection above
-///   `commit::FOLD_MAX_ENTRIES` entries stores a delta). Changing the setting drops the
-///   connection's TEMP objects (the commit epoch table, which the next
-///   commit recreates; the view is reloaded once) and is refused inside a
-///   transaction (best effort, as the rest). An open's rebuild, before the
-///   activator runs, keeps temp files (it may rewrite hundreds of MB).
+///   `commit::FOLD_MAX_ENTRIES` entries stores a delta). The change keeps
+///   the connection's commit epoch, so the view stays
+///   (`Store::set_temp_store_memory`), and is refused inside a transaction
+///   (best effort, as the rest). An open's rebuild, before the activator
+///   runs, keeps temp files (it may rewrite hundreds of MB).
 fn tune_engine_connection(store: &Store, running: bool) {
     let pages = if running {
         ENGINE_WAL_AUTOCHECKPOINT
@@ -336,11 +336,7 @@ fn tune_engine_connection(store: &Store, running: bool) {
         [],
         |_| Ok(()),
     );
-    let _ = store.db.execute_batch(if running {
-        "PRAGMA temp_store=MEMORY"
-    } else {
-        "PRAGMA temp_store=DEFAULT"
-    });
+    let _ = store.set_temp_store_memory(running);
     let _ = if running {
         store.db.busy_handler(Some(poll_busy))
     } else {
