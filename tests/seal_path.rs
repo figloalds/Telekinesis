@@ -218,6 +218,7 @@ fn delta(after: SealStats, before: SealStats) -> SealStats {
         journal_rows: after.journal_rows - before.journal_rows,
         max_micros: after.max_micros,
         total_micros: after.total_micros - before.total_micros,
+        journal_micros: after.journal_micros - before.journal_micros,
     }
 }
 
