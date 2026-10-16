@@ -1,6 +1,8 @@
-//! WP2.7 acceptance: the MetaScheduler (`orchestrator::scheduler`), one
-//! metadata exchange (`orchestrator::meta_exchange`) and the interim bulk
-//! lane (`orchestrator::objects`); REVAMP_PLAN §3.7, §6.5 and §14 WP2.7.
+//! WP2.7 acceptance: the MetaScheduler (`orchestrator::scheduler`) and one
+//! metadata exchange (`orchestrator::meta_exchange`); REVAMP_PLAN §3.7 and
+//! §14 WP2.7. The bulk lanes' session checks are here too; the interim bulk
+//! lane's tests were rewritten against objects v3 in `objects_v3_lanes`
+//! when WP4.5 removed that path (CCR-WP3.3-2).
 //!
 //! Every test runs a lane against a real authenticated v3 session
 //! (`session::dial` ↔ `session::accept`). The server side is a scripted
@@ -10,7 +12,7 @@ mod support;
 
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::{SocketAddr, TcpListener},
     sync::{
         Arc, Mutex, OnceLock,
@@ -21,8 +23,6 @@ use std::{
 };
 use support::FaultProxy;
 use tkfs::{
-    bulk_sync::{self, Page},
-    core::ObjectPart,
     model::{
         errors::{ErrorClass, ErrorWire, Scope},
         health::Generations,
@@ -39,7 +39,7 @@ use tkfs::{
                 Cursor, ExchangeSummary, FEED_FORMAT, FeedApplyResult, FeedPage, FeedState,
                 GateView, MetaExchangeReply, MetaExchangeRequest, PageStatus,
             },
-            frame::{ChunkHeader, ClientHello},
+            frame::ClientHello,
             ops,
         },
         status::{
@@ -50,7 +50,7 @@ use tkfs::{
         Config, Network,
         hub::{HubConfig, StatusHub},
         meta_exchange::{self, ExchangeOptions},
-        objects::{self, BulkOptions},
+        objects,
         scheduler::{
             self, ControlOptions, DriveOptions, FailureKind, KeyPhase, Readiness, SchedulerView,
         },
@@ -63,9 +63,6 @@ use tkfs::{
 
 const PEER: &str = "peer-installation-b";
 const REMOTE_EPOCH: &str = "remote-epoch";
-/// Lane 1 of 2 owns hashes whose first 16 hex digits are odd.
-const H_UP: &str = "0000000000000001aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const H_DOWN: &str = "0000000000000003bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn uuid() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -102,15 +99,12 @@ struct WorkerCall {
 
 type Script = Arc<dyn Fn(&str, &Value) -> Option<Result<Value, CallError>> + Send + Sync>;
 
-/// The local worker: `feed-offer` builds a fresh request per call,
-/// `feed-apply` answers `apply_result`, and the interim bulk ops play a
-/// two-object scenario (we want `H_DOWN`, the peer wants `H_UP`). A script
-/// can override any call.
+/// The local worker: `feed-offer` builds a fresh request per call and
+/// `feed-apply` answers `apply_result`. A script can override any call.
 struct FakeWorker {
     calls: Mutex<Vec<WorkerCall>>,
     script: Mutex<Option<Script>>,
     apply_result: Mutex<FeedApplyResult>,
-    installed: Mutex<HashSet<String>>,
 }
 
 impl FakeWorker {
@@ -128,7 +122,6 @@ impl FakeWorker {
                     ..GateView::default()
                 },
             }),
-            installed: Mutex::new(HashSet::new()),
         })
     }
 
@@ -162,40 +155,6 @@ impl FakeWorker {
                     serde_json::from_value(payload["reply"].clone()).unwrap();
                 assert_eq!(payload["request_id"], json!(reply.reply_to));
                 Ok(json!(*self.apply_result.lock().unwrap()))
-            }
-            "published-bulk-offer" => {
-                let lane: bulk_sync::Lane =
-                    serde_json::from_value(payload["lane"].clone()).unwrap();
-                let inventory: Option<Page> =
-                    serde_json::from_value(payload["inventory"].clone()).unwrap();
-                if let Some(inventory) = &inventory {
-                    check_route(inventory, &route, lane)?;
-                }
-                let installed = self.installed.lock().unwrap().contains(&route.repo);
-                let mut page = page(
-                    &route.repo,
-                    &route.local_replica,
-                    &route.remote_replica,
-                    lane,
-                );
-                if !installed {
-                    page.wanted_objects.insert(H_DOWN.into());
-                }
-                if inventory.is_some_and(|inventory| inventory.wanted_objects.contains(H_UP)) {
-                    page.object_parts.insert(H_UP.into(), part("abcd"));
-                }
-                Ok(json!(page))
-            }
-            "published-bulk-apply" => {
-                let lane: bulk_sync::Lane =
-                    serde_json::from_value(payload["lane"].clone()).unwrap();
-                let reply: Page = serde_json::from_value(payload["page"].clone()).unwrap();
-                check_route(&reply, &route, lane)?;
-                assert_eq!(payload["request"], json!(reply.reply_to.clone().unwrap()));
-                if reply.object_parts.contains_key(H_DOWN) {
-                    self.installed.lock().unwrap().insert(route.repo.clone());
-                }
-                Ok(json!({"received_object_bytes": reply.object_bytes()}))
             }
             other => Err(CallError::Remote(ErrorWire::coded(
                 "UNSUPPORTED_OPERATION",
@@ -243,36 +202,6 @@ impl WorkerClient for FakeWorker {
     }
 }
 
-/// The real worker's check of a peer page (an inventory or a reply) against
-/// the route and lane of the call (`bulk_sync::Page::validate`): it comes
-/// from the remote replica, to us. `BULK_ROUTE_MISMATCH` is Fatal.
-fn check_route(page: &Page, route: &SyncRoute, lane: bulk_sync::Lane) -> Result<(), CallError> {
-    if page.lane != lane {
-        return Err(CallError::Remote(ErrorWire::coded(
-            "INCOMPATIBLE_BULK_LANE",
-            format!("page lane {:?}, call lane {lane:?}", page.lane),
-        )));
-    }
-    if page.repo != route.repo
-        || page.sender != route.remote_replica
-        || page.receiver != route.local_replica
-    {
-        return Err(CallError::Remote(ErrorWire::coded(
-            "BULK_ROUTE_MISMATCH",
-            format!(
-                "page {} -> {} for {}, route {} -> {} for {}",
-                page.sender,
-                page.receiver,
-                page.repo,
-                route.remote_replica,
-                route.local_replica,
-                route.repo
-            ),
-        )));
-    }
-    Ok(())
-}
-
 fn offer(route: &SyncRoute, request: &str) -> MetaExchangeRequest {
     MetaExchangeRequest {
         format: FEED_FORMAT,
@@ -295,30 +224,6 @@ fn offer(route: &SyncRoute, request: &str) -> MetaExchangeRequest {
         state: FeedState::default(),
         need_served: vec![],
         unknown: vec![],
-    }
-}
-
-fn page(repo: &str, sender: &str, receiver: &str, lane: bulk_sync::Lane) -> Page {
-    Page {
-        format: bulk_sync::PROTOCOL,
-        repo: repo.into(),
-        sender: sender.into(),
-        receiver: receiver.into(),
-        request: uuid(),
-        reply_to: None,
-        lane,
-        known_objects: BTreeSet::new(),
-        partial_objects: BTreeMap::new(),
-        wanted_objects: BTreeSet::new(),
-        object_parts: BTreeMap::new(),
-    }
-}
-
-fn part(hex: &str) -> ObjectPart {
-    ObjectPart {
-        offset: 0,
-        total: (hex.len() / 2) as u64,
-        hex: hex.into(),
     }
 }
 
@@ -2391,435 +2296,6 @@ fn lanes_refuse_a_session_of_the_wrong_role_or_peer() {
     server.close();
 }
 
-/// The peer's `objects.exchange` handler: answers with the parts we want
-/// (`H_DOWN`), lists what it holds, and wants `H_UP` until it has it.
-#[derive(Default)]
-struct BulkPeer {
-    seen: Mutex<Vec<(Value, Page)>>,
-    holds_up: Mutex<HashSet<String>>,
-    /// The hex of `H_DOWN` (default `"0102"`).
-    down_hex: Mutex<Option<String>>,
-    /// Stream the reply as 64 KiB body chunks instead of one body.
-    stream: AtomicBool,
-    /// While set, requests wait (until cleared or cancelled) before replying.
-    hold: AtomicBool,
-    /// Requests waiting on `hold` now.
-    holding: AtomicUsize,
-}
-
-impl Handler for BulkPeer {
-    fn handle(&self, req: Incoming) {
-        assert_eq!(req.op, ops::OBJECTS_EXCHANGE);
-        let page: Page = serde_json::from_slice(&req.body).unwrap();
-        self.seen
-            .lock()
-            .unwrap()
-            .push((req.header.clone(), page.clone()));
-        if self.hold.load(Ordering::SeqCst) {
-            self.holding.fetch_add(1, Ordering::SeqCst);
-            while self.hold.load(Ordering::SeqCst) && !req.responder.cancelled() {
-                sleep_ms(5);
-            }
-            self.holding.fetch_sub(1, Ordering::SeqCst);
-        }
-        let mut holds = self.holds_up.lock().unwrap();
-        if page.object_parts.contains_key(H_UP) {
-            holds.insert(page.repo.clone());
-        }
-        let mut reply = Page {
-            request: uuid(),
-            reply_to: Some(page.request.clone()),
-            ..self::page(&page.repo, &page.receiver, &page.sender, page.lane)
-        };
-        if holds.contains(&page.repo) {
-            reply.known_objects.insert(H_UP.into());
-        } else {
-            reply.wanted_objects.insert(H_UP.into());
-        }
-        if page.wanted_objects.contains(H_DOWN) {
-            let hex = self.down_hex.lock().unwrap().clone();
-            reply
-                .object_parts
-                .insert(H_DOWN.into(), part(hex.as_deref().unwrap_or("0102")));
-        }
-        let body = serde_json::to_vec(&reply).unwrap();
-        if !self.stream.load(Ordering::SeqCst) {
-            req.responder.reply(json!({}), body);
-            return;
-        }
-        let pieces: Vec<&[u8]> = body.chunks(64 * 1024).collect();
-        let mut offset = 0;
-        for (index, piece) in pieces.iter().enumerate() {
-            let header = ChunkHeader {
-                id: 0,
-                hash: None,
-                offset,
-                total: body.len() as u64,
-                last: index + 1 == pieces.len(),
-            };
-            req.responder.chunk(header, piece).unwrap();
-            offset += piece.len() as u64;
-        }
-        req.responder.reply(json!({"streamed": true}), vec![]);
-    }
-}
-
-/// §6.5: the interim bulk lane runs offer → `objects.exchange` → apply for
-/// every shared repository, with the lane's `Lane{index, count}`, the peer's
-/// inventory passed into the next offer, and completed objects reported.
-#[test]
-fn interim_bulk_pages_are_routed() {
-    let world = World::new();
-    world.put(folder("repo-a"));
-    world.put(folder("repo-b"));
-    let mut c = folder("repo-c");
-    c.record.sync_enabled = false;
-    world.put(c);
-    let ctx = ctx(&world, 60_000);
-    let peer = peer_ctx(
-        &ctx,
-        vec![
-            entry("repo-a", EntryState::Running),
-            entry("repo-b", EntryState::Running),
-            entry("repo-c", EntryState::Running),
-            entry("repo-x", EntryState::Running),
-        ],
-    );
-    let lane = LaneSpec::new(1, 2);
-    let bulk = Arc::new(BulkPeer::default());
-    let (client, server) = session(
-        &ctx.installation,
-        PEER,
-        LaneRole::Bulk,
-        Some(lane),
-        bulk.clone(),
-    );
-    let mut options = BulkOptions::for_config(&ctx.config);
-    assert_eq!(options.drive.slots, 2);
-    assert_eq!(options.exchange, Duration::from_secs(60));
-    let view = Arc::new(Snapshot::new(SchedulerView::default()));
-    options.drive.view = Some(view.clone());
-    let cancel = Cancel::new();
-    let handle = {
-        let (ctx, peer, client, cancel) =
-            (ctx.clone(), peer.clone(), client.clone(), cancel.clone());
-        thread::spawn(move || objects::run_bulk_lane_with(ctx, peer, lane, client, cancel, options))
-    };
-    // Three exchanges per repository, back to back: download, upload, idle.
-    assert!(wait_until(Duration::from_secs(5), || {
-        world.finished_of("repo-a").len() == 3 && world.finished_of("repo-b").len() == 3
-    }));
-    sleep_ms(300);
-    for repo in ["repo-a", "repo-b"] {
-        let fins = world.finished_of(repo);
-        assert_eq!(
-            fins.len(),
-            3,
-            "{repo}: the third exchange moved nothing, so the key idles"
-        );
-        for fin in &fins {
-            assert!(fin.ok, "{fin:?}");
-            assert_eq!((fin.lane, fin.op.as_str()), (2, "objects.exchange"));
-            assert!(fin.summary.is_none());
-        }
-        let moved: Vec<(u64, u64, u64, u64)> = fins
-            .iter()
-            .map(|fin| {
-                (
-                    fin.objects_down,
-                    fin.bytes_down,
-                    fin.objects_up,
-                    fin.bytes_up,
-                )
-            })
-            .collect();
-        assert_eq!(moved, [(1, 2, 0, 0), (0, 0, 1, 2), (0, 0, 0, 0)], "{repo}");
-        assert!(fins[1].at - fins[0].at < Duration::from_millis(500));
-
-        // The worker saw the lane, the route and the peer's inventory.
-        let offers = world.worker.calls("published-bulk-offer", repo);
-        assert_eq!(offers.len(), 3);
-        for offer in &offers {
-            assert_eq!(offer.payload["lane"], json!({"index": 1, "count": 2}));
-            assert_eq!(
-                offer.payload["route"],
-                json!({"peer": PEER, "repo": repo, "local_replica": device_of(repo), "remote_replica": replica_of(repo)})
-            );
-        }
-        assert_eq!(offers[0].payload["inventory"], Value::Null);
-        let inventory: Page =
-            serde_json::from_value(offers[1].payload["inventory"].clone()).unwrap();
-        assert!(inventory.object_parts.is_empty());
-        assert!(inventory.wanted_objects.contains(H_UP));
-        let applies = world.worker.calls("published-bulk-apply", repo);
-        assert_eq!(applies.len(), 3);
-        let seen: Vec<(Value, Page)> = bulk
-            .seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, page)| page.repo == repo)
-            .cloned()
-            .collect();
-        assert_eq!(seen.len(), 3);
-        for ((header, page), apply) in seen.iter().zip(&applies) {
-            assert_eq!(
-                header,
-                &json!({"repo": repo, "lane": {"index": 1, "count": 2}})
-            );
-            assert_eq!(page.sender, device_of(repo));
-            assert_eq!(page.receiver, replica_of(repo));
-            assert_eq!(apply.payload["request"], json!(page.request));
-            assert_eq!(apply.payload["page"]["reply_to"], json!(page.request));
-        }
-    }
-    // Paused and unshared repositories are not exchanged.
-    assert_eq!(world.worker.count("published-bulk-offer", "repo-c"), 0);
-    assert!(view.load().key("repo-x").is_none());
-    assert_eq!(
-        view.load().key("repo-c").unwrap().readiness,
-        Readiness::Paused
-    );
-    cancel.cancel();
-    handle.join().unwrap();
-    client.close();
-    server.close();
-}
-
-/// Bulk failures are per key too: one repository's failing worker never
-/// stalls another's transfers on the same lane.
-#[test]
-fn a_failing_bulk_repository_never_stalls_the_others() {
-    let world = World::new();
-    world.put(folder("repo-a"));
-    world.put(folder("repo-b"));
-    world.worker.script(|op, payload| {
-        (op == "published-bulk-offer" && payload["route"]["repo"] == "repo-a").then(|| {
-            Err(CallError::Remote(ErrorWire::coded(
-                "OBJECT_IO_ERROR",
-                "disk",
-            )))
-        })
-    });
-    let ctx = ctx(&world, 60_000);
-    let peer = peer_ctx(
-        &ctx,
-        vec![
-            entry("repo-a", EntryState::Running),
-            entry("repo-b", EntryState::Running),
-        ],
-    );
-    let lane = LaneSpec::new(1, 2);
-    let bulk = Arc::new(BulkPeer::default());
-    let (client, server) = session(
-        &ctx.installation,
-        PEER,
-        LaneRole::Bulk,
-        Some(lane),
-        bulk.clone(),
-    );
-    let mut options = BulkOptions::for_config(&ctx.config);
-    let view = Arc::new(Snapshot::new(SchedulerView::default()));
-    options.drive.view = Some(view.clone());
-    let cancel = Cancel::new();
-    let handle = {
-        let (ctx, peer, client, cancel) =
-            (ctx.clone(), peer.clone(), client.clone(), cancel.clone());
-        thread::spawn(move || objects::run_bulk_lane_with(ctx, peer, lane, client, cancel, options))
-    };
-    assert!(wait_until(Duration::from_secs(5), || world
-        .finished_of("repo-b")
-        .len()
-        == 3));
-    let a = view.load().key("repo-a").cloned().unwrap();
-    assert!(
-        a.failures >= 1 && a.last_error.as_ref().unwrap().code == "OBJECT_IO_ERROR",
-        "{a:?}"
-    );
-    assert_eq!(view.load().key("repo-b").unwrap().failures, 0);
-    assert!(
-        bulk.seen
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(_, page)| page.repo == "repo-b")
-    );
-    cancel.cancel();
-    handle.join().unwrap();
-    client.close();
-    server.close();
-}
-
-/// A key reset while its exchange runs (the peer's replica changed) drops the
-/// cached inventory: the running exchange does not put the old replica's
-/// inventory back, so the next offer, to the new replica, is never refused
-/// (`BULK_ROUTE_MISMATCH` is Fatal and would park the key for 10 min). A
-/// repository removed and re-added while its exchange runs starts without an
-/// inventory as well. The fake worker checks every inventory and reply
-/// against the call's route, as `bulk_sync::worker_control` does.
-#[test]
-fn a_key_reset_during_a_bulk_exchange_drops_the_stale_inventory() {
-    let world = World::new();
-    world.put(folder("repo-a"));
-    let ctx = ctx(&world, 300);
-    let peer = peer_ctx(&ctx, vec![entry("repo-a", EntryState::Running)]);
-    let lane = LaneSpec::new(1, 2);
-    let bulk = Arc::new(BulkPeer::default());
-    bulk.hold.store(true, Ordering::SeqCst);
-    let (client, server) = session(
-        &ctx.installation,
-        PEER,
-        LaneRole::Bulk,
-        Some(lane),
-        bulk.clone(),
-    );
-    let mut options = BulkOptions::for_config(&ctx.config);
-    let view = Arc::new(Snapshot::new(SchedulerView::default()));
-    options.drive.view = Some(view.clone());
-    let cancel = Cancel::new();
-    let handle = {
-        let (ctx, peer, client, cancel) =
-            (ctx.clone(), peer.clone(), client.clone(), cancel.clone());
-        thread::spawn(move || objects::run_bulk_lane_with(ctx, peer, lane, client, cancel, options))
-    };
-    let offers = || world.worker.calls("published-bulk-offer", "repo-a");
-    let key = || view.load().key("repo-a").cloned();
-
-    // 1. The peer's replica changes while the first exchange (to the first
-    //    replica) is in flight.
-    assert!(wait_until(Duration::from_secs(2), || bulk
-        .holding
-        .load(Ordering::SeqCst)
-        == 1));
-    let replica2 = "remote-replica-2";
-    let mut moved = entry("repo-a", EntryState::Running);
-    moved.replica = replica2.into();
-    set_entry(&peer, moved.clone());
-    // The lane samples the catalog every 250 ms.
-    sleep_ms(700);
-    assert_eq!(key().unwrap().phase, KeyPhase::Running);
-    bulk.hold.store(false, Ordering::SeqCst);
-    // At once a fresh offer to the new replica, without the old replica's
-    // inventory (it learns the new one), then after the interval an offer
-    // with the new replica's inventory, which uploads `H_UP`, then idle.
-    assert!(wait_until(Duration::from_secs(5), || world
-        .finished_of("repo-a")
-        .len()
-        >= 4));
-    let fins = world.finished_of("repo-a");
-    assert!(fins.iter().all(|fin| fin.ok), "{fins:#?}");
-    let moved_objects: Vec<(u64, u64)> = fins[..4]
-        .iter()
-        .map(|fin| (fin.objects_down, fin.objects_up))
-        .collect();
-    assert_eq!(moved_objects, [(1, 0), (0, 0), (0, 1), (0, 0)]);
-    let sent = offers();
-    assert_eq!(
-        sent[0].payload["route"]["remote_replica"],
-        json!(replica_of("repo-a"))
-    );
-    for offer in &sent[1..] {
-        assert_eq!(offer.payload["route"]["remote_replica"], json!(replica2));
-    }
-    assert_eq!(
-        sent[1].payload["inventory"],
-        Value::Null,
-        "the old replica's inventory was reused"
-    );
-    let inventory: Page = serde_json::from_value(sent[2].payload["inventory"].clone()).unwrap();
-    assert_eq!(inventory.sender, replica2);
-    let receivers: Vec<String> = bulk
-        .seen
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|(_, page)| page.receiver.clone())
-        .collect();
-    assert_eq!(receivers[0], replica_of("repo-a"));
-    assert!(receivers[1..].iter().all(|receiver| receiver == replica2));
-    assert_eq!(key().unwrap().failures, 0);
-
-    // 2. The repository is removed and re-added (same replica) while an
-    //    exchange runs: the re-added key starts without an inventory.
-    bulk.hold.store(true, Ordering::SeqCst);
-    assert!(wait_until(Duration::from_secs(2), || bulk
-        .holding
-        .load(Ordering::SeqCst)
-        == 1));
-    let held = offers().len();
-    assert!(!offers()[held - 1].payload["inventory"].is_null());
-    peer.catalog.update(|catalog| {
-        let mut catalog = catalog.clone();
-        catalog.generation += 1;
-        catalog.entries.retain(|entry| entry.repo != "repo-a");
-        catalog
-    });
-    assert!(wait_until(Duration::from_secs(2), || key().is_none()));
-    set_entry(&peer, moved.clone());
-    assert!(wait_until(Duration::from_secs(2), || key().is_some()));
-    // The old exchange still holds the repository: no second one at once.
-    sleep_ms(200);
-    assert_eq!(offers().len(), held);
-    bulk.hold.store(false, Ordering::SeqCst);
-    assert!(wait_until(Duration::from_secs(3), || offers().len() > held));
-    assert_eq!(
-        offers()[held].payload["inventory"],
-        Value::Null,
-        "the removed key's exchange put its inventory back"
-    );
-    sleep_ms(200);
-    let fins = world.finished_of("repo-a");
-    assert!(fins.iter().all(|fin| fin.ok), "{fins:#?}");
-    assert_eq!(key().unwrap().failures, 0);
-    cancel.cancel();
-    handle.join().unwrap();
-
-    // 3. The exchange itself never hands the worker an inventory of another
-    //    route or lane, whatever its caller passes.
-    let route = SyncRoute {
-        peer: PEER.into(),
-        repo: "repo-a".into(),
-        local_replica: device_of("repo-a"),
-        remote_replica: replica2.into(),
-    };
-    let page_lane = objects::page_lane(lane);
-    assert!(objects::fits(&inventory, &route, page_lane));
-    let stale = Page {
-        sender: replica_of("repo-a"),
-        ..inventory.clone()
-    };
-    assert!(!objects::fits(&stale, &route, page_lane));
-    let reversed = Page {
-        receiver: replica2.into(),
-        ..inventory.clone()
-    };
-    assert!(!objects::fits(&reversed, &route, page_lane));
-    let other_repo = Page {
-        repo: "repo-b".into(),
-        ..inventory.clone()
-    };
-    assert!(!objects::fits(&other_repo, &route, page_lane));
-    let other_lane = bulk_sync::Lane { index: 0, count: 2 };
-    assert!(!objects::fits(&inventory, &route, other_lane));
-    let before = offers().len();
-    let view_a = world.view(&state_of("repo-a")).unwrap();
-    objects::bulk_exchange(
-        &ctx,
-        &client,
-        &peer,
-        lane,
-        &view_a,
-        &moved,
-        Some(&stale),
-        &BulkOptions::for_config(&ctx.config),
-        &mut |_| None,
-    )
-    .unwrap();
-    assert_eq!(offers()[before].payload["inventory"], Value::Null);
-    client.close();
-    server.close();
-}
-
 /// The StatusHub reads the lane's reports as intended: a failing key is its
 /// pair's Backoff (with its retry time), Contention stays hidden, and the
 /// other repository of the same peer is up to date.
@@ -2924,103 +2400,6 @@ fn the_status_hub_reads_the_lane_reports() {
             .all(|op| op.repo != "repo-b")
     );
     lane.stop();
-}
-
-/// A reply streamed as body chunks has no body limit (a 1.5 MiB object);
-/// a request page over the op's body limit fails only its own key
-/// (`WS_MESSAGE_TOO_LARGE`). The limit is 16 MiB since WP2.INT applied
-/// CCR-WP2.7-1 (it was 1 MiB, and this page 1.2 MB of hex).
-#[test]
-fn large_bulk_replies_stream_and_oversize_pages_fail_only_their_key() {
-    let world = World::new();
-    world.put(folder("repo-a"));
-    world.put(folder("repo-big"));
-    let big_hex = "ab".repeat(8 * 1024 * 1024 + 64 * 1024);
-    {
-        let big_hex = big_hex.clone();
-        world.worker.script(move |op, payload| {
-            if op != "published-bulk-offer" || payload["route"]["repo"] != "repo-big" {
-                return None;
-            }
-            let route: SyncRoute = serde_json::from_value(payload["route"].clone()).unwrap();
-            let lane: bulk_sync::Lane = serde_json::from_value(payload["lane"].clone()).unwrap();
-            let mut page = page(
-                &route.repo,
-                &route.local_replica,
-                &route.remote_replica,
-                lane,
-            );
-            page.object_parts.insert(H_UP.into(), part(&big_hex));
-            Some(Ok(json!(page)))
-        });
-    }
-    let ctx = ctx(&world, 60_000);
-    let peer = peer_ctx(
-        &ctx,
-        vec![
-            entry("repo-a", EntryState::Running),
-            entry("repo-big", EntryState::Running),
-        ],
-    );
-    let lane = LaneSpec::new(1, 2);
-    let bulk = Arc::new(BulkPeer::default());
-    bulk.stream.store(true, Ordering::SeqCst);
-    *bulk.down_hex.lock().unwrap() = Some("cd".repeat(1536 * 1024));
-    let (client, server) = session(
-        &ctx.installation,
-        PEER,
-        LaneRole::Bulk,
-        Some(lane),
-        bulk.clone(),
-    );
-    let mut options = BulkOptions::for_config(&ctx.config);
-    let view = Arc::new(Snapshot::new(SchedulerView::default()));
-    options.drive.view = Some(view.clone());
-    let cancel = Cancel::new();
-    let handle = {
-        let (ctx, peer, client, cancel) =
-            (ctx.clone(), peer.clone(), client.clone(), cancel.clone());
-        thread::spawn(move || objects::run_bulk_lane_with(ctx, peer, lane, client, cancel, options))
-    };
-    assert!(wait_until(Duration::from_secs(10), || world
-        .finished_of("repo-a")
-        .len()
-        == 3));
-    let fins = world.finished_of("repo-a");
-    assert!(fins.iter().all(|fin| fin.ok), "{fins:?}");
-    assert_eq!((fins[0].objects_down, fins[0].bytes_down), (1, 1536 * 1024));
-    let apply = &world.worker.calls("published-bulk-apply", "repo-a")[0];
-    assert_eq!(
-        apply.payload["page"]["object_parts"][H_DOWN]["total"],
-        json!(1536 * 1024)
-    );
-    // A 16 MiB page takes a while to build and encode (debug build): wait
-    // for its exchange to end before judging it.
-    assert!(wait_until(Duration::from_secs(20), || !world
-        .finished_of("repo-big")
-        .is_empty()));
-    let big = world.finished_of("repo-big");
-    assert!(!big.is_empty());
-    assert!(
-        big.iter()
-            .all(|fin| !fin.ok && fin.error.as_ref().unwrap().code == "WS_MESSAGE_TOO_LARGE"),
-        "{big:?}"
-    );
-    assert!(view.load().key("repo-big").unwrap().failures >= 1);
-    assert_eq!(view.load().key("repo-a").unwrap().failures, 0);
-    // Nothing of the oversize page reached the peer, and the session is fine.
-    assert!(
-        bulk.seen
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|(_, page)| page.repo == "repo-a")
-    );
-    assert!(client.closed().is_none());
-    cancel.cancel();
-    handle.join().unwrap();
-    client.close();
-    server.close();
 }
 
 /// §8 classes, plus the answers that mean "not serving".

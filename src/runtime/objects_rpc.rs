@@ -1,13 +1,19 @@
-//! Owned by WP3.2.
+//! Owned by WP3.2 (WP4.5: CCR-WP3.2-3, CCR-WP3.3-4).
 //!
-//! Worker `objects.want`, `objects.read`, `objects.write` and `objects.report`
-//! (REVAMP_PLAN §6.4): the worker half of objects v3. Each op checks its route
-//! against this worker (the `paired_sync::binding` codes, as the feed ops do),
-//! runs on a pooled secondary store (`ctx.sync_stores`) and never takes the
-//! engine lock. Bodies are binary (`objects.read` replies with the bytes,
-//! `objects.write` carries the parts' bytes concatenated in item order), so
-//! `read` and `write` need a v3 loopback session (`runtime::server`); `want`
-//! and `report` also answer over the JSON RPC.
+//! Worker `objects.want`, `objects.read`, `objects.write`, `objects.report`
+//! and `objects.release` (REVAMP_PLAN §6.4): the worker half of objects v3.
+//! Each op checks its route against this worker (the `paired_sync::binding`
+//! codes, as the feed ops do), runs on a pooled secondary store
+//! (`ctx.sync_stores`) and never takes the engine lock. Bodies are binary
+//! (`objects.read` replies with the bytes, `objects.write` carries the
+//! parts' bytes concatenated in item order), so `read` and `write` need a v3
+//! loopback session (`runtime::server`); `want`, `report` and `release` also
+//! answer over the JSON RPC.
+//!
+//! **State** (CCR-WP3.2-3, WP4.5): the leases, the source each was granted
+//! for, the per-source backoffs and the durable-progress signal live in the
+//! worker's own context (`WorkerCtx::inflight_objects`, one lock), not in
+//! process-wide statics keyed by the store root.
 //!
 //! **Leases** (invariant 19, with `LaneSpec::owns` and the per-object locks):
 //! `ctx.inflight_objects` maps a hash to the session that may transfer it.
@@ -25,9 +31,17 @@
 //! without being released therefore saw no progress for a whole TTL: it
 //! *lapses*, and the object is backed off for the source that held it (the
 //! route's remote replica) for `STALL_BACKOFF`, so the sessions of other
-//! sources are offered it. A source that cannot serve an object (a relay that
-//! has the metadata but not yet the bytes) thus holds it for one TTL at a
-//! time, never for as long as it keeps asking.
+//! sources are offered it.
+//!
+//! **Giving a lease up** (CCR-WP3.3-4, WP4.5): a session that will not move
+//! an object (its source cannot serve it, its transfer failed or stopped)
+//! need not wait for the lapse. `objects.release{route, session, hashes}`
+//! ends the leases `session` holds on `hashes` at once, and an
+//! `objects.want` with `exclude` gives up the session's leases on the
+//! excluded hashes and leaves them out of its list (the orchestrator
+//! excludes what it backs off for that source). Either way the object is
+//! free for the next want of another session, at its durable offset, with
+//! no stall backoff: the orchestrator keeps its own per-source backoff.
 //!
 //! **Ordered parts:** a session may keep several writes of one object in
 //! flight; handler threads can run them out of order. A write whose first
@@ -53,14 +67,14 @@
 //! list honors, and releases the lease. `RESUME_OFFSET_AHEAD` and
 //! `OBJECT_PART_CHANGED` are not failures of the object: they tell the
 //! writer where to resume, and keep the lease.
-use super::ctx::{ObjectLease, WorkerCtx};
+use super::ctx::{ObjectLease, ObjectsState, WorkerCtx};
 use crate::{
     model::{
         errors::{ErrorClass, ErrorWire},
         protocol::objects::{
-            LEASE_TTL, MAX_READ_LEN, MAX_WANT_ITEMS, ObjectOutcome, ReadHeader, ReadReply,
-            ReportHeader, ReportReply, WantHeader, WantReply, WriteHeader, WriteItem, WriteReply,
-            WriteResult, ops,
+            LEASE_TTL, MAX_READ_LEN, MAX_RELEASE_ITEMS, MAX_WANT_ITEMS, ObjectOutcome, ReadHeader,
+            ReadReply, ReleaseHeader, ReleaseReply, ReportHeader, ReportReply, WantReply,
+            WantRequest, WriteHeader, WriteItem, WriteReply, WriteResult, ops,
         },
     },
     paired_sync::SyncRoute,
@@ -70,8 +84,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    path::PathBuf,
-    sync::{Condvar, Mutex, atomic::Ordering},
+    sync::atomic::Ordering,
     time::{Duration, Instant},
 };
 
@@ -83,23 +96,8 @@ const MAX_SOURCE_BACKOFFS: usize = 16 * 1024;
 /// How long an object whose lease lapsed (no progress for `LEASE_TTL`) is
 /// backed off for the source that held it (see the module docs).
 pub const STALL_BACKOFF: Duration = LEASE_TTL;
-/// Lease holders kept (see `LEASE_HOLDERS`).
+/// Lease holders kept (see [`ObjectsState::holders`]).
 const MAX_LEASE_HOLDERS: usize = 64 * 1024;
-
-/// Wakes writes waiting for an object's durable offset (`ORDER_WAIT`): bumped
-/// after every write call.
-static PROGRESS: (Mutex<u64>, Condvar) = (Mutex::new(0), Condvar::new());
-
-/// `(store root, source replica, hash)` → `(attempts, retry_at_ms)`.
-type SourceKey = (PathBuf, String, String);
-static SOURCE_BACKOFF: Mutex<BTreeMap<SourceKey, (u32, u64)>> = Mutex::new(BTreeMap::new());
-
-/// Who was granted each lease: `(store root, hash)` → `(session, source
-/// replica)`, so a lapsed lease backs its object off for its source
-/// (`ObjectLease`, frozen, has no source). Lock order: `ctx.inflight_objects`,
-/// then `LEASE_HOLDERS`, then `SOURCE_BACKOFF`.
-type HolderKey = (PathBuf, String);
-static LEASE_HOLDERS: Mutex<BTreeMap<HolderKey, (String, String)>> = Mutex::new(BTreeMap::new());
 
 pub fn dispatch(
     ctx: &WorkerCtx,
@@ -112,6 +110,7 @@ pub fn dispatch(
         ops::READ => read(ctx, parse(op, header)?),
         ops::WRITE => write(ctx, parse(op, header)?, body),
         ops::REPORT => report(ctx, parse(op, header)?),
+        ops::RELEASE => release_op(ctx, parse(op, header)?),
         _ => Err(ErrorWire::coded("UNSUPPORTED_OPERATION", op)),
     }
 }
@@ -167,36 +166,37 @@ fn store(ctx: &WorkerCtx) -> Result<crate::runtime::ctx::PooledStore, ErrorWire>
 }
 
 /// The retry time of `hash` from `source` while it is backed off.
-fn source_backoff(ctx: &WorkerCtx, source: &str, hash: &str, now: u64) -> Option<u64> {
-    lock(&SOURCE_BACKOFF)
-        .get(&(ctx.root.clone(), source.to_owned(), hash.to_owned()))
+fn source_backoff(state: &ObjectsState, source: &str, hash: &str, now: u64) -> Option<u64> {
+    state
+        .source_backoff
+        .get(&(source.to_owned(), hash.to_owned()))
         .map(|&(_, retry_at)| retry_at)
         .filter(|retry_at| *retry_at > now)
 }
 
-/// The `SOURCE_BACKOFF` entry of `(source, hash)`, room made first.
+/// The backoff entry of `(source, hash)`, room made first.
 fn source_entry<'a>(
-    map: &'a mut BTreeMap<SourceKey, (u32, u64)>,
-    ctx: &WorkerCtx,
+    state: &'a mut ObjectsState,
     source: &str,
     hash: &str,
     now: u64,
 ) -> &'a mut (u32, u64) {
+    let map = &mut state.source_backoff;
     if map.len() >= MAX_SOURCE_BACKOFFS {
         map.retain(|_, (_, retry_at)| *retry_at > now);
         if map.len() >= MAX_SOURCE_BACKOFFS {
             map.clear();
         }
     }
-    map.entry((ctx.root.clone(), source.to_owned(), hash.to_owned()))
+    map.entry((source.to_owned(), hash.to_owned()))
         .or_insert((0, now))
 }
 
 /// Backs `hash` off for `source` (30 s → 1 h by attempt). Returns the retry time.
 pub fn back_off_source(ctx: &WorkerCtx, source: &str, hash: &str) -> u64 {
     let now = now_ms();
-    let mut map = lock(&SOURCE_BACKOFF);
-    let entry = source_entry(&mut map, ctx, source, hash, now);
+    let mut state = lock(&ctx.inflight_objects);
+    let entry = source_entry(&mut state, source, hash, now);
     entry.0 = entry.0.saturating_add(1);
     let delay = Backoff::objects().nominal(entry.0);
     entry.1 = now.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
@@ -205,9 +205,8 @@ pub fn back_off_source(ctx: &WorkerCtx, source: &str, hash: &str) -> u64 {
 
 /// Backs `hash` off for `source` for `STALL_BACKOFF` (a lapsed lease), never
 /// shortening a longer backoff and without counting an attempt.
-fn back_off_stalled(ctx: &WorkerCtx, source: &str, hash: &str, now: u64) -> u64 {
-    let mut map = lock(&SOURCE_BACKOFF);
-    let entry = source_entry(&mut map, ctx, source, hash, now);
+fn back_off_stalled(state: &mut ObjectsState, source: &str, hash: &str, now: u64) -> u64 {
+    let entry = source_entry(state, source, hash, now);
     entry.1 = entry
         .1
         .max(now.saturating_add(STALL_BACKOFF.as_millis() as u64));
@@ -215,14 +214,9 @@ fn back_off_stalled(ctx: &WorkerCtx, source: &str, hash: &str, now: u64) -> u64 
 }
 
 /// Grants `session` (transferring from `source`) a fresh lease on `hash`.
-fn grant(
-    ctx: &WorkerCtx,
-    leases: &mut BTreeMap<String, ObjectLease>,
-    lease: (&str, &str, &str, u64),
-    now: u64,
-) {
+fn grant(state: &mut ObjectsState, lease: (&str, &str, &str, u64), now: u64) {
     let (hash, session, source, offset) = lease;
-    leases.insert(
+    state.leases.insert(
         hash.to_owned(),
         ObjectLease {
             session: session.to_owned(),
@@ -230,23 +224,56 @@ fn grant(
             offset,
         },
     );
-    let mut holders = lock(&LEASE_HOLDERS);
-    if holders.len() >= MAX_LEASE_HOLDERS {
-        holders.retain(|(root, hash), _| *root != ctx.root || leases.contains_key(hash));
+    if state.holders.len() >= MAX_LEASE_HOLDERS {
+        let ObjectsState {
+            leases, holders, ..
+        } = &mut *state;
+        holders.retain(|hash, _| leases.contains_key(hash));
         if holders.len() >= MAX_LEASE_HOLDERS {
             holders.clear();
         }
     }
-    holders.insert(
-        (ctx.root.clone(), hash.to_owned()),
-        (session.to_owned(), source.to_owned()),
-    );
+    state
+        .holders
+        .insert(hash.to_owned(), (session.to_owned(), source.to_owned()));
 }
 
-/// Ends the lease of `hash` (a terminal outcome or a local failure).
-fn release(ctx: &WorkerCtx, leases: &mut BTreeMap<String, ObjectLease>, hash: &str) {
-    leases.remove(hash);
-    lock(&LEASE_HOLDERS).remove(&(ctx.root.clone(), hash.to_owned()));
+/// Ends the lease of `hash` (a terminal outcome, a local failure, or the
+/// session gave it up).
+fn release(state: &mut ObjectsState, hash: &str) {
+    state.leases.remove(hash);
+    state.holders.remove(hash);
+}
+
+/// Ends the leases `session` holds on `hashes` (module docs, "Giving a lease
+/// up"); returns how many ended. A lease of another session is untouched.
+fn give_up(state: &mut ObjectsState, session: &str, hashes: &[String]) -> u32 {
+    let mut released = 0;
+    for hash in hashes {
+        if state
+            .leases
+            .get(hash)
+            .is_some_and(|lease| lease.session == session)
+        {
+            release(state, hash);
+            released += 1;
+        }
+    }
+    released
+}
+
+/// At most [`MAX_RELEASE_ITEMS`] hashes (an `exclude` or `release` list).
+fn release_list(op: &str, hashes: &[String]) -> Result<(), ErrorWire> {
+    if hashes.len() > MAX_RELEASE_ITEMS {
+        return Err(ErrorWire::coded(
+            "INVALID_REQUEST",
+            format!(
+                "{op}: {} hashes (at most {MAX_RELEASE_ITEMS})",
+                hashes.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The lane set of one of the orchestrator's lease ids (§6.4 "Lease ids":
@@ -287,25 +314,22 @@ fn superseded(held: &ObjectLease, session: &str, now: u64) -> bool {
 /// Drops every lease that lapsed (reached its expiry without progress or
 /// release) and backs each object off for the source that held it, for
 /// `STALL_BACKOFF` (module docs).
-fn sweep_lapsed(ctx: &WorkerCtx, leases: &mut BTreeMap<String, ObjectLease>, now: u64) {
-    let lapsed: Vec<(String, String)> = leases
+fn sweep_lapsed(state: &mut ObjectsState, now: u64) {
+    let lapsed: Vec<(String, String)> = state
+        .leases
         .iter()
         .filter(|(_, lease)| lease.expires_ms <= now)
         .map(|(hash, lease)| (hash.clone(), lease.session.clone()))
         .collect();
-    if lapsed.is_empty() {
-        return;
-    }
-    let mut holders = lock(&LEASE_HOLDERS);
     for (hash, session) in lapsed {
-        leases.remove(&hash);
-        let Some((holder, source)) = holders.remove(&(ctx.root.clone(), hash.clone())) else {
+        state.leases.remove(&hash);
+        let Some((holder, source)) = state.holders.remove(&hash) else {
             continue;
         };
         if holder != session {
             continue;
         }
-        let retry_at = back_off_stalled(ctx, &source, &hash, now);
+        let retry_at = back_off_stalled(state, &source, &hash, now);
         crate::util::log::event!(info, NOT_AVAILABLE, {
             "site": "worker.objects.lease_lapsed",
             "hash": hash,
@@ -316,13 +340,16 @@ fn sweep_lapsed(ctx: &WorkerCtx, leases: &mut BTreeMap<String, ObjectLease>, now
     }
 }
 
-/// `objects.want{route, lane, max_items, max_bytes, session}` → `{items}`;
-/// every returned item is leased to `session`: a free one gets a fresh lease,
-/// one `session` holds already keeps its lease and expiry (only progress
-/// renews it, module docs).
-fn want(ctx: &WorkerCtx, header: WantHeader) -> Result<(Value, Vec<u8>), ErrorWire> {
+/// `objects.want{route, lane, max_items, max_bytes, session, exclude?}` →
+/// `{items}`; every returned item is leased to `session`: a free one gets a
+/// fresh lease, one `session` holds already keeps its lease and expiry (only
+/// progress renews it, module docs). `exclude` (CCR-WP3.3-4, WP4.5): those
+/// hashes are left out, and the leases `session` holds on them end.
+fn want(ctx: &WorkerCtx, request: WantRequest) -> Result<(Value, Vec<u8>), ErrorWire> {
+    let WantRequest { header, exclude } = request;
     bind(ctx, &header.route)?;
     session_id(&header.session)?;
+    release_list(ops::WANT, &exclude)?;
     if !header.lane.is_valid() {
         return Err(ErrorWire::coded(
             "INVALID_BULK_LANE",
@@ -332,73 +359,103 @@ fn want(ctx: &WorkerCtx, header: WantHeader) -> Result<(Value, Vec<u8>), ErrorWi
     let session = header.session.as_str();
     let source = header.route.remote_replica.as_str();
     let now = now_ms();
-    // Lapsed leases back their objects off for their sources first; then a
-    // snapshot (the store's scan runs without the lease lock): objects other
-    // sessions hold, and the ones this session holds.
-    let (leased, mine): (HashSet<String>, HashSet<String>) = {
-        let mut leases = lock(&ctx.inflight_objects);
-        sweep_lapsed(ctx, &mut leases, now);
-        let (mine, others): (Vec<_>, Vec<_>) = leases
+    let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
+    // Lapsed leases back their objects off for their sources first, and the
+    // session gives up what it excludes; then a snapshot (the store's scan
+    // runs without the lock): objects other sessions hold, the ones this
+    // session holds, and the ones backed off for this source.
+    let (leased, mine, backed_off): (HashSet<String>, HashSet<String>, HashSet<String>) = {
+        let mut state = lock(&ctx.inflight_objects);
+        sweep_lapsed(&mut state, now);
+        give_up(&mut state, session, &exclude);
+        let (mine, others): (Vec<_>, Vec<_>) = state
+            .leases
             .iter()
             .filter(|(_, lease)| !superseded(lease, session, now))
             .partition(|(_, lease)| lease.session == session);
-        (
-            others.into_iter().map(|(hash, _)| hash.clone()).collect(),
+        let (mine, others) = (
             mine.into_iter().map(|(hash, _)| hash.clone()).collect(),
-        )
-    };
-    let backed_off: HashSet<String> = {
-        let mut map = lock(&SOURCE_BACKOFF);
-        map.retain(|_, (_, retry_at)| *retry_at > now.saturating_sub(3_600_000));
-        map.iter()
-            .filter(|((root, from, _), (_, retry_at))| {
-                *root == ctx.root && from == source && *retry_at > now
-            })
-            .map(|((_, _, hash), _)| hash.clone())
-            .collect()
+            others.into_iter().map(|(hash, _)| hash.clone()).collect(),
+        );
+        state
+            .source_backoff
+            .retain(|_, (_, retry_at)| *retry_at > now.saturating_sub(3_600_000));
+        let backed_off = state
+            .source_backoff
+            .iter()
+            .filter(|((from, _), (_, retry_at))| from == source && *retry_at > now)
+            .map(|((_, hash), _)| hash.clone())
+            .collect();
+        (others, mine, backed_off)
     };
     let mut items = store(ctx)?
         .want_objects(
             header.lane,
             (header.max_items as usize).min(MAX_WANT_ITEMS),
             header.max_bytes,
-            &|hash| leased.contains(hash) || (backed_off.contains(hash) && !mine.contains(hash)),
+            &|hash| {
+                excluded.contains(hash)
+                    || leased.contains(hash)
+                    || (backed_off.contains(hash) && !mine.contains(hash))
+            },
         )
         .map_err(wire)?;
     {
         let now = now_ms();
-        let mut leases = lock(&ctx.inflight_objects);
-        sweep_lapsed(ctx, &mut leases, now);
+        let mut state = lock(&ctx.inflight_objects);
+        sweep_lapsed(&mut state, now);
         items.retain(|item| {
-            match leases.get_mut(&item.hash) {
-                Some(lease) if superseded(lease, session, now) => {
+            let held = state.leases.get(&item.hash).cloned();
+            match held {
+                Some(lease) if superseded(&lease, session, now) => {
                     let offset = lease.offset.max(item.offset);
-                    grant(ctx, &mut leases, (&item.hash, session, source, offset), now);
+                    grant(&mut state, (&item.hash, session, source, offset), now);
                     true
                 }
                 Some(lease) if lease.session != session => false,
-                Some(lease) => {
+                Some(_) => {
                     // Ours already: offered again, the expiry untouched. The
                     // scan's offset may predate a write that has since moved
                     // it on: never move it back.
-                    lease.offset = lease.offset.max(item.offset);
+                    if let Some(lease) = state.leases.get_mut(&item.hash) {
+                        lease.offset = lease.offset.max(item.offset);
+                    }
                     true
                 }
                 // Lapsed meanwhile (now backed off for this source), or free.
-                None if source_backoff(ctx, source, &item.hash, now).is_some() => false,
+                None if source_backoff(&state, source, &item.hash, now).is_some() => false,
                 None => {
-                    grant(
-                        ctx,
-                        &mut leases,
-                        (&item.hash, session, source, item.offset),
-                        now,
-                    );
+                    grant(&mut state, (&item.hash, session, source, item.offset), now);
                     true
                 }
             }
         });
     }
     Ok((json!(WantReply { items }), vec![]))
+}
+
+/// `objects.release{route, session, hashes}` → `{released}` (module docs,
+/// "Giving a lease up").
+fn release_op(ctx: &WorkerCtx, header: ReleaseHeader) -> Result<(Value, Vec<u8>), ErrorWire> {
+    bind(ctx, &header.route)?;
+    session_id(&header.session)?;
+    release_list(ops::RELEASE, &header.hashes)?;
+    let released = {
+        let mut state = lock(&ctx.inflight_objects);
+        sweep_lapsed(&mut state, now_ms());
+        give_up(&mut state, &header.session, &header.hashes)
+    };
+    if released > 0 {
+        // A write of this session waiting for its earlier writes (ordered
+        // parts) stops waiting for an object it no longer holds.
+        progress(ctx).bump();
+    }
+    Ok((json!(ReleaseReply { released }), vec![]))
+}
+
+/// The durable-progress signal of `ctx`'s worker.
+fn progress(ctx: &WorkerCtx) -> std::sync::Arc<super::ctx::ProgressSignal> {
+    lock(&ctx.inflight_objects).progress.clone()
 }
 
 /// `objects.read{route, hash, offset, len ≤ 1 MiB}` → `{total}` / bytes.
@@ -475,15 +532,16 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
     let mut refused: HashSet<&str> = HashSet::new();
     {
         let now = now_ms();
-        let mut leases = lock(&ctx.inflight_objects);
+        let mut state = lock(&ctx.inflight_objects);
         // A lapsed lease (ours too) backs its object off for its source and
         // frees it (module docs).
-        sweep_lapsed(ctx, &mut leases, now);
+        sweep_lapsed(&mut state, now);
         for hash in &hashes {
-            match leases.get(*hash) {
-                Some(lease) if superseded(lease, &session, now) => {
+            let held = state.leases.get(*hash).cloned();
+            match held {
+                Some(lease) if superseded(&lease, &session, now) => {
                     let offset = committed.get(hash).copied().unwrap_or(lease.offset);
-                    grant(ctx, &mut leases, (hash, &session, source, offset), now);
+                    grant(&mut state, (hash, &session, source, offset), now);
                 }
                 Some(lease) if lease.session != session => {
                     refused.insert(hash);
@@ -492,7 +550,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                 Some(_) => {}
                 None => {
                     let offset = committed.get(hash).copied().unwrap_or(0);
-                    grant(ctx, &mut leases, (hash, &session, source, offset), now);
+                    grant(&mut state, (hash, &session, source, offset), now);
                 }
             }
         }
@@ -545,7 +603,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
     let mut local: BTreeMap<String, ErrorWire> = BTreeMap::new();
     {
         let now = now_ms();
-        let mut leases = lock(&ctx.inflight_objects);
+        let mut state = lock(&ctx.inflight_objects);
         for item in &items {
             if refused.contains(item.hash.as_str()) {
                 results.push(WriteResult {
@@ -556,12 +614,13 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                 continue;
             }
             let Some(result) = written.next() else { break };
-            let ours = leases
+            let ours = state
+                .leases
                 .get(&result.hash)
                 .is_some_and(|lease| lease.session == session);
             match &result.outcome {
                 ObjectOutcome::Progressed { durable_offset } => {
-                    if let Some(lease) = leases.get_mut(&result.hash).filter(|_| ours) {
+                    if let Some(lease) = state.leases.get_mut(&result.hash).filter(|_| ours) {
                         // Progress renews the lease: bytes that were already
                         // durable (a re-sent overlap) are none.
                         if *durable_offset > lease.offset {
@@ -572,7 +631,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                 }
                 ObjectOutcome::Failed(error) => match failure_kind(error) {
                     Failure::Resume => {
-                        if let Some(lease) = leases.get_mut(&result.hash).filter(|_| ours) {
+                        if let Some(lease) = state.leases.get_mut(&result.hash).filter(|_| ours) {
                             lease.offset = result.durable_offset;
                         }
                     }
@@ -582,7 +641,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                             .entry(result.hash.clone())
                             .or_insert_with(|| error.code.clone());
                         if ours {
-                            release(ctx, &mut leases, &result.hash);
+                            release(&mut state, &result.hash);
                         }
                     }
                     Failure::Local => {
@@ -590,7 +649,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                             .entry(result.hash.clone())
                             .or_insert_with(|| error.clone());
                         if ours {
-                            release(ctx, &mut leases, &result.hash);
+                            release(&mut state, &result.hash);
                         }
                     }
                 },
@@ -602,7 +661,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                             .or_insert_with(|| outcome.code().unwrap_or_default().to_owned());
                     }
                     if ours {
-                        release(ctx, &mut leases, &result.hash);
+                        release(&mut state, &result.hash);
                     }
                 }
             }
@@ -626,11 +685,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
             }
         }
     }
-    {
-        let (generation, wake) = &PROGRESS;
-        *lock(generation) += 1;
-        wake.notify_all();
-    }
+    progress(ctx).bump();
     if completed {
         crate::worker::status_cell::want_content(ctx);
     }
@@ -664,18 +719,23 @@ fn failure_kind(error: &ErrorWire) -> Failure {
 /// that part, per this session's lease, or the lease is gone or another
 /// session's, or the worker stops.
 fn wait_for_order(ctx: &WorkerCtx, session: &str, first: &HashMap<&str, u64>) {
-    let ahead = |leases: &BTreeMap<String, ObjectLease>| {
+    let ahead = |state: &ObjectsState| {
         first.iter().any(|(hash, offset)| {
-            leases
+            state
+                .leases
                 .get(*hash)
                 .is_some_and(|lease| lease.session == session && lease.offset < *offset)
         })
     };
-    if !ahead(&lock(&ctx.inflight_objects)) {
-        return;
-    }
+    let signal = {
+        let state = lock(&ctx.inflight_objects);
+        if !ahead(&state) {
+            return;
+        }
+        state.progress.clone()
+    };
     let deadline = Instant::now() + ORDER_WAIT;
-    let (generation, wake) = &PROGRESS;
+    let (generation, wake) = (&signal.generation, &signal.wake);
     let mut seen = lock(generation);
     loop {
         if !ahead(&lock(&ctx.inflight_objects)) || ctx.stopping.load(Ordering::Relaxed) {
@@ -694,5 +754,5 @@ fn wait_for_order(ctx: &WorkerCtx, session: &str, first: &HashMap<&str, u64>) {
 /// The retry time of `hash` from `source`, while that source is backed off
 /// for it (`CorruptAtSource`); `None` otherwise.
 pub fn source_retry_at(ctx: &WorkerCtx, source: &str, hash: &str) -> Option<u64> {
-    source_backoff(ctx, source, hash, now_ms())
+    source_backoff(&lock(&ctx.inflight_objects), source, hash, now_ms())
 }
