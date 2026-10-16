@@ -1,13 +1,16 @@
-//! Owned by WP1.3.
+//! Owned by WP1.3 (Wave 1) and WP4.2 (Wave 4: `worker.log` rotation and
+//! redaction, the desktop log adapter).
 //!
-//! Worker process launcher and adoption (REVAMP_PLAN §3.3, §14 WP1.3).
+//! Worker process launcher and adoption (REVAMP_PLAN §3.3, §14 WP1.3, WP4.2).
 //!
 //! * [`RealLauncher`] implements [`WorkerLauncher`]: it spawns
 //!   `EXE daemon --state S --supervised` ([`RealLauncher::command`]) with
 //!   stdin null, stdout piped and stderr appended to `worker.log`, and runs two
 //!   helper threads per child:
-//!   - the **stdout reader** copies every line to `worker.log`, parses it with
-//!     [`parse_line`] and pushes [`ProcessEvent::Line`] to the sink;
+//!   - the **stdout reader** copies every line to `worker.log` (redacted:
+//!     `util::log::redact_line`, so the Ready line's worker token never
+//!     reaches the file), parses it with [`parse_line`] and pushes
+//!     [`ProcessEvent::Line`] to the sink;
 //!   - the **exit waiter** owns the [`Child`] and blocks in the OS wait, so an
 //!     exit is reported immediately (§2.2 rule 3: signals, not sampling). It
 //!     then lets the reader drain (≤ [`LogPolicy::drain_wait`]) and sends
@@ -29,7 +32,20 @@
 //! terminal Ctrl-C aimed at the daemon does not reach it. Dropping a
 //! [`WorkerProcess`] never kills anything.
 //!
-//! WP4.2 adds `worker.log` rotation at spawn.
+//! **Logs (WP4.2).** At spawn, a `worker.log` larger than
+//! [`LogPolicy::rotate_bytes`] (10 MiB) is rotated (`worker.log.1` …, at most
+//! [`LogPolicy::rotate_files`] files; `util::log::rotate_if_larger`); a failed
+//! rotation is logged and the worker still starts, appending to the old file.
+//! A worker only appends while it runs, and a new one is spawned only after
+//! the previous one released `owner.lock` (invariant 23), so nothing writes
+//! the file while it is renamed. [`RealLauncher::new`] also adopts the
+//! desktop's daemon log (`util::log::adopt_desktop_log`): a daemon the desktop
+//! started has its stdout and stderr appended to `DATA/logs/orchestrator.log`,
+//! and that file becomes its rotating JSON-line log. The launcher is built
+//! once per daemon, after `orchestrator.lock` is held (`ctx::build_with`), so
+//! a second daemon that fails to start never rotates the running one's log.
+//! (The explicit call for every daemon, with `DaemonStatus.log_path`, is
+//! CCR-WP4.2-1.)
 use super::worker_client::JsonWorkerClient;
 use crate::{
     model::{
@@ -40,7 +56,10 @@ use crate::{
             WorkerProcess,
         },
     },
-    util::lock::lock,
+    util::{
+        lock::lock,
+        log::{self, event},
+    },
 };
 use std::{
     fs::{self, File, OpenOptions},
@@ -71,10 +90,15 @@ const PROBE_FAST_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(not(windows))]
 const PROBE_FAST_WINDOW: Duration = Duration::from_secs(2);
 
+/// `worker.log` is rotated at spawn when it is larger than this (10 MiB)…
+pub const WORKER_LOG_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
+/// …keeping this many files (`worker.log` and `worker.log.1` to `.4`).
+pub const WORKER_LOG_FILES: usize = 5;
+
 /// How the launcher treats `worker.log` (the `log_dir_policy` of §14 WP1.3).
 ///
 /// The log path itself comes from [`LaunchSpec::log`]; WP4.2 adds rotation at
-/// spawn here.
+/// spawn.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogPolicy {
     /// `ProcessEvent::Exited.stderr_tail` carries at most this many bytes from
@@ -86,6 +110,10 @@ pub struct LogPolicy {
     pub drain_wait: Duration,
     /// A stdout "line" longer than this is split (it is still logged).
     pub max_line: usize,
+    /// At spawn, a `worker.log` larger than this is rotated…
+    pub rotate_bytes: u64,
+    /// …keeping this many files, the live one included (WP4.2).
+    pub rotate_files: usize,
 }
 
 impl Default for LogPolicy {
@@ -94,6 +122,8 @@ impl Default for LogPolicy {
             tail_bytes: 4096,
             drain_wait: Duration::from_secs(2),
             max_line: 1024 * 1024,
+            rotate_bytes: WORKER_LOG_ROTATE_BYTES,
+            rotate_files: WORKER_LOG_FILES,
         }
     }
 }
@@ -105,7 +135,11 @@ pub struct RealLauncher {
 }
 
 impl RealLauncher {
+    /// The daemon's launcher. Building it also adopts the desktop's daemon
+    /// log (see the module docs; a no-op unless this process's stderr is
+    /// `…/logs/orchestrator.log`).
     pub fn new(policy: LogPolicy) -> Arc<Self> {
+        let _ = log::adopt_desktop_log();
         Arc::new(Self { policy })
     }
 
@@ -151,6 +185,7 @@ impl RealLauncher {
         if let Some(parent) = log.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent).map_err(|e| start_error(&program, "create log dir", &e))?;
         }
+        rotate_worker_log(log, &self.policy, label);
         let log_file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -243,6 +278,24 @@ impl WorkerLauncher for RealLauncher {
 
     fn client(&self, endpoint: &WorkerEndpoint) -> Arc<dyn WorkerClient> {
         JsonWorkerClient::new(endpoint.clone())
+    }
+}
+
+/// Rotates `worker.log` at spawn when it is larger than the policy allows; a
+/// failure is logged and the worker appends to the old file.
+fn rotate_worker_log(log: &Path, policy: &LogPolicy, label: &str) {
+    if let Err(error) = log::rotate_if_larger(log, policy.rotate_bytes, policy.rotate_files) {
+        let code = if error.kind() == io::ErrorKind::PermissionDenied {
+            "PERMISSION_DENIED"
+        } else {
+            UNKNOWN_CODE
+        };
+        event!(warn, (code), {
+            "folder": label,
+            "detail": "worker.log rotation failed; the worker appends to the old file",
+            "path": log.display().to_string(),
+            "error": error.to_string(),
+        });
     }
 }
 
@@ -437,9 +490,10 @@ fn read_stdout(
             end -= 1;
         }
         let text = String::from_utf8_lossy(&buffer[..end]);
-        // Every line reaches worker.log, parsed or not; a failing log write
-        // (disk full) must not stop the pipe from draining.
-        let _ = writeln!(log, "{text}");
+        // Every line reaches worker.log, parsed or not, redacted (the Ready
+        // line carries the worker token); a failing log write (disk full)
+        // must not stop the pipe from draining.
+        let _ = writeln!(log, "{}", log::redact_line(&text));
         if let Some(line) = parse_line(&text) {
             emitter.line(line);
         }

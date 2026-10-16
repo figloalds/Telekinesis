@@ -1,8 +1,14 @@
 //! Scale qualification (WP4.2 list, REVAMP_PLAN §14 WP4.2 and §15): every
 //! floor re-checked at daemon level in release builds.
 //!
-//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP4.2"]`.
+//! Created by WP0.5 against the 6298d0b baseline, `#[ignore = "WP4.2"]`;
+//! owned and run by WP4.2 (the scenarios stay `#[ignore]`: they are release
+//! qualification runs, `scripts/qualify.ps1 -All`).
 //! `cargo test --release --test qual_scale -- --ignored --test-threads=1 --nocapture`
+//!
+//! The 150K feed reads its progress from the worker's status cell, not from
+//! the whole `state` (see `feed_150k`); `TKFS_QUAL_BUDGET_S` must cover it
+//! (`qualify.ps1 -All` passes `-BudgetS 2400`).
 mod support;
 
 use serde_json::{Value, json};
@@ -35,6 +41,25 @@ fn event_count(folder: &Value) -> anyhow::Result<usize> {
     })
 }
 
+/// Waits (≤ `SETUP`) until `b` sees `folder` running in `a`'s published
+/// catalog (`remote-list`), so `receive` does not race the source worker's
+/// restart after the in-process setup (`with_stopped_folder`): a large
+/// store's worker reports `running` before its published entry is
+/// `Running`, and `receive` answers `REMOTE_FOLDER_NOT_FOUND` meanwhile.
+/// The wait is not part of the measured phase.
+fn wait_published(s: &mut Scenario, b: &Node, a: &Node, folder: &Value) {
+    let endpoint = a.endpoint();
+    let repo = folder["repo"].clone();
+    let published = wait_until(SETUP, || {
+        b.raw_call(json!({"op":"remote-list","endpoint":endpoint}))
+            .is_ok_and(|list| {
+                list.as_array()
+                    .is_some_and(|entries| entries.iter().any(|e| e["repo"] == repo))
+            })
+    });
+    s.check(published, "the source folder is published to the receiver");
+}
+
 /// Events activated on the receiver since `base`, for `per_event_ms`. A count
 /// that cannot be read fails the scenario (and reports 1, so the metric stays
 /// an upper bound instead of a fabricated rate).
@@ -64,6 +89,7 @@ fn remote_linear(name: &str, n: usize) {
         panic!("source holds {total} events, fewer than the {n} written");
     };
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let last = format!("lin-{:06}.txt", n - 1);
@@ -151,20 +177,62 @@ fn feed_150k() {
         Ok(())
     })
     .unwrap();
+    // Every event of A's folder (its own setup events included), from its
+    // status cell: the `events` op would return all 150K events (over the
+    // RPC message limit).
+    let total = retry_busy(Duration::from_secs(120), || {
+        try_rpc(&pa, json!({"op":"status"}))?["journal"]["events"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REPLY: journal.events"))
+    })
+    .expect("source event count");
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let last_start = (n - 1) / 10_000 * 10_000;
     let last = format!("f{last_start:06}-{:06}.txt", n - 1 - last_start);
-    let done = wait_until(s.remaining(), || has_hash(&pb, &last, &empty()));
+    // WP4.2 (as WP3.INT's `feed_150k_daemons`): progress is read from B's
+    // worker `status` (its status cell; no projection is read). `has_hash`
+    // asks for the whole `state`: about 70 MB of JSON at 150K entries, over
+    // the RPC's 64 MiB message limit, so it never held, and every poll made
+    // the worker load the whole projection, which slowed what it measured.
+    let mut seen = 0;
+    let activated = wait_until(s.remaining(), || {
+        seen = try_rpc(&pb, json!({"op":"status"}))
+            .ok()
+            .and_then(|status| status["journal"]["events"].as_u64())
+            .unwrap_or(seen);
+        thread::sleep(Duration::from_millis(200));
+        seen >= total
+    });
+    let seconds = s.started.elapsed().as_secs_f64();
+    // Then the last event's entry, read from B's store (folder stopped): it
+    // must be a live file with the (empty) content.
+    let entry = activated.then(|| {
+        b.with_stopped_folder(&pb, SETUP, |st| Ok(st.lookup(&last).ok()))
+            .unwrap_or_else(|error| panic!("cannot read B's store: {error:#}"))
+    });
+    let present = entry.as_ref().is_some_and(|entry| {
+        entry
+            .as_ref()
+            .is_some_and(|e| e.alive && e.content.as_deref() == Some(empty().as_str()))
+    });
+    let done = activated && present;
     s.metric_with(
         "completed",
         if done { 1.0 } else { 0.0 },
         "bool",
-        json!({"events": n, "seconds": s.started.elapsed().as_secs_f64()}),
+        json!({"events": n, "total": total, "activated": seen, "seconds": seconds}),
     );
-    if !done {
-        s.timeout("not synchronized");
+    s.metric("events_per_s", seen as f64 / seconds, "events/s");
+    if !activated {
+        s.timeout(format!("{seen} of {total} events activated"));
+    } else {
+        s.check(
+            present,
+            format!("{last} is not an empty live file in B's store"),
+        );
     }
     s.finish();
 }
@@ -183,6 +251,7 @@ fn tiny_files_10k() {
     })
     .unwrap();
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let done = wait_until(s.remaining(), || content_complete(&pb, count as u64));
@@ -214,6 +283,7 @@ fn one_gib_object() {
         .with_stopped_folder(&pa, SETUP, |st| large_object_in(st, "gib.bin", size, 72))
         .unwrap();
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let done = wait_until(s.remaining(), || {
