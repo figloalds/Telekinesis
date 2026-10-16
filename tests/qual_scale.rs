@@ -41,6 +41,25 @@ fn event_count(folder: &Value) -> anyhow::Result<usize> {
     })
 }
 
+/// Waits (≤ `SETUP`) until `b` sees `folder` running in `a`'s published
+/// catalog (`remote-list`), so `receive` does not race the source worker's
+/// restart after the in-process setup (`with_stopped_folder`): a large
+/// store's worker reports `running` before its published entry is
+/// `Running`, and `receive` answers `REMOTE_FOLDER_NOT_FOUND` meanwhile.
+/// The wait is not part of the measured phase.
+fn wait_published(s: &mut Scenario, b: &Node, a: &Node, folder: &Value) {
+    let endpoint = a.endpoint();
+    let repo = folder["repo"].clone();
+    let published = wait_until(SETUP, || {
+        b.raw_call(json!({"op":"remote-list","endpoint":endpoint}))
+            .is_ok_and(|list| {
+                list.as_array()
+                    .is_some_and(|entries| entries.iter().any(|e| e["repo"] == repo))
+            })
+    });
+    s.check(published, "the source folder is published to the receiver");
+}
+
 /// Events activated on the receiver since `base`, for `per_event_ms`. A count
 /// that cannot be read fails the scenario (and reports 1, so the metric stays
 /// an upper bound instead of a fabricated rate).
@@ -70,6 +89,7 @@ fn remote_linear(name: &str, n: usize) {
         panic!("source holds {total} events, fewer than the {n} written");
     };
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let last = format!("lin-{:06}.txt", n - 1);
@@ -157,9 +177,17 @@ fn feed_150k() {
         Ok(())
     })
     .unwrap();
-    // Every event of A's folder (its own setup events included).
-    let total = event_count(&pa).expect("source event count") as u64;
+    // Every event of A's folder (its own setup events included), from its
+    // status cell: the `events` op would return all 150K events (over the
+    // RPC message limit).
+    let total = retry_busy(Duration::from_secs(120), || {
+        try_rpc(&pa, json!({"op":"status"}))?["journal"]["events"]
+            .as_u64()
+            .ok_or_else(|| anyhow::anyhow!("INVALID_REPLY: journal.events"))
+    })
+    .expect("source event count");
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let last_start = (n - 1) / 10_000 * 10_000;
@@ -223,6 +251,7 @@ fn tiny_files_10k() {
     })
     .unwrap();
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let done = wait_until(s.remaining(), || content_complete(&pb, count as u64));
@@ -254,6 +283,7 @@ fn one_gib_object() {
         .with_stopped_folder(&pa, SETUP, |st| large_object_in(st, "gib.bin", size, 72))
         .unwrap();
     b.pair(&a, &a.code());
+    wait_published(&mut s, &b, &a, &pa);
     s.measure_from_now();
     let pb = b.receive(&a, &pa);
     let done = wait_until(s.remaining(), || {
