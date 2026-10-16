@@ -1,4 +1,7 @@
 //! One mount worker: local write staging and loopback WebSocket control.
+//!
+//! WP4.1: the worker's endpoint requires its local token (`STATE/runtime.token`);
+//! [`rpc`], [`RpcLane`] and [`connect_worker`] present it.
 use crate::util::lock::{PoisonPolicy, poison_policy};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -31,7 +34,10 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Format 6 separates durable metadata from verified object availability.
 /// Never negotiate down or acknowledge events a peer cannot project.
 pub use crate::core::PEER_FORMAT;
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `STATE/runtime.json`: where a worker listens. Unchanged by WP4.1 (no
+/// token in it, §6.1 P2): the worker's token is in `STATE/runtime.token`
+/// next to it, owner-only ([`worker_token`]).
+#[derive(Debug, Clone, Serialize)]
 pub struct Discovery {
     pub format: u32,
     pub address: String,
@@ -40,8 +46,79 @@ pub struct Discovery {
     pub repo: String,
     pub device: String,
 }
+
+#[derive(Deserialize)]
+struct DiscoveryWire {
+    format: u32,
+    address: String,
+    state: String,
+    mount: Option<String>,
+    repo: String,
+    device: String,
+}
+
+/// Reading a worker's discovery is how a local client finds the worker: it
+/// also lets this process present the worker's token to that address
+/// (`ws::tokens::note`), when the discovery is the worker's own published
+/// record (see [`worker_token`]). So a client that reads `runtime.json` and
+/// then dials the address it names (`ws::connect`, `session::dial_loopback`
+/// with no token) keeps working with mandatory worker tokens.
+impl<'de> Deserialize<'de> for Discovery {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = DiscoveryWire::deserialize(deserializer)?;
+        let discovery = Discovery {
+            format: wire.format,
+            address: wire.address,
+            state: wire.state,
+            mount: wire.mount,
+            repo: wire.repo,
+            device: wire.device,
+        };
+        if let Some(token) = published_token(&discovery) {
+            for address in crate::ws::tokens::addresses(&discovery.address) {
+                crate::ws::tokens::note(address, &token);
+            }
+        }
+        Ok(discovery)
+    }
+}
+
+/// The token of the worker `info` describes (§14 WP4.1): `STATE/runtime.token`
+/// when `STATE/runtime.json` (owner-only, written by the worker) publishes
+/// `info.address`, else the one this process already knows for the address
+/// (`ws::tokens::lookup`: a worker server in this process, an endpoint the
+/// orchestrator was given). The address check means a discovery from
+/// elsewhere (a `.tkfs-runtime.json` found by walking up from a directory)
+/// can never make this process send a worker's token to an address that
+/// worker did not publish. `None`: a legacy worker (no token file) or an
+/// unknown address; the call then goes out without a token.
+pub fn worker_token(info: &Discovery) -> Option<String> {
+    published_token(info).or_else(|| crate::ws::tokens::lookup_endpoint(&info.address))
+}
+
+/// `STATE/runtime.token` when `STATE/runtime.json` publishes `info.address`.
+fn published_token(info: &Discovery) -> Option<String> {
+    if info.state.is_empty() {
+        return None;
+    }
+    let state = std::path::Path::new(&info.state);
+    let published: Value =
+        serde_json::from_slice(&std::fs::read(state.join("runtime.json")).ok()?).ok()?;
+    if published.get("address").and_then(Value::as_str) != Some(info.address.as_str()) {
+        return None;
+    }
+    crate::worker::record::read_token(&crate::worker::record::token_path(state))
+}
+
+/// A JSON RPC connection to the worker `info` describes, presenting its token
+/// ([`worker_token`]). A worker that refuses it answers `ACCESS_DENIED`.
+pub fn connect_worker(info: &Discovery) -> Result<crate::ws::Socket> {
+    crate::ws::connect_authorized(&info.address, worker_token(info).as_deref())
+}
+
+/// One worker JSON RPC request on a fresh connection ([`connect_worker`]).
 pub fn rpc(info: &Discovery, request: &str, payload: Value) -> Result<Value> {
-    let mut socket = crate::ws::connect(&info.address)?;
+    let mut socket = connect_worker(info)?;
     crate::ws::call(&mut socket, &json!({"request":request,"payload":payload}))
 }
 /// One worker connection per peer lane. Never share a socket between bulk and
@@ -62,7 +139,7 @@ impl RpcLane {
                 .is_some_and(|at| at.elapsed() >= Duration::from_secs(10))
         {
             self.connection = None;
-            self.connection = Some((info.address.clone(), crate::ws::connect(&info.address)?));
+            self.connection = Some((info.address.clone(), connect_worker(info)?));
         }
         let result = crate::ws::call(
             &mut self.connection.as_mut().unwrap().1,

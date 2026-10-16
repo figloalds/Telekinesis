@@ -95,11 +95,26 @@ pub fn endpoint_uri(endpoint: &str) -> Result<tungstenite::http::Uri> {
     Ok(uri)
 }
 
+/// Connects to a JSON WebSocket endpoint. A loopback endpoint this process
+/// knows a local token for ([`tokens::lookup`]: a server of this process, or
+/// one it was told about) is sent that token; see [`connect_authorized`].
 pub fn connect(endpoint: &str) -> Result<Socket> {
-    connect_with_connector(endpoint, None)
+    connect_with_connector(endpoint, None, None)
 }
 
-fn connect_with_connector(endpoint: &str, connector: Option<Connector>) -> Result<Socket> {
+/// [`connect`] presenting `token` as `X-Tkfs-Token` on the upgrade (§14
+/// WP4.1 local tokens). With `None`, the token [`tokens::lookup`] knows for
+/// the address, if any. An endpoint that refuses the token answers the
+/// upgrade with HTTP 403: `ACCESS_DENIED`.
+pub fn connect_authorized(endpoint: &str, token: Option<&str>) -> Result<Socket> {
+    connect_with_connector(endpoint, None, token)
+}
+
+fn connect_with_connector(
+    endpoint: &str,
+    connector: Option<Connector>,
+    token: Option<&str>,
+) -> Result<Socket> {
     let uri = endpoint_uri(endpoint)?;
     let host = uri
         .host()
@@ -121,12 +136,17 @@ fn connect_with_connector(endpoint: &str, connector: Option<Connector>) -> Resul
                 request
                     .headers_mut()
                     .insert("X-Tkfs-Wire", crate::wire::PROTOCOL.parse()?);
-                let (socket, response) = tungstenite::client_tls_with_config(
-                    request,
-                    stream,
-                    Some(config()),
-                    connector,
-                )?;
+                let presented = token.map(str::to_owned).or_else(|| tokens::lookup(address));
+                if let Some(presented) = presented {
+                    request.headers_mut().insert(
+                        tokens::HEADER,
+                        tungstenite::http::HeaderValue::from_str(&presented)
+                            .context("INVALID_REQUEST: the local token is not a header value")?,
+                    );
+                }
+                let (socket, response) =
+                    tungstenite::client_tls_with_config(request, stream, Some(config()), connector)
+                        .map_err(|error| refused(endpoint, handshake_failure(error)))?;
                 let binary = response
                     .headers()
                     .get("X-Tkfs-Wire")
@@ -142,6 +162,22 @@ fn connect_with_connector(endpoint: &str, connector: Option<Connector>) -> Resul
     )
 }
 
+/// A failed client upgrade; an HTTP 401/403 refusal is `ACCESS_DENIED` (the
+/// endpoint wants a local token this client did not present, or another).
+fn refused(endpoint: &str, error: tungstenite::Error) -> anyhow::Error {
+    let status = match &error {
+        tungstenite::Error::Http(response) => Some(response.status().as_u16()),
+        _ => None,
+    };
+    match status {
+        Some(status @ (401 | 403)) => anyhow::Error::new(error).context(format!(
+            "ACCESS_DENIED: {endpoint} refused the upgrade (HTTP {status}): a local token is \
+             required (X-Tkfs-Token)"
+        )),
+        _ => anyhow::Error::new(error),
+    }
+}
+
 pub fn timeouts(stream: &TcpStream) -> Result<()> {
     // Windows inherits the listener's nonblocking mode on accepted sockets.
     stream.set_nonblocking(false)?;
@@ -151,15 +187,40 @@ pub fn timeouts(stream: &TcpStream) -> Result<()> {
     Ok(())
 }
 
+/// Accepts a JSON WebSocket connection. When this process protects the
+/// listener's address with a local token ([`tokens::protect`], the daemon's
+/// control endpoint), the upgrade must carry it; see [`accept_authorized`].
 #[allow(clippy::result_large_err)]
 pub fn accept(stream: TcpStream) -> Result<Socket> {
+    let required = stream.local_addr().ok().and_then(tokens::enforced);
+    accept_authorized(stream, required.as_deref())
+}
+
+/// [`accept`] requiring `token` (when `Some`) as the upgrade's `X-Tkfs-Token`
+/// (§14 WP4.1: a worker's JSON RPC, the daemon's control endpoint). A missing
+/// or different token is refused before the upgrade completes: HTTP 403, and
+/// `ACCESS_DENIED` here. The comparison is constant-time, and nothing logged
+/// carries a token.
+#[allow(clippy::result_large_err)]
+pub fn accept_authorized(stream: TcpStream, token: Option<&str>) -> Result<Socket> {
     timeouts(&stream)?;
+    let peer = stream.peer_addr().ok();
     let negotiated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let selected = negotiated.clone();
+    let denied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let refusal = denied.clone();
     let inner = tungstenite::accept_hdr_with_config(
         MaybeTlsStream::Plain(stream),
         move |request: &tungstenite::handshake::server::Request,
               mut response: tungstenite::handshake::server::Response| {
+            if let Some(expected) = token
+                && !tokens::matches(request.headers().get(tokens::HEADER), expected)
+            {
+                refusal.store(true, std::sync::atomic::Ordering::Relaxed);
+                let mut refused = tungstenite::handshake::server::ErrorResponse::new(None);
+                *refused.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+                return Err(refused);
+            }
             let binary = request
                 .headers()
                 .get("X-Tkfs-Wire")
@@ -178,7 +239,20 @@ pub fn accept(stream: TcpStream) -> Result<Socket> {
             Ok(response)
         },
         Some(config()),
-    )?;
+    );
+    let inner = match inner {
+        Ok(inner) => inner,
+        Err(error) if denied.load(std::sync::atomic::Ordering::Relaxed) => {
+            crate::util::log::event!(info, ACCESS_DENIED, {
+                "site": "ws.accept",
+                "peer": peer.map(|peer| peer.to_string()),
+                "detail": "upgrade without the local token refused",
+            });
+            return Err(anyhow::Error::new(handshake_failure(error))
+                .context("ACCESS_DENIED: the upgrade did not carry the local token"));
+        }
+        Err(error) => return Err(handshake_failure(error).into()),
+    };
     Ok(Socket::new(
         inner,
         negotiated.load(std::sync::atomic::Ordering::Relaxed),
@@ -711,6 +785,206 @@ pub(crate) mod watchdog {
     }
 }
 
+/// Local tokens (§14 WP4.1): the `X-Tkfs-Token` a loopback endpoint of this
+/// installation requires on its WebSocket upgrade (the daemon's control
+/// endpoint, a worker's JSON RPC and loopback sessions). Clients outside the
+/// process read the token from its owner-only file (`DATA/orchestrator.token`,
+/// `STATE/runtime.token`) and pass it explicitly
+/// ([`super::connect_authorized`], `session::dial_loopback`).
+///
+/// This module is also a process-local registry of the tokens this process
+/// already knows, keyed by the endpoint's socket address:
+///
+/// * [`protect`]: a server of this process whose listener answers through
+///   [`super::accept`] (the daemon's control endpoint): `accept` then
+///   *requires* the token ([`enforced`]);
+/// * [`remember`]: a token this process was given for an endpoint (a worker
+///   server in this process, a worker endpoint the orchestrator learned from
+///   a Ready line or `worker.json`);
+/// * [`note`]: a token read next to a worker's published discovery.
+///
+/// A client that is not handed a token uses [`lookup`], so in-process
+/// clients and callers that only know an address keep working with
+/// mandatory tokens. Entries are only ever made for loopback addresses, a
+/// registration replaces an older one for the same address, and an entry
+/// dies with its owner ([`Hold`]) or its liveness token. Nothing here is
+/// logged or serialized.
+pub mod tokens {
+    use crate::util::cancel::Cancel;
+    use rand::RngCore;
+    use std::{
+        net::SocketAddr,
+        sync::{Arc, Mutex, PoisonError, Weak},
+    };
+
+    /// The upgrade header that carries a local token.
+    pub use crate::model::protocol::TOKEN_HEADER as HEADER;
+
+    /// Ownerless entries ([`note`]) kept at most; the oldest go first.
+    const MAX_NOTED: usize = 256;
+
+    /// Keeps a [`protect`] or [`remember`] registration alive: the entry is
+    /// retired once the last clone is dropped.
+    #[derive(Debug)]
+    pub struct Hold {
+        _private: (),
+    }
+
+    struct Entry {
+        address: SocketAddr,
+        token: String,
+        /// `accept` requires the token (a [`protect`] entry).
+        enforce: bool,
+        /// `None` for a [`note`] entry (no owner).
+        hold: Option<Weak<Hold>>,
+        /// The entry dies when this is cancelled.
+        alive: Option<Cancel>,
+    }
+
+    impl Entry {
+        fn live(&self) -> bool {
+            self.hold
+                .as_ref()
+                .is_none_or(|hold| hold.strong_count() > 0)
+                && self
+                    .alive
+                    .as_ref()
+                    .is_none_or(|alive| !alive.is_cancelled())
+        }
+    }
+
+    fn registry() -> std::sync::MutexGuard<'static, Vec<Entry>> {
+        static REGISTRY: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+        REGISTRY.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A fresh token: 32 random bytes, hex-encoded (64 characters).
+    pub fn generate() -> String {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        hex::encode(bytes)
+    }
+
+    /// Whether a presented header value is `expected` (constant-time).
+    pub fn matches(presented: Option<&tungstenite::http::HeaderValue>, expected: &str) -> bool {
+        let presented = presented.map_or(&b""[..], |value| value.as_bytes());
+        // Compared even when absent, so timing does not tell the two apart.
+        crate::util::hmac::ct_eq(presented, expected.as_bytes()) && !expected.is_empty()
+    }
+
+    fn register(
+        address: SocketAddr,
+        token: &str,
+        enforce: bool,
+        alive: Option<Cancel>,
+        owned: bool,
+    ) -> Option<Arc<Hold>> {
+        if !address.ip().is_loopback() || token.is_empty() {
+            return None;
+        }
+        let hold = owned.then(|| Arc::new(Hold { _private: () }));
+        let mut entries = registry();
+        entries.retain(|entry| {
+            entry.live() && !(entry.address == address && entry.enforce == enforce)
+        });
+        if !owned {
+            let noted = entries.iter().filter(|entry| entry.hold.is_none()).count();
+            if noted >= MAX_NOTED
+                && let Some(oldest) = entries.iter().position(|entry| entry.hold.is_none())
+            {
+                entries.remove(oldest);
+            }
+        }
+        entries.push(Entry {
+            address,
+            token: token.to_owned(),
+            enforce,
+            hold: hold.as_ref().map(Arc::downgrade),
+            alive,
+        });
+        hold
+    }
+
+    /// Requires `token` on every [`super::accept`] at `address` (and lets
+    /// clients of this process find it) while the returned [`Hold`] is held
+    /// and `alive` is not cancelled. `None` (nothing registered) for a
+    /// non-loopback address or an empty token.
+    pub fn protect(address: SocketAddr, token: &str, alive: Option<Cancel>) -> Option<Arc<Hold>> {
+        register(address, token, true, alive, true)
+    }
+
+    /// Lets clients of this process present `token` to `address` while the
+    /// returned [`Hold`] is held.
+    pub fn remember(address: SocketAddr, token: &str) -> Option<Arc<Hold>> {
+        register(address, token, false, None, true)
+    }
+
+    /// [`remember`] without an owner: kept until a newer registration for
+    /// the address replaces it (at most [`MAX_NOTED`] such entries).
+    pub fn note(address: SocketAddr, token: &str) {
+        register(address, token, false, None, false);
+    }
+
+    /// The token this process knows for `address`: the protecting server's,
+    /// else the newest one remembered or noted.
+    pub fn lookup(address: SocketAddr) -> Option<String> {
+        let entries = registry();
+        let live = |entry: &&Entry| entry.address == address && entry.live();
+        entries
+            .iter()
+            .filter(live)
+            .find(|entry| entry.enforce)
+            .or_else(|| entries.iter().rev().find(live))
+            .map(|entry| entry.token.clone())
+    }
+
+    /// The token [`super::accept`] requires at `address`, if it is protected.
+    pub fn enforced(address: SocketAddr) -> Option<String> {
+        registry()
+            .iter()
+            .find(|entry| entry.address == address && entry.enforce && entry.live())
+            .map(|entry| entry.token.clone())
+    }
+
+    /// The loopback socket addresses of a `ws://` endpoint (no DNS lookup
+    /// beyond `localhost`): the keys [`lookup`] is asked with.
+    pub fn addresses(endpoint: &str) -> Vec<SocketAddr> {
+        use std::net::ToSocketAddrs;
+        let Ok(uri) = super::endpoint_uri(endpoint) else {
+            return Vec::new();
+        };
+        let Some(host) = uri
+            .host()
+            .map(|host| host.trim_matches(['[', ']']).to_owned())
+        else {
+            return Vec::new();
+        };
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("wss") {
+                443
+            } else {
+                80
+            });
+        let local = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !local {
+            return Vec::new();
+        }
+        (host.as_str(), port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.filter(|a| a.ip().is_loopback()).collect())
+            .unwrap_or_default()
+    }
+
+    /// [`lookup`] for a `ws://` endpoint.
+    pub fn lookup_endpoint(endpoint: &str) -> Option<String> {
+        addresses(endpoint).into_iter().find_map(lookup)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +1125,7 @@ mod tests {
         let mut socket = connect_with_connector(
             &format!("wss://localhost:{port}/sync?lane=1"),
             Some(trusted_connector()),
+            None,
         )
         .unwrap();
         for sequence in 0..2 {
@@ -874,6 +1149,7 @@ mod tests {
             connect_with_connector(
                 &format!("wss://127.0.0.1:{port}/sync?lane=1"),
                 Some(trusted_connector()),
+                None,
             )
             .is_err()
         );
@@ -886,6 +1162,7 @@ mod tests {
         let mut socket = connect_with_connector(
             &format!("wss://localhost:{port}/sync?lane=1"),
             Some(trusted_connector()),
+            None,
         )
         .unwrap();
         assert_eq!(socket.codec(), crate::wire::PROTOCOL);
@@ -954,6 +1231,109 @@ mod tests {
         let error = connect_any("fallback", &[], &request, None, budget, None)
             .expect_err("nothing to dial");
         assert!(format!("{error:#}").contains("WS_CONNECT_FAILED"));
+    }
+
+    /// WP4.1: `accept_authorized` refuses an upgrade without the token (HTTP
+    /// 403, `ACCESS_DENIED` on both sides) and serves one that carries it.
+    #[test]
+    fn an_authorized_endpoint_refuses_upgrades_without_its_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            for _ in 0..3 {
+                let stream = listener.accept().unwrap().0;
+                match accept_authorized(stream, Some("s3cr3t")) {
+                    Ok(mut socket) => {
+                        let request: Value = receive(&mut socket).unwrap();
+                        reply(&mut socket, Ok(request)).unwrap();
+                        outcomes.push("served".to_owned());
+                    }
+                    Err(error) => outcomes.push(crate::model::errors::code_of(&error)),
+                }
+            }
+            outcomes
+        });
+        let refused = |token: Option<&str>| {
+            let error = connect_authorized(&endpoint, token).err().expect("refused");
+            crate::model::errors::code_of(&error)
+        };
+        assert_eq!(refused(None), "ACCESS_DENIED");
+        assert_eq!(refused(Some("wrong")), "ACCESS_DENIED");
+        let mut socket = connect_authorized(&endpoint, Some("s3cr3t")).unwrap();
+        assert_eq!(
+            call(&mut socket, &json!({"n": 1})).unwrap(),
+            json!({"n": 1})
+        );
+        assert_eq!(
+            server.join().unwrap(),
+            ["ACCESS_DENIED", "ACCESS_DENIED", "served"]
+        );
+    }
+
+    /// WP4.1: a protected address makes `accept` require the token and lets
+    /// clients of this process find it; the protection ends with its hold or
+    /// its liveness token; other addresses are untouched.
+    #[test]
+    fn protected_addresses_are_enforced_while_their_hold_lives() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("ws://{address}");
+        let alive = crate::util::cancel::Cancel::new();
+        let hold = tokens::protect(address, "control-token", Some(alive.clone())).unwrap();
+        assert_eq!(tokens::enforced(address).as_deref(), Some("control-token"));
+        assert_eq!(
+            tokens::lookup_endpoint(&endpoint).as_deref(),
+            Some("control-token")
+        );
+        // A hint for the same address never weakens the enforced token.
+        let hint = tokens::remember(address, "stale").unwrap();
+        assert_eq!(tokens::lookup(address).as_deref(), Some("control-token"));
+        drop(hint);
+        let server = thread::spawn(move || {
+            let mut outcomes = Vec::new();
+            for _ in 0..3 {
+                let stream = listener.accept().unwrap().0;
+                outcomes.push(match accept(stream) {
+                    Ok(_) => "accepted".to_owned(),
+                    Err(error) => crate::model::errors::code_of(&error),
+                });
+            }
+            outcomes
+        });
+        // A raw client without the token is refused; `connect` finds it.
+        assert!(matches!(
+            tungstenite::connect(endpoint.as_str()),
+            Err(tungstenite::Error::Http(response)) if response.status() == 403
+        ));
+        connect(&endpoint).unwrap();
+        // Retired with its liveness token: `accept` no longer requires it.
+        alive.cancel();
+        assert_eq!(tokens::enforced(address), None);
+        assert_eq!(tokens::lookup(address), None);
+        tungstenite::connect(endpoint.as_str()).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            ["ACCESS_DENIED", "accepted", "accepted"]
+        );
+        drop(hold);
+
+        // A dropped hold retires its entry; non-loopback addresses and empty
+        // tokens are never registered; a note is a hint only.
+        let other: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let held = tokens::remember(other, "worker-token").unwrap();
+        assert_eq!(tokens::lookup(other).as_deref(), Some("worker-token"));
+        assert_eq!(tokens::enforced(other), None);
+        drop(held);
+        assert_eq!(tokens::lookup(other), None);
+        assert!(tokens::remember("10.0.0.1:9".parse().unwrap(), "t").is_none());
+        assert!(tokens::remember(other, "").is_none());
+        tokens::note(other, "noted");
+        assert_eq!(tokens::lookup(other).as_deref(), Some("noted"));
+        assert_eq!(tokens::enforced(other), None);
+        assert!(tokens::addresses("ws://example.com:80").is_empty());
+        assert_eq!(tokens::generate().len(), 64);
+        assert_ne!(tokens::generate(), tokens::generate());
     }
 
     /// Unix only: Windows still answers `getpeername` on a socket whose

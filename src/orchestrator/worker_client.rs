@@ -6,7 +6,18 @@
 //!
 //! Requests `{"request": id, "payload": {"op": …}}` over the worker's loopback
 //! WebSocket endpoint, the same envelope and `{ok, result | error}` reply as
-//! `ws::call`. WP4.1 adds the worker token.
+//! `ws::call`.
+//!
+//! * **Token (WP4.1).** Every upgrade carries the instance's token
+//!   (`WorkerEndpoint.token`, from the Ready line or `worker.json`) as
+//!   `X-Tkfs-Token`; an endpoint without one presents the token this process
+//!   knows for the address (`ws::tokens::lookup`), if any, so a legacy
+//!   worker (no token) is still reached. A client with a token also
+//!   remembers it for the address while it lives (`ws::tokens::remember`),
+//!   so other callers of this process that only know the address (the
+//!   `Folder` passthrough's `compat::worker_call`) present it too. A refused
+//!   token is `Unavailable(LOCAL_WORKER_UNAVAILABLE: … ACCESS_DENIED …)`
+//!   (nothing was sent).
 //!
 //! * **Pool.** Up to [`MAX_IDLE`] idle connections are kept. A call checks one
 //!   out (or opens a new one) and returns it afterwards; no socket is ever used
@@ -132,6 +143,8 @@ pub struct JsonWorkerClient {
     options: ClientOptions,
     idle: Mutex<Vec<Idle>>,
     connects: AtomicU64,
+    /// The endpoint's token, remembered for its address (module docs).
+    _remembered: Vec<Arc<crate::ws::tokens::Hold>>,
 }
 
 impl fmt::Debug for JsonWorkerClient {
@@ -157,11 +170,19 @@ impl JsonWorkerClient {
     }
 
     pub fn with_options(endpoint: WorkerEndpoint, options: ClientOptions) -> Arc<Self> {
+        let remembered = match &endpoint.token {
+            Some(token) => crate::ws::tokens::addresses(&endpoint.address)
+                .into_iter()
+                .filter_map(|address| crate::ws::tokens::remember(address, token))
+                .collect(),
+            None => Vec::new(),
+        };
         Arc::new(Self {
             endpoint,
             options,
             idle: Mutex::new(Vec::new()),
             connects: AtomicU64::new(0),
+            _remembered: remembered,
         })
     }
 
@@ -259,10 +280,22 @@ impl JsonWorkerClient {
         };
         let left = remaining(deadline_at).ok_or_else(|| unavailable("connect timed out".into()))?;
         set_timeouts(&stream, left).map_err(|e| unavailable(format!("socket setup: {e}")))?;
-        let request = address
+        let mut request = address
             .as_str()
             .into_client_request()
             .map_err(|e| unavailable(format!("{e}")))?;
+        let token = self
+            .endpoint
+            .token
+            .clone()
+            .or_else(|| crate::ws::tokens::lookup_endpoint(address));
+        if let Some(token) = token {
+            let value = tungstenite::http::HeaderValue::from_str(&token)
+                .map_err(|_| unavailable("the worker token is not a header value".into()))?;
+            request
+                .headers_mut()
+                .insert(crate::ws::tokens::HEADER, value);
+        }
         match tungstenite::client::client_with_config(request, stream, Some(config())) {
             Ok((socket, _)) => {
                 self.connects.fetch_add(1, Ordering::Relaxed);
@@ -271,6 +304,15 @@ impl JsonWorkerClient {
             // A socket read timeout surfaces as an interrupted handshake.
             Err(HandshakeError::Interrupted(_)) => {
                 Err(unavailable("WebSocket upgrade timed out".into()))
+            }
+            Err(HandshakeError::Failure(tungstenite::Error::Http(response)))
+                if matches!(response.status().as_u16(), 401 | 403) =>
+            {
+                Err(unavailable(format!(
+                    "ACCESS_DENIED: the worker refused the upgrade (HTTP {}): its local token \
+                     is required",
+                    response.status()
+                )))
             }
             Err(HandshakeError::Failure(error)) => {
                 Err(unavailable(format!("WebSocket upgrade failed: {error}")))

@@ -83,7 +83,8 @@ fn worker_serves_multiple_requests_and_recovers_from_application_errors_on_one_s
         Store::initialize(dir.path(), &id(), &id()).unwrap(),
     )));
     let info = runtime::start_rpc(engine.clone(), dir.path(), None).unwrap();
-    let mut socket = ws::connect(&info.address).unwrap();
+    // WP4.1: the worker requires its local token; `connect_worker` presents it.
+    let mut socket = runtime::connect_worker(&info).unwrap();
     let request = |payload| json!({"request":id(),"payload":payload});
     assert_eq!(
         ws::call(&mut socket, &request(json!({"op":"published-summary"}))).unwrap()["repo"],
