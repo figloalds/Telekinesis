@@ -193,7 +193,7 @@ folder shows `starting for … · <phase> (step N)` meanwhile (desktop:
 | Phase | One-time work |
 |---|---|
 | `indexing object references` | indexes which events reference which objects |
-| `verifying available objects` | **hashes every stored object once** (the new availability index); proportional to the folder's size on disk |
+| `verifying available objects` | **hashes every stored object once** to build the new availability index (the previous release did this on every start); proportional to the folder's size on disk |
 | `indexing the feed` | indexes the shared journal for the new metadata feed |
 | `recovering incoming events`, `classifying incoming events` | classifies the events the previous release had received but not activated (see below) |
 | `reconstructing snapshot`, `replaying snapshot suffix` | rebuilds or resumes the folder's startup snapshot |
