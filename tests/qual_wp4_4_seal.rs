@@ -7,13 +7,26 @@
 //!   slices as the background activator does: `seal_forecast`, 64 events /
 //!   25 ms, the sealing commit alone). Acceptance: the bytes its seals write
 //!   are at least 10 times fewer than WP3.INT's seals would write
-//!   (`wp3int_model_bytes`, below) and no seal holds the engine lock 50 ms
-//!   or more (the sealing slice's hold, the seal's own time inside it
-//!   reported too). The store then restarts from its snapshot.
+//!   (`wp3int_model_bytes`, below) and every seal's own time under the
+//!   engine lock is under 50 ms (`max_seal_ms`: the time the store measures
+//!   inside the committing transaction, from reading the previous seal to
+//!   writing the anchor). The sealing slice's whole hold, which adds the
+//!   commit's `COMMIT` (WAL append and fsync) that every committing slice
+//!   pays, sealing or not, is reported (`sealing_hold_p99_ms`) without a
+//!   floor. The store then restarts from its snapshot.
 //! - `catch_up_20k_inline_vs_rows`: the WP3.INT model checked against a
 //!   measurement: the same 20K catch-up sealed inline (every seal the whole
 //!   projection at the scaled interval: WP3.INT's seals) and with this
 //!   package's layout.
+//! - `seal_after_other_branch_gap`: `main` (1,000 files) sealed, then a
+//!   150K-event history on another branch, then one save on `main`: its
+//!   seal hashes `main`'s own journal rows since its previous seal
+//!   (`journal_branch`), not the 150K rows in between (floored: under
+//!   50 ms, and only `main`'s rows hashed).
+//! - `restart_50k_rows_vs_inline`: restarts at the tip of a 50K-entry store
+//!   sealed as rows and of the same store sealed inline (WP3.INT's layout
+//!   and restore: the whole projection parsed and `current_state` rewritten
+//!   at every open), alternately (floored: the rows restart is not slower).
 //! - `staging_cost_at_large_inboxes` (CCR-WP2.5-6): a 1,000-event page
 //!   staged, inside a write transaction as the feed stages, into an empty
 //!   inbox and into one of 40K (floored: at most 4 times the empty inbox's
@@ -269,6 +282,7 @@ fn seal_summary(run: &CatchUp) -> serde_json::Value {
         "rows_full": run.seal.rows_full,
         "rows_incremental": run.seal.rows_incremental,
         "entity_rows": run.seal.entity_rows,
+        "journal_rows": run.seal.journal_rows,
         "seal_ms_p50": percentile(&run.seal_ms, 50.0),
         "seal_ms_p99": percentile(&run.seal_ms, 99.0),
         "seal_ms_max": max(&run.seal_ms),
@@ -339,7 +353,7 @@ fn catch_up_150k_seals() {
     );
     s.check(
         seal_max < 50.0,
-        format!("the longest seal held the engine {seal_max:.1} ms (floor 50 ms)"),
+        format!("the longest seal's own time under the engine lock {seal_max:.1} ms (floor 50 ms)"),
     );
     // The restart resumes the rows snapshot.
     let started = Instant::now();
@@ -396,6 +410,148 @@ fn catch_up_20k_inline_vs_rows() {
     s.check(
         inline.seal.bytes > rows.seal.bytes * 3,
         "rows seal fewer bytes than inline seals",
+    );
+    s.finish();
+}
+
+#[test]
+#[ignore = "WP4.4 release scenario"]
+fn seal_after_other_branch_gap() {
+    let mut s = Scenario::with_budget(FILE, "seal_after_other_branch_gap", budget_or(900));
+    let n = scaled(150_000);
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut store = Store::initialize(dir.path(), &repo, "device-b").unwrap();
+    linear_history(&mut store, 1000).unwrap();
+    let main = store.active.clone();
+    drop(store);
+    // `main` sealed at its tip.
+    let mut store = Store::open(dir.path(), Some(&repo)).unwrap();
+    let side = store.fork("side", false).unwrap();
+    store.checkout(&side.id).unwrap();
+    linear_history_named(&mut store, "gap", n).unwrap();
+    store.checkout(&main).unwrap();
+    let gap: i64 = store
+        .db
+        .query_row(
+            "SELECT count(*) FROM journal_sequence WHERE seq>(SELECT cursor FROM startup_snapshots WHERE branch=?)",
+            [&main],
+            |r| r.get(0),
+        )
+        .unwrap();
+    s.measure_from_now();
+    let before = store.seal_stats();
+    let file = store.lookup("lin-000000.txt").unwrap();
+    store
+        .write_revision(
+            &file.id,
+            file.revisions.get("content").cloned(),
+            b"after the gap",
+        )
+        .unwrap();
+    let after = store.seal_stats();
+    let seal_ms = (after.total_micros - before.total_micros) as f64 / 1000.0;
+    let hashed = after.journal_rows - before.journal_rows;
+    s.metric_with(
+        "seal_ms",
+        seal_ms,
+        "ms",
+        json!({"gap_journal_rows": gap, "journal_rows_hashed": hashed,
+            "seals": after.seals - before.seals}),
+    );
+    s.check(after.seals == before.seals + 1, "the save sealed main");
+    s.check(
+        gap as usize >= n,
+        format!("{gap} journal rows of another branch since main's seal"),
+    );
+    s.check(
+        hashed <= 2,
+        format!("the seal hashed {hashed} journal rows (main's own)"),
+    );
+    s.check(
+        seal_ms < 50.0,
+        format!("the seal after the gap took {seal_ms:.1} ms (floor 50 ms)"),
+    );
+    s.finish();
+}
+
+#[test]
+#[ignore = "WP4.4 release scenario"]
+fn restart_50k_rows_vs_inline() {
+    let mut s = Scenario::with_budget(FILE, "restart_50k_rows_vs_inline", budget_or(1800));
+    let n = scaled(50_000);
+    let repo = id();
+    let rows_dir = tempfile::tempdir().unwrap();
+    {
+        let mut store = Store::initialize(rows_dir.path(), &repo, "device-b").unwrap();
+        linear_history(&mut store, n).unwrap();
+    }
+    // The same store sealed inline: its snapshot dropped, the open
+    // reconstructs and seals the whole projection in the anchor.
+    let inline_dir = tempfile::tempdir().unwrap();
+    let inline_root = inline_dir.path().join("store");
+    copy_dir(rows_dir.path(), &inline_root).unwrap();
+    rusqlite::Connection::open(inline_root.join("metadata.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM startup_snapshots; DELETE FROM snapshot_entries;
+            DELETE FROM snapshot_conflicts; DELETE FROM snapshot_dirty;",
+        )
+        .unwrap();
+    let open = |root: &Path, inline: bool| -> (f64, bool, usize) {
+        let previous = set_thread_inline_limit(inline.then_some(usize::MAX));
+        let started = Instant::now();
+        let store = Store::open(root, Some(&repo)).unwrap();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        let resumed = store.startup_resumes() == 1;
+        let rows = store
+            .check_startup_snapshot(&store.active)
+            .map(|check| usize::from(check.rows))
+            .unwrap_or(2);
+        drop(store);
+        set_thread_inline_limit(previous);
+        (ms, resumed, rows)
+    };
+    // The first opens: the inline store's reconstruction, the rows store's
+    // first restore (it stores the projection as rows).
+    let (reconstruct_ms, _, inline_layout) = open(&inline_root, true);
+    let (_, _, rows_layout) = open(rows_dir.path(), false);
+    s.check(
+        inline_layout == 0 && rows_layout == 1,
+        format!(
+            "layouts: inline store {inline_layout}, rows store {rows_layout} (0 inline, 1 rows)"
+        ),
+    );
+    s.measure_from_now();
+    let (mut rows_ms, mut inline_ms) = (vec![], vec![]);
+    let mut resumed = true;
+    for _ in 0..3 {
+        let (ms, ok, _) = open(rows_dir.path(), false);
+        rows_ms.push(ms);
+        resumed &= ok;
+        let (ms, ok, _) = open(&inline_root, true);
+        inline_ms.push(ms);
+        resumed &= ok;
+    }
+    let rows = percentile(&rows_ms, 50.0);
+    let inline = percentile(&inline_ms, 50.0);
+    s.metric_with(
+        "restart_rows_ms",
+        rows,
+        "ms",
+        json!({"samples": rows_ms, "entries": n}),
+    );
+    s.metric_with(
+        "restart_inline_ms",
+        inline,
+        "ms",
+        json!({"samples": inline_ms, "reconstruct_ms": reconstruct_ms}),
+    );
+    s.metric("restart_rows_vs_inline", rows / inline, "ratio");
+    s.check(resumed, "every restart resumed its snapshot");
+    s.check(
+        rows <= inline,
+        format!("a rows restart ({rows:.0} ms) is not slower than an inline one ({inline:.0} ms)"),
     );
     s.finish();
 }

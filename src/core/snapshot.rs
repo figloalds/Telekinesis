@@ -42,9 +42,13 @@
 //! **Journal binding.** `journal_hash` is, as in format 1, the SHA-256 over
 //! the branch's journal rows (sequence, id, payload) up to the cursor. The
 //! anchor also stores the hash's resumable state (`journal_state`), so a
-//! seal hashes only the rows since the previous seal instead of the whole
-//! history. Startup recomputes the hash from the journal (O(history), as
-//! before) and checks that the stored state finalizes to it.
+//! seal hashes only its own branch's rows since the previous seal instead
+//! of the whole history: a range scan of the per-branch journal index
+//! `journal_branch(seq, branch)` (trigger-maintained, `incremental_schema`),
+//! so rows other branches added in between cost nothing. Startup recomputes
+//! the hash from the journal (O(history), as before) and checks that the
+//! stored state finalizes to it; a rebuild's seal recomputes it from the
+//! journal ([`Changed::Rebuild`]).
 //!
 //! **Integrity.** The anchor's checksum covers the anchor; the rows are
 //! covered by the anchor's `rows.digest`, the XOR of one SHA-256 per row
@@ -52,7 +56,16 @@
 //! startup that resumes a rows snapshot reads and checks every row; any
 //! mismatch, like a damaged anchor, a changed journal or an unknown format,
 //! falls back to full reconstruction (snapshots are disposable, invariant
-//! 5).
+//! 5). A seal never fails on what the snapshot tables hold: an anchor,
+//! sealed row or change mark that is unreadable (not an integer or UTF-8
+//! text where a seal writes one) or inconsistent is no previous seal, and
+//! the seal is full, which replaces it (`previous`, `seal_rows_incremental`).
+//!
+//! **Restore.** A startup stores the sealed projection as the branch's
+//! stored projection, then replays the tail. A large rows snapshot is
+//! stored as its header plus one `current_parts` row per entity, and only
+//! the rows (and conflict rows) that differ from the sealed ones are
+//! written: an open at the tip writes nothing of the projection.
 //!
 //! **Crash safety.** Every seal runs inside its caller's transaction (the
 //! commit's savepoint, the startup replay's savepoint, a rebuild's), so the
@@ -503,14 +516,50 @@ pub(super) fn initialize(db: &Connection) -> Result<()> {
 /// `schema:snapshot` stamp of the format-2 side tables.
 const SCHEMA_VERSION: i64 = 2;
 
+/// Journal rows indexed per transaction by the `journal_branch` backfill.
+const JOURNAL_BRANCH_CHUNK: i64 = 10_000;
+/// Config key: the `journal_branch` backfill is complete.
+const JOURNAL_BRANCH_MARKER: &str = "snapshot_journal_branch_v1";
+/// Config key: the last `journal_sequence.seq` the backfill covered.
+const JOURNAL_BRANCH_CURSOR: &str = "snapshot_journal_branch_v1_cursor";
+
 /// The format-2 side tables (module docs): sealed rows, change marks and
-/// their triggers, and the stored projection's header. New tables only
-/// (§9); idempotent; its own savepoint. A mark is inserted only when absent
-/// (`WHERE NOT EXISTS`, not `INSERT OR IGNORE`: inside a trigger, the
-/// conflict policy of the statement that fired it, such as an upsert's
-/// abort, would override the trigger's own).
+/// their triggers, the stored projection's header, and the per-branch
+/// journal index. New tables only (§9); idempotent; its own savepoint. A
+/// mark is inserted only when absent (`WHERE NOT EXISTS`, not `INSERT OR
+/// IGNORE`: inside a trigger, the conflict policy of the statement that
+/// fired it, such as an upsert's abort, would override the trigger's own).
+///
+/// `journal_branch(seq, branch)` names each journal row's branch, indexed
+/// by `(branch, seq)`, so an incremental seal hashes the rows of its own
+/// branch since its previous seal with one range scan, however many rows
+/// other branches added in between (a large catch-up on `main` before an
+/// idle branch's next seal). It is built as `feed_journal` is (WP2.5,
+/// WP2.INT): triggers on `journal_sequence` maintain it for writes by any
+/// executable, and a new table is filled from the journal by a chunked,
+/// resumable backfill (`backfill_journal_branch`) before the store is
+/// usable. Readers join it to the journal and the event's branch, so a
+/// stale row is never hashed; a missing one would only change the hash,
+/// which startup checks against the journal itself (reconstruction).
 fn incremental_schema(db: &Connection) -> Result<()> {
+    let indexed: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_branch')",
+        [],
+        |r| r.get(0),
+    )?;
     db.execute_batch("SAVEPOINT snapshot_rows_schema;
+        CREATE TABLE IF NOT EXISTS journal_branch(seq INTEGER PRIMARY KEY,branch TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS journal_branch_order ON journal_branch(branch,seq);
+        CREATE TRIGGER IF NOT EXISTS journal_branch_insert AFTER INSERT ON journal_sequence BEGIN
+            INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT NEW.seq,e.branch FROM events e WHERE e.id=NEW.event;
+        END;
+        CREATE TRIGGER IF NOT EXISTS journal_branch_update AFTER UPDATE ON journal_sequence BEGIN
+            DELETE FROM journal_branch WHERE seq=OLD.seq;
+            INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT NEW.seq,e.branch FROM events e WHERE e.id=NEW.event;
+        END;
+        CREATE TRIGGER IF NOT EXISTS journal_branch_delete AFTER DELETE ON journal_sequence BEGIN
+            DELETE FROM journal_branch WHERE seq=OLD.seq;
+        END;
         CREATE TABLE IF NOT EXISTS snapshot_entries(branch TEXT NOT NULL,entity TEXT NOT NULL,entry TEXT NOT NULL,heads TEXT NOT NULL,PRIMARY KEY(branch,entity));
         CREATE TABLE IF NOT EXISTS snapshot_conflicts(branch TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,resolved_by TEXT,PRIMARY KEY(branch,id));
         CREATE TABLE IF NOT EXISTS snapshot_dirty(branch TEXT NOT NULL,kind INTEGER NOT NULL,key TEXT NOT NULL,PRIMARY KEY(branch,kind,key));
@@ -545,11 +594,79 @@ fn incremental_schema(db: &Connection) -> Result<()> {
             UPDATE projection_version SET version=version+1 WHERE id=1;
         END;
         RELEASE snapshot_rows_schema;")?;
+    if !indexed {
+        // A new (or dropped) index: build it from the whole journal.
+        db.execute("DELETE FROM config WHERE key=?1", [JOURNAL_BRANCH_MARKER])?;
+        db.execute(
+            "INSERT INTO config(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
+            [JOURNAL_BRANCH_CURSOR],
+        )?;
+    }
     db.execute(
         "INSERT INTO config(key,value) VALUES('schema:snapshot',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
         [SCHEMA_VERSION],
     )?;
-    Ok(())
+    backfill_journal_branch(db)
+}
+
+/// The chunked, resumable `journal_branch` build (`incremental_schema`):
+/// [`JOURNAL_BRANCH_CHUNK`] journal rows per transaction from the cursor
+/// key, with startup progress after each chunk, then the marker. The
+/// triggers already cover every row written since the table was created.
+fn backfill_journal_branch(db: &Connection) -> Result<()> {
+    let value = |key: &str| -> Result<Option<String>> {
+        Ok(db
+            .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
+            .optional()?)
+    };
+    if value(JOURNAL_BRANCH_MARKER)?.is_some() {
+        return Ok(());
+    }
+    if let Some(cursor) = value(JOURNAL_BRANCH_CURSOR)? {
+        let mut cursor: i64 = cursor.parse().unwrap_or(0);
+        loop {
+            let upper: Option<i64> = db.query_row(
+                "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",
+                params![cursor, JOURNAL_BRANCH_CHUNK],
+                |r| r.get(0),
+            )?;
+            let Some(upper) = upper else { break };
+            in_savepoint(db, || {
+                db.execute(
+                    "INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT s.seq,e.branch FROM journal_sequence s JOIN events e ON e.id=s.event WHERE s.seq>?1 AND s.seq<=?2",
+                    params![cursor, upper],
+                )?;
+                db.execute(
+                    "UPDATE config SET value=?2 WHERE key=?1",
+                    params![JOURNAL_BRANCH_CURSOR, upper.to_string()],
+                )?;
+                Ok(())
+            })?;
+            cursor = upper;
+            crate::startup::progress("indexing the journal");
+        }
+    }
+    in_savepoint(db, || {
+        db.execute(
+            "INSERT INTO config(key,value) VALUES(?1,'1') ON CONFLICT(key) DO UPDATE SET value='1'",
+            [JOURNAL_BRANCH_MARKER],
+        )?;
+        db.execute("DELETE FROM config WHERE key=?1", [JOURNAL_BRANCH_CURSOR])?;
+        Ok(())
+    })
+}
+
+/// Runs `f` in its own savepoint (a transaction of its own outside one):
+/// all of its writes or none.
+fn in_savepoint(db: &Connection, f: impl FnOnce() -> Result<()>) -> Result<()> {
+    db.execute_batch("SAVEPOINT snapshot_step")?;
+    match f() {
+        Ok(()) => Ok(db.execute_batch("RELEASE snapshot_step")?),
+        Err(error) => {
+            let _ = db.execute_batch("ROLLBACK TO snapshot_step; RELEASE snapshot_step");
+            Err(error)
+        }
+    }
 }
 
 /// The projection tables' change counter (WP3.INT): every row written to or
@@ -690,46 +807,54 @@ fn journal_hash(db: &Connection, branch: &str, cursor: i64) -> Result<String> {
     Ok(hex::encode(digest.finalize()))
 }
 
+/// A branch's journal rows in `(?1, ?2]` (branch `?3`), in journal order:
+/// the range of `journal_branch_order`, then the journal row and the event
+/// by their keys (`tests::branch_journal_reads_only_the_branchs_range`).
+const BRANCH_JOURNAL_SQL: &str = "SELECT s.seq,e.id,e.payload FROM journal_branch b CROSS JOIN journal_sequence s ON s.seq=b.seq CROSS JOIN events e ON e.id=s.event WHERE b.branch=?3 AND b.seq>?1 AND b.seq<=?2 AND e.branch=?3 ORDER BY b.seq";
+
 /// The resumable journal hash of `branch` over its rows in `(after,
-/// upto]`, continuing `hash`. With a previous seal's state this reads only
-/// the rows since that seal (a range scan of the journal, then one point
-/// lookup per row).
+/// upto]`, continuing `hash`, and how many rows it hashed. With a previous
+/// seal's state this reads only the branch's own rows since that seal: a
+/// range scan of `journal_branch` (`(branch, seq)`), then two point lookups
+/// per row, whatever other branches wrote in between.
 fn extend_journal(
     db: &Connection,
     branch: &str,
     mut hash: JournalHash,
     after: i64,
     upto: i64,
-) -> Result<JournalHash> {
-    let mut statement = db.prepare_cached(
-        "SELECT s.seq,e.id,e.payload FROM journal_sequence s CROSS JOIN events e ON e.id=s.event WHERE s.seq>?1 AND s.seq<=?2 AND e.branch=?3 ORDER BY s.seq",
-    )?;
+) -> Result<(JournalHash, u64)> {
+    let mut statement = db.prepare_cached(BRANCH_JOURNAL_SQL)?;
     let mut rows = statement.query(params![after, upto, branch])?;
+    let mut hashed = 0;
     while let Some(row) = rows.next()? {
         hash.row(
             row.get(0)?,
             row.get_ref(1)?.as_str()?,
             row.get_ref(2)?.as_str()?,
         );
+        hashed += 1;
     }
-    Ok(hash)
+    Ok((hash, hashed))
 }
 
 /// The resumable journal hash of `branch` from its first row to `cursor`
-/// (full seals).
-fn full_journal(db: &Connection, branch: &str, cursor: i64) -> Result<JournalHash> {
+/// (full seals), read from the journal itself, and how many rows it hashed.
+fn full_journal(db: &Connection, branch: &str, cursor: i64) -> Result<(JournalHash, u64)> {
     let mut hash = JournalHash::default();
     let mut statement = db.prepare("SELECT s.seq,e.id,e.payload FROM journal_sequence s JOIN events e ON e.id=s.event WHERE e.branch=? AND s.seq<=? ORDER BY s.seq")?;
     let mut rows = statement.query(params![branch, cursor])?;
+    let mut hashed = 0;
     while let Some(row) = rows.next()? {
         hash.row(
             row.get(0)?,
             row.get_ref(1)?.as_str()?,
             row.get_ref(2)?.as_str()?,
         );
+        hashed += 1;
         crate::startup::progress("sealing startup snapshot");
     }
-    Ok(hash)
+    Ok((hash, hashed))
 }
 
 /// The identity a snapshot binds: repository, device and branch descriptor.
@@ -849,14 +974,29 @@ struct Previous {
     rows: Option<(RowSet, Projection)>,
 }
 
+/// The anchor row's `(cursor, payload, checksum)`, or `None` when a column
+/// does not hold what a seal writes (an integer, UTF-8 texts): a damaged
+/// anchor is no previous seal (snapshots are disposable, invariant 5).
+fn anchor_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<(i64, String, String)>> {
+    let cursor = r.get_ref(0)?.as_i64().ok();
+    let payload = r.get_ref(1)?.as_str().ok().map(str::to_owned);
+    let checksum = r.get_ref(2)?.as_str().ok().map(str::to_owned);
+    Ok(cursor
+        .zip(payload)
+        .zip(checksum)
+        .map(|((c, p), s)| (c, p, s)))
+}
+
+/// The previous seal of the branch, `None` when there is none a seal may
+/// continue from. Never an error for anything the snapshot tables hold:
+/// any unreadable, damaged or foreign anchor is no previous seal, and the
+/// seal is full (which replaces it).
 fn previous(db: &Connection, identity: &Identity, cursor: i64) -> Result<Option<Previous>> {
-    let row: Option<(i64, String, String)> = db
+    let row = db
         .prepare_cached("SELECT cursor,payload,checksum FROM startup_snapshots WHERE branch=?")?
-        .query_row([&identity.branch.id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+        .query_row([&identity.branch.id], anchor_columns)
         .optional()?;
-    let Some((saved, payload, checksum)) = row else {
+    let Some(Some((saved, payload, checksum))) = row else {
         return Ok(None);
     };
     if hash(payload.as_bytes()) != checksum {
@@ -920,6 +1060,8 @@ pub(super) struct SealReport {
     pub(super) bytes: u64,
     pub(super) entity_rows: u64,
     pub(super) conflict_rows: u64,
+    /// Journal rows hashed for the journal binding.
+    pub(super) journal_rows: u64,
     /// The seal used a projection JSON serialized off-lock.
     pub(super) used_json: bool,
     pub(super) micros: u64,
@@ -937,6 +1079,9 @@ pub struct SealStats {
     pub bytes: u64,
     pub entity_rows: u64,
     pub conflict_rows: u64,
+    /// Journal rows hashed (an incremental seal hashes its branch's rows
+    /// since its previous seal; a full seal the branch's whole journal).
+    pub journal_rows: u64,
     pub max_micros: u64,
     pub total_micros: u64,
 }
@@ -952,6 +1097,7 @@ impl SealStats {
         self.bytes += report.bytes;
         self.entity_rows += report.entity_rows;
         self.conflict_rows += report.conflict_rows;
+        self.journal_rows += report.journal_rows;
         self.max_micros = self.max_micros.max(report.micros);
         self.total_micros += report.micros;
     }
@@ -965,8 +1111,12 @@ pub(super) enum Changed<'a> {
     Marked,
     /// The marked ones and these entities (a slow commit's delta).
     Plus(&'a BTreeSet<String>),
-    /// Anything (a rebuild, a rewrite whose change is not known).
+    /// Anything (a rewrite whose change is not known): a full seal.
     All,
+    /// A rebuild: a full seal that trusts nothing of the previous one, its
+    /// journal binding included (recomputed from the journal), so a
+    /// snapshot a startup refused is replaced, never continued.
+    Rebuild,
 }
 
 /// A seal's inputs.
@@ -990,19 +1140,35 @@ pub(super) fn sealed_as_rows(db: &Connection, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The sealed cursor of `branch` and its anchor's length ([`SEALED_SQL`]):
+/// `None` without an anchor, `Some((None, _))` when the cursor is not an
+/// integer (a damaged anchor: its seal is due now, which replaces it).
+fn sealed(db: &Connection, branch: &str) -> Result<Option<(Option<i64>, Option<i64>)>> {
+    Ok(db
+        .prepare_cached(SEALED_SQL)?
+        .query_row([branch], |r| {
+            Ok((
+                r.get_ref(0)?.as_i64().ok(),
+                r.get_ref(1)?.as_i64_or_null().ok().flatten(),
+            ))
+        })
+        .optional()?)
+}
+
 /// Whether a periodic seal of `branch` is due at journal tip `tip` (the
 /// cadence of [`seal_interval`], read with [`SEALED_SQL`]).
 pub(super) fn seal_due(db: &Connection, branch: &str, tip: i64) -> Result<bool> {
-    let saved: Option<(i64, Option<i64>)> = db
-        .prepare_cached(SEALED_SQL)?
-        .query_row([branch], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    Ok(saved.is_none_or(|(saved, bytes)| tip - saved >= seal_interval(bytes)))
+    Ok(match sealed(db, branch)? {
+        Some((Some(saved), bytes)) => tip - saved >= seal_interval(bytes),
+        _ => true,
+    })
 }
 
 /// Seals `branch` in the caller's transaction (module docs): incrementally
 /// when its previous seal is a valid rows anchor and the change is known,
-/// else in full, inline while the anchor fits [`inline_limit`].
+/// else in full, inline while the anchor fits [`inline_limit`]. Whatever
+/// the snapshot tables hold, a seal never fails on them: a damaged anchor,
+/// sealed row or change mark makes the seal full (which replaces them).
 pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<SealReport> {
     let started = Instant::now();
     let cursor = match input.cursor {
@@ -1010,8 +1176,11 @@ pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<Sea
         None => cursor(db, branch)?,
     };
     let identity = Identity::read(db, branch)?;
-    let previous = previous(db, &identity, cursor)?;
-    let journal = match &previous {
+    let previous = match input.changed {
+        Changed::Rebuild => None,
+        _ => previous(db, &identity, cursor)?,
+    };
+    let (journal, journal_rows) = match &previous {
         Some(previous) => extend_journal(
             db,
             branch,
@@ -1022,15 +1191,20 @@ pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<Sea
         None => full_journal(db, branch, cursor)?,
     };
     let frontier = read_frontier(db, branch)?;
-    let mut report = match previous {
+    let incremental = match previous {
         Some(Previous {
             rows: Some((rows, header)),
             ..
-        }) if !matches!(input.changed, Changed::All) => seal_rows_incremental(
+        }) if matches!(input.changed, Changed::Marked | Changed::Plus(_)) => seal_rows_incremental(
             db, branch, &identity, cursor, &journal, &frontier, &input, rows, header,
         )?,
-        _ => seal_full(db, branch, &identity, cursor, &journal, &frontier, &input)?,
+        _ => None,
     };
+    let mut report = match incremental {
+        Some(report) => report,
+        None => seal_full(db, branch, &identity, cursor, &journal, &frontier, &input)?,
+    };
+    report.journal_rows = journal_rows;
     report.micros = started.elapsed().as_micros() as u64;
     Ok(report)
 }
@@ -1058,7 +1232,21 @@ fn seal_full(
             PART_FIELDS.contains(&field) && projection.entries.contains_key(entity)
         })
     });
-    let too_large = projection.entries.len().saturating_mul(MIN_ENTRY_BYTES) > limit;
+    // A lower bound of the inline anchor's size, read without serializing
+    // anything: its entries and its conflict rows (`octet_length` reads no
+    // payload), so a large conflict history is not serialized only to find
+    // it over the limit.
+    let too_large = projection.entries.len().saturating_mul(MIN_ENTRY_BYTES) > limit || {
+        let conflict_bytes: i64 = db
+            .prepare_cached(
+                "SELECT coalesce(sum(octet_length(payload)),0) FROM conflicts WHERE branch=?",
+            )?
+            .query_row([branch], |r| r.get(0))?;
+        usize::try_from(conflict_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(projection.entries.len().saturating_mul(MIN_ENTRY_BYTES))
+            > limit
+    };
     if !(rows_possible && too_large) {
         let json = match input.json {
             Some(json) => Cow::Borrowed(json),
@@ -1141,8 +1329,7 @@ fn seal_full(
         bytes: payload.len() as u64 + rows.bytes,
         entity_rows: rows.entries,
         conflict_rows: rows.conflicts,
-        used_json: false,
-        micros: 0,
+        ..SealReport::default()
     })
 }
 
@@ -1152,16 +1339,78 @@ fn clear_marks(db: &Connection, branch: &str) -> Result<()> {
     Ok(())
 }
 
-/// The marked keys of `branch` of one kind (0: entities, 1: conflicts).
-fn marks(db: &Connection, branch: &str, kind: i64) -> Result<BTreeSet<String>> {
-    Ok(db
-        .prepare_cached("SELECT key FROM snapshot_dirty WHERE branch=? AND kind=?")?
-        .query_map(params![branch, kind], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?)
+/// The marked keys of `branch` of one kind (0: entities, 1: conflicts);
+/// `None` when a mark's key is not UTF-8 text (a damaged mark names no
+/// known key: the seal is full).
+fn marks(db: &Connection, branch: &str, kind: i64) -> Result<Option<BTreeSet<String>>> {
+    let mut statement =
+        db.prepare_cached("SELECT key FROM snapshot_dirty WHERE branch=? AND kind=?")?;
+    let mut rows = statement.query(params![branch, kind])?;
+    let mut keys = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        let Ok(key) = row.get_ref(0)?.as_str() else {
+            return Ok(None);
+        };
+        keys.insert(key.to_owned());
+    }
+    Ok(Some(keys))
+}
+
+/// A sealed row as read back for an incremental seal: `Ok(None)` without
+/// a row, `Err(())` when the row does not hold the UTF-8 texts a seal
+/// writes (a damaged row: the seal is full, which replaces every row).
+type SealedRow<T> = std::result::Result<Option<T>, ()>;
+
+fn sealed_entity(
+    statement: &mut rusqlite::CachedStatement<'_>,
+    branch: &str,
+    entity: &str,
+) -> Result<SealedRow<(String, String)>> {
+    let row = statement
+        .query_row(params![branch, entity], |r| {
+            Ok(match (r.get_ref(0)?.as_str(), r.get_ref(1)?.as_str()) {
+                (Ok(entry), Ok(heads)) => Some((entry.to_owned(), heads.to_owned())),
+                _ => None,
+            })
+        })
+        .optional()?;
+    Ok(match row {
+        None => Ok(None),
+        Some(Some(texts)) => Ok(Some(texts)),
+        Some(None) => Err(()),
+    })
+}
+
+fn sealed_conflict(
+    statement: &mut rusqlite::CachedStatement<'_>,
+    branch: &str,
+    id: &str,
+) -> Result<SealedRow<(String, Option<String>)>> {
+    let row = statement
+        .query_row(params![branch, id], |r| {
+            Ok(
+                match (r.get_ref(0)?.as_str(), r.get_ref(1)?.as_str_or_null()) {
+                    (Ok(payload), Ok(resolved_by)) => {
+                        Some((payload.to_owned(), resolved_by.map(str::to_owned)))
+                    }
+                    _ => None,
+                },
+            )
+        })
+        .optional()?;
+    Ok(match row {
+        None => Ok(None),
+        Some(Some(texts)) => Ok(Some(texts)),
+        Some(None) => Err(()),
+    })
 }
 
 /// An incremental rows seal: the rows of the entities and conflicts that
-/// changed since the previous seal, then the anchor.
+/// changed since the previous seal, then the anchor. `None` when the
+/// previous seal cannot be continued (a malformed digest, a damaged mark or
+/// sealed row): the caller seals in full, which deletes and rewrites every
+/// row of the branch in the same transaction, so rows this one wrote before
+/// it found the damage are replaced too.
 #[allow(clippy::too_many_arguments)]
 fn seal_rows_incremental(
     db: &Connection,
@@ -1173,10 +1422,16 @@ fn seal_rows_incremental(
     input: &Seal<'_>,
     mut rows: RowSet,
     header: Projection,
-) -> Result<SealReport> {
-    let mut digest =
-        RowsDigest::parse(&rows.digest).context("SNAPSHOT_CHECKSUM: malformed rows digest")?;
-    let mut entities = marks(db, branch, 0)?;
+) -> Result<Option<SealReport>> {
+    let Some(mut digest) = RowsDigest::parse(&rows.digest) else {
+        return Ok(None);
+    };
+    let Some(mut entities) = marks(db, branch, 0)? else {
+        return Ok(None);
+    };
+    let Some(conflict_marks) = marks(db, branch, 1)? else {
+        return Ok(None);
+    };
     if let Changed::Plus(extra) = input.changed {
         entities.extend(extra.iter().cloned());
     }
@@ -1220,9 +1475,9 @@ fn seal_rows_incremental(
                     }
                 },
             };
-            let old: Option<(String, String)> = old_row
-                .query_row(params![branch, entity], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
+            let Ok(old) = sealed_entity(&mut old_row, branch, entity)? else {
+                return Ok(None);
+            };
             if old == new {
                 continue;
             }
@@ -1260,13 +1515,13 @@ fn seal_rows_incremental(
         )?;
         let mut delete =
             db.prepare_cached("DELETE FROM snapshot_conflicts WHERE branch=? AND id=?")?;
-        for id in marks(db, branch, 1)? {
+        for id in conflict_marks {
             let new: Option<(String, Option<String>)> = current
                 .query_row(params![id, branch], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            let old: Option<(String, Option<String>)> = old_row
-                .query_row(params![branch, id], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
+            let Ok(old) = sealed_conflict(&mut old_row, branch, &id)? else {
+                return Ok(None);
+            };
             if old == new {
                 continue;
             }
@@ -1320,17 +1575,17 @@ fn seal_rows_incremental(
         Some(&rows),
     )?;
     write_anchor(db, branch, cursor, &payload)?;
-    Ok(SealReport {
+    Ok(Some(SealReport {
         mode: SealMode::RowsIncremental,
         bytes: payload.len() as u64 + written_bytes,
         entity_rows: written_entities,
         conflict_rows: written_conflicts,
-        used_json: false,
-        micros: 0,
-    })
+        ..SealReport::default()
+    }))
 }
 
-/// Seals `branch` in full from its stored projection (a rebuild).
+/// Seals `branch` in full from its stored projection and journal (a
+/// rebuild): nothing of the previous seal is reused.
 pub(super) fn persist(db: &Connection, branch: &str) -> Result<()> {
     seal(
         db,
@@ -1339,7 +1594,7 @@ pub(super) fn persist(db: &Connection, branch: &str) -> Result<()> {
             cursor: None,
             projection: None,
             json: None,
-            changed: Changed::All,
+            changed: Changed::Rebuild,
         },
     )?;
     Ok(())
@@ -1438,12 +1693,11 @@ impl Store {
             .db
             .prepare_cached("SELECT coalesce(max(seq),0) FROM journal_sequence")?
             .query_row([], |r| r.get(0))?;
-        let saved: Option<(i64, Option<i64>)> = self
-            .db
-            .prepare_cached(SEALED_SQL)?
-            .query_row([branch], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
-        Ok(saved.map_or(0, |(saved, bytes)| seal_interval(bytes) - (tip - saved)))
+        Ok(match sealed(&self.db, branch)? {
+            Some((Some(saved), bytes)) => seal_interval(bytes) - (tip - saved),
+            // No seal yet, or a damaged one: the next commit seals.
+            _ => 0,
+        })
     }
 
     /// Seals `branch` now, from the rows marked since its previous seal (a
@@ -1736,21 +1990,27 @@ impl Store {
                     projection.entries.insert(entity, entry);
                     projection.heads.extend(heads);
                 }
-                self.db
-                    .execute("DELETE FROM current_parts WHERE branch=?", [id])?;
                 if projection.entries.len() <= super::commit::FOLD_MAX_ENTRIES {
                     // A projection a slow commit would fold is stored as one
                     // `current_state` row, as an inline restore stores it.
+                    self.db
+                        .execute("DELETE FROM current_parts WHERE branch=?", [id])?;
                     self.db.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload", params![id, serde_json::to_string(&projection)?])?;
                 } else {
-                    // A large one keeps its rows: the header, then one
-                    // `current_parts` row per entity (copied, not serialized).
-                    self.db.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload", params![id, header])?;
-                    self.db.execute("INSERT INTO current_parts(branch,entity,entry,heads) SELECT branch,entity,entry,heads FROM snapshot_entries WHERE branch=?", [id])?;
+                    // A large one is stored as the header plus one
+                    // `current_parts` row per entity, equal to the sealed
+                    // rows. Only what differs from them is written (the
+                    // rows changed since the seal, normally the marked
+                    // ones): an open at the tip rewrites nothing, instead
+                    // of every row (each with its triggers) and its commit.
+                    self.db.execute("INSERT INTO current_state VALUES(?1,?2) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload WHERE current_state.payload IS NOT excluded.payload", params![id, header])?;
+                    self.db.execute("DELETE FROM current_parts WHERE branch=?1 AND NOT EXISTS(SELECT 1 FROM snapshot_entries s WHERE s.branch=?1 AND s.entity=current_parts.entity AND s.entry IS current_parts.entry AND s.heads IS current_parts.heads)", [id])?;
+                    self.db.execute("INSERT INTO current_parts(branch,entity,entry,heads) SELECT s.branch,s.entity,s.entry,s.heads FROM snapshot_entries s WHERE s.branch=?1 AND NOT EXISTS(SELECT 1 FROM current_parts p WHERE p.branch=?1 AND p.entity=s.entity)", [id])?;
                 }
-                self.db
-                    .execute("DELETE FROM conflicts WHERE branch=?", [id])?;
-                self.db.execute("INSERT INTO conflicts(id,branch,payload,resolved_by) SELECT id,branch,payload,resolved_by FROM snapshot_conflicts WHERE branch=?", [id])?;
+                // The conflict rows, likewise: those that differ from the
+                // sealed ones are replaced.
+                self.db.execute("DELETE FROM conflicts WHERE branch=?1 AND NOT EXISTS(SELECT 1 FROM snapshot_conflicts s WHERE s.branch=?1 AND s.id=conflicts.id AND s.payload IS conflicts.payload AND s.resolved_by IS conflicts.resolved_by)", [id])?;
+                self.db.execute("INSERT INTO conflicts(id,branch,payload,resolved_by) SELECT s.id,s.branch,s.payload,s.resolved_by FROM snapshot_conflicts s WHERE s.branch=?1 AND NOT EXISTS(SELECT 1 FROM conflicts c WHERE c.id=s.id AND c.branch=?1)", [id])?;
                 projection
             }
         };
@@ -1884,5 +2144,62 @@ mod tests {
         two.toggle(b);
         assert!(two == RowsDigest::default());
         assert_eq!(RowsDigest::parse(&one.hex()).map(|d| d.0), Some(one.0));
+    }
+
+    /// An incremental seal's journal read is a range of its own branch's
+    /// rows in `journal_branch_order`, then key lookups: never a scan of the
+    /// journal's rows in the range (every branch's), which made a seal after
+    /// a large catch-up on another branch O(gap).
+    #[test]
+    fn branch_journal_reads_only_the_branchs_range() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE events(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE current_state(branch TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE current_parts(branch TEXT NOT NULL,entity TEXT NOT NULL,entry TEXT NOT NULL,heads TEXT NOT NULL,PRIMARY KEY(branch,entity));
+            CREATE TABLE conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);",
+        )
+        .unwrap();
+        initialize(&db).unwrap();
+        // Two branches, interleaved, through the triggers.
+        for i in 0..200 {
+            let branch = if i % 10 == 0 { "own" } else { "other" };
+            db.execute(
+                "INSERT INTO events VALUES(?,?,'{}')",
+                params![format!("e{i:03}"), branch],
+            )
+            .unwrap();
+        }
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {BRANCH_JOURNAL_SQL}"))
+            .unwrap()
+            .query_map(params![0, 1000, "own"], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(plan.len(), 3, "{plan:?}");
+        assert!(
+            plan[0].contains("journal_branch_order") && plan[0].contains("branch=? AND seq>?"),
+            "{plan:?}"
+        );
+        assert!(plan[1].contains("PRIMARY KEY"), "{plan:?}");
+        assert!(plan[2].contains("USING INDEX"), "{plan:?}");
+        // And it reads exactly the branch's rows in the range.
+        let (hash, hashed) = extend_journal(&db, "own", JournalHash::default(), 50, 150).unwrap();
+        assert_eq!(hashed, 10);
+        let mut expected = JournalHash::default();
+        let mut statement = db
+            .prepare("SELECT s.seq,e.id,e.payload FROM journal_sequence s JOIN events e ON e.id=s.event WHERE e.branch='own' AND s.seq>50 AND s.seq<=150 ORDER BY s.seq")
+            .unwrap();
+        let mut rows = statement.query([]).unwrap();
+        while let Some(row) = rows.next().unwrap() {
+            expected.row(
+                row.get(0).unwrap(),
+                row.get_ref(1).unwrap().as_str().unwrap(),
+                row.get_ref(2).unwrap().as_str().unwrap(),
+            );
+        }
+        assert_eq!(hash, expected);
     }
 }

@@ -15,14 +15,19 @@
 //! - Random two-replica workloads with deliveries (legacy receive and the
 //!   prepared off-lock path), reviews, restarts and crashes, in both layouts:
 //!   the strict oracle is empty and every snapshot valid after every step.
-//! - Damaged rows, an older snapshot format and a stale header reconstruct.
+//! - Damaged rows, an older snapshot format and a stale header reconstruct;
+//!   a damaged column (non-UTF-8 or BLOB text, a non-integer cursor) never
+//!   blocks an open or a commit.
+//! - A seal hashes only its own branch's journal rows since its previous
+//!   seal (`journal_branch`); a restart writes only the projection rows that
+//!   differ from the snapshot.
 //!
 //! The thread's inline limit (`set_thread_inline_limit`) picks the layout
 //! in-process; a crash child reads `TKFS_SNAPSHOT_INLINE_LIMIT`.
 mod support;
 
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -210,6 +215,7 @@ fn delta(after: SealStats, before: SealStats) -> SealStats {
         bytes: after.bytes - before.bytes,
         entity_rows: after.entity_rows - before.entity_rows,
         conflict_rows: after.conflict_rows - before.conflict_rows,
+        journal_rows: after.journal_rows - before.journal_rows,
         max_micros: after.max_micros,
         total_micros: after.total_micros - before.total_micros,
     }
@@ -662,21 +668,14 @@ fn seal_crash_child() {
         }
         // A startup that replays a tail and reseals.
         "open" => drop(open(&root)),
-        // Saves of the first alive file (the random workload; a file is
-        // created first when the workload left none).
+        // Saves of a file of its own (the random workload). A new file has
+        // no conflict: saves of a file with an unresolved content conflict
+        // (each based on the winning revision only) would each add
+        // conflict rows, and the inline layout seals every one of them
+        // (hundreds of MB after a few crash steps).
         "touch" => {
             let mut s = open(&root);
-            let alive = s
-                .projection(&s.active)
-                .unwrap()
-                .entries
-                .values()
-                .find(|e| e.alive && e.kind == "file")
-                .map(|e| e.id.clone());
-            let file = match alive {
-                Some(file) => file,
-                None => s.create(&format!("touch-{}", id()), "file").unwrap().id,
-            };
+            let file = s.create(&format!("touch-{}", id()), "file").unwrap().id;
             for i in 0..140 {
                 let entry = s.entry(&file).unwrap();
                 s.write_revision(
@@ -1286,6 +1285,179 @@ fn damaged_rows_and_older_snapshots_are_reconstructed() {
     }
 }
 
+/// A sealed store with a conflict row, at its tip (rows layout).
+fn sealed_with_conflict(root: &Path) {
+    let mut s = open(root);
+    s.create("file", "file").unwrap();
+    for i in 0..60 {
+        s.create(&format!("f{i:03}"), "file").unwrap();
+    }
+    let entry = s.lookup("file").unwrap();
+    let (content, alive) = (
+        entry.revisions.get("content").cloned(),
+        entry.revisions.get("alive").cloned(),
+    );
+    s.write_with_base(&entry.id, content.clone(), alive.clone(), b"one")
+        .unwrap();
+    s.write_with_base(&entry.id, content, alive, b"two")
+        .unwrap();
+    assert_eq!(s.conflicts().unwrap().len(), 1);
+    drop(s);
+    let s = open(root);
+    assert_eq!(s.startup_resumes(), 1);
+    assert_eq!(assert_snapshots(&s, "sealed"), 1);
+}
+
+/// Damages of the snapshot tables' columns: a non-UTF-8 text or a BLOB
+/// where a seal writes UTF-8 text, a cursor that is not an integer. `{e}`
+/// is the entity whose row is damaged.
+const COLUMN_DAMAGES: [(&str, &str); 10] = [
+    (
+        "anchor_payload_not_utf8",
+        "UPDATE startup_snapshots SET payload=CAST(X'FF' AS TEXT)||payload",
+    ),
+    (
+        "anchor_payload_blob",
+        "UPDATE startup_snapshots SET payload=CAST(payload AS BLOB)",
+    ),
+    (
+        "anchor_checksum_blob",
+        "UPDATE startup_snapshots SET checksum=CAST(checksum AS BLOB)",
+    ),
+    (
+        "anchor_cursor_text",
+        "UPDATE startup_snapshots SET cursor='damaged'",
+    ),
+    (
+        "entry_not_utf8",
+        "UPDATE snapshot_entries SET entry=CAST(X'FF' AS TEXT)||entry WHERE entity='{e}'",
+    ),
+    (
+        "heads_blob",
+        "UPDATE snapshot_entries SET heads=CAST(heads AS BLOB) WHERE entity='{e}'",
+    ),
+    (
+        "conflict_payload_blob",
+        "UPDATE snapshot_conflicts SET payload=CAST(payload AS BLOB)",
+    ),
+    (
+        "conflict_resolved_blob",
+        "UPDATE snapshot_conflicts SET resolved_by=X'FF'",
+    ),
+    (
+        "entity_mark_blob",
+        "INSERT INTO snapshot_dirty(branch,kind,key) SELECT branch,0,X'FF' FROM startup_snapshots",
+    ),
+    (
+        "conflict_mark_not_utf8",
+        "INSERT INTO snapshot_dirty(branch,kind,key) SELECT branch,1,CAST(X'FFFE' AS TEXT) FROM startup_snapshots",
+    ),
+];
+
+/// Commits after a damage: the conflict's review (a slow commit and its
+/// forced seal, which reads the conflict's sealed row), then saves of
+/// `f000` (whose sealed row the entity damages hit) through two periodic
+/// seals. Every commit must succeed, with `full` a seal must have been full
+/// (it replaced the damage), and every snapshot is valid afterwards.
+fn commits_keep_sealing(s: &mut Store, context: &str, full: bool) {
+    let before = s.seal_stats();
+    let branch = s.active.clone();
+    let open: Vec<Conflict> = s
+        .conflicts()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.resolved_by.is_none())
+        .collect();
+    if let Some(conflict) = open.first() {
+        let selected = conflict.alternatives[0].revision.clone();
+        s.resolve(std::slice::from_ref(&conflict.id), &selected)
+            .unwrap_or_else(|error| panic!("{context}: the review: {error:#}"));
+    }
+    let saves = s.seal_due_in(&branch).unwrap().max(1) + MIN_SEAL_INTERVAL;
+    for i in 0..saves {
+        let entry = s.lookup("f000").unwrap();
+        s.write_revision(
+            &entry.id,
+            entry.revisions.get("content").cloned(),
+            format!("{context} {i}").as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("{context}: save {i}: {error:#}"));
+    }
+    let seals = delta(s.seal_stats(), before);
+    assert!(seals.seals >= 2, "{context}: {seals:?}");
+    assert!(
+        !full || seals.rows_full + seals.inline >= 1,
+        "{context}: a full seal replaced the damage: {seals:?}"
+    );
+    assert_snapshots(s, context);
+    assert_oracle(s, context);
+}
+
+/// Invariant 5 (snapshots are disposable), whatever the snapshot tables
+/// hold: a non-UTF-8 or BLOB anchor, checksum, sealed row or change mark,
+/// or a cursor that is not an integer, never blocks an open or a commit.
+/// Found by an open, the store reconstructs (marks are only cleared by the
+/// restore, which resumes); found by a commit's seal (the store open when
+/// the damage lands), the seal is full and replaces it. Either way the
+/// store keeps committing and sealing, and the next open resumes.
+#[test]
+fn damaged_snapshot_columns_never_block_opens_or_commits() {
+    let _layout = Layout::rows();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("b");
+    sealed_with_conflict(&root);
+    let (expected, conflicts, f000) = {
+        let s = open(&root);
+        (
+            s.projection(&s.active).unwrap(),
+            stored_conflicts(&s, &s.active),
+            s.lookup("f000").unwrap().id,
+        )
+    };
+    for (damage, sql) in COLUMN_DAMAGES {
+        let sql = sql.replace("{e}", &f000);
+        let marks_only = damage.ends_with("_mark_blob") || damage.ends_with("_mark_not_utf8");
+        // Found by an open.
+        let copy = tempfile::tempdir().unwrap();
+        let state = copy.path().join("b");
+        copy_dir(&root, &state).unwrap();
+        let db = Connection::open(state.join("metadata.sqlite")).unwrap();
+        assert_eq!(db.execute(&sql, []).unwrap(), 1, "{damage}");
+        drop(db);
+        let context = format!("{damage} at open");
+        let mut s = Store::open(&state, Some(REPO))
+            .unwrap_or_else(|error| panic!("{context}: the open failed: {error:#}"));
+        assert_eq!(
+            s.startup_resumes(),
+            u64::from(marks_only),
+            "{context}: reconstructed unless only marks were damaged"
+        );
+        assert_eq!(s.projection(&s.active).unwrap(), expected, "{context}");
+        assert_eq!(stored_conflicts(&s, &s.active), conflicts, "{context}");
+        assert_snapshots(&s, &context);
+        commits_keep_sealing(&mut s, &context, false);
+        drop(s);
+        // Found by a commit's seal: the damage lands while the store is
+        // open (another connection), after its open resumed.
+        let copy = tempfile::tempdir().unwrap();
+        let state = copy.path().join("b");
+        copy_dir(&root, &state).unwrap();
+        let context = format!("{damage} at a commit");
+        let mut s = open(&state);
+        assert_eq!(s.startup_resumes(), 1, "{context}");
+        let db = Connection::open(state.join("metadata.sqlite")).unwrap();
+        assert_eq!(db.execute(&sql, []).unwrap(), 1, "{context}");
+        drop(db);
+        commits_keep_sealing(&mut s, &context, true);
+        let expected = s.projection(&s.active).unwrap();
+        drop(s);
+        let mut s = open(&state);
+        assert_eq!(s.startup_resumes(), 1, "{context}: the next open resumes");
+        assert_eq!(s.projection(&s.active).unwrap(), expected, "{context}");
+        assert_oracle(&mut s, &context);
+    }
+}
+
 /// Flips one hex digit of a journal state (it then finalizes to another
 /// digest).
 struct JournalStateForge(String);
@@ -1344,4 +1516,227 @@ fn branches_seal_from_their_own_marks() {
         assert_eq!(s.projection(&branch).unwrap(), projection);
     }
     assert_oracle(&mut s, "two layouts after a restart");
+}
+
+// ---------------------------------------------------------------------------
+// Per-branch journal index and restore cost
+
+/// Every journal row's branch, as the journal itself names it.
+fn journal_branches(db: &Connection) -> Vec<(i64, String)> {
+    db.prepare("SELECT s.seq,e.branch FROM journal_sequence s JOIN events e ON e.id=s.event ORDER BY s.seq")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The per-branch journal index (`journal_branch`).
+fn indexed_branches(db: &Connection) -> Vec<(i64, String)> {
+    db.prepare("SELECT seq,branch FROM journal_branch ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The sealed cursor of `branch`.
+fn sealed_cursor(s: &Store, branch: &str) -> i64 {
+    s.db.query_row(
+        "SELECT cursor FROM startup_snapshots WHERE branch=?",
+        [branch],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A seal hashes only its own branch's journal rows since its previous
+/// seal, however many rows other branches added in between: `main`'s first
+/// seal after 300 commits on a side branch hashes `main`'s one new row, not
+/// the 300 (both layouts; the index is `journal_branch`).
+#[test]
+fn a_seal_hashes_only_its_own_branchs_journal_rows() {
+    for rows in [true, false] {
+        let _layout = Layout::of(rows);
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        s.create("small", "file").unwrap();
+        let main = s.active.clone();
+        drop(s);
+        let mut s = open(dir.path());
+        let side = s.fork("side", true).unwrap();
+        s.checkout(&side.id).unwrap();
+        for i in 0..300 {
+            s.create(&format!("side-{i:04}"), "file").unwrap();
+        }
+        s.checkout(&main).unwrap();
+        assert!(
+            s.seal_due_in(&main).unwrap() <= 1,
+            "main's next commit seals"
+        );
+        let previous = sealed_cursor(&s, &main);
+        let before = s.seal_stats();
+        save(&mut s, "small", b"after the gap");
+        let seal = delta(s.seal_stats(), before);
+        assert_eq!(seal.seals, 1, "{seal:?}");
+        let now = sealed_cursor(&s, &main);
+        let own = journal(&s, &main)
+            .iter()
+            .filter(|(seq, _)| *seq > previous && *seq <= now)
+            .count() as u64;
+        let all: i64 =
+            s.db.query_row(
+                "SELECT count(*) FROM journal_sequence WHERE seq>? AND seq<=?",
+                [previous, now],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(all > 300, "the gap: {all} journal rows");
+        assert_eq!(own, 1, "main's own rows since its seal");
+        assert_eq!(
+            seal.journal_rows, own,
+            "the seal hashed main's rows only: {seal:?}"
+        );
+        assert_eq!(indexed_branches(&s.db), journal_branches(&s.db));
+        assert_snapshots(&s, "after the gap");
+        drop(s);
+        let mut s = open(dir.path());
+        assert!(s.startup_resumes() >= 1);
+        assert_oracle(&mut s, "after the gap and a restart");
+    }
+}
+
+/// A store without the per-branch journal index (written by a binary
+/// before it) gets it built from the journal at its next open, row for row
+/// as the triggers keep it (inserts, a changed event, a deleted event), and
+/// seals incrementally from it.
+#[test]
+fn the_journal_index_is_built_for_an_older_store() {
+    let _layout = Layout::rows();
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = open(dir.path());
+    for i in 0..40 {
+        s.create(&format!("f{i:03}"), "file").unwrap();
+    }
+    let main = s.active.clone();
+    let side = s.fork("side", true).unwrap();
+    s.checkout(&side.id).unwrap();
+    for i in 0..40 {
+        s.create(&format!("s{i:03}"), "file").unwrap();
+    }
+    s.checkout(&main).unwrap();
+    assert_eq!(indexed_branches(&s.db), journal_branches(&s.db));
+    drop(s);
+    let db = Connection::open(dir.path().join("metadata.sqlite")).unwrap();
+    db.execute_batch(
+        "DROP TRIGGER journal_branch_insert; DROP TRIGGER journal_branch_update;
+        DROP TRIGGER journal_branch_delete; DROP TABLE journal_branch;
+        DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+    )
+    .unwrap();
+    drop(db);
+    let mut s = open(dir.path());
+    assert_eq!(
+        indexed_branches(&s.db),
+        journal_branches(&s.db),
+        "built from the journal"
+    );
+    let config = |s: &Store, key: &str| -> Option<String> {
+        s.db.query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
+            .optional()
+            .unwrap()
+    };
+    assert_eq!(
+        config(&s, "snapshot_journal_branch_v1").as_deref(),
+        Some("1")
+    );
+    assert_eq!(config(&s, "snapshot_journal_branch_v1_cursor"), None);
+    let before = s.seal_stats();
+    for i in 0..MIN_SEAL_INTERVAL {
+        save(&mut s, "f000", format!("{i}").as_bytes());
+    }
+    let seals = delta(s.seal_stats(), before);
+    assert_eq!(seals.rows_incremental, 1, "{seals:?}");
+    assert_eq!(indexed_branches(&s.db), journal_branches(&s.db));
+    assert_snapshots(&s, "after the build");
+    assert_oracle(&mut s, "after the build");
+    drop(s);
+    // Its triggers follow a changed and a deleted journal row (repair tools,
+    // older binaries) as `journal_sequence` does.
+    let db = Connection::open(dir.path().join("metadata.sqlite")).unwrap();
+    let (first, last): (String, String) = db
+        .query_row(
+            "SELECT (SELECT event FROM journal_sequence ORDER BY seq LIMIT 1),(SELECT event FROM journal_sequence ORDER BY seq DESC LIMIT 1)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    db.execute(
+        "UPDATE events SET branch=? WHERE id=?",
+        params![side.id, first],
+    )
+    .unwrap();
+    db.execute("DELETE FROM events WHERE id=?", [last]).unwrap();
+    assert_eq!(indexed_branches(&db), journal_branches(&db));
+}
+
+/// A restart at the tip of a large rows snapshot writes no projection row
+/// (`projection_version` is unchanged), and one with a tail writes only the
+/// tail's entities, not every entity (WP3.INT rewrote `current_state` whole
+/// at every open; this package's first restore copied every row).
+#[test]
+fn a_restart_writes_only_the_rows_that_differ_from_the_snapshot() {
+    let _layout = Layout::rows();
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = open(dir.path());
+    linear_history(&mut s, FOLD_MAX_ENTRIES + 50).unwrap();
+    drop(s);
+    let read = |sql: &str| -> i64 {
+        Connection::open(dir.path().join("metadata.sqlite"))
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
+    };
+    let version = || read("SELECT version FROM projection_version WHERE id=1");
+    let s = open(dir.path());
+    assert_eq!(s.startup_resumes(), 1);
+    let expected = s.projection(&s.active).unwrap();
+    assert!(expected.entries.len() > FOLD_MAX_ENTRIES);
+    drop(s);
+    assert_eq!(
+        read("SELECT count(*) FROM current_parts"),
+        expected.entries.len() as i64,
+        "a large projection is stored as one row per entity"
+    );
+    let before = version();
+    let s = open(dir.path());
+    assert_eq!(s.startup_resumes(), 1);
+    assert_eq!(s.projection(&s.active).unwrap(), expected);
+    drop(s);
+    assert_eq!(
+        version(),
+        before,
+        "an open at the tip writes no projection row"
+    );
+    // A tail of 20 saves.
+    let mut s = open(dir.path());
+    for i in 0..20 {
+        save(&mut s, &format!("lin-{i:06}.txt"), b"tail");
+    }
+    let expected = s.projection(&s.active).unwrap();
+    drop(s);
+    let before = version();
+    let mut s = open(dir.path());
+    let writes = version() - before;
+    assert_eq!(s.startup_resumes(), 1);
+    assert_eq!(s.projection(&s.active).unwrap(), expected);
+    // The 20 rows the restore resets (a delete and an insert each) and the
+    // replay writes again.
+    assert!(
+        writes <= 3 * 20 + 4,
+        "the open wrote {writes} projection rows for a 20-event tail"
+    );
+    assert_eq!(assert_snapshots(&s, "after the tail's replay"), 1);
+    assert_oracle(&mut s, "after the tail's replay");
 }
