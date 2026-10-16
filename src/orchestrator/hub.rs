@@ -1531,11 +1531,18 @@ struct PairEntry {
     touched: u64,
     /// The last exchange in which the peer moved objects to us (monotonic):
     /// the evidence that a peer without a published entry supplies
-    /// (`rules::may_supply`).
+    /// (`rules::may_supply`), and that a peer missing at least as much as we
+    /// do still holds something we miss (`rules::download_work_with_evidence`).
     supplied: Option<u64>,
+    /// The last exchange in which we moved objects to the peer (monotonic):
+    /// the evidence that we hold something it misses while we miss at least
+    /// as much as it does (`rules::upload_work_with_evidence`).
+    served: Option<u64>,
     /// Download work was attributed to the peer at the last tick (a change
     /// of attribution is not progress).
     supplying: bool,
+    /// Upload work was attributed to the pair at the last tick (likewise).
+    serving: bool,
 }
 
 type PairKey = (String, String);
@@ -1576,8 +1583,11 @@ struct HubState {
 struct PairFacts {
     inputs: PeerInputs,
     work: Work,
-    /// Download work may be attributed to the peer (`rules::may_supply`).
+    /// Download work is attributed to the peer (`rules::may_supply`, then
+    /// `rules::supplies_download`).
     supplies: bool,
+    /// Upload work is attributed to the pair (`rules::supplies_upload`).
+    serves: bool,
     meta: MetaProgress,
     direction: Direction,
     /// When the stall began (monotonic).
@@ -2521,6 +2531,10 @@ impl HubState {
                 // Evidence that the peer supplies objects (`rules::may_supply`).
                 pair.supplied = Some(now.mono);
             }
+            if x.bytes_up >= rules::PROGRESS_MIN_BYTES || x.objects_up > 0 {
+                // Evidence that we supply the peer (`rules::upload_work_with_evidence`).
+                pair.served = Some(now.mono);
+            }
             if completed_down {
                 pair.last_down_ms = Some(now.ms);
             }
@@ -2768,10 +2782,10 @@ impl HubState {
                 let pair = self.pairs.get(&key);
                 let facts = self.pair_facts(state, folder, view, peer, pair, now, cfg);
                 pair_work.insert(key.clone(), (facts.inputs.shared, facts.work));
-                updates.push((key, facts.inputs, facts.work, facts.supplies));
+                updates.push((key, facts.inputs, facts.work, facts.supplies, facts.serves));
             }
         }
-        for (key, inputs, work, supplies) in updates {
+        for (key, inputs, work, supplies, serves) in updates {
             let eligible = inputs.can_progress() && inputs.work_remaining();
             if !eligible && !self.pairs.contains_key(&key) {
                 continue;
@@ -2783,6 +2797,11 @@ impl HubState {
                     // because anything was downloaded.
                     before.down_bytes = 0;
                     before.down_objects = 0;
+                }
+                if pair.serving && !serves {
+                    // Likewise for the upload work.
+                    before.up_bytes = 0;
+                    before.up_objects = 0;
                 }
                 if rules::progressed(&before, &work) {
                     // Shown as the pair's `last_progress_ms`, and per
@@ -2800,6 +2819,7 @@ impl HubState {
                 }
             }
             pair.supplying = supplies;
+            pair.serving = serves;
             pair.work = Some(work);
             if work.down_bytes == 0 && work.down_objects == 0 && pair.down_episode != 0 {
                 pair.down_episode = 0;
@@ -3046,11 +3066,25 @@ impl HubState {
         );
         let local_content = folder.content().filter(|_| shared && supplies);
         let remote_content = entry.and_then(|entry| entry.content.as_ref());
+        // Where the counters cannot tell whether one side holds something the
+        // other misses (it misses at least as much), objects that moved
+        // within the stall threshold decide (WP3.INT re-review 2: a peer that
+        // misses a superset of what we miss read as a download source). The
+        // work of a direction is attributed to the pair only while that
+        // holds: when it stops holding, the work leaves with its attribution,
+        // which is no progress (`tick`).
+        let lately = |at: Option<u64>| rules::lately(at, now.mono, cfg.stall_after);
+        let supplied = lately(pair.and_then(|pair| pair.supplied));
+        let served = lately(pair.and_then(|pair| pair.served));
+        let supplies = local_content
+            .is_some_and(|local| rules::supplies_download(local, remote_content, supplied));
+        let serves = remote_content
+            .is_some_and(|remote| rules::supplies_upload(folder.content(), remote, served));
         let (down_objects, down_bytes) = local_content
-            .map(|local| rules::download_work(local, remote_content))
+            .map(|local| rules::download_work_with_evidence(local, remote_content, supplied))
             .unwrap_or_default();
         let (up_objects, up_bytes) = remote_content
-            .map(|remote| rules::upload_work(folder.content(), remote))
+            .map(|remote| rules::upload_work_with_evidence(folder.content(), remote, served))
             .unwrap_or_default();
         let work = Work {
             meta: meta_work_of(&meta),
@@ -3151,6 +3185,7 @@ impl HubState {
             inputs,
             work,
             supplies,
+            serves,
             meta,
             direction,
             stalled_since,

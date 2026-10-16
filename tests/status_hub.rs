@@ -5252,7 +5252,11 @@ fn a_peer_that_still_reaches_us_after_a_rotation_is_not_unreachable() {
 /// Each side missing different objects (v3 network re-review minor): while
 /// we upload a lot to the peer, what we miss that it holds is still a
 /// download; two replicas missing the very same objects owe each other
-/// nothing.
+/// nothing. The counters alone cannot tell a peer that misses other objects
+/// than we do from one that misses a superset of ours (WP3.INT re-review 2:
+/// that peer read as a download source, `1 file to download`, for the whole
+/// upload): when the peer misses at least as many objects and bytes as we
+/// do, only per-pair evidence (its objects reached us lately) makes it one.
 #[test]
 fn download_work_shows_when_each_side_misses_different_objects() {
     // We miss one 64 KiB object; the peer misses three 6 MiB ones we hold.
@@ -5268,14 +5272,58 @@ fn download_work_shows_when_each_side_misses_different_objects() {
         shared_missing_bytes: 18 * 1024 * 1024,
         ..ContentCounters::default()
     };
-    assert_eq!(rules::download_work(&ours, Some(&theirs)), (1, 64 * 1024));
+    // The peer's objects reach us: the download shows.
+    assert_eq!(
+        rules::download_work_with_evidence(&ours, Some(&theirs), true),
+        (1, 64 * 1024)
+    );
+    // The totals alone cannot say (it misses more objects and bytes).
+    assert_eq!(rules::download_work(&ours, Some(&theirs)), (0, 0));
+    // We miss fewer: our upload shows from the totals alone.
     assert_eq!(
         rules::upload_work(Some(&ours), &theirs),
         (3, 18 * 1024 * 1024)
     );
-    // Lost everywhere: the same objects and bytes missing on both sides.
-    assert_eq!(rules::download_work(&ours, Some(&ours)), (0, 0));
-    assert_eq!(rules::upload_work(Some(&ours), &ours), (0, 0));
+    // The peer misses a superset of what we miss: the object lost on both
+    // sides, plus three it is receiving from us. It supplies nothing.
+    let superset = ContentCounters {
+        shared_objects: 40,
+        shared_available: 36,
+        shared_missing_bytes: 64 * 1024 + 18 * 1024 * 1024,
+        ..ContentCounters::default()
+    };
+    assert_eq!(rules::download_work(&ours, Some(&superset)), (0, 0));
+    assert!(!rules::supplies_download(&ours, Some(&superset), false));
+    // A peer that misses fewer objects (more bytes) holds some of what we
+    // miss.
+    let three = ContentCounters {
+        shared_objects: 40,
+        shared_available: 37,
+        shared_missing_bytes: 3 * 64 * 1024,
+        ..ContentCounters::default()
+    };
+    let one_large = ContentCounters {
+        shared_objects: 40,
+        shared_available: 39,
+        shared_missing_bytes: 18 * 1024 * 1024,
+        ..ContentCounters::default()
+    };
+    assert_eq!(
+        rules::download_work(&three, Some(&one_large)),
+        (3, 3 * 64 * 1024)
+    );
+    // Lost everywhere: the same objects and bytes missing on both sides,
+    // whatever moved lately.
+    for moved in [false, true] {
+        assert_eq!(
+            rules::download_work_with_evidence(&ours, Some(&ours), moved),
+            (0, 0)
+        );
+        assert_eq!(
+            rules::upload_work_with_evidence(Some(&ours), &ours, moved),
+            (0, 0)
+        );
+    }
     // A peer that holds nothing at all supplies nothing.
     let empty = ContentCounters {
         shared_objects: 40,
@@ -5284,6 +5332,74 @@ fn download_work_shows_when_each_side_misses_different_objects() {
         ..ContentCounters::default()
     };
     assert_eq!(rules::download_work(&ours, Some(&empty)), (0, 0));
+    assert_eq!(
+        rules::download_work_with_evidence(&ours, Some(&empty), true),
+        (0, 0)
+    );
+}
+
+/// The hub side of the rule above (WP3.INT re-review 2): a peer that misses
+/// a superset of what we miss is no download source (the pair uploads, and
+/// shows no file to download); once its objects reach us it is one, until
+/// that evidence is a stall threshold old. The work that leaves with the
+/// evidence is no progress.
+#[test]
+fn a_peer_missing_more_than_we_do_downloads_only_while_its_objects_arrive() {
+    let fx = Fx::new();
+    fx.running_folder();
+    fx.online_peer(PEER_A, ENDPOINT_A);
+    fx.rec(meta(PEER_A, summary(0, 0)));
+    fx.rec(heartbeat(
+        1,
+        Some(ContentCounters {
+            shared_objects: 40,
+            shared_available: 39,
+            shared_missing_bytes: 64 * 1024,
+            ..ContentCounters::default()
+        }),
+    ));
+    let mut remote = entry(REPO, EntryState::Running);
+    remote.content = Some(ContentCounters {
+        shared_objects: 40,
+        shared_available: 36,
+        shared_missing_bytes: 64 * 1024 + 18 * 1024 * 1024,
+        ..ContentCounters::default()
+    });
+    fx.rec(catalog(PEER_A, &[remote]));
+    fx.run(1);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.objects_down.objects_remaining, 0);
+    assert_eq!(pair.objects_up.objects_remaining, 4);
+    assert_eq!(pair.state, FolderPeerState::Uploading);
+    assert!(
+        !fx.folder().sync.summary.contains("to download"),
+        "{}",
+        fx.folder().sync.summary
+    );
+    // The peer's objects reach us: it supplies.
+    fx.rec(finished(
+        PEER_A,
+        1,
+        "objects.pull",
+        Direction::Outbound,
+        None,
+        None,
+        256 * 1024,
+        1,
+    ));
+    fx.run(1);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.objects_down.objects_remaining, 1);
+    assert_eq!(pair.state, FolderPeerState::Syncing);
+    let progressed = pair.last_progress_ms;
+    assert!(progressed.is_some());
+    // A stall threshold later, nothing more arrived: the download work left
+    // with its evidence, which is no progress.
+    fx.run(STALL.as_secs() + 2);
+    let pair = fx.pair(PEER_A);
+    assert_eq!(pair.objects_down.objects_remaining, 0);
+    assert_eq!(pair.objects_up.objects_remaining, 4);
+    assert_eq!(pair.last_progress_ms, progressed);
 }
 
 /// A configured peer whose host is down cycles its lanes through Dialing and
