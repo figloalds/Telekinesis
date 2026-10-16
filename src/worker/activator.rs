@@ -23,11 +23,12 @@
 //!    events are not committed inline: the slice stops and returns a
 //!    `SlowTicket`), then `Engine::after_activation` (session refresh). The
 //!    commit that crosses the startup-snapshot interval seals the snapshot
-//!    of its own event's branch (an O(history) hash plus a projection
-//!    serialization, `core::snapshot`): the activator commits that event
-//!    alone, in its own slice, and stops the slice before it short of that
-//!    event ([`seal_forecast`]: the branches of the rows the slice will pop,
-//!    each with its own sealed cursor), so no seal hold also carries a
+//!    of its own event's branch (since WP4.4 the rows changed since the
+//!    previous seal, or a projection of at most 1 MiB, `core::snapshot`):
+//!    the activator commits that event alone, in its own slice, and stops
+//!    the slice before it short of that event ([`seal_forecast`]: the
+//!    branches of the rows the slice will pop, each with the store's own
+//!    cadence, `Store::seal_due_in`), so no seal hold also carries a
 //!    slice's worth of other events. While mounted,
 //!    notifications are computed per batch of slices: the `before`
 //!    projection (entries only) is captured when a batch begins and diffed
@@ -95,7 +96,6 @@ use crate::{
     worker::{maintenance, status_cell},
 };
 use anyhow::Result;
-use rusqlite::OptionalExtension;
 use std::{
     collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -311,6 +311,9 @@ impl Drop for Running<'_> {
 ///   (feed exchanges, `stage_incoming`) holds SQLite's writer for a few
 ///   milliseconds, and the default handler's backoff (1, 2, 5, 10, 15, 20,
 ///   25 ms…) overshoots each release by up to 25 ms, under the engine lock.
+///
+/// (On Windows the engine store already keeps a commit's savepoint
+/// sub-journal in memory, from its open on: `inbox::startup_drain`, WP4.4.)
 fn tune_engine_connection(store: &Store, running: bool) {
     let pages = if running {
         ENGINE_WAL_AUTOCHECKPOINT
@@ -417,10 +420,11 @@ pub struct SealForecast {
     pub at: Option<i64>,
 }
 
-/// Forecasts the slice's sealing commit. `core::snapshot::maybe_persist`
-/// seals the startup snapshot of **the committing event's branch** when the
-/// journal tip, that commit included, is [`SEAL_INTERVAL`] past that
-/// branch's sealed cursor, or when the branch has no snapshot yet. The tip
+/// Forecasts the slice's sealing commit. A commit seals the startup snapshot
+/// of **the committing event's branch** when the journal tip, that commit
+/// included, is the branch's interval (at least [`SEAL_INTERVAL`]) past its
+/// sealed cursor, or when the branch has no snapshot yet; the distance is
+/// the store's own (`Store::seal_due_in`, CCR-WP2.3-5 applied by WP4.4). The tip
 /// moves with every commit, whatever its branch, so a branch `b` sealed at
 /// `saved` seals at the slice's commit number `d(b) = SEAL_INTERVAL - (tip -
 /// saved)` if one of its events commits there, else at its first commit
@@ -461,7 +465,7 @@ pub fn seal_forecast(store: &Store, lookahead: usize) -> Option<SealForecast> {
     forecast(store, lookahead).ok()
 }
 
-fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
+fn forecast(store: &Store, lookahead: usize) -> Result<SealForecast> {
     let tip: i64 = store
         .db
         .prepare_cached("SELECT coalesce(max(seq),0) FROM journal_sequence")?
@@ -500,7 +504,6 @@ fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
     );
     head.sort();
     head.truncate(lookahead);
-    let mut cursor = store.db.prepare_cached(crate::core::SEALED_SQL)?;
     let mut distances: BTreeMap<String, i64> = BTreeMap::new();
     let mut rows = Vec::with_capacity(head.len());
     for (_, _, branch) in head {
@@ -513,12 +516,9 @@ fn forecast(store: &Store, lookahead: usize) -> rusqlite::Result<SealForecast> {
         let distance = match distances.get(&branch) {
             Some(distance) => *distance,
             None => {
-                let saved: Option<(i64, Option<i64>)> = cursor
-                    .query_row([&branch], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?;
-                let distance = saved.map_or(0, |(saved, bytes)| {
-                    crate::core::seal_interval(bytes) - (tip - saved)
-                });
+                // The store's own cadence (CCR-WP2.3-5, WP4.4): commits until
+                // the branch's next periodic seal; no snapshot counts as 0.
+                let distance = store.seal_due_in(&branch)?;
                 distances.insert(branch, distance);
                 distance
             }
