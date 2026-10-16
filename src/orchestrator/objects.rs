@@ -63,9 +63,10 @@
 //!    key's fair share of the window, `window / REPOS_PER_LANE`, so a pull
 //!    whose source stalls never takes the window from another repository;
 //!    WP3.INT re-review), and the budget comes back as its bytes are written
-//!    durably (or dropped) and, at its end, whatever it did not deliver. The
-//!    next pull is issued once the one in flight received half its budget
-//!    ("re-pull at half"), and at most 2 are in
+//!    durably (or dropped) and, at its end, whatever it did not deliver.
+//!    Within its share a key pipelines freely; a next pull that would take
+//!    it past its share is issued once the one in flight received half its
+//!    budget ("re-pull at half"), and at most 2 are in
 //!    flight: when the link is the bottleneck the next pull starts while one
 //!    still streams. A large object is split across consecutive pulls; their
 //!    chunks may interleave on the wire, and the sink orders them.
