@@ -1,13 +1,17 @@
 # Documentation
 
-- [Architecture](ARCHITECTURE.md): mount workers, daemon ownership and WS replication.
-- [Configuration](CONFIGURATION.md): version 2 TOML, ordinary storage and proxy setup.
-- [CLI](CLI.md): folder lifecycle, pairing and filesystem operations.
-- [Linux](LINUX.md): building and running headless or FUSE workers.
-- [Validation](VALIDATION.md): reproducible checks and remaining limitations.
-
-The reboot retired O1 catalogs, protected credential storage, application-managed
-certificates, the separate pairing service and desktop enrollment. Their designs
-are available through Git history rather than active guides. Current outbound
-WSS uses platform TLS verification and the same code-only pairing as WS; it does
-not restore those mechanisms.
+- [README](../README.md): what Telekinesis is, quick start, **upgrading from
+  the previous release**, what every status means, error classes, runbooks.
+- [CLI](CLI.md): every command, including `manage status` and `manage watch`.
+- [Configuration](CONFIGURATION.md): the TOML file, environment variables,
+  files and logs, pairing codes, per-peer credentials and local tokens,
+  remote access through a TLS proxy, backups.
+- [Architecture](ARCHITECTURE.md): processes and failure domains, the worker
+  lifecycle, mounts and the initial-sync gate, activation, the v3 protocol
+  (sessions, metadata feed, objects), status and errors, invariants.
+- [Linux](LINUX.md): building, FUSE mounts, signals, systemd and containers.
+- [Validation](VALIDATION.md): the test suite, qualification floors and the
+  latest measurements, the desktop checklist, the soak.
+- `revamp/`: the production revamp's plan (`REVAMP_PLAN.md`), the root-cause
+  analysis of the previous release (`ROOT_CAUSES.md`) and each work package's
+  notes.
