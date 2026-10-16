@@ -7,7 +7,7 @@
 //! every event). Dialers are real v3 sessions (`session::dial`).
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
@@ -19,8 +19,6 @@ use std::{
 };
 use tkfs::model::orchestrator::StatusSink;
 use tkfs::{
-    bulk_sync::{Lane, Page},
-    core::transfer::ObjectPart,
     model::{
         errors::{ErrorClass, ErrorWire},
         ipc::{FeedExchangeReply, FeedExchangeRequest},
@@ -607,17 +605,12 @@ fn feed_reply(request: &FeedExchangeRequest, caught_up: bool) -> FeedExchangeRep
     }
 }
 
-/// A worker serving `feed-exchange` (and, for bulk pages, echoing an empty
-/// offer).
+/// A worker serving `feed-exchange`.
 fn feed_worker(caught_up: bool) -> Arc<FakeWorker> {
     FakeWorker::new(move |op, payload| match op {
         "feed-exchange" => {
             let request: FeedExchangeRequest = serde_json::from_value(payload.clone()).unwrap();
             Ok(serde_json::to_value(feed_reply(&request, caught_up)).unwrap())
-        }
-        "published-bulk-exchange" => {
-            let page: Page = serde_json::from_value(payload["page"].clone()).unwrap();
-            Ok(serde_json::to_value(offer(&page, Vec::new())).unwrap())
         }
         other => Err(CallError::Remote(ErrorWire::coded(
             "UNSUPPORTED_OPERATION",
@@ -626,53 +619,19 @@ fn feed_worker(caught_up: bool) -> Arc<FakeWorker> {
     })
 }
 
-/// A hash owned by `lane` (its first 16 hex digits modulo the count).
-fn hash_on(lane: Lane, salt: u64) -> String {
-    let count = lane.count as u64;
-    let mut prefix = salt * count + lane.index as u64;
-    prefix %= u64::MAX / 2;
-    format!("{prefix:016x}{}", "ab".repeat(24))
-}
-
-fn bulk_page(lane: Lane, receiver: &str, parts: BTreeMap<String, ObjectPart>) -> Page {
-    Page {
-        format: 1,
-        repo: REPO_A.into(),
-        sender: REMOTE_REPLICA.into(),
-        receiver: receiver.into(),
-        request: uuid::Uuid::new_v4().to_string(),
-        reply_to: None,
-        lane,
-        known_objects: BTreeSet::new(),
-        partial_objects: BTreeMap::new(),
-        wanted_objects: BTreeSet::new(),
-        object_parts: parts,
-    }
-}
-
-/// The worker's offer in answer to `page`, carrying `parts`.
-fn offer(page: &Page, parts: Vec<(String, ObjectPart)>) -> Page {
-    Page {
-        format: 1,
-        repo: page.repo.clone(),
-        sender: page.receiver.clone(),
-        receiver: page.sender.clone(),
-        request: uuid::Uuid::new_v4().to_string(),
-        reply_to: Some(page.request.clone()),
-        lane: page.lane,
-        known_objects: BTreeSet::new(),
-        partial_objects: BTreeMap::new(),
-        wanted_objects: BTreeSet::new(),
-        object_parts: parts.into_iter().collect(),
-    }
-}
-
-fn part(offset: u64, total: u64, bytes: usize) -> ObjectPart {
-    ObjectPart {
-        offset,
-        total,
-        hex: "5a".repeat(bytes),
-    }
+/// An `objects.wants` request header of the peer for `repo` (to this
+/// node's `receiver` replica) on `lane` (WP4.5: these tests used the interim
+/// `objects.exchange` page, which WP4.5 removed; a v3 request reaches the
+/// same checks).
+fn wants_request(repo: &str, receiver: &str, lane: LaneSpec) -> serde_json::Value {
+    json!({
+        "repo": repo,
+        "sender": REMOTE_REPLICA,
+        "receiver": receiver,
+        "lane": lane,
+        "max_items": 16,
+        "max_bytes": 1024 * 1024,
+    })
 }
 
 /// A gate that hung workers wait on until released (or 30 s).
@@ -1402,8 +1361,7 @@ fn role_violations_and_route_violations_keep_their_codes() {
     let bulk = node.bulk(1, 3);
     let probe = node.dial(LaneRole::Probe, None).unwrap();
     let request = meta_request(REPO_A, DEVICE_A);
-    let page = bulk_page(Lane { index: 1, count: 3 }, DEVICE_A, BTreeMap::new());
-    let page_body = serde_json::to_vec(&page).unwrap();
+    let wants = wants_request(REPO_A, DEVICE_A, LaneSpec::new(1, 3));
 
     // Roles (invariant 18).
     let meta = |client: &Client| {
@@ -1427,11 +1385,11 @@ fn role_violations_and_route_violations_keep_their_codes() {
         "objects.report",
     ] {
         assert_eq!(
-            control.call_code(op, json!({}), page_body.clone()),
+            control.call_code(op, wants.clone(), Vec::new()),
             "BULK_ON_CONTROL_LANE"
         );
         assert_eq!(
-            probe.call_code(op, json!({}), page_body.clone()),
+            probe.call_code(op, wants.clone(), Vec::new()),
             "BULK_ON_CONTROL_LANE"
         );
     }
@@ -1444,24 +1402,32 @@ fn role_violations_and_route_violations_keep_their_codes() {
         control.call_code("catalog.drop", json!({}), Vec::new()),
         "UNKNOWN_PEER_OPERATION"
     );
-    // The lane a bulk page names must be the session's (invariant 19).
-    let wrong_lane = bulk_page(Lane { index: 2, count: 3 }, DEVICE_A, BTreeMap::new());
+    // The lane a bulk request names must be the session's (invariant 19).
+    // (WP4.5: these were interim `objects.exchange` pages; the interim path
+    // is gone, and a v3 request meets the same lane check.)
+    for op in ["objects.wants", "objects.pull"] {
+        let mut wrong_lane = wants_request(REPO_A, DEVICE_A, LaneSpec::new(2, 3));
+        wrong_lane["items"] = json!([]);
+        wrong_lane["budget_bytes"] = json!(1024);
+        assert_eq!(
+            bulk.call_code(op, wrong_lane, Vec::new()),
+            "BULK_LANE_MISMATCH",
+            "{op}"
+        );
+        let mut wrong_count = wants_request(REPO_A, DEVICE_A, LaneSpec::new(1, 4));
+        wrong_count["items"] = json!([]);
+        wrong_count["budget_bytes"] = json!(1024);
+        assert_eq!(
+            bulk.call_code(op, wrong_count, Vec::new()),
+            "BULK_LANE_MISMATCH",
+            "{op}"
+        );
+    }
+    // The interim `objects.exchange` is not served any more (WP4.5,
+    // CCR-WP3.3-2): refused, it never reaches a worker.
     assert_eq!(
-        bulk.call_code(
-            "objects.exchange",
-            json!({}),
-            serde_json::to_vec(&wrong_lane).unwrap()
-        ),
-        "BULK_LANE_MISMATCH"
-    );
-    let wrong_count = bulk_page(Lane { index: 1, count: 4 }, DEVICE_A, BTreeMap::new());
-    assert_eq!(
-        bulk.call_code(
-            "objects.exchange",
-            json!({}),
-            serde_json::to_vec(&wrong_count).unwrap()
-        ),
-        "BULK_LANE_MISMATCH"
+        bulk.call_code("objects.exchange", json!({}), b"{}".to_vec()),
+        "UNSUPPORTED_OPERATION"
     );
     // CCR-WP3.3-3 (WP3.INT): objects v3 is served since WP3.3, so a
     // malformed `objects.pull` is an invalid request (it was the Wave 2
@@ -1523,8 +1489,13 @@ fn role_violations_and_route_violations_keep_their_codes() {
             meta_body(&request),
         )
         .unwrap();
-    bulk.call("objects.exchange", json!({}), page_body).unwrap();
-    assert_eq!(worker.calls().len(), 2);
+    // The bulk session still serves its folder's checks (this folder's
+    // worker has no loopback endpoint here: a starting folder to the peer).
+    assert_eq!(
+        bulk.call_code("objects.wants", wants, Vec::new()),
+        "REMOTE_WORKER_STARTING"
+    );
+    assert_eq!(worker.calls().len(), 1);
 }
 
 /// Post-integration re-review (WP2.INT): the acceptor's own view of a source
@@ -1616,12 +1587,12 @@ fn paused_and_starting_folders_answer_without_a_worker() {
         ),
         "FOLDER_SYNC_PAUSED"
     );
-    let page = bulk_page(Lane { index: 0, count: 1 }, DEVICE_A, BTreeMap::new());
+    // (WP4.5: this was an interim `objects.exchange` page.)
     assert_eq!(
         bulk.call_code(
-            "objects.exchange",
-            json!({}),
-            serde_json::to_vec(&page).unwrap()
+            "objects.wants",
+            wants_request(REPO_A, DEVICE_A, LaneSpec::new(0, 1)),
+            Vec::new()
         ),
         "FOLDER_SYNC_PAUSED"
     );
@@ -1672,7 +1643,12 @@ fn paused_and_starting_folders_answer_without_a_worker() {
 
 /// §14 WP2.8 acceptance (invariant 15): the route of every inbound exchange
 /// names the **authenticated** installation of the session, whatever the
-/// request says, plus this folder's replica and the request's sender.
+/// request says, plus this folder's replica and the request's sender. The
+/// bulk half of this test sent an interim `objects.exchange` page and read
+/// the route its worker got; WP4.5 removed that path (CCR-WP3.3-2), and the
+/// objects v3 route, which reaches the worker over a loopback session, is
+/// checked against two authenticated dialers in
+/// `objects_v3_lanes::inbound_routes_name_the_authenticated_installation`.
 #[test]
 fn route_binding_uses_the_authenticated_installation() {
     let node = Node::start();
@@ -1692,23 +1668,8 @@ fn route_binding_uses_the_authenticated_installation() {
                 meta_body(&request),
             )
             .unwrap();
-        let bulk = node
-            .dial_as(
-                installation,
-                &code,
-                LaneRole::Bulk,
-                Some(LaneSpec::new(0, 2)),
-            )
-            .unwrap();
-        let page = bulk_page(Lane { index: 0, count: 2 }, DEVICE_A, BTreeMap::new());
-        bulk.call(
-            "objects.exchange",
-            json!({}),
-            serde_json::to_vec(&page).unwrap(),
-        )
-        .unwrap();
         let calls = worker.calls();
-        let (op, payload) = &calls[calls.len() - 2];
+        let (op, payload) = &calls[calls.len() - 1];
         assert_eq!(op, "feed-exchange");
         let sent: FeedExchangeRequest = serde_json::from_value(payload.clone()).unwrap();
         assert_eq!(sent.route.peer, installation);
@@ -1716,13 +1677,6 @@ fn route_binding_uses_the_authenticated_installation() {
         assert_eq!(sent.route.local_replica, DEVICE_A);
         assert_eq!(sent.route.remote_replica, REMOTE_REPLICA);
         assert_eq!(sent.request, request);
-        let (op, payload) = &calls[calls.len() - 1];
-        assert_eq!(op, "published-bulk-exchange");
-        assert_eq!(payload["route"]["peer"], installation);
-        assert_eq!(payload["route"]["local_replica"], DEVICE_A);
-        assert_eq!(payload["route"]["remote_replica"], REMOTE_REPLICA);
-        assert_eq!(payload["lane"], json!({ "index": 0, "count": 2 }));
-        assert_eq!(payload["page"]["request"], page.request);
     }
     // Gate evidence names the authenticated installation too.
     let evidence = node.folders.evidence();
@@ -1859,103 +1813,44 @@ fn meta_exchange_serves_feed_exchange() {
     control.catalog(None);
 }
 
-/// The interim `objects.exchange` (§6.5) reaches `published-bulk-exchange`,
-/// counts the objects the page completed, and trims an offer above the
-/// session's 1 MiB body bound to the parts that fit.
+/// The interim `objects.exchange` (§6.5) is not served any more (WP4.5,
+/// CCR-WP3.3-2; this test checked that it reached `published-bulk-exchange`
+/// and trimmed its pages): whatever its page, it is answered
+/// `UNSUPPORTED_OPERATION`, reaches no worker, is no exchange in the status,
+/// and leaves the session usable (invariant 17).
 #[test]
-fn objects_exchange_serves_the_interim_bulk_path() {
+fn objects_exchange_is_not_served() {
     let node = Node::start();
-    let lane = Lane { index: 1, count: 2 };
-    let big = Arc::new(Mutex::new(Vec::<(String, ObjectPart)>::new()));
-    let worker = {
-        let big = big.clone();
-        FakeWorker::new(move |op, payload| {
-            assert_eq!(op, "published-bulk-exchange");
-            let page: Page = serde_json::from_value(payload["page"].clone()).unwrap();
-            Ok(serde_json::to_value(offer(&page, big.lock().unwrap().clone())).unwrap())
-        })
-    };
+    let worker = feed_worker(true);
     node.folder(STATE_A, REPO_A, DEVICE_A, Some(worker.clone()));
     let bulk = node.bulk(1, 2);
-    // Two parts arrive: one completes its object, one does not.
-    let parts: BTreeMap<String, ObjectPart> = [
-        (hash_on(lane, 1), part(0, 1000, 1000)),
-        (hash_on(lane, 2), part(0, 5000, 1000)),
-    ]
-    .into_iter()
-    .collect();
-    let page = bulk_page(lane, DEVICE_A, parts);
-    let reply = bulk
-        .call(
+    let page = json!({
+        "format": 1,
+        "repo": REPO_A,
+        "sender": REMOTE_REPLICA,
+        "receiver": DEVICE_A,
+        "request": "interim-request",
+        "lane": { "index": 1, "count": 2 },
+    });
+    assert_eq!(
+        bulk.call_code(
             "objects.exchange",
             json!({ "repo": REPO_A }),
-            serde_json::to_vec(&page).unwrap(),
-        )
-        .unwrap();
-    assert_eq!(reply.header["repo"], REPO_A);
-    let answered: Page = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(answered.reply_to.as_deref(), Some(page.request.as_str()));
-    match node.recorder.finished().as_slice() {
-        [
-            StatusEvent::ExchangeFinished {
-                lane: status_lane,
-                op,
-                direction,
-                ok: true,
-                bytes_down,
-                bytes_up,
-                objects_down,
-                objects_up,
-                summary: None,
-                ..
-            },
-        ] => {
-            assert_eq!(*status_lane, 2, "bulk lane index 1 is status lane 2");
-            assert_eq!(
-                (op.as_str(), *direction),
-                ("objects.exchange", Direction::Inbound)
-            );
-            assert_eq!((*bytes_down, *objects_down), (2000, 1));
-            assert_eq!((*bytes_up, *objects_up), (0, 0));
-        }
-        other => panic!("{other:#?}"),
-    }
-
-    // An offer of 3 × 3 MiB (18 MiB of hex) is trimmed under the 16 MiB
-    // `objects.exchange` bound (WP2.INT: CCR-WP2.8-1 raised it from 1 MiB,
-    // where this case was 3 × 400 KiB trimmed to one part).
-    *big.lock().unwrap() = (1..=3)
-        .map(|salt| (hash_on(lane, 10 + salt), part(0, 3 * MIB as u64, 3 * MIB)))
-        .collect();
-    let page = bulk_page(lane, DEVICE_A, BTreeMap::new());
-    let reply = bulk
-        .call(
-            "objects.exchange",
-            json!({}),
-            serde_json::to_vec(&page).unwrap(),
-        )
-        .unwrap();
-    assert!(reply.body.len() <= 16 * MIB, "{} bytes", reply.body.len());
-    let answered: Page = serde_json::from_slice(&reply.body).unwrap();
-    assert_eq!(answered.object_parts.len(), 2, "two 6 MiB parts fit");
-    let first = hash_on(lane, 11);
-    assert!(answered.object_parts.contains_key(&first));
-    match node.recorder.finished().last() {
-        Some(StatusEvent::ExchangeFinished { bytes_up, .. }) => {
-            assert_eq!(*bytes_up, 2 * 3 * MIB as u64)
-        }
-        other => panic!("{other:#?}"),
-    }
-    // A page sent as the request header (no body) is accepted too.
-    *big.lock().unwrap() = Vec::new();
-    let small = bulk_page(lane, DEVICE_A, BTreeMap::new());
-    bulk.call(
-        "objects.exchange",
-        serde_json::to_value(&small).unwrap(),
-        Vec::new(),
-    )
-    .unwrap();
-    assert_eq!(worker.calls().len(), 3);
+            serde_json::to_vec(&page).unwrap()
+        ),
+        "UNSUPPORTED_OPERATION"
+    );
+    // A page sent as the request header (no body) too.
+    assert_eq!(
+        bulk.call_code("objects.exchange", page, Vec::new()),
+        "UNSUPPORTED_OPERATION"
+    );
+    assert!(worker.calls().is_empty(), "{:?}", worker.calls());
+    assert!(
+        node.recorder.finished().is_empty(),
+        "refusals are not exchanges"
+    );
+    bulk.ping();
 }
 
 // ---------------------------------------------------------------------------

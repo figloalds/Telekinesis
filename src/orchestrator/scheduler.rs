@@ -1,13 +1,14 @@
-//! Owned by WP2.7.
+//! Owned by WP2.7 (WP4.5: the interim bulk path removed).
 //!
 //! The MetaScheduler of a peer's control lane (lane 0; REVAMP_PLAN §3.7 and
-//! §14 WP2.7), and the scheduling engine it shares with the interim bulk
-//! lanes ([`super::objects`]).
+//! §14 WP2.7), and the scheduling engine it shares with the bulk lanes
+//! ([`super::objects`]).
 //!
 //! # Keys and slots
 //!
 //! A scheduler serves one peer and one op: `meta.exchange` on lane 0,
-//! `objects.exchange` on each bulk lane. Its keys are the repositories that
+//! `objects.pull` or `objects.push` on each bulk lane (one scheduler per
+//! direction). Its keys are the repositories that
 //! the peer's catalog lists and a local folder holds, so a key is one
 //! (peer, repo, op). At most `slots` exchanges run at once (4 on lane 0, 2 on
 //! a bulk lane) and at most one per key. Every exchange has its own

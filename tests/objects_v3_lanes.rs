@@ -36,7 +36,6 @@ use std::{
 };
 use support::FaultProxy;
 use tkfs::{
-    bulk_sync::{self, Page},
     model::{
         errors::{ErrorWire, Scope},
         health::{ContentCounters, Generations},
@@ -52,8 +51,9 @@ use tkfs::{
             frame::{ChunkHeader, ClientHello},
             objects::{
                 ObjectOutcome, ObjectResult, ObjectsPull, ObjectsPush, ObjectsReport,
-                ObjectsResult, ObjectsWantsReply, ReadHeader, ReadReply, ReportHeader, WantHeader,
-                WantItem, WantPriority, WantReply, WriteHeader, WriteItem, WriteReply, WriteResult,
+                ObjectsResult, ObjectsWantsReply, ReadHeader, ReadReply, ReleaseHeader,
+                ReleaseReply, ReportHeader, WantItem, WantPriority, WantReply, WantRequest,
+                WriteHeader, WriteItem, WriteReply, WriteResult,
             },
         },
         status::{Direction, StatusEvent, StatusSnapshot},
@@ -62,6 +62,7 @@ use tkfs::{
         Config, Network,
         inbound::{self, InboundOptions, InboundServer},
         objects::{self, LaneOptions, LaneStats},
+        scheduler::{Readiness, SchedulerView},
         worker_client::{self, SessionWorkerClient},
     },
     paired_sync::SyncRoute,
@@ -152,6 +153,8 @@ struct Faults {
     /// The next N reads fail `SQLITE_BUSY` (a source registering its
     /// first-serve verifications; WP3.INT re-review).
     busy_reads: usize,
+    /// Every want call fails with this error (a store outage).
+    fail_wants: Option<ErrorWire>,
 }
 
 enum Held {
@@ -218,6 +221,10 @@ struct FakeWorker {
     read_log: Mutex<Vec<(String, u64, u64)>>,
     /// Every write item: (session, hash, offset, len).
     write_log: Mutex<Vec<(String, String, u64, u64)>>,
+    /// Every want call: what it asked with and what it returned.
+    want_log: Mutex<Vec<WantCall>>,
+    /// Every `objects.release`: (session, hashes released).
+    release_log: Mutex<Vec<(String, Vec<String>)>>,
     conns: Mutex<Vec<Conn>>,
     stopped: AtomicBool,
 }
@@ -244,6 +251,8 @@ impl FakeWorker {
             want_calls: AtomicU64::new(0),
             read_log: Mutex::new(Vec::new()),
             write_log: Mutex::new(Vec::new()),
+            want_log: Mutex::new(Vec::new()),
+            release_log: Mutex::new(Vec::new()),
             conns: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
         });
@@ -446,10 +455,22 @@ impl FakeWorker {
     }
 
     fn op_want(&self, header: Value) -> Result<(Value, Vec<u8>), ErrorWire> {
-        let header: WantHeader = parse(header)?;
+        let WantRequest { header, exclude } = parse(header)?;
         self.route_check(&header.route)?;
         self.want_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(error) = self.faults().fail_wants.clone() {
+            return Err(error);
+        }
         let now = Instant::now();
+        // `exclude` (WP4.5): the session gives up its leases on those, and
+        // they are not offered to it.
+        let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
+        {
+            let mut state = self.state.lock().unwrap();
+            state.leases.retain(|hash, (session, _)| {
+                !(excluded.contains(hash.as_str()) && *session == header.session)
+            });
+        }
         // Spools are locked without the state lock (a completing write
         // holds its spool, then takes the state).
         let wanted: Vec<(String, Arc<Mutex<Spool>>)> = {
@@ -457,7 +478,11 @@ impl FakeWorker {
             state
                 .wanted
                 .iter()
-                .filter(|(hash, _)| !state.held.contains_key(*hash) && header.lane.owns(hash))
+                .filter(|(hash, _)| {
+                    !state.held.contains_key(*hash)
+                        && header.lane.owns(hash)
+                        && !excluded.contains(hash.as_str())
+                })
                 .filter(|(hash, _)| {
                     state
                         .leases
@@ -504,10 +529,63 @@ impl FakeWorker {
                 priority: WantPriority::History,
             });
         }
+        drop(state);
+        self.want_log.lock().unwrap().push(WantCall {
+            session: header.session.clone(),
+            route: header.route.clone(),
+            lane: header.lane,
+            exclude,
+            items: items.iter().map(|item| item.hash.clone()).collect(),
+        });
         Ok((
             serde_json::to_value(WantReply { items }).unwrap(),
             Vec::new(),
         ))
+    }
+
+    /// `objects.release` (WP4.5): the leases `session` holds on `hashes` end.
+    fn op_release(&self, header: Value) -> Result<(Value, Vec<u8>), ErrorWire> {
+        let header: ReleaseHeader = parse(header)?;
+        self.route_check(&header.route)?;
+        let mut released = Vec::new();
+        {
+            let mut state = self.state.lock().unwrap();
+            for hash in &header.hashes {
+                if state
+                    .leases
+                    .get(hash)
+                    .is_some_and(|(session, _)| *session == header.session)
+                {
+                    state.leases.remove(hash);
+                    released.push(hash.clone());
+                }
+            }
+        }
+        let count = released.len() as u32;
+        self.release_log
+            .lock()
+            .unwrap()
+            .push((header.session, released));
+        Ok((
+            serde_json::to_value(ReleaseReply { released: count }).unwrap(),
+            Vec::new(),
+        ))
+    }
+
+    /// Every want call so far.
+    fn wants(&self) -> Vec<WantCall> {
+        self.want_log.lock().unwrap().clone()
+    }
+
+    /// Every hash released by `session` so far.
+    fn released_by(&self, session: &str) -> BTreeSet<String> {
+        self.release_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(by, _)| by == session)
+            .flat_map(|(_, hashes)| hashes.iter().cloned())
+            .collect()
     }
 
     fn op_read(&self, header: Value) -> Result<(Value, Vec<u8>), ErrorWire> {
@@ -749,6 +827,17 @@ impl FakeWorker {
     }
 }
 
+/// One want call of a [`FakeWorker`].
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct WantCall {
+    session: String,
+    route: SyncRoute,
+    lane: LaneSpec,
+    exclude: Vec<String>,
+    items: Vec<String>,
+}
+
 fn parse<T: serde::de::DeserializeOwned>(header: Value) -> Result<T, ErrorWire> {
     serde_json::from_value(header).map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))
 }
@@ -770,6 +859,7 @@ impl Handler for WorkerHandler {
             "objects.read" => worker.op_read(header),
             "objects.write" => worker.op_write(header, body),
             "objects.report" => worker.op_report(header),
+            "objects.release" => worker.op_release(header),
             other => Err(ErrorWire::coded("UNSUPPORTED_OPERATION", other)),
         };
         match result {
@@ -781,31 +871,6 @@ impl Handler for WorkerHandler {
 
 // ---------------------------------------------------------------------------
 // A daemon's side: catalog, folders, status
-
-type Script = dyn Fn(&str, &Value) -> Result<Value, CallError> + Send + Sync;
-
-/// A JSON worker client answering from a script (the interim path's ops).
-struct ScriptClient(Box<Script>);
-
-impl WorkerClient for ScriptClient {
-    fn instance(&self) -> &str {
-        "script"
-    }
-    fn call(&self, op: &str, payload: Value, _: Duration) -> Result<Value, CallError> {
-        (self.0)(op, &payload)
-    }
-    fn call_bytes(
-        &self,
-        op: &str,
-        _: Value,
-        _: &[u8],
-        _: Duration,
-    ) -> Result<(Value, Vec<u8>), CallError> {
-        Err(CallError::Unavailable(format!(
-            "BINARY_OPS_REQUIRE_SESSION: {op}"
-        )))
-    }
-}
 
 /// One daemon's catalog, folder directory and status sink.
 struct World {
@@ -894,8 +959,16 @@ impl World {
         self.clients.lock().unwrap().insert(state.into(), client);
     }
 
-    fn set_client(&self, state: &str, client: Arc<dyn WorkerClient>) {
-        self.clients.lock().unwrap().insert(state.into(), client);
+    /// The folder's sync is paused here (`sync_enabled` false).
+    fn pause(&self, state: &str) {
+        self.views.update(|views| {
+            let mut views = views.clone();
+            let mut view = (*views[state]).clone();
+            view.record.sync_enabled = false;
+            view.generation += 1;
+            views.insert(state.into(), Arc::new(view));
+            views
+        });
     }
 
     /// The folder's heartbeat `generations.sync` moves (events were staged).
@@ -1407,7 +1480,14 @@ fn both_directions_complete_with_per_object_results() {
     assert_eq!(LaneStats::get(&stats.objects_down), 5);
     assert_eq!(LaneStats::get(&stats.objects_up), 3);
     assert!(LaneStats::get(&stats.reports) >= 1);
-    assert_eq!(LaneStats::get(&stats.interim_exchanges), 0);
+    // Objects v3 only (this counted the interim `objects.exchange`, which
+    // WP4.5 removed): every exchange is a pull or a push.
+    assert!(
+        a.world
+            .finished()
+            .iter()
+            .all(|f| f.op == "objects.pull" || f.op == "objects.push")
+    );
 
     // B served them: inbound pulls and pushes on its lane 1.
     let served = b.world.finished();
@@ -2086,134 +2166,434 @@ fn inbound_checks_keep_their_codes() {
     conn.close();
 }
 
-/// A peer that answers `UNSUPPORTED_OPERATION` to objects v3 (a Wave 2
-/// build) gets the interim `objects.exchange` instead, and the lane does
-/// not try v3 again until the key resets.
+/// Invariant 15 on the acceptor's objects v3 path (WP4.5: the bulk half of
+/// `inbound_v3::route_binding_uses_the_authenticated_installation`, which
+/// used the interim `objects.exchange`): an `objects.wants` reaches B's
+/// worker with the route `{peer: the session's authenticated installation,
+/// repo, local_replica: B's folder, remote_replica: the request's sender}`
+/// and the lease of that dialer's lane, whatever else the request header
+/// claims; two dialers each get their own.
 #[test]
-fn a_peer_without_objects_v3_gets_the_interim_path() {
-    // B: a scripted v3 server whose objects ops are the interim ones only.
-    struct InterimPeer {
+fn inbound_routes_name_the_authenticated_installation() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let a1 = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let a2 = Dialer::start_as(
+        FakeWorker::start("replica-a2"),
+        "replica-a2",
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    for (dialer, replica) in [(&a1, REPLICA_A), (&a2, "replica-a2")] {
+        let conn = dialer.dial(&b.endpoint, &b.code, LANE);
+        let request = json!({
+            "repo": REPO,
+            "sender": replica,
+            "receiver": REPLICA_B,
+            "lane": LANE,
+            "max_items": 8,
+            "max_bytes": MIB,
+            "peer": "someone-else",
+            "installation": "someone-else",
+        });
+        conn.call(
+            "objects.wants",
+            request,
+            Vec::new(),
+            Priority::Control,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let want = b.worker.wants().last().cloned().unwrap();
+        assert_eq!(
+            want.route,
+            SyncRoute {
+                peer: dialer.ctx.installation.clone(),
+                repo: REPO.into(),
+                local_replica: REPLICA_B.into(),
+                remote_replica: replica.into(),
+            }
+        );
+        assert_eq!(
+            want.session,
+            objects::push_lease(&dialer.ctx.installation, LANE)
+        );
+        assert_eq!(want.lane, LANE);
+        conn.close();
+    }
+    assert_eq!(b.worker.wants().len(), 2);
+}
+
+/// A peer that answers `UNSUPPORTED_OPERATION` to objects v3 (a build
+/// without it) fails the key like any other error (WP4.5, CCR-WP3.3-2:
+/// rewritten from `a_peer_without_objects_v3_gets_the_interim_path`, which
+/// asserted the interim fallback this package removed): the lane never
+/// sends the interim `objects.exchange`, records the failed pulls, and
+/// backs the key off by class (Transient) instead of asking again at every
+/// interval.
+#[test]
+fn a_peer_without_objects_v3_fails_its_key_without_an_interim_exchange() {
+    // B: a scripted v3 server that serves no objects op.
+    struct NoObjects {
         v3_calls: AtomicUsize,
         exchanges: AtomicUsize,
     }
-    impl Handler for InterimPeer {
+    impl Handler for NoObjects {
         fn handle(&self, req: Incoming) {
-            match req.op.as_str() {
-                "objects.exchange" => {
-                    self.exchanges.fetch_add(1, Ordering::SeqCst);
-                    let page: Page = serde_json::from_slice(&req.body).unwrap();
-                    let mut reply = page.clone();
-                    reply.sender = page.receiver.clone();
-                    reply.receiver = page.sender.clone();
-                    reply.reply_to = Some(page.request.clone());
-                    reply.request = uuid();
-                    reply.object_parts.clear();
-                    req.responder
-                        .reply(json!({ "repo": REPO }), serde_json::to_vec(&reply).unwrap());
-                }
-                op => {
-                    self.v3_calls.fetch_add(1, Ordering::SeqCst);
-                    req.responder.error(ErrorWire::coded(
-                        "UNSUPPORTED_OPERATION",
-                        format!("{op} is served from objects v3 (Wave 3)"),
-                    ));
-                }
+            if req.op == "objects.exchange" {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.v3_calls.fetch_add(1, Ordering::SeqCst);
             }
+            let op = req.op.clone();
+            req.responder.error(ErrorWire::coded(
+                "UNSUPPORTED_OPERATION",
+                format!("{op} is not served here"),
+            ));
         }
     }
-    struct Policy(String, Verifier);
-    impl AcceptPolicy for Policy {
-        fn installation(&self) -> String {
-            self.0.clone()
-        }
-        fn verifier(&self) -> Option<(Verifier, u64)> {
-            Some((self.1.clone(), 1))
-        }
-        fn admit(&self, _: &ClientHello) -> Result<(), ErrorWire> {
-            Ok(())
-        }
-        fn legacy_attempt(&self, _: SocketAddr, _: &Value) {}
-    }
-    let remote = format!("b-{}", uuid());
-    let (code, verifier) = Verifier::generate();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let peer = Arc::new(InterimPeer {
+    let peer = Arc::new(NoObjects {
         v3_calls: AtomicUsize::new(0),
         exchanges: AtomicUsize::new(0),
     });
-    let server = {
-        let (peer, remote) = (peer.clone(), remote.clone());
-        thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let (conn, _) = session::accept(
-                stream,
-                Arc::new(Policy(remote, verifier)),
-                ConnOptions::for_role(LaneRole::Bulk),
-            )
-            .unwrap();
-            conn.serve(peer);
-            conn
-        })
-    };
+    let (remote, code, endpoint, server) = scripted_peer(peer.clone());
     let a = Dialer::start(FakeWorker::start(REPLICA_A), &remote, &endpoint, 100);
-    // A's JSON worker client plays the interim worker ops.
-    a.world.set_client(
-        STATE_A,
-        Arc::new(ScriptClient(Box::new(|op, payload| match op {
-            "published-bulk-offer" => {
-                let route: SyncRoute = serde_json::from_value(payload["route"].clone()).unwrap();
-                let page = Page {
-                    format: bulk_sync::PROTOCOL,
-                    repo: route.repo.clone(),
-                    sender: route.local_replica.clone(),
-                    receiver: route.remote_replica.clone(),
-                    request: uuid(),
-                    reply_to: None,
-                    lane: objects::page_lane(LANE),
-                    known_objects: BTreeSet::new(),
-                    partial_objects: BTreeMap::new(),
-                    wanted_objects: BTreeSet::new(),
-                    object_parts: BTreeMap::new(),
-                };
-                Ok(serde_json::to_value(page).unwrap())
-            }
-            "published-bulk-apply" => Ok(json!({})),
-            other => Err(CallError::Remote(ErrorWire::coded(
-                "UNSUPPORTED_OPERATION",
-                other,
-            ))),
-        }))),
-    );
     // Something to want, so the download round reaches the peer.
     a.worker.want(&sha(b"wanted"), 6);
     let conn = a.dial(&endpoint, &code, LANE);
-    let (options, stats) = a.options();
+    let (mut options, _) = a.options();
+    let view = Arc::new(Snapshot::new(SchedulerView::default()));
+    options.download.view = Some(view.clone());
     let lane = a.run(conn, options);
     assert!(
-        wait_until(Duration::from_secs(10), || peer
-            .exchanges
-            .load(Ordering::SeqCst)
-            >= 3),
-        "no interim exchanges"
+        wait_until(Duration::from_secs(10), || a.world.finished().iter().any(
+            |f| f.op == "objects.pull"
+                && !f.ok
+                && f.error
+                    .as_ref()
+                    .is_some_and(|e| e.code == "UNSUPPORTED_OPERATION")
+        )),
+        "{:?}",
+        a.world.finished()
     );
-    let v3 = peer.v3_calls.load(Ordering::SeqCst);
-    sleep_ms(500);
+    // The key backs off (Transient: 1 s, 2 s, …): a 100 ms interval would
+    // have asked about 25 times in 2.5 s.
+    sleep_ms(2_500);
+    let calls = peer.v3_calls.load(Ordering::SeqCst);
+    assert!(calls <= 10, "{calls} v3 calls in 2.5 s: no backoff");
+    let key = view.load().key(REPO).cloned().unwrap();
+    assert!(key.failures >= 1, "{key:?}");
     assert_eq!(
-        peer.v3_calls.load(Ordering::SeqCst),
-        v3,
-        "v3 was tried again on every round"
+        key.last_error.as_ref().map(|error| error.code.as_str()),
+        Some("UNSUPPORTED_OPERATION"),
+        "{key:?}"
     );
-    assert!(v3 <= 2, "{v3} v3 calls before the fallback");
-    assert!(LaneStats::get(&stats.interim_exchanges) >= 3);
+    assert_eq!(
+        peer.exchanges.load(Ordering::SeqCst),
+        0,
+        "an interim exchange"
+    );
     assert!(
         a.world
             .finished()
             .iter()
-            .any(|f| f.op == "objects.exchange" && f.ok)
+            .all(|f| f.op == "objects.pull" || f.op == "objects.push")
     );
     drop(lane);
     server.join().unwrap().close();
+}
+
+/// Several repositories on one lane (WP4.5, CCR-WP3.3-2: the objects v3 form
+/// of `meta_scheduler::interim_bulk_pages_are_routed`): every repository
+/// that both sides share runs both directions on the lane, each with its own
+/// route (`{peer, repo, local_replica, remote_replica}`) and the lane's
+/// spec, under the lane's lease ids at both workers; a repository whose sync
+/// is paused here is not exchanged (Paused), and one only the peer holds has
+/// no key.
+#[test]
+fn every_shared_repository_runs_on_the_lane_with_its_own_route() {
+    let (code, verifier) = Verifier::generate();
+    let b_world = World::new(&format!("b-{}", uuid()), Some(verifier));
+    let a_world = World::new(&format!("a-{}", uuid()), None);
+    let mut workers = BTreeMap::new();
+    let mut entries = Vec::new();
+    for (index, repo) in ["repo-a", "repo-b", "repo-c"].into_iter().enumerate() {
+        let (replica_a, replica_b) = (format!("{repo}-at-a"), format!("{repo}-at-b"));
+        let worker_a = FakeWorker::start(&replica_a);
+        let worker_b = FakeWorker::start(&replica_b);
+        a_world.folder_of(&format!("a-{repo}"), repo, &replica_a, &worker_a);
+        b_world.folder_of(&format!("b-{repo}"), repo, &replica_b, &worker_b);
+        // One object each way.
+        let down = worker_b.hold(content(9400 + index as u64, 4096));
+        worker_a.want(&down, 4096);
+        let up = worker_a.hold(content(9450 + index as u64, 2048));
+        worker_b.want(&up, 2048);
+        entries.push(entry_of(repo, &replica_b));
+        workers.insert(repo, (worker_a, worker_b, down, up));
+    }
+    entries.push(entry_of("repo-x", "repo-x-at-b"));
+    a_world.pause("a-repo-c");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = inbound::start_with(ctx(&b_world, 1000), listener, InboundOptions::default());
+    let a_ctx = ctx(&a_world, 100);
+    let peer = Arc::new(PeerContext {
+        installation: b_world.installation.clone(),
+        endpoint: endpoint.clone(),
+        local_installation: a_ctx.installation.clone(),
+        pool: 2,
+        catalog: Snapshot::new(RemoteCatalog {
+            generation: 1,
+            at_ms: 0,
+            entries,
+        }),
+    });
+    let dialer = Dialer {
+        world: a_world.clone(),
+        worker: workers["repo-a"].0.clone(),
+        ctx: a_ctx,
+        peer,
+    };
+    let conn = dialer.dial(&endpoint, &code, LANE);
+    let (mut options, _) = dialer.options();
+    let (down_view, up_view) = (
+        Arc::new(Snapshot::new(SchedulerView::default())),
+        Arc::new(Snapshot::new(SchedulerView::default())),
+    );
+    options.download.view = Some(down_view.clone());
+    options.upload.view = Some(up_view.clone());
+    let lane = dialer.run(conn, options);
+    assert!(
+        wait_until(Duration::from_secs(20), || ["repo-a", "repo-b"].iter().all(
+            |repo| {
+                let (a, b, down, up) = &workers[repo];
+                a.has(down) && b.has(up)
+            }
+        )),
+        "the shared repositories did not complete both directions"
+    );
+    sleep_ms(300);
+    let (a_installation, b_installation) =
+        (a_world.installation.clone(), b_world.installation.clone());
+    for repo in ["repo-a", "repo-b"] {
+        let (a, b, ..) = &workers[repo];
+        let pull_ids = objects::pull_holder(&b_installation, LANE);
+        let wants = a.wants();
+        assert!(!wants.is_empty(), "{repo}");
+        for want in &wants {
+            assert_eq!(want.lane, LANE, "{repo}");
+            assert!(want.session.starts_with(&pull_ids), "{repo}: {want:?}");
+            assert_eq!(
+                want.route,
+                SyncRoute {
+                    peer: b_installation.clone(),
+                    repo: repo.into(),
+                    local_replica: format!("{repo}-at-a"),
+                    remote_replica: format!("{repo}-at-b"),
+                },
+                "{repo}"
+            );
+        }
+        // The acceptor's worker wants for A's pushes under A's lane.
+        let served = b.wants();
+        assert!(!served.is_empty(), "{repo}");
+        for want in &served {
+            assert_eq!(want.session, objects::push_lease(&a_installation, LANE));
+            assert_eq!(
+                want.route,
+                SyncRoute {
+                    peer: a_installation.clone(),
+                    repo: repo.into(),
+                    local_replica: format!("{repo}-at-b"),
+                    remote_replica: format!("{repo}-at-a"),
+                },
+                "{repo}"
+            );
+        }
+        let (down, up) = (down_view.load(), up_view.load());
+        assert_eq!(down.key(repo).unwrap().failures, 0, "{repo}");
+        assert_eq!(up.key(repo).unwrap().failures, 0, "{repo}");
+    }
+    // Paused here: no worker call, the key Paused; the peer's own
+    // repository has no key at all.
+    let (a_c, b_c, ..) = &workers["repo-c"];
+    assert!(a_c.wants().is_empty() && b_c.wants().is_empty());
+    assert_eq!(
+        down_view.load().key("repo-c").unwrap().readiness,
+        Readiness::Paused
+    );
+    assert!(down_view.load().key("repo-x").is_none());
+    assert!(up_view.load().key("repo-x").is_none());
+    drop(lane);
+    server.shutdown(Duration::from_secs(5));
+    for (a, b, ..) in workers.into_values() {
+        a.shutdown();
+        b.shutdown();
+    }
+}
+
+/// One repository's failing local worker never stalls another's transfers
+/// on the same lane, and fails only its own key (WP4.5, CCR-WP3.3-2: the
+/// objects v3 form of `meta_scheduler::a_failing_bulk_repository_never_stalls_the_others`).
+#[test]
+fn a_failing_repository_never_stalls_the_others_on_its_lane() {
+    let (code, verifier) = Verifier::generate();
+    let b_world = World::new(&format!("b-{}", uuid()), Some(verifier));
+    let a_world = World::new(&format!("a-{}", uuid()), None);
+    let mut workers = BTreeMap::new();
+    let mut entries = Vec::new();
+    for (seed, repo) in [(9500u64, "repo-a"), (9510, "repo-b")] {
+        let (replica_a, replica_b) = (format!("{repo}-at-a"), format!("{repo}-at-b"));
+        let worker_a = FakeWorker::start(&replica_a);
+        let worker_b = FakeWorker::start(&replica_b);
+        a_world.folder_of(&format!("a-{repo}"), repo, &replica_a, &worker_a);
+        b_world.folder_of(&format!("b-{repo}"), repo, &replica_b, &worker_b);
+        let hashes: Vec<String> = (0..4u64)
+            .map(|index| {
+                let hash = worker_b.hold(content(seed + index, 300_000));
+                worker_a.want(&hash, 300_000);
+                hash
+            })
+            .collect();
+        entries.push(entry_of(repo, &replica_b));
+        workers.insert(repo, (worker_a, worker_b, hashes));
+    }
+    workers["repo-a"].0.faults().fail_wants = Some(ErrorWire::coded(
+        "OBJECT_IO_ERROR",
+        "test: the store is gone",
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = inbound::start_with(ctx(&b_world, 1000), listener, InboundOptions::default());
+    let a_ctx = ctx(&a_world, 100);
+    let peer = Arc::new(PeerContext {
+        installation: b_world.installation.clone(),
+        endpoint: endpoint.clone(),
+        local_installation: a_ctx.installation.clone(),
+        pool: 2,
+        catalog: Snapshot::new(RemoteCatalog {
+            generation: 1,
+            at_ms: 0,
+            entries,
+        }),
+    });
+    let dialer = Dialer {
+        world: a_world.clone(),
+        worker: workers["repo-b"].0.clone(),
+        ctx: a_ctx,
+        peer,
+    };
+    let conn = dialer.dial(&endpoint, &code, LANE);
+    let (mut options, _) = dialer.options();
+    let view = Arc::new(Snapshot::new(SchedulerView::default()));
+    options.download.view = Some(view.clone());
+    let lane = dialer.run(conn, options);
+    let (b_a, _, b_hashes) = &workers["repo-b"];
+    assert!(
+        wait_until(Duration::from_secs(20), || b_hashes
+            .iter()
+            .all(|hash| b_a.has(hash))),
+        "repo-b stalled behind repo-a"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || view
+            .load()
+            .key("repo-a")
+            .is_some_and(|key| key.failures >= 1)),
+        "{:?}",
+        view.load()
+    );
+    let a_key = view.load().key("repo-a").cloned().unwrap();
+    assert_eq!(
+        a_key.last_error.as_ref().map(|error| error.code.as_str()),
+        Some("OBJECT_IO_ERROR"),
+        "{a_key:?}"
+    );
+    assert_eq!(view.load().key("repo-b").unwrap().failures, 0);
+    // Nothing of repo-a was pulled: its want never answered.
+    let (a_a, a_b, a_hashes) = &workers["repo-a"];
+    assert!(a_hashes.iter().all(|hash| !a_a.has(hash)));
+    assert!(a_b.reads().is_empty(), "{:?}", a_b.reads());
+    drop(lane);
+    server.shutdown(Duration::from_secs(5));
+    for (a, b, _) in workers.into_values() {
+        a.shutdown();
+        b.shutdown();
+    }
+}
+
+/// A key reset while its transfer runs (the peer's folder now answers as
+/// another replica) moves the key to the new route at once (WP4.5,
+/// CCR-WP3.3-2: the objects v3 form of
+/// `meta_scheduler::a_key_reset_during_a_bulk_exchange_drops_the_stale_inventory`;
+/// objects v3 caches no inventory, but the lane's per-repository state, its
+/// lease-id hints and the peer's content counters, is forgotten on a reset):
+/// the object completes from the new replica, whose route the later wants
+/// carry, and the key ends with no failure counted.
+#[test]
+fn a_replica_change_moves_the_key_to_the_new_route() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let size = 48 * MIB;
+    let bytes = content(9600, size as usize);
+    let hash = b.worker.hold(bytes.clone());
+    let a = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    a.worker.want(&hash, size);
+    a.worker.faults().write_delay = Some(Duration::from_millis(30));
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let (mut options, _) = a.options();
+    let view = Arc::new(Snapshot::new(SchedulerView::default()));
+    options.download.view = Some(view.clone());
+    let lane = a.run(conn, options);
+    assert!(
+        wait_until(Duration::from_secs(20), || a
+            .worker
+            .durable(&hash)
+            .is_some_and(|durable| durable > 0)),
+        "no progress"
+    );
+    // A's writes wait while the replica changes, so the rest of the object
+    // (more than the window) comes after it.
+    a.worker.faults().stall_writes = true;
+    // B's folder is now replica-b2 (its worker holds the object too), and
+    // A's catalog learns it.
+    let replica2 = "replica-b2";
+    let worker2 = FakeWorker::start(replica2);
+    worker2.hold(bytes.clone());
+    b.world.folder(STATE_B, replica2, &worker2);
+    a.peer.catalog.update(|catalog| {
+        let mut catalog = catalog.clone();
+        catalog.generation += 1;
+        catalog.entries = vec![entry_of(REPO, replica2)];
+        catalog
+    });
+    sleep_ms(500);
+    a.worker.faults().stall_writes = false;
+    assert!(
+        wait_until(Duration::from_secs(30), || a.worker.has(&hash)),
+        "the object never completed from the new replica: durable {:?}",
+        a.worker.durable(&hash)
+    );
+    assert_eq!(a.worker.held_bytes(&hash).unwrap(), bytes);
+    let last = a.worker.wants().last().cloned().unwrap();
+    assert_eq!(last.route.remote_replica, replica2, "{last:?}");
+    assert!(
+        !worker2.reads().is_empty(),
+        "the new replica served nothing"
+    );
+    let key = view.load().key(REPO).cloned().unwrap();
+    assert_eq!(key.failures, 0, "{key:?}");
+    drop(lane);
+    worker2.shutdown();
 }
 
 /// §14 WP3.3 task 3: at most 2 repositories share a lane at once (both
@@ -2289,11 +2669,13 @@ fn at_most_two_repositories_share_a_lane() {
 
 /// Multi-source liveness, push side (a hub): B wants Y; A1 cannot serve it,
 /// C can. A1's lane is offered Y first (B's worker leases Y to A1's push
-/// session, and A1's lane keeps renewing that lease with every
-/// `objects.wants`); A1 does not send it, so B backs Y off for A1 (no
-/// error), parks it under A1's lease and offers it to C's lane, whose push
-/// installs it under that lease: well inside the lease's 60 s, with A1's
-/// lane still running.
+/// session, and this fake worker would renew that lease with every
+/// `objects.wants` of A1's lane); A1 does not send it, so B backs Y off for
+/// A1 (no error) and gives A1's lease up at its worker (WP4.5,
+/// CCR-WP3.3-4: `objects.release`, then A1's wants exclude Y), and C's lane
+/// is offered Y and installs it under its own lease: well inside the
+/// lease's 60 s, with A1's lane still running. (Until WP4.5 B parked Y under
+/// A1's lease and C's push wrote under that lease, the handoff table.)
 #[test]
 fn a_source_that_cannot_serve_hands_its_push_lease_on() {
     let b = Acceptor::start(FakeWorker::start(REPLICA_B));
@@ -2317,11 +2699,15 @@ fn a_source_that_cannot_serve_hands_its_push_lease_on() {
     let (options, _) = a1.options();
     let lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
     let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
+    let c_lease = objects::push_lease(&c.ctx.installation, LANE);
+    // (B gives the lease up within the round now: the want log, not the
+    // lease, shows the offer.)
     assert!(
         wait_until(Duration::from_secs(10), || b
             .worker
-            .lease_of(&hash)
-            .is_some_and(|lease| lease == a1_lease)),
+            .wants()
+            .iter()
+            .any(|want| want.session == a1_lease && want.items.contains(&hash))),
         "A1 was never offered Y: lease {:?}",
         b.worker.lease_of(&hash)
     );
@@ -2346,22 +2732,28 @@ fn a_source_that_cannot_serve_hands_its_push_lease_on() {
         "{:?}",
         a1.world.object_errors()
     );
+    // B gave A1's lease up at its worker (no lapse waited for).
+    assert!(
+        wait_until(Duration::from_secs(5), || b
+            .worker
+            .released_by(&a1_lease)
+            .contains(&hash)),
+        "B never released A1's lease on Y"
+    );
+    assert_ne!(b.worker.lease_of(&hash), Some(a1_lease.clone()));
     let began = Instant::now();
     let (options, _) = c.options();
     let lane_c = c.run(c.dial(&b.endpoint, &b.code, LANE), options);
     assert!(
         wait_until(Duration::from_secs(20), || b.worker.has(&hash)),
-        "B never got Y while A1's lane held its lease ({:?})",
+        "B never got Y while A1's lane ran ({:?})",
         b.worker.lease_of(&hash)
     );
     assert!(began.elapsed() < Duration::from_secs(30));
     assert_eq!(b.worker.held_bytes(&hash).unwrap(), bytes);
-    // C's push wrote it under A1's lease (the handoff), and A1's lane was
-    // still running (renewing that lease) the whole time.
-    assert_eq!(
-        b.worker.write_sessions(&hash),
-        BTreeSet::from([a1_lease.clone()])
-    );
+    // C's push wrote it under C's own lease, and A1's lane was still
+    // running (asking B's wants) the whole time.
+    assert_eq!(b.worker.write_sessions(&hash), BTreeSet::from([c_lease]));
     assert!(!lane_a1.finished());
     // A source that does not serve an object is no error at B.
     assert!(
@@ -2378,9 +2770,12 @@ fn a_source_that_cannot_serve_hands_its_push_lease_on() {
 
 /// Multi-source liveness, pull side: D wants X from B (which lacks it) and
 /// C (which has it). D's lane to B leases X first (D's worker), its pull
-/// fails `NOT_AVAILABLE`, and the lane keeps renewing the lease with its
-/// wants; D parks X under that lease, and its lane to C takes it over and
-/// installs it under that lease, well inside the lease's 60 s.
+/// fails `NOT_AVAILABLE`, so the lane gives the lease up at D's worker
+/// (WP4.5, CCR-WP3.3-4: `objects.release`, and its wants exclude X while it
+/// backs X off for B) although its lane keeps running; D's lane to C is then
+/// offered X and installs it under its own lease, well inside the lease's
+/// 60 s. (Until WP4.5 D parked X under the lease of its lane to B, and the
+/// lane to C wrote under that lease.)
 #[test]
 fn a_source_that_cannot_serve_hands_its_pull_lease_on() {
     let b = Acceptor::start(FakeWorker::start(REPLICA_B));
@@ -2398,6 +2793,7 @@ fn a_source_that_cannot_serve_hands_its_pull_lease_on() {
     let (options, _) = to_b.options();
     let lane_b = to_b.run(to_b.dial(&b.endpoint, &b.code, LANE), options);
     let b_lanes = objects::pull_holder(&b.installation(), LANE);
+    let c_lanes = objects::pull_holder(&c.installation(), LANE);
     assert!(
         wait_until(Duration::from_secs(10), || to_b
             .world
@@ -2407,12 +2803,21 @@ fn a_source_that_cannot_serve_hands_its_pull_lease_on() {
         "{:?}",
         to_b.world.object_errors()
     );
+    // The lane to B gave X up (no lapse waited for), and its later wants
+    // exclude it.
     assert!(
-        to_b.worker
+        wait_until(Duration::from_secs(5), || to_b
+            .worker
             .lease_of(&hash)
-            .is_some_and(|lease| lease.starts_with(&b_lanes)),
+            .is_none()),
         "{:?}",
         to_b.worker.lease_of(&hash)
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || to_b.worker.wants().iter().any(
+            |want| want.session.starts_with(&b_lanes) && want.exclude.contains(&hash)
+        )),
+        "the lane to B never excluded X"
     );
     let began = Instant::now();
     let (options, _) = to_c.options();
@@ -2426,7 +2831,7 @@ fn a_source_that_cannot_serve_hands_its_pull_lease_on() {
     assert_eq!(to_b.worker.held_bytes(&hash).unwrap(), bytes);
     let sessions = to_b.worker.write_sessions(&hash);
     assert!(
-        sessions.len() == 1 && sessions.iter().all(|lease| lease.starts_with(&b_lanes)),
+        !sessions.is_empty() && sessions.iter().all(|lease| lease.starts_with(&c_lanes)),
         "{sessions:?}"
     );
     assert!(!lane_b.finished());
@@ -2574,11 +2979,14 @@ fn a_failed_worker_call_fails_the_push_not_its_objects() {
         "{:?}",
         b.world.finished()
     );
+    // (A records its push once B's error reaches it, a moment after B's
+    // own record.)
     assert!(
-        a.world
+        wait_until(Duration::from_secs(10), || a
+            .world
             .finished()
             .iter()
-            .any(|f| f.op == "objects.push" && !f.ok),
+            .any(|f| f.op == "objects.push" && !f.ok)),
         "the dialer's push did not fail"
     );
     b.worker.faults().fail_writes = None;
@@ -2680,7 +3088,11 @@ fn the_session_client_dials_without_its_lock() {
 /// lease, which that lane keeps renewing); D's lane to C takes X over and
 /// moves part of it, then C's session resets and C stays away; E holds X.
 /// C's claim is given back when its round fails, so E's lane takes X over
-/// and installs it, with B's lane still running.
+/// and installs it, with B's lane still running. Since WP4.5 (CCR-WP3.3-4)
+/// the lanes give leases up at D's worker instead of passing the lease of
+/// the lane to B around: B's lane releases X when its pull fails, C's lane
+/// moves X under its own lease and releases it when its round fails, and E
+/// continues it under its own lease from where C left it.
 #[test]
 fn a_holder_that_goes_away_hands_the_pulled_object_on() {
     let b = Acceptor::start(FakeWorker::start(REPLICA_B));
@@ -2712,6 +3124,15 @@ fn a_holder_that_goes_away_hands_the_pulled_object_on() {
         "{:?}",
         to_b.world.object_errors()
     );
+    // The lane to B gave X up (it keeps running).
+    assert!(
+        wait_until(Duration::from_secs(5), || to_b
+            .worker
+            .lease_of(&hash)
+            .is_none_or(|lease| !lease.starts_with(&b_lanes))),
+        "{:?}",
+        to_b.worker.lease_of(&hash)
+    );
     // C takes X over, and its session resets mid-transfer.
     let proxy = FaultProxy::start(&c.endpoint);
     proxy.reset_after(2 * MIB);
@@ -2723,13 +3144,25 @@ fn a_holder_that_goes_away_hands_the_pulled_object_on() {
     );
     lane_c.stop();
     assert!(!to_b.worker.has(&hash), "C delivered X before it went away");
+    let c_lanes = objects::pull_holder(&c.installation(), LANE);
+    let e_lanes = objects::pull_holder(&e.installation(), LANE);
+    // What C wrote of X (perhaps nothing, if its session reset first) was
+    // under its own lease ids.
     assert!(
         to_b.worker
             .write_sessions(&hash)
             .iter()
-            .all(|lease| lease.starts_with(&b_lanes)),
+            .all(|lease| lease.starts_with(&c_lanes)),
         "{:?}",
         to_b.worker.write_sessions(&hash)
+    );
+    // C's failed round gave X up (no lapse waited for).
+    assert!(
+        to_b.worker
+            .lease_of(&hash)
+            .is_none_or(|lease| !lease.starts_with(&c_lanes)),
+        "{:?}",
+        to_b.worker.lease_of(&hash)
     );
     // E takes it over (from where C left it) while B's lane keeps renewing
     // the lease.
@@ -2746,19 +3179,23 @@ fn a_holder_that_goes_away_hands_the_pulled_object_on() {
     assert_eq!(to_b.worker.held_bytes(&hash).unwrap(), bytes);
     let sessions = to_b.worker.write_sessions(&hash);
     assert!(
-        sessions.len() == 1 && sessions.iter().all(|lease| lease.starts_with(&b_lanes)),
+        sessions.iter().any(|lease| lease.starts_with(&e_lanes))
+            && sessions
+                .iter()
+                .all(|lease| lease.starts_with(&c_lanes) || lease.starts_with(&e_lanes)),
         "{sessions:?}"
     );
-    assert!(!lane_b.finished(), "B's lane stopped renewing the lease");
+    assert!(!lane_b.finished(), "B's lane stopped");
     drop(lane_e);
     drop(lane_b);
 }
 
 /// The same on the push side (a hub): B wants Y; A1 cannot serve it (B
-/// parks Y under A1's push lease, which A1's lane keeps renewing); C takes
-/// Y over and pushes part of it, then C's session resets and C stays away;
-/// E holds Y. C's push ends without its end, so B gives C's claim back, and
-/// E's push installs Y under A1's lease, with A1's lane still running.
+/// gives A1's push lease up, WP4.5); C takes Y over and pushes part of it
+/// under its own lease, then C's session resets and C stays away; E holds
+/// Y. C's push ends without its end, so B gives C's lease up too, and E's
+/// push installs Y under E's lease, with A1's lane still running. (Until
+/// WP4.5 every push of Y wrote under A1's lease, the handoff table.)
 #[test]
 fn a_holder_that_goes_away_hands_the_pushed_object_on() {
     let b = Acceptor::start(FakeWorker::start(REPLICA_B));
@@ -2792,6 +3229,8 @@ fn a_holder_that_goes_away_hands_the_pushed_object_on() {
     let (options, _) = a1.options();
     let lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
     let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
+    let c_lease = objects::push_lease(&c.ctx.installation, LANE);
+    let e_lease = objects::push_lease(&e.ctx.installation, LANE);
     // A1 pushed without Y (it cannot read it; no error of A1's, WP3.INT
     // re-review: this sync point was A1's `NOT_AVAILABLE` ObjectError).
     assert!(
@@ -2818,9 +3257,18 @@ fn a_holder_that_goes_away_hands_the_pushed_object_on() {
         wait_until(Duration::from_secs(5), || b
             .worker
             .write_sessions(&hash)
-            .contains(&a1_lease)),
-        "C never pushed Y under A1's lease: {:?}",
+            .contains(&c_lease)),
+        "C never pushed Y: {:?}",
         b.worker.write_sessions(&hash)
+    );
+    // B gave both leases up: A1's (not served), C's (abandoned).
+    assert!(b.worker.released_by(&a1_lease).contains(&hash));
+    assert!(
+        wait_until(Duration::from_secs(5), || b
+            .worker
+            .released_by(&c_lease)
+            .contains(&hash)),
+        "B never released C's lease on Y"
     );
     let began = Instant::now();
     let (options, _) = e.options();
@@ -2835,9 +3283,9 @@ fn a_holder_that_goes_away_hands_the_pushed_object_on() {
     assert_eq!(b.worker.held_bytes(&hash).unwrap(), bytes);
     assert_eq!(
         b.worker.write_sessions(&hash),
-        BTreeSet::from([a1_lease.clone()])
+        BTreeSet::from([c_lease, e_lease])
     );
-    assert!(!lane_a1.finished(), "A1's lane stopped renewing the lease");
+    assert!(!lane_a1.finished(), "A1's lane stopped");
     drop(lane_e);
     drop(lane_a1);
 }
@@ -3710,11 +4158,12 @@ fn an_object_of_unknown_size_is_handed_on_after_partial_progress() {
 }
 
 /// The push side (a hub): B wants Y without knowing its size. A1 cannot
-/// serve it (B parks Y under A1's push lease) and goes away; C takes Y over,
-/// pushes part of it with the size its worker reads, and its session resets;
-/// E holds Y. B hands Y on with the size C pushed it with (WP3.INT re-review
-/// 2: it parked Y with the offer's size 0 at C's durable offset, which no
-/// push could cover until the lease lapsed a minute later).
+/// serve it (B gives A1's push lease up, WP4.5) and goes away; C takes Y
+/// over, pushes part of it with the size its worker reads, and its session
+/// resets; E holds Y. B hands Y on with the size C pushed it with (WP3.INT
+/// re-review 2: it parked Y with the offer's size 0 at C's durable offset,
+/// which no push could cover until the lease lapsed a minute later). Since
+/// WP4.5 B's worker offers E the object with the size its first write took.
 #[test]
 fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
     let b = Acceptor::start(FakeWorker::start(REPLICA_B));
@@ -3748,8 +4197,11 @@ fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
     let (options, _) = a1.options();
     let mut lane_a1 = a1.run(a1.dial(&b.endpoint, &b.code, LANE), options);
     let a1_lease = objects::push_lease(&a1.ctx.installation, LANE);
-    // A1 is offered Y a few times and pushes none of it (its worker cannot
-    // read Y's size), then goes away.
+    let c_lease = objects::push_lease(&c.ctx.installation, LANE);
+    let e_lease = objects::push_lease(&e.ctx.installation, LANE);
+    // A1 is offered Y and pushes none of it (its worker cannot read Y's
+    // size), so B backs Y off for A1 and gives A1's lease up; then A1 goes
+    // away.
     assert!(
         wait_until(Duration::from_secs(10), || b
             .worker
@@ -3758,7 +4210,21 @@ fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
             >= 4),
         "A1 never asked for B's wants"
     );
-    assert_eq!(b.worker.lease_of(&hash).as_deref(), Some(a1_lease.as_str()));
+    assert!(
+        wait_until(Duration::from_secs(5), || b
+            .worker
+            .lease_of(&hash)
+            .is_none()),
+        "{:?}",
+        b.worker.lease_of(&hash)
+    );
+    assert!(
+        b.worker
+            .wants()
+            .iter()
+            .any(|want| want.session == a1_lease && want.exclude.contains(&hash)),
+        "A1's wants never excluded Y"
+    );
     lane_a1.stop();
     // C takes Y over, and its session resets mid-push.
     let proxy = FaultProxy::start(&b.endpoint);
@@ -3793,7 +4259,7 @@ fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
     assert_eq!(b.worker.held_bytes(&hash).unwrap(), bytes);
     assert_eq!(
         b.worker.write_sessions(&hash),
-        BTreeSet::from([a1_lease.clone()])
+        BTreeSet::from([c_lease, e_lease])
     );
 }
 
@@ -4396,6 +4862,41 @@ fn a_pull_never_carries_more_items_than_the_acceptor_takes() {
     );
 }
 
+/// CCR-WP3.INT-5 (WP4.5): a session socket gets the large Windows buffers
+/// only when its peer is this machine's loopback (IPv4, IPv6 or IPv4-mapped);
+/// a socket to another host (a LAN, a WAN, a TLS proxy on another machine)
+/// keeps the system's autotuning, and so does one whose peer is unknown.
+#[test]
+fn socket_buffers_are_tuned_on_loopback_only() {
+    use tkfs::session::io::{SocketTuning, socket_tuning};
+    for loopback in [
+        "127.0.0.1:1",
+        "127.10.0.3:9",
+        "[::1]:1",
+        "[::ffff:127.0.0.1]:1",
+    ] {
+        assert_eq!(
+            socket_tuning(Some(loopback.parse().unwrap())),
+            SocketTuning::Loopback,
+            "{loopback}"
+        );
+    }
+    for other in [
+        "192.168.100.147:443",
+        "10.0.0.1:1",
+        "172.23.9.55:5000",
+        "[2001:db8::1]:1",
+        "[::ffff:10.0.0.1]:1",
+    ] {
+        assert_eq!(
+            socket_tuning(Some(other.parse().unwrap())),
+            SocketTuning::System,
+            "{other}"
+        );
+    }
+    assert_eq!(socket_tuning(None), SocketTuning::System);
+}
+
 // ---------------------------------------------------------------------------
 // Qualification (release, ignored): throughput of the data plane
 
@@ -4681,4 +5182,566 @@ fn object_scope(hash: &str) -> Scope {
         state: STATE_A.into(),
         hash: hash.into(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// WP4.5 qualification (release, ignored): WAN tuning of the data plane
+//
+// `cargo test --release --test objects_v3_lanes -- --ignored --test-threads=1 qual_wp4_5`
+// Sizes: `TKFS_QUAL_LARGE_MIB` (default 256 here). The lane's peer calls can
+// be overridden with `TKFS_QUAL_PEER_CALLS` (measurement of CCR-WP3.3-1: it
+// needs an acceptor that runs as many exchanges per bulk session).
+
+/// The 50 ms RTT, 20 MiB/s link of §14.5a WP4.5's acceptance.
+fn wan_link() -> Link {
+    Link {
+        rtt_ms: 50,
+        bytes_per_s: 20 * MIB,
+    }
+}
+
+fn qual_mib(default: u64) -> u64 {
+    std::env::var("TKFS_QUAL_LARGE_MIB")
+        .ok()
+        .and_then(|mib| mib.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn qual_options(dialer: &Dialer) -> (LaneOptions, Arc<LaneStats>) {
+    let (mut options, stats) = dialer.options();
+    if let Some(calls) = std::env::var("TKFS_QUAL_PEER_CALLS")
+        .ok()
+        .and_then(|calls| calls.parse::<usize>().ok())
+    {
+        options.peer_calls = calls;
+    }
+    (options, stats)
+}
+
+fn proxy_for(endpoint: &str, link: &Link) -> FaultProxy {
+    let proxy = FaultProxy::start(endpoint);
+    proxy.set_latency(Duration::from_millis(link.rtt_ms / 2));
+    proxy.set_bandwidth(link.bytes_per_s);
+    proxy
+}
+
+/// A `ping` round trip on `conn`, in ms (`None`: it failed).
+fn ping_ms(conn: &Conn) -> Option<f64> {
+    let began = Instant::now();
+    conn.call(
+        "ping",
+        json!({}),
+        Vec::new(),
+        Priority::Control,
+        Duration::from_secs(30),
+    )
+    .ok()
+    .map(|_| began.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn percentile(samples: &[f64], p: f64) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+fn summary(samples: &[f64]) -> Value {
+    json!({
+        "count": samples.len(),
+        "p50_ms": percentile(samples, 50.0),
+        "p90_ms": percentile(samples, 90.0),
+        "p99_ms": percentile(samples, 99.0),
+        "max_ms": samples.iter().copied().fold(0.0, f64::max),
+    })
+}
+
+/// A control session of `dialer` to `endpoint` (lane 0 of its pool).
+fn control_session(dialer: &Dialer, endpoint: &str, code: &str) -> Conn {
+    let hello = session::client_hello(&dialer.ctx.installation, LaneRole::Control, None, 2);
+    session::dial(
+        endpoint,
+        hello,
+        &CodeAuth { code: code.into() },
+        None,
+        ConnOptions::for_role(LaneRole::Control),
+    )
+    .unwrap()
+    .0
+}
+
+/// §14.5a WP4.5 acceptance: a FaultProxy scenario at 50 ms RTT and
+/// 20 MiB/s link rate reaches ≥ 80 % utilisation: one object pulled by
+/// workers that keep their spools in memory, so the floor judges the data
+/// plane (sessions, lanes, the link) and not this machine's disk, which
+/// other jobs share (the disk variant below records the same with a
+/// `sync_data` per write call and a full re-read hash).
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_large_object_rtt50_20mib() {
+    // `large_object` reads `TKFS_QUAL_LARGE_MIB` (1 GiB by default).
+    let large = large_object(
+        Some(wan_link()),
+        "objects_v3_lanes::wp4_5_large_object_rtt50_20mib",
+        false,
+    );
+    let ratio = large.link_utilization.unwrap_or(0.0);
+    assert!(
+        ratio >= FLOOR_LINK_UTILIZATION,
+        "through 50 ms / 20 MiB/s at {ratio:.3} of the link rate, below the \
+         {FLOOR_LINK_UTILIZATION} floor"
+    );
+}
+
+/// The same with disk workers (recorded; the floor is the memory
+/// variant's).
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_large_object_rtt50_20mib_disk() {
+    large_object(
+        Some(wan_link()),
+        "objects_v3_lanes::wp4_5_large_object_rtt50_20mib_disk",
+        true,
+    );
+}
+
+/// Both directions at once through one bulk lane (CCR-WP3.3-1's case: a
+/// push in flight leaves a lane of `PEER_CALLS` = 2 one pull at a time):
+/// A pulls one object from B while it pushes another to B, through the
+/// 50 ms / 20 MiB/s link (full duplex: 20 MiB/s each way) or on loopback
+/// (`link` none). Records each direction's rate and the link utilisation.
+/// `disk`: the workers keep their spools on disk (one `sync_data` per write
+/// call); otherwise in memory (the orchestrators' data plane alone).
+fn both_directions(link: Option<Link>, scenario: &str) {
+    both_directions_on(link, scenario, true);
+}
+
+fn both_directions_on(link: Option<Link>, scenario: &str, disk: bool) {
+    let size = qual_mib(256) * MIB;
+    let root = tempfile::tempdir().unwrap();
+    let (a, b) = qual_pair(disk.then(|| root.path()));
+    let (down, up) = if disk {
+        (b.worker.hold_file(41, size), a.worker.hold_file(42, size))
+    } else {
+        (
+            b.worker.hold(content(41, size as usize)),
+            a.worker.hold(content(42, size as usize)),
+        )
+    };
+    a.worker.want(&down, size);
+    b.worker.want(&up, size);
+    let proxy = link.as_ref().map(|link| proxy_for(&b.endpoint, link));
+    let endpoint = proxy
+        .as_ref()
+        .map_or_else(|| b.endpoint.clone(), FaultProxy::endpoint);
+    let conn = a.dial(&endpoint, &b.code, LANE);
+    let (options, stats) = qual_options(&a);
+    let peer_calls = options.peer_calls;
+    let began = Instant::now();
+    let lane = a.run(conn, options);
+    let (mut down_s, mut up_s) = (None, None);
+    let done = wait_until(Duration::from_secs(1800), || {
+        if down_s.is_none() && a.worker.has(&down) {
+            down_s = Some(began.elapsed().as_secs_f64());
+        }
+        if up_s.is_none() && b.worker.has(&up) {
+            up_s = Some(began.elapsed().as_secs_f64());
+        }
+        down_s.is_some() && up_s.is_some()
+    });
+    drop(lane);
+    assert!(done, "the transfers did not finish");
+    let (down_s, up_s) = (down_s.unwrap(), up_s.unwrap());
+    let mib = (size / MIB) as f64;
+    let mut extra = json!({
+        "bytes_each_way": size,
+        "down_seconds": down_s,
+        "up_seconds": up_s,
+        "down_mib_per_s": mib / down_s,
+        "up_mib_per_s": mib / up_s,
+        "peer_calls": peer_calls,
+        "peer_calls_peak": LaneStats::get(&stats.peer_calls_peak),
+        "pulls": LaneStats::get(&stats.pulls),
+        "pulls_peak": LaneStats::get(&stats.pulls_peak),
+        "pushes": LaneStats::get(&stats.pushes),
+    });
+    let total_mib_s = 2.0 * mib / down_s.max(up_s);
+    if let Some(link) = &link {
+        let link_mib_s = link.bytes_per_s as f64 / MIB as f64;
+        extra["rtt_ms"] = json!(link.rtt_ms);
+        extra["link_bytes_per_s"] = json!(link.bytes_per_s);
+        extra["down_utilization"] = json!(mib / down_s / link_mib_s);
+        extra["up_utilization"] = json!(mib / up_s / link_mib_s);
+    }
+    record(scenario, "both_ways_mib_per_s", total_mib_s, "MiB/s", extra);
+}
+
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_both_directions_rtt50_20mib() {
+    both_directions(
+        Some(wan_link()),
+        "objects_v3_lanes::wp4_5_both_directions_rtt50_20mib",
+    );
+}
+
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_both_directions_loopback() {
+    both_directions(None, "objects_v3_lanes::wp4_5_both_directions_loopback");
+}
+
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_both_directions_loopback_memory() {
+    both_directions_on(
+        None,
+        "objects_v3_lanes::wp4_5_both_directions_loopback_memory",
+        false,
+    );
+}
+
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_both_directions_rtt50_20mib_memory() {
+    both_directions_on(
+        Some(wan_link()),
+        "objects_v3_lanes::wp4_5_both_directions_rtt50_20mib_memory",
+        false,
+    );
+}
+
+/// §14.5a WP4.5 acceptance: control-frame latency under a saturated bulk
+/// lane stays < 100 ms. Through the 50 ms / 20 MiB/s link, A pulls one large
+/// object (the bulk lane saturates the link: memory workers), and A pings B
+/// every 100 ms on
+/// its control session (lane 0, its own connection through the same link),
+/// and on the saturated bulk session itself. The floor is the control
+/// session's p99; the bulk session's own round trips are recorded (its
+/// control frames share the connection with the object stream, so they wait
+/// behind what the sender and the link already queue).
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_control_latency_under_a_saturated_lane() {
+    let link = wan_link();
+    let size = qual_mib(256) * MIB;
+    // Memory workers: the link, not this machine's shared disk, is what
+    // saturates.
+    let (a, b) = qual_pair(None);
+    let hash = b.worker.hold(content(43, size as usize));
+    a.worker.want(&hash, size);
+    let proxy = proxy_for(&b.endpoint, &link);
+    let control = control_session(&a, &proxy.endpoint(), &b.code);
+    let idle: Vec<f64> = (0..20)
+        .filter_map(|_| {
+            sleep_ms(50);
+            ping_ms(&control)
+        })
+        .collect();
+    let conn = a.dial(&proxy.endpoint(), &b.code, LANE);
+    let bulk = conn.clone();
+    let (options, _) = qual_options(&a);
+    let began = Instant::now();
+    let lane = a.run(conn, options);
+    // Saturated: the window is full once the first 16 MiB have arrived.
+    assert!(
+        wait_until(Duration::from_secs(120), || a
+            .worker
+            .bytes_written
+            .load(Ordering::Relaxed)
+            >= 16 * MIB),
+        "the lane never got going"
+    );
+    let stop = AtomicBool::new(false);
+    let (mut on_control, mut on_bulk) = (Vec::new(), Vec::new());
+    thread::scope(|scope| {
+        let bulk_pings = scope.spawn(|| {
+            let mut samples = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(ms) = ping_ms(&bulk) {
+                    samples.push(ms);
+                }
+                sleep_ms(100);
+            }
+            samples
+        });
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until && !a.worker.has(&hash) {
+            if let Some(ms) = ping_ms(&control) {
+                on_control.push(ms);
+            }
+            sleep_ms(100);
+        }
+        stop.store(true, Ordering::Relaxed);
+        on_bulk = bulk_pings.join().unwrap();
+    });
+    let done = wait_until(Duration::from_secs(1800), || a.worker.has(&hash));
+    let seconds = began.elapsed().as_secs_f64();
+    drop(lane);
+    assert!(done, "the transfer did not finish");
+    let p99 = percentile(&on_control, 99.0);
+    let extra = json!({
+        "rtt_ms": link.rtt_ms,
+        "link_bytes_per_s": link.bytes_per_s,
+        "bytes": size,
+        "idle_control": summary(&idle),
+        "loaded_control": summary(&on_control),
+        "loaded_bulk_session": summary(&on_bulk),
+        "transfer_seconds": seconds,
+        "link_utilization": (size / MIB) as f64 / seconds / (link.bytes_per_s as f64 / MIB as f64),
+    });
+    record(
+        "objects_v3_lanes::wp4_5_control_latency_under_a_saturated_lane",
+        "control_p99_ms",
+        p99,
+        "ms",
+        extra,
+    );
+    assert!(on_control.len() >= 20, "{} samples", on_control.len());
+    assert!(
+        p99 < 100.0,
+        "control-session p99 {p99:.1} ms under a saturated bulk lane"
+    );
+}
+
+/// A session server for the throughput scenarios: `download{count}`
+/// streams `count` 1 MiB chunks, `upload` consumes a streamed body and
+/// answers its length.
+struct Throughput;
+
+impl Handler for Throughput {
+    fn handle(&self, req: Incoming) {
+        match req.op.as_str() {
+            "download" => {
+                let block = vec![0x5au8; MIB as usize];
+                let count = req.header["count"].as_u64().unwrap_or(0);
+                for index in 0..count {
+                    let header = ChunkHeader {
+                        id: 0,
+                        hash: None,
+                        offset: index * MIB,
+                        total: count * MIB,
+                        last: index + 1 == count,
+                    };
+                    if req.responder.chunk(header, &block).is_err() {
+                        return;
+                    }
+                }
+                req.responder.reply(json!({ "count": count }), Vec::new());
+            }
+            "upload" => {
+                let mut bytes = 0u64;
+                if let Some(chunks) = &req.chunks {
+                    for (_, data) in chunks.iter() {
+                        bytes += data.len() as u64;
+                    }
+                }
+                req.responder.reply(json!({ "bytes": bytes }), Vec::new());
+            }
+            _ => req.responder.reply(json!({}), Vec::new()),
+        }
+    }
+}
+
+/// The pairing verifier of the throughput sessions for `code`.
+fn throughput_verifier(code: &str) -> Verifier {
+    let salt = "wp4-5-throughput".to_owned();
+    let hash: String = Verifier::derive_key(&salt, code)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Verifier { salt, hash }
+}
+
+struct ThroughputPolicy(Verifier);
+
+impl AcceptPolicy for ThroughputPolicy {
+    fn installation(&self) -> String {
+        "throughput-server".into()
+    }
+    fn verifier(&self) -> Option<(Verifier, u64)> {
+        Some((self.0.clone(), 1))
+    }
+    fn admit(&self, _: &ClientHello) -> Result<(), ErrorWire> {
+        Ok(())
+    }
+    fn legacy_attempt(&self, _: SocketAddr, _: &Value) {}
+}
+
+/// Serves throughput sessions on `listener` (one thread per session) until
+/// `stop`.
+fn serve_throughput(listener: TcpListener, code: &str, stop: Arc<AtomicBool>) {
+    let policy = Arc::new(ThroughputPolicy(throughput_verifier(code)));
+    listener.set_nonblocking(true).unwrap();
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                let policy = policy.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    let Ok((conn, _)) =
+                        session::accept(stream, policy, ConnOptions::for_role(LaneRole::Bulk))
+                    else {
+                        return;
+                    };
+                    conn.serve(Arc::new(Throughput));
+                    while conn.closed().is_none() && !stop.load(Ordering::Relaxed) {
+                        sleep_ms(100);
+                    }
+                    conn.close();
+                });
+            }
+            Err(_) => sleep_ms(20),
+        }
+    }
+}
+
+/// Session throughput to `url` (download and upload, `TKFS_QUAL_LARGE_MIB`
+/// MiB each, 1 GiB by default, best of 3 runs each), recorded as `scenario`.
+fn session_throughput(url: &str, code: &str, scenario: &str) {
+    let count = qual_mib(1024);
+    let hello = session::client_hello("throughput-client", LaneRole::Bulk, Some(LANE), 2);
+    let (client, _) = session::dial(
+        url,
+        hello,
+        &CodeAuth { code: code.into() },
+        None,
+        ConnOptions::for_role(LaneRole::Bulk),
+    )
+    .unwrap();
+    let download = |count: u64| {
+        let began = Instant::now();
+        let mut bytes = 0u64;
+        client
+            .call_streaming(
+                "download",
+                json!({ "count": count }),
+                Vec::new(),
+                Priority::Control,
+                None,
+                Duration::from_secs(60),
+                &mut |_: ChunkHeader, data: &[u8]| {
+                    bytes += data.len() as u64;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(bytes, count * MIB);
+        count as f64 / began.elapsed().as_secs_f64()
+    };
+    let block = vec![0xa5u8; MIB as usize];
+    let upload = |count: u64| {
+        let began = Instant::now();
+        let mut upload = client
+            .upload("upload", json!({}), Priority::Data, Duration::from_secs(60))
+            .unwrap();
+        for index in 0..count {
+            let header = ChunkHeader {
+                id: 0,
+                hash: None,
+                offset: index * MIB,
+                total: count * MIB,
+                last: index + 1 == count,
+            };
+            upload.chunk(header, &block).unwrap();
+        }
+        let reply = upload.finish().unwrap();
+        assert_eq!(reply.header["bytes"].as_u64(), Some(count * MIB));
+        count as f64 / began.elapsed().as_secs_f64()
+    };
+    download(16);
+    upload(16);
+    let downs: Vec<f64> = (0..3).map(|_| download(count)).collect();
+    let ups: Vec<f64> = (0..3).map(|_| upload(count)).collect();
+    let best = |runs: &[f64]| runs.iter().copied().fold(0.0, f64::max);
+    record(
+        scenario,
+        "download_mib_per_s",
+        best(&downs),
+        "MiB/s",
+        json!({
+            "url": url,
+            "mib": count,
+            "download_runs_mib_per_s": downs,
+            "upload_runs_mib_per_s": ups,
+            "upload_mib_per_s": best(&ups),
+        }),
+    );
+    client.close();
+}
+
+/// Session throughput on loopback (both sockets loopback: WP4.5 keeps the
+/// large Windows receive buffer there, CCR-WP3.INT-5).
+#[test]
+#[ignore = "WP4.5 qualification (release)"]
+fn qual_wp4_5_session_throughput_loopback() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let code = "wp4-5-loopback-code";
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let stop = stop.clone();
+        thread::spawn(move || serve_throughput(listener, code, stop))
+    };
+    session_throughput(
+        &url,
+        code,
+        "objects_v3_lanes::wp4_5_session_throughput_loopback",
+    );
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+}
+
+/// The server half of a non-loopback throughput measurement (run it on
+/// another host or VM, e.g. in WSL): with `TKFS_QUAL_SERVE_PORT` and
+/// `TKFS_QUAL_CODE` set it serves throughput sessions on all addresses for
+/// `TKFS_QUAL_SERVE_SECS` (600 by default); otherwise it does nothing.
+#[test]
+#[ignore = "WP4.5 qualification (release; a measurement helper)"]
+fn qual_wp4_5_session_server() {
+    let (Some(port), Some(code)) = (
+        std::env::var("TKFS_QUAL_SERVE_PORT").ok(),
+        std::env::var("TKFS_QUAL_CODE").ok(),
+    ) else {
+        eprintln!("TKFS_QUAL_SERVE_PORT and TKFS_QUAL_CODE unset: nothing served");
+        return;
+    };
+    let secs = std::env::var("TKFS_QUAL_SERVE_SECS")
+        .ok()
+        .and_then(|secs| secs.parse().ok())
+        .unwrap_or(600);
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server = {
+        let stop = stop.clone();
+        thread::spawn(move || serve_throughput(listener, &code, stop))
+    };
+    sleep_ms(secs * 1000);
+    stop.store(true, Ordering::Relaxed);
+    server.join().unwrap();
+}
+
+/// Session throughput to a server on another host or VM
+/// (`TKFS_QUAL_REMOTE` = `ws://address:port`, `TKFS_QUAL_CODE`): a session
+/// whose peer is not loopback, so WP4.5 leaves its Windows socket buffers to
+/// the system (receive-window autotuning, dynamic send buffering).
+#[test]
+#[ignore = "WP4.5 qualification (release; needs a remote server)"]
+fn qual_wp4_5_session_throughput_remote() {
+    let (Some(url), Some(code)) = (
+        std::env::var("TKFS_QUAL_REMOTE").ok(),
+        std::env::var("TKFS_QUAL_CODE").ok(),
+    ) else {
+        eprintln!("TKFS_QUAL_REMOTE and TKFS_QUAL_CODE unset: skipped");
+        return;
+    };
+    session_throughput(
+        &url,
+        &code,
+        "objects_v3_lanes::wp4_5_session_throughput_remote",
+    );
 }

@@ -1192,7 +1192,12 @@ fn duplicate_sessions_transfer_once() {
     let done = write_op(&w, &w.route_b, "session-1", &hash, 0, 100_000, &bytes);
     assert_eq!(done["outcome"], "completed", "{done}");
     assert!(
-        w.ctx.inflight_objects.lock().unwrap().get(&hash).is_none(),
+        !w.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash),
         "lease released"
     );
     assert!(want_op(&w, &w.route_b, "session-2").is_empty());
@@ -1219,6 +1224,7 @@ fn mutual_pairing_transfers_once_and_leases_expire() {
         .inflight_objects
         .lock()
         .unwrap()
+        .leases
         .get_mut(&hash)
         .unwrap()
         .expires_ms = 1;
@@ -1292,6 +1298,7 @@ fn lease(w: &Worker, hash: &str) -> tkfs::runtime::ctx::ObjectLease {
         .inflight_objects
         .lock()
         .unwrap()
+        .leases
         .get(hash)
         .cloned()
         .unwrap_or_else(|| panic!("no lease on {hash}"))
@@ -1313,8 +1320,8 @@ fn route_c(w: &Worker) -> Value {
 /// test below asserts that).
 fn age_one_ttl(w: &Worker, hash: &str) {
     let ttl = tkfs::model::protocol::objects::LEASE_TTL.as_millis() as u64;
-    let mut leases = w.ctx.inflight_objects.lock().unwrap();
-    let lease = leases.get_mut(hash).unwrap();
+    let mut state = w.ctx.inflight_objects.lock().unwrap();
+    let lease = state.leases.get_mut(hash).unwrap();
     lease.expires_ms = lease.expires_ms.saturating_sub(ttl);
 }
 
@@ -1379,6 +1386,7 @@ fn want_never_renews_a_lease_only_progress_does() {
         .inflight_objects
         .lock()
         .unwrap()
+        .leases
         .get_mut(&hash)
         .unwrap()
         .offset = 200_000;
@@ -1480,7 +1488,14 @@ fn failed_writes_back_their_object_off() {
         retry_at <= tkfs::util::time::now_ms() + 30_000,
         "one attempt for the object: {retry_at}"
     );
-    assert!(w.ctx.inflight_objects.lock().unwrap().get(&hm).is_none());
+    assert!(
+        !w.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hm)
+    );
     assert!(offered(&want_op(&w, &w.route_b, "s"), &hm).is_none());
     assert!(offered(&want_op(&w, &route_c, "c"), &hm).is_some());
     // A local failure (the spool cannot be created): the object backoff
@@ -1489,7 +1504,14 @@ fn failed_writes_back_their_object_off() {
     let local = write_op(&w, &w.route_b, "s", &hl, 0, 5000, &l);
     assert!(local["outcome"]["failed"]["code"].is_string(), "{local}");
     assert_ne!(local["outcome"]["failed"]["code"], "RESUME_OFFSET_AHEAD");
-    assert!(w.ctx.inflight_objects.lock().unwrap().get(&hl).is_none());
+    assert!(
+        !w.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hl)
+    );
     assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hl).is_none());
     let store = w.ctx.sync_stores.checkout().unwrap();
     assert!(store.object_backoff(&hl).unwrap().is_some());
@@ -2198,6 +2220,7 @@ fn a_new_lane_count_takes_over_the_old_lanes_leases() {
         .inflight_objects
         .lock()
         .unwrap()
+        .leases
         .get_mut(&hash)
         .unwrap()
         .expires_ms -= 16_000;
@@ -2225,4 +2248,269 @@ fn a_new_lane_count_takes_over_the_old_lanes_leases() {
         &content[100_000..],
     );
     assert_eq!(done["outcome"], "completed", "{done}");
+}
+
+// ---------------------------------------------------------------------------
+// WP4.5: leases given up (CCR-WP3.3-4), per-worker state (CCR-WP3.2-3),
+// verified reads quarantine through the store (CCR-WP3.2-1)
+
+fn release_op(w: &Worker, route: &Value, session: &str, hashes: &[&str]) -> u64 {
+    let (reply, _) = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route": route, "session": session, "hashes": hashes}),
+        &[],
+    )
+    .unwrap();
+    reply["released"].as_u64().unwrap()
+}
+
+fn want_excluding(w: &Worker, route: &Value, session: &str, exclude: &[&str]) -> Vec<Value> {
+    let (reply, _) = op(
+        &w.ctx,
+        "objects.want",
+        json!({"route": route, "lane": {"index": 0, "count": 1}, "max_items": 256,
+            "max_bytes": PULL_BUDGET_BYTES, "session": session, "exclude": exclude}),
+        &[],
+    )
+    .unwrap();
+    reply["items"].as_array().unwrap().clone()
+}
+
+/// CCR-WP3.3-4 (WP4.5): `objects.release` ends a session's leases at once,
+/// with no stall backoff for its source, so another source's session is
+/// offered the objects at their durable offsets without waiting for the
+/// lease to lapse. A release by a session that holds nothing (or names a
+/// lease of another session) changes nothing; a list over the bound is an
+/// invalid request; the route is checked.
+#[test]
+fn a_released_lease_moves_the_object_to_another_source_at_once() {
+    let (x, y) = (vec![12u8; 200_000], vec![13u8; 150_000]);
+    let w = worker(|a| {
+        file(a, "x.bin", &x);
+        file(a, "y.bin", &y);
+    });
+    let (hx, hy) = (tkfs::core::hash(&x), tkfs::core::hash(&y));
+    let source_a = w.route_b["remote_replica"].as_str().unwrap().to_owned();
+    let route_c = route_c(&w);
+    let first = want_op(&w, &w.route_b, "s1");
+    assert!(offered(&first, &hx).is_some() && offered(&first, &hy).is_some());
+    let done = write_op(&w, &w.route_b, "s1", &hx, 0, 200_000, &x[..50_000]);
+    assert_eq!(done["outcome"]["progressed"]["durable_offset"], 50_000);
+    assert!(want_op(&w, &route_c, "c1").is_empty(), "held by S1");
+    // Another session cannot release S1's leases.
+    assert_eq!(release_op(&w, &route_c, "c1", &[&hx, &hy]), 0);
+    assert_eq!(lease(&w, &hx).session, "s1");
+    // S1 gives both up: C is offered them at once, X at its durable offset.
+    assert_eq!(release_op(&w, &w.route_b, "s1", &[&hx, &hy]), 2);
+    assert_eq!(release_op(&w, &w.route_b, "s1", &[&hx]), 0, "idempotent");
+    let from_c = want_op(&w, &route_c, "c1");
+    assert_eq!(offered(&from_c, &hx).unwrap()["offset"], 50_000);
+    assert_eq!(offered(&from_c, &hy).unwrap()["offset"], 0);
+    // No lapse happened: no stall backoff for A (another session of A's is
+    // offered them again once C gives them up).
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hx).is_none());
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hy).is_none());
+    let finished = write_op(&w, &route_c, "c1", &hx, 50_000, 200_000, &x[50_000..]);
+    assert_eq!(finished["outcome"], "completed", "{finished}");
+    assert_eq!(release_op(&w, &route_c, "c1", &[&hy]), 1);
+    assert_eq!(
+        offered(&want_op(&w, &w.route_b, "s2"), &hy).unwrap()["offset"],
+        0
+    );
+    // Bounds and routes.
+    let many: Vec<String> = (0..257).map(|i| format!("{i:064x}")).collect();
+    let error = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route": w.route_b, "session": "s1", "hashes": many}),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "INVALID_REQUEST");
+    let mut elsewhere = w.route_b.clone();
+    elsewhere["local_replica"] = json!("someone-else");
+    let error = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route": elsewhere, "session": "s1", "hashes": [hy]}),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "LOCAL_REPLICA_BINDING_MISMATCH");
+}
+
+/// CCR-WP3.3-4 (WP4.5): an `objects.want` with `exclude` leaves those
+/// objects out of its list and gives up the leases its session holds on
+/// them (not another session's), so a source that backs an object off
+/// stops hiding it from the others; a want without `exclude` behaves as
+/// before; an exclusion list over the bound is an invalid request.
+#[test]
+fn a_want_that_excludes_gives_its_leases_up() {
+    let (x, y) = (vec![14u8; 30_000], vec![15u8; 40_000]);
+    let w = worker(|a| {
+        file(a, "x.bin", &x);
+        file(a, "y.bin", &y);
+    });
+    let (hx, hy) = (tkfs::core::hash(&x), tkfs::core::hash(&y));
+    let route_c = route_c(&w);
+    let first = want_op(&w, &w.route_b, "s1");
+    assert!(offered(&first, &hx).is_some() && offered(&first, &hy).is_some());
+    // S1 excludes X: not offered to it, and its lease ends; Y stays S1's.
+    let again = want_excluding(&w, &w.route_b, "s1", &[&hx]);
+    assert!(offered(&again, &hx).is_none(), "{again:?}");
+    assert!(offered(&again, &hy).is_some());
+    let from_c = want_op(&w, &route_c, "c1");
+    assert!(offered(&from_c, &hx).is_some(), "{from_c:?}");
+    assert!(offered(&from_c, &hy).is_none(), "Y is S1's");
+    // Excluding an object another session holds touches nothing.
+    let none = want_excluding(&w, &w.route_b, "s1", &[&hx, &hy]);
+    assert!(none.is_empty(), "{none:?}");
+    assert_eq!(lease(&w, &hx).session, "c1");
+    // S1 gave Y up with that want: C is offered it.
+    assert!(offered(&want_op(&w, &route_c, "c1"), &hy).is_some());
+    let many: Vec<String> = (0..257).map(|i| format!("{i:064x}")).collect();
+    let error = op(
+        &w.ctx,
+        "objects.want",
+        json!({"route": w.route_b, "lane": {"index": 0, "count": 1}, "max_items": 256,
+            "max_bytes": PULL_BUDGET_BYTES, "session": "s1", "exclude": many}),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "INVALID_REQUEST");
+}
+
+/// CCR-WP3.2-3 (WP4.5): the objects state lives in the worker's context, not
+/// in process-wide statics keyed by the store root: a second worker context
+/// on the same store (as a restarted worker would be) shares neither the
+/// first one's leases nor its per-source backoffs.
+#[test]
+fn objects_state_belongs_to_its_worker_context() {
+    let x = vec![16u8; 20_000];
+    let w = worker(|a| {
+        file(a, "x.bin", &x);
+    });
+    let hx = tkfs::core::hash(&x);
+    let source_a = w.route_b["remote_replica"].as_str().unwrap().to_owned();
+    assert!(offered(&want_op(&w, &w.route_b, "s1"), &hx).is_some());
+    objects_rpc::back_off_source(&w.ctx, &source_a, &hx);
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hx).is_some());
+    let root = w.ctx.root.clone();
+    let store = Store::open(&root, None).unwrap();
+    let other =
+        tkfs::worker::build_ctx(Arc::new(Mutex::new(Engine::new(store))), &root, false, None);
+    assert!(objects_rpc::source_retry_at(&other, &source_a, &hx).is_none());
+    assert!(other.inflight_objects.lock().unwrap().leases.is_empty());
+    let (reply, _) = objects_rpc::dispatch(
+        &other,
+        "objects.want",
+        &json!({"route": w.route_b, "lane": {"index": 0, "count": 1}, "max_items": 256,
+            "max_bytes": PULL_BUDGET_BYTES, "session": "s9"}),
+        &[],
+    )
+    .unwrap();
+    assert!(
+        offered(reply["items"].as_array().unwrap(), &hx).is_some(),
+        "the other context saw the first one's lease or backoff: {reply}"
+    );
+    // The first context's state is unchanged by the second's.
+    assert_eq!(lease(&w, &hx).session, "s1");
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hx).is_some());
+}
+
+/// CCR-WP3.2-1 (WP4.5): a verified read (`runtime::content::fetch_verified`,
+/// the mount's and `cat-object`'s path) that finds corrupt installed bytes
+/// quarantines them through the store: renamed aside, the object `CORRUPT`
+/// with its legacy `object_errors` row and its backoff, and its download
+/// queued. Before, only the rename happened and the index learned of it
+/// through `request_object`'s reconciliation (`MISSING`). A good copy put
+/// back later is read and healed as before.
+#[test]
+fn a_verified_read_quarantines_corrupt_bytes_through_the_store() {
+    let content = vec![17u8; 120_000];
+    let w = worker(|a| {
+        file(a, "q.bin", &content);
+    });
+    let hash = tkfs::core::hash(&content);
+    let locks = ObjectLocks::default();
+    {
+        let engine = w.ctx.engine.lock().unwrap();
+        let (done, _) = transfer(&w.a, &engine.store, &locks, &hash, 64 * 1024);
+        assert_eq!(done.outcome, ObjectOutcome::Completed);
+        assert_eq!(availability(&engine.store, &hash), Some(AVAILABLE));
+    }
+    let path = w.ctx.root.join("objects").join(&hash);
+    let mut rotten = content.clone();
+    rotten[77] ^= 0xff;
+    fs::write(&path, &rotten).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let error = runtime::content::fetch_verified(&w.ctx.engine, &hash, deadline).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("CONTENT_UNAVAILABLE"),
+        "{error:#}"
+    );
+    assert!(!path.exists(), "the corrupt bytes stayed in place");
+    let aside = fs::read_dir(w.ctx.root.join("objects"))
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{hash}.corrupt-"))
+        })
+        .count();
+    assert_eq!(aside, 1, "renamed aside once");
+    {
+        let engine = w.ctx.engine.lock().unwrap();
+        let store = &engine.store;
+        assert_eq!(availability(store, &hash), Some(CORRUPT));
+        let recorded: Option<String> = store
+            .db
+            .query_row(
+                "SELECT error FROM object_errors WHERE hash=?",
+                [&hash],
+                |r| r.get(0),
+            )
+            .ok();
+        assert!(
+            recorded
+                .as_deref()
+                .is_some_and(|error| error.contains("CORRUPT_OBJECT")),
+            "{recorded:?}"
+        );
+        let code: Option<String> = store
+            .db
+            .query_row(
+                "SELECT code FROM object_error_state WHERE hash=?",
+                [&hash],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(code.as_deref(), Some("CORRUPT_OBJECT"));
+        let queued: bool = store
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM object_requests WHERE hash=?)",
+                [&hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(queued, "the download was not queued");
+        // The quarantine never delays the download that repairs it.
+        assert!(
+            store
+                .want_objects(lane(), 256, PULL_BUDGET_BYTES, &no_leases)
+                .unwrap()
+                .iter()
+                .any(|item| item.hash == hash && item.priority == WantPriority::Demand),
+        );
+    }
+    // A good copy put back is read (verified), and the index heals.
+    fs::write(&path, &content).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    runtime::content::fetch_verified(&w.ctx.engine, &hash, deadline).unwrap();
+    let engine = w.ctx.engine.lock().unwrap();
+    assert!(engine.store.object_available_checked(&hash));
+    assert_eq!(availability(&engine.store, &hash), Some(AVAILABLE));
 }
