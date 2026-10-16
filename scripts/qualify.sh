@@ -14,6 +14,7 @@
 # Usage:
 #   CARGO_TARGET_DIR=$HOME/tkfs-target/<pkg> scripts/qualify.sh --wave 1 [--files "a b"] [--filter NAME]
 #   scripts/qualify.sh --all | --baseline [--budget-s 120] [--file-timeout-min 90] [--evidence PATH] [--no-build]
+#   scripts/qualify.sh --all --merge --files "a b"   # re-run some files into an existing evidence
 #
 # Evidence: test-evidence/qualification-<kind>-linux.json. A file passes only
 # when cargo exits 0 and its last `test result:` line says `ok.`; exit code and
@@ -26,12 +27,13 @@
 # machinery or on the Windows dev box's disk). --all gives the long scenarios
 # their budget (--budget-s 2400, --file-timeout-min 150) unless given. The
 # evidence records the disk of the temporary directory and the machine's load
-# at the start.
+# at the start. --merge keeps the other files' results from the existing
+# evidence file and replaces only the files run now (as qualify.ps1 -Merge).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(pwd)
 
-wave=0; kind=""; files=""; filter=""; budget=""; file_timeout=""; evidence=""; build=1; baseline=0
+wave=0; kind=""; files=""; filter=""; budget=""; file_timeout=""; evidence=""; build=1; baseline=0; merge=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --wave) wave="$2"; shift 2 ;;
@@ -43,6 +45,7 @@ while [ $# -gt 0 ]; do
     --file-timeout-min) file_timeout="$2"; shift 2 ;;
     --evidence) evidence="$2"; shift 2 ;;
     --no-build) build=0; shift ;;
+    --merge) merge=1; shift ;;
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -106,7 +109,7 @@ for f in "${selected[@]}"; do
   echo "qualify: $f -> $st (exit $code)"
 done
 
-python3 - "$root" "$run_dir" "$evidence" "$kind" "$wave" "$baseline" "$budget" "$file_timeout" "$filter" "$started" "${statuses[@]}" <<'PY'
+TKFS_QUALIFY_MERGE="$merge" python3 - "$root" "$run_dir" "$evidence" "$kind" "$wave" "$baseline" "$budget" "$file_timeout" "$filter" "$started" "${statuses[@]}" <<'PY'
 import json, os, platform, subprocess, sys, time
 root, run_dir, evidence, kind, wave, baseline, budget, file_timeout, flt, started = sys.argv[1:11]
 statuses = sys.argv[11:]
@@ -147,6 +150,23 @@ for entry in statuses:
     files.append({"file": name, "status": st, "exit_code": int(code), "duration_s": int(secs),
                   "result": result,
                   "log": log, "scenarios": scenarios})
+merged_from = None
+if os.environ.get("TKFS_QUALIFY_MERGE") == "1" and os.path.exists(evidence):
+    # Carry the other files' results (and their metrics, for the floors) forward.
+    old = json.load(open(evidence))
+    merged_from = {k: old.get(k) for k in ("generated_at", "git", "run_dir")}
+    current = {f["file"] for f in files}
+    kept = [f for f in old.get("files", []) if f["file"] not in current]
+    for f in kept:
+        for sc in f.get("scenarios", []):
+            records.append({"scenario": sc["scenario"], "status": "started"})
+            for m in sc.get("metrics", []):
+                records.append({"scenario": sc["scenario"], "metric": m["metric"], "value": m["value"]})
+    order = ["qual_wp1_4_worker", "qual_wp1_5_mount", "qual_wp1_6_activation", "qual_wp1_7_derive",
+             "qual_wp1_8_objects", "qual_wp1_9_session", "qual_wp1_12_legacy", "qual_wp2_1_lifecycle",
+             "qual_wp2_3_worker", "qual_wp2_4_offlock", "qual_wp2_5_feed", "qual_wp3_1_transport",
+             "qual_wp3_2_objects", "qual_wp3_int_e2e", "qual_scale"]
+    files = sorted(kept + files, key=lambda f: order.index(f["file"]) if f["file"] in order else 99)
 selected = {f["file"] for f in files}
 ops = {"<": lambda v, l: v < l, "<=": lambda v, l: v <= l, ">": lambda v, l: v > l,
        ">=": lambda v, l: v >= l, "==": lambda v, l: v == l}
@@ -217,7 +237,7 @@ doc = {
                 "floors_not_run": sum(r["verdict"] == "not_run" for r in results),
                 "floors_incomplete": sum(r["verdict"] == "incomplete" for r in results),
                 "enforced_failures": enforced_failures},
-    "files": files, "floors": results, "run_dir": run_dir,
+    "files": files, "floors": results, "run_dir": run_dir, "merged_from": merged_from,
 }
 json.dump(doc, open(evidence, "w"), indent=2)
 print(f"qualify: evidence written to {evidence}")
