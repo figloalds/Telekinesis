@@ -83,9 +83,20 @@ run_dir="$root/test-runs/qualify-$kind-linux-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$run_dir" "$(dirname "$evidence")"
 started=$(date +%s)
 # Git state when the run starts (edits made during a long run do not belong to it).
-git -C "$root" rev-parse HEAD >"$run_dir/git-head.txt" 2>/dev/null || true
-git -C "$root" rev-parse --abbrev-ref HEAD >"$run_dir/git-branch.txt" 2>/dev/null || true
-git -C "$root" status --porcelain >"$run_dir/git-status.txt" 2>/dev/null || true
+gitq() { git -C "$root" "$@"; }
+# A Windows worktree read from WSL (/mnt/c): its .git file names a Windows
+# gitdir, which Linux git cannot follow by itself (WP4.2).
+if ! git -C "$root" rev-parse HEAD >/dev/null 2>&1 && [ -f "$root/.git" ]   && command -v wslpath >/dev/null 2>&1; then
+  windows_gitdir=$(sed -n 's/^gitdir: //p' "$root/.git" | tr -d '\r')
+  if [ -n "$windows_gitdir" ]; then
+    gitq() {
+      GIT_DIR="$(wslpath -u "$windows_gitdir")" GIT_WORK_TREE="$root"         git -c core.autocrlf=true -c core.filemode=false "$@"
+    }
+  fi
+fi
+gitq rev-parse HEAD >"$run_dir/git-head.txt" 2>/dev/null || true
+gitq rev-parse --abbrev-ref HEAD >"$run_dir/git-branch.txt" 2>/dev/null || true
+gitq status --porcelain >"$run_dir/git-status.txt" 2>/dev/null || true
 # What else ran when this run started (the machine may be shared).
 { cat /proc/loadavg 2>/dev/null || true; } >"$run_dir/loadavg.txt"
 { ps -eo comm= 2>/dev/null | grep -cE '^(cargo|rustc|tkfs|ld|cc)$' || true; } >"$run_dir/build-processes.txt"
