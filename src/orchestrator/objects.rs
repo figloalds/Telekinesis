@@ -24,7 +24,11 @@
 //! ([`LaneOptions::peer_calls`]): pulls, pushes and reports wait their turn
 //! in order, and pushes (with their `objects.wants`) hold at most
 //! `peer_calls - 1` slots at once, so a push the peer stalls never keeps a
-//! pull or a report waiting (CCR-WP3.3-1; WP3.INT re-review). A key's round
+//! pull or a report waiting (CCR-WP3.3-1; WP3.INT re-review). That limit is
+//! the *push gate*: an upload round takes it before its repository's turn
+//! and holds it for the round, so an upload round never waits for it while
+//! holding a turn, and a stalled push holds one turn at most, whatever the
+//! number of repositories (WP3.INT re-review 2). A key's round
 //! ends after [`ROUND_CAP`] (10 s) so other repositories get their turn; one
 //! that moved data runs again after
 //! [`CONTENT_YIELD`]. A round that finds nothing to pull starts no writer
@@ -853,6 +857,33 @@ fn handoffs() -> &'static Mutex<HashMap<String, HashMap<String, Handoff>>> {
 /// past this, nothing more is parked: those leases simply lapse).
 const MAX_HANDOFFS: usize = 64 * 1024;
 
+/// What the handoff table records of `item` (WP3.INT re-review 2). A size-0
+/// item past offset 0 of an object that is not the empty one names a size
+/// nobody knows at an offset nothing can move from: [`allot`] gives it no
+/// bytes, and it is no size probe ([`size_unknown`]) either, so a transfer
+/// that took it over would pull nothing, round after round. It keeps the
+/// size the table knew of the object or, without one, goes back to offset 0,
+/// a size probe again (a worker answers a write behind its durable offset
+/// with that offset, where the object then continues).
+fn handoff_item(item: &WantItem, known: Option<&WantItem>) -> WantItem {
+    if item.size > 0 || item.offset == 0 || item.hash == EMPTY_OBJECT {
+        return item.clone();
+    }
+    match known
+        .map(|known| known.size)
+        .filter(|size| *size >= item.offset)
+    {
+        Some(size) => WantItem {
+            size,
+            ..item.clone()
+        },
+        None => WantItem {
+            offset: 0,
+            ..item.clone()
+        },
+    }
+}
+
 fn handoff_put(map: &mut HashMap<String, Handoff>, hash: &str, entry: Handoff, now: Instant) {
     if map.len() >= MAX_HANDOFFS && !map.contains_key(hash) {
         map.retain(|_, handoff| now < handoff.until);
@@ -888,7 +919,7 @@ pub(crate) fn handoff_wanted(
             // The want renewed the lease, and its offset is our worker's
             // newest word.
             entry.until = now + LEASE_TTL;
-            entry.item = item.clone();
+            entry.item = handoff_item(item, Some(&entry.item));
             if entry.holder(now).is_some_and(|other| other != holder) {
                 // Another transfer continues it under this lease.
                 return false;
@@ -911,7 +942,7 @@ pub(crate) fn handoff_wanted(
         return true;
     }
     let entry = Handoff {
-        item: item.clone(),
+        item: handoff_item(item, None),
         lease: lease.to_owned(),
         claim: None,
         until: now + LEASE_TTL,
@@ -929,7 +960,7 @@ pub(crate) fn handoff_park(instance: &str, item: &WantItem, lease: &str) {
     let mut all = lock(handoffs());
     let map = all.entry(instance.to_owned()).or_default();
     let entry = Handoff {
-        item: item.clone(),
+        item: handoff_item(item, map.get(&item.hash).map(|known| &known.item)),
         lease: lease.to_owned(),
         claim: None,
         until: now + LEASE_TTL,
@@ -955,7 +986,7 @@ pub(crate) fn handoff_unclaim(
     {
         entry.claim = None;
         if let Some(item) = item {
-            entry.item = item.clone();
+            entry.item = handoff_item(item, Some(&entry.item));
         }
     }
 }
@@ -1057,7 +1088,7 @@ pub(crate) fn handoff_progress(instance: &str, item: &WantItem, lease: &str, hol
         && entry.lease == lease
         && entry.holder(now).is_none_or(|other| other == holder)
     {
-        entry.item = item.clone();
+        entry.item = handoff_item(item, Some(&entry.item));
         entry.claim = Some(Claim {
             holder: holder.to_owned(),
             until: now + CLAIM_TTL,
@@ -2320,8 +2351,10 @@ struct LaneRun {
     status: u32,
     window: Arc<Window>,
     slots: Arc<Slots>,
-    /// Pushes at once: one fewer than `slots` (when there are two or more),
-    /// so a stalled push never takes the last slot from pulls and reports.
+    /// Upload rounds at once (the push gate): one fewer than `slots` (when
+    /// there are two or more), so a stalled push never takes the last slot
+    /// from pulls and reports. Taken before the repository's turn
+    /// (`UploadJob::run`), never while holding one.
     pushes: Arc<Slots>,
     repos: RepoGate,
     stats: Arc<LaneStats>,
@@ -2758,6 +2791,15 @@ impl Job for UploadJob {
             return Ok(idle);
         }
         let stop = || lane.stopped();
+        // The push gate before the repository's turn, held for the round: a
+        // round never waits for the gate while it holds a turn (WP3.INT
+        // re-review 2). A push the peer stalls holds the gate, one turn and
+        // one peer slot; every other repository's upload round waits for the
+        // gate without a turn, so the other turn and the other slot stay with
+        // downloads and reports, however many repositories the lane has.
+        let Some(_gate) = lane.pushes.acquire(&stop) else {
+            return Err(lane.stop_error());
+        };
         let Some(_turn) = lane.repos.enter(&target.repo, &stop) else {
             return Err(lane.stop_error());
         };
@@ -2832,7 +2874,8 @@ struct RoundState {
     plan: VecDeque<Planned>,
     begun: HashSet<String>,
     /// Every object planned in this round, as first planned (offset: where
-    /// the worker said it stood), with its lease and whether it was taken
+    /// the worker said it stood; size: the one a size probe learned, for an
+    /// object of unknown size), with its lease and whether it was taken
     /// from the handoff table (module docs, "Lease handoff").
     planned: HashMap<String, Planned>,
     /// Objects that failed for this source in this round (now in backoff).
@@ -3135,6 +3178,14 @@ fn round_event(
                     continue;
                 };
                 if sink.resize(&hash, total) {
+                    // The round's record of the object takes the size too:
+                    // what the round parks, hands on or continues
+                    // (`settle_handoffs`) carries it. A size-0 item parked
+                    // at a durable offset past 0 was never moved again by
+                    // the source that took it over (WP3.INT re-review 2).
+                    if let Some(first) = state.planned.get_mut(&hash) {
+                        first.item.size = total;
+                    }
                     state.plan.push_front(Planned {
                         item: WantItem {
                             size: total,
@@ -3758,12 +3809,9 @@ fn upload_round(
             }));
         }
         let stop = || lane.stopped();
-        // The push gate first, then a peer slot: at most `peer_calls - 1`
-        // pushes (with their wants) hold slots, so pulls and reports always
-        // find one (WP3.INT re-review).
-        let Some(gate) = lane.pushes.acquire(&stop) else {
-            return Err(lane.stop_error());
-        };
+        // The round holds the push gate (`UploadJob::run`): at most
+        // `peer_calls - 1` upload rounds hold peer slots for their wants and
+        // pushes, so pulls and reports always find one (WP3.INT re-review).
         let Some(slot) = lane.slots.acquire(&stop) else {
             return Err(lane.stop_error());
         };
@@ -3821,9 +3869,7 @@ fn upload_round(
                 progress: moved,
             }));
         }
-        let pushed = push(lane, target, client, &route, items, &spans, slot);
-        drop(gate);
-        match pushed {
+        match push(lane, target, client, &route, items, &spans, slot) {
             Ok(push) => {
                 moved |= push.sent > 0 || push.completed > 0;
                 if push.sent == 0 && push.completed == 0 {
@@ -4579,5 +4625,57 @@ mod tests {
         let before = lock(held()).entries;
         assert_eq!(object_installed(&last), vec!["NOT_AVAILABLE".to_owned()]);
         assert_eq!(lock(held()).entries, before - 1);
+    }
+
+    /// The handoff table never keeps an item no transfer can move (WP3.INT
+    /// re-review 2): size 0 past offset 0 of an object that is not the empty
+    /// one gets no bytes from `allot` and is no size probe. Such an item keeps
+    /// the size the table knew, or goes back to offset 0 (a size probe).
+    #[test]
+    fn the_handoff_table_keeps_no_unmovable_item() {
+        let instance = format!("handoff-{}", uuid::Uuid::new_v4());
+        let item = |hash: &str, size: u64, offset: u64| WantItem {
+            hash: hash.to_owned(),
+            size,
+            offset,
+            priority: WantPriority::History,
+        };
+        let (known, unknown) = (format!("{:064x}", 1), format!("{:064x}", 2));
+        // Parked with its size, then given back with size 0 past offset 0
+        // (a record that lost the size): the size stays.
+        handoff_park(&instance, &item(&known, 24 << 20, 1 << 20), "lease-a");
+        let taken = handoff_take(&instance, "holder", 16, u64::MAX, &|_| true);
+        assert_eq!(taken.len(), 1);
+        handoff_unclaim(
+            &instance,
+            &known,
+            "lease-a",
+            "holder",
+            Some(&item(&known, 0, 5 << 20)),
+        );
+        // Parked with size 0 past offset 0 and no size known: a size probe.
+        handoff_park(&instance, &item(&unknown, 0, 3 << 20), "lease-b");
+        let mut taken = handoff_take(&instance, "other", 16, u64::MAX, &|_| true);
+        taken.sort_by(|a, b| a.0.hash.cmp(&b.0.hash));
+        let items: Vec<WantItem> = taken.into_iter().map(|(item, _)| item).collect();
+        assert_eq!(
+            items,
+            vec![item(&known, 24 << 20, 5 << 20), item(&unknown, 0, 0)]
+        );
+        assert!(size_unknown(&items[1]));
+        assert!(covered(&items[1], allot(&items[1..], 1 << 20)[0]));
+        // A size learned since (the worker's word) replaces the probe.
+        let sized = item(&unknown, 7 << 20, 2 << 20);
+        handoff_progress(&instance, &sized, "lease-b", "other");
+        let taken = handoff_take(&instance, "other", 16, u64::MAX, &|_| true);
+        assert!(taken.iter().any(|(taken, _)| *taken == sized), "{taken:?}");
+        // The empty object keeps size 0 (at offset 0, as always).
+        handoff_park(&instance, &item(EMPTY_OBJECT, 0, 0), "lease-c");
+        let taken = handoff_take(&instance, "third", 16, u64::MAX, &|_| true);
+        assert!(
+            taken
+                .iter()
+                .any(|(taken, _)| *taken == item(EMPTY_OBJECT, 0, 0))
+        );
     }
 }
