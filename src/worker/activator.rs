@@ -310,20 +310,10 @@ impl Drop for Running<'_> {
 ///   5 s, as the store's `busy_timeout`): staging on secondary connections
 ///   (feed exchanges, `stage_incoming`) holds SQLite's writer for a few
 ///   milliseconds, and the default handler's backoff (1, 2, 5, 10, 15, 20,
-///   25 ms…) overshoots each release by up to 25 ms, under the engine lock;
-/// * `temp_store` is `MEMORY` (WP4.4): a commit runs in a savepoint nested
-///   in its slice's transaction, and SQLite keeps the original image of
-///   every page the savepoint modifies in a sub-journal, which it moves to a
-///   newly created temp file once it passes 64 KiB. Creating that file on
-///   Windows stalled single statements for 30-60 ms (no CPU, no page I/O:
-///   measured on the 150K catch-up, where it was every seal over 30 ms and
-///   most of the commit holds' tail). A commit's sub-journal is the pages it
-///   touches (a few MB: a slow commit on a projection above
-///   `commit::FOLD_MAX_ENTRIES` entries stores a delta). The change keeps
-///   the connection's commit epoch, so the view stays
-///   (`Store::set_temp_store_memory`), and is refused inside a transaction
-///   (best effort, as the rest). An open's rebuild, before the activator
-///   runs, keeps temp files (it may rewrite hundreds of MB).
+///   25 ms…) overshoots each release by up to 25 ms, under the engine lock.
+///
+/// (On Windows the engine store already keeps a commit's savepoint
+/// sub-journal in memory, from its open on: `inbox::startup_drain`, WP4.4.)
 fn tune_engine_connection(store: &Store, running: bool) {
     let pages = if running {
         ENGINE_WAL_AUTOCHECKPOINT
@@ -336,7 +326,6 @@ fn tune_engine_connection(store: &Store, running: bool) {
         [],
         |_| Ok(()),
     );
-    let _ = store.set_temp_store_memory(running);
     let _ = if running {
         store.db.busy_handler(Some(poll_busy))
     } else {

@@ -586,9 +586,11 @@ impl Store {
         self.caches.commit.view_loads.get()
     }
     /// Sets the connection's `temp_store` to `MEMORY` (`memory`) or back to
-    /// the default, outside a transaction (SQLite refuses it inside one). The
-    /// activator keeps a commit's savepoint sub-journal in memory this way
-    /// (`worker::activator`, WP4.4). The change drops the connection's TEMP
+    /// the default, outside a transaction (SQLite refuses it inside one). On
+    /// Windows the worker's engine store keeps its commits' savepoint
+    /// sub-journals in memory this way from its open on
+    /// (`inbox::startup_drain`, WP4.4). The
+    /// change drops the connection's TEMP
     /// objects, among them the commit-epoch table (module docs,
     /// "Rolled-back commits and the view"): its stored value is carried over
     /// unchanged, so the change neither drops the view (an O(projection)
