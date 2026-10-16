@@ -1065,6 +1065,9 @@ pub(super) struct SealReport {
     /// The seal used a projection JSON serialized off-lock.
     pub(super) used_json: bool,
     pub(super) micros: u64,
+    /// Of `micros`: reading the previous seal and the journal binding (the
+    /// rest writes the rows and the anchor).
+    pub(super) journal_micros: u64,
 }
 
 /// Seals written on a store handle (`Store::seal_stats`): how many of each
@@ -1084,6 +1087,9 @@ pub struct SealStats {
     pub journal_rows: u64,
     pub max_micros: u64,
     pub total_micros: u64,
+    /// Of `total_micros`: reading the previous seals and extending their
+    /// journal bindings (telemetry: what a slow seal spent its time on).
+    pub journal_micros: u64,
 }
 
 impl SealStats {
@@ -1100,6 +1106,7 @@ impl SealStats {
         self.journal_rows += report.journal_rows;
         self.max_micros = self.max_micros.max(report.micros);
         self.total_micros += report.micros;
+        self.journal_micros += report.journal_micros;
     }
 }
 
@@ -1191,6 +1198,7 @@ pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<Sea
         None => full_journal(db, branch, cursor)?,
     };
     let frontier = read_frontier(db, branch)?;
+    let journal_micros = started.elapsed().as_micros() as u64;
     let incremental = match previous {
         Some(Previous {
             rows: Some((rows, header)),
@@ -1205,6 +1213,7 @@ pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<Sea
         None => seal_full(db, branch, &identity, cursor, &journal, &frontier, &input)?,
     };
     report.journal_rows = journal_rows;
+    report.journal_micros = journal_micros;
     report.micros = started.elapsed().as_micros() as u64;
     Ok(report)
 }
