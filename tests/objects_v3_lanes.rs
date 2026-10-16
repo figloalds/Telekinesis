@@ -146,6 +146,12 @@ struct Faults {
     /// Reads of objects wait while this is set (a source verifying a large
     /// object on its first serve, a slow disk; WP3.INT re-review).
     stall_reads: bool,
+    /// The next N write items fail `SQLITE_BUSY` (the real worker's answer
+    /// when its database is busy; it records nothing; WP3.INT re-review).
+    busy_items: usize,
+    /// The next N reads fail `SQLITE_BUSY` (a source registering its
+    /// first-serve verifications; WP3.INT re-review).
+    busy_reads: usize,
 }
 
 enum Held {
@@ -510,6 +516,13 @@ impl FakeWorker {
         while self.faults().stall_reads && !self.stopped.load(Ordering::Relaxed) {
             sleep_ms(10);
         }
+        {
+            let mut faults = self.faults();
+            if faults.busy_reads > 0 {
+                faults.busy_reads -= 1;
+                return Err(ErrorWire::coded("SQLITE_BUSY", "test: database is locked"));
+            }
+        }
         let held = {
             let state = self.state.lock().unwrap();
             match state.held.get(&header.hash) {
@@ -602,6 +615,26 @@ impl FakeWorker {
             outcome,
             durable_offset,
         };
+        {
+            let mut faults = self.faults();
+            if faults.busy_items > 0 {
+                faults.busy_items -= 1;
+                let durable = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .wanted
+                    .get(&item.hash)
+                    .map_or(0, |spool| spool.lock().unwrap().durable);
+                return result(
+                    ObjectOutcome::Failed(ErrorWire::coded(
+                        "SQLITE_BUSY",
+                        "test: database is locked",
+                    )),
+                    durable,
+                );
+            }
+        }
         let spool = {
             let mut state = self.state.lock().unwrap();
             if state.held.contains_key(&item.hash) {
@@ -3981,6 +4014,111 @@ fn an_object_a_dialer_lacked_is_offered_again_soon() {
         b.world.object_errors().is_empty(),
         "{:?}",
         b.world.object_errors()
+    );
+}
+
+/// A busy database (`SQLITE_BUSY`, our worker's write or the source's
+/// read) is no failure of the objects: the worker that answers it records
+/// nothing (`objects_rpc::failure_kind`), and the lane neither backs them off
+/// (30 s -> 1 h) nor records `ObjectError`s; they continue in the next round
+/// (WP3.INT re-review: in the release qualification, 10K tiny files stalled
+/// 30-100 s on one busy write batch).
+#[test]
+fn a_busy_database_is_no_failure_of_the_objects() {
+    let (a, b) = pair(100);
+    let hashes: Vec<String> = (0..64)
+        .map(|i| {
+            let hash = b.worker.hold(content(6000 + i, 4096));
+            a.worker.want(&hash, 4096);
+            hash
+        })
+        .collect();
+    a.worker.faults().busy_items = 24;
+    b.worker.faults().busy_reads = 24;
+    let (options, _) = a.options();
+    let began = Instant::now();
+    let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+    let done = wait_until(Duration::from_secs(40), || {
+        hashes.iter().all(|hash| a.worker.has(hash))
+    });
+    let took = began.elapsed();
+    drop(lane);
+    assert!(done, "never installed");
+    assert!(
+        took < Duration::from_secs(12),
+        "installed only after {took:?} (a failure's backoff is 24-36 s)"
+    );
+    assert!(
+        a.world.object_errors().is_empty(),
+        "{:?}",
+        a.world.object_errors()
+    );
+}
+
+/// A pull carries at most the acceptor's `MAX_WANT_ITEMS` (256) items
+/// (§6.4): a round's plan can hold more (objects it takes over from a source
+/// of ours that cannot serve them, plus its own want list), and a pull of all
+/// of them was refused `INVALID_REQUEST` round after round, until the leases
+/// lapsed a minute later (WP3.INT re-review: found in the release
+/// qualification's tiny files).
+#[test]
+fn a_pull_never_carries_more_items_than_the_acceptor_takes() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let c = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let to_b = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let hashes: Vec<String> = (0..600)
+        .map(|i| {
+            let hash = c.worker.hold(content(6100 + i, 2048));
+            to_b.worker.want(&hash, 2048);
+            hash
+        })
+        .collect();
+    // D's lane to B (which lacks them) leases a want list of them, fails
+    // them `NOT_AVAILABLE` and parks them for D's other sources.
+    let (options, _) = to_b.options();
+    let lane_b = to_b.run(to_b.dial(&b.endpoint, &b.code, LANE), options);
+    assert!(
+        wait_until(Duration::from_secs(10), || to_b
+            .world
+            .object_errors()
+            .iter()
+            .filter(|(_, code)| code == "NOT_AVAILABLE")
+            .count()
+            >= 200),
+        "{}",
+        to_b.world.object_errors().len()
+    );
+    drop(lane_b);
+    // D's lane to C takes the parked objects over and wants the rest.
+    let to_c = to_b.to_peer(&c.installation(), &c.endpoint);
+    let (options, _) = to_c.options();
+    let began = Instant::now();
+    let lane_c = to_c.run(to_c.dial(&c.endpoint, &c.code, LANE), options);
+    let done = wait_until(Duration::from_secs(40), || {
+        hashes.iter().all(|hash| to_b.worker.has(hash))
+    });
+    let took = began.elapsed();
+    drop(lane_c);
+    let refused: Vec<Fin> = to_c
+        .world
+        .finished()
+        .into_iter()
+        .filter(|fin| {
+            fin.error
+                .as_ref()
+                .is_some_and(|error| error.code == "INVALID_REQUEST")
+        })
+        .collect();
+    assert!(refused.is_empty(), "{refused:?}");
+    assert!(done, "never installed");
+    assert!(
+        took < Duration::from_secs(15),
+        "installed only after {took:?}"
     );
 }
 

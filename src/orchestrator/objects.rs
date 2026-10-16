@@ -522,11 +522,22 @@ pub fn is_resume_point(code: &str) -> bool {
     matches!(code, "RESUME_OFFSET_AHEAD" | "OBJECT_PART_CHANGED")
 }
 
+/// Whether a failed item's (or write call's) error is contention: the §8
+/// Contention class, or a busy database (`SQLITE_BUSY`, Transient in the §8
+/// table). The worker that answers it records nothing for the object
+/// (`objects_rpc::failure_kind`), and neither does a lane: no backoff, no
+/// `ObjectError`; the object continues in the next round (WP3.INT
+/// re-review: one busy write batch of 256 tiny objects backed them off for
+/// 30 s).
+pub fn is_contention(error: &ErrorWire) -> bool {
+    error.class == ErrorClass::Contention || error.code == "SQLITE_BUSY"
+}
+
 /// Whether an outcome is a per-object failure worth a backoff and an
-/// `ObjectError` (not success, not Contention). `Unsolicited` is none: the
-/// receiving worker no longer wants the object (its event was quarantined,
-/// or it never wanted it), which is nobody's failure; the object settles
-/// (WP3.INT re-review).
+/// `ObjectError` (not success, not contention, see [`is_contention`]).
+/// `Unsolicited` is none: the receiving worker no longer wants the object
+/// (its event was quarantined, or it never wanted it), which is nobody's
+/// failure; the object settles (WP3.INT re-review).
 pub fn is_failure(outcome: &ObjectOutcome) -> bool {
     match outcome {
         ObjectOutcome::Completed
@@ -534,7 +545,7 @@ pub fn is_failure(outcome: &ObjectOutcome) -> bool {
         | ObjectOutcome::Skipped
         | ObjectOutcome::InFlightElsewhere
         | ObjectOutcome::Unsolicited => false,
-        ObjectOutcome::Failed(error) => error.class != ErrorClass::Contention,
+        ObjectOutcome::Failed(error) => !is_contention(error),
         _ => true,
     }
 }
@@ -3235,7 +3246,7 @@ fn sink_event(lane: &LaneRun, target: &Target, state: &mut RoundState, event: Si
                     // The whole write call failed: the round's error, not
                     // the object's (it resumes from its durable offset).
                     state.leftovers = true;
-                    if !matches!(error.class, ErrorClass::Contention) {
+                    if !is_contention(error) {
                         state
                             .local_error
                             .get_or_insert_with(|| CallError::Remote(error.clone()));
@@ -3246,6 +3257,9 @@ fn sink_event(lane: &LaneRun, target: &Target, state: &mut RoundState, event: Si
                     if is_failure(other) {
                         lane.object_failed(target, false, &hash, other);
                         state.failed.insert(hash);
+                    } else if matches!(other, ObjectOutcome::Failed(_)) {
+                        // Contention in our worker: it continues next round.
+                        state.leftovers = true;
                     }
                 }
             }
@@ -3522,14 +3536,17 @@ fn issue_pull<'scope, 'env>(
         lane.window.release(budget);
         return false;
     };
-    // Take items in order; the last one may be split (its rest stays first
-    // in the plan for the next pull).
+    // Take items in order, at most the `MAX_WANT_ITEMS` an acceptor takes in
+    // one pull (§6.4; a plan can hold more: what the lane takes over from a
+    // source of ours that cannot serve it, plus its own want list; WP3.INT
+    // re-review); the last one may be split (its rest stays first in the
+    // plan for the next pull).
     let mut items = Vec::new();
     let mut leases = Vec::new();
     let mut left = budget;
     while let Some(front) = state.plan.front_mut() {
         let remaining = front.item.size.saturating_sub(front.item.offset);
-        if remaining > 0 && left == 0 {
+        if items.len() >= MAX_WANT_ITEMS || (remaining > 0 && left == 0) {
             break;
         }
         let take = remaining.min(left);
