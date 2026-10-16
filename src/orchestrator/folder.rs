@@ -34,7 +34,11 @@
 //!   (invariant 26); the gate marker is cleared only after `Attached`.
 //! * **Published entry**: `published-summary` on Ready, on a
 //!   `generations.branches` change and every 60 s while unavailable; tip and
-//!   content counters follow the heartbeat without an RPC.
+//!   content counters follow the heartbeat without an RPC. While no worker
+//!   serves the folder (starting, stopped, failed, also from the daemon's
+//!   start on) it is published `unavailable`, built from its record, so peers
+//!   wait for it instead of reading it as no longer shared; only leaving the
+//!   catalog removes it (WP3.INT re-review 2).
 use crate::{
     model::{
         errors::{ErrorRecord, ErrorWire, Scope},
@@ -1225,6 +1229,7 @@ impl Controller {
             {
                 self.clear_gate();
             }
+            self.publish_unavailable();
             self.maybe_refresh_published();
         }
         self.publish();
@@ -3383,6 +3388,47 @@ impl Controller {
         }
     }
 
+    /// A folder without a published entry (no worker answered
+    /// `published-summary` in this process: it is starting, or stopped or
+    /// failed since the daemon started) is published `unavailable`, built
+    /// from its record, so peers keep its pair and wait for it (their pair
+    /// reads `WaitingForRemote`) instead of reading the share as withdrawn
+    /// (WP3.INT re-review 2: a folder stopped across a restart read "Not
+    /// shared" on its peers). The worker's summary replaces it once one runs
+    /// (`maybe_refresh_published`); leaving the catalog removes it.
+    fn publish_unavailable(&mut self) {
+        if self.retired || self.done || self.record.repo.is_empty() {
+            return;
+        }
+        let now_ms = self.now_ms();
+        let entry = match self.published.entry.as_mut() {
+            None => {
+                let entry = PublishedEntry {
+                    repo: self.record.repo.clone(),
+                    replica: self.record.device.clone(),
+                    label: self.record.label.clone(),
+                    state: EntryState::Unavailable,
+                    updated_at_ms: now_ms,
+                    ..PublishedEntry::default()
+                };
+                self.published.entry = Some(entry.clone());
+                entry
+            }
+            // Renamed while no worker serves it: the label follows the record.
+            Some(entry)
+                if entry.state == EntryState::Unavailable
+                    && self.running.is_none()
+                    && entry.label != self.record.label =>
+            {
+                entry.label = self.record.label.clone();
+                entry.updated_at_ms = now_ms;
+                entry.clone()
+            }
+            Some(_) => return,
+        };
+        self.deps.published.update(&self.state, Some(entry));
+    }
+
     fn maybe_refresh_published(&mut self) {
         let wanted = self.published.entry.is_none()
             || self.published.refresh
@@ -3516,7 +3562,8 @@ impl Controller {
     /// reads `WaitingForRemote`, §3.7) instead of reading it as no longer
     /// shared (WP3.INT re-review). It is published again once the worker
     /// runs (`maybe_refresh_published`), and removed when the folder leaves
-    /// the catalog.
+    /// the catalog. A folder that never had a worker's entry in this process
+    /// is published the same way (`publish_unavailable`).
     fn withdraw_entry(&mut self) {
         self.published.rpc = None;
         self.published.retry_at = None;

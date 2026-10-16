@@ -1492,7 +1492,13 @@ fn stalled_engine_marks_degraded_without_kill() {
 fn graceful_stop_persists_desired_before_the_stop_rpc() {
     let env = EnvBuilder::new().folder("a", true).start();
     env.running("a");
-    wait_for("entry", || env.published.entry("a").is_some());
+    // (The worker's entry: before it, the folder is published unavailable,
+    // WP3.INT re-review 2.)
+    wait_for("entry", || {
+        env.published
+            .entry("a")
+            .is_some_and(|entry| entry.state == EntryState::Running)
+    });
     let view = env
         .registry
         .request(
@@ -2940,7 +2946,13 @@ fn published_entry_taken_before_the_first_heartbeat_is_refreshed_once() {
         .behavior(|b| b.watch = Mode::Hold)
         .start();
     env.running("a");
-    wait_for("entry", || env.published.entry("a").is_some());
+    // (The worker's entry: before it, the folder is published unavailable,
+    // WP3.INT re-review 2.)
+    wait_for("entry", || {
+        env.published
+            .entry("a")
+            .is_some_and(|entry| entry.state == EntryState::Running)
+    });
     assert_eq!(env.published.entry("a").unwrap().label, "fake-b0");
     assert_eq!(env.log.count("rpc:published-summary"), 1);
     let worker = env.worker("a");
@@ -3025,6 +3037,86 @@ fn published_summary_failure_marks_the_entry_unavailable_and_branch_changes_refr
             .entry("a")
             .is_some_and(|e| e.state == EntryState::Paused)
     });
+}
+
+/// A folder that is stopped when the daemon starts is published
+/// `unavailable`, built from its record (WP3.INT re-review 2): its peers keep
+/// the pair and wait for it, instead of reading the share as withdrawn ("Not
+/// shared with any peer") until it runs again. Its label follows the record
+/// while it is stopped; the worker's summary replaces it once it runs; only
+/// leaving the catalog removes it.
+#[test]
+fn a_folder_stopped_at_start_is_published_unavailable() {
+    let env = EnvBuilder::new()
+        .folder("a", false)
+        .folder("b", true)
+        .start();
+    env.running("b");
+    wait_for("entry b", || {
+        env.published
+            .entry("b")
+            .is_some_and(|entry| entry.state == EntryState::Running)
+    });
+    env.advance(Duration::from_secs(5));
+    env.settle();
+    let record = env.catalog.folder("a");
+    let entry = env
+        .published
+        .entry("a")
+        .expect("a folder stopped at start is published");
+    assert_eq!(entry.state, EntryState::Unavailable);
+    assert_eq!(
+        (&entry.repo, &entry.replica, &entry.label),
+        (&record.repo, &record.device, &record.label)
+    );
+    assert!(entry.branches.is_empty() && entry.tip.is_none() && entry.content.is_none());
+    assert_eq!(env.view("a").phase, FolderPhase::Stopped);
+    // Renamed while stopped: the entry follows.
+    env.catalog.mutate(|snapshot| {
+        for folder in &mut snapshot.folders {
+            if folder.state == "a" {
+                folder.label = "renamed".into();
+            }
+        }
+    });
+    wait_for("renamed entry", || {
+        env.published
+            .entry("a")
+            .is_some_and(|entry| entry.label == "renamed" && entry.state == EntryState::Unavailable)
+    });
+    // Started: the worker's summary replaces it.
+    env.registry
+        .request("a", FolderCmd::Start, Duration::from_secs(10))
+        .unwrap();
+    env.running("a");
+    wait_for("running entry a", || {
+        env.published
+            .entry("a")
+            .is_some_and(|entry| entry.state == EntryState::Running && entry.label == "fake-b0")
+    });
+    // Stopped again: unavailable, and kept.
+    env.registry
+        .request(
+            "a",
+            FolderCmd::Stop {
+                mode: StopMode::Graceful,
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    wait_for("unavailable entry a", || {
+        env.published
+            .entry("a")
+            .is_some_and(|entry| entry.state == EntryState::Unavailable)
+    });
+    // Leaving the catalog removes it (and the other folder's stays).
+    env.catalog
+        .mutate(|snapshot| snapshot.folders.retain(|folder| folder.state != "a"));
+    wait_for("a retired", || env.registry.view("a").is_none());
+    wait_for("entry a removed", || env.published.entry("a").is_none());
+    env.settle();
+    assert!(env.published.entry("a").is_none());
+    assert!(env.published.entry("b").is_some());
 }
 
 #[test]
