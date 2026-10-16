@@ -159,7 +159,10 @@ pub(super) const PART_FIELDS: [&str; 5] = ["kind", "location", "alive", "content
 /// The `(entry, heads)` texts of `entity`'s row in `p` (which must hold the
 /// entry): what `current_parts` and `snapshot_entries` store.
 pub(super) fn part_texts(p: &Projection, entity: &str) -> Result<(String, String)> {
-    let entry = p.entries.get(entity).context("SNAPSHOT_ENTRY_MISSING")?;
+    let entry = p
+        .entries
+        .get(entity)
+        .context("INVALID_SNAPSHOT: no entry for a sealed row")?;
     let heads: BTreeMap<_, _> = PART_FIELDS
         .into_iter()
         .filter_map(|field| {
@@ -1171,7 +1174,8 @@ fn seal_rows_incremental(
     mut rows: RowSet,
     header: Projection,
 ) -> Result<SealReport> {
-    let mut digest = RowsDigest::parse(&rows.digest).context("SNAPSHOT_ROWS_DIGEST")?;
+    let mut digest =
+        RowsDigest::parse(&rows.digest).context("SNAPSHOT_CHECKSUM: malformed rows digest")?;
     let mut entities = marks(db, branch, 0)?;
     if let Changed::Plus(extra) = input.changed {
         entities.extend(extra.iter().cloned());
@@ -1366,7 +1370,10 @@ fn read_rows(db: &Connection, branch: &str, expected: &RowSet) -> Result<SealedR
             found.entries += 1;
             found.bytes += (entry.len() + heads.len()) as u64;
             let parsed: Entry = serde_json::from_str(entry)?;
-            ensure!(parsed.id == entity, "SNAPSHOT_ROW_IDENTITY");
+            ensure!(
+                parsed.id == entity,
+                "SNAPSHOT_VERSION_OR_IDENTITY: a sealed row names another key"
+            );
             let heads: BTreeMap<String, Vec<Version>> = serde_json::from_str(heads)?;
             entries.insert(entity.to_owned(), (parsed, heads));
         }
@@ -1390,12 +1397,18 @@ fn read_rows(db: &Connection, branch: &str, expected: &RowSet) -> Result<SealedR
             found.conflicts += 1;
             found.bytes += payload.len() as u64;
             let parsed: Conflict = serde_json::from_str(&payload)?;
-            ensure!(parsed.id == id, "SNAPSHOT_ROW_IDENTITY");
+            ensure!(
+                parsed.id == id,
+                "SNAPSHOT_VERSION_OR_IDENTITY: a sealed row names another key"
+            );
             conflicts.push((id, payload, resolved_by));
         }
     }
     found.digest = digest.hex();
-    ensure!(found == *expected, "SNAPSHOT_ROWS_CHANGED");
+    ensure!(
+        found == *expected,
+        "SNAPSHOT_CHECKSUM: the sealed rows differ from the anchor's digest"
+    );
     Ok(SealedRows { entries, conflicts })
 }
 
@@ -1486,7 +1499,7 @@ impl Store {
         ensure!(
             JournalHash::decode(&anchor.journal_state).map(|state| state.finalize())
                 == Some(journal),
-            "SNAPSHOT_JOURNAL_STATE"
+            "SNAPSHOT_JOURNAL_CHANGED: the journal state does not finalize to the journal hash"
         );
         let mut projection = anchor.projection;
         let mut conflicts = BTreeMap::new();
@@ -1501,7 +1514,7 @@ impl Store {
             Some(rows) => {
                 ensure!(
                     projection.entries.is_empty() && projection.heads.is_empty(),
-                    "SNAPSHOT_HEADER"
+                    "INVALID_SNAPSHOT: a rows anchor holds entries"
                 );
                 let sealed = read_rows(&self.db, branch, rows)?;
                 for (entity, (entry, heads)) in sealed.entries {
@@ -1585,7 +1598,7 @@ impl Store {
         ensure!(
             JournalHash::decode(&snapshot.journal_state).map(|state| state.finalize())
                 == Some(journal),
-            "SNAPSHOT_JOURNAL_STATE"
+            "SNAPSHOT_JOURNAL_CHANGED: the journal state does not finalize to the journal hash"
         );
         ensure!(
             snapshot.projection.pending.is_empty(),
@@ -1713,7 +1726,7 @@ impl Store {
             Some(rows) => {
                 ensure!(
                     snapshot.projection.entries.is_empty() && snapshot.projection.heads.is_empty(),
-                    "SNAPSHOT_HEADER"
+                    "INVALID_SNAPSHOT: a rows anchor holds entries"
                 );
                 // Every row is checked before any is restored.
                 let sealed = read_rows(&self.db, id, rows)?;
