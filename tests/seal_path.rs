@@ -662,18 +662,21 @@ fn seal_crash_child() {
         }
         // A startup that replays a tail and reseals.
         "open" => drop(open(&root)),
-        // Random saves of the first alive file (the random workload).
+        // Saves of the first alive file (the random workload; a file is
+        // created first when the workload left none).
         "touch" => {
             let mut s = open(&root);
-            let file = s
+            let alive = s
                 .projection(&s.active)
                 .unwrap()
                 .entries
                 .values()
                 .find(|e| e.alive && e.kind == "file")
-                .unwrap()
-                .id
-                .clone();
+                .map(|e| e.id.clone());
+            let file = match alive {
+                Some(file) => file,
+                None => s.create(&format!("touch-{}", id()), "file").unwrap().id,
+            };
             for i in 0..140 {
                 let entry = s.entry(&file).unwrap();
                 s.write_revision(
