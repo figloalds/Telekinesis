@@ -3938,6 +3938,52 @@ fn an_inbound_only_peer_that_unpairs_is_recorded_gone() {
     assert_eq!(removed(&b.world), 1);
 }
 
+/// An object we offered a dialer that did not send it (it lacked it: a
+/// relay that had the event first) is offered again soon once it may have
+/// it: not serving is no failure, so its backoff is short (5 s → 5 min), not
+/// the failures' 30 s → 1 h (WP3.INT re-review: a relay delivered such an
+/// object 28 s late).
+#[test]
+fn an_object_a_dialer_lacked_is_offered_again_soon() {
+    let (a, b) = pair(100);
+    let data = content(5900, 300_000);
+    let hash = sha(&data);
+    b.worker.want(&hash, 300_000);
+    let (options, _) = a.options();
+    let lane = a.run(a.dial(&b.endpoint, &b.code, LANE), options);
+    // A pushes without it (it lacks it): B backs it off for A.
+    assert!(
+        wait_until(Duration::from_secs(10), || a
+            .world
+            .finished()
+            .iter()
+            .any(|f| f.op == "objects.push" && f.ok)),
+        "{:?}",
+        a.world.finished()
+    );
+    sleep_ms(500);
+    // A gets it (a relay that received it).
+    a.worker.hold(data.clone());
+    let began = Instant::now();
+    a.world.bump_sync(STATE_A);
+    assert!(
+        wait_until(Duration::from_secs(20), || b.worker.has(&hash)),
+        "never delivered"
+    );
+    let took = began.elapsed();
+    drop(lane);
+    assert!(
+        took < Duration::from_secs(15),
+        "offered again only after {took:?} (a failure's backoff is 24-36 s)"
+    );
+    assert_eq!(b.worker.held_bytes(&hash).unwrap(), data);
+    assert!(
+        b.world.object_errors().is_empty(),
+        "{:?}",
+        b.world.object_errors()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Qualification (release, ignored): throughput of the data plane
 
