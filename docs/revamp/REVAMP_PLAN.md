@@ -427,7 +427,7 @@ All triggers take the same path: the `Shutdown` action, Ctrl-C and console close
     - `Paused`: sync is disabled.
 - **Exchange** (`meta_exchange::exchange`):
   1. worker `feed-offer` (10 s);
-  2. peer `meta.exchange` (30 s);
+  2. peer `meta.exchange` (idle 30 s within a 30 min cap, WP3.INT re-review);
   3. worker `feed-apply` (10 s);
   4. emit `ExchangeFinished{summary}`, plus `GateEvidence` to the folder.
 - **Error policy:**
@@ -723,7 +723,7 @@ The code never crosses the wire, and replaying a captured proof fails because th
 |---|---|---|---|---|
 | `ping` | any | 5 s | `{}` | `{alive:true}` |
 | `catalog.list` | control/probe | 10 s | `CatalogListRequest{since}` | `CatalogListReply{generation, unchanged, entries:[PublishedEntry]}` |
-| `meta.exchange` | control | 30 s | header `{repo}` + body `MetaExchangeRequest` | `MetaExchangeReply` |
+| `meta.exchange` | control | idle 30 s, cap 30 min (WP3.INT re-review: every frame of the reply restarts the idle deadline, so a large event's reply on a slow link completes) | header `{repo}` + body `MetaExchangeRequest` | `MetaExchangeReply` |
 | `objects.exchange` (interim W2–W3) | bulk | 60 s | `bulk_sync::Page` (v6 JSON) | `bulk_sync::Page` |
 | `objects.pull` | bulk | idle 30 s | `ObjectsPull` | CHUNK stream + `ObjectsResult` |
 | `objects.wants` | bulk | 10 s | `ObjectsWantsRequest` | `[WantItem]` |
@@ -879,7 +879,7 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 | `objects.report` | `{route, hash, code}` | — | `{action:"quarantined"\|"verified_ok"}` |
 
 **Authorization** (invariant 13):
-- `objects.read` serves only if all of these hold: `object_availability.state = available`, the hash is in `published_objects ∪ received_shared_objects`, and it is referenced by a **committed** shared event (`event_objects.shared = 1`). Otherwise it returns `NOT_PERMITTED` or `NOT_AVAILABLE`.
+- `objects.read` serves only if all of these hold: `object_availability.state = available`, the hash is in `published_objects ∪ received_shared_objects`, and it is referenced by a **committed** shared event (`event_objects.shared = 1`). Otherwise it returns `NOT_PERMITTED` (no committed shared event references the hash) or `NOT_AVAILABLE` (referenced but not received here, whether or not a private copy exists, or its bytes are gone): a relay that committed an event before its object arrived answers a Transient code, and the answer never tells whether a private copy exists (WP3.INT re-review). The read path's own verification of an untrusted file counts only while the availability row is absent or `available`.
 - `objects.write` accepts only hashes it wants (referenced by committed or validly staged shared events, and not already shareable-available), with the lease held by this session. Otherwise it returns `UNSOLICITED_OBJECT` or `IN_FLIGHT_ELSEWHERE`.
 - A physically present private object **is** accepted and fully verified, then registered as `received_shared` (I4).
 
@@ -900,11 +900,14 @@ pub struct ExchangeSummary { pub sent_events: u32, pub received_events: u32, pub
 - Peer requests are the JSON header; replies the JSON body or header. `sender` is the requesting replica, `receiver` the acceptor's (as `meta.exchange`). A malformed request is `INVALID_REQUEST` (CCR-WP3.3-3); an acceptor without objects v3 answers `UNSUPPORTED_OPERATION`.
 - **Allotment:** a pull's or push's items cover, in order, `[offset, offset + min(size − offset, budget left))`; an item's share is fixed by the list whether or not it is served; a zero-size object is one empty chunk. A stream must start each object at its span's start and stay contiguous and inside its share; a chunk outside it ends the request `PROTOCOL_VIOLATION` before it is buffered.
 - A pull's per-item results at the sender: `Completed` (sent through its end), `Progressed{durable_offset}` (sent up to there), `Skipped` (nothing sent), or the read's failure. A receiver counts a peer's results only for the items its request listed, each once; it reports `CORRUPT_AT_SOURCE` to its own worker only for an object its push sent through its end, and an acceptor takes `objects.report` only for an object of the session's lane that it served that peer through its end (`OBJECT_ON_WRONG_LANE`, `UNSOLICITED_OBJECT`) (invariant 22; WP3.INT).
-- Lease ids: the dialer uses two per lane and repository (`pull:<peer>:<i>/<n>:a|b`): a want with a pull in flight uses the id the last want did not; a want with none asks both, the second only when the first found nothing. The acceptor uses `push:<peer>:<i>/<n>`.
+- Lease ids: the dialer uses two per lane and repository (`pull:<peer>:<i>/<n>:a|b`): a want with a pull in flight uses the id the last want did not; a want with none asks both, the second only when the first found nothing. The acceptor uses `push:<peer>:<i>/<n>`. A lease held by an id of the same kind and peer with another lane count `n` (a re-pairing with another `connections` restarted that peer's lanes) and idle for a quarter of a TTL is taken over by the new lane set, without a stall backoff (WP3.INT re-review).
 - Leases renew only on progress (a write whose durable offset advances); a want that offers an object again to its holder does not renew it. A lease that lapses (no progress for one TTL) backs its object off for the source that held it for 60 s, so other sources' sessions are offered it. Writes in flight for one object may arrive out of order; the worker waits up to 2 s for the earlier ones.
 - `RESUME_OFFSET_AHEAD` and `OBJECT_PART_CHANGED` are resume points, not failures of the object: the receiver resynchronizes from the durable offset the worker answered, with no backoff and no `ObjectError` (WP3.INT). `SizeMismatch` and malformed items back the object off for that source (worker side); local failures record `object_error_state`.
 - A daemon hands an object its source cannot serve to another of its transfers under the lease that holds it (the *lease handoff*): the taker holds a claim that only it renews (30 s), and gives it back, parked at the durable offset it reached, when it fails or stops.
-- An object a peer wants that we may not serve (`NotPermitted` at our worker) is backed off silently, on the dialer as on the acceptor: not serving is no error of ours (WP3.INT).
+- An object a peer wants that we may not serve (`NotPermitted` at our worker) is backed off silently, on the dialer as on the acceptor: not serving is no error of ours (WP3.INT). Since the re-review: the dialer records neither an `ObjectError` nor a backoff for a wants item its worker refuses to read (`NotPermitted`, `NotAvailable`; the acceptor backs off what it offered and was not sent), and the acceptor records them only for objects of its current offer to that dialer (a push may list any hash: one never offered is answered in the result alone); `Unsolicited` (the receiving worker no longer wants the object) is no failure anywhere. The per-object backoff table holds at most 16K entries; a source's backoffs for a repository reset when its published content counters grow.
+- **Sizes not recorded** (an event without a size descriptor, kept for legacy journals): the receiver's worker wants the object with size 0 and offset 0. Its item is sent like a zero-size object (one empty chunk, its span empty), and the sender's empty chunk carries the object's real total; the receiver then pulls it with that size (a push reads the total from the pusher's own worker first). Only the empty object (the SHA-256 of no bytes) has size 0. A pull stream's empty chunk is accepted only as the one chunk of an empty span (invariant 22).
+- **Peer slots and the window** (WP3.INT re-review): pushes (with their `objects.wants`) hold at most `PEER_CALLS − 1` peer slots, so pulls and reports always find one; a pull reserves at most its key's fair share of the lane window (`window / REPOS_PER_LANE`), and the next pull of a round goes once the one in flight received half its budget, so one repository whose source stalls never stops another's downloads. An object that settles in a round's sink leaves the round's plan, and a pull whose objects all settled is cancelled.
+- **Wire chunks**: object bytes travel in CHUNK frames of at most 256 KiB (a worker read of up to 1 MiB is split), and a session socket's send buffer follows the rate it drains at (two round trips, 64 KiB to 4 MiB; the receive buffer stays 4 MiB on Windows), so control frames never wait behind megabytes on a slow uplink (WP3.INT re-review).
 - `objects.write` installs a call's verified objects with plain renames and one directory fsync before registering any (§6.4 durability, "rename plus directory fsync"); the spool I/O of concurrent calls takes turns (one turn per call for its appends, one for its renames).
 
 ### 6.5 Interim bulk path (Wave 2 → replaced in Wave 3)
@@ -1003,7 +1006,7 @@ pub enum StatusEvent {
 | 5 | `Stalled` | any sharing peer is stalled |
 | 6 | `InitialSync` | gate awaiting |
 | 7 | transfer states | `Metadata`, `Downloading`, `Uploading`, or `Syncing` if mixed; summary "N of M peers" |
-| 8 | `Blocked` | only blocked, quarantined or rejected work remains |
+| 8 | `Blocked` | only blocked or quarantined work remains (rejected events are shown, not counted: Revalidate does not revive them; WP3.INT re-review) |
 | 9 | `Backoff` | all sharing peers in backoff |
 | 10 | `Offline` | all sharing peers offline, incompatible or unauthorized |
 | 11 | `UpToDate` | none of the above |
