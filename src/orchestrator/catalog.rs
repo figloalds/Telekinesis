@@ -60,8 +60,10 @@
 //! (`IF NOT EXISTS`; `catalog_schema` stays 1, older binaries never read
 //! it). The actor publishes the rows as [`Credentials`] beside the frozen
 //! [`CatalogSnapshot`] ([`Catalog::credentials`]); they change through
-//! [`Catalog::enroll`], [`Catalog::revoke`] and [`Catalog::forget`], which
-//! run as commands of the same actor (same transaction, retry and
+//! [`Catalog::enroll`] (and [`Catalog::enroll_paired`], which requires a
+//! peer record in the same transaction), [`Catalog::revoke`] and
+//! [`Catalog::forget`], which run as commands of the same actor (same
+//! transaction, retry and
 //! [`APPLY_WAIT`] rules), and as part of two catalog commands:
 //!
 //! * `SetVerifier` (ResetPairingCode), and a rotation by a downgraded binary
@@ -253,6 +255,7 @@ mod sql {
     pub const FORGET: &str = "DELETE FROM peer_credentials WHERE installation=? AND side=?";
     pub const REVOKE_INBOUND: &str =
         "UPDATE peer_credentials SET revoked_ms=? WHERE side='inbound' AND revoked_ms IS NULL";
+    pub const PAIRED: &str = "SELECT EXISTS(SELECT 1 FROM peers WHERE installation=?)";
     pub const FORGET_UNPAIRED_OUTBOUND: &str = "DELETE FROM peer_credentials WHERE side='outbound' AND installation=?1 AND NOT EXISTS (SELECT 1 FROM peers WHERE installation=?1)";
 }
 
@@ -352,6 +355,9 @@ enum CredentialCmd {
         installation: String,
         side: CredentialSide,
         key: [u8; 32],
+        /// Refused (`PEER_NOT_PAIRED`) unless a peer record names the
+        /// installation, checked in the same transaction.
+        paired_only: bool,
     },
     Revoke {
         installation: String,
@@ -537,6 +543,28 @@ impl Catalog {
             installation: installation.to_owned(),
             side,
             key,
+            paired_only: false,
+        }))
+        .map(drop)
+    }
+
+    /// [`Catalog::enroll`] only while a peer record names `installation`,
+    /// checked in the same transaction: `PEER_NOT_PAIRED` otherwise, and
+    /// nothing is stored. For an enrollment that can race an unpair (lane
+    /// 0's, WP4.1): `RemovePeer` either runs first (refused here) or deletes
+    /// the outbound credential with the record, so no credential outlives
+    /// its peer.
+    pub fn enroll_paired(
+        &self,
+        installation: &str,
+        side: CredentialSide,
+        key: [u8; 32],
+    ) -> Result<(), ErrorWire> {
+        self.submit(Work::Credential(CredentialCmd::Enroll {
+            installation: installation.to_owned(),
+            side,
+            key,
+            paired_only: true,
         }))
         .map(drop)
     }
@@ -1088,12 +1116,20 @@ fn apply_credential(
             installation,
             side,
             key,
+            paired_only,
         } => {
             if installation.is_empty() {
                 bail!("INVALID_REQUEST: a peer installation is required");
             }
             if *installation == current.installation {
                 bail!("CANNOT_PAIR_WITH_SELF");
+            }
+            if *paired_only
+                && !tx
+                    .prepare_cached(sql::PAIRED)?
+                    .query_row([installation], |r| r.get::<_, bool>(0))?
+            {
+                bail!("PEER_NOT_PAIRED: no peer record names this installation any more");
             }
             tx.prepare_cached(sql::ENROLL)?.execute(params![
                 installation,

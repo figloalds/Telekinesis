@@ -28,15 +28,21 @@
 //!
 //! | Op | Handling |
 //! |---|---|
-//! | `peer.enroll` | opens the sealed secret with this verifier's key (`session::auth::open_enrollment`) and stores `K_peer` as the dialer's inbound credential |
+//! | `peer.enroll` | opens the sealed secret with this verifier's key (`session::auth::open_enrollment`) and stores `K_peer` as the dialer's inbound credential; refused `PEER_REVOKED` on a session that registered before a `peer.revoke` of its installation |
 //! | `peer.revoke` | revokes the dialer's inbound credential, answers, then sends every session of that installation `GOAWAY{PEER_REVOKED}` and closes those still open after [`REVOKE_CLOSE_GRACE`] (within 1 s) |
 //!
 //! Both write the catalog, so they run on an exchange slot's thread, never
 //! on the handler pool. A daemon without a concrete catalog (tests' fakes)
-//! answers them `UNKNOWN_PEER_OPERATION`, as an older acceptor does. A
-//! `peer-hmac-v1` session that completed its handshake while its credential
-//! was being revoked is sent away when it registers (a per-installation
-//! revocation epoch, checked under the state lock like the generation).
+//! answers them `UNKNOWN_PEER_OPERATION`, as an older acceptor does.
+//!
+//! A per-installation revocation epoch orders revocations against the
+//! sessions and enrollments they race. `peer.revoke` bumps it before it
+//! revokes the credential and again, under the state lock, when it sends
+//! the sessions away. A `peer-hmac-v1` session whose handshake read the
+//! credential before the revocation is sent away when it registers (the
+//! epoch moved; checked under the state lock like the generation). A
+//! `peer.enroll` that stored its credential while a revocation ran sees the
+//! epoch moved since its session registered and revokes what it stored.
 //!
 //! **Sessions.** Each session gets the handler pool of its role (4 threads for
 //! control and probe sessions, 2 for bulk, queue 16; a full queue answers
@@ -788,13 +794,12 @@ impl Inner {
         let reserved = policy.take_reservation();
         let per_peer_epoch = policy.per_peer_epoch();
         drop(policy);
-        let registered = Registered {
-            inner: &self,
-            id: self.register(&conn, &peer, address, reserved, per_peer_epoch),
-        };
+        let (id, revocation_epoch) = self.register(&conn, &peer, address, reserved, per_peer_epoch);
+        let registered = Registered { inner: &self, id };
         conn.serve(Arc::new(SessionHandler {
             inner: self.clone(),
             peer: peer.clone(),
+            revocation_epoch,
             exchanges: Arc::new(AtomicUsize::new(0)),
             exchange_slots: self.session_options(peer.role).handlers,
         }));
@@ -851,7 +856,9 @@ impl Inner {
     /// the rotation watcher (and `peer.revoke`) scans under: a session is
     /// either seen by the watcher or sees the new catalog here.
     /// `per_peer_epoch` is the installation's revocation epoch a
-    /// `peer-hmac-v1` handshake started under (WP4.1).
+    /// `peer-hmac-v1` handshake started under (WP4.1). Returns the session
+    /// id and the installation's revocation epoch at registration (which
+    /// `peer.enroll` on this session checks).
     fn register(
         &self,
         conn: &Conn,
@@ -859,22 +866,20 @@ impl Inner {
         address: SocketAddr,
         reserved: bool,
         per_peer_epoch: Option<u64>,
-    ) -> u64 {
+    ) -> (u64, u64) {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
-        let goaway = {
+        let (goaway, epoch) = {
             let mut state = self.state.lock();
             if reserved {
                 state.reserved = state.reserved.saturating_sub(1);
             }
             let snapshot = self.ctx.catalog.snapshot();
-            let revoked_meanwhile = per_peer_epoch.is_some_and(|epoch| {
-                state
-                    .revocations
-                    .get(&peer.installation)
-                    .copied()
-                    .unwrap_or(0)
-                    != epoch
-            });
+            let epoch = state
+                .revocations
+                .get(&peer.installation)
+                .copied()
+                .unwrap_or(0);
+            let revoked_meanwhile = per_peer_epoch.is_some_and(|started| started != epoch);
             let goaway = if let Some(stopping) = &state.stopping {
                 Some(stopping.clone())
             } else if rotated(&snapshot, peer) {
@@ -898,7 +903,7 @@ impl Inner {
             self.counters
                 .sessions_peak
                 .fetch_max(used, Ordering::Relaxed);
-            goaway
+            (goaway, epoch)
         };
         self.counters
             .sessions_opened
@@ -919,7 +924,7 @@ impl Inner {
             }
             conn.goaway(&error.code, &error.message);
         }
-        id
+        (id, epoch)
     }
 
     fn unregister(&self, id: u64) {
@@ -937,10 +942,35 @@ impl Inner {
         self.changed.poke();
     }
 
+    /// The revocation epoch of `installation` (WP4.1): how many times
+    /// `peer.revoke` bumped it.
+    fn revocation_epoch(&self, installation: &str) -> u64 {
+        self.state
+            .lock()
+            .revocations
+            .get(installation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Bumps the revocation epoch of `installation` (`peer.revoke`, before
+    /// it revokes the credential, so a `peer.enroll` racing it sees the
+    /// change after storing and undoes its enrollment).
+    fn bump_revocation(state: &mut State, installation: &str) {
+        let epoch = state
+            .revocations
+            .entry(installation.to_owned())
+            .or_insert(0);
+        *epoch = epoch.saturating_add(1);
+    }
+
     /// `peer.revoke` (WP4.1): every session of `installation` gets
     /// `GOAWAY{PEER_REVOKED}`, and the ones still open after
     /// [`REVOKE_CLOSE_GRACE`] are closed. Bumps the installation's
-    /// revocation epoch first, under the lock `register` checks it under.
+    /// revocation epoch again first (the credential is revoked by now),
+    /// under the lock `register` checks it under: a `peer-hmac-v1`
+    /// handshake that read the credential before the revocation is either
+    /// registered already (and sent away here) or sees the epoch moved.
     fn revoke_sessions(self: &Arc<Self>, installation: &str) {
         let error = ErrorWire::coded(
             "PEER_REVOKED",
@@ -948,10 +978,7 @@ impl Inner {
         );
         let conns: Vec<Conn> = {
             let mut state = self.state.lock();
-            *state
-                .revocations
-                .entry(installation.to_owned())
-                .or_insert(0) += 1;
+            Self::bump_revocation(&mut state, installation);
             state
                 .sessions
                 .values_mut()
@@ -1316,6 +1343,9 @@ pub(crate) fn accept_error_is_per_connection(error: &io::Error) -> bool {
 struct SessionHandler {
     inner: Arc<Inner>,
     peer: AcceptedPeer,
+    /// The installation's revocation epoch when this session registered
+    /// (WP4.1): a `peer.enroll` after a revocation of it is refused.
+    revocation_epoch: u64,
     /// Exchanges of this session running now.
     exchanges: Arc<AtomicUsize>,
     /// At most this many at once (the role's handler count).
@@ -1343,8 +1373,9 @@ impl Handler for SessionHandler {
             {
                 let inner = self.inner.clone();
                 let peer = self.peer.clone();
+                let epoch = self.revocation_epoch;
                 self.job(req, move |req| match req.op.as_str() {
-                    peer_auth::ops::PEER_ENROLL => peer_enroll(&inner, &peer, req),
+                    peer_auth::ops::PEER_ENROLL => peer_enroll(&inner, &peer, epoch, req),
                     _ => peer_revoke(&inner, &peer, req),
                 });
             }
@@ -1733,8 +1764,11 @@ fn objects(ctx: &Arc<Ctx>, peer: &AcceptedPeer, req: Incoming) {
 /// `peer.enroll` (WP4.1): the dialer's sealed secret, opened with this
 /// verifier's key, becomes its inbound credential `K_peer`. The session must
 /// still be under the current verifier generation (a rotation since the
-/// handshake refuses it, as every request).
-fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
+/// handshake refuses it, as every request), and no `peer.revoke` of the
+/// installation may have run since the session registered (`epoch`): one
+/// that races this enrollment wins (it bumps the epoch before it revokes, so
+/// an enrollment stored meanwhile sees the change and revokes itself).
+fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incoming) {
     let Incoming {
         header, responder, ..
     } = req;
@@ -1753,6 +1787,10 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
         if snapshot.verifier_generation != peer.verifier_generation {
             return Err(rotation_error());
         }
+        let revoked_since = || inner.revocation_epoch(&peer.installation) != epoch;
+        if revoked_since() {
+            return Err(revoked_during_session());
+        }
         let secret = peer_auth::open_enrollment(
             &verifier.key(),
             &peer.installation,
@@ -1763,7 +1801,14 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
             &peer.installation,
             CredentialSide::Inbound,
             peer_auth::peer_key(&secret),
-        )
+        )?;
+        if revoked_since() {
+            // A `peer.revoke` ran meanwhile; it may have revoked before this
+            // stored. The revocation wins.
+            catalog.revoke(&peer.installation, CredentialSide::Inbound)?;
+            return Err(revoked_during_session());
+        }
+        Ok(())
     })();
     match enrolled {
         Ok(()) => responder.reply(json!(EnrollReply { enrolled: true }), Vec::new()),
@@ -1785,7 +1830,13 @@ fn peer_revoke(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
     let responder = req.responder;
     let op = peer_auth::ops::PEER_REVOKE;
     let revoked = match &inner.catalog {
-        Some(catalog) => catalog.revoke(&peer.installation, CredentialSide::Inbound),
+        Some(catalog) => {
+            // First the epoch: a `peer.enroll` of this installation running
+            // now either stores before the revocation below, or sees the
+            // epoch moved after it stored and revokes itself.
+            Inner::bump_revocation(&mut inner.state.lock(), &peer.installation);
+            catalog.revoke(&peer.installation, CredentialSide::Inbound)
+        }
         None => Err(unknown_op(op)),
     };
     match revoked {
@@ -1799,6 +1850,13 @@ fn peer_revoke(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
         }
         Err(error) => responder.error(error),
     }
+}
+
+fn revoked_during_session() -> ErrorWire {
+    ErrorWire::coded(
+        "PEER_REVOKED",
+        "this peer's credential was revoked since this session started; pair again",
+    )
 }
 
 fn unknown_op(op: &str) -> ErrorWire {

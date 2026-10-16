@@ -97,13 +97,21 @@
 //!   `UNKNOWN_PEER_OPERATION`, logged once per session). No user action.
 //!
 //! An acceptor that refuses our credential (`PEER_REVOKED`: revoked by a
-//! rotation of its code, or lost) makes the lane drop it (forgotten in the
-//! catalog, ignored at once in memory) and re-dial with the code at once; a
-//! rotated code then blocks the peer `Unauthorized` as before, a valid one
-//! re-enrolls. [`NetworkApi::unpair`] of a peer we hold a credential for
-//! first sends it a best-effort `peer.revoke` (on lane 0 if it is up, else
-//! on a probe session, at most about [`REVOKE_BUDGET`]), then removes the
-//! record, which deletes our outbound credential with it.
+//! rotation of its code, or lost) makes the supervisor stop presenting it
+//! (in memory) and the lane re-dial with the code at once; a rotated code
+//! then blocks the peer `Unauthorized` as before, a valid one re-enrolls on
+//! lane 0, which replaces the refused credential in the catalog. A refusal
+//! is not authenticated (a `GOAWAY` before `HELLO_ACK`, or after `AUTH`
+//! without a server proof), so it never deletes the stored credential:
+//! anyone answering at the peer's address could send one. Only a
+//! code-authenticated session, which proves the acceptor knows the code,
+//! replaces it. [`NetworkApi::unpair`] of a peer's last record first stops
+//! its supervisor from enrolling (an enrollment racing the revoke would
+//! leave an active credential at the peer; one already running stores
+//! nothing once the record is gone, `Catalog::enroll_paired`), then, when
+//! we hold a credential, sends a best-effort `peer.revoke` (on lane 0 if it
+//! is up, else on a probe session, at most about [`REVOKE_BUDGET`]), then
+//! removes the record, which deletes our outbound credential with it.
 //! [`NetworkApi::remote_list`] presents the credential too, and retries once
 //! with the code on `PEER_REVOKED`.
 //!
@@ -947,26 +955,48 @@ impl NetworkApi for PeerManager {
             .map_err(|error| error.to_wire())
     }
 
-    /// Tells the peer (best effort, WP4.1 `peer.revoke`), removes the peer
-    /// (with our outbound credential), then stops and joins its lanes
-    /// (≤ 5 s). Unpairing an endpoint that is not paired succeeds (the
-    /// legacy `Unpair` did).
+    /// Stops the peer's enrollments and tells the peer (best effort, WP4.1
+    /// `peer.revoke`), removes the peer (with our outbound credential), then
+    /// stops and joins its lanes (≤ 5 s). Unpairing an endpoint that is not
+    /// paired succeeds (the legacy `Unpair` did).
     fn unpair(&self, endpoint: &str) -> Result<(), ErrorWire> {
         let snapshot = self.ctx.catalog.snapshot();
-        if let Some(record) = snapshot.peer_by_endpoint(endpoint)
-            && !record.installation.is_empty()
-            && !snapshot.peers.iter().any(|other| {
-                other.installation == record.installation && other.endpoint != endpoint
-            })
+        // The installation's last record: the peer is unpaired, not moved.
+        let last = snapshot.peer_by_endpoint(endpoint).filter(|record| {
+            !record.installation.is_empty()
+                && !snapshot.peers.iter().any(|other| {
+                    other.installation == record.installation && other.endpoint != endpoint
+                })
+        });
+        // No enrollment of this peer starts or is stored from now on: one
+        // racing the revoke would leave an active credential at the peer.
+        let unpairing = last.and_then(|record| {
+            let supervisor = self
+                .peers
+                .lock()
+                .active
+                .get(&record.installation)
+                .map(|handle| handle.supervisor.clone())?;
+            supervisor.unpairing.store(true, Ordering::Release);
+            Some(supervisor)
+        });
+        if let Some(record) = last
             && !self.closed.load(Ordering::Acquire)
             && self.outbound_key(&record.installation).is_some()
         {
             // Only a credential we enrolled has anything to revoke there.
             self.revoke_remote(record);
         }
-        self.ctx.catalog.apply(CatalogCmd::RemovePeer {
+        let removed = self.ctx.catalog.apply(CatalogCmd::RemovePeer {
             endpoint: endpoint.to_owned(),
-        })?;
+        });
+        if removed.is_err()
+            && let Some(supervisor) = &unpairing
+        {
+            // Still paired: its lane 0 may enroll again.
+            supervisor.unpairing.store(false, Ordering::Release);
+        }
+        removed?;
         self.reconcile();
         Ok(())
     }
@@ -1173,10 +1203,15 @@ struct Supervisor {
     /// Per-peer credentials (WP4.1).
     credentialing: Credentialing,
     /// An outbound key the peer refused (`PEER_REVOKED`): never presented
-    /// again, while the catalog forgets it.
+    /// again by this supervisor. The catalog keeps it until a lane-0
+    /// enrollment (a code-authenticated session) replaces it: a refusal is
+    /// not authenticated.
     refused_key: Mutex<Option<[u8; 32]>>,
     /// An enrollment on lane 0 is queued or running.
     enrolling: Arc<AtomicBool>,
+    /// Set by an unpair of this peer before its `peer.revoke`: no
+    /// enrollment starts, and none running is stored.
+    unpairing: Arc<AtomicBool>,
     /// `true` once retired: nothing of this supervisor reaches
     /// `ctx.status` any more. Every status event is recorded under the read
     /// side and `retire` flips it under the write side, so no event recorded
@@ -1242,6 +1277,7 @@ impl Supervisor {
             credentialing,
             refused_key: Mutex::new(None),
             enrolling: Arc::new(AtomicBool::new(false)),
+            unpairing: Arc::new(AtomicBool::new(false)),
         });
         // Lanes parked on the gate wake when the supervisor is cancelled. The
         // hook holds a weak reference: the token outlives nothing it needs.
@@ -1699,26 +1735,27 @@ impl Supervisor {
         (*lock(&self.refused_key) != Some(key)).then_some(key)
     }
 
-    /// The peer refused `key` (`PEER_REVOKED`): stop presenting it and have
-    /// the catalog forget it (off this thread).
+    /// The peer refused `key` (`PEER_REVOKED`): this supervisor stops
+    /// presenting it. The catalog keeps it: the refusal is not
+    /// authenticated (anyone answering at the peer's address can send it),
+    /// so only a code-authenticated session replaces the credential (lane
+    /// 0's enrollment, [`Supervisor::enroll_later`]).
     fn credential_refused(&self, key: [u8; 32]) {
         *lock(&self.refused_key) = Some(key);
         event!(info, PEER_REVOKED, {
             "peer": self.installation(),
             "detail": "the peer refused our per-peer credential; dialing with the pairing code",
         });
-        self.credentialing.writer.post(CredentialJob::Forget {
-            installation: self.record.installation.clone(),
-            key,
-        });
     }
 
     /// Lane 0 authenticated with the pairing code (no credential of ours,
-    /// or an acceptor without the scheme): enroll one on this session, off
-    /// the lane thread, once at a time.
+    /// one the peer refused, or an acceptor without the scheme): enroll one
+    /// on this session, off the lane thread, once at a time. Never once an
+    /// unpair of this peer began.
     fn enroll_later(&self, conn: &Conn, server: &session::ServerHello) {
         if self.credentialing.catalog.is_none()
             || self.record.code.is_empty()
+            || self.unpairing.load(Ordering::Acquire)
             || self.enrolling.swap(true, Ordering::AcqRel)
         {
             return;
@@ -1727,7 +1764,9 @@ impl Supervisor {
             conn: conn.clone(),
             server: Box::new(server.clone()),
             code: self.record.code.clone(),
+            replaces: *lock(&self.refused_key),
             cancel: self.cancel.clone(),
+            unpairing: self.unpairing.clone(),
             done: self.enrolling.clone(),
         });
         if !posted {
@@ -2113,23 +2152,24 @@ struct Credentialing {
 enum CredentialJob {
     /// Enroll on lane 0's session (authenticated with `code`, whose server
     /// hello is `server`), then store our outbound credential unless the
-    /// supervisor stopped meanwhile. `done` is cleared at the end.
+    /// supervisor stopped, its peer is being unpaired, or no record names
+    /// the peer any more. An active credential other than `replaces` (the
+    /// one the peer refused, if any) means one was stored meanwhile: nothing
+    /// is enrolled. `done` is cleared at the end.
     Enroll {
         conn: Conn,
         server: Box<session::ServerHello>,
         code: String,
+        replaces: Option<[u8; 32]>,
         cancel: Cancel,
+        unpairing: Arc<AtomicBool>,
         done: Arc<AtomicBool>,
     },
-    /// Forget our outbound credential for `installation` if it is still
-    /// `key` (the peer refused it).
-    Forget { installation: String, key: [u8; 32] },
 }
 
-/// Credential enrollments and removals, off the lane threads (a slow or
-/// wedged catalog never holds a lane, §2.3). The queue is bounded; a job
-/// that does not fit is dropped (the next session establishment queues an
-/// enrollment again; a refused key is never presented again anyway).
+/// Credential enrollments, off the lane threads (a slow or wedged catalog
+/// never holds a lane, §2.3). The queue is bounded; a job that does not fit
+/// is dropped (the next session establishment queues an enrollment again).
 struct CredentialWriter {
     tx: Mutex<Option<mpsc::SyncSender<CredentialJob>>>,
 }
@@ -2188,22 +2228,35 @@ fn run_credential_job(local: &str, catalog: &Catalog, job: CredentialJob) {
             conn,
             server,
             code,
+            replaces,
             cancel,
+            unpairing,
             done,
         } => {
             let installation = server.installation.clone();
+            let stopped = || cancel.is_cancelled() || unpairing.load(Ordering::Acquire);
+            let paired = || {
+                catalog
+                    .snapshot()
+                    .peers
+                    .iter()
+                    .any(|peer| peer.installation == installation)
+            };
             // `pair` (or an earlier job) stored one since this was queued.
-            if catalog
+            let active = catalog
                 .credentials()
-                .active(&installation, CredentialSide::Outbound)
-                .is_some()
-            {
+                .active(&installation, CredentialSide::Outbound);
+            if stopped() || !paired() || active.is_some_and(|key| Some(key) != replaces) {
                 done.store(false, Ordering::Release);
                 return;
             }
             match enroll_on(&conn, local, &server, &code) {
-                Ok(key) if !cancel.is_cancelled() => {
-                    if let Err(error) = catalog.enroll(&installation, CredentialSide::Outbound, key)
+                // Stored only while a record names the peer, checked in the
+                // catalog's transaction: an unpair's `RemovePeer` either
+                // runs first (refused) or deletes it with the record.
+                Ok(key) if !stopped() => {
+                    if let Err(error) =
+                        catalog.enroll_paired(&installation, CredentialSide::Outbound, key)
                     {
                         event!(warn, (error.code.as_str()), {
                             "peer": installation,
@@ -2222,20 +2275,6 @@ fn run_credential_job(local: &str, catalog: &Catalog, job: CredentialJob) {
                 }
             }
             done.store(false, Ordering::Release);
-        }
-        CredentialJob::Forget { installation, key } => {
-            let current = catalog
-                .credentials()
-                .active(&installation, CredentialSide::Outbound);
-            if current == Some(key)
-                && let Err(error) = catalog.forget(&installation, CredentialSide::Outbound)
-            {
-                event!(warn, (error.code.as_str()), {
-                    "peer": installation,
-                    "detail": "a refused per-peer credential could not be forgotten",
-                    "message": error.message,
-                });
-            }
         }
     }
 }

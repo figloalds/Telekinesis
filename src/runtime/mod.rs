@@ -58,11 +58,15 @@ struct DiscoveryWire {
 }
 
 /// Reading a worker's discovery is how a local client finds the worker: it
-/// also lets this process present the worker's token to that address
-/// (`ws::tokens::note`), when the discovery is the worker's own published
-/// record (see [`worker_token`]). So a client that reads `runtime.json` and
-/// then dials the address it names (`ws::connect`, `session::dial_loopback`
-/// with no token) keeps working with mandatory worker tokens.
+/// also lets this process present the worker's token to that address, when
+/// the discovery is the worker's own published record (see
+/// [`worker_token`]). So a client that reads `runtime.json` and then dials
+/// the address it names (`ws::connect`, `session::dial_loopback` with no
+/// token) keeps working with mandatory worker tokens (the adapter of
+/// CCR-WP4.1-6). Parsing reads no file and resolves no name: it notes where
+/// the token is (`ws::tokens::note_source`, an IP-literal loopback address
+/// only), and the files are read when a client dials that address, outside
+/// any lock of the caller (`runtime::export` parses under the engine lock).
 impl<'de> Deserialize<'de> for Discovery {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire = DiscoveryWire::deserialize(deserializer)?;
@@ -74,9 +78,15 @@ impl<'de> Deserialize<'de> for Discovery {
             repo: wire.repo,
             device: wire.device,
         };
-        if let Some(token) = published_token(&discovery) {
-            for address in crate::ws::tokens::addresses(&discovery.address) {
-                crate::ws::tokens::note(address, &token);
+        if !discovery.state.is_empty() {
+            let addresses = crate::ws::tokens::literal_addresses(&discovery.address);
+            if !addresses.is_empty() {
+                let published = discovery.clone();
+                let source: crate::ws::tokens::Source =
+                    Arc::new(move || published_token(&published));
+                for address in addresses {
+                    crate::ws::tokens::note_source(address, source.clone());
+                }
             }
         }
         Ok(discovery)

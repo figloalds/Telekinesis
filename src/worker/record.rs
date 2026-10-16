@@ -9,8 +9,8 @@
 //!
 //! **Local token files (WP4.1).** `STATE/runtime.token` holds the worker
 //! instance's token (also in `worker.json` and the Ready line), which its
-//! JSON RPC and loopback sessions require. Secret files are written with
-//! [`write_private`]: atomically, and owner-only. On Unix the file is created
+//! JSON RPC and loopback sessions require. Secret files, `worker.json`
+//! included, are written with [`write_private`]: atomically, and owner-only. On Unix the file is created
 //! with mode 0600 before any byte is written. On Windows it inherits the ACL
 //! of its directory: the state and data directories live under the user's
 //! profile, whose ACL grants the user (plus SYSTEM and Administrators) only.
@@ -33,9 +33,11 @@ pub fn path(state: &Path) -> PathBuf {
 
 /// Writes `STATE/worker.json` atomically: a fsynced temporary file renamed
 /// over the old record (and, on unix, a fsync of the directory), so a reader
-/// sees the old record or the new one, never a torn one.
+/// sees the old record or the new one, never a torn one. The record carries
+/// the instance token (WP4.1), so it is written owner-only, like
+/// `runtime.token` ([`write_private`]).
 pub fn write_atomic(state: &Path, record: &WorkerRecord) -> Result<()> {
-    replace_file(&path(state), &serde_json::to_vec_pretty(record)?)
+    write_private(&path(state), &serde_json::to_vec_pretty(record)?)
 }
 
 /// Replaces `target` atomically with `bytes`: a fsynced temporary file next
@@ -47,7 +49,8 @@ pub fn replace_file(target: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// [`replace_file`] for a secret: the file is owner-only (see the module
-/// docs). Used for `STATE/runtime.token` and `DATA/orchestrator.token`.
+/// docs). Used for `STATE/runtime.token`, `STATE/worker.json` and
+/// `DATA/orchestrator.token`.
 pub fn write_private(target: &Path, bytes: &[u8]) -> Result<()> {
     replace(target, bytes, true)
 }

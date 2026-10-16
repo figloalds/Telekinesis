@@ -801,14 +801,18 @@ pub(crate) mod watchdog {
 /// * [`remember`]: a token this process was given for an endpoint (a worker
 ///   server in this process, a worker endpoint the orchestrator learned from
 ///   a Ready line or `worker.json`);
-/// * [`note`]: a token read next to a worker's published discovery.
+/// * [`note`]: a token read next to a worker's published discovery;
+/// * [`note_source`]: where to read one, when the address is looked up (a
+///   worker's discovery parsed by this process: nothing is read while it is
+///   parsed).
 ///
 /// A client that is not handed a token uses [`lookup`], so in-process
 /// clients and callers that only know an address keep working with
 /// mandatory tokens. Entries are only ever made for loopback addresses, a
-/// registration replaces an older one for the same address, and an entry
-/// dies with its owner ([`Hold`]) or its liveness token. Nothing here is
-/// logged or serialized.
+/// registration replaces an older one of the same kind for the same
+/// address, and an entry dies with its owner ([`Hold`]) or its liveness
+/// token. Nothing here is logged or serialized, and the registry's lock is
+/// never held while a source reads its token.
 pub mod tokens {
     use crate::util::cancel::Cancel;
     use rand::RngCore;
@@ -820,8 +824,13 @@ pub mod tokens {
     /// The upgrade header that carries a local token.
     pub use crate::model::protocol::TOKEN_HEADER as HEADER;
 
-    /// Ownerless entries ([`note`]) kept at most; the oldest go first.
+    /// Ownerless entries ([`note`], [`note_source`]) kept at most; the
+    /// oldest go first.
     const MAX_NOTED: usize = 256;
+
+    /// Reads a token when its address is looked up ([`note_source`]);
+    /// `None` when there is none (any more).
+    pub type Source = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
     /// Keeps a [`protect`] or [`remember`] registration alive: the entry is
     /// retired once the last clone is dropped.
@@ -830,12 +839,18 @@ pub mod tokens {
         _private: (),
     }
 
+    #[derive(Clone)]
+    enum Token {
+        Known(String),
+        Read(Source),
+    }
+
     struct Entry {
         address: SocketAddr,
-        token: String,
+        token: Token,
         /// `accept` requires the token (a [`protect`] entry).
         enforce: bool,
-        /// `None` for a [`note`] entry (no owner).
+        /// `None` for a [`note`] or [`note_source`] entry (no owner).
         hold: Option<Weak<Hold>>,
         /// The entry dies when this is cancelled.
         alive: Option<Cancel>,
@@ -874,18 +889,23 @@ pub mod tokens {
 
     fn register(
         address: SocketAddr,
-        token: &str,
+        token: Token,
         enforce: bool,
         alive: Option<Cancel>,
         owned: bool,
     ) -> Option<Arc<Hold>> {
-        if !address.ip().is_loopback() || token.is_empty() {
+        if !address.ip().is_loopback() || matches!(&token, Token::Known(known) if known.is_empty())
+        {
             return None;
         }
         let hold = owned.then(|| Arc::new(Hold { _private: () }));
+        let read = matches!(token, Token::Read(_));
         let mut entries = registry();
         entries.retain(|entry| {
-            entry.live() && !(entry.address == address && entry.enforce == enforce)
+            entry.live()
+                && !(entry.address == address
+                    && entry.enforce == enforce
+                    && matches!(entry.token, Token::Read(_)) == read)
         });
         if !owned {
             let noted = entries.iter().filter(|entry| entry.hold.is_none()).count();
@@ -897,7 +917,7 @@ pub mod tokens {
         }
         entries.push(Entry {
             address,
-            token: token.to_owned(),
+            token,
             enforce,
             hold: hold.as_ref().map(Arc::downgrade),
             alive,
@@ -910,32 +930,48 @@ pub mod tokens {
     /// and `alive` is not cancelled. `None` (nothing registered) for a
     /// non-loopback address or an empty token.
     pub fn protect(address: SocketAddr, token: &str, alive: Option<Cancel>) -> Option<Arc<Hold>> {
-        register(address, token, true, alive, true)
+        register(address, Token::Known(token.to_owned()), true, alive, true)
     }
 
     /// Lets clients of this process present `token` to `address` while the
     /// returned [`Hold`] is held.
     pub fn remember(address: SocketAddr, token: &str) -> Option<Arc<Hold>> {
-        register(address, token, false, None, true)
+        register(address, Token::Known(token.to_owned()), false, None, true)
     }
 
     /// [`remember`] without an owner: kept until a newer registration for
     /// the address replaces it (at most [`MAX_NOTED`] such entries).
     pub fn note(address: SocketAddr, token: &str) {
-        register(address, token, false, None, false);
+        register(address, Token::Known(token.to_owned()), false, None, false);
+    }
+
+    /// [`note`] of a token that `source` reads when the address is looked
+    /// up (never while this is called, nor under the registry's lock). It
+    /// replaces an older source for the address, not a known token; a
+    /// source that finds nothing defers to the older entries.
+    pub fn note_source(address: SocketAddr, source: Source) {
+        register(address, Token::Read(source), false, None, false);
     }
 
     /// The token this process knows for `address`: the protecting server's,
-    /// else the newest one remembered or noted.
+    /// else the newest one remembered or noted (a source is read now, after
+    /// the registry's lock is released; one that finds nothing is skipped).
     pub fn lookup(address: SocketAddr) -> Option<String> {
-        let entries = registry();
-        let live = |entry: &&Entry| entry.address == address && entry.live();
-        entries
-            .iter()
-            .filter(live)
-            .find(|entry| entry.enforce)
-            .or_else(|| entries.iter().rev().find(live))
-            .map(|entry| entry.token.clone())
+        let candidates: Vec<Token> = {
+            let entries = registry();
+            let live = |entry: &&Entry| entry.address == address && entry.live();
+            entries
+                .iter()
+                .filter(live)
+                .filter(|entry| entry.enforce)
+                .chain(entries.iter().rev().filter(live))
+                .map(|entry| entry.token.clone())
+                .collect()
+        };
+        candidates.into_iter().find_map(|token| match token {
+            Token::Known(token) => Some(token),
+            Token::Read(source) => source().filter(|token| !token.is_empty()),
+        })
     }
 
     /// The token [`super::accept`] requires at `address`, if it is protected.
@@ -943,7 +979,26 @@ pub mod tokens {
         registry()
             .iter()
             .find(|entry| entry.address == address && entry.enforce && entry.live())
-            .map(|entry| entry.token.clone())
+            .and_then(|entry| match &entry.token {
+                Token::Known(token) => Some(token.clone()),
+                Token::Read(_) => None,
+            })
+    }
+
+    /// The loopback socket addresses of a `ws://` endpoint whose host is an
+    /// IP literal: no name is resolved (a worker publishes its listener's
+    /// socket address). Empty for anything else.
+    pub fn literal_addresses(endpoint: &str) -> Vec<SocketAddr> {
+        let Ok(uri) = super::endpoint_uri(endpoint) else {
+            return Vec::new();
+        };
+        let (Some(host), Some(port)) = (uri.host(), uri.port_u16()) else {
+            return Vec::new();
+        };
+        match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(ip) if ip.is_loopback() => vec![SocketAddr::new(ip, port)],
+            _ => Vec::new(),
+        }
     }
 
     /// The loopback socket addresses of a `ws://` endpoint (no DNS lookup
@@ -1269,6 +1324,51 @@ mod tests {
             server.join().unwrap(),
             ["ACCESS_DENIED", "ACCESS_DENIED", "served"]
         );
+    }
+
+    /// WP4.1: a noted source is read when its address is looked up, never
+    /// when it is noted; one that finds nothing defers to the older entries;
+    /// only IP-literal loopback endpoints give addresses to note.
+    #[test]
+    fn a_noted_source_is_read_when_its_address_is_looked_up() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let address: std::net::SocketAddr = "127.0.0.1:7".parse().unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let answer = Arc::new(Mutex::new(Some("from-source".to_owned())));
+        let source: tokens::Source = {
+            let (reads, answer) = (reads.clone(), answer.clone());
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                answer.lock().unwrap().clone()
+            })
+        };
+        tokens::note(address, "known");
+        tokens::note_source(address, source);
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "nothing is read when noted"
+        );
+        assert_eq!(tokens::lookup(address).as_deref(), Some("from-source"));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        *answer.lock().unwrap() = None;
+        assert_eq!(
+            tokens::lookup(address).as_deref(),
+            Some("known"),
+            "a source that finds nothing defers to the older note"
+        );
+        assert_eq!(tokens::enforced(address), None);
+        assert_eq!(tokens::literal_addresses("ws://127.0.0.1:7"), vec![address]);
+        assert_eq!(
+            tokens::literal_addresses("ws://[::1]:7"),
+            vec!["[::1]:7".parse::<std::net::SocketAddr>().unwrap()]
+        );
+        assert!(tokens::literal_addresses("ws://localhost:7").is_empty());
+        assert!(tokens::literal_addresses("ws://10.0.0.1:7").is_empty());
+        assert!(tokens::literal_addresses("not an endpoint").is_empty());
     }
 
     /// WP4.1: a protected address makes `accept` require the token and lets
