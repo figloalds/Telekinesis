@@ -79,10 +79,11 @@
 //! cannot or will not serve. It backs off for that peer (no `ObjectError`:
 //! not serving is no error here), and its lease is given up at our worker
 //! (`objects.release`), so the next `objects.wants` of another dialer is
-//! offered it at once; that dialer's own wants exclude it while it backs
-//! off. An object of our offer whose push failed here, or that the dialer
-//! abandoned (its push failed or ended early, its session went away), is
-//! given up the same way (without a backoff when the object did not fail).
+//! offered it at once; the dialer that did not send it is not offered it
+//! again while it backs off (its wants exclude it). An object of our offer
+//! whose push failed here, or that the dialer abandoned (its push failed or
+//! ended early, its session went away), is given up the same way (without a
+//! backoff when the object did not fail).
 //!
 //! **Report.** A report makes our worker re-read a whole object, so it is
 //! taken only for an object of the session's lane (`OBJECT_ON_WRONG_LANE`)
