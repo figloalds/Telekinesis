@@ -585,6 +585,46 @@ impl Store {
     pub fn view_loads(&self) -> u64 {
         self.caches.commit.view_loads.get()
     }
+    /// Sets the connection's `temp_store` to `MEMORY` (`memory`) or back to
+    /// the default, outside a transaction (SQLite refuses it inside one). The
+    /// activator keeps a commit's savepoint sub-journal in memory this way
+    /// (`worker::activator`, WP4.4). The change drops the connection's TEMP
+    /// objects, among them the commit-epoch table (module docs,
+    /// "Rolled-back commits and the view"): its stored value is carried over
+    /// unchanged, so the change neither drops the view (an O(projection)
+    /// reload at the next commit) nor hides a rolled-back commit.
+    #[doc(hidden)]
+    pub fn set_temp_store_memory(&self, memory: bool) -> Result<()> {
+        let changes = self.db.total_changes();
+        let stored: Option<i64> = self
+            .db
+            .prepare("SELECT n FROM temp.tkfs_commit_epoch WHERE id=0")
+            .and_then(|mut statement| statement.query_row([], |r| r.get(0)).optional())
+            .ok()
+            .flatten();
+        self.db.execute_batch(if memory {
+            "PRAGMA temp_store=MEMORY"
+        } else {
+            "PRAGMA temp_store=DEFAULT"
+        })?;
+        if let Some(n) = stored {
+            self.db.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS tkfs_commit_epoch(id INTEGER PRIMARY KEY CHECK(id=0), n INTEGER NOT NULL)",
+            )?;
+            self.db.execute(
+                "INSERT INTO temp.tkfs_commit_epoch VALUES(0,?1) ON CONFLICT(id) DO UPDATE SET n=excluded.n",
+                [n],
+            )?;
+        }
+        // That row counts in `total_changes`, the view's freshness key: a
+        // view fresh before it is fresh after it (no projection row changed).
+        if let Ok(mut cache) = self.view_cache.try_borrow_mut()
+            && let Some(view) = cache.as_mut().filter(|view| view.changes == changes)
+        {
+            view.changes = self.db.total_changes();
+        }
+        Ok(())
+    }
     pub(super) fn count_view_load(&self) {
         let loads = &self.caches.commit.view_loads;
         loads.set(loads.get().saturating_add(1));
