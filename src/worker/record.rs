@@ -20,10 +20,7 @@ use std::{
     fs::{self, File},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{
-        OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::OnceLock,
 };
 
 /// `STATE/worker.json`.
@@ -93,6 +90,36 @@ fn create_temporary(path: &Path, private: bool) -> std::io::Result<File> {
     options.open(path)
 }
 
+/// How many temporary names [`replace`] tries before it gives up (each one
+/// random, so a second attempt is already a matter of chance).
+const TEMPORARY_ATTEMPTS: u32 = 4;
+
+/// A fresh temporary next to `target`, `{name}.{pid}.{random}.tmp`, created
+/// with `create_new` (so a private one is owner-only from its first byte,
+/// never an older file reopened). The random part makes the name
+/// collision-free: a temporary left behind by a process killed before its
+/// rename (the same pid reused later, the same write sequence) never makes a
+/// later write fail.
+fn open_temporary(directory: &Path, name: &str, private: bool) -> std::io::Result<(File, PathBuf)> {
+    let mut attempt = 1;
+    loop {
+        let temporary = directory.join(format!(
+            "{name}.{}.{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        match create_temporary(&temporary, private) {
+            Ok(file) => return Ok((file, temporary)),
+            Err(error)
+                if error.kind() == ErrorKind::AlreadyExists && attempt < TEMPORARY_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn replace(target: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let directory = target.parent().unwrap_or_else(|| Path::new("."));
     let name = target
@@ -100,14 +127,9 @@ fn replace(target: &Path, bytes: &[u8], private: bool) -> Result<()> {
         .with_context(|| format!("no file name in {}", target.display()))?
         .to_string_lossy();
     // Unique per call, so two writers of one file never share a temporary.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let temporary = directory.join(format!(
-        "{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let (mut file, temporary) = open_temporary(directory, &name, private)
+        .with_context(|| format!("cannot write {}", target.display()))?;
     let written = (|| -> Result<()> {
-        let mut file = create_temporary(&temporary, private)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

@@ -64,13 +64,17 @@
 //! peer record in the same transaction), [`Catalog::revoke`] and
 //! [`Catalog::forget`], which run as commands of the same actor (same
 //! transaction, retry and
-//! [`APPLY_WAIT`] rules), and as part of two catalog commands:
+//! [`APPLY_WAIT`] rules), and as part of three catalog commands:
 //!
 //! * `SetVerifier` (ResetPairingCode), and a rotation by a downgraded binary
 //!   folded in at open, revoke every inbound credential with the verifier
 //!   generation bump, in the same transaction (invariant 21);
 //! * `RemovePeer` deletes our outbound credential for the installation once
-//!   no peer record names it any more (an unpair).
+//!   no peer record names it any more (an unpair);
+//! * `UpsertPeer` of an endpoint whose record named another installation (a
+//!   re-pair of an endpoint that now answers as a different installation:
+//!   the record is replaced in place) does the same for the old
+//!   installation.
 //!
 //! A component that holds only `Arc<dyn CatalogApi>` finds the concrete
 //! catalog with [`Catalog::of`] (the frozen trait has no credential calls:
@@ -1242,6 +1246,11 @@ fn upsert_peer(tx: &Transaction<'_>, record: &PeerRecord, current: &CatalogSnaps
     } else {
         record.revision.clone()
     };
+    // WP4.1: a re-pair of an endpoint that now answers as another
+    // installation replaces the old installation's record in place (the
+    // conflict is on the endpoint); its outbound credential goes with it once
+    // no record names it, as with `RemovePeer`.
+    let previous = peer_installation(tx, &record.endpoint)?;
     tx.prepare_cached(sql::UPSERT_PEER)?.execute(params![
         record.endpoint,
         record.code,
@@ -1249,6 +1258,10 @@ fn upsert_peer(tx: &Transaction<'_>, record: &PeerRecord, current: &CatalogSnaps
         record.connections,
         revision,
     ])?;
+    if let Some(previous) = previous.filter(|previous| *previous != record.installation) {
+        tx.prepare_cached(sql::FORGET_UNPAIRED_OUTBOUND)?
+            .execute([previous])?;
+    }
     tx.prepare_cached(sql::RESOLVE_GATES)?.execute([])?;
     Ok(())
 }
