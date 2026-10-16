@@ -115,13 +115,6 @@
 //! [`NetworkApi::remote_list`] presents the credential too, and retries once
 //! with the code on `PEER_REVOKED`.
 //!
-//! **Control token (WP4.1 adapter).** [`PeerManager::start`] runs on every
-//! daemon's build before its control endpoint accepts: with a concrete
-//! catalog it installs the control endpoint's local token
-//! (`api::install_control_token`, CCR-WP4.1-3), held until its
-//! [`NetworkApi::shutdown`] (§3.6 step 2: `stopping` is set by then, so
-//! every action is refused anyway).
-//!
 //! Invariants: 16 (a probe and every lane session are fresh requests, nothing
 //! is replayed), 20 (a legacy endpoint is `Incompatible`, the code is never
 //! sent), 21 (the code and the per-peer keys are only ever dial credentials:
@@ -141,7 +134,6 @@ use crate::{
         status::{Direction, LaneState, StatusEvent},
     },
     orchestrator::{
-        api,
         catalog::{Catalog, CredentialSide},
         objects, scheduler,
     },
@@ -328,9 +320,6 @@ pub struct PeerManager {
     catalog: Option<Arc<Catalog>>,
     /// Enrollments and forgotten credentials, off the lane threads.
     credentials: Arc<CredentialWriter>,
-    /// The control endpoint's local token registration (WP4.1 adapter),
-    /// released by [`NetworkApi::shutdown`] (§3.6 step 2, after `stopping`).
-    control_token: Mutex<Option<Arc<crate::ws::tokens::Hold>>>,
 }
 
 #[derive(Default)]
@@ -380,9 +369,6 @@ impl PeerManager {
         let cancel = ctx.shutdown.child();
         let ctx_catalog = ctx.catalog.clone();
         let catalog = Catalog::of(&ctx.catalog);
-        let control_token = catalog
-            .as_ref()
-            .and_then(|catalog| api::install_control_token(catalog, &ctx.endpoints.load().control));
         let credentials = CredentialWriter::start(ctx.installation.clone(), catalog.clone());
         let manager = Arc::new(PeerManager {
             ctx,
@@ -399,7 +385,6 @@ impl PeerManager {
             meta: MetaWriter::start(ctx_catalog),
             catalog,
             credentials,
-            control_token: Mutex::new(control_token),
         });
         let generation = manager.reconcile();
         let weak = Arc::downgrade(&manager);
@@ -1045,9 +1030,6 @@ impl NetworkApi for PeerManager {
         self.stop_all(&supervisors, until);
         self.meta.close();
         self.credentials.close();
-        // The daemon is stopping (every action is refused): the control
-        // endpoint's token is no longer enforced.
-        lock(&self.control_token).take();
         let watcher = lock(&self.watcher).take();
         if let Some(watcher) = watcher {
             // The watcher re-checks its token every CATALOG_WAIT and pokes

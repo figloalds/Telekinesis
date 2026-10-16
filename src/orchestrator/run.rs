@@ -4,7 +4,9 @@
 //! with no global lock and no polling loop:
 //!
 //! * `control-accept` blocks in `accept` on the loopback control listener and
-//!   gives each connection its own thread (at most
+//!   gives each connection its own thread, whose upgrade must carry the
+//!   daemon's control token (`X-Tkfs-Token`, WP4.1; CCR-WP4.1-3: required
+//!   here until the control server stops, refused with HTTP 403 otherwise) (at most
 //!   `limits::MAX_CONTROL_CONNECTIONS` outside a request, and as many more
 //!   parked inside one, so requests waiting on a slow catalog never lock
 //!   List, Inspect and Status out): a persistent `receive → manage →
@@ -95,6 +97,7 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
     let Daemon {
         ctx,
         control,
+        mut control_token,
         network,
         net,
         catalog,
@@ -124,7 +127,7 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
         // sequence (§3.6 step 2).
         net.serve_inbound(&ctx, listener);
     }
-    let controls = match ControlServer::start(ctx.clone(), control) {
+    let controls = match ControlServer::start(ctx.clone(), control, control_token.token()) {
         Ok(controls) => controls,
         Err(error) => {
             // The inbound server and the peer stack run already: stop them
@@ -149,6 +152,7 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
     net.shutdown(limits::SHUTDOWN_NETWORK);
     drop(net);
     controls.stop(limits::SHUTDOWN_CONTROL_JOIN);
+    control_token.release();
     // The file goes first, while `orchestrator.lock` is still held: a
     // successor cannot have written its own yet.
     drop(file);
@@ -313,7 +317,7 @@ impl Connections {
 }
 
 impl ControlServer {
-    fn start(ctx: Arc<Ctx>, listener: TcpListener) -> Result<Self> {
+    fn start(ctx: Arc<Ctx>, listener: TcpListener, token: Arc<str>) -> Result<Self> {
         let address = listener.local_addr()?;
         let stop = Arc::new(AtomicBool::new(false));
         let connections = Arc::new(Connections::new());
@@ -321,7 +325,7 @@ impl ControlServer {
             let (stop, connections) = (stop.clone(), connections.clone());
             thread::Builder::new()
                 .name("control-accept".into())
-                .spawn(move || accept_control(ctx, listener, stop, connections))?
+                .spawn(move || accept_control(ctx, listener, token, stop, connections))?
         };
         Ok(Self {
             address,
@@ -364,6 +368,7 @@ impl ControlServer {
 fn accept_control(
     ctx: Arc<Ctx>,
     listener: TcpListener,
+    token: Arc<str>,
     stop: Arc<AtomicBool>,
     connections: Arc<Connections>,
 ) {
@@ -400,11 +405,11 @@ fn accept_control(
             },
         );
         let spawned = {
-            let (ctx, connections) = (ctx.clone(), connections.clone());
+            let (ctx, connections, token) = (ctx.clone(), connections.clone(), token.clone());
             thread::Builder::new()
                 .name(format!("control-conn-{id}"))
                 .spawn(move || {
-                    serve_control(&ctx, stream, &busy);
+                    serve_control(&ctx, stream, &token, &busy);
                     connections.remove(id);
                 })
         };
@@ -421,8 +426,9 @@ fn accept_control(
 /// A persistent control connection: requests are answered in order until
 /// the client goes away, the connection idles for [`CONTROL_IDLE`], or it
 /// asked for Shutdown (answered, then the daemon's shutdown is signalled).
-fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, busy: &AtomicBool) {
-    let Ok(mut socket) = ws::accept(stream) else {
+/// The upgrade must carry `token` (refused before any request is read).
+fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, token: &str, busy: &AtomicBool) {
+    let Ok(mut socket) = ws::accept_authorized(stream, Some(token)) else {
         return;
     };
     if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {

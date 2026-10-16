@@ -155,20 +155,47 @@ pub fn read_control_token(data_directory: &Path) -> Option<String> {
     crate::worker::record::read_token(&control_token_path(data_directory))
 }
 
+/// The daemon's control token (WP4.1): the value its control server
+/// requires on every upgrade, and the registration that lets clients of this
+/// process (in-process daemons of the tests) find it.
+pub struct ControlToken {
+    token: Arc<str>,
+    /// Released when the control server stops.
+    hold: Option<Arc<ws::tokens::Hold>>,
+}
+
+impl ControlToken {
+    /// The token the control server requires.
+    pub fn token(&self) -> Arc<str> {
+        self.token.clone()
+    }
+
+    /// Ends the in-process registration (the control server stopped).
+    pub fn release(&mut self) {
+        self.hold = None;
+    }
+}
+
+impl std::fmt::Debug for ControlToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlToken")
+            .field("token", &"<redacted>")
+            .field("registered", &self.hold.is_some())
+            .finish()
+    }
+}
+
 /// Protects the daemon's control endpoint `control` (`ws://127.0.0.1:PORT`)
-/// with a fresh local token (WP4.1): writes `DATA/orchestrator.token`
+/// with a fresh local token (WP4.1; CCR-WP4.1-3, applied by WP4.INT: called
+/// by `ctx::build_with` right after the control listener is bound, and the
+/// control server requires the returned token on every upgrade, whatever the
+/// process-wide registry says). Writes `DATA/orchestrator.token`
 /// (owner-only; the catalog holds `orchestrator.lock`, so no other daemon
-/// writes it) and makes `ws::accept` on that address require the token for
-/// as long as the returned hold is kept. A token file that cannot be written
+/// writes it) and registers the token for the endpoint's loopback address so
+/// clients of this process present it. A token file that cannot be written
 /// is logged and the endpoint is still protected (fail closed: clients then
-/// cannot connect). `None` for an endpoint that is not a loopback address
-/// (nothing to protect).
-pub fn install_control_token(
-    catalog: &super::catalog::Catalog,
-    control: &str,
-) -> Option<Arc<ws::tokens::Hold>> {
-    let addresses = ws::tokens::addresses(control);
-    let address = *addresses.first()?;
+/// cannot connect).
+pub fn install_control_token(catalog: &super::catalog::Catalog, control: &str) -> ControlToken {
     let token = ws::tokens::generate();
     let path = control_token_path(catalog.data_directory());
     if let Err(error) = crate::worker::record::write_private(&path, token.as_bytes()) {
@@ -178,7 +205,13 @@ pub fn install_control_token(
             "error": format!("{error:#}"),
         });
     }
-    ws::tokens::protect(address, &token, None)
+    let hold = ws::tokens::addresses(control)
+        .first()
+        .and_then(|address| ws::tokens::protect(*address, &token, None));
+    ControlToken {
+        token: token.into(),
+        hold,
+    }
 }
 
 /// One request to the running daemon: [`ControlClient::connect`], then

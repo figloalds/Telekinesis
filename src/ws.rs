@@ -188,11 +188,18 @@ pub fn timeouts(stream: &TcpStream) -> Result<()> {
 }
 
 /// Accepts a JSON WebSocket connection. When this process protects the
-/// listener's address with a local token ([`tokens::protect`], the daemon's
-/// control endpoint), the upgrade must carry it; see [`accept_authorized`].
+/// listener's address with a local token ([`tokens::protect`]), the upgrade
+/// must carry it; see [`accept_authorized`]. Fails closed: a socket whose
+/// local address cannot be read is refused, since its listener may be a
+/// protected one (WP4.INT, the WP4.1 review's minor). The daemon's control
+/// server does not rely on this lookup: it calls [`accept_authorized`] with
+/// its token (CCR-WP4.1-3).
 #[allow(clippy::result_large_err)]
 pub fn accept(stream: TcpStream) -> Result<Socket> {
-    let required = stream.local_addr().ok().and_then(tokens::enforced);
+    let local = stream.local_addr().context(
+        "ACCESS_DENIED: the listener's address is unknown, so its local token cannot be checked",
+    )?;
+    let required = tokens::enforced(local);
     accept_authorized(stream, required.as_deref())
 }
 

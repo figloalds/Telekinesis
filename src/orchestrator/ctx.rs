@@ -9,7 +9,10 @@
 //!    data directory fails here, before anything else starts) →
 //!    `StatusHub::new` with its 1 Hz `hub-tick` thread → `PublishedCatalog`;
 //! 2. the control and network listeners (a busy port fails the start before
-//!    any worker is started or adopted);
+//!    any worker is started or adopted), and the control endpoint's local
+//!    token (`api::install_control_token`, CCR-WP4.1-3: written before
+//!    `orchestrator.json` names the endpoint, required by the control server
+//!    on every upgrade);
 //! 3. `FolderRegistry::start` with the real launcher and the limits derived
 //!    from `Config` (the worker version is `worker::version()`,
 //!    CCR-WP1.2-2): every desired folder adopts or starts its worker;
@@ -40,6 +43,7 @@
 //! `maximum_running` slot every 2 s (WP1.2 review: a slot wake-up can be lost
 //! while the registry is still inserting a new controller).
 use super::{
+    api::{self, ControlToken},
     catalog::Catalog,
     compat::HubLegacyView,
     config::Config,
@@ -95,6 +99,9 @@ pub const SLOT_TICK: Duration = Duration::from_secs(2);
 pub struct Daemon {
     pub ctx: Arc<Ctx>,
     pub control: TcpListener,
+    /// The control endpoint's local token (WP4.1, CCR-WP4.1-3): the control
+    /// server requires it on every upgrade.
+    pub control_token: ControlToken,
     pub network: Option<TcpListener>,
     /// `ctx.network`: the v3 peer stack; `run` starts the inbound server on
     /// `network` and hands it over ([`DaemonNetwork::serve_inbound`]).
@@ -170,6 +177,7 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
             .transpose()?,
         log_path: None,
     };
+    let control_token = api::install_control_token(&catalog, &endpoints.control);
     let executable = match options.executable {
         Some(path) => path,
         None => std::env::current_exe()?,
@@ -235,6 +243,7 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
     Ok(Daemon {
         ctx,
         control,
+        control_token,
         network,
         net,
         legacy,

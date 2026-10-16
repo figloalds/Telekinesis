@@ -364,6 +364,30 @@ fn the_control_endpoint_requires_the_daemon_token() {
     orchestrator::client(&config, &Action::List).unwrap();
 }
 
+/// CCR-WP4.1-3 (applied by WP4.INT): the control server itself requires the
+/// daemon's token on every upgrade until it stops, also once the network has
+/// stopped (§3.6 step 2), when WP4.1's adapter (a registration held by the
+/// peer stack) had stopped enforcing it.
+#[test]
+fn the_control_token_holds_until_the_control_server_stops() {
+    use tkfs::model::orchestrator::NetworkApi;
+    let daemon = Daemon::start();
+    let control = daemon.ctx.endpoints.load().control.clone();
+    let token =
+        fs::read_to_string(daemon.config.data_directory.join("orchestrator.token")).unwrap();
+    assert_eq!(upgrade_status(&control, &[]), 403);
+    daemon.net.shutdown(Duration::from_secs(5));
+    assert_eq!(
+        upgrade_status(&control, &[]),
+        403,
+        "the network's stop lifted the control token"
+    );
+    assert_eq!(
+        upgrade_status(&control, &[("X-Tkfs-Token", token.trim())]),
+        101
+    );
+}
+
 /// §14 WP4.1 acceptance: a worker's JSON RPC and loopback sessions refuse an
 /// upgrade without the instance's token, which is in `worker.json`,
 /// `STATE/runtime.token` (owner-only) and nowhere in `runtime.json`;
