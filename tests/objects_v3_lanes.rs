@@ -2979,11 +2979,14 @@ fn a_failed_worker_call_fails_the_push_not_its_objects() {
         "{:?}",
         b.world.finished()
     );
+    // (A records its push once B's error reaches it, a moment after B's
+    // own record.)
     assert!(
-        a.world
+        wait_until(Duration::from_secs(10), || a
+            .world
             .finished()
             .iter()
-            .any(|f| f.op == "objects.push" && !f.ok),
+            .any(|f| f.op == "objects.push" && !f.ok)),
         "the dialer's push did not fail"
     );
     b.worker.faults().fail_writes = None;
@@ -3143,11 +3146,13 @@ fn a_holder_that_goes_away_hands_the_pulled_object_on() {
     assert!(!to_b.worker.has(&hash), "C delivered X before it went away");
     let c_lanes = objects::pull_holder(&c.installation(), LANE);
     let e_lanes = objects::pull_holder(&e.installation(), LANE);
+    // What C wrote of X (perhaps nothing, if its session reset first) was
+    // under its own lease ids.
     assert!(
-        {
-            let sessions = to_b.worker.write_sessions(&hash);
-            !sessions.is_empty() && sessions.iter().all(|lease| lease.starts_with(&c_lanes))
-        },
+        to_b.worker
+            .write_sessions(&hash)
+            .iter()
+            .all(|lease| lease.starts_with(&c_lanes)),
         "{:?}",
         to_b.worker.write_sessions(&hash)
     );
@@ -5411,7 +5416,8 @@ fn qual_wp4_5_both_directions_rtt50_20mib_memory() {
 
 /// §14.5a WP4.5 acceptance: control-frame latency under a saturated bulk
 /// lane stays < 100 ms. Through the 50 ms / 20 MiB/s link, A pulls one large
-/// object (the bulk lane saturates the link), and A pings B every 100 ms on
+/// object (the bulk lane saturates the link: memory workers), and A pings B
+/// every 100 ms on
 /// its control session (lane 0, its own connection through the same link),
 /// and on the saturated bulk session itself. The floor is the control
 /// session's p99; the bulk session's own round trips are recorded (its
@@ -5422,9 +5428,10 @@ fn qual_wp4_5_both_directions_rtt50_20mib_memory() {
 fn qual_wp4_5_control_latency_under_a_saturated_lane() {
     let link = wan_link();
     let size = qual_mib(256) * MIB;
-    let root = tempfile::tempdir().unwrap();
-    let (a, b) = qual_pair(Some(root.path()));
-    let hash = b.worker.hold_file(43, size);
+    // Memory workers: the link, not this machine's shared disk, is what
+    // saturates.
+    let (a, b) = qual_pair(None);
+    let hash = b.worker.hold(content(43, size as usize));
     a.worker.want(&hash, size);
     let proxy = proxy_for(&b.endpoint, &link);
     let control = control_session(&a, &proxy.endpoint(), &b.code);
