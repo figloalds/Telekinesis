@@ -1203,6 +1203,174 @@ fn the_catalog_keeps_credentials_per_installation_and_side() {
     assert_owner_only(&config.data_directory.join("folders.sqlite"));
 }
 
+/// WP4.INT (the WP4.1 review's blocker, invariant 21): an acceptor's
+/// enrollment is stored only while the verifier generation its session was
+/// authenticated at is still current, checked in the catalog transaction
+/// that stores it. A stale one is refused `PAIRING_CODE_CHANGED` and stores
+/// nothing; a current one is stored, and the next rotation revokes it.
+#[test]
+fn an_enrollment_at_a_replaced_generation_stores_nothing() {
+    use tkfs::model::orchestrator::{CatalogApi, CatalogCmd};
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network::default(),
+    };
+    let catalog = Catalog::open(&config).unwrap();
+    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
+    catalog.apply(CatalogCmd::SetVerifier { verifier }).unwrap();
+    let authenticated_at = catalog.snapshot().verifier_generation;
+    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
+    catalog.apply(CatalogCmd::SetVerifier { verifier }).unwrap();
+    let current = catalog.snapshot().verifier_generation;
+    assert_ne!(current, authenticated_at);
+
+    let error = catalog
+        .enroll_at_generation("peer", CredentialSide::Inbound, [7; 32], authenticated_at)
+        .unwrap_err();
+    assert_eq!(error.code, "PAIRING_CODE_CHANGED", "{error:?}");
+    assert!(
+        catalog
+            .credentials()
+            .get("peer", CredentialSide::Inbound)
+            .is_none(),
+        "a refused enrollment left a row: {:?}",
+        catalog.credentials()
+    );
+
+    catalog
+        .enroll_at_generation("peer", CredentialSide::Inbound, [8; 32], current)
+        .unwrap();
+    assert_eq!(
+        catalog
+            .credentials()
+            .active("peer", CredentialSide::Inbound),
+        Some([8; 32])
+    );
+    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
+    catalog.apply(CatalogCmd::SetVerifier { verifier }).unwrap();
+    assert_eq!(
+        catalog
+            .credentials()
+            .active("peer", CredentialSide::Inbound),
+        None,
+        "the rotation revokes what was enrolled before it"
+    );
+    // The unchecked enroll (the dialer's own outbound side) is unchanged.
+    catalog
+        .enroll("peer", CredentialSide::Outbound, [9; 32])
+        .unwrap();
+}
+
+const SECURITY_CHILD: &str = "TKFS_SECURITY_CHILD";
+
+/// WP4.INT (the WP4.1 review's blocker, invariant 21), end to end: a
+/// `peer.enroll` that arrives while a rotation holds the catalog's write
+/// transaction (`catalog.slow_write` hang, so the published snapshot still
+/// shows the old generation) never leaves an active credential after the
+/// rotation, and its key is refused. Before WP4.INT the enrollment, queued
+/// behind the rotation in the actor, stored an active `K_peer` sealed under
+/// the old code. The fault is process-wide, so the scenario runs in a child
+/// process of this binary.
+#[test]
+fn an_enrollment_racing_a_rotation_never_outlives_it() {
+    if std::env::var(SECURITY_CHILD).as_deref() == Ok("rotation_race") {
+        rotation_race_child();
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "an_enrollment_racing_a_rotation_never_outlives_it",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SECURITY_CHILD, "rotation_race")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("ROTATION_RACE_OK"),
+        "the child failed ({:?}):
+{stdout}
+{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn rotation_race_child() {
+    use tkfs::{
+        model::orchestrator::CatalogApi,
+        pairing_code::Verifier,
+        session::{CodeAuth, Priority, auth},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    let b = Daemon::start();
+    let code = b.code();
+    let dialer = uuid::Uuid::new_v4().to_string();
+    let (conn, server) = session::dial(
+        &b.endpoint(),
+        session::client_hello(&dialer, LaneRole::Probe, None, 2),
+        &CodeAuth { code: code.clone() },
+        None,
+        ConnOptions::for_role(LaneRole::Probe),
+    )
+    .unwrap();
+    let before = b.catalog.snapshot().verifier_generation;
+    fault::configure(Some(FaultConfig {
+        point: "catalog.slow_write".into(),
+        scope: None,
+        action: FaultAction::Hang,
+        ms: Some(1500),
+        count: Some(1),
+    }));
+    let rotation = {
+        let ctx = b.ctx.clone();
+        thread::spawn(move || manage(&ctx, Action::ResetPairingCode))
+    };
+    // The rotation's transaction is now held; the snapshot the handler reads
+    // still shows the generation this session was authenticated at.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        b.catalog.snapshot().verifier_generation,
+        before,
+        "the rotation was not held: the race is not exercised"
+    );
+    let secret = auth::new_secret();
+    let request = auth::seal_enrollment(
+        &Verifier::derive_key(&server.salt, &code),
+        &dialer,
+        &server.installation,
+        &secret,
+    );
+    let reply = conn.call(
+        auth::ops::PEER_ENROLL,
+        serde_json::to_value(&request).unwrap(),
+        Vec::new(),
+        Priority::Control,
+        auth::ENROLL_DEADLINE,
+    );
+    let rotated = rotation.join().unwrap();
+    fault::configure(None);
+    rotated.unwrap();
+    assert!(b.catalog.snapshot().verifier_generation > before);
+    assert!(reply.is_err(), "the racing enrollment was confirmed");
+    assert_eq!(
+        b.credential(&dialer, CredentialSide::Inbound),
+        None,
+        "an enrollment authenticated by the replaced code is active (reply {:?}): {:?}",
+        reply.map(|reply| reply.header),
+        b.catalog.credentials()
+    );
+    let error = dial_per_peer(&b, &dialer, auth::peer_key(&secret)).unwrap_err();
+    assert_eq!(error.to_wire().code, "PEER_REVOKED", "{error:?}");
+    println!("ROTATION_RACE_OK");
+}
+
 /// A re-pair of an endpoint that now answers as another installation
 /// replaces the old installation's record in place (`UpsertPeer` conflicts
 /// on the endpoint): our outbound credential for the old installation goes

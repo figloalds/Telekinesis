@@ -362,6 +362,11 @@ enum CredentialCmd {
         /// Refused (`PEER_NOT_PAIRED`) unless a peer record names the
         /// installation, checked in the same transaction.
         paired_only: bool,
+        /// Refused (`PAIRING_CODE_CHANGED`) unless the verifier generation
+        /// is this one, checked in the same transaction (WP4.INT: an
+        /// enrollment authenticated by a code that a rotation replaced
+        /// meanwhile never stores an active credential, invariant 21).
+        generation: Option<u64>,
     },
     Revoke {
         installation: String,
@@ -548,6 +553,34 @@ impl Catalog {
             side,
             key,
             paired_only: false,
+            generation: None,
+        }))
+        .map(drop)
+    }
+
+    /// [`Catalog::enroll`] only while the pairing verifier is still at
+    /// `generation`, checked in the same transaction: `PAIRING_CODE_CHANGED`
+    /// otherwise, and nothing is stored. For an acceptor's `peer.enroll`
+    /// (WP4.INT, invariant 21): the session that carries it was
+    /// authenticated at `generation`, and the actor serializes this with a
+    /// rotation (`SetVerifier`), so either the enrollment commits first and
+    /// the rotation revokes it, or the rotation commits first and this is
+    /// refused. A check of the published snapshot before the call cannot
+    /// tell: a rotation queued in the actor (or committing) still shows the
+    /// old generation there.
+    pub fn enroll_at_generation(
+        &self,
+        installation: &str,
+        side: CredentialSide,
+        key: [u8; 32],
+        generation: u64,
+    ) -> Result<(), ErrorWire> {
+        self.submit(Work::Credential(CredentialCmd::Enroll {
+            installation: installation.to_owned(),
+            side,
+            key,
+            paired_only: false,
+            generation: Some(generation),
         }))
         .map(drop)
     }
@@ -569,6 +602,7 @@ impl Catalog {
             side,
             key,
             paired_only: true,
+            generation: None,
         }))
         .map(drop)
     }
@@ -1121,12 +1155,20 @@ fn apply_credential(
             side,
             key,
             paired_only,
+            generation,
         } => {
             if installation.is_empty() {
                 bail!("INVALID_REQUEST: a peer installation is required");
             }
             if *installation == current.installation {
                 bail!("CANNOT_PAIR_WITH_SELF");
+            }
+            if let Some(generation) = generation
+                && verifier_generation(tx)? != *generation
+            {
+                bail!(
+                    "PAIRING_CODE_CHANGED: this orchestrator's pairing code changed since the session was authenticated; pair again with the new code"
+                );
             }
             if *paired_only
                 && !tx
