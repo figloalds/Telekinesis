@@ -4,7 +4,8 @@
   the previous release**, what every status means, error classes, runbooks.
 - [CLI](CLI.md): every command, including `manage status` and `manage watch`.
 - [Configuration](CONFIGURATION.md): the TOML file, environment variables,
-  files and logs, credentials, remote access through a TLS proxy, backups.
+  files and logs, pairing codes, per-peer credentials and local tokens,
+  remote access through a TLS proxy, backups.
 - [Architecture](ARCHITECTURE.md): processes and failure domains, the worker
   lifecycle, mounts and the initial-sync gate, activation, the v3 protocol
   (sessions, metadata feed, objects), status and errors, invariants.

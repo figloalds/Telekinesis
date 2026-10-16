@@ -22,10 +22,12 @@ previous release it removes are mapped in `docs/revamp/ROOT_CAUSES.md`
 - **Worker** (`tkfs daemon --state STATE --supervised`): one per folder state
   (`owner.lock`). It owns the folder's store and its mount and activates the
   events it receives. Workers never dial anyone: the daemon talks to them over
-  loopback (JSON RPC, and binary sessions for object bytes).
+  loopback (JSON RPC, and binary sessions for object bytes), presenting the
+  worker's per-instance token.
 - **Clients**: the CLI and the desktop are clients of the daemon's control
-  endpoint. The desktop uses one long-polling status subscription and
-  separate connections for commands, so a command never waits behind the
+  endpoint, authenticated by the daemon's token (`DATA/orchestrator.token`).
+  The desktop uses one long-polling status subscription and separate
+  connections for commands, so a command never waits behind the
   subscription.
 
 Every mutable resource has one owner, and no lock is held across I/O:
@@ -76,8 +78,9 @@ The schema is additive: the tables of the previous release are never altered
 (they have positional `INSERT`s that an older binary still uses); new state
 lives in side tables: `folder_intents` (sync and mount intents), `mount_gates`
 (initial-sync gates, mirrored to the legacy `initial_sync` table so a
-downgraded binary still sees them), `peer_meta`, and the `verifier_generation`
-setting (rotations).
+downgraded binary still sees them), `peer_meta`, `peer_credentials`
+(per-peer keys and their revocation) and the `verifier_generation` setting
+(rotations). `folders.sqlite` is owner-only (Unix `0600`).
 
 ### FolderController
 
@@ -151,11 +154,17 @@ of reading it as unshared.
 ### Management API
 
 The control endpoint is a loopback WebSocket (address in
-`DATA/orchestrator.json`). One thread per connection, persistent request
-loop, at most 64 idle connections plus those parked inside a long request.
-Reads (`list`, `inspect`, `peers`, `status`, `subscribe`) come from snapshots
-and never wait. Writes persist the intent in the catalog, then command the
-folder's controller; `start` returns at once, `stop` waits up to 15 s.
+`DATA/orchestrator.json`). The upgrade must carry the daemon's token
+(`X-Tkfs-Token`, read from `DATA/orchestrator.token`, an owner-only file the
+daemon writes at start); without it the connection is refused before any
+action is read. One thread per connection, persistent request loop, at most
+64 idle connections plus those parked inside a long request. Reads (`list`,
+`inspect`, `peers`, `status`, `subscribe`) come from snapshots and never
+wait. Writes persist the intent in the catalog, then command the folder's
+controller; `start` returns at once, `stop` waits up to about 13 s
+(`force-stop` up to 15 s). `diagnostics` writes a bundle under
+`DATA/diagnostics/<time>/` from snapshots and files only (no worker RPC, no
+catalog command), with every code, secret and token removed.
 `subscribe{since, wait_ms ≤ 25 s}` long-polls the hub. The client
 (`ControlClient`) never resends a mutating action after a transport failure
 (`CONNECTION_LOST`); read-only actions are retried once.
@@ -198,11 +207,14 @@ current, the op allowed on the session's role (`meta.exchange` and
 `catalog.list` only on control, `objects.*` only on bulk), the folder running
 (`REMOTE_WORKER_STARTING`) and not paused (`FOLDER_SYNC_PAUSED`). Exchanges run
 on their own threads, bounded per session and server-wide, so a hung worker
-never holds a handler. A rotation of this host's pairing code sends
-`GOAWAY{PAIRING_CODE_CHANGED}` to older sessions within a second. A legacy
-(previous-release) dialer is answered `PEER_NEEDS_UPGRADE` in its own format
-and recorded as an `inbound` notice. Served exchanges are reported to the
-status hub, so the accepting host shows its peers too.
+never holds a handler. A rotation of this host's pairing code revokes every
+per-peer credential and sends `GOAWAY{PAIRING_CODE_CHANGED}` to older
+sessions within a second. `peer.enroll` stores a dialer's per-peer
+credential; `peer.revoke` (a dialer's unpair) revokes it and closes that
+installation's sessions within a second. A legacy (previous-release) dialer
+is answered `PEER_NEEDS_UPGRADE` in its own format and recorded as an
+`inbound` notice. Served exchanges are reported to the status hub, so the
+accepting host shows its peers too.
 
 ## Worker
 
@@ -217,12 +229,15 @@ status hub, so the accepting host shows its peers too.
    frontiers, snapshot resume or rebuild, inbox classification. Activation
    is deferred to the background.
 4. Recover pending saves; build the worker context.
-5. Open the RPC listener and start the heartbeat (1 Hz), then write
-   `runtime.json` and `worker.json` (atomically).
+5. Open the RPC listener, which requires the instance's token (a fresh
+   random token, written owner-only to `runtime.token`), and start the
+   heartbeat (1 Hz); then write `runtime.json` and `worker.json` (with the
+   token) atomically.
 6. Standalone with `--mount`: attach now (a failure is reported, never fatal).
    Supervised: wait for `mount-attach`.
 7. Print the Ready line (`{"ready":true, repo, device, instance, pid,
-   address, version, "ipc":3, mounted, mount_error}`).
+   address, token, version, "ipc":3, mounted, mount_error}`); the daemon
+   reads the token from it (its copy in `worker.log` is redacted).
 8. Start the maintenance (1 Hz), activator and notifier threads; wait for a
    stop; flush the stop reply; remove the records.
 
@@ -349,15 +364,31 @@ in CHUNK frames, reassembled up to the op's limit (16 MiB for
 malformed closes the connection.
 
 **Handshake and authentication.** HELLO (client nonce, installation, role
-`control|bulk|probe`, lane) → HELLO_ACK (verifier salt, server nonce,
-verifier generation) → AUTH (`HMAC-SHA256(K, "client" ‖ transcript)`) →
-AUTH_OK (`HMAC-SHA256(K, "server" ‖ transcript)`, verified by the client:
-mutual). `K` is the 32-byte verifier digest: the server stores it, the client
-derives it from the salt and its pairing code. The code never crosses the
-wire, and a replayed proof fails because both nonces change. The dialer then
-checks the server's installation against the catalog
+`control|bulk|probe`, lane, features) → HELLO_ACK (verifier salt, server
+nonce, verifier generation, features) → AUTH
+(`HMAC-SHA256(K, "client" ‖ transcript)`) → AUTH_OK
+(`HMAC-SHA256(K, "server" ‖ transcript)`, verified by the client: mutual).
+With the pairing code, `K` is the 32-byte verifier digest: the server stores
+it, the client derives it from the salt and its code. The code never crosses
+the wire, and a replayed proof fails because both nonces change. The dialer
+then checks the server's installation against the catalog
 (`PEER_INSTALLATION_CHANGED`). Socket timeouts (5 s per step) exist only
 during the handshake.
+
+**Per-peer credentials.** After `pair` has authenticated a probe session
+with the code, the dialer sends `peer.enroll` with 32 random bytes `S`; both
+sides store `K_peer = SHA-256("tkfs-peer-secret-v1" ‖ S)` in
+`peer_credentials`. Later sessions offer the scheme `peer-hmac-v1` in
+HELLO's features and run the same mutual proofs keyed by `K_peer`. A missing
+or revoked credential is refused with `GOAWAY{PEER_REVOKED}`. A dialer's
+unpair sends `peer.revoke` first (best effort); the acceptor revokes the
+credential and closes that installation's sessions within 1 s. A rotation
+(`reset-pairing-code`) revokes every code session and every per-peer
+credential (invariant 21).
+
+**Loopback sessions** (daemon ↔ worker) use the upgrade header
+`X-Tkfs-Sync: 3-loopback` and no HELLO or AUTH: the upgrade must carry the
+worker's token (`X-Tkfs-Token`), as must its JSON RPC.
 
 **I/O.** One thread per connection owns the socket in non-blocking mode with
 a `polling` poller: it always drains reads (TLS buffers internally), writes
@@ -481,6 +512,15 @@ their scope; 50 resolved errors stay in the history. `FOLDER_SYNC_PAUSED` is
 shown as the paused state, never as an error. Legacy `list`/`inspect`/`peers`
 replies keep their shapes, computed from the hub.
 
+**Logs** are JSON lines (`{"at_ms", "level", "code", …}`) with a per-code
+rate limit (20 a minute, then a `suppressed` count). The daemon writes
+`DATA/logs/orchestrator.log`, rotated at 10 MiB with 5 files kept; a worker's
+`worker.log` is rotated when the worker is spawned and the file is larger
+than 10 MiB. Fields that name codes, secrets or tokens are redacted. The
+`diagnostics` action collects the status, the activity, each folder's view,
+the redacted catalog, the ends of the logs and the versions into
+`DATA/diagnostics/<time>/`.
+
 ## Storage and migration
 
 - `folders.sqlite` and each state's `metadata.sqlite` are only ever extended:
@@ -522,11 +562,11 @@ replies keep their shapes, computed from the hub.
 | 18 | Control carries no object bytes; bulk never activates or acknowledges | op/role table | `inbound_v3::role_violations_and_route_violations_keep_their_codes`, `objects_v3_lanes::control_carries_no_object_bytes` |
 | 19 | One owner per object per session | lane sharding, worker leases, object locks | `objects_v3_worker::duplicate_sessions_transfer_once` |
 | 20 | Fail closed against old peers | `X-Tkfs-Sync` both ways | `session_handshake::legacy_both_directions`, `qual_wp3_1_transport` |
-| 21 | Salted verifier; rotation invalidates; the code never in status | HMAC over the verifier digest; generation → GOAWAY | `session_handshake`, `status_hub` |
+| 21 | Salted verifier; per-peer credentials; rotation invalidates sessions and credentials; no code, secret or token in status, logs or diagnostics | HMAC over the verifier digest or `K_peer`; generation → GOAWAY; rotation and unpair revoke `peer_credentials`; redaction of logs and bundles | `session_handshake`, `status_hub`, `security`, `logging` |
 | 22 | Bounded input | frame, header, page, need and body limits; pre-auth limits | `session_core::bounds`, `inbound_v3::preauth_flood_keeps_memory_flat` |
 | 23 | One owner per data directory and per state | `orchestrator.lock`, `owner.lock`, verified kills | `folder_controller::adoption_*` |
 | 24 | Recovery before RPC | the listener opens after the store and pending saves | `worker_lifecycle::rpc_after_recovery` |
-| 25 | Workers never dial | worker sessions are loopback and accepted only | review |
+| 25 | Workers never dial | worker sessions are loopback and accepted only, with the worker's token | review, `security` |
 | 26 | Durable intent; the gate | `desired=0` persisted first; gate cleared only after attach | `folder_controller::gate_holds_the_attach_until_evidence_and_clears_only_after_attached`, `orchestrator::received_mount_waits_for_complete_metadata_across_daemon_restart` |
 | 27 | Mount safety | path validation; FUSE recovery only for mounts proven ours | `mount_lifecycle::foreign_mount_untouched` |
 | 28 | Startup progress from the recovering thread | backfills report from the opening thread | `worker_lifecycle::backfill_reports_progress` |
