@@ -8,11 +8,15 @@
 //! * per-peer credentials: pairing enrolls one on both sides, and a session
 //!   authenticates with it (`peer-hmac-v1`) without the code; a wrong key, an
 //!   unknown dialer and a replayed handshake are refused;
-//! * an unpair revokes the dialer's inbound access within 1 s;
+//! * an unpair revokes the dialer's inbound access within 1 s; a re-pair of
+//!   an endpoint that now answers as another installation forgets our
+//!   credential for the old one;
 //! * a rotation invalidates live sessions and every per-peer credential, and
 //!   a re-pair enrolls a new one;
 //! * peers paired before WP4.1 (no credential table) enroll on their next
 //!   connection without user action;
+//! * a secret's atomic write never fails on a temporary an earlier process
+//!   left behind;
 //! * no pairing code, per-peer key or local token appears in status JSON or
 //!   in the daemons' and workers' logs.
 //!
@@ -1197,6 +1201,151 @@ fn the_catalog_keeps_credentials_per_installation_and_side() {
     assert_eq!(catalog.credentials(), before);
     #[cfg(unix)]
     assert_owner_only(&config.data_directory.join("folders.sqlite"));
+}
+
+/// A re-pair of an endpoint that now answers as another installation
+/// replaces the old installation's record in place (`UpsertPeer` conflicts
+/// on the endpoint): our outbound credential for the old installation goes
+/// in the same transaction once no record names it, as with `RemovePeer`
+/// (fix round 2). Its inbound credential (its own dial access) is untouched.
+#[test]
+fn a_record_taken_over_by_another_installation_forgets_its_credential() {
+    use tkfs::model::orchestrator::{CatalogApi, CatalogCmd, PeerRecord};
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network::default(),
+    };
+    let catalog = Catalog::open(&config).unwrap();
+    let upsert = |endpoint: &str, installation: &str, code: &str| {
+        catalog
+            .apply(CatalogCmd::UpsertPeer {
+                record: PeerRecord {
+                    endpoint: endpoint.into(),
+                    code: code.into(),
+                    installation: installation.into(),
+                    connections: 2,
+                    revision: String::new(),
+                },
+            })
+            .unwrap();
+    };
+    let outbound = |installation: &str| {
+        catalog
+            .credentials()
+            .get(installation, CredentialSide::Outbound)
+            .is_some()
+    };
+    upsert("ws://e:1", "x", "c1");
+    upsert("ws://f:2", "x", "c1");
+    catalog
+        .enroll_paired("x", CredentialSide::Outbound, [5; 32])
+        .unwrap();
+    catalog
+        .enroll("x", CredentialSide::Inbound, [6; 32])
+        .unwrap();
+    // The same installation again (a new code): nothing changes.
+    upsert("ws://e:1", "x", "c2");
+    assert!(outbound("x"));
+    // One endpoint taken over: another record still names `x`.
+    upsert("ws://e:1", "y", "c3");
+    assert!(outbound("x"));
+    // The last one: `x` is no longer paired, its outbound credential goes.
+    upsert("ws://f:2", "z", "c4");
+    assert!(!outbound("x"));
+    assert_eq!(
+        catalog.credentials().active("x", CredentialSide::Inbound),
+        Some([6; 32])
+    );
+    let peers = catalog.snapshot().peers.clone();
+    assert!(
+        peers.iter().all(|peer| peer.installation != "x"),
+        "{peers:?}"
+    );
+}
+
+/// The same through `pair`: B stops, another daemon C listens at B's
+/// endpoint, and A pairs that endpoint with C's code. A's outbound
+/// credential for B goes with B's record (fix round 2); C's is enrolled.
+#[test]
+fn a_repaired_endpoint_of_another_installation_forgets_the_old_credential() {
+    let (a, mut b) = paired();
+    let (old, endpoint) = (b.installation(), b.endpoint());
+    assert!(a.credential(&old, CredentialSide::Outbound).is_some());
+    b.stop();
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network {
+            listen: endpoint.strip_prefix("ws://").map(str::to_owned),
+            connections: 2,
+            sync_interval_ms: 200,
+        },
+    };
+    let c = Daemon::on(root, config);
+    assert_eq!(c.endpoint(), endpoint);
+    assert_ne!(c.installation(), old);
+    let code = c.code();
+    a.ctx
+        .network()
+        .unwrap()
+        .pair(&endpoint, &code, Some(2))
+        .unwrap();
+    wait_enrolled(&a, &c);
+    assert!(
+        a.catalog
+            .credentials()
+            .get(&old, CredentialSide::Outbound)
+            .is_none(),
+        "{:?}",
+        a.catalog.credentials()
+    );
+    let peers = a.ctx.catalog.snapshot().peers.clone();
+    assert_eq!(peers.len(), 1, "{peers:?}");
+    assert_eq!(peers[0].installation, c.installation());
+}
+
+/// An atomic write never fails on a temporary left behind by an earlier
+/// process with the same pid (killed between creating its temporary and the
+/// rename, then its pid reused by a process running the same write
+/// sequence): temporaries are created with `create_new`, so their names
+/// carry a random part (fix round 2). The leftovers are not touched.
+#[test]
+fn a_leftover_temporary_never_blocks_an_atomic_write() {
+    use tkfs::worker::record;
+    let dir = tempfile::tempdir().unwrap();
+    let pid = std::process::id();
+    let names = ["runtime.token", "runtime.json"];
+    // The names a per-process counter would give (pid, 0, 1, …).
+    for name in names {
+        for counter in 0..1024 {
+            fs::write(
+                dir.path().join(format!("{name}.{pid}.{counter}.tmp")),
+                b"stale",
+            )
+            .unwrap();
+        }
+    }
+    record::write_private(&dir.path().join("runtime.token"), b"secret").unwrap();
+    record::replace_file(&dir.path().join("runtime.json"), b"{}").unwrap();
+    assert_eq!(
+        record::read_token(&dir.path().join("runtime.token")).as_deref(),
+        Some("secret")
+    );
+    assert_eq!(fs::read(dir.path().join("runtime.json")).unwrap(), b"{}");
+    #[cfg(unix)]
+    assert_owner_only(&dir.path().join("runtime.token"));
+    // Only the targets were added; no temporary of these writes is left.
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        2 * 1024 + names.len()
+    );
 }
 
 /// §14 WP4.1 task 2 and acceptance: an unpair sends `peer.revoke` first; the
