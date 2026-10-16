@@ -149,7 +149,9 @@ struct CatchUp {
 /// activator's slices under a mutex (the worker's engine lock) until the
 /// page is activated. The engine connection is tuned as the activator tunes
 /// it while a backlog drains (`wal_autocheckpoint` 16,384 pages, a 32 MiB
-/// page cache, `temp_store=MEMORY`) and the WAL is checkpointed off-lock after each seal and
+/// page cache) and, on Windows, keeps commit sub-journals in memory as the
+/// worker's engine store does (`Store::set_temp_store_memory`, which the
+/// worker's open with deferred activation applies there) and the WAL is checkpointed off-lock after each seal and
 /// every 16 committing slices (`maintenance::checkpoint_db`), as the
 /// activator does (§4.4, WP2.3): otherwise SQLite's own checkpoint runs
 /// inside a commit, under the lock, whatever seals cost.
@@ -160,7 +162,9 @@ fn catch_up(dir: &Path, repo: &str, n: usize, inline: bool) -> CatchUp {
         .db
         .execute_batch("PRAGMA wal_autocheckpoint=16384; PRAGMA cache_size=-32768;")
         .unwrap();
-    store.set_temp_store_memory(true).unwrap();
+    if cfg!(windows) {
+        store.set_temp_store_memory(true).unwrap();
+    }
     let stager = Store::open_secondary(dir, repo, "device-b").unwrap();
     let engine = Arc::new(Mutex::new(store));
     let allowed: BTreeSet<String> = [SOURCE.to_string()].into();

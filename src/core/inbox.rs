@@ -392,6 +392,25 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
 /// retries every `retry` row and re-derives waits; NULL rows are classified;
 /// with `defer=false` every ready row is activated (progress per slice).
 pub(super) fn startup_drain(store: &mut Store, defer_activation: bool) -> Result<()> {
+    // On Windows, the worker's engine connection (the only store opened with
+    // deferred activation, for its background activator) keeps a commit
+    // savepoint's sub-journal in memory from here on (WP4.4). SQLite moves it
+    // to a newly created temp file past 64 KiB, and creating that file on
+    // Windows stalled single statements for 30-60 ms under the engine lock
+    // (measured on the 150K catch-up; `worker_concurrency`'s timing tests
+    // failed 2 of 12 runs without this, 0 of 12 with it). A commit's
+    // sub-journal is the pages it touches (a few MB: no slow commit rewrites
+    // a projection above `commit::FOLD_MAX_ENTRIES` entries); the open's
+    // earlier phases, whose rebuilds may rewrite hundreds of MB in one
+    // statement, keep temp files. Elsewhere temp files stay: an in-memory
+    // journal grows in 1 KiB allocations, which cost more than a temp file
+    // where creating one is cheap (Linux: the same tests failed 6 of 24 runs
+    // with it, 2 of 24 without) and when every connection of a process
+    // uses it. No TEMP object exists yet (the first commit creates the
+    // commit-epoch table), so the change resets nothing. Best effort.
+    if defer_activation && cfg!(windows) {
+        let _ = store.set_temp_store_memory(true);
+    }
     crate::startup::progress("recovering incoming events");
     store.with_write("inbox_startup", |store| store.reconcile_rows())?;
     while store.with_write("inbox_classify", |store| {

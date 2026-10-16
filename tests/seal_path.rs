@@ -1761,11 +1761,13 @@ fn a_restart_writes_only_the_rows_that_differ_from_the_snapshot() {
 // ---------------------------------------------------------------------------
 // The engine connection's in-memory sub-journal
 
-/// `Store::set_temp_store_memory`, which the activator uses on the engine
-/// connection: the setting changes, the view survives the change in both
-/// directions (no reload at the next commit, although the pragma drops the
-/// connection's TEMP commit-epoch table), and a commit rolled back around
-/// the store before the change is still detected after it.
+/// `Store::set_temp_store_memory` (on Windows the worker's engine store,
+/// opened with deferred activation, starts at `MEMORY`; other stores and
+/// other platforms at the default):
+/// the setting changes both ways, the view survives each change (no reload
+/// at the next commit, although the pragma drops the connection's TEMP
+/// commit-epoch table once a commit created it), and a commit rolled back
+/// around the store before a change is still detected after it.
 #[test]
 fn the_engine_connection_keeps_its_view_across_temp_store_changes() {
     let dir = tempfile::tempdir().unwrap();
@@ -1774,6 +1776,14 @@ fn the_engine_connection_keeps_its_view_across_temp_store_changes() {
         s.db.query_row("PRAGMA temp_store", [], |r| r.get(0))
             .unwrap()
     };
+    assert_eq!(temp_store(&s), 0, "a store keeps SQLite's temp files");
+    let engine = tempfile::tempdir().unwrap();
+    drop(open(engine.path()));
+    assert_eq!(
+        temp_store(&open_deferred(engine.path())),
+        if cfg!(windows) { 2 } else { 0 },
+        "on Windows the worker's engine store (deferred activation) keeps sub-journals in memory"
+    );
     for i in 0..5 {
         s.create(&format!("f{i}"), "file").unwrap();
     }
