@@ -30,7 +30,9 @@
 //!    report a failure in Ready (never fatal; a stop accepted since step 6
 //!    skips it); `--supervised`: the orchestrator attaches later through
 //!    `mount-attach`;
-//! 9. print the `ReadyLine` (with the token: the supervisor's credential);
+//! 9. print the `ReadyLine` (with the token: the supervisor's credential;
+//!    `worker.json` is owner-only, and so is `worker.log`, where a launcher
+//!    copies the line, before it is printed);
 //! 10. install the Linux signal handlers; start the activator, maintenance
 //!     and notifier threads (WP2.3; a thread that cannot start is logged,
 //!     never fatal after Ready);
@@ -377,6 +379,9 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     }
     let mount: MountStatus = ctx.mount.status();
     heartbeat::beat(&ctx, &vitals);
+    // The Ready line carries the token, and a supervising launcher copies it
+    // into `worker.log`: owner-only before it is printed (WP4.1).
+    restrict_worker_log(&state);
     drop(reporting);
     // The supervised idle clock starts at Ready: a supervisor contacts the
     // worker only after reading it, however long startup took.
@@ -558,6 +563,41 @@ impl Running {
         remove_own_token(&self.state, self.server.token());
         Ok(())
     }
+}
+
+/// `STATE/worker.log`, where the orchestrator's launcher appends this
+/// worker's stdout and stderr (`orchestrator::folder`, `process.rs`).
+const WORKER_LOG: &str = "worker.log";
+
+/// Makes `STATE/worker.log` owner-only (Unix 0600) when it is a regular file
+/// that others can read (WP4.1): the launcher copies the Ready line, which
+/// carries the instance token for the supervisor, into it verbatim, and
+/// creates the file with the default mode (CCR-WP4.1-4 asks it to create it
+/// owner-only and to redact the token). Best effort: a failure is logged.
+/// Windows: the file inherits the state directory's ACL (the user's
+/// profile), like the token files.
+fn restrict_worker_log(state: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let log = state.join(WORKER_LOG);
+        // Not followed: a link is left alone.
+        let Ok(metadata) = fs::symlink_metadata(&log) else {
+            return;
+        };
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        if let Err(error) = fs::set_permissions(&log, fs::Permissions::from_mode(0o600)) {
+            crate::util::log::event!(warn, WORKER_START, {
+                "detail": "worker.log could not be made owner-only",
+                "path": log,
+                "message": error.to_string(),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (state, WORKER_LOG);
 }
 
 /// Removes `STATE/runtime.token` if it is still this instance's (with
