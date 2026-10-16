@@ -795,6 +795,173 @@ fn null_standard_streams_are_captured_into_the_log() {
     assert!(events.iter().any(|e| e["detail"] == "null mode event"));
 }
 
+/// The C runtime of the test process (descriptors, not Rust's streams).
+#[cfg(windows)]
+mod crt {
+    use std::ffi::c_void;
+
+    unsafe extern "C" {
+        fn _write(fd: i32, buffer: *const c_void, count: u32) -> i32;
+        fn _get_osfhandle(fd: i32) -> isize;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetHandleInformation(handle: isize, flags: *mut u32) -> i32;
+    }
+
+    /// `_write(fd, text)`, as C code's `printf` ends; whether all of it was
+    /// written.
+    pub fn write(fd: i32, text: &str) -> bool {
+        // SAFETY: `text` is readable for its length; descriptors 1 and 2 are
+        // always open in the runtime.
+        unsafe { _write(fd, text.as_ptr().cast(), text.len() as u32) == text.len() as i32 }
+    }
+
+    /// Whether the handle descriptor `fd` holds is inheritable.
+    pub fn inheritable(fd: i32) -> Option<bool> {
+        // SAFETY: lookups on an open descriptor and its handle.
+        unsafe {
+            let handle = _get_osfhandle(fd);
+            let mut flags = 0u32;
+            (handle != -1 && handle != -2 && GetHandleInformation(handle, &mut flags) != 0)
+                .then_some(flags & 1 != 0)
+        }
+    }
+}
+
+/// The events of a log that may also hold raw lines.
+#[cfg(windows)]
+fn events_in(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(Value::is_object)
+        .collect()
+}
+
+/// C code's writes (the C runtime's descriptors 1 and 2, which keep the
+/// handles of startup and never see `SetStdHandle`) follow the captured
+/// streams into the log once the capture settles. Before WP4.2 fix round 2
+/// they kept the replaced log-file handle, which the capture closed 2 s
+/// later: C output then failed, or went into whichever file reused the handle
+/// value. The descriptors' new handles are not inheritable.
+#[cfg(windows)]
+#[test]
+fn c_runtime_writes_follow_the_captured_streams() {
+    const TEST: &str = "c_runtime_writes_follow_the_captured_streams";
+    if child_mode().as_deref() == Some("crt") {
+        crt_child();
+        return;
+    }
+    if child_mode().is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("logs").join("crt.log");
+    fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    // As the desktop's Spawner: the log file, appended, for both streams.
+    let out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let err = out.try_clone().unwrap();
+    let status = child(TEST, "crt")
+        .env(CHILD_LOG_ENV, &log_path)
+        .stdout(out)
+        .stderr(err)
+        .status()
+        .unwrap();
+    let text = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(status.success(), "{status}\n{text}");
+    let events = events_in(&log_path);
+    for (code, line) in [
+        ("stdout", "C stdout after the switch"),
+        ("stderr", "C stderr after the switch"),
+        ("stdout", "Rust stdout after the switch"),
+        ("stderr", "Rust stderr after the switch"),
+    ] {
+        assert!(
+            events
+                .iter()
+                .any(|e| e["code"] == code && e["text"] == line),
+            "{code}: {line:?} is not a captured event\n{text}"
+        );
+    }
+    let victims = dir.path().join("victims");
+    let mut opened = 0;
+    for victim in fs::read_dir(&victims).unwrap() {
+        let victim = victim.unwrap().path();
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "",
+            "{} received C output",
+            victim.display()
+        );
+        opened += 1;
+    }
+    assert_eq!(opened, 64);
+}
+
+#[cfg(windows)]
+fn crt_child() {
+    let path = PathBuf::from(std::env::var(CHILD_LOG_ENV).unwrap());
+    let installed = log::install_file(
+        &path,
+        Rotation {
+            max_bytes: 1 << 20,
+            files: 2,
+        },
+    )
+    .unwrap();
+    assert!(installed.captured_stdout && installed.captured_stderr);
+    let captured = |code: &str, prefix: &str| {
+        events_in(&path)
+            .iter()
+            .any(|e| e["code"] == code && e["text"].as_str().is_some_and(|t| t.starts_with(prefix)))
+    };
+    // Until a stream settles, C writes still reach the log file raw (through
+    // the inherited handle); then they arrive as captured events.
+    let mut probe = 0;
+    let settled = wait_until(Duration::from_secs(60), || {
+        probe += 1;
+        crt::write(1, &format!("C stdout probe {probe}\n"));
+        crt::write(2, &format!("C stderr probe {probe}\n"));
+        captured("stdout", "C stdout probe ") && captured("stderr", "C stderr probe ")
+    });
+    assert!(settled, "C writes never reached the capture");
+    // Files opened from now on may get the value of a released handle.
+    let victims = path.parent().unwrap().parent().unwrap().join("victims");
+    fs::create_dir_all(&victims).unwrap();
+    let _open: Vec<fs::File> = (0..64)
+        .map(|i| fs::File::create(victims.join(format!("victim{i:02}"))).unwrap())
+        .collect();
+    assert!(crt::write(1, "C stdout after the switch\n"));
+    assert!(crt::write(2, "C stderr after the switch\n"));
+    println!("Rust stdout after the switch");
+    eprintln!("Rust stderr after the switch");
+    assert_eq!(crt::inheritable(1), Some(false));
+    assert_eq!(crt::inheritable(2), Some(false));
+    let drained = wait_until(Duration::from_secs(20), || {
+        let events = events_in(&path);
+        [
+            ("stdout", "C stdout after the switch"),
+            ("stderr", "C stderr after the switch"),
+            ("stdout", "Rust stdout after the switch"),
+            ("stderr", "Rust stderr after the switch"),
+        ]
+        .iter()
+        .all(|(code, line)| {
+            events
+                .iter()
+                .any(|e| e["code"] == *code && e["text"] == *line)
+        })
+    });
+    assert!(drained, "the capture threads drained");
+}
+
 // ===========================================================================
 // worker.log at spawn
 
@@ -875,9 +1042,11 @@ fn worker_log_rotates_at_spawn_and_never_keeps_the_ready_token() {
 // Daemons
 
 /// The secrets a daemon's data directory holds: pairing codes and verifier
-/// hashes in `folders.sqlite`, any table or setting named like a secret,
-/// token or credential (WP4.1's per-peer credentials), `*.token` files and
-/// sensitive fields of `worker.json` / `runtime.json`.
+/// hashes in `folders.sqlite`, any setting named like a secret, token or
+/// credential, the sensitive columns (named like a secret, [`log::is_sensitive_key`])
+/// of any table named like one (WP4.1's `peer_credentials.secret_hash`, not
+/// its public `installation` and `side`), `*.token` files and sensitive
+/// fields of `worker.json` / `runtime.json`.
 fn secrets_of(data: &Path) -> Vec<String> {
     let mut secrets = vec![];
     let catalog = data.join("folders.sqlite");
@@ -933,10 +1102,21 @@ fn secrets_of(data: &Path) -> Vec<String> {
                 continue;
             }
             let mut rows = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
-            let columns = rows.column_count();
+            // Only the columns named like a secret hold one (WP4.1's
+            // `peer_credentials.secret_hash`); the others are public and
+            // appear legitimately in the status, the bundle and the logs
+            // (`installation`, `side` = "outbound", times).
+            let sensitive: Vec<usize> = (0..rows.column_count())
+                .filter(|&i| log::is_sensitive_key(rows.column_name(i).unwrap()))
+                .collect();
+            assert!(
+                !sensitive.is_empty(),
+                "table {table} is named like a secret but none of its columns is: \
+                 teach secrets_of which column holds the secret"
+            );
             let mut query = rows.query([]).unwrap();
             while let Some(row) = query.next().unwrap() {
-                for i in 0..columns {
+                for &i in &sensitive {
                     match row.get_ref(i).unwrap() {
                         rusqlite::types::ValueRef::Text(t) => {
                             secrets.push(String::from_utf8_lossy(t).into_owned())
@@ -977,6 +1157,65 @@ fn secrets_of(data: &Path) -> Vec<String> {
     secrets.sort();
     secrets.dedup();
     secrets
+}
+
+/// The grep's secret list on a catalog shaped like WP4.1's (its
+/// `peer_credentials` schema, verbatim): every pairing code, the verifier's
+/// hash and every `secret_hash` are secrets; the installation ids, the
+/// `side` values and the salt are not (they are public: the status, the
+/// redacted catalog and `versions.json` carry the installation ids, and
+/// `"outbound"` is a status direction).
+#[test]
+fn secrets_of_takes_only_the_secret_columns_of_a_credential_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let ours = "11111111-2222-4333-8444-555555555555";
+    let peer = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+    let code = "c0de".repeat(16);
+    let hash = "4a54".repeat(16);
+    let salt = "5a17".repeat(16);
+    let outbound = "0b0b".repeat(16);
+    let inbound = "1b1b".repeat(16);
+    let db = rusqlite::Connection::open(dir.path().join("folders.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+         CREATE TABLE peers(endpoint TEXT PRIMARY KEY,code TEXT NOT NULL,installation TEXT NOT NULL,connections INTEGER NOT NULL,revision TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS peer_credentials(installation TEXT NOT NULL,side TEXT NOT NULL,secret_hash TEXT NOT NULL,created_ms INTEGER NOT NULL,revoked_ms INTEGER,PRIMARY KEY(installation,side));",
+    )
+    .unwrap();
+    db.execute("INSERT INTO settings VALUES('installation',?1)", [ours])
+        .unwrap();
+    db.execute(
+        "INSERT INTO settings VALUES('pairing',?1)",
+        [json!({"salt": salt, "hash": hash}).to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO peers VALUES('127.0.0.1:1',?1,?2,2,'r1')",
+        rusqlite::params![code, peer],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO peer_credentials VALUES(?1,'outbound',?2,1,NULL)",
+        rusqlite::params![peer, outbound],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO peer_credentials VALUES(?1,'inbound',?2,2,3)",
+        rusqlite::params![peer, inbound],
+    )
+    .unwrap();
+    drop(db);
+    let secrets = secrets_of(dir.path());
+    for secret in [&code, &hash, &outbound, &inbound] {
+        assert!(secrets.contains(secret), "{secret} missing: {secrets:?}");
+    }
+    for public in [ours, peer, "outbound", "inbound", &salt, "r1"] {
+        assert!(
+            !secrets.iter().any(|s| s == public),
+            "{public} is not a secret: {secrets:?}"
+        );
+    }
+    assert_eq!(secrets.len(), 4, "{secrets:?}");
 }
 
 /// Every log a node wrote: its daemon output (`daemon.log`), `DATA/logs`,

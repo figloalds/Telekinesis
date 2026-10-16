@@ -67,7 +67,10 @@
 //!   rotation instead of landing in a renamed (and later deleted) file, and
 //!   nothing is discarded. A panic message is written straight to the file by
 //!   a panic hook, so it is not lost if the process ends before the capture
-//!   thread runs;
+//!   thread runs. On Windows the C runtime's descriptors 1 and 2 (`printf`;
+//!   they keep the handles of startup) follow into the pipe 2 s later, and
+//!   only then is a replaced log-file handle closed, so no descriptor ever
+//!   writes through a closed (and possibly reused) handle value;
 //! * events are also written to stderr when it is a terminal, a pipe or
 //!   another file (a console run, the test harness's `daemon.log`).
 //!
@@ -1026,9 +1029,9 @@ fn capture(stream: Stream, kind: StreamKind, file: &Arc<Mutex<RotatingFile>>) ->
         stdio::restore(stream, previous);
         return Err(error);
     }
-    if kind == StreamKind::LogFile {
-        stdio::release_later(previous);
-    }
+    // The C runtime's descriptor follows the stream into the pipe, and a
+    // replaced handle to the log file is released (Windows; see `stdio`).
+    stdio::settle_later(stream, previous, kind == StreamKind::LogFile);
     Ok(())
 }
 
@@ -1185,9 +1188,18 @@ mod stdio {
     const FILE_TYPE_DISK: u32 = 1;
     const FILE_TYPE_CHAR: u32 = 2;
     const PIPE_BYTES: u32 = 64 * 1024;
-    /// A redirected log-file handle is closed this long after the switch, so
-    /// a write that read the old handle just before it can finish.
-    const RELEASE_AFTER: Duration = Duration::from_secs(2);
+    /// A switch is settled ([`settle_later`]) this long after it, so a caller
+    /// that read the previous handle just before it (a child spawn inheriting
+    /// the stream) is done with it.
+    const SETTLE_AFTER: Duration = Duration::from_secs(2);
+    const DUPLICATE_SAME_ACCESS: u32 = 2;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    /// `_O_TEXT`: the mode the C runtime gives its standard descriptors.
+    const O_TEXT: i32 = 0x4000;
+
+    /// The C runtime's invalid-parameter handler (`_invalid_parameter_handler`).
+    type InvalidParameterHandler =
+        Option<unsafe extern "C" fn(*const u16, *const u16, *const u16, u32, usize)>;
 
     #[repr(C)]
     #[derive(Default)]
@@ -1217,12 +1229,60 @@ mod stdio {
             size: u32,
         ) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn DuplicateHandle(
+            source_process: Handle,
+            source: Handle,
+            target_process: Handle,
+            target: *mut Handle,
+            access: u32,
+            inherit: i32,
+            options: u32,
+        ) -> i32;
+        fn SetHandleInformation(handle: Handle, mask: u32, flags: u32) -> i32;
+    }
+
+    // The C runtime's low-level I/O (the UCRT every C object and Rust's
+    // standard library link): `printf` and every C write end at its
+    // descriptors 1 and 2, which hold the standard handles of startup and
+    // never see `SetStdHandle`.
+    unsafe extern "C" {
+        fn _get_osfhandle(fd: i32) -> isize;
+        fn _open_osfhandle(handle: isize, flags: i32) -> i32;
+        fn _dup2(from: i32, to: i32) -> i32;
+        fn _close(fd: i32) -> i32;
+        fn _set_thread_local_invalid_parameter_handler(
+            handler: InvalidParameterHandler,
+        ) -> InvalidParameterHandler;
     }
 
     fn id(stream: Stream) -> u32 {
         match stream {
             Stream::Stdout => STD_OUTPUT_HANDLE,
             Stream::Stderr => STD_ERROR_HANDLE,
+        }
+    }
+
+    /// The C runtime's descriptor of `stream`.
+    fn descriptor(stream: Stream) -> i32 {
+        match stream {
+            Stream::Stdout => 1,
+            Stream::Stderr => 2,
+        }
+    }
+
+    /// Holds Rust's lock on `stream`: `print!`/`eprint!` writers wait
+    /// meanwhile, so none writes through a handle it read before a switch,
+    /// or meets the moment `_dup2` leaves the standard handle unset.
+    fn writers(
+        stream: Stream,
+    ) -> (
+        Option<io::StdoutLock<'static>>,
+        Option<io::StderrLock<'static>>,
+    ) {
+        match stream {
+            Stream::Stdout => (Some(io::stdout().lock()), None),
+            Stream::Stderr => (None, Some(io::stderr().lock())),
         }
     }
 
@@ -1309,6 +1369,11 @@ mod stdio {
         }
         let _ = io::stdout().flush();
         let _ = io::stderr().flush();
+        let _writers = writers(stream);
+        if stream == Stream::Stdout {
+            // Anything buffered since, under the lock (stderr is unbuffered).
+            let _ = io::stdout().flush();
+        }
         let previous = std_handle(stream).map_or(0, |handle| handle as usize);
         // SAFETY: `write` is a valid handle this process owns from now on
         // (as the standard handle); `read` is owned by the returned File.
@@ -1331,28 +1396,126 @@ mod stdio {
         }
     }
 
-    /// Closes a replaced handle to the log file after [`RELEASE_AFTER`], so
-    /// the renamed file is not held open forever.
-    pub(super) fn release_later(previous: usize) {
-        // Both streams may share one handle: it is closed once.
-        static RELEASED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-        {
-            let mut released = crate::util::lock::lock(&RELEASED);
-            if previous == 0 || released.contains(&previous) {
-                return;
-            }
-            released.push(previous);
-        }
+    /// Settles the switch of `stream` to its pipe after [`SETTLE_AFTER`]
+    /// ([`settle`]): the C runtime's descriptor follows the stream, and the
+    /// replaced handle `previous` is released when `release` (it was the log
+    /// file, which must not stay open once a rotation renames it). Without
+    /// the thread nothing changes: the descriptor keeps `previous`, which
+    /// then stays open (to the old file) until exit.
+    pub(super) fn settle_later(stream: Stream, previous: usize, release: bool) {
         let _ = std::thread::Builder::new()
-            .name("log-release".into())
+            .name("log-settle".into())
             .spawn(move || {
-                std::thread::sleep(RELEASE_AFTER);
-                // SAFETY: the handle is no longer a standard handle; it was
-                // inherited for this process's own use and nothing else owns it.
-                unsafe {
-                    CloseHandle(previous as Handle);
-                }
+                std::thread::sleep(SETTLE_AFTER);
+                settle(stream, previous, release);
             });
+    }
+
+    /// Points the C runtime's descriptor of `stream` (1 or 2) at a duplicate
+    /// of the pipe that is now the stream's standard handle, so C code's
+    /// output is captured like Rust's, then closes `previous` (when
+    /// `release`) unless something still holds it. `_dup2` closes the handle
+    /// the descriptor held (the runtime's copy of the inherited one), or
+    /// leaves it to the other descriptor while that one still holds the same
+    /// handle; such a handle is never closed here, so it is closed exactly
+    /// once, and never while a descriptor or a standard handle refers to it
+    /// (a value Windows could reuse for an unrelated file). Streams settle
+    /// one at a time.
+    fn settle(stream: Stream, previous: usize, release: bool) {
+        static SETTLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _settling = crate::util::lock::lock(&SETTLING);
+        // SAFETY: `ignore` returns; the runtime then reports a bad descriptor
+        // to this thread with -1 instead of ending the process.
+        unsafe {
+            _set_thread_local_invalid_parameter_handler(Some(ignore));
+        }
+        let _writers = writers(stream);
+        let Some(pipe) = std_handle(stream) else {
+            return;
+        };
+        let held = crt_handle(descriptor(stream));
+        crt_point(descriptor(stream), pipe);
+        // In a console process `_dup2` also makes its duplicate the standard
+        // handle: the pipe handle stays the standard handle.
+        if std_handle(stream) != Some(pipe) {
+            // SAFETY: `pipe` is this process's open pipe handle.
+            unsafe {
+                SetStdHandle(id(stream), pipe);
+            }
+        }
+        if !release || previous == 0 || held == Some(previous) || in_use(previous) {
+            return;
+        }
+        // SAFETY: neither standard handle nor either C descriptor refers to
+        // `previous` any more, and the runtime did not own it: it was
+        // inherited for this process's standard streams only.
+        unsafe {
+            CloseHandle(previous as Handle);
+        }
+    }
+
+    /// An invalid-parameter handler that returns.
+    unsafe extern "C" fn ignore(_: *const u16, _: *const u16, _: *const u16, _: u32, _: usize) {}
+
+    /// The handle C descriptor `fd` holds, if it is open on one.
+    fn crt_handle(fd: i32) -> Option<usize> {
+        // SAFETY: a lookup; a closed descriptor reports -1 (the caller's
+        // invalid-parameter handler returns).
+        let handle = unsafe { _get_osfhandle(fd) };
+        // -2: the runtime's "no console" placeholder.
+        (handle != -1 && handle != -2 && handle != 0).then_some(handle as usize)
+    }
+
+    /// Whether a standard handle or a C descriptor still refers to `handle`.
+    fn in_use(handle: usize) -> bool {
+        [Stream::Stdout, Stream::Stderr].into_iter().any(|stream| {
+            std_handle(stream).map(|h| h as usize) == Some(handle)
+                || crt_handle(descriptor(stream)) == Some(handle)
+        })
+    }
+
+    /// Points C descriptor `fd` at a non-inheritable duplicate of `handle`
+    /// (`_dup2` duplicates as inheritable).
+    fn crt_point(fd: i32, handle: Handle) -> bool {
+        let mut copy: Handle = std::ptr::null_mut();
+        // SAFETY: duplicates a handle of this process within it.
+        let duplicated = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                GetCurrentProcess(),
+                &mut copy,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } != 0;
+        if !duplicated {
+            return false;
+        }
+        // SAFETY: the runtime owns `copy` from here on (as `temporary`).
+        let temporary = unsafe { _open_osfhandle(copy as isize, O_TEXT) };
+        if temporary < 0 {
+            // SAFETY: `copy` is still ours.
+            unsafe {
+                CloseHandle(copy);
+            }
+            return false;
+        }
+        // SAFETY: both descriptors are the runtime's; `temporary` is closed
+        // once `fd` holds its own duplicate.
+        let pointed = unsafe { _dup2(temporary, fd) } == 0;
+        // SAFETY: `temporary` is open and nothing else uses it.
+        unsafe {
+            _close(temporary);
+        }
+        if pointed && let Some(now) = crt_handle(fd) {
+            // SAFETY: `now` is the handle descriptor `fd` holds.
+            unsafe {
+                SetHandleInformation(now as Handle, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+        pointed
     }
 }
 
@@ -1438,7 +1601,9 @@ mod stdio {
         // to the pipe without a reader fails instead of blocking.
     }
 
-    pub(super) fn release_later(_previous: usize) {}
+    /// Nothing to settle: `dup2` replaced descriptor 1 or 2 itself, which C
+    /// code writes to as well, and closed the previous file with it.
+    pub(super) fn settle_later(_stream: Stream, _previous: usize, _release: bool) {}
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -1456,7 +1621,7 @@ mod stdio {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
     pub(super) fn restore(_stream: Stream, _previous: usize) {}
-    pub(super) fn release_later(_previous: usize) {}
+    pub(super) fn settle_later(_stream: Stream, _previous: usize, _release: bool) {}
 }
 
 // ---------------------------------------------------------------------------
