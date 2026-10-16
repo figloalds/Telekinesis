@@ -535,3 +535,198 @@ Merge commits are `--no-ff` (the packages' own commits are their second parents)
 | `9d78acf` | qualification evidence, third merged re-run of qual_wp3_2_objects (97 MiB/s and 296 objects/s with the disk at 327 fsynced creates/s) |
 | `2539ad9` | qualification evidence - summary ok (41 of 41 floors; qual_wp3_2_objects re-run with the disk at 333 fsynced creates/s) |
 | (this commit) | notes: final |
+
+## Post-integration re-review
+
+Four reviews of the integrated tree (WP3.3's files, objects integrity, the
+v3 network end to end, status and GUI) returned `changes_required`: 9 major
+and 19 minor findings. Every major and every minor is fixed here, each with
+a regression test that fails on the code before its fix (checked by running
+the new tests with the fixed source files stashed; the exceptions are said
+below). The release qualification of the fixes found three more defects,
+fixed the same way (*Found by the qualification of these fixes*). No frozen
+contract changed: `src/model/**` and `src/util/**` are untouched, so no CCR
+is filed; files of earlier packages were changed under
+§13 rule 5 (the integrator fixes defects found in them). The plan records
+the rules that changed (§6.2 peer ops, §3.7 exchange, §6.4 authorization
+and wire rules, §7.1 rule 8).
+
+### Fixes
+
+**Objects v3, orchestrator (WP3.3 review; `objects.rs`,
+`inbound_objects.rs`)**
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| major: a peer could make the acceptor record an `ObjectError` and a backoff for any hash it pushed (and the dialer for any hash an acceptor's `objects.wants` named); the backoff table grew for an hour with an O(n) scan per insert | The acceptor records a failure (and settles the handoff table) only for objects of its current offer to that dialer; a push's other items are answered in the result alone. The dialer records neither an `ObjectError` nor a backoff for wants items its worker refuses to read (`NotPermitted`, `NotAvailable`): the acceptor backs off what it offered and was not sent. `Unsolicited` is no failure anywhere (also the objects review's minor). The table holds at most 16K (object, source) entries: past it, one prune drops the expired entries, then the earliest-expiring ones down to 12K | `objects_v3_lanes::a_push_of_objects_never_offered_records_no_errors` (256 never-wanted hashes in 4 pushes: 0 `ObjectError`s; 256 before), `::wants_for_objects_we_cannot_serve_record_no_errors`, lib `orchestrator::objects::tests::the_object_backoff_table_is_bounded` (new API; the old table had no bound) |
+| major: a stalled push held the lane's peer slots with two repositories pushing, so pulls and reports waited up to the peer's 60 s write deadline | A push gate: pushes (with their `objects.wants`) hold at most `PEER_CALLS − 1` slots. A pipelined pull now waits its turn for a slot (at most 1 s per try) instead of `try_acquire`, which an upload round's `wants` always won | `::stalled_pushes_of_two_repositories_leave_a_slot_to_pulls` (the two-repository variant the review asked for) |
+| minor: an object settled in a round's sink stayed in the round's plan, so the rest of it was pulled and dropped | `Settled` removes it from the plan; a pull whose objects all settled is cancelled | `::a_settled_object_is_not_pulled_again_in_its_round` (48 MiB object: the source read ≤ 72 MiB; 95 MiB before) |
+
+**Objects integrity (objects review)**
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| major: an object whose size nothing records (an event without `object_sizes`) never moved: the want's size 0 met the sender's real total (`SIZE_MISMATCH`, 30 s → 1 h backoff, forever) | A want item of size 0 whose hash is not the SHA-256 of no bytes has an unknown size (`objects::size_unknown`). It is sent like a zero-size object: the acceptor's one empty chunk carries its real total (result `Skipped`), and the dialer re-plans the object with that size (`Sink::resize`). A push reads the size from our worker (a zero-length read) first. The receiving worker already accepts any total when it knows none | `objects_v3_lanes::objects_of_unknown_size_travel_both_ways`; the worker contract the probe relies on: `objects_v3_worker::objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete` and `::staged_objects_without_a_size_descriptor_complete` (both pass before the fix too: the worker side was right; the review asked for them) |
+| minor: the read path's `SERVED` cache outranked a later `CORRUPT` verdict of the index | `SERVED` counts only while the availability row is absent or `available`; `note_corrupt`, `note_missing` and `quarantine` forget the entry | `objects_v3_worker::a_corrupt_verdict_outranks_an_earlier_serve` (the corrupt bytes were served) |
+| minor: a lane-count change stalled every object in flight for about two minutes and backed off a healthy source | The worker treats a lease held by an id of the same kind and peer with another lane count (`pull:<peer>:<i>/<n>:…`, `push:<peer>:<i>/<n>`), idle for a quarter of a TTL, as superseded: the new lane set takes it over without a stall backoff. An old lane still moving the object keeps it | `objects_v3_worker::a_new_lane_count_takes_over_the_old_lanes_leases` |
+| minor: the spool of an object no longer wanted (its staged event quarantined) stayed forever and counted as a download | `reconcile_spools` drops spools of objects no committed or validly staged event references; the content counters count only spools of wanted objects; `Unsolicited` settles without an error (above) | `objects_v3_worker::a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open`, `objects_v3_lanes::an_object_no_longer_wanted_settles_without_an_error` |
+| minor: the dialer accepted any number of empty chunks of a non-empty object, each resetting the pull's idle deadline | `admit`'s rule in the pull callback: an empty chunk only as the one chunk of an empty span; otherwise `PROTOCOL_VIOLATION` | `objects_v3_lanes::empty_chunks_cannot_hold_a_pull` (the pull ended `PROTOCOL_VIOLATION` in < 2 s; it completed after 6 s before) |
+| minor: the backoff table was unbounded | see the first WP3.3 row | |
+
+**v3 network (network review)**
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| major: one repository whose source stalled (a first-serve verify, a slow disk) held the lane's whole 16 MiB window and stopped every other repository's downloads | A pull reserves at most its key's fair share of the window (`window / REPOS_PER_LANE`, 8 MiB). Within its share a key pipelines freely; a second pull that would take it past its share waits until the pull in flight received half its budget ("re-pull at half"), so a key whose source stalls holds at most its share, and one key still uses the whole window with two pulls once data flows. (A first version gated every second pull on half its budget: the release qualification caught it, `tiny_files_10k` at 70–77 files/s, as pulls of tiny objects then ran one after another and the writer's batches shrank; with the gate only past the share, 294 files/s, `76a8332`) | `objects_v3_lanes::a_stalled_source_leaves_the_window_to_other_repositories` (repository 1's three 256 KiB objects in < 5 s while repository 0's source stalls every read; they waited for the stall before) |
+| major: `meta.exchange` had an absolute 30 s deadline, so a large event's reply on a slow link timed out forever and was re-sent with every retry | `options.exchange` is an idle deadline, restarted by every frame of the reply (a reassembled reply's first frame and continuations now push a progress event to their call, as stream chunks did), within `EXCHANGE_CAP` (30 min); the acceptor's worker deadline is unchanged (25 s) | `meta_scheduler::a_large_reply_on_a_slow_link_completes` (a 6 MiB reply at 2 MiB/s with a 1.5 s deadline completes once; a silent peer still times out at 1.5 s) |
+| major: the fixed 4 MiB `SO_SNDBUF` (CCR-WP3.INT-5) queued 4 MiB ahead of every control frame on a slow uplink | The receive buffer stays 4 MiB on Windows; the send buffer starts at the system's own and follows the rate the socket drains at while saturated (`session::io::SendBuffer`: two round trips of data, at least 100 ms, 64 KiB to 4 MiB, measured each 250 ms). Object bytes go out in CHUNK frames of at most 256 KiB (`objects::wire_pieces`), so a control frame waits behind at most one in the session's own buffer | `objects_v3_lanes::a_saturating_push_does_not_delay_pulls_on_a_slow_uplink` (256 KiB/s: a 64 KiB pull under a saturating push took 8.8 s, of which the proxy's own queue holds about 2 MiB; 18.8 s before), `w3_integration::the_send_buffer_follows_the_drain_rate` (the rule). On Linux, where the kernel autotunes its buffers, the same test took 18.7 s in WSL: a Linux session socket now bounds its unsent bytes at 256 KiB (`TCP_NOTSENT_LOWAT`), and the test passes there too |
+| major: a relay that committed an event before its object arrived answered `NOT_PERMITTED` (Fatal), and the downstream receiver waited out a growing backoff after the relay got the object | `read_object_range` answers `NOT_AVAILABLE` for an object a committed shared event references that is not received here, whether or not a private copy exists (so the answer reveals nothing beyond the shared event); `NOT_PERMITTED` stays for hashes nothing references. A source's per-object backoffs for a repository reset when its published content counters grow | `objects_v3_worker::a_committed_object_not_yet_received_is_not_available`, `objects_v3_lanes::a_source_whose_content_grows_is_asked_again_at_once` (< 10 s; 30 s backoff before) |
+| major: with mutual pairing, after the peer rotated its code our folder read Offline while it still synced through the peer's sessions | The pair's connection is Online while the peer has inbound sessions and our lanes are Unauthorized (the peer's badge stays Unauthorized: it needs a re-pair) | `status_hub::a_peer_that_still_reaches_us_after_a_rotation_is_not_unreachable` |
+| minor: download work disappeared while the peer missed more bytes than we did | A peer may supply what we miss when it misses something else than we do and holds objects; two replicas missing the same objects and bytes still owe each other nothing | `status_hub::download_work_shows_when_each_side_misses_different_objects` |
+| minor: after an inbound-only dialer unpaired, the acceptor's folder read Offline forever | The inbound server records `PeerRemoved` when a session of a peer it does not dial itself closes with `GOAWAY PEER_NOT_PAIRED` (the hub forgets the peer once its last session closed) | `objects_v3_lanes::an_inbound_only_peer_that_unpairs_is_recorded_gone` (also: a session that merely closes, and a peer we dial, are kept); `status_hub::an_inbound_only_peer_that_unpaired_us_is_forgotten` (the hub side, which was right before) |
+| minor: stopping a folder removed its catalog entry, so peers read "Not shared" | The worker's exit keeps the entry published as `unavailable` (peers' pairs read WaitingForRemote); only leaving the catalog removes it | `folder_controller::graceful_stop_persists_desired_before_the_stop_rpc` (assertion changed, below) |
+
+**Found by the qualification of these fixes** (the release qualification
+of the files they touch, and repeated runs of its tiny-files scenario)
+
+| Finding | Fix | Regression test |
+|---|---|---|
+| the first version of the window share gated every second pull of a key on half the first one's budget: tiny objects then moved one pull at a time and the writer's batches shrank (`tiny_files_10k` 69.7 files/s) | within its share a key pipelines freely; only a pull past the share waits (`76a8332`, see the network table) | the qualification scenario itself (release, ignored); `a_stalled_source_leaves_the_window_to_other_repositories` keeps the share |
+| an object the acceptor offered and the dialer did not send (it lacked it: a relay that committed the event before the object arrived) backed off on the failures' schedule, 30 s → 1 h, so the relay delivered it 28 s late (`relay_with_objects`, 27.9 s against 0.25 s) | not serving is no failure: such an object backs off 5 s → 5 min (`objects::object_unserved`); failures keep their schedule (`9733604`) | `objects_v3_lanes::an_object_a_dialer_lacked_is_offered_again_soon` (< 15 s; failed before, the failure backoff is 24–36 s) |
+| about one tiny-files run in four took 130–190 s (53–79 files/s) instead of 31 s. The defect predates the re-review (WP3.3's code; the two runs of the old code in the A/B comparison were both good). A write item our worker answered `SQLITE_BUSY` (its database busy with activation; the worker treats it as contention and records nothing) was a failure in the lane: a whole write batch of 256 objects backed off for 30 s, with `ObjectError`s, and was parked for the lease handoff. The next round took those over (256) plus its own want list (256), and `issue_pull` put all 512 into one `objects.pull`, which the acceptor refuses (`INVALID_REQUEST`: at most 256 items), round after round until the leases lapsed a minute later and backed the objects off for another minute | `SQLITE_BUSY`, like the Contention class, is no failure of an object on either side (`objects::is_contention`): the object continues in the next round; a pull carries at most `MAX_WANT_ITEMS` items (`cc6d449`). Found with a timeline of the scenario and the hub's status during its stalls (the peer's error read `invalid objects.pull request: 512 items (at most 256)`) | `objects_v3_lanes::a_busy_database_is_no_failure_of_the_objects` (64 objects, 24 busy write items and 24 busy reads: 35.6 s and `ObjectError`s before, a failure's backoff), `::a_pull_never_carries_more_items_than_the_acceptor_takes` (600 objects, 256 of them handed over by a source that lacks them: pulls of 344 items refused `INVALID_REQUEST` before); after the fix, 8 of 8 release runs of the scenario at 296–319 files/s |
+
+**Status and GUI (ux review)**
+
+| Finding | Fix | Regression test (`gui_model` unless said) |
+|---|---|---|
+| major: an initial sync from an unreachable source showed frozen progress | The InitialSync chip names the wait (`Initial sync from office — waiting (offline 20 min) · 1,588 of 2,000 events`), Warn, Error for a source that needs an upgrade or a re-pair | `an_initial_sync_from_an_unreachable_source_says_why` |
+| major: a configured peer whose host is down never showed how long, and the Backoff chip named neither the peer nor its error | The hub keeps the time a peer became unreachable across Connecting/Backoff/Offline flips (`PeerStatus.since_ms`); Backoff and Offline chips name the peer, `unreachable N min`, the retry and the lane's error code | `status_hub::an_unreachable_peer_keeps_the_time_it_became_unreachable` (5 min of Dialing/Backoff: the chip names the peer, `unreachable 4 min` and `WS_CONNECT_FAILED`; it read `Retrying` or `Waiting for … (connecting)`) |
+| major: one rejected event left the folder Blocked for good | Rejected events are no blocked work (`PeerInputs.blocked` is blocked + quarantined); the summary and the row's detail line show them | `rejected_events_are_shown_on_an_up_to_date_folder`; `status_hub::worker_counters_of_the_same_exchange_win_over_its_summary` (assertion changed, below) |
+| major: a stale status was rendered as current | With the feed down, rows and peers are greyed and labelled `Last known: … (as of 13:20:00 (5 min ago))`, without rates, ETAs, progress or remedies; every banner branch says how old the status is; the transfer card reads Unknown; a peer dialog whose peer is gone says so; the missing-files list says when it was listed | `a_stale_status_is_shown_as_such` (new API), bin `gui::tests::a_stale_status_is_labelled_on_the_banner_and_the_rows` (the window, headless) |
+| major: totals and ETA over several peers | Uploads add up per peer; downloads add the peers' episodes over the largest remainder; the ETA is the hub's, the longest | `transfer_totals_and_eta_over_several_peers` |
+| minor: the stall duration disagreed with the hub's | The chips count from the later of the last progress and the stall's start (`stalled_since − STALL_MIN`) | `the_stall_duration_follows_the_hubs_stall` |
+| minor: a failed mount's time was re-stamped every heartbeat | The record of an unchanged attempt is kept; `ErrorLine.first` shows whenever first ≠ last | `status_hub::a_mount_failure_keeps_the_time_of_its_attempt`, `error_lines_show_a_first_time_that_differs_and_unlisted_peers_once` |
+| minor: `peer peer ws://10.` | A scope of an unlisted peer shows its id or endpoint once | same test; `daemon_header_and_overview` (assertion changed, below) |
+| minor: a stopped activator's rate stayed non-zero | `Rate: idle` when the activator is not running; `RateMeter::per_second_at` expires samples against the render clock | `a_stopped_activator_reads_idle` (new API) |
+| minor: a blocked gate's mount chip read as progress | `Initial sync blocked [Mount now]`, Warn | `a_blocked_gate_mount_chip_is_not_progress` |
+| minor: `open_log` on the UI thread; the time zone offset read once | The file check and `explorer.exe` run on a thread of their own and report through the event loop; the offset is re-read each minute | none (Slint glue: the window's event wiring is untested, as before) |
+
+### Existing assertions changed (each where the finding changes the behavior it encoded)
+
+- `objects_v3_worker::hash_only_request_not_permitted`, `::private_present_object_is_retransferred_verified_then_registered`, `::crash_between_install_and_register_retransfers`: a hash a committed shared event references but that is not shareable here reads `NOT_AVAILABLE` (was `NOT_PERMITTED`). The bytes are still never served, and the answer is the same whether or not a private copy exists (the attacker case of the first test learns nothing more than before); unreferenced hashes stay `NOT_PERMITTED`.
+- `objects_v3_lanes::a_source_that_cannot_serve_hands_its_push_lease_on` and `::a_holder_that_goes_away_hands_the_pushed_object_on`: their sync point "A1 recorded a `NOT_AVAILABLE` ObjectError" (A1 cannot read the object B wants) is now "A1's push went through without it", and the first also asserts A1 records no error for it. The handoff they test is unchanged.
+- `status_hub::worker_counters_of_the_same_exchange_win_over_its_summary`: "only rejected events remain" reads up to date with `4 events rejected` in the summary (was Blocked).
+- `folder_controller::graceful_stop_persists_desired_before_the_stop_rpc`: after a stop the entry is published `unavailable` (was removed); the retire test still asserts removal.
+- `gui_model::a_lane_backoff_already_past_never_hides_the_next_retry`: the folder chip of a peer whose connection backs off is `Waiting for home (retry in 7 s)` (was `Retrying in 7 s`); the point of the test (a past lane backoff never hides the next retry) is asserted the same way, and a key-level backoff with the peer online still reads `Retrying in 9 s`.
+- `gui_model::daemon_header_and_overview`: `peer gone` (was the bug, `peer peer gone`).
+- `w3_integration::session_sockets_get_large_buffers_on_windows`: the send buffer starts at the system's size and is 4 MiB only once the socket was saturated while draining fast (a 256 MiB loopback download on this machine never saturates it: the 4 MiB receive buffer is enough), never smaller.
+
+### What this supersedes above
+
+- CCR-WP3.INT-5 (*CCRs*) and the socket-buffer limitation (*Known
+  limitations*): only the receive buffer is a fixed 4 MiB on Windows now; the
+  send buffer is adaptive (Windows) and the unsent bytes bounded (Linux).
+- *Known limitations*, "Repaired objects wait out their backoffs": an object a
+  sender could not serve backs off 5 s → 5 min now (was 30 s → 1 h), so a
+  repaired or newly received copy is offered again within the current step
+  (at most 5 min, seconds while the gap is fresh); a source whose published
+  content grows is asked again at once.
+- *Known limitations*, "Shared-machine floors": the slow `e2e_tiny_files_10k`
+  runs (70–195 files/s) were, at least in part, the busy-database defect above,
+  not the disk. With it fixed the scenario still runs near its floor (296–319
+  files/s in 8 runs: it is bound by fsynced creates), so a run on a busy
+  machine can still miss it by a few files per second.
+- *Package status*, WP3.3's open item "a settled object is not pruned from
+  its round's plan": fixed (above).
+
+### Deviations
+
+1. **The slow-uplink test's bound** is 12 s for a 64 KiB pull at 256 KiB/s, not "near the baseline" (0.26 s): the test's FaultProxy itself queues about 2 MiB (its 1 MiB channel and its socket's receive window), which is the network's queue, not ours. Our side holds at most about 600 KiB now (64 KiB to the system's send buffer, 256 KiB frames); before the fix the pull took 18.8 s.
+2. **Lease ids are not made count-independent** (the review's first option): a lease is per hash, so a count-independent id of lane `i` would still differ from the new lane that owns the hash. The worker instead lets the new lane set take over an idle lease of the same kind and peer with another count (§6.4), which needs no frozen change.
+3. **Dialer wants items its worker refuses get no backoff** (the review: "Do the same on the dialer"): such an item is read again each upload round until the acceptor backs it off (it does after one round, through its offer), at the cost of one refused read per item per round with a peer that keeps naming it.
+4. **The push gate** allows one push at a time per lane with the default two peer slots (CCR-WP3.3-1, deferred, would raise the acceptor's exchange slots to 4).
+5. **`SQLITE_BUSY` on an object item is contention for the lanes**, although the §8 table lists the code as Transient (objects 30 s → 1 h): the worker that answers it already records nothing for the object (WP3.2's `failure_kind`), and a busy database is nobody's failure of the object. The code's class is frozen (`src/model/errors.rs`), so the lanes test the code itself (`objects::is_contention`); §6.4's rules say so.
+
+### Tests added
+
+`objects_v3_lanes`: `a_push_of_objects_never_offered_records_no_errors`, `wants_for_objects_we_cannot_serve_record_no_errors`, `stalled_pushes_of_two_repositories_leave_a_slot_to_pulls`, `a_settled_object_is_not_pulled_again_in_its_round`, `empty_chunks_cannot_hold_a_pull`, `a_stalled_source_leaves_the_window_to_other_repositories`, `objects_of_unknown_size_travel_both_ways`, `a_source_whose_content_grows_is_asked_again_at_once`, `an_object_no_longer_wanted_settles_without_an_error`, `a_saturating_push_does_not_delay_pulls_on_a_slow_uplink`, `an_inbound_only_peer_that_unpairs_is_recorded_gone`, `an_object_a_dialer_lacked_is_offered_again_soon`, `a_busy_database_is_no_failure_of_the_objects`, `a_pull_never_carries_more_items_than_the_acceptor_takes` (the fake worker gains stalled reads, unsized wants, `unwant`, busy write items and busy reads). `objects_v3_worker`: `a_committed_object_not_yet_received_is_not_available`, `a_corrupt_verdict_outranks_an_earlier_serve`, `a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open`, `objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete`, `staged_objects_without_a_size_descriptor_complete`, `a_new_lane_count_takes_over_the_old_lanes_leases`. `meta_scheduler`: `a_large_reply_on_a_slow_link_completes`. `status_hub`: `a_peer_that_still_reaches_us_after_a_rotation_is_not_unreachable`, `download_work_shows_when_each_side_misses_different_objects`, `an_unreachable_peer_keeps_the_time_it_became_unreachable`, `a_mount_failure_keeps_the_time_of_its_attempt`, `an_inbound_only_peer_that_unpaired_us_is_forgotten`. `gui_model`: `an_initial_sync_from_an_unreachable_source_says_why`, `rejected_events_are_shown_on_an_up_to_date_folder`, `a_stale_status_is_shown_as_such`, `transfer_totals_and_eta_over_several_peers`, `the_stall_duration_follows_the_hubs_stall`, `error_lines_show_a_first_time_that_differs_and_unlisted_peers_once`, `a_stopped_activator_reads_idle`, `a_blocked_gate_mount_chip_is_not_progress`. `w3_integration`: `the_send_buffer_follows_the_drain_rate`. lib: `orchestrator::objects::tests::the_object_backoff_table_is_bounded`. bin: `gui::tests::a_stale_status_is_labelled_on_the_banner_and_the_rows`.
+
+Checked against the code before the fixes: every test above fails there except the two size-descriptor worker tests and `status_hub::an_inbound_only_peer_that_unpaired_us_is_forgotten` (the worker and hub sides were right; they cover the contract the fixes rely on), and the four that use new APIs (`the_object_backoff_table_is_bounded`, `a_stale_status_is_shown_as_such`, `a_stopped_activator_reads_idle`, `the_send_buffer_follows_the_drain_rate`), which do not compile there.
+
+### Qualification (re-review)
+
+`scripts/qualify.ps1 -Wave 3 -Merge` of the files the fixes touch, each run
+merged into the evidence of the one before (`test-evidence/qualification-wave-3.json`
+keeps the last run of each file; `TKFS_BASELINE_BIN` the WP2.INT baseline
+build, as before):
+
+| Run (`test-runs/qualify-wave-3-…`) | Code | Files | Result |
+|---|---|---|---|
+| `20261015-211639` | `104cff5` | `qual_wp1_9_session`, `qual_wp1_12_legacy`, `qual_wp3_1_transport`, `qual_wp3_int_e2e` | 1 floor failed: `e2e_tiny_files_10k` 69.7 files/s (the window share's first version; fixed in `76a8332`) |
+| `20261015-220330` | `76a8332` | the same four | 1 floor failed: `e2e_tiny_files_10k` 297.1 files/s; session loopback 2,406 MiB/s (this is the evidence's `qual_wp1_9_session`: later commits do not touch the session layer) |
+| `20261015-223953` | `0886e55` (plan and docs since `76a8332`) | `qual_wp3_int_e2e` | 1 floor failed: `e2e_tiny_files_10k` 195.7 files/s |
+| `20261015-230500` | `0886e55` | `qual_wp3_int_e2e` | 1 floor failed: `e2e_tiny_files_10k` 73.2 files/s; `two_way_backlog_e2e` 129 s (floor 180 s; 2.3–4.7 s in every other run) |
+| `20261015-233127` | `0886e55` | `qual_wp3_int_e2e` | ok, 41 of 41 floors; tiny files 305.4 files/s; `relay_with_objects` 27.9 s (fixed in `9733604`) |
+| `20261015-235541` | `9733604` | `qual_wp1_12_legacy`, `qual_wp3_1_transport`, `qual_wp3_int_e2e` | ok, 41 of 41 (`3aa6936`); tiny files 304.6 files/s, relay 0.2 s |
+| `20261016-013236` | `cc6d449` | the same three | 1 floor failed: `e2e_objects_before_activation`, `objects_ahead` 0 (the scenario samples installed files against the status counters while activation is slowed: 0–135 over the day's ten runs, 3 in one before the re-review's last fixes, and 10–135 in 6 standalone runs right after); tiny files 304.2 files/s, relay 0.26 s, 256 MiB loopback 102.5 MiB/s, link utilization 0.974 |
+| `20261016-015927` | `cc6d449` | `qual_wp3_int_e2e` | **ok: summary ok, 77 scenarios (76 pass, 1 skipped), 41 of 41 floors** (this commit's evidence: `qual_wp1_12_legacy` and `qual_wp3_1_transport` from `20261016-013236`, the other files from the runs listed under *Qualification*); tiny files 301.1 files/s, `objects_ahead` 21, relay 0.25 s, two-way backlog 4.1 s, 256 MiB loopback 94.6 MiB/s (floor 40), link utilization 0.975, 150K feed 204 events/s |
+
+The slow tiny-files runs on `76a8332`/`0886e55` (195.7 and 73.2 files/s)
+were first taken for the shared machine (standalone runs of the scenario on
+that code measured 285–321 files/s, 8 times). Three standalone runs on
+`9733604` measured 299.0, 78.9 and 74.8 files/s, so the scenario was run
+again with a timeline (a temporary test, not committed): 4 of 15 runs stalled
+(for example 2,306 of 10,000 files for 69 s, then 5,454 for 50 s), and the
+hub's status during the stalls showed the peer's error `invalid objects.pull
+request: 512 items (at most 256)`; temporary events in the lane then showed
+the busy write batch before it (`cc6d449`, *Found by the qualification of
+these fixes*). After the fix, 8 of 8 runs at 296–319 files/s. The 129 s
+`two_way_backlog_e2e` of `20261015-230500` fits the same backoff steps (30 s,
+then 60 s) but was not reproduced.
+
+### VERIFY (re-review)
+
+Run on `cc6d449` (the last code change; the commit after it holds only the
+evidence and these notes), Windows 11, `CARGO_TARGET_DIR=C:/tkfs-target/wp3-int`.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo build --all-targets` | ok |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets` | **ok: 65 test binaries, 960 passed, 0 failed, 104 ignored** (the ignored are the same as before the re-review: 86 qualification scenarios and 18 marked tests). 960 = 923 before the re-review + 37 new tests. Earlier full runs of the re-review: on `ca3a2a0` 957 passed and on `9733604` 958 passed, 0 failed, 104 ignored each. `peer_supervisor::a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed` failed once during the re-review in a run of its binary (1.504 s against 1.5 s; see *Known limitations*); it passed in every run counted here |
+| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp3-int`) | ok |
+| WSL: `cargo test --no-fail-fast --lib` and `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle` (FUSE), `objects_v3_worker`, `objects_v3_lanes`, `status_hub`, `gui_model`, `w3_integration`, `meta_scheduler`, `folder_controller`, `inbound_v3`, `peer_supervisor`, `contracts`, `feed_v7`, `partial_content`, `availability` | **ok: 19 binaries, 645 passed, 0 failed, 11 ignored** (`objects_v3_lanes` 8, lib 2, `meta_scheduler` 1). On `9733604`: 643 passed (the two new lanes tests are the difference) |
+
+Per binary (Windows): `lib` 50+2i, `bin` 2, `acknowledgements` 3, `activation_inbox` 21, `additional` 5, `availability` 13, `availability_index` 21, `basic_metadata` 4, `bulk_lanes` 3, `catalog_actor` 19, `contracts` 40, `control_transactions` 4, `core` 16, `derive_oracle` 11+2i, `directory_progress` 3, `feed_v7` 44, `folder_controller` 56, `gui_model` 45, `harness_selftest` 18+2i, `inbound_v3` 20, `legacy_stabilizers` 2, `management_api` 27, `meta_scheduler` 25+1i, `mount_lifecycle` 11, `objects_v3_lanes` 39+8i, `objects_v3_worker` 36, `offlock_commit` 20+1i, `oracle_smoke` 4, `orchestrator` 18, `orchestrator_runtime` 17, `paired_sync` 9, `partial_content` 8, `peer_supervisor` 25, `posix_metadata` 3, `recovery` 6, `replication_regressions` 9, `runtime_lanes` 3, `scalability` 5, `seam_stubs` 7, `session_core` 59, `session_handshake` 21, `startup_snapshots` 8, `status_hub` 94, `w1_integration` 4+1i, `w2_integration` 13+1i, `w3_integration` 9, `worker_concurrency` 29, `worker_lifecycle` 25, `worker_process` 22, `worker_seams` 4, and the 15 qualification binaries 0+86i.
+
+Per binary (WSL): `lib` 55+2i, `availability` 10, `contracts` 40, `feed_v7` 44, `folder_controller` 56, `gui_model` 45, `inbound_v3` 20, `meta_scheduler` 25+1i, `mount_lifecycle` 17, `objects_v3_lanes` 39+8i, `objects_v3_worker` 36, `orchestrator` 18, `partial_content` 8, `peer_supervisor` 25, `session_core` 59, `session_handshake` 21, `status_hub` 94, `w3_integration` 8 (its Windows socket test is not built on Linux), `worker_lifecycle` 25.
+
+### Known limitations (re-review)
+
+- **Linux sockets** keep the kernel's buffer autotuning; only their unsent bytes are bounded (`TCP_NOTSENT_LOWAT`, 256 KiB). The adaptive `SO_SNDBUF` is Windows only. Measured in WSL only through the lanes test (not on a real WAN).
+- **Frames already in a socket's buffer** delay control frames by up to one 256 KiB object frame plus the send buffer (64 KiB at slow rates): about 1.3 s at 256 KiB/s, plus whatever the network queues.
+- **A relay's object offered before it arrived** waits out the first step of
+  the unserved backoff: `relay_with_objects` measured 0.2 s in the
+  qualification and 0.2, 5.3 and 5.3 s in three standalone runs (an acceptor
+  does not see the dialer's published content counters, so it cannot reset
+  that backoff when the relay receives the object, as a dialer does).
+- **An object of unknown size** costs one extra exchange (the size probe) the first time, and a push reads it once more for its size.
+- **The two size-descriptor worker tests** cover the worker contract, not a daemon end to end with a stripped journal (the lanes test covers the protocol with fake workers).
+- `peer_supervisor::a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed` stays flaky in its binary (unpair 1.503 s against 1.5 s: a lane in its TCP connect is closed only at the join's force-close margin, the open WP3.1 finding); it passes alone.
+
+### Commits (re-review)
+
+| Commit | What |
+|---|---|
+| `b150dff` | objects v3 lanes: offered-only failures, push gate, fair window share, unknown sizes |
+| `c0d1fcf` | objects v3 worker: relay refusals, served cache, stale spools, lane-count leases |
+| `22ba742` | slow links: meta.exchange idle deadline, adaptive send buffer, 256 KiB object frames |
+| `ca3a2a0` | status and GUI: working direction, unreachable peers, rejected events, stale status, transfer totals |
+| `104cff5` | Linux session sockets bound their unsent bytes (`TCP_NOTSENT_LOWAT`); plan rules; module docs |
+| `76a8332` | a key pipelines freely within its share of the lane window (the tiny-files regression the qualification found) |
+| `0886e55` | plan and module docs follow the pipelining rule |
+| `9733604` | an object a dialer did not send backs off 5 s → 5 min (the relay delay the qualification found) |
+| `3aa6936` | qualification evidence, merged re-run on `9733604` (summary ok, 41 of 41) |
+| `cc6d449` | busy databases are no object failures; a pull carries at most 256 items (the tiny-files stalls) |
+| (this commit) | qualification evidence (merged re-run on `cc6d449`) and these notes |
