@@ -381,7 +381,8 @@ pub fn thread_fallback_reasons() -> BTreeMap<&'static str, u64> {
 }
 
 /// Rewrites `branch`'s stored projection as `p` (`current_state`, with its
-/// `current_parts` folded in) and derives and writes its conflict records:
+/// `current_parts` folded in and its `current_meta` header row removed) and
+/// derives and writes its conflict records:
 /// every source in full for a rebuild (`new_event == None`), else the records
 /// of the newly accepted event in the configured mode. `derive_conflicts`
 /// plus `write_projection`; only the stored rows the new event reviews are
@@ -395,6 +396,9 @@ pub(super) fn persist_projection(
 ) -> Result<()> {
     tx.execute("DELETE FROM current_parts WHERE branch=?", [branch])?;
     tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload",params![branch,serde_json::to_string(p)?])?;
+    // `current_state` now carries the conflict and pending lists itself
+    // (the header row of CCR-WP2.INT-5 goes).
+    super::snapshot::clear_header(tx, branch)?;
     let reviewed = reviewed_rows(tx, branch, events, new_event)?;
     let out = derive_conflicts(&DeriveInput {
         branch,
