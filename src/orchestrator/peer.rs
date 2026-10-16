@@ -83,11 +83,42 @@
 //! are detached, counted ([`PeerManager::detached_lanes`]) and logged; they
 //! close their new session as soon as the dial returns.
 //!
+//! **Per-peer credentials (WP4.1).** A dial presents our outbound credential
+//! for the peer (`peer_credentials`, side `outbound`, `Catalog::of`) with
+//! the scheme `peer-hmac-v1`, the stored pairing code as the fallback for an
+//! acceptor that does not offer the scheme. Credentials are enrolled:
+//!
+//! * by [`NetworkApi::pair`], on its code-authenticated probe session, before
+//!   the peer is stored (`peer.enroll` with a fresh secret, sealed under the
+//!   code's key; `session::auth::seal_enrollment`);
+//! * automatically, for a peer paired before WP4.1 or whose credential is
+//!   gone: when lane 0 authenticated with the code, the `peer-credentials`
+//!   thread enrolls on that session (an older acceptor answers
+//!   `UNKNOWN_PEER_OPERATION`, logged once per session). No user action.
+//!
+//! An acceptor that refuses our credential (`PEER_REVOKED`: revoked by a
+//! rotation of its code, or lost) makes the lane drop it (forgotten in the
+//! catalog, ignored at once in memory) and re-dial with the code at once; a
+//! rotated code then blocks the peer `Unauthorized` as before, a valid one
+//! re-enrolls. [`NetworkApi::unpair`] of a peer we hold a credential for
+//! first sends it a best-effort `peer.revoke` (on lane 0 if it is up, else
+//! on a probe session, at most about [`REVOKE_BUDGET`]), then removes the
+//! record, which deletes our outbound credential with it.
+//! [`NetworkApi::remote_list`] presents the credential too, and retries once
+//! with the code on `PEER_REVOKED`.
+//!
+//! **Control token (WP4.1 adapter).** [`PeerManager::start`] runs on every
+//! daemon's build before its control endpoint accepts: with a concrete
+//! catalog it installs the control endpoint's local token
+//! (`api::install_control_token`, CCR-WP4.1-3), held as long as the manager
+//! runs.
+//!
 //! Invariants: 16 (a probe and every lane session are fresh requests, nothing
 //! is replayed), 20 (a legacy endpoint is `Incompatible`, the code is never
-//! sent), 21 (the code is only ever a dial credential: no status event, log
-//! line or error carries it; installation checks, self-pair refusal), 29
-//! (every wait is interruptible by the supervisor's token and bounded).
+//! sent), 21 (the code and the per-peer keys are only ever dial credentials:
+//! no status event, log line or error carries them; installation checks,
+//! self-pair refusal), 29 (every wait is interruptible by the supervisor's
+//! token and bounded).
 //!
 //! [`ConnHealth`]: crate::session::ConnHealth
 use crate::{
@@ -100,8 +131,16 @@ use crate::{
         protocol::{CatalogListReply, CatalogListRequest, LaneRole, LaneSpec, deadlines, ops},
         status::{Direction, LaneState, StatusEvent},
     },
-    orchestrator::{objects, scheduler},
-    session::{self, ClientAuth, CodeAuth, Conn, ConnOptions, DialError, Priority, Reply},
+    orchestrator::{
+        api,
+        catalog::{Catalog, CredentialSide},
+        objects, scheduler,
+    },
+    pairing_code::Verifier,
+    session::{
+        self, ClientAuth, CodeAuth, Conn, ConnOptions, DialError, Priority, Reply,
+        auth::{self as peer_auth, EnrollReply, PEER_HMAC_V1, PeerAuth},
+    },
     util::{
         backoff::Backoff,
         cancel::Cancel,
@@ -135,6 +174,13 @@ const RTT_MIN_DELTA_MS: u64 = 5;
 /// The furthest deadline [`deadline_in`] computes (a year): a caller's
 /// `Duration::MAX` means "no practical limit", not an overflow.
 const FAR_FUTURE: Duration = Duration::from_secs(365 * 24 * 3600);
+/// How long [`NetworkApi::unpair`] spends at most on its best-effort
+/// `peer.revoke` through a probe session (lane 0, when up, answers within
+/// `REVOKE_DEADLINE`).
+pub const REVOKE_BUDGET: Duration = Duration::from_secs(3);
+/// Queued credential jobs before new ones are dropped (the next session
+/// establishment queues an enrollment again).
+const CREDENTIAL_QUEUE: usize = 64;
 
 /// `now + after`, capped at [`FAR_FUTURE`] instead of overflowing `Instant`.
 fn deadline_in(after: Duration) -> Instant {
@@ -268,6 +314,13 @@ pub struct PeerManager {
     watcher_done: Arc<Notify>,
     /// `peer_meta` writes, off the lane threads.
     meta: Arc<MetaWriter>,
+    /// The concrete catalog (per-peer credentials, WP4.1); `None` under a
+    /// test's fake catalog, which keeps the code-only behaviour.
+    catalog: Option<Arc<Catalog>>,
+    /// Enrollments and forgotten credentials, off the lane threads.
+    credentials: Arc<CredentialWriter>,
+    /// The control endpoint's local token registration (WP4.1 adapter).
+    _control_token: Option<Arc<crate::ws::tokens::Hold>>,
 }
 
 #[derive(Default)]
@@ -316,6 +369,11 @@ impl PeerManager {
     pub fn start_with(ctx: Arc<Ctx>, options: PeerOptions) -> Arc<PeerManager> {
         let cancel = ctx.shutdown.child();
         let ctx_catalog = ctx.catalog.clone();
+        let catalog = Catalog::of(&ctx.catalog);
+        let control_token = catalog.as_ref().and_then(|catalog| {
+            api::install_control_token(catalog, &ctx.endpoints.load().control, ctx.shutdown.clone())
+        });
+        let credentials = CredentialWriter::start(ctx.installation.clone(), catalog.clone());
         let manager = Arc::new(PeerManager {
             ctx,
             options,
@@ -329,6 +387,9 @@ impl PeerManager {
             watcher: Mutex::new(None),
             watcher_done: Arc::new(Notify::new()),
             meta: MetaWriter::start(ctx_catalog),
+            catalog,
+            credentials,
+            _control_token: control_token,
         });
         let generation = manager.reconcile();
         let weak = Arc::downgrade(&manager);
@@ -517,6 +578,10 @@ impl PeerManager {
             self.cancel.child(),
             catalog,
             self.meta.clone(),
+            Credentialing {
+                catalog: self.catalog.clone(),
+                writer: self.credentials.clone(),
+            },
         );
         {
             // Checked under the map lock: `shutdown` sets `closed` before it
@@ -559,20 +624,172 @@ impl PeerManager {
         expected: Option<&str>,
         pool: u32,
     ) -> Result<(Conn, session::ServerHello), ErrorWire> {
+        self.probe_with(
+            endpoint,
+            &CodeAuth {
+                code: code.to_owned(),
+            },
+            expected,
+            pool,
+            &self.cancel,
+        )
+        .map_err(|error| error.to_wire())
+    }
+
+    fn probe_with(
+        &self,
+        endpoint: &str,
+        auth: &dyn ClientAuth,
+        expected: Option<&str>,
+        pool: u32,
+        cancel: &Cancel,
+    ) -> Result<(Conn, session::ServerHello), DialError> {
         let hello = session::client_hello(&self.ctx.installation, LaneRole::Probe, None, pool);
         // A shutdown interrupts a probe in progress (CCR-WP2.6-2).
         session::dial_cancellable(
             endpoint,
             hello,
-            &CodeAuth {
-                code: code.to_owned(),
-            },
+            auth,
             expected,
             None,
             self.options.conn,
-            &self.cancel,
+            cancel,
         )
-        .map_err(|error| error.to_wire())
+    }
+
+    /// A probe session to a paired peer with our outbound credential (WP4.1)
+    /// when we hold one, else the code; a `PEER_REVOKED` refusal of the
+    /// credential is retried once with the code.
+    fn probe_paired(
+        &self,
+        record: &PeerRecord,
+        cancel: &Cancel,
+    ) -> Result<(Conn, session::ServerHello), DialError> {
+        let expected = (!record.installation.is_empty()).then_some(record.installation.as_str());
+        let pool = record.connections.max(limits::MIN_POOL);
+        let code = CodeAuth {
+            code: record.code.clone(),
+        };
+        let Some(key) = self.outbound_key(&record.installation) else {
+            return self.probe_with(&record.endpoint, &code, expected, pool, cancel);
+        };
+        let auth = PeerAuth {
+            key,
+            code: Some(record.code.clone()),
+        };
+        match self.probe_with(&record.endpoint, &auth, expected, pool, cancel) {
+            Err(error) if error.to_wire().code == "PEER_REVOKED" => {
+                self.probe_with(&record.endpoint, &code, expected, pool, cancel)
+            }
+            other => other,
+        }
+    }
+
+    /// Our active outbound credential for `installation`.
+    fn outbound_key(&self, installation: &str) -> Option<[u8; 32]> {
+        self.catalog
+            .as_ref()?
+            .credentials()
+            .active(installation, CredentialSide::Outbound)
+    }
+
+    /// The best-effort `peer.revoke` of an unpair (WP4.1): on the peer's
+    /// lane 0 when it is up, else on a probe session, within about
+    /// [`REVOKE_BUDGET`]. A failure is logged; the unpair goes on.
+    fn revoke_remote(&self, record: &PeerRecord) {
+        let live = self
+            .peers
+            .lock()
+            .active
+            .get(&record.installation)
+            .and_then(|handle| handle.supervisor.conns.lock().get(&0).cloned())
+            .filter(|conn| conn.closed().is_none());
+        let outcome = match live {
+            Some(conn) => call_revoke(&conn),
+            None => {
+                // The probe is bounded by its own token: a timer cancels it
+                // at the budget (a TCP connect in progress runs to its end).
+                let cancel = self.cancel.child();
+                let done = Cancel::new();
+                let timer = {
+                    let (cancel, done) = (cancel.clone(), done.clone());
+                    thread::Builder::new()
+                        .name("peer-revoke".into())
+                        .spawn(move || {
+                            if !done.sleep(REVOKE_BUDGET) {
+                                cancel.cancel();
+                            }
+                        })
+                };
+                let outcome = match self.probe_paired(record, &cancel) {
+                    Ok((conn, _)) => {
+                        let outcome = call_revoke(&conn);
+                        conn.close();
+                        outcome
+                    }
+                    Err(error) => Err(error.to_wire()),
+                };
+                done.cancel();
+                if let Ok(timer) = timer {
+                    let _ = timer.join();
+                }
+                outcome
+            }
+        };
+        if let Err(error) = outcome {
+            event!(info, (error.code.as_str()), {
+                "peer": record.installation,
+                "endpoint": record.endpoint,
+                "detail": "peer.revoke was not delivered; the peer keeps our credential until it rotates its pairing code",
+                "message": error.message,
+            });
+        }
+    }
+}
+
+/// One `peer.revoke` on `conn`.
+fn call_revoke(conn: &Conn) -> Result<(), ErrorWire> {
+    conn.call(
+        peer_auth::ops::PEER_REVOKE,
+        Value::Object(serde_json::Map::new()),
+        Vec::new(),
+        Priority::Control,
+        peer_auth::REVOKE_DEADLINE,
+    )
+    .map(drop)
+    .map_err(|error| error.to_wire())
+}
+
+/// Enrolls a fresh per-peer secret on an authenticated session (WP4.1):
+/// `peer.enroll` with the secret sealed under the pairing code's key for
+/// `server`'s salt. Returns `K_peer` once the acceptor stored it.
+fn enroll_on(
+    conn: &Conn,
+    local_installation: &str,
+    server: &session::ServerHello,
+    code: &str,
+) -> Result<[u8; 32], ErrorWire> {
+    let secret = peer_auth::new_secret();
+    let code_key = Verifier::derive_key(&server.salt, code);
+    let request =
+        peer_auth::seal_enrollment(&code_key, local_installation, &server.installation, &secret);
+    let header = serde_json::to_value(&request)
+        .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
+    let reply = conn
+        .call(
+            peer_auth::ops::PEER_ENROLL,
+            header,
+            Vec::new(),
+            Priority::Control,
+            peer_auth::ENROLL_DEADLINE,
+        )
+        .map_err(|error| error.to_wire())?;
+    match serde_json::from_value::<EnrollReply>(reply.header) {
+        Ok(EnrollReply { enrolled: true }) => Ok(peer_auth::peer_key(&secret)),
+        _ => Err(ErrorWire::coded(
+            "INVALID_REPLY",
+            "peer.enroll did not confirm the enrollment",
+        )),
     }
 }
 
@@ -602,14 +819,33 @@ impl NetworkApi for PeerManager {
         }
         let pool = count.max(limits::MIN_POOL);
         let (conn, server) = self.probe(endpoint, code, None, pool)?;
-        conn.close();
-        let installation = server.installation;
+        let installation = server.installation.clone();
         if installation == self.ctx.installation {
+            conn.close();
             return Err(ErrorWire::coded(
                 "CANNOT_PAIR_WITH_SELF",
                 "the endpoint is this installation",
             ));
         }
+        // WP4.1: a per-peer credential, enrolled on the code-authenticated
+        // probe session. An acceptor that does not know `peer.enroll` keeps
+        // the pairing code-only (its lane 0 tries again later).
+        let enrolled = match &self.catalog {
+            Some(_) => match enroll_on(&conn, &self.ctx.installation, &server, code) {
+                Ok(key) => Some(key),
+                Err(error) => {
+                    event!(info, (error.code.as_str()), {
+                        "peer": installation,
+                        "endpoint": endpoint,
+                        "detail": "no per-peer credential was enrolled while pairing; the pairing code is used",
+                        "message": error.message,
+                    });
+                    None
+                }
+            },
+            None => None,
+        };
+        conn.close();
         {
             // The record and the removal of the installation's other
             // endpoints are one step for concurrent pairs: without this, two
@@ -636,6 +872,16 @@ impl NetworkApi for PeerManager {
                     .catalog
                     .apply(CatalogCmd::RemovePeer { endpoint: old })?;
             }
+            if let (Some(key), Some(catalog)) = (enrolled, &self.catalog)
+                && let Err(error) = catalog.enroll(&installation, CredentialSide::Outbound, key)
+            {
+                // The lanes use the code; lane 0 enrolls again.
+                event!(warn, (error.code.as_str()), {
+                    "peer": installation,
+                    "detail": "the per-peer credential could not be stored",
+                    "message": error.message,
+                });
+            }
         }
         self.reconcile();
         Ok(PairResult {
@@ -660,9 +906,9 @@ impl NetworkApi for PeerManager {
             .ok_or_else(|| {
                 ErrorWire::coded("PEER_NOT_PAIRED", format!("{endpoint} is not paired"))
             })?;
-        let expected = (!record.installation.is_empty()).then_some(record.installation.as_str());
-        let pool = record.connections.max(limits::MIN_POOL);
-        let (conn, _) = self.probe(endpoint, &record.code, expected, pool)?;
+        let (conn, _) = self
+            .probe_paired(&record, &self.cancel)
+            .map_err(|error| error.to_wire())?;
         let listed = list_catalog(&conn, None);
         conn.close();
         listed
@@ -670,9 +916,23 @@ impl NetworkApi for PeerManager {
             .map_err(|error| error.to_wire())
     }
 
-    /// Removes the peer, then stops and joins its lanes (≤ 5 s). Unpairing an
-    /// endpoint that is not paired succeeds (the legacy `Unpair` did).
+    /// Tells the peer (best effort, WP4.1 `peer.revoke`), removes the peer
+    /// (with our outbound credential), then stops and joins its lanes
+    /// (≤ 5 s). Unpairing an endpoint that is not paired succeeds (the
+    /// legacy `Unpair` did).
     fn unpair(&self, endpoint: &str) -> Result<(), ErrorWire> {
+        let snapshot = self.ctx.catalog.snapshot();
+        if let Some(record) = snapshot.peer_by_endpoint(endpoint)
+            && !record.installation.is_empty()
+            && !snapshot.peers.iter().any(|other| {
+                other.installation == record.installation && other.endpoint != endpoint
+            })
+            && !self.closed.load(Ordering::Acquire)
+            && self.outbound_key(&record.installation).is_some()
+        {
+            // Only a credential we enrolled has anything to revoke there.
+            self.revoke_remote(record);
+        }
         self.ctx.catalog.apply(CatalogCmd::RemovePeer {
             endpoint: endpoint.to_owned(),
         })?;
@@ -723,6 +983,7 @@ impl NetworkApi for PeerManager {
         supervisors.extend(stopping);
         self.stop_all(&supervisors, until);
         self.meta.close();
+        self.credentials.close();
         let watcher = lock(&self.watcher).take();
         if let Some(watcher) = watcher {
             // The watcher re-checks its token every CATALOG_WAIT and pokes
@@ -875,6 +1136,13 @@ struct Supervisor {
     threads: Mutex<Vec<(u32, JoinHandle<()>)>>,
     /// Whether this supervisor has emitted a `PeerCatalog` yet.
     catalog_emitted: AtomicBool,
+    /// Per-peer credentials (WP4.1).
+    credentialing: Credentialing,
+    /// An outbound key the peer refused (`PEER_REVOKED`): never presented
+    /// again, while the catalog forgets it.
+    refused_key: Mutex<Option<[u8; 32]>>,
+    /// An enrollment on lane 0 is queued or running.
+    enrolling: Arc<AtomicBool>,
     /// `true` once retired: nothing of this supervisor reaches
     /// `ctx.status` any more. Every status event is recorded under the read
     /// side and `retire` flips it under the write side, so no event recorded
@@ -891,6 +1159,7 @@ impl Supervisor {
         cancel: Cancel,
         catalog: Option<Arc<RemoteCatalog>>,
         meta: Arc<MetaWriter>,
+        credentialing: Credentialing,
     ) -> Arc<Supervisor> {
         let pool = record.connections.clamp(limits::MIN_POOL, 16);
         let context = Arc::new(PeerContext {
@@ -936,6 +1205,9 @@ impl Supervisor {
             catalog_emitted: AtomicBool::new(false),
             retired: RwLock::new(false),
             meta,
+            credentialing,
+            refused_key: Mutex::new(None),
+            enrolling: Arc::new(AtomicBool::new(false)),
         });
         // Lanes parked on the gate wake when the supervisor is cancelled. The
         // hook holds a weak reference: the token outlives nothing it needs.
@@ -1382,7 +1654,60 @@ impl Supervisor {
 
     // -- dialing ------------------------------------------------------------
 
-    fn dial(&self, lane: u32) -> Result<(Conn, session::ServerHello), DialError> {
+    /// Our outbound credential for this peer, unless the peer refused it.
+    fn outbound_key(&self) -> Option<[u8; 32]> {
+        let key = self
+            .credentialing
+            .catalog
+            .as_ref()?
+            .credentials()
+            .active(self.installation(), CredentialSide::Outbound)?;
+        (*lock(&self.refused_key) != Some(key)).then_some(key)
+    }
+
+    /// The peer refused `key` (`PEER_REVOKED`): stop presenting it and have
+    /// the catalog forget it (off this thread).
+    fn credential_refused(&self, key: [u8; 32]) {
+        *lock(&self.refused_key) = Some(key);
+        event!(info, PEER_REVOKED, {
+            "peer": self.installation(),
+            "detail": "the peer refused our per-peer credential; dialing with the pairing code",
+        });
+        self.credentialing.writer.post(CredentialJob::Forget {
+            installation: self.record.installation.clone(),
+            key,
+        });
+    }
+
+    /// Lane 0 authenticated with the pairing code (no credential of ours,
+    /// or an acceptor without the scheme): enroll one on this session, off
+    /// the lane thread, once at a time.
+    fn enroll_later(&self, conn: &Conn, server: &session::ServerHello) {
+        if self.credentialing.catalog.is_none()
+            || self.record.code.is_empty()
+            || self.enrolling.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let posted = self.credentialing.writer.post(CredentialJob::Enroll {
+            conn: conn.clone(),
+            server: Box::new(server.clone()),
+            code: self.record.code.clone(),
+            cancel: self.cancel.clone(),
+            done: self.enrolling.clone(),
+        });
+        if !posted {
+            self.enrolling.store(false, Ordering::Release);
+        }
+    }
+
+    /// Dials `lane`, presenting `credential` (our outbound key, WP4.1) when
+    /// given, else the pairing code.
+    fn dial(
+        &self,
+        lane: u32,
+        credential: Option<[u8; 32]>,
+    ) -> Result<(Conn, session::ServerHello), DialError> {
         let role = role_of(lane);
         let hello = session::client_hello(
             &self.ctx.installation,
@@ -1393,9 +1718,16 @@ impl Supervisor {
         let code = CodeAuth {
             code: self.record.code.clone(),
         };
+        let credential = credential.map(|key| PeerAuth {
+            key,
+            code: Some(self.record.code.clone()),
+        });
         let handshaking = || self.set_lane(lane, LaneState::Handshaking, None, None, None);
         let auth = AnnounceHandshake {
-            inner: &code,
+            inner: match &credential {
+                Some(peer) => peer,
+                None => &code,
+            },
             on_key: &handshaking,
         };
         // CCR-WP2.6-2 (applied by WP3.1): stopping the supervisor (unpair,
@@ -1717,14 +2049,151 @@ impl MetaWriter {
 /// Emits `Handshaking` when the handshake reaches the authentication step
 /// (the server's `HELLO_ACK` arrived and the dialer derives its key).
 struct AnnounceHandshake<'a> {
-    inner: &'a CodeAuth,
+    inner: &'a dyn ClientAuth,
     on_key: &'a (dyn Fn() + Sync),
 }
 
 impl ClientAuth for AnnounceHandshake<'_> {
     fn key(&self, salt: &str) -> Result<[u8; 32], ErrorWire> {
-        (self.on_key)();
         self.inner.key(salt)
+    }
+
+    fn peer_key(&self) -> Option<[u8; 32]> {
+        self.inner.peer_key()
+    }
+
+    fn begin_auth(&self) {
+        (self.on_key)();
+        self.inner.begin_auth();
+    }
+}
+
+/// What a supervisor needs for per-peer credentials (WP4.1).
+#[derive(Clone)]
+struct Credentialing {
+    catalog: Option<Arc<Catalog>>,
+    writer: Arc<CredentialWriter>,
+}
+
+/// A credential job of the `peer-credentials` thread.
+enum CredentialJob {
+    /// Enroll on lane 0's session (authenticated with `code`, whose server
+    /// hello is `server`), then store our outbound credential unless the
+    /// supervisor stopped meanwhile. `done` is cleared at the end.
+    Enroll {
+        conn: Conn,
+        server: Box<session::ServerHello>,
+        code: String,
+        cancel: Cancel,
+        done: Arc<AtomicBool>,
+    },
+    /// Forget our outbound credential for `installation` if it is still
+    /// `key` (the peer refused it).
+    Forget { installation: String, key: [u8; 32] },
+}
+
+/// Credential enrollments and removals, off the lane threads (a slow or
+/// wedged catalog never holds a lane, §2.3). The queue is bounded; a job
+/// that does not fit is dropped (the next session establishment queues an
+/// enrollment again; a refused key is never presented again anyway).
+struct CredentialWriter {
+    tx: Mutex<Option<mpsc::SyncSender<CredentialJob>>>,
+}
+
+impl CredentialWriter {
+    fn start(local: String, catalog: Option<Arc<Catalog>>) -> Arc<CredentialWriter> {
+        let Some(catalog) = catalog else {
+            return Arc::new(CredentialWriter {
+                tx: Mutex::new(None),
+            });
+        };
+        let (tx, rx) = mpsc::sync_channel::<CredentialJob>(CREDENTIAL_QUEUE);
+        let spawned = thread::Builder::new()
+            .name("peer-credentials".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    run_credential_job(&local, &catalog, job);
+                }
+            });
+        let tx = match spawned {
+            Ok(_) => Some(tx),
+            Err(error) => {
+                event!(error, CATALOG_UNAVAILABLE, {
+                    "detail": "cannot start the peer-credentials thread; peers keep their pairing codes",
+                    "error": error.to_string(),
+                });
+                None
+            }
+        };
+        Arc::new(CredentialWriter { tx: Mutex::new(tx) })
+    }
+
+    /// Queues `job`; `false` when it was dropped.
+    fn post(&self, job: CredentialJob) -> bool {
+        match lock(&self.tx).as_ref().map(|tx| tx.try_send(job)) {
+            Some(Ok(())) => true,
+            Some(Err(mpsc::TrySendError::Full(_))) => {
+                event!(warn, CATALOG_UNAVAILABLE, {
+                    "detail": "the peer-credentials queue is full; a credential job was dropped",
+                });
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// No more jobs; the thread ends once the queue is drained.
+    fn close(&self) {
+        lock(&self.tx).take();
+    }
+}
+
+fn run_credential_job(local: &str, catalog: &Catalog, job: CredentialJob) {
+    match job {
+        CredentialJob::Enroll {
+            conn,
+            server,
+            code,
+            cancel,
+            done,
+        } => {
+            let installation = server.installation.clone();
+            match enroll_on(&conn, local, &server, &code) {
+                Ok(key) if !cancel.is_cancelled() => {
+                    if let Err(error) = catalog.enroll(&installation, CredentialSide::Outbound, key)
+                    {
+                        event!(warn, (error.code.as_str()), {
+                            "peer": installation,
+                            "detail": "the per-peer credential could not be stored",
+                            "message": error.message,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    event!(info, (error.code.as_str()), {
+                        "peer": installation,
+                        "detail": "no per-peer credential was enrolled; the pairing code stays in use",
+                        "message": error.message,
+                    });
+                }
+            }
+            done.store(false, Ordering::Release);
+        }
+        CredentialJob::Forget { installation, key } => {
+            let current = catalog
+                .credentials()
+                .active(&installation, CredentialSide::Outbound);
+            if current == Some(key)
+                && let Err(error) = catalog.forget(&installation, CredentialSide::Outbound)
+            {
+                event!(warn, (error.code.as_str()), {
+                    "peer": installation,
+                    "detail": "a refused per-peer credential could not be forgotten",
+                    "message": error.message,
+                });
+            }
+        }
     }
 }
 
@@ -1759,16 +2228,28 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
             return;
         }
         supervisor.set_lane(lane, LaneState::Dialing, None, None, None);
-        let dialed = supervisor.dial(lane);
+        let presented = supervisor.outbound_key();
+        let dialed = supervisor.dial(lane, presented);
         if supervisor.cancel.is_cancelled() {
             if let Ok((conn, _)) = dialed {
                 conn.close();
             }
             return;
         }
+        // WP4.1: the peer refused our credential: drop it and re-dial with
+        // the code at once (the next dial no longer presents it).
+        if let (Err(error), Some(key)) = (&dialed, presented)
+            && error.to_wire().code == "PEER_REVOKED"
+        {
+            supervisor.credential_refused(key);
+            continue;
+        }
         let error = match dialed {
             Ok((conn, server)) => {
                 supervisor.gate_success();
+                if lane == 0 && !server.features.iter().any(|f| f == PEER_HMAC_V1) {
+                    supervisor.enroll_later(&conn, &server);
+                }
                 backoff.success(Instant::now());
                 supervisor.update_lane(lane, |view| view.attempt = backoff.attempt());
                 let protocol = format!("{}/{}", server.protocol, server.version);
