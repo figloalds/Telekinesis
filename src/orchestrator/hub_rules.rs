@@ -734,19 +734,41 @@ pub fn missing(content: &ContentCounters) -> (u64, u64) {
     )
 }
 
-/// Whether `source` can likely supply some of what `target` misses: its
-/// counters are unknown (for a download, only a peer that [`may_supply`]
-/// gets this far), it is complete, it misses strictly fewer bytes, or it
-/// misses something else than `target` does while holding objects (WP3.INT
-/// re-review: each side missing different objects, as during a large upload
-/// one way and a download the other, hid the download). Two replicas missing
-/// the same objects (lost everywhere: the same objects and bytes missing)
-/// owe each other nothing, so that case never shows as a transfer or a stall.
-fn can_supply(source: Option<&ContentCounters>, target: &ContentCounters) -> bool {
+/// Whether `source` can likely supply some of what `target` misses:
+///
+/// * its counters are unknown (for a download, only a peer that
+///   [`may_supply`] gets this far), or it is complete;
+/// * it misses strictly fewer objects or fewer bytes: then `target` misses
+///   something `source` holds;
+/// * it misses at least as many objects and bytes, so the totals cannot say
+///   (it may miss a superset of what `target` misses: one object lost on both
+///   sides plus what it is still receiving from `target`, WP3.INT re-review
+///   2), but it moved objects to `target` lately (`moved`, per-pair
+///   evidence), misses something else than `target` does and holds objects.
+///   That shows a download while each side misses different objects, as
+///   during a large upload one way and a download the other (WP3.INT
+///   re-review), without counting phantom work from a peer that only misses
+///   more.
+///
+/// Two replicas missing the same objects (lost everywhere: the same objects
+/// and bytes missing) owe each other nothing, so that case never shows as a
+/// transfer or a stall.
+fn can_supply(source: Option<&ContentCounters>, target: &ContentCounters, moved: bool) -> bool {
     source.is_none_or(|source| {
         let (theirs, ours) = (missing(source), missing(target));
-        source.complete || theirs.1 < ours.1 || (theirs != ours && source.shared_available > 0)
+        source.complete
+            || theirs.0 < ours.0
+            || theirs.1 < ours.1
+            || (moved && theirs != ours && source.shared_available > 0)
     })
+}
+
+/// Whether something happened within `window` before `now` (`at` and `now`
+/// on the same clock, in milliseconds): the per-pair evidence that a peer
+/// moved objects (`may_supply`, [`download_work_with_evidence`],
+/// [`upload_work_with_evidence`]).
+pub fn lately(at: Option<u64>, now: u64, window: Duration) -> bool {
+    at.is_some_and(|at| now.saturating_sub(at) < ms(window))
 }
 
 /// Whether our missing content may be attributed to a peer as download work
@@ -770,13 +792,48 @@ pub fn may_supply(
     now_ms: u64,
     window: Duration,
 ) -> bool {
-    published || last_supplied_ms.is_some_and(|at| now_ms.saturating_sub(at) < ms(window))
+    published || lately(last_supplied_ms, now_ms, window)
+}
+
+/// Whether a peer may supply some of what we miss ([`can_supply`]; `supplied`:
+/// it moved objects to us lately, the hub's per-pair evidence): download
+/// work is attributed to it.
+pub fn supplies_download(
+    local: &ContentCounters,
+    remote: Option<&ContentCounters>,
+    supplied: bool,
+) -> bool {
+    can_supply(remote, local, supplied)
+}
+
+/// Whether we may supply some of what a peer misses ([`can_supply`];
+/// `served`: we moved objects to it lately): upload work is attributed to the
+/// pair.
+pub fn supplies_upload(
+    local: Option<&ContentCounters>,
+    remote: &ContentCounters,
+    served: bool,
+) -> bool {
+    can_supply(local, remote, served)
 }
 
 /// What we may still download from a peer: our missing objects and bytes,
-/// when the peer (its published content counters) can supply some of them.
+/// when the peer (its published content counters) can supply some of them,
+/// judged from the counters alone ([`download_work_with_evidence`] without
+/// evidence).
 pub fn download_work(local: &ContentCounters, remote: Option<&ContentCounters>) -> (u64, u64) {
-    if can_supply(remote, local) {
+    download_work_with_evidence(local, remote, false)
+}
+
+/// [`download_work`], given whether the peer moved objects to us lately
+/// (`supplied`: within the stall threshold, the hub's per-pair evidence),
+/// which decides when the counters cannot ([`can_supply`]).
+pub fn download_work_with_evidence(
+    local: &ContentCounters,
+    remote: Option<&ContentCounters>,
+    supplied: bool,
+) -> (u64, u64) {
+    if supplies_download(local, remote, supplied) {
         missing(local)
     } else {
         (0, 0)
@@ -784,9 +841,22 @@ pub fn download_work(local: &ContentCounters, remote: Option<&ContentCounters>) 
 }
 
 /// What a peer still lacks that we may upload: its missing objects and
-/// bytes (from its published entry), when we can supply some of them.
+/// bytes (from its published entry), when we can supply some of them,
+/// judged from the counters alone ([`upload_work_with_evidence`] without
+/// evidence).
 pub fn upload_work(local: Option<&ContentCounters>, remote: &ContentCounters) -> (u64, u64) {
-    if can_supply(local, remote) {
+    upload_work_with_evidence(local, remote, false)
+}
+
+/// [`upload_work`], given whether we moved objects to the peer lately
+/// (`served`: within the stall threshold, the hub's per-pair evidence),
+/// which decides when the counters cannot ([`can_supply`]).
+pub fn upload_work_with_evidence(
+    local: Option<&ContentCounters>,
+    remote: &ContentCounters,
+    served: bool,
+) -> (u64, u64) {
+    if supplies_upload(local, remote, served) {
         missing(remote)
     } else {
         (0, 0)
