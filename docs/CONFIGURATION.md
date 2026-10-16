@@ -40,6 +40,7 @@ Set them in the daemon's environment; workers inherit it. All are optional.
 | `TKFS_UNSUPERVISED_EXIT_S` | worker | A worker started by a daemon stops itself (when quiet) after this many seconds without contact from any daemon; default 600, `0` disables it. |
 | `TKFS_REMOTE_FASTPATH` | worker | `0` restricts the incremental commit of creations and namespace changes to this replica's own events, and disables it on a branch with any conflict row, as the previous release did (a kill switch; slower). Any other value, or unset: the fast paths serve remote events too. |
 | `TKFS_CONFLICT_MODE` | worker | How commits derive conflicts: `append` (default) derives only what the new event adds when that is provably exact, else in full; `full` always derives in full (the reference, slower); `verify` runs both and fails the commit with `CONFLICT_MODE_MISMATCH` on any difference (for testing). An unknown value selects `full`. |
+| `TKFS_LOG_ROTATE_BYTES`, `TKFS_LOG_ROTATE_FILES` | daemon | The size at which `DATA/logs/orchestrator.log` is rotated (bytes, at least 256; default 10 MiB) and how many files are kept (1–100, default 5). |
 | `TKFS_FAULT_POINT`, `TKFS_FAULT_ACTION`, `TKFS_FAULT_SCOPE`, `TKFS_FAULT_MS`, `TKFS_FAULT_COUNT` | both | Fault injection for the qualification scenarios (`hang`, `fail`, `exit`, `panic` at a named point). Never set them in production. |
 | `TKFS_FAULT` | worker | The older fault hook of the test suites (exit 86 at a named point). Never set it in production. |
 | `TKFS_GUI_RENDER`, `TKFS_GUI_RENDER_SNAPSHOT`, `TKFS_GUI_RENDER_VIEW`, `TKFS_GUI_RENDER_SIZE` | desktop | Render one desktop frame to a BMP file without a window (from a saved status snapshot or the running daemon), for documentation and checks; see [validation](VALIDATION.md#desktop-manual-checklist). |
@@ -50,41 +51,54 @@ Set them in the daemon's environment; workers inherit it. All are optional.
 ```text
 orchestrator.toml
 data/                            data_directory
-  folders.sqlite                 catalog: folders, intents, gates, peers, pairing verifier
+  folders.sqlite                 catalog: folders, intents, gates, peers, pairing
+                                 verifier, per-peer credentials (owner-only)
   orchestrator.lock              one daemon per data directory
-  orchestrator.json              the running daemon: control and network addresses, pid, version
-  logs/orchestrator.log          output of a daemon the desktop started
+  orchestrator.json              the running daemon: addresses, pid, version
+  orchestrator.token             the running daemon's control token (owner-only)
+  logs/orchestrator.log          the daemon's log (JSON lines; rotated to .1 … .4)
+  diagnostics/<time>/            bundles written by `manage diagnostics`
   states/<state id>/             one folder
     metadata.sqlite (-wal, -shm) journal, projection, inbox, feed and object indexes
     objects/                     verified content objects (SHA-256 names)
     incoming-objects/            partial downloads (spools)
-    staging/                     write buffers of open files; kept for saves still pending
+    staging/                     write buffers of open files; pending saves
     owner.lock                   one worker per state
     runtime.json                 the running worker's loopback address
-    worker.json                  the running worker's identity (pid, start time, executable, version)
+    runtime.token                the running worker's token (owner-only)
+    worker.json                  the running worker's identity (pid, start time,
+                                 executable, version) and token
     worker.log                   the worker's startup lines and errors
+                                 (rotated at start: worker.log.1 …)
 mounts/<label>/                  default mount points
 ```
 
-`runtime.json` and `worker.json` exist only while a worker runs (a crashed
-worker leaves them; the next daemon checks them before adopting or replacing
-it). `orchestrator.json` exists only while a daemon runs.
+`runtime.json`, `runtime.token` and `worker.json` exist only while a worker
+runs (a crashed worker leaves them; the next daemon checks them before
+adopting or replacing it). `orchestrator.json` exists only while a daemon
+runs; `orchestrator.token` is written by each daemon when it starts.
 
 ## Logs
 
-- **Daemon**: JSON lines on stderr, `{"at_ms":…,"level":…,"code":…,…}`, at
-  most 20 lines per code and minute (then one `suppressed` count). A daemon
-  started by the desktop appends its output to `DATA/logs/orchestrator.log`;
-  a daemon you start yourself logs where its stderr goes (redirect it, or let
-  the service manager keep it).
-- **Workers**: `DATA/states/<state>/worker.log`, appended at every start: the
-  startup lines, the Ready line, and the worker's JSON log lines. The last
-  lines of it are shown as a folder's `last exit` when no fatal line explains
-  an exit.
-- In this build neither file is rotated: watch their size on long-running
-  hosts.
+- **Daemon**: `DATA/logs/orchestrator.log`, one JSON object per line,
+  `{"at_ms":…,"level":…,"code":…,…}`, at most 20 lines per code and minute
+  (then one `suppressed` count). The file is rotated at 10 MiB and 5 files are
+  kept (`orchestrator.log`, then `.1` to `.4`, the oldest dropped);
+  `TKFS_LOG_ROTATE_BYTES` and `TKFS_LOG_ROTATE_FILES` change that. A daemon
+  started from a terminal or by a service manager also prints its events on
+  stderr. A daemon started by the desktop writes the same file, and the
+  desktop's **Log** button opens it; `manage status` shows its path (`log`).
+- **Workers**: `DATA/states/<state>/worker.log`: the startup lines, the Ready
+  line (its token redacted) and the worker's JSON log lines, appended while
+  it runs. When a worker
+  starts and the file is larger than 10 MiB, it is rotated first
+  (`worker.log.1` …). The last lines of it are shown as a folder's
+  `last exit` when no fatal line explains an exit.
+- No log line carries a pairing code, a per-peer secret or a token: fields
+  with such names are written `<redacted>`.
 - `manage status` and the desktop show the status and the recent activity
-  (500 entries) without reading logs.
+  (500 entries) without reading logs; `manage diagnostics` collects the ends
+  of the logs with the status into one bundle ([CLI](CLI.md#daemon)).
 
 ## Pairing credentials and local access
 
@@ -92,19 +106,44 @@ it). `orchestrator.json` exists only while a daemon runs.
   once by `manage reset-pairing-code`. The host stores a salted SHA-256
   verifier of it; the verifier is as sensitive as the code (it is the
   authentication key).
-- A **dialing** host stores the remote host's code in its catalog
-  (`folders.sqlite`), so it can reconnect.
-- The code never crosses the network: sessions authenticate with an
+- **Per-peer credentials.** `manage pair` authenticates once with the code;
+  over that authenticated session the dialing host then enrolls a fresh
+  random 32-byte secret `S` with the accepting host (`peer.enroll`), and both
+  keep the key derived from it, `K_peer = SHA-256("tkfs-peer-secret-v1" ‖ S)`,
+  in `folders.sqlite`. Later sessions authenticate with `K_peer` (scheme
+  `peer-hmac-v1`) instead of the code, so each pairing has its own
+  credential that can be revoked alone. A missing or revoked credential is
+  refused with `PEER_REVOKED`. `K_peer` is as sensitive as a code.
+- A **dialing** host also keeps the remote host's code in its catalog
+  (`folders.sqlite`).
+- The pairing code never crosses the network: sessions authenticate with an
   HMAC-SHA256 challenge in both directions, so WS and WSS carry the same
   proof; WSS adds transport encryption.
-- Rotating the code (`reset-pairing-code`) closes every session that used the
-  old one within a second; dialers must pair again.
-- **Local control**: the daemon's management endpoint and the workers'
-  endpoints listen on loopback only. In this build they require no token:
-  any process of a local user can manage the daemon. Protect the data
-  directory and the configuration with the operating system's permissions
-  (Linux: owner-only `0700`/`0600` if other users share the machine; Windows:
-  keep them in your user profile). TKFS never changes permissions itself.
+- **Revocation.** `manage unpair` first asks the other host to revoke this
+  host's credential (`peer.revoke`, best effort: an unreachable host does not
+  block the unpair); the other host revokes it and closes every session of
+  this installation within a second. Rotating the code
+  (`reset-pairing-code`) closes every session that used the old code and
+  revokes every per-peer credential of the hosts that dial this one, within a
+  second; they must pair again with the new code.
+- **Local access.** The daemon's management endpoint and the workers'
+  endpoints listen on loopback only, and each requires a token at the
+  WebSocket upgrade (header `X-Tkfs-Token`); a connection without the right
+  one is refused before any request is read (`ACCESS_DENIED`):
+  - the daemon's token is `DATA/orchestrator.token`; `tkfs manage …` and the
+    desktop read it;
+  - each worker has its own token, in `STATE/runtime.token` and
+    `STATE/worker.json`, required on its JSON RPC and on its loopback
+    sessions; the daemon gets it from the worker's Ready line, and the
+    filesystem commands (`tkfs -C …`, `tkfs --runtime …`) read
+    `runtime.token`.
+- **Owner-only files.** The token files and `folders.sqlite` are created
+  owner-only: mode `0600` on Linux; on Windows they inherit the ACL of the
+  data directory, which in your user profile allows only you (plus SYSTEM
+  and Administrators). Whoever can read them can manage the daemon, act as
+  this host towards its peers, or dial its peers: keep the data directory in
+  your profile on Windows, and `0700` on Linux if other users share the
+  machine. Run `tkfs manage …` as the user the daemon runs as.
 
 ## Remote access through a TLS proxy
 
@@ -149,4 +188,7 @@ Stop the daemon (`manage shutdown`; check that no worker is left running),
 then copy the whole data directory. Restore it at the same path: the catalog
 records the absolute paths of the folders' state directories and mounts, and
 no command changes a state directory's path (`manage configure-mount`
-changes a stopped folder's mount path).
+changes a stopped folder's mount path). The copy holds the pairing verifier,
+the per-peer credentials and the codes of the hosts this one dials
+(`folders.sqlite`): protect it like the original. The token files need no
+backup; each daemon and worker writes a new one when it starts.

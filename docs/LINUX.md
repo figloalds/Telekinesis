@@ -13,7 +13,12 @@ cargo build --release --locked
 Outbound `wss://` uses OpenSSL and the distribution's CA bundle
 (`ca-certificates`). Mounts need FUSE 3 (`fuse3`, `fusermount3`) and
 `/dev/fuse`; headless folders need neither. TKFS does not install
-certificates, change trust stores or change file permissions.
+certificates or change trust stores. It creates its token files
+(`orchestrator.token`, each state's `runtime.token`) and the catalog
+(`folders.sqlite`, with its `-wal`/`-shm` files) with mode `0600`; the rest of
+the data directory follows your umask, so keep it `0700` if other users share
+the machine (see
+[local access](CONFIGURATION.md#pairing-credentials-and-local-access)).
 
 ```sh
 tkfs init -f ./orchestrator.toml
@@ -50,7 +55,11 @@ A worker started by hand (`tkfs daemon`) also stops on SIGINT/SIGTERM; with
 files open it refuses (`BUSY_VIEW`, logged): send the signal again once they
 are closed.
 
-For a systemd service, adapt `deploy/tkfs-orchestrator.service.example`:
+Management commands read the daemon's token (`DATA/orchestrator.token`,
+owner-only), so run them as the daemon's user (`sudo -u USER tkfs …`).
+
+For a systemd service, adapt `deploy/tkfs-orchestrator.service.example`
+(`ExecStop` runs as the service's user, so it can read the token):
 
 ```ini
 ExecStart=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml orchestrator
@@ -81,8 +90,8 @@ adoption: a restarted container restarts its folders.
 
 - Stop or restart it with time for the daemon's own shutdown:
   `docker compose stop -t 60` (Docker's default is 10 s, then SIGKILL).
-- Run management commands inside it:
-  `docker compose exec tkfs-daemon ./tkfs manage status`.
+- Run management commands inside it, as the daemon's user (they read its
+  token): `docker compose exec tkfs-daemon ./tkfs manage status`.
 - Mounts live in the container's mount namespace; to see the files on the
   host, use a headless folder plus another tool, or configure mount
   propagation yourself.

@@ -45,10 +45,13 @@ tkfs -f orchestrator.toml gui            # the Windows desktop
   console, or SIGINT/SIGTERM; every one of them runs the same shutdown
   sequence (see `manage shutdown`). On start it prints its discovery record
   (`{control, network, installation, pid, version, …}`) on stdout and writes
-  the same to `DATA/orchestrator.json`; its log is JSON lines on stderr.
+  the same to `DATA/orchestrator.json`, and its control token to
+  `DATA/orchestrator.token`. Its log is `DATA/logs/orchestrator.log` (JSON
+  lines, rotated; see [logs](CONFIGURATION.md#logs)); its events are also
+  printed on stderr.
 - `gui` (Windows only; elsewhere it fails with `DESKTOP_WINDOWS_ONLY`) creates
-  the configuration if it is missing, starts a daemon if none answers (its
-  output appended to `DATA/logs/orchestrator.log`) and shows the folders,
+  the configuration if it is missing, starts a daemon if none answers (it
+  logs to `DATA/logs/orchestrator.log`) and shows the folders,
   peers and activity. `tkfs` with no arguments opens the desktop with
   `orchestrator.toml` on Windows. Closing the window leaves the daemon and its
   mounts running.
@@ -56,8 +59,11 @@ tkfs -f orchestrator.toml gui            # the Windows desktop
 ## Managing folders: `tkfs manage …`
 
 Every `manage` command talks to the running daemon over its loopback control
-endpoint. With no daemon running they fail with `ORCHESTRATOR_NOT_RUNNING`
-(or `WS_CONNECT_FAILED` when a crashed daemon left its `orchestrator.json`).
+endpoint, presenting the daemon's token (`DATA/orchestrator.token`): run them
+as the user the daemon runs as. A token that cannot be read or does not match
+is refused at the connection (`ACCESS_DENIED`). With no daemon running they
+fail with `ORCHESTRATOR_NOT_RUNNING` (or `WS_CONNECT_FAILED` when a crashed
+daemon left its `orchestrator.json`).
 A command that changes something is never sent twice: if the connection is
 lost after sending, it fails with `CONNECTION_LOST` and says so; check
 `manage status` to see whether it happened.
@@ -75,9 +81,10 @@ tkfs manage watch
 tkfs manage watch --json
 ```
 
-- `status` prints the daemon, a one-line overview, one block per folder and
-  the peers, then the recent activity. `--json` prints the status snapshot
-  (schema 2) as the daemon sends it.
+- `status` prints the daemon (version, uptime, installation, control and
+  network addresses, its `log` file, its own errors), a one-line overview,
+  one block per folder and the peers, then the recent activity. `--json`
+  prints the status snapshot (schema 2) as the daemon sends it.
 - `watch` follows the same view live until Ctrl-C: on a terminal it redraws
   in place on every change and every 2 s (ages and countdowns); otherwise it
   prints each changed snapshot. With `--json` it prints one snapshot per line.
@@ -217,8 +224,18 @@ tkfs manage diagnostics
 tkfs manage shutdown
 ```
 
-- `diagnostics` is the diagnostics bundle action. In this build it returns
-  only `{"schema": 1}`; the bundle itself is not written yet.
+- `diagnostics` writes a diagnostics bundle and prints the daemon's JSON
+  reply, whose `path` is the bundle's directory, `DATA/diagnostics/<time>/`.
+  It holds `status.json` (the status snapshot), `activity.json` (the recent
+  activity), `folders/<state>.heartbeat.json` (each folder's lifecycle,
+  gate, mount and last heartbeat), `catalog.redacted.json` (folders, peers,
+  gates; no codes, verifier or credentials), `logs/*.tail` (the end of the
+  daemon's log and of each folder's `worker.log`) and `versions.json` (the
+  daemon's and workers' versions, protocol and format versions, the
+  platform). Pairing codes, per-peer secrets and tokens are removed from
+  every file. It reads the daemon's snapshots and files only, so it answers
+  while folders are busy or stuck; older bundles are deleted, keeping the
+  newest 10.
 - `shutdown` stops the daemon: new requests get `ORCHESTRATOR_STOPPING`, the
   peer connections close, every folder is stopped in parallel (at most 30 s),
   and the reply lists each folder's outcome: `stopped`, `left_running` (the
@@ -242,16 +259,20 @@ tkfs manage unpair wss://files.example.com
 ```
 
 - `reset-pairing-code` creates a new pairing code for this daemon and prints
-  it once (`{"code": …}`); only a salted verifier of it is stored. Sessions
-  that authenticated with the previous code are closed within a second
-  (`PAIRING_CODE_CHANGED`); every host that dials this one must pair again
+  it once (`{"code": …}`); only a salted verifier of it is stored. It also
+  revokes the per-peer credential of every host that dials this one.
+  Sessions that authenticated with the previous code or one of those
+  credentials are closed within a second (`PAIRING_CODE_CHANGED`), and
+  their hosts are refused from then on (`PEER_REVOKED`,
+  `INVALID_PAIRING_CODE`): every host that dials this one must pair again
   with the new code.
 - `pair ENDPOINT` reads the other host's pairing code from stdin (it prompts
   `Pairing code:` on stderr), authenticates once (the code itself never
-  crosses the network), stores the endpoint, the code and the peer's
-  installation, and starts the connection pool. `--connections N` (1–16,
-  default `network.connections`) sets the pool: one control lane plus at
-  least one bulk lane (`1` is raised to 2). Pairing the same endpoint again
+  crosses the network), enrolls a per-peer credential with the other host
+  (later sessions authenticate with it), stores the endpoint, the code and
+  the peer's installation, and starts the connection pool.
+  `--connections N` (1–16, default `network.connections`) sets the pool: one
+  control lane plus at least one bulk lane (`1` is raised to 2). Pairing the same endpoint again
   updates the code and the pool and reconnects at once; pairing another
   endpoint of the same installation replaces the old one. A host running the
   previous release is refused with `PEER_NEEDS_UPGRADE` before the code is
@@ -267,8 +288,13 @@ tkfs manage unpair wss://files.example.com
   mount (at `--mount`, or `default_mount_directory/LABEL`) waits for the
   initial sync from that host (the gate), so files are not shown half
   synchronized. `--headless` receives without a mount.
-- `unpair ENDPOINT` forgets the peer and closes its connections within 5 s.
-  The other host keeps its own pairings.
+- `unpair ENDPOINT` first asks the other host to revoke this host's
+  per-peer credential (`peer.revoke`; best effort, so an unreachable host
+  does not block it), then forgets the peer and closes its connections
+  within 5 s. The other host closes this host's sessions within a second and
+  refuses its credential from then on (`PEER_REVOKED`). If the other host
+  also paired with this one (it dials this host too), that pairing is its
+  own: unpair it there.
 
 `ENDPOINT` is `ws://HOST:PORT` or `wss://HOST[:PORT][/PATH]` (query strings
 are kept). `ws://` defaults to port 80, `wss://` to 443; `wss://` verifies the
@@ -301,8 +327,9 @@ tkfs daemon --state D:\tkfs\standalone --supervised
 ## Filesystem commands
 
 These talk to one folder's worker, found through its mount (`-C`) or its
-state directory (`--runtime`). They work the same on managed and standalone
-folders.
+state directory (`--runtime`), and present the worker's token
+(`runtime.token` in its state directory): run them as the user the worker
+runs as. They work the same on managed and standalone folders.
 
 ```sh
 tkfs -C D:\Work\Projects status

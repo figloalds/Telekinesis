@@ -117,6 +117,19 @@ of each data directory (the configuration's `data_directory`:
 rollback possible. The configuration file does not change (it stays
 `format_version = 2`).
 
+**How the previous release shuts down.** Its `manage shutdown` stops the
+folders one at a time and gives up at the first one that refuses: a folder
+with files open or unsaved in its mount (`BUSY_VIEW: N open contexts, M
+unsaved files; …`), or a worker that has not exited 5 s after it was asked
+(`WORKER_STOP_TIMEOUT`). The command then prints that error and exits with
+status 1, and the old daemon **keeps running**: within 2 s it starts again
+the folders it had already stopped. Nothing is lost, but the old binary is
+still in use. Close the files and run the same `manage shutdown` again, until
+it prints `"stopped": true`. (Its client gives up after 15 s; if it times out,
+run it again: `ORCHESTRATOR_STOPPING` or `ORCHESTRATOR_NOT_RUNNING` then
+means the old daemon is exiting or gone.) Do not stop single workers
+(`tkfs --runtime … stop`) while the old daemon runs: it starts them again.
+
 1. **Server first.** With the Docker example (`examples/docker-compose.yml`:
    the binary `./tkfs` sits in the bind-mounted directory, the daemon is the
    container's main process and the container restarts by itself), put the
@@ -129,15 +142,20 @@ rollback possible. The configuration file does not change (it stays
    docker compose exec tkfs-daemon ./tkfs.previous manage shutdown
    ```
 
-   The old daemon stops its folders cooperatively and exits; Docker restarts
-   the container, which now runs the new binary. (The previous release does
-   not handle SIGTERM, so `docker compose stop` would end it only by killing
-   it after the timeout.) To take a backup first, keep the container from
+   Only when it prints `"stopped": true` has the old daemon stopped every
+   folder; it then exits, and Docker restarts the container, which now runs
+   the new binary. If it prints `BUSY_VIEW` or `WORKER_STOP_TIMEOUT`, the old
+   daemon is still running with its folders: repeat the command as described
+   above (a headless folder on a server rarely has files open; a mounted one
+   may, through programs in the container). The previous release does not
+   handle SIGTERM, so `docker compose stop` would end it only by killing it
+   after the timeout. To take a backup first, keep the container from
    restarting (`docker update --restart=no tkfs_daemon` before the shutdown),
-   copy the directory, then `docker update --restart=unless-stopped
-   tkfs_daemon` and `docker compose up -d`. Without Docker:
-   `tkfs -f orchestrator.toml manage shutdown` with the old binary, replace
-   the binary, start the daemon.
+   copy the directory once the shutdown succeeded, then
+   `docker update --restart=unless-stopped tkfs_daemon` and
+   `docker compose up -d`. Without Docker: run
+   `tkfs -f orchestrator.toml manage shutdown` with the old binary until it
+   prints `"stopped": true`, replace the binary, start the daemon.
 2. **Then the desktop.** Close the desktop window, then shut the old daemon
    down with the old binary:
 
@@ -145,11 +163,17 @@ rollback possible. The configuration file does not change (it stays
    tkfs -f orchestrator.toml manage shutdown
    ```
 
-   On Windows an executable cannot be replaced while any `tkfs.exe` process
-   runs, workers included. A worker with files open refuses to stop and is
-   left running: close the files, then `tkfs --runtime
-   DATA\states\STATE\runtime.json stop`, until no `tkfs.exe` is left in Task
-   Manager. Replace the binary and start `tkfs gui` (or
+   It must print `"stopped": true`. If it fails with `BUSY_VIEW` (files open
+   or unsaved in a mounted folder) or `WORKER_STOP_TIMEOUT`, the old daemon
+   is still running and starts the folders it had stopped again: close the
+   files (editors, Explorer windows, terminals inside the mounts) and run the
+   same command again until it prints `"stopped": true`. Only then replace
+   the binary: on Windows an executable cannot be replaced while any
+   `tkfs.exe` process runs. Check Task Manager: once the old daemon has
+   exited, a `tkfs.exe` still listed is a worker it did not know about (left
+   by an earlier crash of it); stop that one with the old binary,
+   `tkfs --runtime DATA\states\STATE\runtime.json stop`, after closing its
+   files. Replace the binary and start `tkfs gui` (or
    `tkfs -f orchestrator.toml orchestrator`).
 3. **Watch** both sides until every folder reads `Up to date`:
 
@@ -180,6 +204,14 @@ Nothing needs to be exported, re-created or re-paired:
   paths, desired-running flags, pairings (endpoints, codes, installations,
   pool sizes) and this host's pairing code are kept. A folder that was still
   waiting for its initial sync keeps waiting under the new gate.
+- **Pairings and credentials**: a pairing made with the previous release
+  keeps working with its stored code. This release gives each pairing its
+  own per-peer credential (enrolled when you pair; see
+  [pairing credentials](docs/CONFIGURATION.md#pairing-credentials-and-local-access)),
+  and the daemon writes its local control token (`DATA/orchestrator.token`)
+  at start. Run every `tkfs` command with the new binary after the upgrade:
+  the new daemon refuses clients that do not present its token, which
+  includes the previous release's CLI and desktop.
 - **Folder states** (`DATA/states/<id>/`): opened in place by their worker.
   New tables and indexes are added and filled once; the journal, the objects
   and every received event are kept. Nothing deletes user data or history.
@@ -344,7 +376,7 @@ Each folder lists every peer that shares it, with its own state:
 |---|---|
 | `paused` | Sync is paused for this folder. |
 | `needs upgrade` | The peer runs the previous release (`PEER_NEEDS_UPGRADE`) or another incompatible version. |
-| `unauthorized` | The pairing code was refused or rotated: pair again. |
+| `unauthorized` | The peer refused our pairing code or our per-peer credential (its code was rotated, or the credential revoked): pair again. |
 | `offline`, `connecting` | The peer's connection is down, or being dialed. |
 | `backing off (retry in …)` | The connection waits to redial (1 s up to 60 s), or an exchange for this folder failed and is retried. |
 | `waiting for the local worker` | Our folder is not running. |
@@ -370,8 +402,8 @@ up`, `last exchange`.
 | `backing off (retry in …)` | `Backoff (retry in 12 s)` | Every lane waits to redial after a failure (1 s doubling up to 60 s, reset after 30 s connected). |
 | `offline for …` | `Offline N min` | No lane and no inbound session. |
 | `needs upgrade (incompatible protocol)` | `Peer needs upgrade` | The peer runs the previous release or an incompatible protocol; rechecked every 10 min. |
-| `unauthorized: pair again with the current code` | `Unauthorized — re-pair` | The peer refused our pairing code (rotated or wrong); rechecked every 60 s. |
-| `revoked` | `Revoked` | Reserved for per-peer revocation; nothing sets it in this build. |
+| `unauthorized: pair again with the current code` | `Unauthorized — re-pair` | The peer refused our pairing code or our per-peer credential (code rotated or wrong, credential revoked); rechecked every 60 s. |
+| `revoked` | `Revoked` | The per-peer credential between the two hosts was revoked (`PEER_REVOKED`), by an unpair or by a rotation of the accepting host's code. Pair again with that host's current code. |
 
 Direction: `outbound` (we dial it), `inbound` (it dials us; we have no
 pairing record for it), `both ways`. Lanes: lane 0 is the control lane
@@ -385,9 +417,9 @@ pairing record for it), `both ways`. Lanes: lane 0 is the control lane
 |---|---|
 | `stopped` | No worker; `stopped (start pending)` if it should run. |
 | `starting for … · <phase> (step N)` | Recovering the store; killed only if it reports no progress for 30 s (`WORKER_START_TIMEOUT`). `adopting the running worker` after a daemon restart. |
-| `running · pid N` | Serving; `adopted` when this daemon took over a worker a previous daemon started; `degraded: the engine lock is stalled` when one operation has held the store for more than 120 s (never killed for it). |
-| `stop blocked` | A stop was refused because files are open or unsaved (`BUSY_VIEW`); retried every 2 s. `force-stop` ends it. |
-| `stopping` | Stop in progress (graceful, then 10 s for the exit, then a verified kill). |
+| `running for … · pid N` | Serving; `adopted` when this daemon took over a worker a previous daemon started; `degraded: the engine lock is stalled` when one operation has held the store for more than 120 s (never killed for it). |
+| `stop blocked for …` | A stop was refused because files are open or unsaved (`BUSY_VIEW`); retried every 2 s. `force-stop` ends it. |
+| `stopping for …` | Stop in progress (graceful, then 10 s for the exit, then a verified kill). |
 | `restarting in N s` | The worker exited or failed to start; it restarts after 1 s doubling up to 5 min (±20 %). |
 | `failed` | Not restarted until you act: `CRASH_LOOP` (5 failures in 10 min), a fatal store error, or `PREVIOUS_WORKER_UNRESPONSIVE`. |
 
@@ -458,7 +490,7 @@ Common codes:
 | Code | Class | What to do |
 |---|---|---|
 | `PEER_NEEDS_UPGRADE`, `PEER_PROTOCOL_UNSUPPORTED` | incompatible | Upgrade the other host ([runbook](#peer-needs-upgrade)). |
-| `INVALID_PAIRING_CODE`, `PAIRING_CODE_CHANGED`, `PAIRING_CODE_NOT_SET` | needs action | Pair again with the host's current code ([runbook](#unauthorized-after-a-code-rotation)). |
+| `INVALID_PAIRING_CODE`, `PAIRING_CODE_CHANGED`, `PAIRING_CODE_NOT_SET`, `PEER_REVOKED` | needs action | Pair again with the host's current code ([runbook](#unauthorized-after-a-code-rotation)). `PEER_REVOKED`: the other host no longer accepts this host's per-peer credential (it was unpaired, or the code was rotated). |
 | `PEER_INSTALLATION_CHANGED` | needs action | Another installation answers at that address (the host was reinstalled or the address moved): pair again (`manage pair ENDPOINT`) if that is intended. |
 | `CANNOT_PAIR_WITH_SELF` | needs action | That address is this daemon. |
 | `MOUNT_PATH_MUST_NOT_EXIST` | needs action | Remove the (empty) directory at the mount path or choose another path, then `manage attach` ([runbook](#mount-failed)). |
@@ -478,7 +510,13 @@ Common codes:
 | `STORE_IDENTITY_MISMATCH`, `INVALID_STORE_METADATA`, `STATE_NOT_INITIALIZED`, `ENGINE_POISONED` | fatal (that folder) | The folder's store needs attention: read `worker.log`; `manage retry` restarts it. |
 | `ORCHESTRATOR_NOT_RUNNING` | transient | No daemon answers for this configuration: start one. |
 | `ORCHESTRATOR_STOPPING` | transient | The daemon is shutting down. |
+| `ACCESS_DENIED` | transient | The daemon or worker refused the local connection: its token (`DATA/orchestrator.token`, `STATE/runtime.token`) was missing or did not match. Run `tkfs` as the user the daemon runs as, with the new binary ([local access](docs/CONFIGURATION.md#pairing-credentials-and-local-access)). |
 | `CONNECTION_LOST`, `REQUEST_TIMEOUT` | transient | A management command may or may not have run: check `manage status` before repeating it. |
+
+To report a problem, `tkfs manage diagnostics` writes a bundle (status,
+activity, each folder's view, the catalog without codes or secrets, the ends
+of the logs, versions) under `DATA/diagnostics/` and prints its path; see the
+[CLI](docs/CLI.md#daemon).
 
 ## Runbooks
 
@@ -497,16 +535,18 @@ header.
 
 ### Unauthorized after a code rotation
 
-`manage reset-pairing-code` on a host closes every session that used the old
-code within a second. Hosts that dial it show **Unauthorized — re-pair**
-(`INVALID_PAIRING_CODE` or `PAIRING_CODE_CHANGED`) and retry every 60 s,
-which keeps failing until they have the new code.
+`manage reset-pairing-code` on a host revokes the per-peer credential of
+every host that dials it and closes, within a second, every session that used
+the old code or one of those credentials. Hosts that dial it show
+**Unauthorized — re-pair** (`PEER_REVOKED`, `INVALID_PAIRING_CODE` or
+`PAIRING_CODE_CHANGED`) and retry every 60 s, which keeps failing until they
+pair with the new code.
 
 1. On the host that was rotated, use the code it printed (it is shown once; if
    it is lost, run `manage reset-pairing-code` again and use the new one for
    every dialer).
 2. On each dialing host: `tkfs manage pair ENDPOINT` and paste the code. The
-   lanes reconnect at once.
+   pairing gets a new per-peer credential and the lanes reconnect at once.
 
 ### Quarantined or blocked events
 

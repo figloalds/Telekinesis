@@ -41,6 +41,8 @@ What the suite covers, by area (file names under `tests/`):
 | Metadata feed | `feed_v7` (acks from evidence only, rejections, regressions, private branches, forged origins, large events) |
 | Objects | `objects_v3_worker` (durability, crash resume, authorization, leases), `objects_v3_lanes` (both directions, backoffs, handoff, slow links), `partial_content`, `availability` |
 | Sessions | `session_core` (framing, multiplexing, heartbeats, deadlines, WSS), `session_handshake` (HMAC, replay, legacy detection both ways) |
+| Security | `security` (local tokens on the control and worker endpoints, per-peer credentials and their enrollment, revocation on unpair within 1 s, rotation, replay, no code, secret or token in status or logs) |
+| Operations | `logging` (log rotation, redaction, the desktop's daemon log, `worker.log` rotation, diagnostics bundles without secrets) |
 | Daemon | `catalog_actor` (including the 6298d0b catalog upgrade and downgrade), `folder_controller` (lifecycle, adoption, gate), `management_api`, `peer_supervisor`, `meta_scheduler`, `inbound_v3`, `status_hub`, `orchestrator` (real daemons over the network), `w1/w2/w3_integration` |
 | Worker | `worker_lifecycle`, `worker_process`, `worker_concurrency`, `mount_lifecycle` (WinFsp and FUSE) |
 | Desktop | `gui_model` (every chip, row and action from status snapshots), the binary's own window tests |
@@ -66,7 +68,7 @@ CARGO_TARGET_DIR=$HOME/tkfs-target/qual bash scripts/qualify.sh --wave 3   # Lin
 
 | Option | Meaning |
 |---|---|
-| `-Wave N` / `-All` | Run the files of waves ≤ N (all) and enforce their floors. |
+| `-Wave N` / `-All` | Run the files of waves ≤ N (all) and enforce their floors. `-All` also raises the budgets the long scenarios need (`-BudgetS 2400`, `-FileTimeoutMin 150`) unless they are given, and writes `qualification-all.json`. |
 | `-Files a,b` / `-Filter NAME` | Only these files / scenarios. |
 | `-Merge` | Keep the other files' results from the existing evidence and replace only those run now. |
 | `-BudgetS S` | Measured-phase budget per scenario (`TKFS_QUAL_BUDGET_S`, default 120). |
@@ -136,7 +138,9 @@ baseline column is the previous release (`6298d0b`).
 The Wave 4 floors (`qual_scale`: startup to Ready at 50K objects < 10 s, idle
 worker CPU ≤ 1 %, management API p99 under churn, 1 GiB object, 10K tiny
 files, 150K feed, remote linear and two-way activation) are defined in
-`tests/qualification-floors.json` and are not measured in this build yet.
+`tests/qualification-floors.json` and enforced by `qualify.ps1 -All`; their
+measurements are recorded in `test-evidence/qualification-all.json` and are
+added to this table with the final integration's run.
 
 Floors bound by fsync latency (tiny files, the 256 MiB worker transfer) and by
 single slow operations (`fs_p99_during_catchup`, `concurrent_namespace_ops_5k`)
