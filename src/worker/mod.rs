@@ -1,5 +1,5 @@
 //! Owned by WP1.4 (worker lifecycle); WP2.3 adds the activator, status cell
-//! and maintenance threads.
+//! and maintenance threads; WP4.1 the instance's local token.
 //!
 //! Worker process entry: one folder state, its engine, the loopback RPC
 //! listener and an optional mount. `tkfs daemon --state S [--mount M]
@@ -16,8 +16,12 @@
 //! 5. build the `WorkerCtx`;
 //! 6. start the RPC listener: recovery is complete before any RPC (invariant
 //!    24); then the heartbeat thread (§4.1 step 10, moved here so that
-//!    nothing fallible remains after Ready);
-//! 7. write `runtime.json` and `worker.json` (`runtime.json.mount` is the
+//!    nothing fallible remains after Ready). The listener's per-instance
+//!    token (WP4.1) is in `STATE/runtime.token` (owner-only) before it
+//!    accepts anything; every JSON RPC and loopback session upgrade must
+//!    carry it;
+//! 7. write `runtime.json` and `worker.json` with the token
+//!    (`runtime.json.mount` is the
 //!    absolute, normalized legacy `--mount` once prepared, or the path of a
 //!    successful `mount-attach`; `None` before); a failure withdraws them
 //!    (`runtime.json`, and `worker.json` if it is this process's) before the
@@ -26,12 +30,14 @@
 //!    report a failure in Ready (never fatal; a stop accepted since step 6
 //!    skips it); `--supervised`: the orchestrator attaches later through
 //!    `mount-attach`;
-//! 9. print the `ReadyLine`;
+//! 9. print the `ReadyLine` (with the token: the supervisor's credential;
+//!    `worker.json` is owner-only, and so is `worker.log`, where a launcher
+//!    copies the line, before it is printed);
 //! 10. install the Linux signal handlers; start the activator, maintenance
 //!     and notifier threads (WP2.3; a thread that cannot start is logged,
 //!     never fatal after Ready);
 //! 11. wait for `stopping`, let the stop reply flush (≤ 2 s), remove
-//!     `runtime.json` and `worker.json`.
+//!     `runtime.json`, `worker.json` and `runtime.token`.
 //!
 //! Failures before Ready print a `FatalLine` and exit 73 (store), 75
 //! (locked), 78 (configuration) or 70 (internal). Nothing after Ready prints
@@ -346,13 +352,13 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
                 process_start: record::process_start(),
                 executable,
                 supervised: args.supervised,
-                token: None,
+                token: Some(server.token().to_owned()),
             },
         )?;
         Ok(discovery)
     })();
     let discovery = records.map_err(|error| {
-        withdraw_records(&state, &ctx.instance);
+        withdraw_records(&state, &ctx.instance, server.token());
         internal(error)
     })?;
     // 8. legacy synchronous mount; never fatal. RPC is up since step 6: a
@@ -373,6 +379,9 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     }
     let mount: MountStatus = ctx.mount.status();
     heartbeat::beat(&ctx, &vitals);
+    // The Ready line carries the token, and a supervising launcher copies it
+    // into `worker.log`: owner-only before it is printed (WP4.1).
+    restrict_worker_log(&state);
     drop(reporting);
     // The supervised idle clock starts at Ready: a supervisor contacts the
     // worker only after reading it, however long startup took.
@@ -390,7 +399,7 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
         address: discovery.address.clone(),
         version: ctx.version.clone(),
         ipc: IPC_VERSION,
-        token: None,
+        token: Some(server.token().to_owned()),
     });
     // 10. signal handlers. Nothing after Ready is fatal: a thread started
     // here (WP2.3's maintenance and activator) must log a failure to start,
@@ -437,9 +446,11 @@ fn start_background(ctx: &Arc<WorkerCtx>) {
 /// process's listener, which dies with the exit) and `worker.json` if it is
 /// this process's record. A previous worker's record is kept: it describes a
 /// dead process (adoption checks `process_start_of`), and its instance is what
-/// the next worker's FUSE recovery matches a stale mount against.
-fn withdraw_records(state: &Path, instance: &str) {
+/// the next worker's FUSE recovery matches a stale mount against. This
+/// process's token file goes too (WP4.1).
+fn withdraw_records(state: &Path, instance: &str, token: &str) {
     let _ = fs::remove_file(state.join("runtime.json"));
+    remove_own_token(state, token);
     if record::read(state)
         .ok()
         .flatten()
@@ -549,6 +560,50 @@ impl Running {
         self.server.wait_stop_reply(STOP_REPLY_FLUSH);
         let _ = fs::remove_file(self.state.join("runtime.json"));
         let _ = record::remove(&self.state);
+        remove_own_token(&self.state, self.server.token());
         Ok(())
+    }
+}
+
+/// `STATE/worker.log`, where the orchestrator's launcher appends this
+/// worker's stdout and stderr (`orchestrator::folder`, `process.rs`).
+const WORKER_LOG: &str = "worker.log";
+
+/// Makes `STATE/worker.log` owner-only (Unix 0600) when it is a regular file
+/// that others can read (WP4.1): the launcher copies the Ready line, which
+/// carries the instance token for the supervisor, into it verbatim, and
+/// creates the file with the default mode (CCR-WP4.1-4 asks it to create it
+/// owner-only and to redact the token). Best effort: a failure is logged.
+/// Windows: the file inherits the state directory's ACL (the user's
+/// profile), like the token files.
+fn restrict_worker_log(state: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let log = state.join(WORKER_LOG);
+        // Not followed: a link is left alone.
+        let Ok(metadata) = fs::symlink_metadata(&log) else {
+            return;
+        };
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o077 == 0 {
+            return;
+        }
+        if let Err(error) = fs::set_permissions(&log, fs::Permissions::from_mode(0o600)) {
+            crate::util::log::event!(warn, WORKER_START, {
+                "detail": "worker.log could not be made owner-only",
+                "path": log,
+                "message": error.to_string(),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (state, WORKER_LOG);
+}
+
+/// Removes `STATE/runtime.token` if it is still this instance's (with
+/// `owner.lock` held, nobody else writes it; checked anyway).
+fn remove_own_token(state: &Path, token: &str) {
+    if record::read_token(&record::token_path(state)).as_deref() == Some(token) {
+        let _ = record::remove_token(state);
     }
 }

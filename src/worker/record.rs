@@ -1,4 +1,4 @@
-//! Owned by WP1.4.
+//! Owned by WP1.4; WP4.1 adds the worker's local token file.
 //!
 //! `STATE/worker.json`, the adoption record (REVAMP_PLAN §3.3, §6.1): written
 //! atomically once the RPC listener is up, read back by the next worker (FUSE
@@ -6,16 +6,21 @@
 //! clean exit. Also the process identity it carries: `process_start` (the
 //! Windows creation FILETIME, or Linux `/proc/<pid>/stat` field 22) and the
 //! executable path, which adoption compares before trusting or killing a pid.
+//!
+//! **Local token files (WP4.1).** `STATE/runtime.token` holds the worker
+//! instance's token (also in `worker.json` and the Ready line), which its
+//! JSON RPC and loopback sessions require. Secret files, `worker.json`
+//! included, are written with [`write_private`]: atomically, and owner-only. On Unix the file is created
+//! with mode 0600 before any byte is written. On Windows it inherits the ACL
+//! of its directory: the state and data directories live under the user's
+//! profile, whose ACL grants the user (plus SYSTEM and Administrators) only.
 use crate::model::ipc::{WORKER_RECORD_FILE, WorkerRecord};
 use anyhow::{Context, Result};
 use std::{
     fs::{self, File},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    sync::{
-        OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::OnceLock,
 };
 
 /// `STATE/worker.json`.
@@ -25,9 +30,11 @@ pub fn path(state: &Path) -> PathBuf {
 
 /// Writes `STATE/worker.json` atomically: a fsynced temporary file renamed
 /// over the old record (and, on unix, a fsync of the directory), so a reader
-/// sees the old record or the new one, never a torn one.
+/// sees the old record or the new one, never a torn one. The record carries
+/// the instance token (WP4.1), so it is written owner-only, like
+/// `runtime.token` ([`write_private`]).
 pub fn write_atomic(state: &Path, record: &WorkerRecord) -> Result<()> {
-    replace_file(&path(state), &serde_json::to_vec_pretty(record)?)
+    write_private(&path(state), &serde_json::to_vec_pretty(record)?)
 }
 
 /// Replaces `target` atomically with `bytes`: a fsynced temporary file next
@@ -35,20 +42,94 @@ pub fn write_atomic(state: &Path, record: &WorkerRecord) -> Result<()> {
 /// see the old content or the new one, never a torn file. Also used for
 /// `runtime.json`, which a `mount-attach` may rewrite while readers poll it.
 pub fn replace_file(target: &Path, bytes: &[u8]) -> Result<()> {
+    replace(target, bytes, false)
+}
+
+/// [`replace_file`] for a secret: the file is owner-only (see the module
+/// docs). Used for `STATE/runtime.token`, `STATE/worker.json` and
+/// `DATA/orchestrator.token`.
+pub fn write_private(target: &Path, bytes: &[u8]) -> Result<()> {
+    replace(target, bytes, true)
+}
+
+/// `STATE/runtime.token`, the worker instance's local token (WP4.1).
+pub const TOKEN_FILE: &str = "runtime.token";
+
+/// `STATE/runtime.token`.
+pub fn token_path(state: &Path) -> PathBuf {
+    state.join(TOKEN_FILE)
+}
+
+/// The token in a token file (trimmed), `None` when the file is missing,
+/// unreadable or empty.
+pub fn read_token(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let token = text.trim();
+    (!token.is_empty() && token.len() <= 1024 && !token.chars().any(char::is_control))
+        .then(|| token.to_owned())
+}
+
+/// Removes `STATE/runtime.token`; a missing file is not an error.
+pub fn remove_token(state: &Path) -> Result<()> {
+    match fs::remove_file(token_path(state)) {
+        Err(error) if error.kind() != ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+fn create_temporary(path: &Path, private: bool) -> std::io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    options.open(path)
+}
+
+/// How many temporary names [`replace`] tries before it gives up (each one
+/// random, so a second attempt is already a matter of chance).
+const TEMPORARY_ATTEMPTS: u32 = 4;
+
+/// A fresh temporary next to `target`, `{name}.{pid}.{random}.tmp`, created
+/// with `create_new` (so a private one is owner-only from its first byte,
+/// never an older file reopened). The random part makes the name
+/// collision-free: a temporary left behind by a process killed before its
+/// rename (the same pid reused later, the same write sequence) never makes a
+/// later write fail.
+fn open_temporary(directory: &Path, name: &str, private: bool) -> std::io::Result<(File, PathBuf)> {
+    let mut attempt = 1;
+    loop {
+        let temporary = directory.join(format!(
+            "{name}.{}.{:016x}.tmp",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        match create_temporary(&temporary, private) {
+            Ok(file) => return Ok((file, temporary)),
+            Err(error)
+                if error.kind() == ErrorKind::AlreadyExists && attempt < TEMPORARY_ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn replace(target: &Path, bytes: &[u8], private: bool) -> Result<()> {
     let directory = target.parent().unwrap_or_else(|| Path::new("."));
     let name = target
         .file_name()
         .with_context(|| format!("no file name in {}", target.display()))?
         .to_string_lossy();
     // Unique per call, so two writers of one file never share a temporary.
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let temporary = directory.join(format!(
-        "{name}.{}.{}.tmp",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let (mut file, temporary) = open_temporary(directory, &name, private)
+        .with_context(|| format!("cannot write {}", target.display()))?;
     let written = (|| -> Result<()> {
-        let mut file = File::create(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

@@ -1,3 +1,15 @@
+//! The management API's actions, its client ([`client`], [`ControlClient`])
+//! and the text rendering of status (§3.5, §7.2).
+//!
+//! **Control token (WP4.1, §14).** The daemon's control endpoint requires a
+//! local token as the `X-Tkfs-Token` of its WebSocket upgrade: a fresh one
+//! per daemon start, in `DATA/orchestrator.token` (owner-only, written
+//! before `orchestrator.json` names the endpoint; [`install_control_token`]).
+//! An upgrade without it is refused (HTTP 403) before any action is read.
+//! [`client`] and [`ControlClient`] read the file next to the
+//! `orchestrator.json` they follow, again on every connect (a restarted
+//! daemon has a new token); a client of a known endpoint presents the token
+//! its own process knows for it, if any (`ws::tokens`).
 use super::config::Config;
 use super::hub_rules::{format_bytes, format_duration, format_elapsed};
 use crate::{
@@ -19,7 +31,8 @@ use std::{
     fmt::Write as _,
     fs, io,
     net::TcpStream,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tungstenite::stream::MaybeTlsStream;
@@ -127,6 +140,45 @@ pub struct Project {
     pub directory: PathBuf,
     pub mount: Option<PathBuf>,
     pub desired_running: bool,
+}
+
+/// `DATA/orchestrator.token`: the control endpoint's local token (WP4.1).
+pub const TOKEN_FILE: &str = "orchestrator.token";
+
+/// `DATA/orchestrator.token`.
+pub fn control_token_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(TOKEN_FILE)
+}
+
+/// The control token in `data_directory`, if there is one.
+pub fn read_control_token(data_directory: &Path) -> Option<String> {
+    crate::worker::record::read_token(&control_token_path(data_directory))
+}
+
+/// Protects the daemon's control endpoint `control` (`ws://127.0.0.1:PORT`)
+/// with a fresh local token (WP4.1): writes `DATA/orchestrator.token`
+/// (owner-only; the catalog holds `orchestrator.lock`, so no other daemon
+/// writes it) and makes `ws::accept` on that address require the token for
+/// as long as the returned hold is kept. A token file that cannot be written
+/// is logged and the endpoint is still protected (fail closed: clients then
+/// cannot connect). `None` for an endpoint that is not a loopback address
+/// (nothing to protect).
+pub fn install_control_token(
+    catalog: &super::catalog::Catalog,
+    control: &str,
+) -> Option<Arc<ws::tokens::Hold>> {
+    let addresses = ws::tokens::addresses(control);
+    let address = *addresses.first()?;
+    let token = ws::tokens::generate();
+    let path = control_token_path(catalog.data_directory());
+    if let Err(error) = crate::worker::record::write_private(&path, token.as_bytes()) {
+        crate::util::log::event!(error, PERMISSION_DENIED, {
+            "detail": "cannot write the control token; management clients cannot connect",
+            "path": path.display().to_string(),
+            "error": format!("{error:#}"),
+        });
+    }
+    ws::tokens::protect(address, &token, None)
 }
 
 /// One request to the running daemon: [`ControlClient::connect`], then
@@ -327,19 +379,22 @@ impl ControlClient {
     }
 
     fn open(&mut self) -> Result<()> {
-        let endpoint = match &self.target {
-            Target::Endpoint(endpoint) => endpoint.clone(),
+        let (endpoint, token) = match &self.target {
+            Target::Endpoint(endpoint) => (endpoint.clone(), None),
             Target::Discovery(path) => {
                 let discovery: Value =
                     serde_json::from_slice(&fs::read(path).context("ORCHESTRATOR_NOT_RUNNING")?)
                         .context("INVALID_ORCHESTRATOR_DISCOVERY")?;
-                discovery["control"]
+                let endpoint = discovery["control"]
                     .as_str()
                     .context("INVALID_ORCHESTRATOR_DISCOVERY")?
-                    .to_owned()
+                    .to_owned();
+                // WP4.1: the daemon's token, next to its discovery.
+                let token = path.parent().and_then(read_control_token);
+                (endpoint, token)
             }
         };
-        let socket = ws::connect(&endpoint)?;
+        let socket = ws::connect_authorized(&endpoint, token.as_deref())?;
         self.socket = Some(socket);
         self.endpoint = Some(endpoint);
         self.connects += 1;

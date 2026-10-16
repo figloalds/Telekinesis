@@ -355,7 +355,14 @@ fn ready_worker_record_and_hello_describe_the_same_process() {
     assert_eq!(Some(ready.pid), worker.pid());
     assert!(uuid::Uuid::parse_str(&ready.instance).is_ok());
     assert!(ready.version.contains('+'), "{}", ready.version);
-    assert!(ready.token.is_none());
+    // WP4.1 (§14): the per-instance token (`None` until WP4.1) is in Ready,
+    // `worker.json` and the owner-only `STATE/runtime.token`.
+    let token = ready.token.clone().expect("Ready carries the worker token");
+    assert_eq!(token.len(), 64, "32 random bytes, hex");
+    assert_eq!(
+        record::read_token(&record::token_path(&state)).as_deref(),
+        Some(token.as_str())
+    );
     let discovery = discovery_at(&state).unwrap();
     assert_eq!(ready.address, discovery.address);
     assert_eq!(
@@ -364,8 +371,13 @@ fn ready_worker_record_and_hello_describe_the_same_process() {
     );
 
     let raw: Value = serde_json::from_slice(&fs::read(record::path(&state)).unwrap()).unwrap();
-    assert_eq!(keys(&raw), keys(&contract_golden("ipc.worker_record")));
+    // The golden record predates WP4.1: `token` is the one key it lacks.
+    let mut golden = keys(&contract_golden("ipc.worker_record"));
+    golden.push("token".into());
+    golden.sort();
+    assert_eq!(keys(&raw), golden);
     let written: WorkerRecord = serde_json::from_value(raw).unwrap();
+    assert_eq!(written.token.as_deref(), Some(token.as_str()));
     assert_eq!(record::read(&state).unwrap().as_ref(), Some(&written));
     assert_eq!(written.format, 1);
     assert_eq!(written.ipc, 3);
