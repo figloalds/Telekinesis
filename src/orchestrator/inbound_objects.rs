@@ -1,5 +1,5 @@
-//! Owned by WP2.8 and WP3.3 — inbound `objects.*` (REVAMP_PLAN §3.8, §6.4,
-//! §6.5).
+//! Owned by WP2.8 and WP3.3 (WP4.5: the interim path removed, leases given
+//! up at the worker) — inbound `objects.*` (REVAMP_PLAN §3.8, §6.4).
 //!
 //! Requests on an authenticated **bulk** session; the acceptor's half of
 //! objects v3 (the dialer's is [`super::objects`], which also holds the
@@ -11,10 +11,13 @@
 //! | op | handling |
 //! |---|---|
 //! | `objects.pull` | our worker's `objects.read` (≤ 4 in flight, ≤ 1 MiB each) → CHUNK `{hash, offset, total, last}` stream → `ObjectsResult` |
-//! | `objects.wants` | what the dialer's lane continues or takes over (the handoff table), then our worker's `objects.want`, leased to [`push_lease`] (peer, lane) → `ObjectsWantsReply` |
-//! | `objects.push` | the CHUNK stream, checked against each object's share → our worker's `objects.write` (≤ 4 in flight, one per object, with the lease it was offered under) → `ObjectsResult` |
+//! | `objects.wants` | our worker's `objects.want`, leased to [`push_lease`] (peer, lane), excluding what that dialer cannot serve now → `ObjectsWantsReply` |
+//! | `objects.push` | the CHUNK stream, checked against each object's share → our worker's `objects.write` (≤ 4 in flight, one per object, under the dialer lane's push lease) → `ObjectsResult` |
 //! | `objects.report` | for an object of the lane that we served this peer through its end lately: our worker's `objects.report` (it re-verifies and, if corrupt, quarantines its copy) → `{}` |
-//! | `objects.exchange` | the interim page (§6.5) → worker `published-bulk-exchange` |
+//!
+//! Any other `objects.*` op is answered `UNSUPPORTED_OPERATION`, among them
+//! the Wave 2 interim `objects.exchange` (removed by WP4.5, CCR-WP3.3-2: every
+//! peer of this protocol serves objects v3).
 //!
 //! **Checks, in order** (none of the refusals reaches a worker):
 //! 1. the session is a bulk session (`BULK_ON_CONTROL_LANE`; the inbound
@@ -33,9 +36,8 @@
 //!    The worker checks the rest (authorization triad on reads, wanted and
 //!    leased on writes, invariant 13).
 //!
-//! A folder whose worker serves no objects v3 (no loopback sessions, or
-//! `UNSUPPORTED_OPERATION` from its objects ops) is answered
-//! `UNSUPPORTED_OPERATION` too: the dialer then takes the interim path.
+//! A folder whose worker cannot be reached over a loopback session is, to
+//! the peer, a folder that is starting (`REMOTE_WORKER_STARTING`).
 //!
 //! **Pull.** An item whose size the dialer does not know (size 0, not the
 //! empty object) gets one empty chunk carrying our total, and the result
@@ -67,70 +69,55 @@
 //! out, went away, refused or erred for the call) fails the push with that
 //! error, not its objects: no per-object backoff or `ObjectError` (§2.3).
 //!
-//! **Lease handoff** ([`super::objects`] module docs). Our worker leases
-//! what `objects.wants` returns to the dialer's lane, and that lane's next
-//! `objects.wants` renews the lease. What we offered (the *offer*: each
-//! object, its lease, and whether a push of the whole offer would give it a
-//! share) is compared with what the dialer then does on the same session:
-//! an object with a share it did not send (its push ended normally without
-//! a byte of it, or did not list it, or no push came before its next
-//! `objects.wants`) is one it cannot or will not serve. It backs off for
-//! that peer (no `ObjectError`: not serving is no error here) and is
-//! *parked* under its lease, and the next dialer of another source whose
-//! lane owns it is offered it first, to push under that lease. That
-//! dialer's claim (its lane's push lease and its bulk session) stands while
-//! its pushes go through. When a push fails or the dialer abandons it (its
-//! session ends), or an `objects.wants` fails, every claim of that session
-//! goes back to the table, so another source takes the object over; the
-//! claims of a dialer that vanishes between requests lapse
-//! ([`super::objects::CLAIM_TTL`]).
+//! **Leases given up** ([`super::objects`] module docs; CCR-WP3.3-4,
+//! WP4.5). Our worker leases what `objects.wants` returns to the dialer's
+//! lane ([`push_lease`]). What we offered (the *offer*: each object, and
+//! whether a push of the whole offer would give it a share) is compared with
+//! what the dialer then does on the same session: an object with a share it
+//! did not send (its push ended normally without a byte of it, or did not
+//! list it, or no push came before its next `objects.wants`) is one it
+//! cannot or will not serve. It backs off for that peer (no `ObjectError`:
+//! not serving is no error here), and its lease is given up at our worker
+//! (`objects.release`), so the next `objects.wants` of another dialer is
+//! offered it at once; that dialer's own wants exclude it while it backs
+//! off. An object of our offer whose push failed here, or that the dialer
+//! abandoned (its push failed or ended early, its session went away), is
+//! given up the same way (without a backoff when the object did not fail).
 //!
 //! **Report.** A report makes our worker re-read a whole object, so it is
 //! taken only for an object of the session's lane (`OBJECT_ON_WRONG_LANE`)
 //! that a pull of ours sent this peer through its end in the last hour
 //! (`UNSOLICITED_OBJECT`; the record is bounded).
 //!
-//! **Interim** `objects.exchange` (§6.5): the dialer's legacy
-//! `bulk_sync::Page` (bulk protocol 1, v6 JSON) goes to the folder's worker
-//! as `published-bulk-exchange` (route checked by the worker:
-//! `BULK_ROUTE_MISMATCH`, `OBJECT_ON_WRONG_LANE`, …), and the worker's page
-//! is the reply: the header `{repo}` and the page as the JSON body, trimmed
-//! to `protocol::max_body` (object parts are dropped, the last ones first;
-//! offers are stateless, so they are offered again later).
-//!
 //! **Status.** `ExchangeStarted`/`ExchangeFinished{direction: inbound}` for
 //! every pull and push served (bytes; `objects_down`: objects a push
 //! completed here; `objects_up` is 0, only the dialer knows what it
-//! installed) and for every interim exchange; `ObjectError` for objects a
-//! push failed here, `Resolved` for every source's errors of an object a
-//! push installed.
+//! installed); `ObjectError` for objects a push failed here, `Resolved` for
+//! every source's errors of an object a push installed.
 use super::{
     inbound::{
-        Failed, Finished, deadline_error, invalid_request, peer_error, record_finished, resolve,
+        Finished, deadline_error, invalid_request, peer_error, record_finished, resolve,
         status_lane, worker_deadline,
     },
     objects::{
-        KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, Renewal, Sink, SinkEvent,
-        SinkOptions, SinkResult, allot, covered, handoff_park, handoff_progress, handoff_release,
-        handoff_take, handoff_unclaim, handoff_unclaim_all, handoff_wanted, is_failure,
-        is_unsupported, object_blocked, object_failed, object_installed, object_key,
-        object_unserved, outcome_error, push_lease, read_outcome, read_ranges, size_unknown,
-        wire_pieces,
+        KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, Sink, SinkEvent, SinkOptions,
+        SinkResult, allot, blocked_objects, covered, is_failure, object_blocked, object_failed,
+        object_installed, object_key, object_unserved, outcome_error, push_lease, read_outcome,
+        read_ranges, release_leases, size_unknown, want_excluding, wire_pieces,
     },
     worker_client::{self, ReadFlow, SessionWorkerClient},
 };
 use crate::{
-    bulk_sync::Page,
     model::{
         errors::{ErrorWire, Scope},
         orchestrator::{CallError, Ctx},
         protocol::{
-            self, LaneRole, LaneSpec, deadlines,
+            self, LaneSpec, deadlines,
             frame::ChunkHeader,
             objects::{
-                INFLIGHT_READS, MAX_WANT_ITEMS, ObjectOutcome, ObjectResult, ObjectsPull,
-                ObjectsPush, ObjectsReport, ObjectsResult, ObjectsWantsReply, ObjectsWantsRequest,
-                PULL_BUDGET_BYTES, WantHeader, WantItem,
+                INFLIGHT_READS, MAX_RELEASE_ITEMS, MAX_WANT_ITEMS, ObjectOutcome, ObjectResult,
+                ObjectsPull, ObjectsPush, ObjectsReport, ObjectsResult, ObjectsWantsReply,
+                ObjectsWantsRequest, PULL_BUDGET_BYTES, WantHeader, WantItem,
             },
             ops,
         },
@@ -154,8 +141,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The worker op that serves an inbound interim bulk page.
-const BULK_EXCHANGE: &str = "published-bulk-exchange";
 /// A JSON reply above this many bytes goes in the body (the response
 /// header bound is 64 KiB, framing included).
 const HEADER_REPLY_MAX: usize = protocol::frame::MAX_HEADER - 1024;
@@ -163,7 +148,7 @@ const HEADER_REPLY_MAX: usize = protocol::frame::MAX_HEADER - 1024;
 const POLL: Duration = Duration::from_millis(100);
 
 pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
-    if peer.role != LaneRole::Bulk {
+    if peer.role != protocol::LaneRole::Bulk {
         let error = ErrorWire::coded(
             "BULK_ON_CONTROL_LANE",
             format!(
@@ -176,7 +161,6 @@ pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incomi
         return;
     }
     match req.op.as_str() {
-        ops::OBJECTS_EXCHANGE => exchange(ctx, peer, req),
         ops::OBJECTS_PULL => pull(ctx, peer, req),
         ops::OBJECTS_WANTS => wants(ctx, peer, req),
         ops::OBJECTS_PUSH => push(ctx, peer, req),
@@ -203,8 +187,7 @@ fn request_of<T: DeserializeOwned>(op: &str, header: &Value, body: &[u8]) -> Res
         serde_json::from_slice(body)
     };
     // CCR-WP3.3-3 (applied by WP3.INT): a malformed objects v3 request is
-    // an invalid request, never "not served" (which would send a buggy v3
-    // dialer to the interim path without a trace).
+    // an invalid request, never "not served".
     parsed.map_err(|error| invalid_request(op, &error))
 }
 
@@ -273,13 +256,7 @@ fn bind(
             ),
         ));
     };
-    let client = worker_client::session_for(endpoint).map_err(|error| {
-        if is_unsupported(&error) {
-            error.to_wire()
-        } else {
-            peer_error(&error)
-        }
-    })?;
+    let client = worker_client::session_for(endpoint).map_err(|error| peer_error(&error))?;
     Ok(Bound {
         state: served.view.record.state.clone(),
         route: served.route,
@@ -290,14 +267,7 @@ fn bind(
 
 /// The answer to the peer for a failed worker call of a v3 op.
 fn worker_failure(error: &CallError) -> ErrorWire {
-    if is_unsupported(error) {
-        ErrorWire::coded(
-            "UNSUPPORTED_OPERATION",
-            format!("this folder's worker serves no objects v3: {error}"),
-        )
-    } else {
-        peer_error(error)
-    }
+    peer_error(error)
 }
 
 fn started(ctx: &Ctx, peer: &session::AcceptedPeer, repo: &str, op: &str) {
@@ -451,10 +421,6 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                         sent_to.insert(range.hash.clone(), range.offset + range.len);
                         ReadFlow::Continue
                     }
-                    Err(error) if is_unsupported(&error) => {
-                        failure = Some(worker_failure(&error));
-                        ReadFlow::Stop
-                    }
                     Err(error @ (CallError::Unavailable(_) | CallError::ConnectionLost(_))) => {
                         failure = Some(worker_failure(&error));
                         ReadFlow::Stop
@@ -532,7 +498,7 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
 }
 
 // ---------------------------------------------------------------------------
-// Offers and lease handoff (module docs, "Lease handoff")
+// Offers and leases given up (module docs, "Leases given up")
 
 /// What we offered a dialer's lane in its last `objects.wants`, until its
 /// push (or its next `objects.wants`) shows what it moved.
@@ -545,11 +511,8 @@ struct Offer {
 
 #[derive(Clone)]
 struct Offered {
-    /// As our worker (or the handoff table) gave it: its offset is where our
-    /// worker stands.
+    /// As our worker gave it: its offset is where our worker stands.
     item: WantItem,
-    /// The lease its writes use.
-    lease: String,
     /// Inside the allotment of a push of the whole offer: a dialer that can
     /// serve it sends some of it.
     covered: bool,
@@ -584,16 +547,15 @@ fn put_offer(key: String, offer: Offer) {
     map.insert(key, offer);
 }
 
-/// Where one dialer's lane stands in our worker's leases: its lease session,
-/// its claimant in the handoff table (that lease and its bulk session: one
-/// session gives back only its own claims), and its per-object backoff keys.
+/// Where one dialer's lane stands in our worker's leases: its lease session
+/// and its per-object backoff keys.
 struct Source<'a> {
     ctx: &'a Ctx,
     peer: &'a str,
     repo: &'a str,
+    lane: LaneSpec,
     instance: String,
     lease: String,
-    claimant: String,
 }
 
 impl<'a> Source<'a> {
@@ -603,14 +565,13 @@ impl<'a> Source<'a> {
         repo: &'a str,
         bound: &Bound,
     ) -> Source<'a> {
-        let lease = push_lease(&peer.installation, bound.lane);
         Source {
             ctx,
             peer: &peer.installation,
             repo,
+            lane: bound.lane,
             instance: bound.client.endpoint().instance.clone(),
-            claimant: format!("{lease}@{}", peer.session),
-            lease,
+            lease: push_lease(&peer.installation, bound.lane),
         }
     }
 
@@ -622,54 +583,46 @@ impl<'a> Source<'a> {
         object_blocked(&self.key(hash))
     }
 
-    /// `item` (at the durable offset our worker gave) cannot move under
-    /// `lease` through this dialer: parked for another source. One under
-    /// this dialer's own lease is parked anew; one it took over is given
-    /// back to the table (module docs, "Lease handoff").
-    fn park(&self, item: &WantItem, lease: &str) {
-        if lease == self.lease {
-            handoff_park(&self.instance, item, lease);
-        } else {
-            handoff_unclaim(
-                &self.instance,
-                &item.hash,
-                lease,
-                &self.claimant,
-                Some(item),
-            );
-        }
+    /// What this dialer's wants exclude: the objects of its lane in their
+    /// backoff for it.
+    fn excluded(&self) -> Vec<String> {
+        blocked_objects(
+            &self.ctx.installation,
+            self.peer,
+            self.repo,
+            false,
+            MAX_RELEASE_ITEMS,
+            &|hash| self.lane.owns(hash),
+        )
     }
 
     /// The dialer did not send an object it was offered (it cannot read it,
-    /// or it backs it off): no error here, but a backoff for this source,
-    /// and the object is parked under its lease for another source.
-    fn not_served(&self, offered: &Offered) {
-        object_unserved(&self.key(&offered.item.hash));
-        self.park(&offered.item, &offered.lease);
-    }
-
-    /// The dialer's request failed or was cancelled: what it claimed goes
-    /// back to the table.
-    fn unclaim_all(&self) {
-        handoff_unclaim_all(Some(&self.instance), &self.claimant);
+    /// or it backs it off): no error here, but a backoff for this source
+    /// (its lease is given up by the caller).
+    fn not_served(&self, hash: &str) {
+        object_unserved(&self.key(hash));
     }
 
     /// An offer the dialer's next request settles: `pushed` (what its push
-    /// moved of it) or nothing (it pushed none of it). Called only when the
-    /// dialer ended its push normally (or never started one).
-    fn settle_unpushed(&self, offer: &Offer, pushed: &HashSet<String>) {
-        for offered in &offer.items {
-            if offered.covered && !pushed.contains(&offered.item.hash) {
-                self.not_served(offered);
-            }
-        }
+    /// listed of it) or nothing (it pushed none of it). Called only when the
+    /// dialer ended its push normally (or never started one). Returns what
+    /// it did not send, to give up.
+    fn settle_unpushed(&self, offer: &Offer, pushed: &HashSet<String>) -> Vec<String> {
+        offer
+            .items
+            .iter()
+            .filter(|offered| offered.covered && !pushed.contains(&offered.item.hash))
+            .map(|offered| {
+                self.not_served(&offered.item.hash);
+                offered.item.hash.clone()
+            })
+            .collect()
     }
 }
 
 /// `objects.wants`: what our worker wants of the dialer, leased to the
-/// dialer's lane ([`push_lease`]) for its next push, after what that lane
-/// continues or takes over under another lease (module docs, "Lease
-/// handoff").
+/// dialer's lane ([`push_lease`]) for its next push, without what that lane
+/// cannot serve now (module docs, "Leases given up").
 fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     let op = ops::OBJECTS_WANTS;
     let session::Incoming {
@@ -700,21 +653,22 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     let source = Source::new(ctx, peer, &request.repo, &bound);
     let key = offer_key(&source.instance, &source.lease);
     // The last offer on this session was followed by no push: the dialer
-    // took none of it.
+    // took none of it. Its objects back off for this dialer, and the want
+    // below excludes them first, which gives up their leases.
+    let mut exclude = Vec::new();
     if let Some(offer) = take_offer(&key)
         && offer.session == peer.session
     {
-        source.settle_unpushed(&offer, &HashSet::new());
+        exclude = source.settle_unpushed(&offer, &HashSet::new());
     }
+    for hash in source.excluded() {
+        if !exclude.contains(&hash) {
+            exclude.push(hash);
+        }
+    }
+    exclude.truncate(MAX_RELEASE_ITEMS);
     let max_items = request.max_items.clamp(1, MAX_WANT_ITEMS as u32);
     let max_bytes = request.max_bytes.clamp(1, PULL_BUDGET_BYTES);
-    let mut offered = handoff_take(
-        &source.instance,
-        &source.claimant,
-        max_items as usize,
-        max_bytes,
-        &|hash| bound.lane.owns(hash) && !source.blocked(hash),
-    );
     let want = WantHeader {
         route: bound.route.clone(),
         lane: bound.lane,
@@ -722,67 +676,51 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         max_bytes,
         session: source.lease.clone(),
     };
-    match bound.client.want(&want, wait) {
-        Ok(items) => {
-            for item in items {
-                if !bound.lane.owns(&item.hash) {
-                    continue;
-                }
-                if let Some(index) = offered
-                    .iter()
-                    .position(|(taken, _)| taken.hash == item.hash)
-                {
-                    // The other lease lapsed and this want took it: our
-                    // worker's word is the newer one.
-                    let (_, stale) = offered.remove(index);
-                    handoff_release(&source.instance, &item.hash, &stale);
-                }
-                // An object in its backoff for this source is parked under
-                // this lease, for another source; one another source
-                // continues under this lease is left to it.
-                let blocked = source.blocked(&item.hash);
-                if handoff_wanted(
-                    &source.instance,
-                    &item,
-                    &source.lease,
-                    &source.claimant,
-                    blocked,
-                ) {
-                    offered.push((item, source.lease.clone()));
-                }
-            }
+    let items = match want_excluding(&bound.client, &want, exclude, wait) {
+        Ok(items) => items,
+        Err(error) => return responder.error(worker_failure(&error)),
+    };
+    // One in its backoff for this dialer although the want excluded what it
+    // could (the list is bounded) is given up at once.
+    let mut refused = Vec::new();
+    let mut offered = Vec::new();
+    for item in items {
+        if !bound.lane.owns(&item.hash) {
+            continue;
         }
-        Err(error) => {
-            // What this request took from the handoff table goes back.
-            source.unclaim_all();
-            return responder.error(worker_failure(&error));
+        if source.blocked(&item.hash) {
+            refused.push(item.hash);
+        } else {
+            offered.push(item);
         }
     }
     if responder.cancelled() {
         // The dialer will never see this offer.
-        source.unclaim_all();
+        refused.extend(offered.drain(..).map(|item| item.hash));
+    }
+    if !refused.is_empty() {
+        release_leases(&bound.client, &bound.route, &source.lease, refused);
+    }
+    if responder.cancelled() {
         return;
     }
-    offered.truncate(max_items as usize);
-    let items: Vec<WantItem> = offered.iter().map(|(item, _)| item.clone()).collect();
-    let spans = allot(&items, PUSH_BUDGET_BYTES);
+    let spans = allot(&offered, PUSH_BUDGET_BYTES);
     let offer = Offer {
         session: peer.session.clone(),
         at: Instant::now(),
         items: offered
-            .into_iter()
+            .iter()
             .zip(spans)
-            .map(|((item, lease), span)| Offered {
-                covered: covered(&item, span),
-                item,
-                lease,
+            .map(|(item, span)| Offered {
+                covered: covered(item, span),
+                item: item.clone(),
             })
             .collect(),
     };
     if !offer.items.is_empty() {
         put_offer(key, offer);
     }
-    reply_json(responder, &ObjectsWantsReply { items });
+    reply_json(responder, &ObjectsWantsReply { items: offered });
 }
 
 /// One pushed object's share of the push (the allotment rule) and how far
@@ -832,8 +770,7 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     };
     started(ctx, peer, &request.repo, op);
     let source = Source::new(ctx, peer, &request.repo, &bound);
-    // What we offered this lane on this session: each object's lease (one
-    // taken over from another source is written under that source's lease).
+    // What we offered this lane on this session.
     let offer = take_offer(&offer_key(&source.instance, &source.lease))
         .filter(|offer| offer.session == peer.session);
     let offered: HashMap<&str, &Offered> = offer
@@ -841,20 +778,6 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         .flat_map(|offer| &offer.items)
         .map(|offered| (offered.item.hash.as_str(), offered))
         .collect();
-    let lease_of = |hash: &str| {
-        offered
-            .get(hash)
-            .map_or_else(|| source.lease.clone(), |offered| offered.lease.clone())
-    };
-    // What this dialer took over stays claimed while the push runs (module
-    // docs, "Lease handoff").
-    let renewal = Renewal::new(&source.instance, &source.claimant);
-    if offered
-        .values()
-        .any(|offered| offered.lease != source.lease)
-    {
-        renewal.activate();
-    }
     let wrote = Arc::new(AtomicU64::new(0));
     let sink = {
         let wrote = wrote.clone();
@@ -895,7 +818,7 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
             continue;
         }
         if covered(item, *span) {
-            sink.expect(&item.hash, &lease_of(&item.hash), item.size, span.0, 0);
+            sink.expect(&item.hash, &source.lease, item.size, span.0, 0);
             shares.insert(
                 item.hash.clone(),
                 Share {
@@ -915,10 +838,7 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         // PROGRESS after writes (and every KEEPALIVE): the dialer's idle
         // deadline then measures our progress.
         scope.spawn(|| keepalive(&responder, &done, Some(&wrote)));
-        let stop = || {
-            renewal.tick(false);
-            responder.cancelled()
-        };
+        let stop = || responder.cancelled();
         let mut last: Option<String> = None;
         loop {
             if stop() {
@@ -956,7 +876,6 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         }
         // What arrived is valid and contiguous: written even when the
         // dialer went away, so its next push resumes after it.
-        renewal.tick(true);
         results = sink.finish(failure.is_none());
         done.cancel();
     });
@@ -974,12 +893,13 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     let mut objects_down = 0;
     let mut answer = Vec::new();
     let mut pushed = HashSet::new();
+    // The leases this push gives up at our worker (module docs).
+    let mut give_up = Vec::new();
     for item in &request.items {
         if !seen.remove(&item.hash) {
             continue;
         }
         pushed.insert(item.hash.clone());
-        let lease = lease_of(&item.hash);
         let result = results.get(&item.hash);
         let (outcome, written) = match outcomes.remove(&item.hash) {
             Some(outcome) => (outcome, 0),
@@ -1009,7 +929,7 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
             ObjectOutcome::Completed => {
                 objects_down += 1;
                 // Installed: the errors of every source of it are resolved
-                // (one that could not serve it may have handed it on).
+                // (one that could not serve it may have given it up).
                 for code in object_installed(&source.key(&item.hash)) {
                     ctx.status.record(StatusEvent::Resolved {
                         scope: Scope::Object {
@@ -1040,38 +960,35 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
             }
             _ => {}
         }
-        let unsent = whole && shares.get(&item.hash).is_some_and(|share| !share.got);
-        if !ours {
-            answer.push(ObjectResult {
-                hash: item.hash.clone(),
-                bytes: written,
-                outcome,
-            });
-            continue;
+        if ours {
+            let unsent = whole && shares.get(&item.hash).is_some_and(|share| !share.got);
+            if gives_up(&source, &item.hash, result, &outcome, unsent, whole) {
+                give_up.push(item.hash.clone());
+            }
         }
-        settle_pushed(
-            &source,
-            item,
-            &lease,
-            offered.get(item.hash.as_str()).copied(),
-            result,
-            &outcome,
-            unsent,
-            whole,
-        );
         answer.push(ObjectResult {
             hash: item.hash.clone(),
             bytes: written,
             outcome,
         });
     }
-    if whole && let Some(offer) = &offer {
-        source.settle_unpushed(offer, &pushed);
+    if let Some(offer) = &offer {
+        if whole {
+            give_up.extend(source.settle_unpushed(offer, &pushed));
+        } else {
+            // The push failed or the dialer went away: what we offered it and
+            // it did not list is given up too, for another source.
+            give_up.extend(
+                offer
+                    .items
+                    .iter()
+                    .filter(|offered| !pushed.contains(&offered.item.hash))
+                    .map(|offered| offered.item.hash.clone()),
+            );
+        }
     }
-    if !whole {
-        // The push failed or the dialer went away: what it took over and did
-        // not finish goes back to the table, for another source.
-        source.unclaim_all();
+    if !give_up.is_empty() {
+        release_leases(&bound.client, &bound.route, &source.lease, give_up);
     }
     let result = match &failure {
         Some(error) => Err(error.clone()),
@@ -1132,23 +1049,22 @@ fn admit(
     Ok(())
 }
 
-/// The handoff table after one pushed object (module docs, "Lease
-/// handoff"): installed or another session's → forgotten; not sent at all
-/// though it had a share (`unsent`) → not served by this dialer; failed →
-/// parked for another source; taken over and still moving → still this
-/// dialer's when its push went through (`whole`), given back otherwise.
-#[allow(clippy::too_many_arguments)]
-fn settle_pushed(
+/// Whether the lease of one pushed object of our offer is given up after the
+/// push (module docs, "Leases given up"): not when it settled for good here
+/// (installed, already ours, held by another session, no longer wanted);
+/// yes when it had a share the dialer did not send (`unsent`, a push that
+/// went through: not served, backed off for this dialer), when it failed
+/// here (backed off already), and when the push did not go through
+/// (`whole` false: the dialer abandoned it). An object still moving under a
+/// push that went through keeps its lease (the dialer continues it).
+fn gives_up(
     source: &Source<'_>,
-    item: &WantItem,
-    lease: &str,
-    offered: Option<&Offered>,
+    hash: &str,
     result: Option<&SinkResult>,
     outcome: &ObjectOutcome,
     unsent: bool,
     whole: bool,
-) {
-    let own = lease == source.lease;
+) -> bool {
     let settled = result.and_then(|result| result.outcome.as_ref());
     if matches!(
         settled,
@@ -1159,61 +1075,13 @@ fn settle_pushed(
                 | ObjectOutcome::Unsolicited
         )
     ) {
-        if !own {
-            handoff_release(&source.instance, &item.hash, lease);
-        }
-        return;
+        return false;
     }
-    // Where our worker stands: a write's word, or (nothing written) the
-    // offset our own want gave; the dialer's claim is not that.
-    let known = match result {
-        Some(result) if result.call.is_some() => None,
-        Some(result) if result.written > 0 || settled.is_some() => Some(result.durable),
-        _ => offered.map(|offered| offered.item.offset),
-    };
-    let base = offered.map_or(item, |offered| &offered.item);
-    // An object whose size we did not know (offered with size 0,
-    // `size_unknown`) has the size the dialer pushed it with once our worker
-    // took bytes of it: every chunk carried that total (`admit`), and our
-    // worker's first write took it as the object's size. Parked or handed on
-    // with size 0 past offset 0, no source could move it again (WP3.INT
-    // re-review 2).
-    let at = known.map(|offset| WantItem {
-        offset,
-        size: if size_unknown(base) && offset > 0 {
-            item.size
-        } else {
-            base.size
-        },
-        ..base.clone()
-    });
-    match at {
-        Some(at) if unsent && settled.is_none() => source.not_served(&Offered {
-            item: at,
-            lease: lease.to_owned(),
-            covered: true,
-        }),
-        Some(at) if is_failure(outcome) => source.park(&at, lease),
-        Some(at) if !own && whole => {
-            handoff_progress(&source.instance, &at, lease, &source.claimant);
-        }
-        Some(at) if !own => {
-            handoff_unclaim(
-                &source.instance,
-                &item.hash,
-                lease,
-                &source.claimant,
-                Some(&at),
-            );
-        }
-        None if !own => handoff_release(&source.instance, &item.hash, lease),
-        _ if unsent && settled.is_none() => {
-            // Our own lease, where our worker stands not known: a backoff
-            // for this source; our worker's next want parks it.
-            object_unserved(&source.key(&item.hash));
-        }
-        _ => {}
+    if unsent && settled.is_none() {
+        source.not_served(hash);
+        return true;
     }
+    is_failure(outcome) || !whole
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,164 +1213,5 @@ fn report(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) 
     {
         Ok(_) => responder.reply(json!({}), Vec::new()),
         Err(error) => responder.error(worker_failure(&error)),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Interim path (§6.5)
-
-/// The interim `objects.exchange` (§6.5).
-fn exchange(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
-    let started = Instant::now();
-    let op = ops::OBJECTS_EXCHANGE;
-    let session::Incoming {
-        header,
-        body,
-        deadline,
-        responder,
-        ..
-    } = req;
-    let parsed = if body.is_empty() {
-        serde_json::from_value::<Page>(header)
-    } else {
-        serde_json::from_slice::<Page>(&body)
-    };
-    let page = match parsed {
-        Ok(page) => page,
-        Err(error) => {
-            responder.error(invalid_request(op, &error));
-            return;
-        }
-    };
-    let lane_matches = peer.lane.is_some_and(|lane| {
-        u32::try_from(page.lane.index).is_ok_and(|index| index == lane.index)
-            && u32::try_from(page.lane.count).is_ok_and(|count| count == lane.count)
-    });
-    if !lane_matches {
-        responder.error(ErrorWire::coded(
-            "BULK_LANE_MISMATCH",
-            format!(
-                "the page is for lane {}/{}; this session is lane {}",
-                page.lane.index,
-                page.lane.count,
-                peer.lane.map_or_else(
-                    || "none".to_owned(),
-                    |lane| format!("{}/{}", lane.index, lane.count)
-                )
-            ),
-        ));
-        return;
-    }
-    let served = match resolve(ctx, peer, &page.repo, &page.sender) {
-        Ok(served) => served,
-        Err(error) => {
-            responder.error(error);
-            return;
-        }
-    };
-    let Some(wait) = worker_deadline(deadline, deadlines::OBJECTS_EXCHANGE) else {
-        responder.error(deadline_error(op));
-        return;
-    };
-    let bytes_down = page.object_bytes() as u64;
-    let completed_down = completed_parts(&page);
-    let repo = page.repo.clone();
-    let payload = json!({ "route": served.route, "lane": page.lane, "page": page });
-    if responder.cancelled() {
-        return;
-    }
-    let result = served
-        .client
-        .call(BULK_EXCHANGE, payload, wait)
-        .map_err(|error| Failed::call(&error))
-        .and_then(|value| {
-            let page = parse_reply(value).map_err(Failed::both)?;
-            fit_page(page, protocol::max_body(op)).map_err(Failed::both)
-        });
-    let finish = |outcome: Result<(), ErrorWire>, bytes_up: u64| {
-        let objects_down = if outcome.is_ok() { completed_down } else { 0 };
-        record_finished(
-            ctx,
-            Finished {
-                peer,
-                repo: &repo,
-                op,
-                result: outcome,
-                summary: None,
-                bytes_up,
-                bytes_down,
-                objects_up: 0,
-                objects_down,
-                started,
-            },
-        );
-    };
-    match result {
-        Ok((body, sent_bytes)) => {
-            // Status first: once the reply is out, the dialer may reuse
-            // this exchange's slot.
-            finish(Ok(()), sent_bytes);
-            responder.reply(json!({ "repo": repo }), body);
-        }
-        Err(failed) => {
-            finish(Err(failed.local), 0);
-            responder.error(failed.peer);
-        }
-    }
-}
-
-/// Object parts of `page` that end their object (the worker installs and
-/// registers each one, or fails the whole call).
-fn completed_parts(page: &Page) -> u64 {
-    page.object_parts
-        .values()
-        .filter(|part| {
-            part.offset
-                .checked_add((part.hex.len() / 2) as u64)
-                .is_some_and(|end| end == part.total)
-        })
-        .count() as u64
-}
-
-fn parse_reply(value: Value) -> Result<Page, ErrorWire> {
-    serde_json::from_value(value).map_err(|error| {
-        ErrorWire::coded(
-            "INVALID_REPLY",
-            format!("the worker's {BULK_EXCHANGE} reply is not a bulk page: {error}"),
-        )
-    })
-}
-
-/// Encodes `page` within `limit` bytes, dropping object parts (the last ones
-/// first) while it does not fit. Returns the body and the object bytes it
-/// carries. A page whose inventories alone exceed the bound is refused
-/// (`BULK_PAGE_TOO_LARGE`).
-fn fit_page(mut page: Page, limit: usize) -> Result<(Vec<u8>, u64), ErrorWire> {
-    loop {
-        let body =
-            serde_json::to_vec(&page).map_err(|error| ErrorWire::coded("UNKNOWN_ERROR", error))?;
-        if body.len() <= limit {
-            return Ok((body, page.object_bytes() as u64));
-        }
-        if page.object_parts.is_empty() {
-            return Err(ErrorWire::coded(
-                "BULK_PAGE_TOO_LARGE",
-                format!(
-                    "the worker's page is {} bytes without object parts, above the {limit}-byte \
-                     objects.exchange bound",
-                    body.len()
-                ),
-            ));
-        }
-        // Drop parts from the end until the estimate fits, then re-encode.
-        let mut over = body.len() - limit;
-        while over > 0 {
-            let Some((hash, part)) = page.object_parts.pop_last() else {
-                break;
-            };
-            // `"hash":{"offset":…,"total":…,"hex":"…"},` with some slack.
-            let size = hash.len() + part.hex.len() + 64;
-            over = over.saturating_sub(size);
-        }
     }
 }
