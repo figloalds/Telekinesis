@@ -36,7 +36,21 @@ pub fn prepare_content(engine: &Shared, handle: u64, timeout: Duration) -> Resul
         );
     }
 }
-pub(super) fn fetch_verified(
+/// A verified copy of `object`, opened for reading: the installed file when
+/// its bytes hash to `object`; otherwise its download is queued
+/// (`request_object`) and the installed file is awaited until `deadline`.
+///
+/// Corrupt bytes at the object's path are quarantined (CCR-WP3.2-1, applied
+/// by WP4.5): renamed aside (`<hash>.corrupt-<id>`) under the object's
+/// install lock, after a re-check there (a concurrent download may have
+/// repaired the path), and then, with the install lock released, recorded
+/// through the store (`Store::quarantine_renamed`: `CORRUPT`, the legacy
+/// `object_errors` row, the backoff). The engine lock is never taken under
+/// the install lock: the legacy part receiver takes install locks under the
+/// engine lock, so the opposite order could deadlock. Before WP4.5 only the
+/// rename happened, and the index learned of it from `request_object`'s
+/// reconciliation (`MISSING`).
+pub fn fetch_verified(
     engine: &Shared,
     object: &str,
     deadline: std::time::Instant,
@@ -63,17 +77,44 @@ pub(super) fn fetch_verified(
                 return Ok(file);
             }
             drop(file);
-            let object_lock = lock.for_object(object);
-            let _guard = object_lock.lock().unwrap();
-            if path.is_file() {
-                // Recheck after acquiring the install lock: another request may
-                // have repaired the path while this reader verified old bytes.
-                let mut current = std::fs::File::open(&path)?;
-                if current.metadata()?.len() == size && stream_hash(&mut current)? == object {
-                    return Ok(current);
+            // `Some(length)`: corrupt bytes of that length were renamed aside.
+            let renamed = {
+                let object_lock = lock.for_object(object);
+                let _guard = object_lock.lock().unwrap();
+                if path.is_file() {
+                    // Recheck after acquiring the install lock: another request
+                    // may have repaired the path while this reader verified old
+                    // bytes.
+                    let mut current = std::fs::File::open(&path)?;
+                    let length = current.metadata()?.len();
+                    if length == size && stream_hash(&mut current)? == object {
+                        return Ok(current);
+                    }
+                    drop(current);
+                    std::fs::rename(&path, path.with_extension(format!("corrupt-{}", id())))?;
+                    Some(length)
+                } else {
+                    None
                 }
-                drop(current);
-                std::fs::rename(&path, path.with_extension(format!("corrupt-{}", id())))?;
+            };
+            if let Some(length) = renamed {
+                // The install lock is released: the store call may take the
+                // engine lock (the lock order of the module docs).
+                let error = anyhow::anyhow!(
+                    "CORRUPT_OBJECT: the installed bytes of {object} do not hash to it \
+                     ({length} bytes, {size} expected); quarantined by a verified read"
+                );
+                let recorded = super::lock_engine(engine)
+                    .store
+                    .quarantine_renamed(object, length, &error);
+                if let Err(failed) = recorded {
+                    // The rename stands; the index heals at the next read.
+                    crate::util::log::event!(warn, CORRUPT_OBJECT, {
+                        "site": "worker.content.quarantine",
+                        "object": object,
+                        "detail": format!("recording the quarantine failed: {failed:#}"),
+                    });
+                }
             }
         }
         if !queued {

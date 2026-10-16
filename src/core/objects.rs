@@ -705,10 +705,60 @@ impl Store {
         if path.is_file() {
             fs::rename(&path, path.with_extension(format!("corrupt-{}", id())))?;
         }
+        self.record_quarantine(object, size, error)?;
+        self.queue_request(object)?;
+        Ok(())
+    }
+    /// The rows of a quarantine: the legacy `object_errors` row, `CORRUPT`
+    /// (with `size`, the corrupt file's length or -1) and the backoff.
+    fn record_quarantine(&self, object: &str, size: i64, error: &anyhow::Error) -> Result<()> {
         self.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", params![object, format!("{error:#}"), time()])?;
         self.set_availability(object, size, CORRUPT, 0, time() as i64)?;
         self.record_object_failure(object, &ErrorWire::coded("CORRUPT_OBJECT", object))?;
-        self.queue_request(object)?;
+        Ok(())
+    }
+    /// Records the quarantine of `object` whose corrupt bytes (`size` bytes)
+    /// a caller already renamed aside under the object's install lock
+    /// (CCR-WP3.2-1, WP4.5: `runtime::content::fetch_verified`, which may not
+    /// hold that lock across this store's engine lock). The rows of
+    /// [`Store::quarantine`] (`object_errors`, `CORRUPT`, the backoff), in one
+    /// savepoint, and no rename: the lock is released by now, so a file at the
+    /// object's path is a copy installed since (a concurrent download), never
+    /// the corrupt one. Such a copy wins: nothing is recorded when it is there
+    /// before, and its row is healed (to what the filesystem shows) when it
+    /// appears during the recording. Queueing the download is the caller's
+    /// (`request_object`).
+    pub(crate) fn quarantine_renamed(
+        &self,
+        object: &str,
+        size: u64,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        valid_object(object)?;
+        forget_served(&self.root, object);
+        let path = self.root.join("objects").join(object);
+        if path.is_file() {
+            return Ok(());
+        }
+        self.in_savepoint("quarantine_renamed", || {
+            self.record_quarantine(object, i64::try_from(size).unwrap_or(-1), error)
+        })?;
+        if path.is_file() {
+            // Installed while this recorded the corrupt copy: the install's
+            // registration may have run first, so the rows say what the
+            // filesystem does again (an unverified copy is verified when it
+            // is next read).
+            let _ = self.in_savepoint("quarantine_superseded", || {
+                self.db
+                    .prepare_cached("DELETE FROM object_errors WHERE hash=?")?
+                    .execute([object])?;
+                self.db
+                    .prepare_cached("DELETE FROM object_error_state WHERE hash=?")?
+                    .execute([object])?;
+                Ok(())
+            });
+            self.object_available_checked(object);
+        }
         Ok(())
     }
     /// Queue a download of a committed-referenced object (no-op otherwise).

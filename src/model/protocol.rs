@@ -711,6 +711,9 @@ pub mod objects {
         pub const READ: &str = "objects.read";
         pub const WRITE: &str = "objects.write";
         pub const REPORT: &str = "objects.report";
+        /// Gives up a session's leases ([`super::ReleaseHeader`];
+        /// CCR-WP3.3-4, WP4.5).
+        pub const RELEASE: &str = "objects.release";
     }
 
     /// Items per want list.
@@ -862,6 +865,44 @@ pub mod objects {
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
     pub struct WantReply {
         pub items: Vec<WantItem>,
+    }
+
+    /// Hashes one `objects.want` excludes, or one `objects.release` names, at
+    /// most (a request header stays well inside its 64 KiB bound).
+    pub const MAX_RELEASE_ITEMS: usize = MAX_WANT_ITEMS;
+
+    /// Worker `objects.want` with what its session will not move
+    /// (CCR-WP3.3-4, WP4.5): the [`WantHeader`] fields plus `exclude`, at most
+    /// [`MAX_RELEASE_ITEMS`] hashes the worker neither returns nor keeps
+    /// leased to `session` (a lease the session holds on one of them is given
+    /// up, as by `objects.release`). A source that cannot serve an object (it
+    /// backs it off) excludes it, so the worker offers it to another source's
+    /// session at once instead of hiding it until the lease lapses. A worker
+    /// without the field reads the plain header (serde ignores it).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct WantRequest {
+        #[serde(flatten)]
+        pub header: WantHeader,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub exclude: Vec<String>,
+    }
+
+    /// Worker `objects.release{route, session, hashes}` (CCR-WP3.3-4, WP4.5):
+    /// the leases `session` holds on `hashes` (at most [`MAX_RELEASE_ITEMS`])
+    /// end now, without the stall backoff of a lapse; leases of other
+    /// sessions are untouched. Reply [`ReleaseReply`]. The durable spool
+    /// offsets stay (a later session resumes there).
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReleaseHeader {
+        pub route: SyncRoute,
+        pub session: String,
+        pub hashes: Vec<String>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReleaseReply {
+        /// Leases that ended (held by `session`).
+        pub released: u32,
     }
 
     /// Worker `objects.read` header; reply header [`ReadReply`], body = bytes.

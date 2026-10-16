@@ -5,6 +5,8 @@
 //! process and hands it to the RPC server, heartbeat and maintenance threads;
 //! WP2.3 adds the activator. `WorkerCtx`, `SyncStorePool`, `PooledStore`,
 //! `ObjectLease` and `EngineGaugeCell` are frozen: a change needs a CCR.
+//! CCR-WP3.2-3 (applied by WP4.5) made `inflight_objects` hold the whole
+//! [`ObjectsState`] (still built with `Mutex::default()`).
 use crate::{
     core::Store,
     model::{health::EngineGauges, ipc::timing::ENGINE_STALLED_AFTER},
@@ -55,8 +57,12 @@ pub struct WorkerCtx {
     pub sync_obs: std::sync::Mutex<BTreeMap<String, crate::model::health::PeerFeedCounters>>,
     /// Secondary store connections for lock-free RPCs.
     pub sync_stores: SyncStorePool,
-    /// Object leases by hash (§6.4, WP3.2).
-    pub inflight_objects: std::sync::Mutex<BTreeMap<String, ObjectLease>>,
+    /// The worker's objects v3 state outside the store (§6.4, WP3.2): leases
+    /// by hash, plus (CCR-WP3.2-3, WP4.5) the source each lease was granted
+    /// for, the per-source backoffs and the durable-progress signal, which
+    /// were process-wide statics keyed by store root. One lock for all of
+    /// it ([`ObjectsState`]). Built with `Mutex::default()`.
+    pub inflight_objects: std::sync::Mutex<ObjectsState>,
     pub stopping: Arc<std::sync::atomic::AtomicBool>,
     /// Last `hello`/`watch` contact (supervised idle exit, §3.3).
     pub last_contact_ms: std::sync::atomic::AtomicU64,
@@ -70,6 +76,41 @@ pub struct ObjectLease {
     pub session: String,
     pub expires_ms: u64,
     pub offset: u64,
+}
+
+/// What a worker keeps of objects v3 besides the store (§6.4;
+/// `runtime::objects_rpc`), under `WorkerCtx::inflight_objects`
+/// (CCR-WP3.2-3, applied by WP4.5: these were process-wide statics keyed by
+/// the store root, shared by every in-process worker of a test binary).
+#[derive(Debug, Default)]
+pub struct ObjectsState {
+    /// Leases by hash.
+    pub leases: BTreeMap<String, ObjectLease>,
+    /// Who was granted each lease: hash → `(session, source replica)` (a
+    /// lapsed lease backs its object off for its source; `ObjectLease` has
+    /// no source).
+    pub holders: BTreeMap<String, (String, String)>,
+    /// Per-source backoff: `(source replica, hash)` → `(attempts,
+    /// retry_at_ms)`.
+    pub source_backoff: BTreeMap<(String, String), (u32, u64)>,
+    /// Bumped after every write call; wakes writes waiting for an object's
+    /// durable offset (ordered parts).
+    pub progress: Arc<ProgressSignal>,
+}
+
+/// A generation counter and its condvar (see [`ObjectsState::progress`]).
+#[derive(Debug, Default)]
+pub struct ProgressSignal {
+    pub generation: Mutex<u64>,
+    pub wake: std::sync::Condvar,
+}
+
+impl ProgressSignal {
+    /// Bumps the generation and wakes every waiter.
+    pub fn bump(&self) {
+        *lock(&self.generation) += 1;
+        self.wake.notify_all();
+    }
 }
 
 /// A pool of secondary store connections (`Store::open_secondary`) for the RPC
