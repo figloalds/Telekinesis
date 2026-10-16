@@ -854,7 +854,28 @@ impl NetworkApi for PeerManager {
             // pairs of one installation at two endpoints could each remove
             // the other's fresh record and leave none. The last pair wins.
             let _pairing = lock(&self.pairing);
-            let snapshot = self.ctx.catalog.apply(CatalogCmd::UpsertPeer {
+            // The credential is stored before the record: a supervisor the
+            // record starts (the `peer-manager` thread may reconcile before
+            // this call does) presents it at once and never enrolls a second
+            // one on its lane 0.
+            let stored = match (enrolled, &self.catalog) {
+                (Some(key), Some(catalog)) => {
+                    match catalog.enroll(&installation, CredentialSide::Outbound, key) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            // The lanes use the code; lane 0 enrolls again.
+                            event!(warn, (error.code.as_str()), {
+                                "peer": installation,
+                                "detail": "the per-peer credential could not be stored",
+                                "message": error.message,
+                            });
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            };
+            let upserted = self.ctx.catalog.apply(CatalogCmd::UpsertPeer {
                 record: PeerRecord {
                     endpoint: endpoint.to_owned(),
                     code: code.to_owned(),
@@ -862,7 +883,25 @@ impl NetworkApi for PeerManager {
                     connections: count,
                     revision: uuid::Uuid::new_v4().to_string(),
                 },
-            })?;
+            });
+            let snapshot = match upserted {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // No record: no credential for it either (best effort).
+                    if let (true, Some(catalog)) = (stored, &self.catalog)
+                        && !self
+                            .ctx
+                            .catalog
+                            .snapshot()
+                            .peers
+                            .iter()
+                            .any(|peer| peer.installation == installation)
+                    {
+                        let _ = catalog.forget(&installation, CredentialSide::Outbound);
+                    }
+                    return Err(error);
+                }
+            };
             let replaced: Vec<String> = snapshot
                 .peers
                 .iter()
@@ -873,16 +912,6 @@ impl NetworkApi for PeerManager {
                 self.ctx
                     .catalog
                     .apply(CatalogCmd::RemovePeer { endpoint: old })?;
-            }
-            if let (Some(key), Some(catalog)) = (enrolled, &self.catalog)
-                && let Err(error) = catalog.enroll(&installation, CredentialSide::Outbound, key)
-            {
-                // The lanes use the code; lane 0 enrolls again.
-                event!(warn, (error.code.as_str()), {
-                    "peer": installation,
-                    "detail": "the per-peer credential could not be stored",
-                    "message": error.message,
-                });
             }
         }
         self.reconcile();
@@ -2163,6 +2192,15 @@ fn run_credential_job(local: &str, catalog: &Catalog, job: CredentialJob) {
             done,
         } => {
             let installation = server.installation.clone();
+            // `pair` (or an earlier job) stored one since this was queued.
+            if catalog
+                .credentials()
+                .active(&installation, CredentialSide::Outbound)
+                .is_some()
+            {
+                done.store(false, Ordering::Release);
+                return;
+            }
             match enroll_on(&conn, local, &server, &code) {
                 Ok(key) if !cancel.is_cancelled() => {
                     if let Err(error) = catalog.enroll(&installation, CredentialSide::Outbound, key)
