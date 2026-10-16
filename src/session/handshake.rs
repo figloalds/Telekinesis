@@ -53,8 +53,10 @@
 //! one, answers `GOAWAY{PEER_REVOKED}` instead of `HELLO_ACK` (the dialer may
 //! retry with the code). A server that does not know the scheme (an older
 //! acceptor) ignores it and the dialer falls back to the code in the same
-//! handshake. A wrong per-peer proof is `PEER_REVOKED` on either side, and a
-//! credential revoked between `HELLO_ACK` and `AUTH` refuses the proof.
+//! handshake. A wrong client proof is `GOAWAY{PEER_REVOKED}` (the dialer's
+//! key is not ours), a wrong server proof is `INVALID_PAIRING_CODE` on the
+//! dialer (an impostor: the dialer keeps its key), and a credential revoked
+//! between `HELLO_ACK` and `AUTH` refuses the proof.
 //! Rotation applies to both schemes: the session records the verifier
 //! generation, which a `ResetPairingCode` bumps.
 //!
@@ -770,8 +772,10 @@ fn client_steps(
             if verify_proof(&transcript.server_proof(&key), &ok.server_proof) {
                 Ok(server)
             } else if per_peer {
+                // Not `PEER_REVOKED`: the server failed *its* proof (an
+                // impostor), which must not make the dialer drop its key.
                 Err(DialError::Unauthorized(ErrorWire::coded(
-                    "PEER_REVOKED",
+                    "INVALID_PAIRING_CODE",
                     "the server could not prove it holds this peer credential",
                 )))
             } else {
