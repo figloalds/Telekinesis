@@ -10,10 +10,16 @@
 //! | `folders/<state>.heartbeat.json` | each folder controller's view: phase, gate, mount, the worker endpoint (without its token), the last `WorkerHeartbeat`, the last errors, restarts |
 //! | `catalog.redacted.json` | the catalog snapshot: folders, peers (endpoint, installation, connections; never the code), whether a pairing verifier is set and its generation (never its salt or hash), gates, peer metadata |
 //! | `logs/*.tail` | the end of the daemon log (`orchestrator.log.tail`, [`DAEMON_TAIL_BYTES`], across its rotated files) and of every folder's `worker.log` (`<state>.worker.log.tail`, [`WORKER_TAIL_BYTES`]) |
-//! | `versions.json` | daemon and worker versions, protocol, IPC, feed and status versions, platform, process |
+//! | `versions.json` | daemon and worker versions, protocol, IPC, feed and status versions, platform, process, the installed log (`log`, `null` when none) |
 //!
 //! The reply is `{schema: 1, path, at_ms, files: [{path, bytes}], log_path,
-//! secrets_redacted}`.
+//! secrets_redacted}`; `log_path` is the daemon's installed log
+//! (`util::log::file_log`), or `null` when it has none (it logs to stderr).
+//! `logs/orchestrator.log.tail` is written only for an installed log. Without
+//! one, a `DATA/logs/orchestrator.log` that exists is not this daemon's log
+//! (an earlier desktop-started daemon wrote it, or whoever started this one
+//! appends raw output to it): its tail goes to
+//! `logs/orchestrator.log.not-installed.tail` ([`NOT_INSTALLED_TAIL`]).
 //!
 //! **No secret leaves in a bundle** (invariant 21). Every file goes through
 //! two passes before it is written:
@@ -61,6 +67,11 @@ pub const DAEMON_TAIL_BYTES: usize = 512 * 1024;
 pub const WORKER_TAIL_BYTES: usize = 256 * 1024;
 /// Bundles kept in `DATA/diagnostics/` (the new one included).
 pub const KEEP_BUNDLES: usize = 10;
+/// The tail of this daemon's installed log (`util::log::file_log`).
+pub const DAEMON_TAIL: &str = "logs/orchestrator.log.tail";
+/// With no installed log: the tail of a `DATA/logs/orchestrator.log` this
+/// daemon did not install (see the module docs).
+pub const NOT_INSTALLED_TAIL: &str = "logs/orchestrator.log.not-installed.tail";
 
 /// Writes a bundle under `DATA/diagnostics/<ts>/` (see the module docs).
 pub fn collect(ctx: &Arc<Ctx>) -> Result<Value> {
@@ -90,19 +101,29 @@ pub fn collect_in(ctx: &Arc<Ctx>, root: &Path) -> Result<Value> {
     }
     bundle.json("catalog.redacted.json", catalog_redacted(&catalog))?;
 
-    let data = &ctx.config.data_directory;
-    let daemon_log = log::file_log()
-        .map(|installed| installed.path)
-        .unwrap_or_else(|| log::daemon_log_path(data));
-    let daemon_files = log::file_log()
-        .map_or(log::ORCHESTRATOR_LOG_FILES, |installed| {
-            installed.rotation.files
-        })
-        .max(log::ORCHESTRATOR_LOG_FILES);
-    bundle.text(
-        "logs/orchestrator.log.tail",
-        &log::tail_lines(&daemon_log, daemon_files, DAEMON_TAIL_BYTES),
-    )?;
+    let installed = log::file_log();
+    match &installed {
+        Some(installed) => {
+            let files = installed.rotation.files.max(log::ORCHESTRATOR_LOG_FILES);
+            bundle.text(
+                DAEMON_TAIL,
+                &log::tail_lines(&installed.path, files, DAEMON_TAIL_BYTES),
+            )?;
+        }
+        None => {
+            // This daemon's events went to its stderr. A file at
+            // `DATA/logs/orchestrator.log` is not its log (an earlier daemon's,
+            // or raw output appended by whoever started this one): its tail is
+            // kept under a name that says so.
+            let path = log::daemon_log_path(&ctx.config.data_directory);
+            if !log::rotated_files(&path, log::ORCHESTRATOR_LOG_FILES).is_empty() {
+                bundle.text(
+                    NOT_INSTALLED_TAIL,
+                    &log::tail_lines(&path, log::ORCHESTRATOR_LOG_FILES, DAEMON_TAIL_BYTES),
+                )?;
+            }
+        }
+    }
     for record in &catalog.folders {
         let worker_log = record.directory.join("worker.log");
         if !worker_log.is_file() {
@@ -128,7 +149,7 @@ pub fn collect_in(ctx: &Arc<Ctx>, root: &Path) -> Result<Value> {
         "path": dir.display().to_string(),
         "at_ms": at_ms,
         "files": files,
-        "log_path": daemon_log.display().to_string(),
+        "log_path": installed.map(|installed| installed.path.display().to_string()),
         "secrets_redacted": bundle.scrubbed,
     }))
 }

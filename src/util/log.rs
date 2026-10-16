@@ -55,7 +55,9 @@
 //! [`Rotation::max_bytes`] (`log` → `log.1` → … → `log.<files-1>`, the oldest
 //! dropped; [`ORCHESTRATOR_LOG_BYTES`] × [`ORCHESTRATOR_LOG_FILES`] by default,
 //! `TKFS_LOG_ROTATE_BYTES` and `TKFS_LOG_ROTATE_FILES` override). The
-//! process's standard streams are classified first:
+//! process's standard streams are classified first, against the file as it
+//! is before any rotation (an inherited log already past the limit is still
+//! the log; it rotates once the streams no longer write to it):
 //! * a stream that **is** the log file (the desktop starts its daemon with
 //!   stdout and stderr appended to `DATA/logs/orchestrator.log`), or that is
 //!   missing or the null device, is **captured**: it is redirected into a pipe
@@ -594,20 +596,67 @@ fn rename_if_exists(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
-/// Rotates `path`: the oldest kept file is removed, `path.k` becomes
-/// `path.k+1`, and `path` becomes `path.1` (with `files == 1`, `path` is
-/// removed). A missing file is skipped. On an error the files already moved
-/// stay moved, and `path` is left in place (its writer keeps appending).
+/// Where [`rotate_files`] moves the live file while it makes room for it in
+/// the history (`path.rotating`).
+fn aside_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".rotating");
+    PathBuf::from(name)
+}
+
+/// Rotates `path`: it becomes `path.1`, and the history moves up by one
+/// (`path.k` → `path.k+1`) as far as the first missing generation; when none
+/// is missing, the oldest kept file (`path.<files-1>`) is removed first. With
+/// `files == 1`, `path` is removed. A missing `path` is not rotated.
+///
+/// The live file is moved aside (`path.rotating`) **before** any older file
+/// moves: when it cannot be renamed (another process holds it without delete
+/// sharing), nothing has changed, so a writer that retries later never loses
+/// history to failed attempts. When the history cannot move (an older file is
+/// held), the live file is put back (its writer keeps appending) and the error
+/// is returned; the next attempt fills the gap the partial move left instead
+/// of removing another old file. A live file left aside by an interrupted
+/// rotation is placed into the history first.
 pub fn rotate_files(path: &Path, files: usize) -> io::Result<()> {
     let files = files.max(1);
     if files == 1 {
         return remove_if_exists(path);
     }
-    remove_if_exists(&rotated_path(path, files - 1))?;
-    for n in (1..files - 1).rev() {
+    let aside = aside_path(path);
+    if aside.is_file() {
+        make_room(path, files)?;
+        fs::rename(&aside, rotated_path(path, 1))?;
+    }
+    match fs::rename(path, &aside) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let placed = make_room(path, files).and_then(|()| fs::rename(&aside, rotated_path(path, 1)));
+    if let Err(error) = placed {
+        // A failed put-back leaves it aside, for the next rotation to place.
+        let _ = fs::rename(&aside, path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Frees `path.1` for [`rotate_files`] (`files` ≥ 2): the generations below
+/// the first missing one move up by one; when none is missing, the oldest
+/// kept one is removed first.
+fn make_room(path: &Path, files: usize) -> io::Result<()> {
+    let last = files.max(2) - 1;
+    let top = match (1..=last).find(|&n| !rotated_path(path, n).exists()) {
+        Some(free) => free,
+        None => {
+            remove_if_exists(&rotated_path(path, last))?;
+            last
+        }
+    };
+    for n in (1..top).rev() {
         rename_if_exists(&rotated_path(path, n), &rotated_path(path, n + 1))?;
     }
-    rename_if_exists(path, &rotated_path(path, 1))
+    Ok(())
 }
 
 /// Rotates `path` ([`rotate_files`]) if it is larger than `max_bytes`;
@@ -637,8 +686,8 @@ fn ends_with_newline(path: &Path) -> bool {
 /// Writes are best effort: a failed rotation (another process holds the file
 /// without delete sharing) leaves the live file in place, notes the failure
 /// in it, and is retried after another `max_bytes / 8` (at least 64 KiB) were
-/// written; a failed write drops that write and reopens the file at the next
-/// one. Each `write` call lands whole in one file, so callers that write whole
+/// written (no history is lost to failed attempts, see [`rotate_files`]); a
+/// failed write drops that write and reopens the file at the next one. Each `write` call lands whole in one file, so callers that write whole
 /// lines get whole lines. A file that does not end with a newline when it is
 /// opened (a partial line another writer left) gets one first.
 #[derive(Debug)]
@@ -656,6 +705,15 @@ impl RotatingFile {
     /// Opens (appends to) `path`, creating its directory; a file already at
     /// or past the limit is rotated first.
     pub fn open(path: &Path, rotation: Rotation) -> io::Result<Self> {
+        let mut this = Self::open_unrotated(path, rotation)?;
+        this.rotate_if_full();
+        Ok(this)
+    }
+
+    /// [`open`](Self::open) without the rotation: the live file is the one
+    /// at `path` now, whatever its size ([`install_file`] compares the
+    /// standard streams with this very file before it may rotate).
+    fn open_unrotated(path: &Path, rotation: Rotation) -> io::Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
@@ -672,10 +730,15 @@ impl RotatingFile {
             rotations: 0,
         };
         this.reopen()?;
-        if this.size >= rotation.max_bytes {
-            this.rotate();
-        }
         Ok(this)
+    }
+
+    /// Rotates a live file already at or past the limit (unless a failed
+    /// rotation is not due for its retry yet).
+    fn rotate_if_full(&mut self) {
+        if self.size >= self.rotation.max_bytes && self.size >= self.retry_at {
+            self.rotate();
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -810,20 +873,17 @@ pub struct FileLog {
     pub tee_stderr: bool,
 }
 
-struct Installed {
-    log: FileLog,
-}
+/// The installed process log: published once, read without a lock.
+static INSTALLED: OnceLock<FileLog> = OnceLock::new();
 
-fn installed() -> &'static Mutex<Option<Installed>> {
-    static INSTALLED: OnceLock<Mutex<Option<Installed>>> = OnceLock::new();
-    INSTALLED.get_or_init(|| Mutex::new(None))
-}
+/// Serializes [`install_file`] calls only (the install redirects the
+/// standard streams, once per process). It guards no data: [`file_log`] and
+/// every other reader use [`INSTALLED`] and never wait for an install.
+static INSTALLING: Mutex<()> = Mutex::new(());
 
 /// The process log installed by [`install_file`], if any.
 pub fn file_log() -> Option<FileLog> {
-    crate::util::lock::lock(installed())
-        .as_ref()
-        .map(|installed| installed.log.clone())
+    INSTALLED.get().cloned()
 }
 
 /// `DATA/logs/orchestrator.log`.
@@ -866,12 +926,21 @@ pub fn adopt_desktop_log() -> Option<FileLog> {
 /// standard streams that are the log file, missing or the null device are
 /// captured into it; events are teed to any other stderr). The first install
 /// wins: a later call returns the installed log unchanged.
+///
+/// The streams are classified against the file as it is **before** any
+/// rotation: an inherited log already at or past the limit (the desktop's
+/// `orchestrator.log` after an upgrade from unbounded raw output) is still
+/// recognized as the log, captured, and only then rotated, so nothing keeps
+/// writing to the renamed file.
 pub fn install_file(path: &Path, rotation: Rotation) -> io::Result<FileLog> {
-    let mut slot = crate::util::lock::lock(installed());
-    if let Some(installed) = slot.as_ref() {
-        return Ok(installed.log.clone());
+    if let Some(log) = file_log() {
+        return Ok(log);
     }
-    let file = RotatingFile::open(path, rotation)?;
+    let _installing = crate::util::lock::lock(&INSTALLING);
+    if let Some(log) = file_log() {
+        return Ok(log);
+    }
+    let file = RotatingFile::open_unrotated(path, rotation)?;
     let (out_kind, err_kind) = match file.file() {
         Some(handle) => (
             stdio::classify(Stream::Stdout, handle),
@@ -883,6 +952,9 @@ pub fn install_file(path: &Path, rotation: Rotation) -> io::Result<FileLog> {
     let file = Arc::new(Mutex::new(file));
     let captured_stdout = out_kind.captured() && capture(Stream::Stdout, out_kind, &file).is_ok();
     let captured_stderr = err_kind.captured() && capture(Stream::Stderr, err_kind, &file).is_ok();
+    // The streams that were the file now write to their pipes: an oversized
+    // file can rotate without anything still appending to it.
+    crate::util::lock::lock(&file).rotate_if_full();
     if captured_stderr {
         install_panic_hook(&file);
     }
@@ -898,8 +970,7 @@ pub fn install_file(path: &Path, rotation: Rotation) -> io::Result<FileLog> {
         captured_stderr,
         tee_stderr,
     };
-    *slot = Some(Installed { log: log.clone() });
-    Ok(log)
+    Ok(INSTALLED.get_or_init(|| log).clone())
 }
 
 /// The process sink of an installed file log.
@@ -1539,4 +1610,32 @@ macro_rules! __tkfs_log_event {
             &[$($crate::util::log::field($crate::__tkfs_log_key!($key), &$value)),*],
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A live file left aside by an interrupted rotation is placed into the
+    /// history (as the newest older file) before the live file rotates.
+    #[test]
+    fn an_interrupted_rotation_is_completed_by_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.log");
+        let read = |n: usize| fs::read_to_string(rotated_path(&path, n)).ok();
+        fs::write(rotated_path(&path, 1), "older").unwrap();
+        fs::write(aside_path(&path), "interrupted").unwrap();
+        fs::write(&path, "live").unwrap();
+        rotate_files(&path, 4).unwrap();
+        assert_eq!(
+            (read(0), read(1), read(2), read(3)),
+            (
+                None,
+                Some("live".into()),
+                Some("interrupted".into()),
+                Some("older".into())
+            )
+        );
+        assert!(!aside_path(&path).exists());
+    }
 }
