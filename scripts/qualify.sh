@@ -27,7 +27,10 @@
 # machinery or on the Windows dev box's disk). --all gives the long scenarios
 # their budget (--budget-s 2400, --file-timeout-min 150) unless given. The
 # evidence records the disk of the temporary directory and the machine's load
-# at the start. --merge keeps the other files' results from the existing
+# at the start. Scenarios run with TKFS_QUAL_ENFORCE=0 so this script judges
+# the floors (a scenario whose only failures are floors not enforced here
+# counts as passed, with a note); functional failures still fail it. --merge
+# keeps the other files' results from the existing
 # evidence file and replaces only the files run now (as qualify.ps1 -Merge).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -98,7 +101,7 @@ for f in "${selected[@]}"; do
   echo "qualify: running $f (budget $budget s per scenario)"
   t0=$(date +%s)
   set +e
-  TKFS_QUAL_OUT="$run_dir/$f.qual.jsonl" TKFS_QUAL_BUDGET_S="$budget" \
+  TKFS_QUAL_OUT="$run_dir/$f.qual.jsonl" TKFS_QUAL_BUDGET_S="$budget" TKFS_QUAL_ENFORCE=0 \
     timeout --kill-after=30 "$((file_timeout * 60))" nice -n 10 \
     cargo test --release --test "$f" -- --ignored --test-threads=1 --nocapture $filter \
     >"$run_dir/$f.log" 2>&1
@@ -118,6 +121,11 @@ def started_git(name):
     try: return open(os.path.join(run_dir, name)).read().strip()
     except Exception: return ""
 floors = json.load(open(os.path.join(root, "tests/qualification-floors.json")))["floors"]
+# Floors not enforced on Linux (their `platforms` do not name it).
+excluded = {fl["id"] for fl in floors if "platforms" in fl and "linux" not in fl["platforms"]}
+def only_excluded_floors(failures):
+    ids = [f.split()[1].rstrip(":") for f in failures if f.startswith("FLOOR ")]
+    return bool(failures) and len(ids) == len(failures) and all(i in excluded for i in ids)
 records, files = [], []
 for entry in statuses:
     name, st, secs, code = entry.split("=")
@@ -130,12 +138,17 @@ for entry in statuses:
     for sc in dict.fromkeys(r["scenario"] for r in recs if r.get("status") == "started"):
         finals = [r for r in recs if r.get("scenario") == sc and r.get("status") not in (None, "started")]
         final = finals[-1] if finals else None
+        status = final["status"] if final else ("killed" if st == "timeout" else "incomplete")
+        notes = list(final.get("notes", [])) if final else []
+        if status == "fail" and only_excluded_floors(final.get("failures", [])):
+            status = "pass"
+            notes.append("only floors not enforced on linux failed: " + "; ".join(final["failures"]))
         scenarios.append({
             "scenario": sc,
-            "status": final["status"] if final else ("killed" if st == "timeout" else "incomplete"),
+            "status": status,
             "elapsed_ms": final.get("elapsed_ms") if final else None,
             "failures": final.get("failures", []) if final else [],
-            "notes": final.get("notes", []) if final else [],
+            "notes": notes,
             "unsupported": [r["unsupported"] for r in recs if r.get("scenario") == sc and "unsupported" in r],
             "metrics": [{"metric": r["metric"], "value": r["value"], "unit": r.get("unit")}
                         for r in recs if r.get("scenario") == sc and "metric" in r],
