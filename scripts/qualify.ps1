@@ -10,7 +10,10 @@
   the hardware it ran on.
 
   -Wave N    run the qual files owned by waves <= N; enforce floors tagged <= N.
-  -All       every qual file and every floor (same as -Wave 4).
+  -All       every qual file and every floor (same as -Wave 4), with the
+             budgets the long scenarios need (150K-event feeds, 1 GiB
+             objects): -BudgetS 2400 and -FileTimeoutMin 150 unless given.
+             Evidence: test-evidence/qualification-all.json (WP4.2).
   -Baseline  every qual file; floors are evaluated and recorded, never enforced
              (exit 0); writes test-evidence/qualification-baseline.json.
   -Merge     keep the other files' results from the existing evidence file and
@@ -27,7 +30,15 @@
   line are recorded per file.
 
   Floor verdicts: pass, fail, missing (no metric), incomplete (the scenario
-  timed out, so its metric covers a partial run), not_run.
+  timed out, so its metric covers a partial run), not_run. A floor whose
+  `platforms` list (tests/qualification-floors.json) does not name "windows"
+  is evaluated and recorded but not enforced here.
+
+  Evidence records the hardware it ran on (CPU, memory, OS), the disks of the
+  temporary directory and of the build (model, media, bus, free space: the
+  fsync-bound floors depend on them), and the machine's load when the run
+  started (CPU load, other build and tkfs processes): the dev machine is
+  shared, so a floor read must be read with its context.
 
   Exit code: 0 when every enforced floor holds and every selected file and
   scenario passed (or skipped); 1 otherwise. -Baseline always exits 0 unless
@@ -65,6 +76,10 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+# -All runs the 150K-event and 1 GiB scenarios: give them their budget
+# unless the caller chose one (WP4.2).
+if ($All -and -not $PSBoundParameters.ContainsKey("BudgetS")) { $BudgetS = 2400 }
+if ($All -and -not $PSBoundParameters.ContainsKey("FileTimeoutMin")) { $FileTimeoutMin = 150 }
 
 # File status from the exit code and the last `test result:` line. A pass
 # needs both: exit code 0 and `test result: ok.`. An unknown ($null) exit code
@@ -195,6 +210,45 @@ try {
     }
 } catch { $hardware = [ordered]@{ error = "$_" } }
 
+# The disk of a directory: drive, free space and the physical disk behind it
+# (best effort; WP4.2).
+function Get-DiskInfo([string]$Role, [string]$Path) {
+    $info = [ordered]@{ role = $Role; path = $Path }
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+        $letter = $full.Substring(0, 1)
+        $volume = Get-Volume -DriveLetter $letter -ErrorAction Stop
+        $info.drive = "$($letter):"
+        $info.free_gb = [math]::Round($volume.SizeRemaining / 1GB, 1)
+        $info.size_gb = [math]::Round($volume.Size / 1GB, 1)
+        $info.file_system = $volume.FileSystem
+        $partition = Get-Partition -DriveLetter $letter -ErrorAction Stop
+        $disk = Get-PhysicalDisk | Where-Object { "$($_.DeviceId)" -eq "$($partition.DiskNumber)" } |
+            Select-Object -First 1
+        if ($disk) {
+            $info.model = $disk.FriendlyName
+            $info.media = "$($disk.MediaType)"
+            $info.bus = "$($disk.BusType)"
+        }
+    } catch { $info.error = "$_" }
+    return $info
+}
+$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root "target" }
+$tempDir = [System.IO.Path]::GetTempPath()
+$hardware.disks = @((Get-DiskInfo "temp" $tempDir), (Get-DiskInfo "target" $targetDir))
+
+# What else ran when this run started (the dev machine is shared; WP4.2).
+$load = [ordered]@{}
+try {
+    $load.cpu_load_percent = [math]::Round((Get-CimInstance Win32_Processor |
+                Measure-Object -Property LoadPercentage -Average).Average, 1)
+    $others = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -match '^(cargo|rustc|tkfs|link)$' -or $_.ProcessName -like 'qual_*' })
+    $load.build_processes = @($others | Where-Object { $_.ProcessName -match '^(cargo|rustc|link)$' }).Count
+    $load.tkfs_processes = @($others | Where-Object { $_.ProcessName -eq 'tkfs' }).Count
+    $load.qual_processes = @($others | Where-Object { $_.ProcessName -like 'qual_*' }).Count
+} catch { $load.error = "$_" }
+
 $started = Get-Date
 # Git state when the run starts (the build and the binaries under test), not
 # when the evidence is written: edits made while a long run is in progress do
@@ -319,7 +373,8 @@ foreach ($floor in $floorsDoc.floors) {
     $ran = [bool]($records | Where-Object { $_.scenario -eq $floor.scenario -and $_.status -eq "started" })
     $scenarioStatus = ($fileResults | ForEach-Object { $_.scenarios } |
         Where-Object { $_.scenario -eq $floor.scenario } | Select-Object -First 1).status
-    $enforced = (-not $Baseline) -and ($floor.wave -le $Wave) -and ($ran -or -not $Filter)
+    $platformOk = (-not $floor.platforms) -or (@($floor.platforms) -contains "windows")
+    $enforced = (-not $Baseline) -and ($floor.wave -le $Wave) -and ($ran -or -not $Filter) -and $platformOk
     if (-not $ran) { $verdict = "not_run" }
     elseif ($null -eq $metric) { $verdict = "missing" }
     elseif ($scenarioStatus -in @("timeout", "killed", "incomplete")) { $verdict = "incomplete" }
@@ -328,6 +383,7 @@ foreach ($floor in $floorsDoc.floors) {
     $floorResults += [ordered]@{
         id       = $floor.id
         wave     = $floor.wave
+        platforms = $floor.platforms
         scenario = $floor.scenario
         metric   = $floor.metric
         op       = $floor.op
@@ -354,18 +410,23 @@ $ok = $enforcedFailures.Count -eq 0 -and $scenarioFailures.Count -eq 0 -and $fil
 $evidenceDoc = [ordered]@{
     schema       = 1
     kind         = $kind
+    platform     = "windows"
     wave         = $Wave
     generated_at = (Get-Date).ToString("o")
     duration_s   = [math]::Round(((Get-Date) - $started).TotalSeconds, 1)
     git          = $gitState
     toolchain    = (& rustc -V 2>$null | Out-String).Trim()
     hardware     = $hardware
+    load_at_start = $load
     settings     = [ordered]@{
         budget_s         = $BudgetS
         file_timeout_min = $FileTimeoutMin
         priority         = $Priority
         filter           = $Filter
         profile          = "release"
+        temp_dir         = $tempDir
+        target_dir       = $targetDir
+        baseline_bin     = $env:TKFS_BASELINE_BIN
     }
     summary      = [ordered]@{
         ok                = if ($Baseline) { $null } else { $ok }

@@ -1,0 +1,1048 @@
+//! WP4.2: rotating JSON-line logs, redaction, the desktop (GUI) mode capture,
+//! `worker.log` rotation at spawn and the diagnostics bundle
+//! (REVAMP_PLAN §14 WP4.2 tasks 1 and 2, acceptance: "log rotation test" and
+//! "a diagnostics bundle with no secrets (grep)").
+//!
+//! Tests that install a process log or redirect the standard streams run in a
+//! child process (this binary re-run with `TKFS_LOGGING_CHILD=<mode>`): both
+//! are process-wide and cannot be undone.
+mod support;
+
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::{Read, Write},
+    net::TcpStream,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex, mpsc},
+    thread,
+    time::{Duration, Instant},
+};
+use support::{Control, Node, bin, has_file, state_dir, wait_until, write_file};
+use tkfs::{
+    model::{ipc::StartupLine, orchestrator::ProcessEvent, status::StatusSnapshot},
+    orchestrator::process::{LogPolicy, RealLauncher},
+    util::log::{self, MemorySink, REDACTED, RotatingFile, Rotation},
+};
+
+const CHILD_ENV: &str = "TKFS_LOGGING_CHILD";
+/// The log path a child installs (modes `tee` and `null`).
+const CHILD_LOG_ENV: &str = "TKFS_LOGGING_CHILD_LOG";
+
+fn child_mode() -> Option<String> {
+    std::env::var(CHILD_ENV).ok()
+}
+
+/// This test binary re-running one test in `mode`; the caller sets stdio.
+fn child(test: &str, mode: &str) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([test, "--exact", "--nocapture", "--test-threads=1"])
+        .env(CHILD_ENV, mode)
+        .stdin(Stdio::null());
+    command
+}
+
+/// Serializes the tests of this binary that replace the process sink.
+fn sink_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The files of a rotated log, oldest first (`log.n` … `log.1`, `log`).
+fn rotated_oldest_first(path: &Path, files: usize) -> Vec<PathBuf> {
+    let mut found = log::rotated_files(path, files);
+    found.reverse();
+    found
+}
+
+fn json_lines(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|e| panic!("{}: not a JSON line ({e}): {line}", path.display()))
+        })
+        .collect()
+}
+
+/// Every byte under `dir` (recursively) and in `files`, as text.
+fn texts_under(dir: &Path, out: &mut Vec<(PathBuf, String)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            texts_under(&path, out);
+        } else if let Ok(bytes) = fs::read(&path) {
+            out.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+}
+
+fn assert_no_secret(texts: &[(PathBuf, String)], secrets: &[String]) {
+    assert!(!secrets.is_empty(), "the grep needs secrets to look for");
+    for (path, text) in texts {
+        for secret in secrets {
+            assert!(
+                !text.contains(secret.as_str()),
+                "{} contains a secret ({}…)",
+                path.display(),
+                &secret[..secret.len().min(6)]
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Rotation
+
+#[test]
+fn rotating_file_rotates_by_size_and_keeps_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("logs").join("test.log");
+    let rotation = Rotation {
+        max_bytes: 1024,
+        files: 3,
+    };
+    let mut file = RotatingFile::open(&path, rotation).unwrap();
+    let lines: Vec<String> = (0..100)
+        .map(|i| format!("{{\"n\":{i},\"pad\":\"{}\"}}\n", "p".repeat(60)))
+        .collect();
+    for line in &lines {
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    assert!(file.rotations() >= 2, "rotations: {}", file.rotations());
+    let files = rotated_oldest_first(&path, 10);
+    assert_eq!(
+        files.len(),
+        3,
+        "the live file and two older ones: {files:?}"
+    );
+    assert!(
+        !log::rotated_path(&path, 3).exists(),
+        "the oldest is dropped"
+    );
+    let mut kept = vec![];
+    for file in &files {
+        let len = fs::metadata(file).unwrap().len();
+        assert!(
+            len <= rotation.max_bytes,
+            "{} has {len} bytes",
+            file.display()
+        );
+        kept.extend(json_lines(file));
+    }
+    // The newest lines survive, whole and in order, ending with the last one.
+    let numbers: Vec<u64> = kept.iter().map(|v| v["n"].as_u64().unwrap()).collect();
+    assert_eq!(*numbers.last().unwrap(), 99);
+    assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "{numbers:?}");
+    assert!(numbers.len() >= 2 * (1024 / lines[0].len()));
+
+    // A reopened writer keeps appending to the live file and rotates it.
+    drop(file);
+    let before = fs::read_to_string(&path).unwrap();
+    let mut file = RotatingFile::open(&path, rotation).unwrap();
+    assert_eq!(file.size(), before.len() as u64);
+    for line in &lines[..20] {
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    assert!(file.rotations() >= 1);
+}
+
+#[test]
+fn a_one_file_rotation_keeps_no_history_and_an_oversized_line_is_written_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("one.log");
+    let mut file = RotatingFile::open(
+        &path,
+        Rotation {
+            max_bytes: 300,
+            files: 1,
+        },
+    )
+    .unwrap();
+    for i in 0..20 {
+        file.write_all(format!("line {i:03} {}\n", "x".repeat(40)).as_bytes())
+            .unwrap();
+    }
+    assert!(!log::rotated_path(&path, 1).exists());
+    assert!(fs::metadata(&path).unwrap().len() <= 300);
+    let big = format!("{}\n", "y".repeat(1000));
+    file.write_all(big.as_bytes()).unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        big,
+        "alone in a fresh file"
+    );
+}
+
+#[test]
+fn rotate_if_larger_moves_only_a_file_past_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("worker.log");
+    assert!(
+        !log::rotate_if_larger(&path, 10, 3).unwrap(),
+        "missing file"
+    );
+    fs::write(&path, "0123456789").unwrap();
+    assert!(
+        !log::rotate_if_larger(&path, 10, 3).unwrap(),
+        "at the limit"
+    );
+    fs::write(&path, "first generation, past the limit\n").unwrap();
+    assert!(log::rotate_if_larger(&path, 10, 3).unwrap());
+    assert!(!path.exists());
+    fs::write(&path, "second generation, past the limit\n").unwrap();
+    assert!(log::rotate_if_larger(&path, 10, 3).unwrap());
+    fs::write(&path, "third generation, past the limit\n").unwrap();
+    assert!(log::rotate_if_larger(&path, 10, 3).unwrap());
+    assert_eq!(
+        fs::read_to_string(log::rotated_path(&path, 1)).unwrap(),
+        "third generation, past the limit\n"
+    );
+    assert_eq!(
+        fs::read_to_string(log::rotated_path(&path, 2)).unwrap(),
+        "second generation, past the limit\n"
+    );
+    assert!(!log::rotated_path(&path, 3).exists(), "three files at most");
+}
+
+/// Windows: a reader without delete sharing blocks the rename; the writer
+/// keeps appending (with a note), then rotates once the reader is gone.
+#[cfg(windows)]
+#[test]
+fn a_blocked_rotation_keeps_appending_and_rotates_later() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("blocked.log");
+    let rotation = Rotation {
+        max_bytes: 4096,
+        files: 3,
+    };
+    let mut file = RotatingFile::open(&path, rotation).unwrap();
+    let line = format!("{}\n", "z".repeat(100));
+    file.write_all(line.as_bytes()).unwrap();
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .unwrap();
+    for _ in 0..100 {
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    assert_eq!(file.rotations(), 0);
+    assert!(!log::rotated_path(&path, 1).exists());
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("log rotation failed"),
+        "the failure is noted in the file"
+    );
+    assert!(text.len() > 4096, "still appending");
+    drop(blocker);
+    // The retry comes after another max(max/8, 64 KiB) bytes.
+    for _ in 0..800 {
+        file.write_all(line.as_bytes()).unwrap();
+    }
+    assert!(file.rotations() >= 1);
+    assert!(log::rotated_path(&path, 1).exists());
+}
+
+// ===========================================================================
+// Redaction
+
+#[test]
+fn events_never_carry_codes_tokens_or_registered_secrets() {
+    let _serial = sink_lock();
+    let sink = MemorySink::new();
+    log::set_sink(Some(Box::new(sink.clone())));
+    let code = "0123456789abcdef".repeat(4);
+    let registered = "registered-secret-in-a-message-0001";
+    log::register_secret(registered);
+    log::event!(warn, WS_CLOSED, {
+        "token": "tok-0123456789",
+        "Authorization": "Bearer abcdefghijkl",
+        "nested": json!({"pairing_code": code, "list": [{"secret": [1, 2, 3]}], "keep": "visible"}),
+        "action": json!({"op": "pair", "endpoint": "ws://h:1", "code": code}),
+        "error": json!({"code": "WS_CLOSED", "message": "closed"}),
+        "verifier_generation": 7,
+        "message": format!("peer said {registered}"),
+    });
+    log::flush_suppressed();
+    log::set_sink(None);
+    log::forget_secret(registered);
+    let text = sink.contents();
+    for secret in [code.as_str(), "tok-0123456789", "abcdefghijkl", registered] {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let event = sink
+        .events()
+        .into_iter()
+        .find(|e| e["code"] == "WS_CLOSED")
+        .unwrap();
+    assert_eq!(event["token"], REDACTED);
+    assert_eq!(event["Authorization"], REDACTED);
+    assert_eq!(event["nested"]["pairing_code"], REDACTED);
+    assert_eq!(event["nested"]["list"][0]["secret"], REDACTED);
+    assert_eq!(event["nested"]["keep"], "visible");
+    assert_eq!(event["action"]["code"], REDACTED, "not an error code");
+    assert_eq!(event["action"]["endpoint"], "ws://h:1");
+    assert_eq!(event["error"]["code"], "WS_CLOSED", "error codes stay");
+    assert_eq!(event["verifier_generation"], 7, "numbers stay");
+    assert_eq!(event["message"], format!("peer said {REDACTED}"));
+}
+
+#[test]
+fn foreign_lines_are_redacted() {
+    let ready = r#"{"ready":true,"repo":"r","pid":4,"token":"worker-token-0123456789"}"#;
+    let redacted = log::redact_line(ready);
+    assert!(!redacted.contains("worker-token-0123456789"));
+    let value: Value = serde_json::from_str(&redacted).unwrap();
+    assert_eq!(value["token"], REDACTED);
+    assert_eq!(value["pid"], 4);
+    let clean = r#"{"startup_progress":true,"phase":"open"}"#;
+    assert_eq!(
+        log::redact_line(clean),
+        clean,
+        "unchanged lines stay as written"
+    );
+    assert_eq!(log::redact_line("plain text"), "plain text");
+    let secrets = ["abcdefgh-secret".to_owned()];
+    assert_eq!(
+        log::scrub_with("x abcdefgh-secret y", &secrets),
+        format!("x {REDACTED} y")
+    );
+    assert_eq!(
+        log::scrub_with("short", &["short".to_owned()]),
+        "short",
+        "strings under MIN_SECRET_LEN are not secrets"
+    );
+    let line = log::captured_line("stdout", r#"{"format":3,"token":"t-0123456789"}"#);
+    let value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(value["code"], "stdout");
+    assert_eq!(value["json"]["format"], 3);
+    assert_eq!(value["json"]["token"], REDACTED);
+    // A captured line read back (a diagnostics tail) keeps its stream code.
+    let again: Value = serde_json::from_str(&log::redact_line(&line)).unwrap();
+    assert_eq!(again["code"], "stdout");
+    assert_eq!(again["json"]["token"], REDACTED);
+    let line = log::captured_line("stderr", "thread 'main' panicked");
+    let value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        (value["level"].as_str(), value["text"].as_str()),
+        (Some("warn"), Some("thread 'main' panicked"))
+    );
+}
+
+// ===========================================================================
+// Process logs (child processes)
+
+/// The desktop starts its daemon with stdout and stderr appended to
+/// `DATA/logs/orchestrator.log` (`gui.rs`'s `Spawner`). Building the launcher
+/// adopts that file as the rotating log: both streams are captured, every
+/// line is a JSON event, raw output follows the rotation (nothing lands in a
+/// renamed file), panics are kept and secrets are redacted.
+#[test]
+fn desktop_mode_daemon_output_goes_to_the_rotating_log() {
+    const TEST: &str = "desktop_mode_daemon_output_goes_to_the_rotating_log";
+    if child_mode().as_deref() == Some("desktop") {
+        let _launcher = RealLauncher::new(LogPolicy::default());
+        let installed = log::file_log().expect("the desktop log is adopted");
+        assert!(installed.captured_stdout && installed.captured_stderr);
+        assert!(!installed.tee_stderr);
+        assert_eq!(installed.rotation.max_bytes, 4096);
+        println!(
+            "{}",
+            json!({"format":3,"pid":1,"control":"ws://127.0.0.1:1","token":"tok-leak-0123456789"})
+        );
+        eprintln!("plain stderr line");
+        log::event!(warn, WS_CLOSED, {"detail": "an event through the sink", "token": "tok-event-0123456789"});
+        log::register_secret("registered-secret-value");
+        eprintln!("a raw line that mentions registered-secret-value");
+        for i in 0..150 {
+            println!("stdout filler {i:04} {}", "x".repeat(80));
+            eprintln!("stderr filler {i:04} {}", "y".repeat(80));
+        }
+        let _ = thread::spawn(|| panic!("child panic kept by the log")).join();
+        println!("stdout end marker");
+        eprintln!("stderr end marker");
+        let live = installed.path.clone();
+        let drained = wait_until(Duration::from_secs(20), || {
+            let text: String = log::rotated_files(&live, 50)
+                .iter()
+                .map(|p| fs::read_to_string(p).unwrap_or_default())
+                .collect();
+            text.contains("stdout end marker") && text.contains("stderr end marker")
+        });
+        assert!(drained, "the capture threads drained");
+        return;
+    }
+    if child_mode().is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = log::daemon_log_path(&dir.path().join("data"));
+    fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    // Exactly as the desktop's Spawner: one file, appended, for both streams.
+    let out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let err = out.try_clone().unwrap();
+    let status = child(TEST, "desktop")
+        .env(log::ROTATE_BYTES_ENV, "4096")
+        .env(log::ROTATE_FILES_ENV, "50")
+        .stdout(out)
+        .stderr(err)
+        .status()
+        .unwrap();
+    let files = rotated_oldest_first(&log_path, 50);
+    let all: String = files
+        .iter()
+        .map(|p| fs::read_to_string(p).unwrap())
+        .collect();
+    assert!(status.success(), "child failed: {status}\n{all}");
+    assert!(files.len() >= 5, "rotated: {files:?}");
+    let mut events = vec![];
+    for (n, file) in files.iter().enumerate() {
+        let len = fs::metadata(file).unwrap().len();
+        assert!(len <= 4096, "{} has {len} bytes", file.display());
+        let lines = if n == 0 {
+            // libtest's own output reached the file before the child adopted
+            // it (`running 1 test`, `test NAME ... `); everything after is ours.
+            let text = fs::read_to_string(file).unwrap();
+            let preamble = text
+                .lines()
+                .take_while(|line| serde_json::from_str::<Value>(line).is_err())
+                .count();
+            text.lines()
+                .skip(preamble)
+                .map(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .unwrap_or_else(|e| panic!("not a JSON line ({e}): {line}"))
+                })
+                .collect()
+        } else {
+            json_lines(file)
+        };
+        for event in lines {
+            assert!(
+                event["at_ms"].is_u64() && event["level"].is_string() && event["code"].is_string(),
+                "every line is an event: {event}"
+            );
+            events.push(event);
+        }
+    }
+    let texts: Vec<&str> = events.iter().filter_map(|e| e["text"].as_str()).collect();
+    for stream in ["stdout", "stderr"] {
+        let fillers: Vec<&str> = texts
+            .iter()
+            .copied()
+            .filter(|t| t.starts_with(&format!("{stream} filler ")))
+            .collect();
+        let expected: Vec<String> = (0..150)
+            .map(|i| {
+                let pad = if stream == "stdout" { "x" } else { "y" };
+                format!("{stream} filler {i:04} {}", pad.repeat(80))
+            })
+            .collect();
+        assert_eq!(fillers, expected, "{stream}: every line, once, in order");
+    }
+    assert!(
+        events.iter().any(|e| e["code"] == "stdout"
+            && e["json"]["format"] == 3
+            && e["json"]["token"] == REDACTED),
+        "a JSON stdout line is kept whole, redacted"
+    );
+    assert!(events.iter().any(|e| e["code"] == "stderr"
+        && e["level"] == "warn"
+        && e["text"] == "plain stderr line"));
+    assert!(events.iter().any(|e| e["code"] == "WS_CLOSED"
+        && e["detail"] == "an event through the sink"
+        && e["token"] == REDACTED));
+    assert!(
+        events
+            .iter()
+            .any(|e| e["code"] == "stderr" && e["panic"] == "child panic kept by the log"),
+        "the panic is in the log"
+    );
+    for secret in [
+        "tok-leak-0123456789",
+        "tok-event-0123456789",
+        "registered-secret-value",
+    ] {
+        assert!(!all.contains(secret), "{secret} leaked");
+    }
+}
+
+/// A console run (stderr a terminal, a pipe or another file): events go to
+/// the log file and to stderr; stdout and stderr are left alone.
+#[test]
+fn a_daemon_log_tees_events_to_another_stderr() {
+    const TEST: &str = "a_daemon_log_tees_events_to_another_stderr";
+    if child_mode().as_deref() == Some("tee") {
+        let data = PathBuf::from(std::env::var(CHILD_LOG_ENV).unwrap());
+        let installed = log::install_daemon_log(&data).unwrap();
+        assert_eq!(installed.path, log::daemon_log_path(&data));
+        assert!(!installed.captured_stdout && !installed.captured_stderr);
+        assert!(installed.tee_stderr);
+        assert_eq!(installed.rotation, Rotation::default());
+        log::event!(warn, WS_CLOSED, {"detail": "teed event"});
+        println!("plain stdout stays on stdout");
+        // A second install keeps the first.
+        let again = log::install_file(&data.join("other.log"), Rotation::default()).unwrap();
+        assert_eq!(again, installed);
+        return;
+    }
+    if child_mode().is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let output = child(TEST, "tee")
+        .env(CHILD_LOG_ENV, &data)
+        .env_remove(log::ROTATE_BYTES_ENV)
+        .env_remove(log::ROTATE_FILES_ENV)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert!(stderr.contains("teed event"), "{stderr}");
+    assert!(stdout.contains("plain stdout stays on stdout"));
+    let file = fs::read_to_string(log::daemon_log_path(&data)).unwrap();
+    assert!(file.contains("teed event"));
+    assert!(!file.contains("plain stdout stays on stdout"));
+    assert!(!data.join("other.log").exists());
+}
+
+/// A process started without standard streams (the null device) keeps its
+/// raw output in the log instead of discarding it.
+#[test]
+fn null_standard_streams_are_captured_into_the_log() {
+    const TEST: &str = "null_standard_streams_are_captured_into_the_log";
+    if child_mode().as_deref() == Some("null") {
+        let path = PathBuf::from(std::env::var(CHILD_LOG_ENV).unwrap());
+        let installed = log::install_file(
+            &path,
+            Rotation {
+                max_bytes: 1 << 20,
+                files: 2,
+            },
+        )
+        .unwrap();
+        assert!(installed.captured_stdout && installed.captured_stderr);
+        assert!(!installed.tee_stderr);
+        println!("stdout kept although it was discarded");
+        eprintln!("stderr kept although it was discarded");
+        log::event!(info, WS_CLOSED, {"detail": "null mode event"});
+        assert!(wait_until(Duration::from_secs(20), || {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            text.contains("stdout kept") && text.contains("stderr kept")
+        }));
+        return;
+    }
+    if child_mode().is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("null.log");
+    let status = child(TEST, "null")
+        .env(CHILD_LOG_ENV, &path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    assert!(status.success(), "{status}\n{text}");
+    let events = json_lines(&path);
+    assert!(
+        events
+            .iter()
+            .any(|e| e["code"] == "stdout" && e["text"] == "stdout kept although it was discarded")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["code"] == "stderr" && e["text"] == "stderr kept although it was discarded")
+    );
+    assert!(events.iter().any(|e| e["detail"] == "null mode event"));
+}
+
+// ===========================================================================
+// worker.log at spawn
+
+/// A `worker.log` past the limit is rotated when the next worker spawns, and
+/// the Ready line's token reaches the controller but never the file.
+#[test]
+fn worker_log_rotates_at_spawn_and_never_keeps_the_ready_token() {
+    const TEST: &str = "worker_log_rotates_at_spawn_and_never_keeps_the_ready_token";
+    const TOKEN: &str = "worker-token-0123456789abcdef";
+    if child_mode().as_deref() == Some("worker") {
+        // libtest printed `test NAME ... ` without a newline on this stdout.
+        println!();
+        println!(
+            "{}",
+            json!({"ready":true,"repo":"r","device":"d","runtime":"rt","mounted":false,
+                "instance":"i-1","pid":std::process::id(),"address":"127.0.0.1:1",
+                "version":"v","ipc":3,"token":TOKEN})
+        );
+        eprintln!("worker stderr line");
+        return;
+    }
+    if child_mode().is_some() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("worker.log");
+    let old = "an earlier worker's output\n".repeat(100);
+    fs::write(&log_path, &old).unwrap();
+    let launcher = RealLauncher::new(LogPolicy {
+        rotate_bytes: 1024,
+        rotate_files: 3,
+        ..LogPolicy::default()
+    });
+    let (tx, rx) = mpsc::channel();
+    let tx = Mutex::new(tx);
+    let sink: tkfs::model::orchestrator::ProcessSink = Arc::new(move |event| {
+        let _ = tkfs::util::lock::lock(&tx).send(event);
+    });
+    let _process = launcher
+        .launch_command(child(TEST, "worker"), &log_path, "test", sink)
+        .unwrap();
+    let mut token = None;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let event = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("the worker exits");
+        match event {
+            ProcessEvent::Line(StartupLine::Ready(ready)) => token = ready.token,
+            ProcessEvent::Line(_) => {}
+            ProcessEvent::Exited { code, .. } => {
+                assert_eq!(code, Some(0));
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        token.as_deref(),
+        Some(TOKEN),
+        "the controller gets the token"
+    );
+    assert_eq!(
+        fs::read_to_string(log::rotated_path(&log_path, 1)).unwrap(),
+        old,
+        "the old log was rotated at spawn"
+    );
+    let text = fs::read_to_string(&log_path).unwrap();
+    assert!(!text.contains(TOKEN), "{text}");
+    assert!(
+        text.contains(&format!("\"token\":\"{REDACTED}\"")),
+        "{text}"
+    );
+    assert!(text.contains("worker stderr line"));
+    assert!(!text.contains("an earlier worker's output"));
+}
+
+// ===========================================================================
+// Daemons
+
+/// The secrets a daemon's data directory holds: pairing codes and verifier
+/// hashes in `folders.sqlite`, any table or setting named like a secret,
+/// token or credential (WP4.1's per-peer credentials), `*.token` files and
+/// sensitive fields of `worker.json` / `runtime.json`.
+fn secrets_of(data: &Path) -> Vec<String> {
+    let mut secrets = vec![];
+    let catalog = data.join("folders.sqlite");
+    if catalog.is_file() {
+        let db = rusqlite::Connection::open_with_flags(
+            &catalog,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut codes = db.prepare("SELECT code FROM peers").unwrap();
+        for code in codes.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            secrets.push(code.unwrap());
+        }
+        let mut settings = db.prepare("SELECT key, value FROM settings").unwrap();
+        for row in settings
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+        {
+            let (key, value) = row.unwrap();
+            let key = key.to_ascii_lowercase();
+            if ["pairing", "secret", "token", "credential"]
+                .iter()
+                .any(|k| key.contains(k))
+            {
+                match serde_json::from_str::<Value>(&value) {
+                    Ok(Value::Object(map)) => {
+                        // The verifier's hash is HMAC-key-equivalent to the code.
+                        for (field, value) in map {
+                            if field != "salt"
+                                && let Some(text) = value.as_str()
+                            {
+                                secrets.push(text.to_owned());
+                            }
+                        }
+                    }
+                    _ => secrets.push(value),
+                }
+            }
+        }
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        for table in tables {
+            let name = table.to_ascii_lowercase();
+            if !["secret", "token", "credential"]
+                .iter()
+                .any(|k| name.contains(k))
+            {
+                continue;
+            }
+            let mut rows = db.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut query = rows.query([]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                for i in 0..columns {
+                    match row.get_ref(i).unwrap() {
+                        rusqlite::types::ValueRef::Text(t) => {
+                            secrets.push(String::from_utf8_lossy(t).into_owned())
+                        }
+                        rusqlite::types::ValueRef::Blob(b) => secrets.push(hex::encode(b)),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut directories = vec![data.to_path_buf()];
+    if let Ok(states) = fs::read_dir(data.join("states")) {
+        directories.extend(states.flatten().map(|e| e.path()));
+    }
+    for dir in directories {
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "token") {
+                secrets.push(fs::read_to_string(&path).unwrap().trim().to_owned());
+            }
+        }
+        for name in ["worker.json", "runtime.json"] {
+            if let Ok(bytes) = fs::read(dir.join(name))
+                && let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes)
+            {
+                for (key, value) in map {
+                    if log::is_sensitive_key(&key)
+                        && let Some(text) = value.as_str()
+                    {
+                        secrets.push(text.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    secrets.retain(|s| s.len() >= log::MIN_SECRET_LEN);
+    secrets.sort();
+    secrets.dedup();
+    secrets
+}
+
+/// Every log a node wrote: its daemon output (`daemon.log`), `DATA/logs`,
+/// and every `worker.log*`.
+fn logs_of(node: &Node) -> Vec<(PathBuf, String)> {
+    let mut texts = vec![];
+    texts.push((
+        node.log_path(),
+        fs::read_to_string(node.log_path()).unwrap_or_default(),
+    ));
+    texts_under(&node.data_dir().join("logs"), &mut texts);
+    if let Ok(states) = fs::read_dir(node.data_dir().join("states")) {
+        for state in states.flatten() {
+            for file in fs::read_dir(state.path()).into_iter().flatten().flatten() {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if name.starts_with("worker.log") {
+                    texts.push((
+                        file.path(),
+                        fs::read_to_string(file.path()).unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+    }
+    texts
+}
+
+/// Two paired daemons with a synchronized folder: their logs and status hold
+/// no secret, and each diagnostics bundle has every part and no secret even
+/// after a pairing code and a token were planted in a worker log.
+#[test]
+fn diagnostics_bundles_have_every_part_and_no_secret() {
+    let a = Node::new();
+    let b = Node::new();
+    let pa = a.create("Diagnostics", true);
+    write_file(&pa, "hello.txt", b"hello");
+    let code = a.code();
+    b.pair(&a, &code);
+    let pb = b.receive(&a, &pa);
+    b.wait_for("hello on B", Duration::from_secs(90), || {
+        has_file(&pb, "hello.txt", b"hello")
+    });
+    let mut secrets = secrets_of(&a.data_dir());
+    secrets.extend(secrets_of(&b.data_dir()));
+    secrets.push(code.clone());
+    secrets.sort();
+    secrets.dedup();
+    assert!(
+        secrets_of(&b.data_dir()).contains(&code),
+        "B's catalog holds A's code (the grep has something to find)"
+    );
+    // Logs and status, as written by the daemons.
+    let mut texts = logs_of(&a);
+    texts.extend(logs_of(&b));
+    for node in [&a, &b] {
+        let status = node.call(json!({"op":"status"}));
+        texts.push((node.data_dir(), status.to_string()));
+    }
+    assert_no_secret(&texts, &secrets);
+
+    // A leak planted in B's worker log is scrubbed from B's bundle.
+    let planted_token = "planted-token-0123456789".to_owned();
+    {
+        let mut worker_log = fs::OpenOptions::new()
+            .append(true)
+            .open(state_dir(&pb).join("worker.log"))
+            .unwrap();
+        writeln!(worker_log, "a leaked line with {code} in it").unwrap();
+        writeln!(worker_log, "{}", json!({"token": planted_token, "x": 1})).unwrap();
+    }
+    let mut planted = secrets.clone();
+    planted.push(planted_token);
+    for (node, folder) in [(&a, &pa), (&b, &pb)] {
+        let reply = node.call(json!({"op":"diagnostics"}));
+        assert_eq!(reply["schema"], 1, "{reply}");
+        let dir = PathBuf::from(reply["path"].as_str().unwrap());
+        assert!(
+            fs::canonicalize(&dir)
+                .unwrap()
+                .starts_with(fs::canonicalize(node.data_dir().join("diagnostics")).unwrap()),
+            "{}",
+            dir.display()
+        );
+        let state = folder["state"].as_str().unwrap();
+        for file in [
+            "status.json".to_owned(),
+            "activity.json".to_owned(),
+            "catalog.redacted.json".to_owned(),
+            "versions.json".to_owned(),
+            "logs/orchestrator.log.tail".to_owned(),
+            format!("folders/{state}.heartbeat.json"),
+            format!("logs/{state}.worker.log.tail"),
+        ] {
+            assert!(dir.join(&file).is_file(), "missing {file}");
+            assert!(
+                reply["files"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f["path"] == file.as_str()),
+                "{file} not listed: {reply}"
+            );
+        }
+        let status: StatusSnapshot =
+            serde_json::from_slice(&fs::read(dir.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status.schema, 2);
+        assert!(status.folders.iter().any(|f| f.state == state));
+        let activity: Value =
+            serde_json::from_slice(&fs::read(dir.join("activity.json")).unwrap()).unwrap();
+        assert!(activity.is_array());
+        let heartbeat: Value = serde_json::from_slice(
+            &fs::read(dir.join(format!("folders/{state}.heartbeat.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(heartbeat["state"], state);
+        assert!(heartbeat["phase"].is_object() || heartbeat["phase"].is_string());
+        assert!(
+            heartbeat["heartbeat"]["instance"].is_string(),
+            "a running worker's heartbeat: {heartbeat}"
+        );
+        let versions: Value =
+            serde_json::from_slice(&fs::read(dir.join("versions.json")).unwrap()).unwrap();
+        assert_eq!(versions["protocol"], 3);
+        assert!(versions["tkfs"].as_str().is_some_and(|v| !v.is_empty()));
+        assert_eq!(versions["workers"][0]["state"], state);
+        let worker_tail =
+            fs::read_to_string(dir.join(format!("logs/{state}.worker.log.tail"))).unwrap();
+        assert!(!worker_tail.is_empty());
+        let mut bundle = vec![];
+        texts_under(&dir, &mut bundle);
+        assert_no_secret(&bundle, &planted);
+    }
+    // The catalogs as the bundles show them.
+    let latest = |node: &Node| -> PathBuf {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(node.data_dir().join("diagnostics"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        dirs.sort();
+        dirs.pop().unwrap()
+    };
+    let catalog_b: Value =
+        serde_json::from_slice(&fs::read(latest(&b).join("catalog.redacted.json")).unwrap())
+            .unwrap();
+    assert_eq!(catalog_b["peers"][0]["has_code"], true);
+    assert_eq!(catalog_b["peers"][0]["endpoint"], a.endpoint());
+    assert!(catalog_b["peers"][0].get("code").is_none());
+    let catalog_a: Value =
+        serde_json::from_slice(&fs::read(latest(&a).join("catalog.redacted.json")).unwrap())
+            .unwrap();
+    assert_eq!(catalog_a["pairing"]["verifier_set"], true);
+    assert!(catalog_a["pairing"].get("hash").is_none());
+    let tail_b = fs::read_to_string(latest(&b).join(format!(
+        "logs/{}.worker.log.tail",
+        pb["state"].as_str().unwrap()
+    )))
+    .unwrap();
+    assert!(tail_b.contains(&format!("a leaked line with {REDACTED} in it")));
+    assert!(tail_b.contains(&format!("\"token\":\"{REDACTED}\"")));
+}
+
+/// A daemon started the way the desktop starts it (stdout and stderr appended
+/// to `DATA/logs/orchestrator.log`) writes a rotating JSON-line log: its
+/// discovery line and its events are there, the log rotates, the
+/// diagnostics bundle carries its tail, and the pairing code is nowhere.
+#[test]
+fn a_desktop_started_daemon_writes_a_rotating_log() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("orchestrator.toml");
+    fs::write(
+        &config,
+        "format_version=2\ndata_directory='data'\ndefault_mount_directory='mounts'\nmaximum_running=8\n[network]\nlisten='127.0.0.1:0'\nconnections=2\nsync_interval_ms=500\n",
+    )
+    .unwrap();
+    let data = root.path().join("data");
+    let log_path = log::daemon_log_path(&data);
+    fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+    let out = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let err = out.try_clone().unwrap();
+    let mut command = Command::new(bin());
+    command
+        .arg("-f")
+        .arg(&config)
+        .arg("orchestrator")
+        .env(log::ROTATE_BYTES_ENV, "2048")
+        .env(log::ROTATE_FILES_ENV, "20")
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err);
+    let mut daemon = KillOnDrop(command.spawn().unwrap());
+    let control = Control {
+        data_dir: data.clone(),
+    };
+    let all_logs = || -> String {
+        log::rotated_files(&log_path, 20)
+            .iter()
+            .rev()
+            .map(|p| fs::read_to_string(p).unwrap_or_default())
+            .collect()
+    };
+    assert!(
+        wait_until(Duration::from_secs(30), || control
+            .call(&json!({"op":"list"}))
+            .is_ok()),
+        "the daemon answers\n{}",
+        all_logs()
+    );
+    let code = control.call(&json!({"op":"reset-pairing-code"})).unwrap()["code"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let discovery: Value =
+        serde_json::from_slice(&fs::read(data.join("orchestrator.json")).unwrap()).unwrap();
+    let network = discovery["network"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches("ws://")
+        .to_owned();
+    // Failed inbound handshakes are logged (at most 20 a minute per code).
+    for _ in 0..30 {
+        if let Ok(mut stream) = TcpStream::connect(&network) {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        }
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || all_logs()
+            .contains("inbound handshake failed")),
+        "handshake failures are logged\n{}",
+        all_logs()
+    );
+    let reply = control.call(&json!({"op":"diagnostics"})).unwrap();
+    assert_eq!(reply["log_path"], log_path.display().to_string());
+    let bundle = PathBuf::from(reply["path"].as_str().unwrap());
+    let tail = fs::read_to_string(bundle.join("logs/orchestrator.log.tail")).unwrap();
+    assert!(tail.contains("inbound handshake failed"), "{tail}");
+    let _ = control.call(&json!({"op":"shutdown"}));
+    let exited = wait_until(Duration::from_secs(30), || {
+        daemon.0.try_wait().ok().flatten().is_some()
+    });
+    assert!(exited, "the daemon exits\n{}", all_logs());
+    let files = log::rotated_files(&log_path, 20);
+    assert!(files.len() >= 2, "the log rotated: {files:?}");
+    let mut events = vec![];
+    for file in &files {
+        assert!(fs::metadata(file).unwrap().len() <= 2048);
+        events.extend(json_lines(file));
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| e["code"] == "stdout" && e["json"]["format"] == 3),
+        "the discovery line is captured"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["detail"] == "inbound handshake failed")
+    );
+    assert!(
+        events.iter().any(|e| e["code"] == "ORCHESTRATOR_STOPPING"),
+        "shutdown events reach the live log"
+    );
+    let mut texts = vec![];
+    texts_under(&data.join("logs"), &mut texts);
+    texts_under(&bundle, &mut texts);
+    let mut secrets = secrets_of(&data);
+    secrets.push(code);
+    assert_no_secret(&texts, &secrets);
+}
+
+/// Kills a process this test started if the test fails before it exits.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
