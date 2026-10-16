@@ -43,6 +43,25 @@
 //! The pre-auth frames use the §6.2 frame layout (8-byte prefix, JSON header,
 //! no body). They are encoded here rather than by `session::frame` (WP1.9) so
 //! this package has no intra-wave dependency; the layout is the same.
+//!
+//! **Per-peer credentials (WP4.1).** A dialer whose [`ClientAuth`] holds a
+//! per-peer key offers [`PEER_HMAC_V1`] in `ClientHello.features`. A server
+//! that holds an active credential for the dialer's installation
+//! ([`AcceptPolicy::peer_key`]) echoes it in `ServerHello.features`, and both
+//! proofs are then keyed by `K_peer` over the per-peer transcript
+//! ([`Transcript::per_peer`]); a server with no credential, or a revoked
+//! one, answers `GOAWAY{PEER_REVOKED}` instead of `HELLO_ACK` (the dialer may
+//! retry with the code). A server that does not know the scheme (an older
+//! acceptor) ignores it and the dialer falls back to the code in the same
+//! handshake. A wrong client proof is `GOAWAY{PEER_REVOKED}` (the dialer's
+//! key is not ours), a wrong server proof is `INVALID_PAIRING_CODE` on the
+//! dialer (an impostor: the dialer keeps its key), and a credential revoked
+//! between `HELLO_ACK` and `AUTH` refuses the proof.
+//! Rotation applies to both schemes: the session records the verifier
+//! generation, which a `ResetPairingCode` bumps.
+//!
+//! **Loopback tokens (WP4.1).** [`dial_loopback`] with no token presents the
+//! one this process knows for the address (`ws::tokens::lookup`), if any.
 use crate::{
     model::{
         errors::{ErrorClass, ErrorWire},
@@ -58,7 +77,7 @@ use crate::{
     },
     pairing_code::Verifier,
     session::{
-        auth::{Transcript, decode_nonce, new_nonce, valid_id, verify_proof},
+        auth::{PEER_HMAC_V1, Transcript, decode_nonce, new_nonce, valid_id, verify_proof},
         conn::{AcceptedPeer, Conn, ConnOptions, PeerInfo, Side},
     },
     util::{cancel::Cancel, hmac::ct_eq},
@@ -144,6 +163,17 @@ impl std::error::Error for DialError {}
 /// derives it from the pairing code with `Verifier::derive_key`).
 pub trait ClientAuth: Send + Sync {
     fn key(&self, salt: &str) -> Result<[u8; 32], ErrorWire>;
+
+    /// A per-peer credential `K_peer` for this server (WP4.1, `PeerAuth`):
+    /// with one, the hello offers [`PEER_HMAC_V1`] and a server that echoes
+    /// it is authenticated with this key instead of [`ClientAuth::key`].
+    fn peer_key(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// Called once per handshake when the server's `HELLO_ACK` arrived and
+    /// the key is about to be used (either scheme).
+    fn begin_auth(&self) {}
 }
 
 /// The accepting side's view of the catalog (WP2.8 implements it over
@@ -159,6 +189,18 @@ pub trait AcceptPolicy: Send + Sync {
     fn admit(&self, hello: &ClientHello) -> Result<(), ErrorWire>;
     /// A legacy (v2) client tried to connect; `hello` is its first message.
     fn legacy_attempt(&self, addr: SocketAddr, hello: &Value);
+
+    /// The active per-peer credential `K_peer` of the dialer `installation`
+    /// (WP4.1), asked when its hello offers [`PEER_HMAC_V1`]. A missing or
+    /// revoked credential is `PEER_REVOKED`, sent as the `GOAWAY`; so is any
+    /// policy without credentials (the default).
+    fn peer_key(&self, installation: &str) -> Result<[u8; 32], ErrorWire> {
+        let _ = installation;
+        Err(ErrorWire::coded(
+            "PEER_REVOKED",
+            "this server keeps no per-peer credentials",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -402,6 +444,11 @@ pub fn client_handshake(
     auth: &dyn ClientAuth,
 ) -> Result<(RawSocket, ServerHello), DialError> {
     hello.client_nonce = new_nonce();
+    // The per-peer scheme is offered exactly when there is a key for it.
+    hello.features.retain(|feature| feature != PEER_HMAC_V1);
+    if auth.peer_key().is_some() {
+        hello.features.push(PEER_HMAC_V1.to_owned());
+    }
     if let Err(detail) = check_client_hello(&hello) {
         let mut ws = ws;
         abandon_ws(&mut ws);
@@ -518,17 +565,22 @@ pub fn server_handshake(
 }
 
 /// Dials a worker's loopback endpoint (`X-Tkfs-Sync: 3-loopback`, plus
-/// `X-Tkfs-Token` when `token` is set). There is no HELLO/AUTH: loopback
-/// sessions are local and token-checked (WP4.1). A worker that does not echo
-/// the header gives `NeedsUpgrade`; a refused token gives
+/// `X-Tkfs-Token`). There is no HELLO/AUTH: loopback sessions are local and
+/// token-checked (WP4.1). With `token: None`, the token this process knows
+/// for the address (`ws::tokens::lookup`) is presented, if any. A worker that
+/// does not echo the header gives `NeedsUpgrade`; a refused token gives
 /// `Unauthorized(ACCESS_DENIED)`.
 pub fn dial_loopback(
     address: &str,
     token: Option<&str>,
     o: ConnOptions,
 ) -> Result<Conn, DialError> {
+    let known = match token {
+        Some(_) => None,
+        None => ws::tokens::lookup_endpoint(address),
+    };
     let mut headers = vec![(UPGRADE_HEADER, UPGRADE_LOOPBACK)];
-    if let Some(token) = token {
+    if let Some(token) = token.or(known.as_deref()) {
         headers.push((TOKEN_HEADER, token));
     }
     let (mut ws, response) =
@@ -686,9 +738,30 @@ fn client_steps(
             "the endpoint is this installation",
         )));
     }
-    let key = auth.key(&server.salt).map_err(DialError::Unauthorized)?;
-    let transcript =
-        Transcript::new(hello, &server).map_err(|e| DialError::Protocol(violation_detail(e)))?;
+    let offered = hello.features.iter().any(|feature| feature == PEER_HMAC_V1);
+    let per_peer = server
+        .features
+        .iter()
+        .any(|feature| feature == PEER_HMAC_V1);
+    if per_peer && !offered {
+        return Err(DialError::Protocol(format!(
+            "server hello chose {PEER_HMAC_V1}, which was not offered"
+        )));
+    }
+    auth.begin_auth();
+    let (key, transcript) = if per_peer {
+        let key = auth.peer_key().ok_or_else(|| {
+            DialError::Protocol(format!("{PEER_HMAC_V1} was offered without a key"))
+        })?;
+        let transcript = Transcript::per_peer(hello, &server)
+            .map_err(|e| DialError::Protocol(violation_detail(e)))?;
+        (key, transcript)
+    } else {
+        let key = auth.key(&server.salt).map_err(DialError::Unauthorized)?;
+        let transcript = Transcript::new(hello, &server)
+            .map_err(|e| DialError::Protocol(violation_detail(e)))?;
+        (key, transcript)
+    };
     let proof = hex::encode(transcript.client_proof(&key));
     guarded
         .write_frame(FrameKind::Auth, &Auth { proof })
@@ -698,6 +771,13 @@ fn client_steps(
             let ok: AuthOk = parse_header(&header).map_err(DialError::Protocol)?;
             if verify_proof(&transcript.server_proof(&key), &ok.server_proof) {
                 Ok(server)
+            } else if per_peer {
+                // Not `PEER_REVOKED`: the server failed *its* proof (an
+                // impostor), which must not make the dialer drop its key.
+                Err(DialError::Unauthorized(ErrorWire::coded(
+                    "INVALID_PAIRING_CODE",
+                    "the server could not prove it holds this peer credential",
+                )))
             } else {
                 Err(DialError::Unauthorized(ErrorWire::coded(
                     "INVALID_PAIRING_CODE",
@@ -917,6 +997,18 @@ fn server_auth(
         )));
     };
     policy.admit(&hello).map_err(Failure::Goaway)?;
+    // WP4.1: a dialer offering the per-peer scheme is authenticated with its
+    // credential, or refused (`PEER_REVOKED`) when there is no active one.
+    let per_peer = hello.features.iter().any(|feature| feature == PEER_HMAC_V1);
+    let peer_key = if per_peer {
+        Some(
+            policy
+                .peer_key(&hello.installation)
+                .map_err(Failure::Goaway)?,
+        )
+    } else {
+        None
+    };
     let server = ServerHello {
         protocol: PROTOCOL_NAME.to_owned(),
         version: PROTOCOL_VERSION,
@@ -926,11 +1018,19 @@ fn server_auth(
         salt: verifier.salt.clone(),
         server_nonce: new_nonce(),
         verifier_generation: generation,
-        features: Vec::new(),
+        features: if per_peer {
+            vec![PEER_HMAC_V1.to_owned()]
+        } else {
+            Vec::new()
+        },
         limits,
     };
-    let transcript =
-        Transcript::new(&hello, &server).map_err(|e| Failure::Violation(violation_detail(e)))?;
+    let transcript = if per_peer {
+        Transcript::per_peer(&hello, &server)
+    } else {
+        Transcript::new(&hello, &server)
+    }
+    .map_err(|e| Failure::Violation(violation_detail(e)))?;
     guarded.write_frame(FrameKind::HelloAck, &server)?;
     let auth: Auth = match guarded.read_frame()? {
         (FrameKind::Auth, header) => parse_header(&header).map_err(Failure::Violation)?,
@@ -945,12 +1045,13 @@ fn server_auth(
             )));
         }
     };
-    let key = verifier.key();
+    let key = peer_key.unwrap_or_else(|| verifier.key());
     if !verify_proof(&transcript.client_proof(&key), &auth.proof) {
-        return Err(Failure::Goaway(ErrorWire::coded(
-            "INVALID_PAIRING_CODE",
-            "the pairing code was not accepted",
-        )));
+        return Err(Failure::Goaway(if per_peer {
+            ErrorWire::coded("PEER_REVOKED", "the peer credential was not accepted")
+        } else {
+            ErrorWire::coded("INVALID_PAIRING_CODE", "the pairing code was not accepted")
+        }));
     }
     // A rotation between HELLO_ACK and AUTH invalidates the proof's generation.
     let current = policy.verifier();
@@ -960,6 +1061,17 @@ fn server_auth(
         return Err(Failure::Goaway(ErrorWire::coded(
             "PAIRING_CODE_CHANGED",
             "the pairing code changed during the handshake",
+        )));
+    }
+    // A credential revoked (or replaced) between HELLO_ACK and AUTH.
+    if per_peer
+        && !policy
+            .peer_key(&hello.installation)
+            .is_ok_and(|now| ct_eq(&now, &key))
+    {
+        return Err(Failure::Goaway(ErrorWire::coded(
+            "PEER_REVOKED",
+            "the peer credential was revoked during the handshake",
         )));
     }
     let server_proof = hex::encode(transcript.server_proof(&key));

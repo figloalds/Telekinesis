@@ -41,6 +41,17 @@
 //! `{"in_body": true}` with the JSON as the body. `stop` stays on the JSON
 //! RPC, whose reply flush the stop ladder waits for. Workers never dial
 //! (invariant 25): sessions are accepted only.
+//!
+//! **Local token (WP4.1, §14).** Each server generates a per-instance token
+//! (32 random bytes, hex) before its listener accepts anything, writes it to
+//! `STATE/runtime.token` (owner-only, `worker::record::write_private`) and
+//! requires it as `X-Tkfs-Token` on every JSON RPC upgrade
+//! (`ws::accept_authorized`) and loopback session upgrade
+//! (`session::accept_loopback`): a connection without it is refused at the
+//! upgrade (HTTP 403, `ACCESS_DENIED`). `worker::run` also puts it in
+//! `worker.json` and the Ready line ([`RpcServer::token`]). Clients of this
+//! process find it through `ws::tokens` (the server remembers its own
+//! address there); `runtime::rpc` and `runtime::connect_worker` read the file.
 use super::{
     Discovery, EngineGuard, EngineVitals, Shared, check_engine_poison, content::fetch_verified,
     ctx::WorkerCtx, export::export_bucket, lock_engine_tracked, objects_rpc,
@@ -200,7 +211,8 @@ pub fn start_rpc(engine: Shared, state: &Path, mount: Option<String>) -> Result<
 }
 
 /// Starts the RPC listener for `ctx` (§4.1 step 6) and returns its
-/// discovery (with `mount: None`). Nothing is written to disk: the caller
+/// discovery (with `mount: None`). Only the instance's token is written
+/// (`STATE/runtime.token`, before the listener accepts); the caller
 /// publishes `runtime.json` ([`RpcServer::publish`]) and `worker.json`.
 pub fn start_rpc_ctx(ctx: Arc<WorkerCtx>) -> Result<Discovery> {
     Ok(start_rpc_server(ctx)?.discovery().clone())
@@ -225,6 +237,13 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         repo: ctx.repo.clone(),
         device: ctx.device.clone(),
     };
+    // The instance's local token, on disk before anything can connect.
+    let token = crate::ws::tokens::generate();
+    crate::worker::record::write_private(
+        &crate::worker::record::token_path(&ctx.state),
+        token.as_bytes(),
+    )?;
+    let remembered = crate::ws::tokens::remember(address, &token);
     let core = Arc::new(Core {
         bulk: crate::bulk_sync::Worker {
             root: ctx.root.clone(),
@@ -242,6 +261,8 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         reply: Mutex::new(StopReplyState::default()),
         reply_flushed: Condvar::new(),
         connections: AtomicU64::new(0),
+        token,
+        _remembered: remembered,
     });
     let accept = core.clone();
     thread::Builder::new()
@@ -275,6 +296,11 @@ impl RpcServer {
     }
     pub fn vitals(&self) -> &Arc<EngineVitals> {
         &self.core.vitals
+    }
+    /// This instance's local token (`STATE/runtime.token`; WP4.1): required
+    /// on every JSON RPC and loopback session upgrade.
+    pub fn token(&self) -> &str {
+        &self.core.token
     }
     /// Publishes this server's discovery with `mount` (an absolute path, or
     /// `None`): the engine's discovery bytes and `STATE/runtime.json`.
@@ -348,6 +374,10 @@ struct Core {
     reply: Mutex<StopReplyState>,
     reply_flushed: Condvar,
     connections: AtomicU64,
+    /// The instance's local token (module docs).
+    token: String,
+    /// Lets clients of this process find the token (`ws::tokens`).
+    _remembered: Option<Arc<crate::ws::tokens::Hold>>,
 }
 
 /// One handled request: its result, and whether it accepted a stop (the
@@ -462,7 +492,7 @@ impl Core {
             self.serve_session(stream);
             return;
         }
-        let Ok(mut socket) = crate::ws::accept(stream) else {
+        let Ok(mut socket) = crate::ws::accept_authorized(stream, Some(&self.token)) else {
             return;
         };
         loop {
@@ -495,10 +525,11 @@ impl Core {
         }
     }
 
-    /// One loopback session: accepted (`session::accept_loopback`; no token
-    /// until WP4.1), served by its handler pool, closed when the worker stops.
+    /// One loopback session: accepted (`session::accept_loopback`, with the
+    /// instance's token), served by its handler pool, closed when the worker
+    /// stops.
     fn serve_session(self: Arc<Self>, stream: TcpStream) {
-        let conn = match session::accept_loopback(stream, None, loopback_options()) {
+        let conn = match session::accept_loopback(stream, Some(&self.token), loopback_options()) {
             Ok(conn) => conn,
             Err(error) => {
                 crate::util::log::event!(info, (error.code.as_str()), {
