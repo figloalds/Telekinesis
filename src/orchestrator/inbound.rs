@@ -1768,6 +1768,13 @@ fn objects(ctx: &Arc<Ctx>, peer: &AcceptedPeer, req: Incoming) {
 /// installation may have run since the session registered (`epoch`): one
 /// that races this enrollment wins (it bumps the epoch before it revokes, so
 /// an enrollment stored meanwhile sees the change and revokes itself).
+///
+/// The generation is checked again inside the catalog transaction that
+/// stores the credential (`Catalog::enroll_at_generation`, WP4.INT): the
+/// snapshot read here still shows the old generation while a rotation
+/// waits in the catalog actor or commits, and an enrollment queued behind
+/// that rotation would otherwise store an active credential that only the
+/// old code authenticated (invariant 21).
 fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incoming) {
     let Incoming {
         header, responder, ..
@@ -1797,10 +1804,11 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incomin
             &inner.ctx.installation,
             &request,
         )?;
-        catalog.enroll(
+        catalog.enroll_at_generation(
             &peer.installation,
             CredentialSide::Inbound,
             peer_auth::peer_key(&secret),
+            peer.verifier_generation,
         )?;
         if revoked_since() {
             // A `peer.revoke` ran meanwhile; it may have revoked before this
