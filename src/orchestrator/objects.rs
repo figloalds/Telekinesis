@@ -3412,9 +3412,10 @@ fn want_more(
 }
 
 /// Issues the next pull when the window and a peer slot allow (module docs,
-/// step 2). The first pull of a round waits its turn; a second one only
-/// goes once the pull in flight received half its budget ("re-pull at
-/// half"), when its budget is free and nobody waits.
+/// step 2). The first pull of a round waits its turn; a second one goes when
+/// its budget is free and nobody waits, and, if it would take the key past
+/// its share of the window, only once the pull in flight received half its
+/// budget ("re-pull at half").
 ///
 /// A pull reserves at most its key's fair share of the lane window
 /// (`window / repos`, 8 MiB): the window is shared by the lane's keys, and a
@@ -3435,20 +3436,33 @@ fn issue_pull<'scope, 'env>(
     scope: &'scope thread::Scope<'scope, 'env>,
 ) -> bool {
     let first = state.in_flight() == 0;
-    if !first
-        && state.pulls.values().any(|pull| {
-            pull.ended.is_none() && pull.streamed.load(Ordering::Relaxed) < pull.budget / 2
-        })
-    {
-        return false;
-    }
     // A pull's budget never exceeds what the acceptor honours, nor the key's
-    // fair share of the window.
+    // fair share of the window: within its share a key pipelines freely (a
+    // round of small objects keeps two pulls in flight), beyond it only once
+    // the pull in flight received half its budget, so a key whose source
+    // stalls holds at most its share.
     let window = lane.window.capacity().min(PULL_BUDGET_BYTES);
     let share = (window / lane.options.repos.max(1) as u64).max(1);
+    let in_flight: Vec<&Pull> = state
+        .pulls
+        .values()
+        .filter(|pull| pull.ended.is_none())
+        .collect();
+    let streaming = in_flight
+        .iter()
+        .all(|pull| pull.streamed.load(Ordering::Relaxed) >= pull.budget / 2);
+    let reserved: u64 = in_flight.iter().map(|pull| pull.budget).sum();
+    let cap = if first || streaming {
+        share
+    } else {
+        share.saturating_sub(reserved)
+    };
+    if cap == 0 {
+        return false;
+    }
     let plan_bytes = state.plan_bytes();
-    let min = plan_bytes.min(share / 2);
-    let max = plan_bytes.min(share);
+    let min = plan_bytes.min(share / 2).min(cap);
+    let max = plan_bytes.min(cap);
     // (Claims stay renewed while the round waits its turn.)
     let stop = || {
         renewal.tick(false);
