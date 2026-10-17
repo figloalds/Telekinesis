@@ -2359,7 +2359,7 @@ mod tests {
         );
         // Changed behind the store's back (same size): verified, refused.
         let object = s.put_object(b"other bytes").unwrap();
-        fs::write(s.root.join("objects").join(&object), b"OTHER BYTES").unwrap();
+        fs::write(s.root.join("objects").join(&object), b"Other bytes").unwrap();
         let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
         let refused = s.write_object_with_base_and_times(&file.id, content, None, object, 0);
         assert!(
