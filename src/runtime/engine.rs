@@ -27,8 +27,26 @@
 //! Shutdown or control requests (it used to, for good, with a misleading
 //! `BUSY_VIEW: 0 open contexts, 0 unsaved files`). The `pending-saves`
 //! control op lists the records, and `discard-pending-save{entity}` drops one
-//! that cannot be restored (README runbook). A later save of the same file
-//! supersedes such a record.
+//! that cannot be restored (README runbook). A later save of the same file on
+//! the same branch supersedes such a record.
+//!
+//! **A pending save is never lost to another branch (WP4.INT confirmation
+//! review).** `pending_saves` holds one record per entity (a positional table,
+//! §9: its key cannot change), and each record belongs to the branch it was
+//! saved on. So:
+//! * a checkout is refused while a record that could belong to the active
+//!   branch is not restored ([`Engine::checkout_allowed`],
+//!   `RECOVERY_REQUIRED`): the record is retried, or discarded by the user,
+//!   first. A restored one is a dirty session, which `quiet()` refuses
+//!   already. This build therefore never leaves a record of the active branch
+//!   behind a checkout;
+//! * a record of another branch (left by an earlier build) is never
+//!   superseded: a save of the same entity commits without touching it
+//!   (`flush_entity`), a retain refuses to overwrite it (`retain_pending`),
+//!   and the entity cannot be opened for writing on this branch
+//!   (`ACCESS_DENIED`) until that branch is checked out, which restores the
+//!   record, or the record is discarded. It is not retried while its branch
+//!   is not active; a checkout makes every unrestored record due at once.
 use super::notify::{NotifyQueue, delta_notifications};
 use crate::core::{inbox::SliceBudget, *};
 use anyhow::{Context, Result, bail, ensure};
@@ -140,6 +158,15 @@ struct Unrecovered {
     error: String,
     failures: u32,
     next_at: Instant,
+    /// The branch the record belongs to (`None`: the record does not parse).
+    branch: Option<String>,
+}
+
+/// The branch of a `pending_saves` record (`None`: it does not parse).
+fn record_branch(record: &str) -> Option<String> {
+    serde_json::from_str::<PendingSave>(record)
+        .ok()
+        .map(|pending| pending.branch)
 }
 
 /// The delay before retry number `failures + 1` (1 s → 60 s).
@@ -704,7 +731,7 @@ impl Engine {
             // Qualification: slows recovery down to observe its progress.
             crate::util::fault::hang("engine.recover_pending");
             if let Err(error) = self.restore_pending(&record) {
-                self.note_unrecovered(&entity, &error, now);
+                self.note_unrecovered(&entity, &record, &error, now);
             }
         }
         if self.sessions.values().any(|s| s.dirty) {
@@ -752,8 +779,15 @@ impl Engine {
         );
         Ok(())
     }
-    /// Records that `entity`'s pending save could not be restored (again).
-    fn note_unrecovered(&mut self, entity: &str, error: &anyhow::Error, now: Instant) {
+    /// Records that `entity`'s pending save (`record`) could not be restored
+    /// (again).
+    fn note_unrecovered(
+        &mut self,
+        entity: &str,
+        record: &str,
+        error: &anyhow::Error,
+        now: Instant,
+    ) {
         let failures = self
             .unrecovered
             .get(entity)
@@ -778,6 +812,7 @@ impl Engine {
                 error: message,
                 failures,
                 next_at: now + retry_delay(failures),
+                branch: record_branch(record),
             },
         );
     }
@@ -798,7 +833,7 @@ impl Engine {
     }
     /// The health this engine reports: [`Engine::health`], else the
     /// `pending_saves` records it could not restore (`RECOVERY_REQUIRED`,
-    /// a degraded store that gates nothing).
+    /// a degraded store that gates only a checkout, [`Engine::checkout_allowed`]).
     pub fn reported_health(&self) -> Option<String> {
         if self.health.is_some() {
             return self.health.clone();
@@ -807,7 +842,8 @@ impl Engine {
         let count = self.unrecovered.len();
         Some(format!(
             "RECOVERY_REQUIRED: {count} unsaved file{} could not be restored (entity {entity}: {}); \
-             they are retried; `tkfs pending-saves` lists them and `tkfs discard-pending-save` drops one",
+             they are retried (one of another branch once that branch is checked out); \
+             `tkfs pending-saves` lists them and `tkfs discard-pending-save` drops one",
             if count == 1 { "" } else { "s" },
             first.error
         ))
@@ -923,14 +959,36 @@ impl Engine {
         Ok(removed)
     }
     pub(crate) fn retain_pending(&mut self, entity: &str, error: &anyhow::Error) -> Result<()> {
+        if !self.sessions.get(entity).context("INVALID_HANDLE")?.dirty {
+            return Ok(());
+        }
+        let existing: Option<String> = self
+            .store
+            .db
+            .query_row(
+                "SELECT payload FROM pending_saves WHERE entity=?",
+                [entity],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // A record of another branch is never overwritten (module docs; one
+        // row per entity): its unsaved bytes would be lost. The entity cannot
+        // be opened for writing on this branch while it waits, so this is
+        // reached only by a session older than that record.
+        if let Some(existing) = existing.as_deref()
+            && self.of_other_branch(existing)
+        {
+            bail!(
+                "RECOVERY_BRANCH_MISMATCH: an unsaved version of {entity} on branch {} waits to be \
+                 restored there; this branch's unsaved changes to it are not retained over it",
+                record_branch(existing).unwrap_or_default()
+            );
+        }
         self.recovery_health = self.health.is_none() || self.recovery_health;
         if self.recovery_health {
             self.health = Some(format!("PENDING_SAVE: {error:#}"));
         }
         let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
-        if !session.dirty {
-            return Ok(());
-        }
         let stage = session.bytes.retain(&self.store.root)?;
         let record = PendingSave {
             branch: self.store.active.clone(),
@@ -940,18 +998,7 @@ impl Engine {
             alive_base: session.alive_base.clone(),
             preserve_times: session.preserve_times,
         };
-        let replaced: Option<String> = if self.unrecovered.contains_key(entity) {
-            self.store
-                .db
-                .query_row(
-                    "SELECT payload FROM pending_saves WHERE entity=?",
-                    [entity],
-                    |row| row.get(0),
-                )
-                .optional()?
-        } else {
-            None
-        };
+        let replaced = existing.filter(|_| self.unrecovered.contains_key(entity));
         self.store.db.execute("INSERT INTO pending_saves VALUES(?,?) ON CONFLICT(entity) DO UPDATE SET payload=excluded.payload",
             rusqlite::params![entity,serde_json::to_string(&record)?])?;
         self.refresh_pending_saves();
@@ -1043,29 +1090,28 @@ impl Engine {
             .context("cannot close the connection")
     }
     fn flush_entity(&mut self, entity: &str) -> Result<()> {
-        let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
-        if !session.dirty {
+        if !self.sessions.get(entity).context("INVALID_HANDLE")?.dirty {
             return Ok(());
         }
-        let pending: bool = self.store.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pending_saves WHERE entity=?)",
-            [entity],
-            |r| r.get(0),
-        )?;
-        // A record of this entity that was not restored is superseded by
-        // this save (its row goes with the commit below).
-        let replaced: Option<String> = if pending && self.unrecovered.contains_key(entity) {
-            self.store
-                .db
-                .query_row(
-                    "SELECT payload FROM pending_saves WHERE entity=?",
-                    [entity],
-                    |row| row.get(0),
-                )
-                .optional()?
-        } else {
-            None
-        };
+        let row: Option<String> = self
+            .store
+            .db
+            .query_row(
+                "SELECT payload FROM pending_saves WHERE entity=?",
+                [entity],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // A record of another branch is not this save's (module docs): the
+        // save commits without touching it. A record of this entity on this
+        // branch is: this session's own retained save, or one that was not
+        // restored, which this save supersedes (its row goes with the commit
+        // below).
+        let pending = row
+            .as_deref()
+            .is_some_and(|record| !self.of_other_branch(record));
+        let replaced = row.filter(|_| pending && self.unrecovered.contains_key(entity));
+        let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
         // A retained save commits its write and the removal of its row
         // together. From autocommit that transaction begins IMMEDIATE, taking
         // SQLite's writer slot before the write reads the projection (as
@@ -1233,13 +1279,19 @@ impl Engine {
     /// (module docs): a staging file a scanner held at startup, a record of
     /// a branch that is active again. A restored one becomes a dirty session
     /// that [`Engine::retry_pending_due`] commits. A record of an entity with
-    /// a session (the file is open) waits for it to go.
+    /// a session (the file is open) waits for it to go, and one of a branch
+    /// that is not active waits for a checkout of it.
     fn retry_unrecovered_due(&mut self, now: Instant) {
         let due: Vec<String> = self
             .unrecovered
             .iter()
             .filter(|(entity, unrecovered)| {
-                unrecovered.next_at <= now && !self.sessions.contains_key(*entity)
+                unrecovered.next_at <= now
+                    && !self.sessions.contains_key(*entity)
+                    && unrecovered
+                        .branch
+                        .as_ref()
+                        .is_none_or(|branch| *branch == self.store.active)
             })
             .map(|(entity, _)| entity.clone())
             .collect();
@@ -1269,10 +1321,54 @@ impl Engine {
                         self.recovery_health = true;
                     }
                 }
-                Err(error) => self.note_unrecovered(&entity, &error, now),
+                Err(error) => self.note_unrecovered(&entity, record, &error, now),
             }
         }
         self.refresh_vitals();
+    }
+    /// Whether `record` belongs to a branch other than the active one (a
+    /// record that does not parse might be the active branch's: `false`).
+    fn of_other_branch(&self, record: &str) -> bool {
+        record_branch(record).is_some_and(|branch| branch != self.store.active)
+    }
+    /// Refuses a checkout while a `pending_saves` record that could belong to
+    /// the active branch is not restored (module docs; WP4.INT confirmation
+    /// review): after the checkout it could not be restored, and before this
+    /// a later save of the same file on the other branch superseded it, so its
+    /// unsaved bytes were lost. A restored record is a dirty session, which
+    /// `quiet()` refuses already; records of other branches do not block.
+    pub fn checkout_allowed(&self) -> Result<()> {
+        let blocking: Vec<String> = self
+            .pending_records()?
+            .into_iter()
+            .filter(|(entity, record)| {
+                !self.of_other_branch(record) && !self.sessions.get(entity).is_some_and(|s| s.dirty)
+            })
+            .map(|(entity, _)| entity)
+            .collect();
+        let Some(first) = blocking.first() else {
+            return Ok(());
+        };
+        let count = blocking.len();
+        let reason = self
+            .unrecovered
+            .get(first)
+            .map_or("not restored yet", |unrecovered| unrecovered.error.as_str());
+        bail!(
+            "RECOVERY_REQUIRED: checkout refused: {count} unsaved file{} of this branch could not be \
+             restored yet (entity {first}: {reason}) and would be left behind; they are retried and \
+             saved on this branch once restored; `tkfs pending-saves` lists them and \
+             `tkfs discard-pending-save ENTITY` drops one",
+            if count == 1 { "" } else { "s" }
+        )
+    }
+    /// After a checkout: every record not restored is due at once (those of
+    /// the branch now active can be restored now).
+    pub(crate) fn unrecovered_due_now(&mut self, now: Instant) {
+        for unrecovered in self.unrecovered.values_mut() {
+            unrecovered.failures = 0;
+            unrecovered.next_at = now;
+        }
     }
     pub fn open(
         &mut self,
@@ -1316,6 +1412,23 @@ impl Engine {
                 || entry.basic_info().attributes & 1 == 0,
             "ACCESS_DENIED: readonly file"
         );
+        // An unsaved version of this file on another branch waits to be
+        // restored there (module docs): no unsaved changes of this branch may
+        // compete with it for its one `pending_saves` row.
+        if writable
+            && let Some(branch) = self
+                .unrecovered
+                .get(&entry.id)
+                .and_then(|unrecovered| unrecovered.branch.as_ref())
+                .filter(|branch| **branch != self.store.active)
+        {
+            bail!(
+                "ACCESS_DENIED: an unsaved version of this file on branch {branch} waits to be \
+                 restored (RECOVERY_BRANCH_MISMATCH); check out that branch to restore it, or \
+                 `tkfs discard-pending-save {}` drops it",
+                entry.id
+            );
+        }
         if !self.sessions.contains_key(&entry.id) {
             let bytes = if special {
                 crate::staging::Staged::memory(self.discovery.clone())
@@ -1542,7 +1655,8 @@ impl Engine {
     /// No open handle, no unsaved session and no pending-save health
     /// (`PENDING_SAVES`/`PENDING_SAVE`, set only while sessions are unsaved).
     /// A `pending_saves` record that could not be restored does not count
-    /// (module docs): its row stays for the next start.
+    /// (module docs): its row stays and is retried; only a checkout waits for
+    /// it ([`Engine::checkout_allowed`]).
     pub fn quiet(&self) -> Result<()> {
         let open = self.handles.len();
         let dirty = self.sessions.values().filter(|s| s.dirty).count();

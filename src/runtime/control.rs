@@ -192,6 +192,9 @@ impl Engine {
                 }
                 "checkout" => {
                     ensure!(!self.mounted, "MOUNT_REBIND_REQUIRED");
+                    // Never leave an unrestored save of this branch behind
+                    // (WP4.INT confirmation review).
+                    self.checkout_allowed()?;
                     self.store.checkout(text("name")?)?;
                     json!({"branch":self.store.active,"generation":self.store.generation})
                 }
@@ -255,6 +258,8 @@ impl Engine {
             } else {
                 self.notifications.clear();
                 self.notification_error = None;
+                // The saves of the branch now active can be restored now.
+                self.unrecovered_due_now(std::time::Instant::now());
             }
         } else {
             self.store.active = old_active;

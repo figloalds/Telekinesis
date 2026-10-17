@@ -9,6 +9,9 @@
 //! * a record whose staging file comes back (a scanner held it at startup) is
 //!   restored by the retry and committed;
 //! * a later save of the same file supersedes a record that was not restored;
+//! * a record is never lost to another branch (WP4.INT confirmation review):
+//!   a checkout is refused while a record of the active branch is not
+//!   restored, and a record of another branch is never superseded;
 //! * at worker startup, staging files no record names and temporary object
 //!   files (`objects/*.part`) are removed.
 use serde_json::{Value, json};
@@ -249,6 +252,232 @@ fn a_later_save_of_the_same_file_supersedes_an_unrestored_record() {
     assert!(pending_entities(&engine).is_empty());
     assert_eq!(engine.reported_health(), None);
     assert_eq!(content(&engine, "unsaved-0.bin"), b"rewritten");
+}
+
+fn control(engine: &mut Engine, request: &str, payload: Value) -> anyhow::Result<Value> {
+    engine.control(request, &payload)
+}
+
+fn checkout(engine: &mut Engine, request: &str, branch: &str) -> anyhow::Result<Value> {
+    control(engine, request, json!({"op": "checkout", "name": branch}))
+}
+
+/// Saves `bytes` as the whole content of `path` (created when `create`).
+fn save(engine: &mut Engine, path: &str, create: bool, bytes: &[u8]) {
+    let (h, _) = engine.open(path, create.then_some("file"), true).unwrap();
+    engine.truncate(h, 0, false).unwrap();
+    engine.write(h, 0, bytes, false, false).unwrap();
+    engine.close(h).unwrap();
+}
+
+fn unsaved_bytes() -> Vec<u8> {
+    (0..300 * 1024).map(|i| (i % 241) as u8).collect()
+}
+
+/// WP4.INT confirmation review (blocker): `pending_saves` holds one record
+/// per entity, each of the branch it was saved on. Since an unrestored record
+/// no longer gated `quiet()`, a checkout to another branch was allowed while
+/// one existed; a save of the same file there then superseded it (its row
+/// deleted with that commit, its staging file removed) and the first branch's
+/// unsaved bytes were gone. The review's reproduction: the checkout is now
+/// refused (`RECOVERY_REQUIRED`) until the record is restored and saved on its
+/// own branch, and after that both branches keep their content.
+#[test]
+fn a_checkout_never_leaves_an_unrestored_save_of_its_branch_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let unsaved = unsaved_bytes();
+    let entity = {
+        let mut engine = Engine::new(Store::open(dir.path(), Some(REPO)).unwrap());
+        save(&mut engine, "f.bin", true, b"committed v1");
+        control(
+            &mut engine,
+            "branch-other",
+            json!({"op": "branch", "name": "other"}),
+        )
+        .unwrap();
+        // On main: 300 KiB unsaved (spooled), retained, then a crash (the
+        // engine is dropped, its retained spool stays).
+        let (h, entry) = engine.open("f.bin", None, true).unwrap();
+        engine.truncate(h, 0, false).unwrap();
+        engine.write(h, 0, &unsaved, false, false).unwrap();
+        assert_eq!(engine.retain_all_dirty().unwrap(), 1);
+        drop(engine);
+        entry.id
+    };
+    // A scanner holds the staging file at startup.
+    let (stage, aside) = {
+        let engine = Engine::new(Store::open_existing(dir.path()).unwrap());
+        let stage = stage_of(&engine, &entity);
+        let aside = stage.with_extension("held");
+        drop(engine);
+        fs::rename(&stage, &aside).unwrap();
+        (stage, aside)
+    };
+    let mut engine = Engine::new(Store::open_existing(dir.path()).unwrap());
+    let main = engine.store.active.clone();
+    let reported = engine.reported_health().unwrap();
+    assert!(reported.starts_with("RECOVERY_REQUIRED"), "{reported}");
+    // Stop and other requests are not gated; a checkout is.
+    engine.quiet().unwrap();
+    let refused = checkout(&mut engine, "checkout-1", "other").unwrap_err();
+    let message = format!("{refused:#}");
+    assert!(
+        message.starts_with("RECOVERY_REQUIRED: checkout refused"),
+        "{message}"
+    );
+    assert!(message.contains(&entity), "{message}");
+    assert_eq!(engine.store.active, main);
+    assert_eq!(pending_entities(&engine), vec![entity.clone()]);
+    // The scanner lets go: the retry restores the save and commits it on main.
+    fs::rename(&aside, &stage).unwrap();
+    let started = Instant::now();
+    engine.retry_pending_due(started + Duration::from_secs(3));
+    engine.retry_pending_due(started + Duration::from_secs(6));
+    assert!(pending_entities(&engine).is_empty());
+    assert_eq!(engine.reported_health(), None);
+    assert_eq!(content(&engine, "f.bin"), unsaved);
+    // Now the checkout is allowed; a save of the same file on the other branch
+    // leaves main's content alone.
+    checkout(&mut engine, "checkout-2", "other").unwrap();
+    assert_eq!(content(&engine, "f.bin"), b"committed v1");
+    save(&mut engine, "f.bin", false, b"edited on other");
+    checkout(&mut engine, "checkout-3", "main").unwrap();
+    for pass in 1..=5 {
+        engine.retry_pending_due(started + Duration::from_secs(10 * pass));
+    }
+    assert_eq!(engine.store.active, main);
+    assert_eq!(
+        content(&engine, "f.bin"),
+        unsaved,
+        "main's unsaved file is lost"
+    );
+    checkout(&mut engine, "checkout-4", "other").unwrap();
+    assert_eq!(content(&engine, "f.bin"), b"edited on other");
+}
+
+/// Discarding the record (its bytes are gone) unblocks the checkout.
+#[test]
+fn a_discarded_unrestorable_save_no_longer_blocks_a_checkout() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = retained(dir.path(), 1);
+    let (entity, _) = files[0].clone();
+    {
+        let engine = Engine::new(Store::open_existing(dir.path()).unwrap());
+        fs::remove_file(stage_of(&engine, &entity)).unwrap();
+    }
+    let mut engine = Engine::new(Store::open_existing(dir.path()).unwrap());
+    control(
+        &mut engine,
+        "branch-other",
+        json!({"op": "branch", "name": "other"}),
+    )
+    .unwrap();
+    let refused = checkout(&mut engine, "checkout-1", "other").unwrap_err();
+    assert!(
+        format!("{refused:#}").starts_with("RECOVERY_REQUIRED: checkout refused"),
+        "{refused:#}"
+    );
+    control(
+        &mut engine,
+        "discard",
+        json!({"op": "discard-pending-save", "entity": entity}),
+    )
+    .unwrap();
+    checkout(&mut engine, "checkout-2", "other").unwrap();
+}
+
+/// A record of another branch (left by an earlier build, which allowed the
+/// checkout above) is never superseded: a writable open of its file on this
+/// branch is refused, a save of the same entity on this branch (a session
+/// older than the record's arrival, simulated by lifting the handle's
+/// refusal) commits without touching the record, a retain does not overwrite
+/// it, and a checkout of its branch restores and commits it there.
+#[test]
+fn a_pending_save_of_another_branch_is_never_superseded() {
+    let dir = tempfile::tempdir().unwrap();
+    let unsaved = unsaved_bytes();
+    let (entity, main, other) = {
+        let mut engine = Engine::new(Store::open(dir.path(), Some(REPO)).unwrap());
+        let main = engine.store.active.clone();
+        save(&mut engine, "f.bin", true, b"committed v1");
+        let other = control(
+            &mut engine,
+            "branch-other",
+            json!({"op": "branch", "name": "other"}),
+        )
+        .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        checkout(&mut engine, "checkout-1", "other").unwrap();
+        let (h, entry) = engine.open("f.bin", None, true).unwrap();
+        engine.truncate(h, 0, false).unwrap();
+        engine.write(h, 0, &unsaved, false, false).unwrap();
+        assert_eq!(engine.retain_all_dirty().unwrap(), 1);
+        drop(engine);
+        (entry.id, main, other)
+    };
+    // The earlier build's checkout back to main, which left the record.
+    {
+        let db = rusqlite::Connection::open(dir.path().join("metadata.sqlite")).unwrap();
+        db.execute("UPDATE config SET value=? WHERE key='active'", [&main])
+            .unwrap();
+    }
+    let mut engine = Engine::new(Store::open_existing(dir.path()).unwrap());
+    assert_eq!(engine.store.active, main);
+    let record = |engine: &Engine| -> String {
+        engine
+            .store
+            .db
+            .query_row(
+                "SELECT payload FROM pending_saves WHERE entity=?",
+                [&entity],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let kept = record(&engine);
+    assert!(kept.contains(&other), "{kept}");
+    let stage = stage_of(&engine, &entity);
+    assert!(engine.reported_health().is_some());
+    // A writable open on main is refused; a read is not.
+    let refused = engine.open("f.bin", None, true).unwrap_err();
+    assert!(
+        format!("{refused:#}").starts_with("ACCESS_DENIED"),
+        "{refused:#}"
+    );
+    let (h, _) = engine.open("f.bin", None, false).unwrap();
+    assert_eq!(content(&engine, "f.bin"), b"committed v1");
+    // A session of main that writes anyway: its retain refuses to overwrite
+    // the other branch's record, and its save leaves the record alone.
+    engine.handles.get_mut(&h).unwrap().writable = true;
+    engine.truncate(h, 0, false).unwrap();
+    engine.write(h, 0, b"main edit", false, false).unwrap();
+    let error = engine.retain_all_dirty().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("RECOVERY_BRANCH_MISMATCH"),
+        "{error:#}"
+    );
+    assert_eq!(record(&engine), kept);
+    engine.close(h).unwrap();
+    assert_eq!(content(&engine, "f.bin"), b"main edit");
+    assert_eq!(record(&engine), kept);
+    assert!(
+        stage.exists(),
+        "the other branch's staging file was removed"
+    );
+    // Main's records do not block a checkout; the record is restored and
+    // committed on its own branch.
+    engine.quiet().unwrap();
+    checkout(&mut engine, "checkout-2", "other").unwrap();
+    let now = Instant::now();
+    engine.retry_pending_due(now);
+    engine.retry_pending_due(now + Duration::from_millis(10));
+    assert!(pending_entities(&engine).is_empty());
+    assert_eq!(engine.reported_health(), None);
+    assert_eq!(content(&engine, "f.bin"), unsaved);
+    checkout(&mut engine, "checkout-3", "main").unwrap();
+    assert_eq!(content(&engine, "f.bin"), b"main edit");
 }
 
 /// The review's minor: write spools of sessions a crash interrupted

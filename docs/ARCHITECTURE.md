@@ -238,8 +238,12 @@ accepting host shows its peers too.
    is deferred to the background.
 4. Recover pending saves, each on its own: one whose staging file is
    missing or unreadable, or that belongs to another branch, is kept,
-   reported (`RECOVERY_REQUIRED`, a degraded store that gates nothing) and
-   retried with the pending-save backoff, and the others load. Remove the
+   reported (`RECOVERY_REQUIRED`, a degraded store) and retried with the
+   pending-save backoff, and the others load. Such a record gates only a
+   checkout while it belongs to the active branch (one row per entity:
+   after the switch a save of the same file would replace it); one of
+   another branch waits for that branch, and its file cannot be opened for
+   writing meanwhile. Remove the
    staging files no pending save names and the temporary object files
    (`objects/*.part`) an interrupted run left. Build the worker context.
 5. Open the RPC listener, which requires the instance's token (a fresh

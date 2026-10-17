@@ -361,7 +361,7 @@ tkfs -C D:\Work\Projects discard-pending-save ENTITY_ID
 |---|---|
 | `status` | The worker's status: metadata and content counters (`content_complete` and the per-peer feed state `feed_peers`, each with its `caught_up`, cursor and the peer's tip, are separate claims), up to 20 current files with missing bytes, activation, inbox, mount and store health. `caught_up` and `metadata_caught_up` at the top are the previous release's lane observations and stay `false` on this release's peer path; `manage status` shows each folder's sync with each peer. |
 | `branches`, `conflicts`, `state`, `events`, `history` | Read the branches, unresolved conflicts, current projection, journal and checkpoints. |
-| `branch NAME`, `checkout NAME` | Create a private branch; switch the mount to a branch (refused while files are open). |
+| `branch NAME`, `checkout NAME` | Create a private branch; switch the mount to a branch (refused while files are open, and while an unsaved file of the current branch could not be restored: `RECOVERY_REQUIRED`, see `pending-saves`). |
 | `publish NAME --current-state-only` | Publish only the visible state as a new shared branch; private history stays here. |
 | `checkpoint -m MESSAGE`, `restore CHECKPOINT --branch NAME` | Record a checkpoint; restore one into a new private branch. |
 | `resolve --conflict ID… --revision ID` | Resolve conflicts by choosing a revision. |
@@ -370,5 +370,5 @@ tkfs -C D:\Work\Projects discard-pending-save ENTITY_ID
 | `cat-object HASH` | Write one stored object's bytes to stdout. |
 | `bucket-export --directory DIR` | Copy the shared objects to a local directory outside the mount and the state. |
 | `stop [--force]` | Stop a **standalone** worker (refused while busy; `--force` saves unsaved files and detaches). For a managed folder use `tkfs manage stop`, or the daemon restarts it. |
-| `pending-saves` | The folder's pending saves: unsaved files kept for a retry (`restored: true`: being saved), and each one that could not be restored with its `error` (its staging file is missing or unreadable, it belongs to another branch). Such a save is retried (1 s up to every 60 s) and reported as `RECOVERY_REQUIRED` in the folder's store health; it does not block Stop or other commands. |
+| `pending-saves` | The folder's pending saves: unsaved files kept for a retry (`restored: true`: being saved), and each one that could not be restored with its `error` (its staging file is missing or unreadable, it belongs to another branch). Such a save is retried (1 s up to every 60 s) and reported as `RECOVERY_REQUIRED` in the folder's store health; it does not block Stop or other commands, only a `checkout` while it belongs to the current branch. One of another branch is restored when that branch is checked out, and its file cannot be opened for writing meanwhile. |
 | `discard-pending-save ENTITY` | Drop a pending save that cannot be restored (its row and staging file): its unsaved bytes are lost. A restored one is refused (`PENDING_SAVE_RESTORED`). See the README runbook *Unsaved file that cannot be restored*. |

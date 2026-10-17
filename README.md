@@ -519,7 +519,7 @@ Common codes:
 | `CORRUPT_AT_SOURCE`, `SIZE_MISMATCH`, `OBJECT_SIZE_CHANGED` | fatal (that object) | The sender's copy is damaged; it re-verifies and quarantines it. Fix or restore the file at the source. |
 | `EVENT_ID_REUSED`, `FORGED_EVENT_ORIGIN`, `INVALID_EVENT`, `CAUSAL_CYCLE`, `INVALID_CAUSAL_PARENT`, `QUARANTINED_CAUSAL_ANCESTOR`, `PRIVATE_BRANCH_REJECTED`, … | fatal (that event) | Quarantined or rejected: see [quarantined events](#quarantined-or-blocked-events). |
 | `STORE_IDENTITY_MISMATCH`, `INVALID_STORE_METADATA`, `STATE_NOT_INITIALIZED`, `ENGINE_POISONED` | fatal (that folder) | The folder's store needs attention: read `worker.log`; `manage retry` restarts it. |
-| `RECOVERY_REQUIRED` | transient (the store is degraded) | An unsaved file kept as a pending save could not be restored: [runbook](#unsaved-file-that-cannot-be-restored). |
+| `RECOVERY_REQUIRED` | transient (the store is degraded) | An unsaved file kept as a pending save could not be restored (a checkout to another branch waits for it): [runbook](#unsaved-file-that-cannot-be-restored). |
 | `ORCHESTRATOR_NOT_RUNNING` | transient | No daemon answers for this configuration: start one. |
 | `ORCHESTRATOR_STOPPING` | transient | The daemon is shutting down. |
 | `ACCESS_DENIED` | transient | The daemon or worker refused the local connection: its token (`DATA/orchestrator.token`, `STATE/runtime.token`) was missing or did not match. Run `tkfs` as the user the daemon runs as, with the new binary ([local access](docs/CONFIGURATION.md#pairing-credentials-and-local-access)). |
@@ -654,17 +654,25 @@ a save that failed) and, at its next start, one of them could not be
 restored: its staging file under `STATE/staging/` is missing or unreadable
 (a scanner may hold it for a moment), or it belongs to another branch. The
 other pending saves are restored and committed as usual, and the folder
-works normally: Stop, Shutdown and every command keep working.
+works normally: Stop, Shutdown and every command keep working, except a
+`checkout` to another branch, which is refused (`RECOVERY_REQUIRED:
+checkout refused …`) while an unsaved file of the current branch is not
+restored: after the switch it could not be saved on its branch.
 
 1. Wait: an unreadable staging file is tried again (after 1 s, then up to
-   every 60 s) and committed once it opens. A save of another branch is
-   restored when that branch is checked out again.
+   every 60 s) and committed once it opens; then the checkout works.
 2. `tkfs -C MOUNT pending-saves` (or `--runtime STATE/runtime.json`) lists
    the pending saves: the file's name and branch, its staging file's size
    (none: it is gone) and why it was not restored.
 3. If the staging file is gone, its bytes are lost: `tkfs -C MOUNT
    discard-pending-save ENTITY` removes the record and the health clears.
-   Saving the same file again also replaces the record.
+   Saving the same file again on the same branch also replaces the record.
+
+A pending save of another branch (a store an earlier build switched
+branches with) waits for that branch: checking it out restores and saves
+it. Until then the file cannot be opened for writing on the current branch
+(access denied), so nothing saved here replaces it; `discard-pending-save`
+drops it instead.
 
 ### Adoption after a daemon crash
 
