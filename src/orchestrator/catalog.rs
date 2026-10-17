@@ -68,7 +68,11 @@
 //!
 //! * `SetVerifier` (ResetPairingCode), and a rotation by a downgraded binary
 //!   folded in at open, revoke every inbound credential with the verifier
-//!   generation bump, in the same transaction (invariant 21);
+//!   generation bump, in the same transaction (invariant 21); so does an
+//!   open that finds the generation moved since the credentials were last
+//!   reconciled with it (`credentials_generation`: a revamp build before
+//!   WP4.1 bumps the generation and records the salt itself; WP4.INT
+//!   re-review);
 //! * `RemovePeer` deletes our outbound credential for the installation once
 //!   no peer record names it any more (an unpair);
 //! * `UpsertPeer` of an endpoint whose record named another installation (a
@@ -193,6 +197,12 @@ mod keys {
     /// The salt of the verifier `verifier_generation` belongs to, so a code
     /// rotated by a downgraded binary still bumps the generation.
     pub const VERIFIER_SALT: &str = "verifier_salt";
+    /// The `verifier_generation` the inbound per-peer credentials were last
+    /// reconciled with (WP4.INT re-review): a generation bumped by a binary
+    /// that knows no credentials (a revamp build before WP4.1 records the
+    /// salt and the generation itself, so no salt discrepancy shows it)
+    /// revokes them at the next open.
+    pub const CREDENTIALS_GENERATION: &str = "credentials_generation";
 }
 
 /// SQL text. The `LEGACY_*` and positional statements are byte-identical to
@@ -1003,8 +1013,13 @@ fn migrate(conn: &mut Connection, now: u64) -> Result<()> {
 
 /// Folds what a downgraded binary may have changed into the side tables:
 /// gate rows it added or removed in `initial_sync`, peers it paired (which
-/// resolve gate sources), and a pairing code it rotated (which bumps
-/// `verifier_generation`). Idempotent; also the schema-1 backfill.
+/// resolve gate sources), a pairing code it rotated (which bumps
+/// `verifier_generation`), and a generation it bumped itself without
+/// revoking the inbound per-peer credentials (WP4.INT re-review: a revamp
+/// build before WP4.1 records the new salt and generation, so only the
+/// generation the credentials were reconciled with,
+/// `credentials_generation`, shows it; invariant 21). Idempotent; also the
+/// schema-1 backfill.
 fn reconcile_legacy(tx: &Transaction<'_>, now: u64) -> Result<()> {
     tx.execute(sql::BACKFILL_GATES, [ms(now)])?;
     tx.execute(sql::PRUNE_GATES, [])?;
@@ -1014,6 +1029,13 @@ fn reconcile_legacy(tx: &Transaction<'_>, now: u64) -> Result<()> {
         if recorded.as_deref() != Some(verifier.salt.as_str()) {
             bump_verifier_generation(tx, &verifier, now)?;
         }
+    }
+    let generation = verifier_generation(tx)?;
+    let reconciled = get_setting(tx, keys::CREDENTIALS_GENERATION)?
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if reconciled != Some(generation) {
+        tx.prepare_cached(sql::REVOKE_INBOUND)?.execute([ms(now)])?;
+        set_setting(tx, keys::CREDENTIALS_GENERATION, &generation.to_string())?;
     }
     Ok(())
 }
@@ -1332,6 +1354,7 @@ fn bump_verifier_generation(tx: &Transaction<'_>, verifier: &Verifier, now: u64)
     set_setting(tx, keys::VERIFIER_GENERATION, &next.to_string())?;
     set_setting(tx, keys::VERIFIER_SALT, &verifier.salt)?;
     tx.prepare_cached(sql::REVOKE_INBOUND)?.execute([ms(now)])?;
+    set_setting(tx, keys::CREDENTIALS_GENERATION, &next.to_string())?;
     Ok(())
 }
 

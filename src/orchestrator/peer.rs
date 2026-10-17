@@ -690,8 +690,13 @@ impl PeerManager {
 
     /// The best-effort `peer.revoke` of an unpair (WP4.1): on the peer's
     /// lane 0 when it is up, else on a probe session, within about
-    /// [`REVOKE_BUDGET`]. A failure is logged; the unpair goes on.
+    /// [`REVOKE_BUDGET`]. A lane-0 call that fails (refused `BUSY` by an
+    /// acceptor whose exchange slots its lane-0 exchanges hold, or lost) is
+    /// sent again on a probe session within what is left of the budget
+    /// (WP4.INT re-review: it was only logged, and the acceptor kept our
+    /// credential). A failure is logged; the unpair goes on.
     fn revoke_remote(&self, record: &PeerRecord) {
+        let started = std::time::Instant::now();
         let live = self
             .peers
             .lock()
@@ -699,37 +704,22 @@ impl PeerManager {
             .get(&record.installation)
             .and_then(|handle| handle.supervisor.conns.lock().get(&0).cloned())
             .filter(|conn| conn.closed().is_none());
-        let outcome = match live {
-            Some(conn) => call_revoke(&conn),
-            None => {
-                // The probe is bounded by its own token: a timer cancels it
-                // at the budget (a TCP connect in progress runs to its end).
-                let cancel = self.cancel.child();
-                let done = Cancel::new();
-                let timer = {
-                    let (cancel, done) = (cancel.clone(), done.clone());
-                    thread::Builder::new()
-                        .name("peer-revoke".into())
-                        .spawn(move || {
-                            if !done.sleep(REVOKE_BUDGET) {
-                                cancel.cancel();
-                            }
-                        })
-                };
-                let outcome = match self.probe_paired(record, &cancel) {
-                    Ok((conn, _)) => {
-                        let outcome = call_revoke(&conn);
-                        conn.close();
-                        outcome
-                    }
-                    Err(error) => Err(error.to_wire()),
-                };
-                done.cancel();
-                if let Ok(timer) = timer {
-                    let _ = timer.join();
+        let outcome = match live.map(|conn| call_revoke(&conn)) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) => {
+                let left = REVOKE_BUDGET.saturating_sub(started.elapsed());
+                event!(debug, (error.code.as_str()), {
+                    "peer": record.installation,
+                    "detail": "peer.revoke on lane 0 failed; sending it on a probe session",
+                    "message": error.message,
+                });
+                if left.is_zero() {
+                    Err(error)
+                } else {
+                    self.revoke_on_probe(record, left)
                 }
-                outcome
             }
+            None => self.revoke_on_probe(record, REVOKE_BUDGET),
         };
         if let Err(error) = outcome {
             event!(info, (error.code.as_str()), {
@@ -741,6 +731,48 @@ impl PeerManager {
         }
     }
 }
+
+impl PeerManager {
+    /// `peer.revoke` on a probe session of its own, bounded by `budget`: a
+    /// timer cancels the probe at the budget (a TCP connect in progress runs
+    /// to its end).
+    fn revoke_on_probe(&self, record: &PeerRecord, budget: Duration) -> Result<(), ErrorWire> {
+        let cancel = self.cancel.child();
+        let done = Cancel::new();
+        let timer = {
+            let (cancel, done) = (cancel.clone(), done.clone());
+            thread::Builder::new()
+                .name("peer-revoke".into())
+                .spawn(move || {
+                    if !done.sleep(budget) {
+                        cancel.cancel();
+                    }
+                })
+        };
+        let outcome = match self.probe_paired(record, &cancel) {
+            Ok((conn, _)) => {
+                let outcome = call_revoke(&conn);
+                conn.close();
+                outcome
+            }
+            Err(error) => Err(error.to_wire()),
+        };
+        done.cancel();
+        if let Ok(timer) = timer {
+            let _ = timer.join();
+        }
+        outcome
+    }
+}
+
+/// The pauses before each retry of a lane-0 enrollment the acceptor refused
+/// with a code it may lift (`run_credential_job`).
+const ENROLL_RETRIES: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
 
 /// One `peer.revoke` on `conn`.
 fn call_revoke(conn: &Conn) -> Result<(), ErrorWire> {
@@ -2232,7 +2264,28 @@ fn run_credential_job(local: &str, catalog: &Catalog, job: CredentialJob) {
                 done.store(false, Ordering::Release);
                 return;
             }
-            match enroll_on(&conn, local, &server, &code) {
+            // A refusal the acceptor may lift (`BUSY`, a catalog it could
+            // not write) is retried on the same session while it stays up
+            // (WP4.INT re-review: it waited for lane 0 to reconnect, which
+            // can be days on a stable link).
+            let mut outcome = enroll_on(&conn, local, &server, &code);
+            for delay in ENROLL_RETRIES {
+                let retryable = outcome.as_ref().is_err_and(|error| {
+                    matches!(
+                        crate::model::errors::classify(&error.code),
+                        crate::model::errors::ErrorClass::Contention
+                            | crate::model::errors::ErrorClass::Transient
+                    )
+                });
+                if !retryable || conn.closed().is_some() || stopped() || cancel.sleep(delay) {
+                    break;
+                }
+                if conn.closed().is_some() || stopped() {
+                    break;
+                }
+                outcome = enroll_on(&conn, local, &server, &code);
+            }
+            match outcome {
                 // Stored only while a record names the peer, checked in the
                 // catalog's transaction: an unpair's `RemovePeer` either
                 // runs first (refused) or deletes it with the record.

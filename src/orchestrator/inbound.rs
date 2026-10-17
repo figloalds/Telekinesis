@@ -31,8 +31,11 @@
 //! | `peer.enroll` | opens the sealed secret with this verifier's key (`session::auth::open_enrollment`) and stores `K_peer` as the dialer's inbound credential; refused `PEER_REVOKED` on a session that registered before a `peer.revoke` of its installation |
 //! | `peer.revoke` | revokes the dialer's inbound credential, answers, then sends every session of that installation `GOAWAY{PEER_REVOKED}` and closes those still open after [`REVOKE_CLOSE_GRACE`] (within 1 s) |
 //!
-//! Both write the catalog, so they run on an exchange slot's thread, never
-//! on the handler pool. A daemon without a concrete catalog (tests' fakes)
+//! Both write the catalog, so they run on a thread of their own, never on
+//! the handler pool, holding one of the session's [`CREDENTIAL_SLOTS`] and
+//! no exchange slot (WP4.INT re-review: on an exchange slot, a lane 0
+//! running its 4 `meta.exchange` calls got an unpair's `peer.revoke`
+//! refused `BUSY`). A daemon without a concrete catalog (tests' fakes)
 //! answers them `UNKNOWN_PEER_OPERATION`, as an older acceptor does.
 //!
 //! A per-installation revocation epoch orders revocations against the
@@ -809,6 +812,7 @@ impl Inner {
             revocation_epoch,
             exchanges: Arc::new(AtomicUsize::new(0)),
             exchange_slots: self.exchange_slots(peer.role),
+            credential_jobs: Arc::new(AtomicUsize::new(0)),
         }));
         let reason = loop {
             if let Some(reason) = conn.wait_closed(Duration::from_secs(3600)) {
@@ -1376,7 +1380,19 @@ struct SessionHandler {
     exchanges: Arc<AtomicUsize>,
     /// At most this many at once ([`exchange_slots`]).
     exchange_slots: usize,
+    /// `peer.enroll` / `peer.revoke` jobs of this session running now (at
+    /// most [`CREDENTIAL_SLOTS`]; [`SessionHandler::credential_job`]).
+    credential_jobs: Arc<AtomicUsize>,
 }
+
+/// `peer.enroll` and `peer.revoke` jobs one session runs at once (WP4.INT
+/// re-review). They have slots of their own, apart from the session's and
+/// the server's exchange slots: a dialer's lane 0 runs up to 4
+/// `meta.exchange` calls at once, which used to take every slot and get an
+/// unpair's `peer.revoke` (or a lane-0 enrollment) refused `BUSY`. A dialer
+/// sends one enrollment at a time per peer; two slots also leave room for a
+/// revoke beside an enrollment in flight.
+pub const CREDENTIAL_SLOTS: usize = 2;
 
 impl Handler for SessionHandler {
     fn handle(&self, req: Incoming) {
@@ -1400,7 +1416,7 @@ impl Handler for SessionHandler {
                 let inner = self.inner.clone();
                 let peer = self.peer.clone();
                 let epoch = self.revocation_epoch;
-                self.job(req, move |req| match req.op.as_str() {
+                self.credential_job(req, move |req| match req.op.as_str() {
                     peer_auth::ops::PEER_ENROLL => peer_enroll(&inner, &peer, epoch, req),
                     _ => peer_revoke(&inner, &peer, req),
                 });
@@ -1488,6 +1504,58 @@ impl SessionHandler {
             if let Some(req) = taken {
                 req.responder
                     .error(busy("no thread is available for the exchange".into()));
+            }
+        }
+    }
+}
+
+impl SessionHandler {
+    /// Runs a `peer.enroll` or `peer.revoke` job (the catalog's transaction)
+    /// on a thread of its own, holding one of the session's
+    /// [`CREDENTIAL_SLOTS`], never an exchange slot (`BUSY` only when those
+    /// are full).
+    fn credential_job(&self, req: Incoming, run: impl FnOnce(Incoming) + Send + 'static) {
+        let jobs = self.credential_jobs.clone();
+        if jobs.fetch_add(1, Ordering::AcqRel) >= CREDENTIAL_SLOTS {
+            jobs.fetch_sub(1, Ordering::AcqRel);
+            self.inner
+                .counters
+                .busy_refusals
+                .fetch_add(1, Ordering::Relaxed);
+            req.responder.error(busy(format!(
+                "{CREDENTIAL_SLOTS} credential requests of this session are already running"
+            )));
+            return;
+        }
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let release = Release(jobs);
+        let slot = Arc::new(Mutex::new(Some(req)));
+        let job = {
+            let slot = slot.clone();
+            move || {
+                let _release = release;
+                let taken = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if let Some(req) = taken
+                    && !req.responder.cancelled()
+                {
+                    run(req);
+                }
+            }
+        };
+        if thread::Builder::new()
+            .name("net-credential".into())
+            .spawn(job)
+            .is_err()
+        {
+            let taken = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(req) = taken {
+                req.responder
+                    .error(busy("no thread is available for the request".into()));
             }
         }
     }

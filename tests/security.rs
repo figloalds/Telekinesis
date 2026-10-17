@@ -2266,3 +2266,170 @@ fn unauthenticated_worker_connections_are_bounded_and_closed() {
         started.elapsed()
     );
 }
+
+/// WP4.INT re-review (the security review's minor, invariant 21): a revamp
+/// build before WP4.1 knows no per-peer credentials; its ResetPairingCode
+/// stores the new verifier and records the new generation and salt itself,
+/// so the open-time fold-in (which looks for a salt the generation was not
+/// bumped for) saw nothing and the peer's inbound credential stayed active
+/// past the rotation. The catalog now records the generation its
+/// credentials were reconciled with, and an open that finds it moved
+/// revokes them.
+#[test]
+fn a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open() {
+    use tkfs::model::orchestrator::{CatalogApi, CatalogCmd};
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network::default(),
+    };
+    let catalog = Catalog::open(&config).unwrap();
+    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
+    catalog.apply(CatalogCmd::SetVerifier { verifier }).unwrap();
+    let generation = catalog.snapshot().verifier_generation;
+    catalog
+        .enroll_at_generation("peer", CredentialSide::Inbound, [7; 32], generation)
+        .unwrap();
+    assert!(catalog.close());
+    drop(catalog);
+
+    // A reopen by this build keeps it.
+    let catalog = Catalog::open(&config).unwrap();
+    assert_eq!(
+        catalog
+            .credentials()
+            .active("peer", CredentialSide::Inbound),
+        Some([7; 32])
+    );
+    assert!(catalog.close());
+    drop(catalog);
+
+    // The older build's rotation: the new verifier, generation + 1 and the
+    // new salt, written together; the credential table is not touched.
+    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
+    {
+        let db = rusqlite::Connection::open(config.data_directory.join("folders.sqlite")).unwrap();
+        let upsert =
+            "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+        db.execute(
+            upsert,
+            [
+                "pairing",
+                serde_json::to_string(&verifier).unwrap().as_str(),
+            ],
+        )
+        .unwrap();
+        db.execute(
+            upsert,
+            ["verifier_generation", &(generation + 1).to_string()],
+        )
+        .unwrap();
+        db.execute(upsert, ["verifier_salt", verifier.salt.as_str()])
+            .unwrap();
+    }
+    let catalog = Catalog::open(&config).unwrap();
+    assert_eq!(catalog.snapshot().verifier_generation, generation + 1);
+    assert_eq!(
+        catalog
+            .credentials()
+            .active("peer", CredentialSide::Inbound),
+        None,
+        "the credential enrolled before the other build's rotation is still active"
+    );
+    // A credential enrolled at the new generation survives later opens.
+    catalog
+        .enroll_at_generation("peer", CredentialSide::Inbound, [8; 32], generation + 1)
+        .unwrap();
+    assert!(catalog.close());
+    drop(catalog);
+    let catalog = Catalog::open(&config).unwrap();
+    assert_eq!(
+        catalog
+            .credentials()
+            .active("peer", CredentialSide::Inbound),
+        Some([8; 32])
+    );
+}
+
+/// WP4.INT re-review (the WP4.1 review's minor): `peer.enroll` and
+/// `peer.revoke` took one of the session's and the server's exchange slots,
+/// so with a dialer's lane 0 running 4 `meta.exchange` calls (or the server
+/// at its exchange limit) an unpair's `peer.revoke` was refused `BUSY` and
+/// the acceptor kept the credential. They now have slots of their own: with
+/// no exchange slot left on the server, `meta.exchange` is refused `BUSY`
+/// and `peer.revoke` is still served.
+#[test]
+fn credential_requests_do_not_wait_for_exchange_slots() {
+    use tkfs::orchestrator::inbound::{self, InboundOptions};
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network {
+            listen: None,
+            connections: 2,
+            sync_interval_ms: 200,
+        },
+    };
+    let daemon = orchestrator::ctx::build(config).unwrap();
+    let ctx = daemon.ctx.clone();
+    manage(&ctx, Action::ResetPairingCode).unwrap();
+    let dialer = "busy-dialer";
+    let key = tkfs::session::auth::peer_key(&tkfs::session::auth::new_secret());
+    daemon
+        .catalog
+        .enroll(dialer, CredentialSide::Inbound, key)
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let _server = inbound::start_with(
+        ctx.clone(),
+        listener,
+        InboundOptions {
+            max_exchanges: 0,
+            ..InboundOptions::default()
+        },
+    );
+    let (conn, _) = session::dial(
+        &endpoint,
+        session::client_hello(dialer, LaneRole::Control, None, 2),
+        &PeerAuth { key, code: None },
+        None,
+        ConnOptions::default(),
+    )
+    .unwrap();
+    let busy = conn
+        .call(
+            tkfs::model::protocol::ops::META_EXCHANGE,
+            json!({"repo": "r"}),
+            Vec::new(),
+            session::Priority::Control,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+    assert_eq!(busy.to_wire().code, "BUSY", "{busy:?}");
+    let reply = conn
+        .call(
+            tkfs::session::auth::ops::PEER_REVOKE,
+            json!({}),
+            Vec::new(),
+            session::Priority::Control,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(reply.header["revoked"], true, "{:?}", reply.header);
+    assert!(
+        daemon
+            .catalog
+            .credentials()
+            .get(dialer, CredentialSide::Inbound)
+            .is_some_and(|credential| credential.revoked_ms.is_some())
+    );
+    conn.close();
+    ctx.shutdown.cancel();
+}
