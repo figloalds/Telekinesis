@@ -1044,7 +1044,9 @@ impl Store {
                 }
                 let appended = match base {
                     Some(base) => derive::timed("s.append", || {
-                        derive::project_append(branch, base, events, new)
+                        let index = index.map(|cell| cell.borrow());
+                        let index = index.as_deref().and_then(Option::as_ref);
+                        derive::project_append(branch, base, events, new, index)
                     })?,
                     None => None,
                 };
@@ -1633,6 +1635,7 @@ impl Store {
         if tip == cache.upto {
             return Ok((total == cache.total).then_some(cache));
         }
+        let t0 = std::time::Instant::now();
         let mut statement = self.db.prepare_cached(
             "SELECT s.seq,e.id,e.branch=?1,CASE WHEN e.branch=?1 THEN e.payload END FROM journal_sequence s CROSS JOIN events e ON e.id=s.event WHERE s.seq>?2 ORDER BY s.seq",
         )?;
@@ -1668,6 +1671,7 @@ impl Store {
                 .rows
                 .extend(read);
         }
+        derive::record_phase("s.ev.read", t0.elapsed().as_micros() as u64);
         if !added.is_empty() {
             added.sort_by(|a, b| a.id.cmp(&b.id));
             let old = std::mem::take(&mut cache.events);
@@ -1691,7 +1695,9 @@ impl Store {
             cache.events = merged;
             // The index follows the cache, or is dropped (rebuilt on demand).
             let follows = match cache.index.get_mut() {
-                Some(index) => index.extend(&cache.events, &positions)?,
+                Some(index) => {
+                    derive::timed("s.ev.index", || index.extend(&cache.events, &positions))?
+                }
                 None => true,
             };
             if !follows {
