@@ -372,10 +372,9 @@ pub unsafe extern "C" fn tk_call(
             7 => crate::runtime::engine::save_handle(engine, h)?,
             12 => {
                 crate::runtime::engine::save_handle(engine, h)?;
-                if flags & 1 != 0 {
-                    // The file a rename replaces is final first.
-                    crate::runtime::engine::settle_path(engine, &path)?;
-                }
+                // The entry at the target (one a rename replaces, or a
+                // deferred create holding the name) is final first.
+                crate::runtime::engine::settle_path(engine, &path)?;
             }
             9 if flags & 1 != 0 => {
                 crate::runtime::engine::save_handle(engine, h)?;
@@ -398,9 +397,13 @@ pub unsafe extern "C" fn tk_call(
             }
             _ => {}
         }
-        // A write waits (without the lock) for a save that reads its file.
+        // A write waits (without the lock) for a save that reads its file; a
+        // rename or a delete of a file whose creation a save is committing
+        // waits for that commit (`runtime::engine`, *Deferred creates*).
         let mut e = if op == 5 || op == 6 {
             crate::runtime::engine::lock_for_write(engine, h)
+        } else if op == 12 || (op == 9 && flags & 1 != 0) {
+            crate::runtime::engine::lock_created(engine, h)
         } else {
             lock_engine(engine)
         };
@@ -418,10 +421,12 @@ pub unsafe extern "C" fn tk_call(
                         ..Default::default()
                     }
                 } else {
-                    e.store.lookup(&path)?
+                    e.lookup_visible(&path)?
                 };
                 let size = if special {
                     e.discovery.len()
+                } else if e.is_deferred(&entry.id) {
+                    e.visible_size(&entry)?
                 } else {
                     entry
                         .content
@@ -443,8 +448,13 @@ pub unsafe extern "C" fn tk_call(
                 } else {
                     None
                 };
-                let (handle, entry) =
-                    e.open_with_attributes(&path, create, flags & 2 != 0, attributes)?;
+                // A file's creation commits with its first save (`runtime::engine`,
+                // *Deferred creates*); a directory's at once.
+                let (handle, entry) = if create == Some("file") {
+                    e.create_deferred(&path, flags & 2 != 0, attributes)?
+                } else {
+                    e.open_with_attributes(&path, create, flags & 2 != 0, attributes)?
+                };
                 unsafe { *token = handle };
                 fill(&mut out, &entry, e.session(handle)?.bytes.len());
             }
@@ -478,13 +488,15 @@ pub unsafe extern "C" fn tk_call(
                     s.entry.kind == "directory" || s.entry.basic_info().attributes & 1 == 0,
                     "ACCESS_DENIED: readonly file"
                 );
+                let entity = s.entry.id.clone();
                 ensure!(
-                    e.store.children(&s.entry.id)?.is_empty(),
+                    e.children_visible(&entity)?.is_empty(),
                     "DIRECTORY_NOT_EMPTY"
                 );
             }
             12 => {
                 e.flush(h)?;
+                e.commit_created_at(&path)?;
                 let entity = e.session(h)?.entry.id.clone();
                 e.store.rename(&entity, &path, flags & 1 != 0)?;
                 let entry = e.store.lookup(&path)?;
