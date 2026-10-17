@@ -587,7 +587,8 @@ fn the_help_parser_reads_clap_command_lists_and_options() {
                 --wrapped begins this description line\n  \
                 -m, --message <MESSAGE>\n      \
                 --conflict <CONFLICT>...  Repeatable\n  \
-                -C <DIRECTORY>\n\n\
+                -C <DIRECTORY>\n      \
+                --color [<WHEN>]          Optional value\n\n\
                 Folder arguments take --label too.\n";
     let commands: Vec<String> = commands_of(help).into_iter().collect();
     assert_eq!(commands, vec!["configure-mount", "status"]);
@@ -603,12 +604,19 @@ fn the_help_parser_reads_clap_command_lists_and_options() {
             vec!["-m", "--message"],
             vec!["--conflict"],
             vec!["-C"],
+            vec!["--color"],
         ]
     );
     let takes: Vec<Takes> = specs.iter().map(|spec| spec.takes).collect();
     assert_eq!(
         takes,
-        vec![Takes::Nothing, Takes::One, Takes::Many, Takes::One]
+        vec![
+            Takes::Nothing,
+            Takes::One,
+            Takes::Many,
+            Takes::One,
+            Takes::Maybe
+        ]
     );
     // Names in descriptions or after the section are not options, and a
     // prefix of a name is not that name.
