@@ -279,3 +279,84 @@ fn local_create_after_resolved_conflict() {
     }
     s.finish();
 }
+
+/// WP4.INT re-review (RC1): local creations, renames and deletes beside an
+/// unresolved conflict of another file take the fast path. Before the scoped
+/// gate one unresolved conflict anywhere on the branch made each of them a
+/// full replay under the engine lock (262-436 ms per create at 10K events,
+/// 872-1,064 ms at 30K). The floor judges the creates; renames and deletes
+/// are reported: a rename into a slot its entity never used and a first
+/// delete count the competing cuts over the branch's history (CCR-WP1.6-5),
+/// with or without conflicts, which is O(history) on its own.
+#[test]
+#[ignore = "WP4.INT"]
+fn local_namespace_ops_beside_an_unresolved_conflict_10k() {
+    let mut s = Scenario::new(
+        FILE,
+        "local_namespace_ops_beside_an_unresolved_conflict_10k",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
+    linear_history(&mut a, scaled(10_000)).unwrap();
+    let file = a.create("conflicted.txt", "file").unwrap();
+    let (mut a, mut b) = clone_replica(a, &dir.path().join("b")).unwrap();
+    let allowed = devices([&a, &b]);
+    let base = file.revisions.get("content").cloned();
+    a.write_revision(&file.id, base.clone(), b"from A").unwrap();
+    b.write_revision(&file.id, base, b"from B").unwrap();
+    sync_into(&b, &mut a, &allowed).unwrap();
+    s.check(
+        a.conflicts()
+            .unwrap()
+            .iter()
+            .any(|c| c.resolved_by.is_none()),
+        "an unresolved conflict remains",
+    );
+    let before = a.commit_path_counters();
+    s.measure_from_now();
+    let (mut creates, mut renames, mut deletes) = (vec![], vec![], vec![]);
+    for i in 0..40 {
+        if s.over_budget() {
+            s.timeout(format!("{i} of 40 rounds in budget"));
+            break;
+        }
+        let (r, ms) = time_ms(|| a.create(&format!("beside-{i:02}.txt"), "file"));
+        let created = r.unwrap();
+        creates.push(ms);
+        let (r, ms) =
+            time_ms(|| a.rename(&created.id, &format!("beside-{i:02}-renamed.txt"), false));
+        r.unwrap();
+        renames.push(ms);
+        if i % 2 == 0 {
+            let (r, ms) = time_ms(|| a.delete(&created.id));
+            r.unwrap();
+            deletes.push(ms);
+        }
+    }
+    let after = a.commit_path_counters();
+    let summary = summarize(&creates);
+    s.metric_with("p90_ms", summary.p90, "ms", summary.json());
+    s.metric("p50_ms", summary.p50, "ms");
+    let renamed = summarize(&renames);
+    s.metric_with("rename_p90_ms", renamed.p90, "ms", renamed.json());
+    let deleted = summarize(&deletes);
+    s.metric_with("delete_p90_ms", deleted.p90, "ms", deleted.json());
+    s.metric(
+        "slow_path_commits",
+        (after.slow - before.slow) as f64,
+        "count",
+    );
+    let total = (creates.len() + renames.len() + deletes.len()) as u64;
+    if tkfs::core::commit::remote_fast_paths_enabled() {
+        s.check(
+            after.slow == before.slow && after.fast - before.fast == total,
+            format!(
+                "every create, rename and delete took the fast path ({} fast, {} slow)",
+                after.fast - before.fast,
+                after.slow - before.slow
+            ),
+        );
+    }
+    s.finish();
+}

@@ -722,7 +722,13 @@ resumes by itself when it serves again.
   unresolved: an event from a peer that conflicts with the local history is
   activated by a full replay, whose cost grows with the history and its
   conflicts (at about 9,000 events and 9,000 unresolved conflicts, minutes
-  per event; [validation](docs/VALIDATION.md#soak)).
+  per event; [validation](docs/VALIDATION.md#soak)). An open conflict slows
+  only what touches it: creating, renaming, moving or deleting other files
+  stays on the fast path, local or from a peer; changing the name or place
+  of a conflicted entry (or of its folder) is a full replay, about 0.3 s at
+  10,000 events and 1 s at 30,000. A rename to a new name and a first
+  delete also count the folder's concurrent history (CCR-WP1.6-5): about
+  0.1 s at 10,000 events, with or without conflicts.
 - Metadata and content travel separately: a file can be listed, renamed or
   moved before its bytes arrive. Opening a file whose bytes have not arrived
   moves it to the front of the download queue and waits for it for up to 15
