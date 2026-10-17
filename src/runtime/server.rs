@@ -209,6 +209,7 @@ const READ_ONLY_CONTROL_OPS: &[&str] = &[
     "state",
     "cat-object",
     "events",
+    "pending-saves",
 ];
 
 /// Legacy entry point (in-process tests and tools): builds a minimal

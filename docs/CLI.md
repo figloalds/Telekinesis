@@ -353,6 +353,8 @@ tkfs -C D:\Work\Projects cat-object OBJECT_HASH
 tkfs -C D:\Work\Projects bucket-export --directory D:\Exports\bucket
 tkfs -C D:\Work\Projects stop
 tkfs -C D:\Work\Projects stop --force
+tkfs -C D:\Work\Projects pending-saves
+tkfs -C D:\Work\Projects discard-pending-save ENTITY_ID
 ```
 
 | Command | Effect |
@@ -368,3 +370,5 @@ tkfs -C D:\Work\Projects stop --force
 | `cat-object HASH` | Write one stored object's bytes to stdout. |
 | `bucket-export --directory DIR` | Copy the shared objects to a local directory outside the mount and the state. |
 | `stop [--force]` | Stop a **standalone** worker (refused while busy; `--force` saves unsaved files and detaches). For a managed folder use `tkfs manage stop`, or the daemon restarts it. |
+| `pending-saves` | The folder's pending saves: unsaved files kept for a retry (`restored: true`: being saved), and each one that could not be restored with its `error` (its staging file is missing or unreadable, it belongs to another branch). Such a save is retried (1 s up to every 60 s) and reported as `RECOVERY_REQUIRED` in the folder's store health; it does not block Stop or other commands. |
+| `discard-pending-save ENTITY` | Drop a pending save that cannot be restored (its row and staging file): its unsaved bytes are lost. A restored one is refused (`PENDING_SAVE_RESTORED`). See the README runbook *Unsaved file that cannot be restored*. |

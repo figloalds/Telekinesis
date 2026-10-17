@@ -519,6 +519,7 @@ Common codes:
 | `CORRUPT_AT_SOURCE`, `SIZE_MISMATCH`, `OBJECT_SIZE_CHANGED` | fatal (that object) | The sender's copy is damaged; it re-verifies and quarantines it. Fix or restore the file at the source. |
 | `EVENT_ID_REUSED`, `FORGED_EVENT_ORIGIN`, `INVALID_EVENT`, `CAUSAL_CYCLE`, `INVALID_CAUSAL_PARENT`, `QUARANTINED_CAUSAL_ANCESTOR`, `PRIVATE_BRANCH_REJECTED`, … | fatal (that event) | Quarantined or rejected: see [quarantined events](#quarantined-or-blocked-events). |
 | `STORE_IDENTITY_MISMATCH`, `INVALID_STORE_METADATA`, `STATE_NOT_INITIALIZED`, `ENGINE_POISONED` | fatal (that folder) | The folder's store needs attention: read `worker.log`; `manage retry` restarts it. |
+| `RECOVERY_REQUIRED` | transient (the store is degraded) | An unsaved file kept as a pending save could not be restored: [runbook](#unsaved-file-that-cannot-be-restored). |
 | `ORCHESTRATOR_NOT_RUNNING` | transient | No daemon answers for this configuration: start one. |
 | `ORCHESTRATOR_STOPPING` | transient | The daemon is shutting down. |
 | `ACCESS_DENIED` | transient | The daemon or worker refused the local connection: its token (`DATA/orchestrator.token`, `STATE/runtime.token`) was missing or did not match. Run `tkfs` as the user the daemon runs as, with the new binary ([local access](docs/CONFIGURATION.md#pairing-credentials-and-local-access)). |
@@ -641,6 +642,26 @@ its last phase is named.
 because files are open in the mount or unsaved data is pending. Close them
 (the daemon retries every 2 s), or `tkfs manage force-stop STATE`: unsaved
 files go to the folder's pending saves and are committed on its next start.
+
+### Unsaved file that cannot be restored
+
+`Degraded — RECOVERY_REQUIRED: N unsaved files could not be restored (entity
+ID: …)`: a folder kept unsaved files as pending saves (a force stop, a crash,
+a save that failed) and, at its next start, one of them could not be
+restored: its staging file under `STATE/staging/` is missing or unreadable
+(a scanner may hold it for a moment), or it belongs to another branch. The
+other pending saves are restored and committed as usual, and the folder
+works normally: Stop, Shutdown and every command keep working.
+
+1. Wait: an unreadable staging file is tried again (after 1 s, then up to
+   every 60 s) and committed once it opens. A save of another branch is
+   restored when that branch is checked out again.
+2. `tkfs -C MOUNT pending-saves` (or `--runtime STATE/runtime.json`) lists
+   the pending saves: the file's name and branch, its staging file's size
+   (none: it is gone) and why it was not restored.
+3. If the staging file is gone, its bytes are lost: `tkfs -C MOUNT
+   discard-pending-save ENTITY` removes the record and the health clears.
+   Saving the same file again also replaces the record.
 
 ### Adoption after a daemon crash
 

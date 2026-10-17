@@ -27,7 +27,7 @@ impl Engine {
                 s["mounted"] = json!(self.mounted);
                 s["open_handles"] = json!(self.handles.len());
                 s["unflushed_files"] = json!(self.sessions.values().filter(|s| s.dirty).count());
-                s["health"] = json!(self.health);
+                s["health"] = json!(self.reported_health());
                 s["notification_error"] = json!(self.notification_error);
                 s["pending_notifications"] = json!(self.notifications.len());
                 s["last_sync"] = json!(self.last_sync);
@@ -48,7 +48,7 @@ impl Engine {
                         && s["incoming_active"] == 0
                         && s["pending_causal_events"] == json!([])
                         && s["unflushed_files"] == 0
-                        && self.health.is_none()
+                        && self.reported_health().is_none()
                         && !self.sync_peers.is_empty()
                         && self.sync_peers.iter().all(|peer| {
                             self.peer_sync
@@ -156,6 +156,12 @@ impl Engine {
                 return Ok(json!({"hex":hex::encode(self.store.read_object(text("object")?)?)}));
             }
             "events" => return Ok(json!(self.store.events()?)),
+            // WP4.INT re-review: the pending saves, and dropping one that
+            // could not be restored (`Engine::discard_pending_save`). Neither
+            // waits for the folder to be quiet: open files elsewhere must not
+            // keep a broken record.
+            "pending-saves" => return self.pending_saves_report(),
+            "discard-pending-save" => return self.discard_pending_save(text("entity")?),
             _ => {}
         }
         self.quiet()?;
