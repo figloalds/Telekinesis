@@ -2439,6 +2439,52 @@ fn names(ctx: &WorkerCtx) -> BTreeSet<String> {
         .collect()
 }
 
+/// WP4.INT (CCR-WP4.2-5): a feed exchange that moves nothing (no event
+/// sent, received, staged, rejected or acknowledged, the peer's counters
+/// unchanged) does not move `status_generation`, so an idle replica's
+/// exchanges every sync interval do not move `generations.sync` and so do
+/// not trigger a download round on every bulk lane. The counters keep their
+/// time stamp; an exchange that moves something still bumps both sides.
+#[test]
+fn an_idle_feed_exchange_moves_no_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let a = worker(&dir.path().join("a"), &repo);
+    let b = worker(&dir.path().join("b"), &repo);
+    a.engine
+        .lock()
+        .unwrap()
+        .store
+        .create("one", "directory")
+        .unwrap();
+    for _ in 0..6 {
+        rpc_round(&b, &a);
+    }
+    assert!(names(&b).contains("one"));
+    let generations = |w: &WorkerCtx| w.status_generation.load(Ordering::SeqCst);
+    let (gb, ga) = (generations(&b), generations(&a));
+    let stamped = b.sync_obs.lock().unwrap()[&a.device].last_exchange_ms;
+    std::thread::sleep(Duration::from_millis(5));
+    for _ in 0..3 {
+        rpc_round(&b, &a);
+    }
+    assert_eq!(
+        (generations(&b), generations(&a)),
+        (gb, ga),
+        "idle exchanges"
+    );
+    assert!(b.sync_obs.lock().unwrap()[&a.device].last_exchange_ms > stamped);
+    a.engine
+        .lock()
+        .unwrap()
+        .store
+        .create("two", "directory")
+        .unwrap();
+    rpc_round(&b, &a);
+    assert!(generations(&b) > gb, "the dialer received an event");
+    assert!(generations(&a) > ga, "the acceptor sent one");
+}
+
 #[test]
 fn feed_ops_run_through_the_worker_rpc_seam() {
     let dir = tempfile::tempdir().unwrap();
@@ -2465,11 +2511,27 @@ fn feed_ops_run_through_the_worker_rpc_seam() {
     );
     assert_eq!(exchanged["local"]["summary"]["sent_events"], 3);
     assert_eq!(applied["summary"]["staged"], 3);
-    // No activator runs here: the exchange activated what it staged.
-    assert_eq!(
-        names(&b),
-        BTreeSet::from(["one", "two", "three"].map(String::from))
+    // No activator runs here: the exchange activated what it staged, in its
+    // stand-in pass. That pass is bounded (`sync_rpc::STAND_IN_BUDGET`,
+    // 100 ms), so on a loaded machine it may end before the batch does
+    // (CCR-WP4.1-11, applied by WP4.INT): a non-empty part of it inline, the
+    // rest as the next pass would.
+    let expected = BTreeSet::from(["one", "two", "three"].map(String::from));
+    let inline = names(&b);
+    assert!(
+        !inline.is_empty() && inline.is_subset(&expected),
+        "inline: {inline:?}"
     );
+    {
+        let mut engine = b.engine.lock().unwrap();
+        while engine
+            .store
+            .activate_slice(SliceBudget::UNBOUNDED)
+            .unwrap()
+            .more
+        {}
+    }
+    assert_eq!(names(&b), expected);
     assert!(b.activation.count() > 0 && a.activation.count() > 0);
     assert!(b.status_generation.load(Ordering::SeqCst) > 0);
     let counters = b.sync_obs.lock().unwrap()[&a.device].clone();

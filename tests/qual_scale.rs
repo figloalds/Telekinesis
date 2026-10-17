@@ -421,6 +421,15 @@ fn idle_worker_cpu() {
             .is_ok_and(|p| p[0]["lanes"][0]["repositories"][&repo]["caught_up"] == true)
     });
     s.check(settled, "replicas idle and caught up");
+    // Idle means settled (WP4.INT): for the first seconds after a
+    // synchronization each pooled connection of a worker builds its caches
+    // once (the content scan, about 0.3 s at 10K objects; the want scan,
+    // about 0.2 s), and the last metadata and object rounds of the catch-up
+    // end. Profiled at 10 s windows from 5 s after `caught_up`: about 1 s of
+    // CPU per worker in the first 20 s, then 0.15-0.8 %. That is the end of
+    // the catch-up, not idle work: the window starts 30 s after `caught_up`
+    // (it was 5 s).
+    thread::sleep(Duration::from_secs(25));
     thread::sleep(Duration::from_secs(5));
     let pids: Vec<u32> = a
         .worker_pids(&pa)

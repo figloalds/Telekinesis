@@ -5,7 +5,8 @@
 //! route against this worker (codes as in `paired_sync::binding`), runs on a
 //! pooled secondary store (`ctx.sync_stores`) and never waits for the engine
 //! lock; afterwards it refreshes the peer's `ctx.sync_obs` counters, bumps
-//! `ctx.status_generation` and pokes `ctx.activation`.
+//! `ctx.status_generation` (when the exchange moved anything, WP4.INT) and
+//! pokes `ctx.activation`.
 //!
 //! Replies are the typed `model` messages as JSON, with the `"event": null`
 //! and `"large": null` members of feed entries left out (both are
@@ -25,6 +26,7 @@ use crate::{
     core::{Bundle, Store, time},
     model::{
         errors::code_of,
+        health::PeerFeedCounters,
         ipc::{FeedApplyRequest, FeedExchangeReply, FeedExchangeRequest, FeedOfferRequest, ops},
         protocol::feed::{FeedApplyResult, MetaExchangeReply, MetaExchangeRequest},
     },
@@ -170,15 +172,43 @@ fn compact_page(page: Option<&mut Value>) {
 }
 
 /// Refresh the peer's counters in `ctx.sync_obs` (from the exchange result,
-/// stamped now) and mark the status cell stale. A failure here never fails
-/// the exchange.
+/// stamped now) and, when the exchange moved anything, mark the status cell
+/// stale (`status_generation`, which moves `generations.sync`). A failure
+/// here never fails the exchange.
+///
+/// An exchange that moved nothing (no event sent, received, staged, rejected
+/// or acknowledged, the metadata not advanced, the peer's counters equal but
+/// for their time stamp) bumps nothing (CCR-WP4.2-5, applied by WP4.INT): an
+/// idle replica's feed exchanges every sync interval would otherwise move
+/// `generations.sync` every time, and each move triggers a download round on
+/// every bulk lane (objects of staged events are wanted before activation),
+/// an O(objects) want at this worker each. The counters' new time stamp
+/// still goes out with the next regular heartbeat (1 s).
 fn observe(ctx: &WorkerCtx, store: &Store, route: &SyncRoute, result: &FeedApplyResult) {
+    let summary = &result.summary;
+    let mut moved = summary.sent_events > 0
+        || summary.received_events > 0
+        || summary.staged > 0
+        || summary.rejected > 0
+        || summary.acked > 0
+        || summary.metadata_advanced;
     match store.feed_counters_after(&route.remote_replica, result) {
         Ok(mut counters) => {
             counters.last_exchange_ms = Some(time());
-            lock(&ctx.sync_obs).insert(route.remote_replica.clone(), counters);
+            let previous =
+                lock(&ctx.sync_obs).insert(route.remote_replica.clone(), counters.clone());
+            moved |= previous.is_none_or(|previous| {
+                PeerFeedCounters {
+                    last_exchange_ms: None,
+                    ..previous
+                } != PeerFeedCounters {
+                    last_exchange_ms: None,
+                    ..counters
+                }
+            });
         }
         Err(error) => {
+            moved = true;
             crate::util::log::event!(warn, (code_of(&error).as_str()), {
                 "site": "worker.feed.counters",
                 "peer": route.remote_replica,
@@ -186,7 +216,9 @@ fn observe(ctx: &WorkerCtx, store: &Store, route: &SyncRoute, result: &FeedApply
             });
         }
     }
-    ctx.status_generation.fetch_add(1, Ordering::SeqCst);
+    if moved {
+        ctx.status_generation.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn after_exchange(ctx: &WorkerCtx, result: &FeedApplyResult) {

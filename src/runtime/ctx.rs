@@ -174,11 +174,25 @@ impl SyncStorePool {
     pub fn idle(&self) -> usize {
         lock(&self.inner.idle).len()
     }
+
+    /// A secondary connection of the pool's store that its caller keeps for
+    /// itself (WP4.INT: the maintenance thread's status refresh), so its
+    /// derived caches stay warm: a pooled connection's caches are its own,
+    /// and the pool hands out whichever connection was returned last, so a
+    /// periodic caller would meet a cold one (an O(objects) content scan)
+    /// whenever two checkouts had overlapped. Refresh its identity with
+    /// [`refresh_view_identity`] before each use.
+    pub fn open_dedicated(&self) -> Result<Store> {
+        let mut store =
+            Store::open_secondary(&self.inner.root, &self.inner.repo, &self.inner.device)?;
+        refresh_view_identity(&mut store)?;
+        Ok(store)
+    }
 }
 
 /// Copies the engine's `active` branch and view `generation` (both written by
 /// `Store::checkout`) from `config` into a secondary handle.
-fn refresh_view_identity(store: &mut Store) -> Result<()> {
+pub fn refresh_view_identity(store: &mut Store) -> Result<()> {
     let (active, generation): (String, Option<String>) = store.db.query_row(
         "SELECT (SELECT value FROM config WHERE key='active'),
                 (SELECT value FROM config WHERE key='generation')",
