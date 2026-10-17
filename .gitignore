@@ -4,6 +4,8 @@
 /test-evidence/*
 # Integrators commit qualification evidence (REVAMP_PLAN §13 rule 8.5; CCR-WP0.5-2).
 !/test-evidence/qualification-*.json
+# ...and the two-machine lab results (WP4.INT, docs/VALIDATION.md).
+!/test-evidence/lab/
 # Legacy report locations (current harnesses use the directories above).
 /VALIDATION.json
 /*-VALIDATION.json
