@@ -1672,15 +1672,15 @@ impl Engine {
     /// saving again (it would hold the lock for a save that failed a moment
     /// ago); the session goes when nothing keeps it. A dirty session stays
     /// (its failed save retained it; the pending-save retry commits it).
-    pub fn release_handle(&mut self, h: u64) {
-        if let Some(handle) = self.handles.remove(&h)
-            && let Some(s) = self.sessions.get_mut(&handle.entity)
-        {
+    pub fn release_handle(&mut self, h: u64) -> Result<()> {
+        let handle = self.handles.remove(&h).context("INVALID_HANDLE")?;
+        if let Some(s) = self.sessions.get_mut(&handle.entity) {
             s.references = s.references.saturating_sub(1);
             if s.references == 0 && !s.dirty && !s.saving {
                 self.sessions.remove(&handle.entity);
             }
         }
+        Ok(())
     }
     /// One directory cut per enumeration, retained through marker continuations.
     /// A rewind sees later mutations; close releases the cursor. Generation
@@ -1851,6 +1851,13 @@ impl Engine {
                 s.preserve_times |= 4;
             }
         }
+        Ok(())
+    }
+    /// Marks handle `h` cleaned up (the application closed it: no more
+    /// writes through it) without saving its session; the mount adapters
+    /// save it next, without the engine lock ([`save_handle_in_background`]).
+    pub fn cleanup_unsaved(&mut self, h: u64) -> Result<()> {
+        self.handles.get_mut(&h).context("INVALID_HANDLE")?.cleaned = true;
         Ok(())
     }
     pub fn cleanup(&mut self, h: u64, delete: bool) -> Result<()> {
@@ -2025,43 +2032,111 @@ impl SaveSignal {
 /// view stale, and its next operation would reload the whole projection
 /// (about 10 ms per save at 2K files; it was most of a small file's save
 /// before WP5.2). Another connection's commit that leaves the projection
-/// tables alone keeps the view (`Store::adopt_foreign_commits`). Best
-/// effort, like the index itself: an object without its row is checked with
-/// a `stat`, and verified again at the next startup.
+/// tables alone keeps the view (`Store::adopt_foreign_commits`).
+///
+/// The rows are written in batches, one transaction every
+/// [`NOTES_INTERVAL`] at most, by a thread that runs only while rows wait:
+/// one row per transaction made the saves of a burst of small files wait on
+/// each other's commits (SQLite's busy handler sleeps). Best effort, like
+/// the index itself: until its row is written an object counts as present by
+/// the listing of `objects/` (never as corrupt), and one whose row a crash
+/// lost is verified again at the next startup.
 pub struct AvailabilityNotes {
     root: std::path::PathBuf,
     repo: String,
     device: String,
-    store: Mutex<Option<Store>>,
+    state: Mutex<NotesState>,
 }
+#[derive(Default)]
+struct NotesState {
+    /// `(object, size, mtime_ns, verified_ms)` not yet written.
+    queue: Vec<(String, u64, i64, u64)>,
+    /// A flushing thread runs.
+    flusher: bool,
+}
+/// How long noted rows wait before the flushing thread writes them.
+pub const NOTES_INTERVAL: Duration = Duration::from_millis(200);
 impl AvailabilityNotes {
     fn new(store: &Store) -> Self {
         Self {
             root: store.root.clone(),
             repo: store.repo.clone(),
             device: store.device.clone(),
-            store: Mutex::new(None),
+            state: Mutex::new(NotesState::default()),
         }
     }
     /// Records `object` (`size` bytes, mtime `mtime_ns`) as available and
-    /// verified now.
-    fn note(&self, object: &str, size: u64, mtime_ns: i64) {
-        let mut slot = crate::util::lock::lock(&self.store);
-        if slot.is_none() {
-            match Store::open_secondary(&self.root, &self.repo, &self.device) {
-                Ok(store) => *slot = Some(store),
-                Err(error) => {
-                    crate::util::log::event!(debug, OBJECT_IO_ERROR, {
-                        "site": "engine.save.note",
-                        "message": format!("{error:#}"),
-                    });
+    /// verified now, in the next batch.
+    fn note(self: &Arc<Self>, object: &str, size: u64, mtime_ns: i64) {
+        let mut state = crate::util::lock::lock(&self.state);
+        state
+            .queue
+            .push((object.to_owned(), size, mtime_ns, time()));
+        if state.flusher {
+            return;
+        }
+        let notes = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("availability-notes".into())
+            .spawn(move || notes.flush_loop());
+        state.flusher = spawned.is_ok();
+        if !state.flusher {
+            // No thread: written now (the rows are best effort either way).
+            let batch = std::mem::take(&mut state.queue);
+            drop(state);
+            self.write(batch);
+        }
+    }
+    /// Rows noted and not yet written.
+    pub fn queued(&self) -> usize {
+        crate::util::lock::lock(&self.state).queue.len()
+    }
+    /// Writes every queued row now.
+    pub fn flush(&self) {
+        let batch = std::mem::take(&mut crate::util::lock::lock(&self.state).queue);
+        self.write(batch);
+    }
+    fn flush_loop(&self) {
+        loop {
+            std::thread::sleep(NOTES_INTERVAL);
+            let batch = {
+                let mut state = crate::util::lock::lock(&self.state);
+                if state.queue.is_empty() {
+                    state.flusher = false;
                     return;
                 }
+                std::mem::take(&mut state.queue)
+            };
+            self.write(batch);
+        }
+    }
+    /// One transaction on a connection opened for it (none stays open).
+    fn write(&self, batch: Vec<(String, u64, i64, u64)>) {
+        if batch.is_empty() {
+            return;
+        }
+        let written = (|| -> Result<()> {
+            crate::util::fault::trigger("engine.save.notes")?;
+            let store = Store::open_secondary(&self.root, &self.repo, &self.device)?;
+            store.db.execute_batch("BEGIN IMMEDIATE")?;
+            for (object, size, mtime_ns, verified_ms) in &batch {
+                store.note_available(object, *size, *mtime_ns, *verified_ms);
             }
+            store.db.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            crate::util::log::event!(debug, OBJECT_IO_ERROR, {
+                "site": "engine.save.notes",
+                "rows": batch.len(),
+                "message": format!("{error:#}"),
+            });
         }
-        if let Some(store) = slot.as_ref() {
-            store.note_available(object, size, mtime_ns, time());
-        }
+    }
+}
+impl Drop for AvailabilityNotes {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 
@@ -2299,6 +2374,106 @@ pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
 
 /// The longest single wait for a save's end before the waiter looks again.
 const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// Saves running on threads of their own ([`save_handle_in_background`]) at
+/// most at once, in this process: a close beyond it saves before it returns.
+/// It bounds what a hard crash (power loss, a killed process) can lose of
+/// files that were closed but not yet committed.
+pub const MAX_BACKGROUND_SAVES: usize = 8;
+static BACKGROUND_SAVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Saves running in the background now ([`save_handle_in_background`]).
+pub fn background_saves() -> usize {
+    BACKGROUND_SAVES.load(Ordering::SeqCst)
+}
+
+/// One background save slot, given back on drop.
+struct BackgroundSlot;
+impl BackgroundSlot {
+    fn take() -> Option<Self> {
+        BACKGROUND_SAVES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
+                (running < MAX_BACKGROUND_SAVES).then_some(running + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+impl Drop for BackgroundSlot {
+    fn drop(&mut self) {
+        BACKGROUND_SAVES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The save of a closed file (WinFsp cleanup, FUSE flush): when the session
+/// of handle `h` is dirty and no save of it runs, it is saved on a thread of
+/// its own ([`save_entity`]) and this returns at once, so the application's
+/// close does not wait for the hashing, copying and commits (module docs,
+/// *Saves off the engine lock*); with every background slot taken it is
+/// saved here. Until it is committed the session is a dirty session like any
+/// other: reads see its bytes, a graceful stop or detach waits for it
+/// (`quiet`), a forced one or a poison exit retains it (invariant 8), and a
+/// flush (`FlushFileBuffers`, `fsync`) waits for it ([`save_handle`]). A
+/// failed background save is retained (`pending_saves`) and retried.
+pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
+    let entity = {
+        let e = super::lock_engine(engine);
+        match e.handles.get(&h) {
+            Some(handle)
+                if e.sessions
+                    .get(&handle.entity)
+                    .is_some_and(|s| s.dirty && !s.saving) =>
+            {
+                handle.entity.clone()
+            }
+            _ => return Ok(()),
+        }
+    };
+    let Some(slot) = BackgroundSlot::take() else {
+        return save_entity(engine, &entity);
+    };
+    let shared = engine.clone();
+    let name = entity.clone();
+    let spawned = std::thread::Builder::new()
+        .name("save".into())
+        .spawn(move || {
+            let _slot = slot;
+            if let Err(error) = save_entity(&shared, &name) {
+                let wire = crate::model::errors::ErrorWire::from_error(&error);
+                crate::util::log::event!(warn, (wire.code.as_str()), {
+                    "site": "engine.background_save",
+                    "entity": name,
+                    "message": wire.message,
+                });
+            }
+        });
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(_) => save_entity(engine, &entity),
+    }
+}
+
+/// Closes handle `h` (WinFsp close, FUSE release): saves its session first
+/// when it is dirty and no save of it runs (without the engine lock), then
+/// removes the handle. A save that runs in the background is not waited for
+/// (it ends the session once committed). A failed save retained the
+/// session; the handle goes either way, and the failure is returned.
+pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
+    let unsaved = {
+        let e = super::lock_engine(engine);
+        e.handles
+            .get(&h)
+            .and_then(|handle| e.sessions.get(&handle.entity))
+            .is_some_and(|s| s.dirty && !s.saving)
+    };
+    let saved = if unsaved {
+        save_handle(engine, h)
+    } else {
+        Ok(())
+    };
+    let released = super::lock_engine(engine).release_handle(h);
+    saved.and(released)
+}
 
 /// Opens the transaction that commits a retained save (`SAVEPOINT staged_save`)
 /// and reports whether it is the outermost one: from autocommit it begins with
