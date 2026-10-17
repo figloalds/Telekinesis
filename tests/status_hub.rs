@@ -5596,3 +5596,58 @@ fn an_endpoint_scoped_refusal_is_a_daemon_error() {
             .all(|e| e.error.code != "PEER_NEEDS_UPGRADE" || e.resolved_at_ms.is_some())
     );
 }
+
+/// CCR-WP3.4-1 (applied by WP4.INT): the hub prefers the controller's mount
+/// over a heartbeat from before the controller's attach or detach result. A
+/// heartbeat of the mount generation the result supersedes keeps the
+/// controller's mount; a newer one (the worker published the transition, or
+/// a later one) takes it again.
+#[test]
+fn a_heartbeat_older_than_the_mount_result_keeps_the_controllers_mount() {
+    let fx = Fx::new();
+    let mount = |state: MountState| MountStatus {
+        intent: MountIntent::Attach,
+        path: Some(std::env::temp_dir().join("m")),
+        state,
+    };
+    let beat = |seq: u64, generation: u64, state: MountState| {
+        let mut hb = WorkerHeartbeat {
+            instance: "instance-1".into(),
+            seq,
+            at_ms: T0,
+            mount: mount(state),
+            ..WorkerHeartbeat::default()
+        };
+        hb.generations.mount = generation;
+        StatusEvent::WorkerHeartbeat {
+            state: STATE.into(),
+            hb: Arc::new(hb),
+        }
+    };
+    fx.running_folder();
+    fx.rec(beat(1, 3, MountState::Attaching));
+    assert_eq!(fx.folder().mount.state, MountState::Attaching);
+    // The controller's attach result.
+    let mut attached = view(running());
+    attached.mount = mount(MountState::Attached { since_ms: T0 });
+    fx.rec(StatusEvent::FolderLifecycle(Box::new(attached)));
+    assert_eq!(
+        fx.folder().mount.state,
+        MountState::Attached { since_ms: T0 }
+    );
+    // A heartbeat sampled before the result (same generation) is stale.
+    fx.rec(beat(2, 3, MountState::Attaching));
+    assert_eq!(
+        fx.folder().mount.state,
+        MountState::Attached { since_ms: T0 },
+        "a stale heartbeat flipped the mount back"
+    );
+    // The worker publishes the transition, then a later one.
+    fx.rec(beat(3, 4, MountState::Attached { since_ms: T0 }));
+    assert_eq!(
+        fx.folder().mount.state,
+        MountState::Attached { since_ms: T0 }
+    );
+    fx.rec(beat(4, 5, MountState::Detached));
+    assert_eq!(fx.folder().mount.state, MountState::Detached);
+}

@@ -1220,6 +1220,14 @@ struct FolderEntry {
     /// When the entry was created (monotonic): a folder that is never
     /// registered (no view) is pruned [`ORPHAN_GRACE`] later.
     created: u64,
+    /// The worker's mount generation (`WorkerHeartbeat.generations.mount`)
+    /// the controller's mount state supersedes (CCR-WP3.4-1, applied by
+    /// WP4.INT): set when a FolderView brings a mount state that differs from
+    /// the last heartbeat's (an attach or detach result the worker has not
+    /// published yet). A heartbeat of that generation or older is from before
+    /// the result and keeps the controller's mount; a newer one (the worker
+    /// published the transition, or a later one) takes it again.
+    mount_floor: Option<u64>,
 }
 
 /// See [`FolderEntry::sourced`]: objects flow before activation (§6.4), so a
@@ -2036,6 +2044,17 @@ impl HubState {
             &mut self.ring,
         );
         let heartbeat = view.heartbeat.clone();
+        // The controller's mount state is newer than every heartbeat that
+        // shows another (CCR-WP3.4-1).
+        let published = [heartbeat.as_ref(), entry.heartbeat.as_ref()]
+            .into_iter()
+            .flatten()
+            .max_by_key(|hb| hb.generations.mount);
+        entry.mount_floor = match published {
+            Some(hb) if hb.mount != view.mount => Some(hb.generations.mount),
+            Some(_) => None,
+            None => entry.mount_floor,
+        };
         entry.mount = view.mount.clone();
         entry.view = Some(Box::new(view));
         // A newer heartbeat mirrors the mount itself; either way the mount is
@@ -2066,8 +2085,14 @@ impl HubState {
             return false;
         }
         let previous = entry.heartbeat.replace(Arc::clone(&hb));
-        if take_mount {
+        // A heartbeat from before the controller's attach or detach result
+        // keeps the controller's mount (CCR-WP3.4-1).
+        let superseded = entry
+            .mount_floor
+            .is_some_and(|floor| hb.generations.mount <= floor && hb.mount != entry.mount);
+        if take_mount && !superseded {
             entry.mount = hb.mount.clone();
+            entry.mount_floor = None;
         }
         // Store health: a persistent condition, mirrored into a Folder slot.
         let store_key = (
