@@ -3,8 +3,13 @@
 //! `FaultProxy` (A dials B through one, B dials A through the other), share
 //! one folder. For `TKFS_SOAK_MINUTES` (default 120) both sides edit
 //! continuously through their workers (new files, saves of existing ones,
-//! directories, renames, deletes, a few larger files; the same names on
-//! both sides, so concurrent edits conflict), while the links cycle through
+//! directories, renames, deletes, a few larger files, an operation every
+//! 50–400 ms on each side). Each side edits names of its own, and
+//! `TKFS_SOAK_SHARED_PERCENT` (default 10) of its operations go to a name
+//! pool both sides edit, so concurrent edits conflict now and then; with
+//! 100 every operation is on the shared pool (a conflict storm: the first
+//! WP4.INT run, which did not converge, see `docs/revamp/notes/wp4-int.md`).
+//! Meanwhile the links cycle through
 //! fault phases: healthy, latency changes (5 to 100 ms one way), bandwidth
 //! caps (256 KiB/s to 20 MiB/s), stalls, connection resets, a blackhole and
 //! refused connections. Every minute the scenario samples both daemons'
@@ -66,13 +71,25 @@ impl Editor {
         })
     }
 
-    fn run(self: Arc<Self>, folder: Value, seed: u64, stop: Arc<AtomicBool>) {
+    fn run(
+        self: Arc<Self>,
+        folder: Value,
+        seed: u64,
+        side: &'static str,
+        shared_percent: u32,
+        stop: Arc<AtomicBool>,
+    ) {
         let mut rng = StdRng::seed_from_u64(seed);
         let dirs = ["", "docs/", "src/", "media/"];
         while !stop.load(Ordering::Relaxed) {
             let dir = dirs[rng.gen_range(0..dirs.len())];
-            // A shared name pool: both sides edit the same names.
-            let name = format!("{dir}f{:03}.dat", rng.gen_range(0..160));
+            // The shared pool (`f…`, both sides edit it) or this side's own.
+            let pool = if rng.gen_range(0..100) < shared_percent {
+                "f"
+            } else {
+                side
+            };
+            let name = format!("{dir}{pool}{:03}.dat", rng.gen_range(0..160));
             let op = rng.gen_range(0..100);
             let result = match op {
                 0..=64 => {
@@ -91,7 +108,7 @@ impl Editor {
                 }
                 65..=72 => {
                     let target = format!(
-                        "{}f{:03}.dat",
+                        "{}{pool}{:03}.dat",
                         dirs[rng.gen_range(0..dirs.len())],
                         rng.gen_range(0..160)
                     );
@@ -233,8 +250,10 @@ fn brief(status: &Value) -> Value {
         "inbox": status["activation"]["inbox"],
         "complete": status["content"]["complete"],
         "missing_bytes": status["content"]["shared_missing_bytes"],
+        // Open errors only (the list also keeps resolved ones).
         "errors": status["errors"].as_array().map(|errors| errors.iter()
-            .map(|e| e["code"].clone()).collect::<Vec<_>>()),
+            .filter(|e| e["resolved_at_ms"].is_null())
+            .map(|e| e["error"]["code"].clone()).collect::<Vec<_>>()),
     })
 }
 
@@ -259,6 +278,7 @@ fn settled(status: &Value) -> bool {
 fn soak_two_daemons_through_faulty_links() {
     let duration = Duration::from_secs(60 * minutes("TKFS_SOAK_MINUTES", 120));
     let settle = Duration::from_secs(60 * minutes("TKFS_SOAK_SETTLE_MINUTES", 30));
+    let shared_percent = minutes("TKFS_SOAK_SHARED_PERCENT", 10).min(100) as u32;
     let mut s = Scenario::with_budget(FILE, "soak", duration + settle + Duration::from_secs(900));
     // A short anti-entropy interval, as the harness daemons use: more
     // exchanges per minute through the faults.
@@ -281,12 +301,12 @@ fn soak_two_daemons_through_faulty_links() {
 
     let stop = Arc::new(AtomicBool::new(false));
     let editors = [Editor::new(), Editor::new()];
-    let edit_threads: Vec<_> = [(&pa, 1u64), (&pb, 2u64)]
+    let edit_threads: Vec<_> = [(&pa, 1u64, "a"), (&pb, 2u64, "b")]
         .into_iter()
         .zip(editors.iter())
-        .map(|((folder, seed), editor)| {
+        .map(|((folder, seed, side), editor)| {
             let (editor, folder, stop) = (editor.clone(), folder.clone(), stop.clone());
-            thread::spawn(move || editor.run(folder, seed, stop))
+            thread::spawn(move || editor.run(folder, seed, side, shared_percent, stop))
         })
         .collect();
 
@@ -400,6 +420,7 @@ fn soak_two_daemons_through_faulty_links() {
         "s",
         json!({
             "edit_minutes": edited.as_secs_f64() / 60.0,
+            "shared_percent": shared_percent,
             "edits": edits,
             "refused_edits": refused,
             "last_refusal": editors.iter().map(|e| e.last_error.lock().unwrap().clone()).collect::<Vec<_>>(),

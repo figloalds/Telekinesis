@@ -29,7 +29,12 @@ cargo test --all-targets
   The subset that matters most there:
   `cargo test --test orchestrator --test session_core --test session_handshake --test worker_lifecycle --test mount_lifecycle`.
 - Long scenarios are `#[ignore]`d in the normal suite; they are the
-  qualification scenarios below.
+  qualification scenarios below and the release runs of the fuzzers:
+  `cargo test --release --test derive_oracle -- --ignored`
+  (`TKFS_DERIVE_SEEDS`, `TKFS_DERIVE_SEED_START`; the stress run
+  `fuzz_stress_release`), `cargo test --release --test feed_fuzz -- --ignored`
+  (`TKFS_FEED_SEEDS`, `TKFS_FEED_SEED_START`), and the crash workloads
+  `cargo test --release --test seal_path -- --ignored`.
 - `tests/docs_cli.rs` checks that every command in [CLI](CLI.md) exists with
   the options it shows, and that every command of the binary is documented.
 
@@ -38,7 +43,7 @@ What the suite covers, by area (file names under `tests/`):
 | Area | Tests |
 |---|---|
 | Store, activation, conflicts | `core`, `activation_inbox`, `derive_oracle` (randomized histories checked against the full reducer), `offlock_commit`, `startup_snapshots`, `recovery`, `directory_progress`, `availability_index` |
-| Metadata feed | `feed_v7` (acks from evidence only, rejections, regressions, private branches, forged origins, large events) |
+| Metadata feed | `feed_v7` (acks from evidence only, rejections, regressions, private branches, forged origins, large events), `feed_fuzz` (seeded random topologies of 2–4 replicas with lost requests and replies, partial activation, restarts and restores; the oracle after every step, convergence, acks and per-id evidence at the end) |
 | Objects | `objects_v3_worker` (durability, crash resume, authorization, leases), `objects_v3_lanes` (both directions, backoffs, handoff, slow links), `partial_content`, `availability` |
 | Sessions | `session_core` (framing, multiplexing, heartbeats, deadlines, WSS), `session_handshake` (HMAC, replay, legacy detection both ways) |
 | Security | `security` (local tokens on the control and worker endpoints, per-peer credentials and their enrollment, revocation on unpair within 1 s, rotation, replay, no code, secret or token in status or logs) |
