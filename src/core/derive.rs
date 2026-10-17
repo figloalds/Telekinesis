@@ -172,13 +172,77 @@
 use super::*;
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    hash::{BuildHasher, Hasher},
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+/// The hash maps and sets of derivation: keyed by short ids and entity
+/// names, built on every commit, so they use a multiply-rotate hash (the
+/// `FxHash` scheme) seeded once per process, instead of SipHash.
+type HashMap<K, V> = std::collections::HashMap<K, V, FastHash>;
+type HashSet<K> = std::collections::HashSet<K, FastHash>;
+
+/// `BuildHasher` of [`FastHasher`], with a per-process random seed.
+#[derive(Clone, Copy)]
+struct FastHash(u64);
+impl Default for FastHash {
+    fn default() -> Self {
+        static SEED: OnceLock<u64> = OnceLock::new();
+        Self(
+            *SEED.get_or_init(|| {
+                std::collections::hash_map::RandomState::new().hash_one(0x5eed_u64)
+            }),
+        )
+    }
+}
+impl BuildHasher for FastHash {
+    type Hasher = FastHasher;
+    fn build_hasher(&self) -> FastHasher {
+        FastHasher(self.0)
+    }
+}
+
+/// A multiply-rotate hasher over 8-byte words.
+struct FastHasher(u64);
+impl FastHasher {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(Self::K);
+    }
+}
+impl Hasher for FastHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.add(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    fn write_u8(&mut self, i: u8) {
+        self.add(u64::from(i));
+    }
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// Derivation cache (owned by WP1.7). Derivation runs inside
 /// `persist_projection`, which has no `Store`, so all memoization lives in a
@@ -440,6 +504,7 @@ pub(super) fn persist_projection(
         events,
         new_event,
         reviewed: &reviewed,
+        stored: None,
     })?;
     write_projection(tx, branch, &out)
 }
@@ -464,6 +529,11 @@ pub struct DeriveInput<'a> {
     /// The stored conflict rows (payloads) that the new event reviews, in
     /// its `reviewed` order; missing ones are skipped. Empty for a rebuild.
     pub reviewed: &'a [Conflict],
+    /// Ids of `projection`'s records that are stored with exactly that
+    /// payload already (WP5.1: a projection `project_append` made from the
+    /// stored one keeps them): append mode does not write them again. `None`:
+    /// unknown, every record is written.
+    pub stored: Option<&'a BTreeSet<String>>,
 }
 
 /// A derived record set ready to write: rows deduplicated by id (the last
@@ -575,6 +645,7 @@ pub fn derive_conflicts(input: &DeriveInput) -> Result<DeriveOutput> {
         &DeriveInput {
             new_event: None,
             reviewed: &[],
+            stored: None,
             ..*input
         },
         None,
@@ -669,7 +740,7 @@ fn derive_in_mode(input: &DeriveInput, new_id: &str) -> Result<Derived> {
                 Ok(Derived::Rows(finish(
                     input,
                     Some(new_id),
-                    conflicts,
+                    without_stored(input, conflicts),
                     false,
                 )?))
             }
@@ -680,6 +751,33 @@ fn derive_in_mode(input: &DeriveInput, new_id: &str) -> Result<Derived> {
         },
         ConflictMode::Verify => derive_verified(input, new_id),
     }
+}
+
+/// Append mode's records without the projection's records that are stored
+/// already (`DeriveInput::stored`): the leading `projection.conflicts` part
+/// of the list (append mode's first source), for ids no later source derives
+/// again (the last record of an id is the one written). Writing them again
+/// would upsert an identical row; skipping them leaves the same table.
+fn without_stored(input: &DeriveInput, conflicts: Vec<Conflict>) -> Vec<Conflict> {
+    let Some(stored) = input.stored else {
+        return conflicts;
+    };
+    let projected = input.projection.conflicts.len().min(conflicts.len());
+    let last: HashMap<&str, usize> = conflicts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.id.as_str(), i))
+        .collect();
+    let keep: Vec<bool> = conflicts
+        .iter()
+        .enumerate()
+        .map(|(i, c)| !(i < projected && last[c.id.as_str()] < projected && stored.contains(&c.id)))
+        .collect();
+    conflicts
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(c, keep)| keep.then_some(c))
+        .collect()
 }
 
 /// Full derivation: every source over the whole branch history, written
@@ -749,6 +847,7 @@ fn derive_full(
             events,
             new_event,
             reviewed: &reviewed,
+            stored: None,
         },
         new_event,
     )
@@ -820,7 +919,7 @@ fn full_location_pairs(ns: &NsContext, activated: &[bool]) -> Result<Vec<Conflic
             );
         }
     }
-    let mut slots: HashMap<(&str, Arc<str>), Vec<usize>> = HashMap::new();
+    let mut slots: HashMap<(&str, Arc<str>), Vec<usize>> = HashMap::default();
     for (k, (_, c)) in rows.iter().enumerate() {
         let (Some(parent), Some(name)) = (c.value["parent"].as_str(), c.value["name"].as_str())
         else {
@@ -939,7 +1038,7 @@ fn register_pairs(
     });
     // Derive historical concurrent pairs from the full activated DAG too, so a
     // fast-forward delivered before a competitor cannot hide the earlier pair.
-    let mut history: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::new();
+    let mut history: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::default();
     for (i, e) in events.iter().enumerate() {
         if pending.contains(e.id.as_str()) {
             continue;
@@ -1132,8 +1231,8 @@ struct SlotKeys {
 impl SlotKeys {
     fn new(budget: usize) -> Self {
         Self {
-            current: HashMap::new(),
-            older: HashMap::new(),
+            current: HashMap::default(),
+            older: HashMap::default(),
             current_bytes: 0,
             older_bytes: 0,
             budget,
@@ -1382,7 +1481,7 @@ impl ConeGraph {
                 graph.nodes[ns.entities[c.entity.as_str()] as usize].add(i == new);
             }
         }
-        let mut slot_ids: HashMap<(&str, &str), u32> = HashMap::new();
+        let mut slot_ids: HashMap<(&str, &str), u32> = HashMap::default();
         for row in &locations.rows {
             let is_new = row.event == new;
             let entity = ns.entities[row.change.entity.as_str()];
@@ -1539,6 +1638,7 @@ fn derive_append(
             events,
             new_event: Some(new_id),
             reviewed: &reviewed,
+            stored: None,
         },
         new_id,
     )
@@ -1567,6 +1667,10 @@ fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
     }
     let e = &events[new];
     let ns = timed("a.nscontext", || NsContext::new(branch, events));
+    if ns.irregular {
+        // Only crafted journals (see `NsContext::new`): the reference decides.
+        return Ok(Plan::Fallback("an irregular history"));
+    }
     let locations = timed("a.locations", || Locations::new(events));
     // Same source order as full mode, so a refusal surfaces with the same error.
     let mut conflicts = timed("a.pconflicts", || p.conflicts.clone());
@@ -1988,7 +2092,9 @@ fn derive_verified(input: &DeriveInput, new_id: &str) -> Result<Derived> {
             fallback(reason);
             return Ok(Derived::Rows(full_rows(input, Some(new_id))?));
         }
-        Ok(Plan::Derived(conflicts)) => finish(input, Some(new_id), conflicts, false),
+        Ok(Plan::Derived(conflicts)) => {
+            finish(input, Some(new_id), without_stored(input, conflicts), false)
+        }
         Err(error) => Err(error),
     };
     let full = full_rows(input, Some(new_id));
@@ -2205,7 +2311,7 @@ fn version_of(events: &[Event], (i, c): VersionRef) -> Version {
 /// Whether the versions (in event order) form one single-parent chain from
 /// a single root: no historical concurrency.
 fn linear_versions(versions: &[VersionRef]) -> bool {
-    let mut children = HashSet::new();
+    let mut children = HashSet::default();
     let mut roots = 0;
     for (_, c) in versions {
         if c.parents.is_empty() {
@@ -2539,6 +2645,9 @@ struct NsContext<'a> {
     touching: Vec<Vec<usize>>,
     /// Kind, location and alive versions per entity, in event order.
     regs: Vec<[Vec<RegVersion<'a>>; 3]>,
+    /// Repeated event ids or a register changed twice by one event: no cut
+    /// is projected from registers alone (see `new`).
+    irregular: bool,
     memo: RefCell<Memo<'a>>,
 }
 
@@ -2572,10 +2681,25 @@ type RegisterMemo<'a> = BTreeMap<(&'a str, Option<usize>), Option<Rc<RegisterFac
 
 impl<'a> NsContext<'a> {
     fn new(branch: &'a str, events: &'a [Event]) -> Self {
-        let mut index: HashMap<&'a str, usize> = HashMap::with_capacity(events.len());
+        let mut index: HashMap<&'a str, usize> =
+            HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
+        // Repeated event ids, or an event changing one register twice (only
+        // crafted journals have them; commits refuse both): such a history is
+        // derived with whole-cut projections (`irregular`).
+        let mut irregular = false;
         for (i, e) in events.iter().enumerate() {
-            index.insert(e.id.as_str(), i);
+            irregular |= index.insert(e.id.as_str(), i).is_some();
+            if e.changes.len() > 1 {
+                let mut registers: Vec<(&str, &str)> = e
+                    .changes
+                    .iter()
+                    .map(|c| (c.entity.as_str(), c.field.as_str()))
+                    .collect();
+                registers.sort_unstable();
+                irregular |= registers.windows(2).any(|w| w[0] == w[1]);
+            }
         }
+        let t0 = std::time::Instant::now();
         let mut parents: Vec<Vec<usize>> = Vec::with_capacity(events.len());
         for e in events {
             let mut ps: Vec<usize> = e
@@ -2589,7 +2713,9 @@ impl<'a> NsContext<'a> {
             parents.push(ps);
         }
         let children = children_of(&parents);
-        let mut unique: HashSet<&'a str> = HashSet::new();
+        record_phase("n.parents", t0.elapsed().as_micros() as u64);
+        let t0 = std::time::Instant::now();
+        let mut unique: HashSet<&'a str> = HashSet::default();
         for e in events {
             for c in &e.changes {
                 unique.insert(c.entity.as_str());
@@ -2609,6 +2735,8 @@ impl<'a> NsContext<'a> {
             .map(|(k, &name)| (name, k as u32))
             .collect();
         let n = names.len();
+        record_phase("n.names", t0.elapsed().as_micros() as u64);
+        let t0 = std::time::Instant::now();
         let mut alive: Vec<Vec<(usize, &Change)>> = vec![vec![]; n];
         let mut touching: Vec<Vec<usize>> = vec![vec![]; n];
         let mut regs: Vec<[Vec<RegVersion>; 3]> = (0..n).map(|_| Default::default()).collect();
@@ -2631,28 +2759,31 @@ impl<'a> NsContext<'a> {
                 }
             }
         }
-        // Version parents within each register (by revision).
+        record_phase("n.regs", t0.elapsed().as_micros() as u64);
+        let t0 = std::time::Instant::now();
+        // Version parents within each register (by revision): a parent's
+        // event position, then its version in the register (the versions
+        // are in event order, one per event).
         for fields in &mut regs {
             for versions in fields.iter_mut() {
-                if versions.iter().all(|v| v.change.parents.is_empty()) {
-                    continue;
-                }
-                let at: HashMap<&str, usize> = versions
-                    .iter()
-                    .enumerate()
-                    .map(|(k, v)| (events[v.event].id.as_str(), k))
-                    .collect();
                 for k in 0..versions.len() {
+                    if versions[k].change.parents.is_empty() {
+                        continue;
+                    }
                     let ps: Vec<usize> = versions[k]
                         .change
                         .parents
                         .iter()
-                        .filter_map(|p| at.get(p.as_str()).copied())
+                        .filter_map(|p| index.get(p.as_str()))
+                        .filter_map(|&event| {
+                            versions.binary_search_by_key(&event, |v| v.event).ok()
+                        })
                         .collect();
                     versions[k].parents = ps;
                 }
             }
         }
+        record_phase("n.vparents", t0.elapsed().as_micros() as u64);
         let memo = Memo {
             ancestors: vec![None; events.len()],
             descendants: vec![None; events.len()],
@@ -2670,6 +2801,7 @@ impl<'a> NsContext<'a> {
             alive,
             touching,
             regs,
+            irregular,
             memo: RefCell::new(memo),
         }
     }
@@ -2940,7 +3072,7 @@ impl<'a> NsContext<'a> {
         let mut extrema: Vec<usize> = vec![];
         for (_, facts) in &compressed {
             type Group = (usize, Bits, Bits, Vec<u8>);
-            let mut groups: HashMap<Group, (usize, usize)> = HashMap::new();
+            let mut groups: HashMap<Group, (usize, usize)> = HashMap::default();
             for (k, &(i, c)) in facts.versions.iter().enumerate() {
                 if c.value != true || is_primary.contains(&i) {
                     continue;
@@ -3298,6 +3430,7 @@ impl<'a> NsContext<'a> {
         let cones = NamespaceCones::new(self)?;
         let locations = Locations::new(self.events);
         let restricted = !self.memo.borrow().unrestricted
+            && !self.irregular
             && locations.first_error().is_ok()
             && timed("f.cannot_fail", || projection_cannot_fail(self, &locations));
         let mut conflicts = BTreeMap::new();
@@ -3468,7 +3601,7 @@ impl<'a> NsContext<'a> {
             }
         }
         let derived: HashSet<&str> = derived.iter().map(|c| c.id.as_str()).collect();
-        let mut maximal: HashMap<Rc<[u32]>, HashSet<String>> = HashMap::new();
+        let mut maximal: HashMap<Rc<[u32]>, HashSet<String>> = HashMap::default();
         for record in self.namespace_records(&plan.members, &relations, &old)? {
             if derived.contains(record.id.as_str()) {
                 continue;
@@ -3784,7 +3917,7 @@ mod cut_counts {
 
     fn memo() -> &'static Mutex<HashMap<[u8; 32], usize>> {
         static MEMO: OnceLock<Mutex<HashMap<[u8; 32], usize>>> = OnceLock::new();
-        MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+        MEMO.get_or_init(|| Mutex::new(HashMap::default()))
     }
 
     pub(super) fn get(key: &[u8; 32]) -> Option<usize> {
@@ -3824,7 +3957,7 @@ impl NamespaceCones {
             entity_slots: vec![vec![]; n],
             slots: vec![],
         };
-        let mut slot_ids: HashMap<(&str, String), u32> = HashMap::new();
+        let mut slot_ids: HashMap<(&str, String), u32> = HashMap::default();
         for e in ns.events {
             for c in &e.changes {
                 if c.field != "location" {
@@ -3906,7 +4039,7 @@ impl NamespaceCones {
                 }
             }
         }
-        let mut cones: HashMap<usize, Rc<[u32]>> = HashMap::new();
+        let mut cones: HashMap<usize, Rc<[u32]>> = HashMap::default();
         let mut distinct = BTreeSet::new();
         for entity in 0..n {
             let root = find(&mut group, entity);
@@ -3938,7 +4071,8 @@ pub fn project(branch: &str, events: &[Event]) -> Result<Projection> {
 /// the historical code (`project_refs_reference`), whose bookkeeping keeps
 /// the last of them.
 fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
-    let mut index: HashMap<&str, usize> = HashMap::with_capacity(events.len());
+    let mut index: HashMap<&str, usize> =
+        HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
     for (i, e) in events.iter().enumerate() {
         if index.insert(e.id.as_str(), i).is_some() {
             return project_refs_reference(branch, events);
@@ -4008,7 +4142,7 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
     }
     record_phase("pr.activation", t0.elapsed().as_micros() as u64);
     let t0 = std::time::Instant::now();
-    let mut registers: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::new();
+    let mut registers: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::default();
     for (i, e) in events.iter().enumerate().filter(|(i, _)| active[*i]) {
         for c in &e.changes {
             registers
@@ -4156,6 +4290,9 @@ pub(super) struct Appended {
     pub(super) changed: BTreeSet<String>,
     /// Whether the conflict or pending list differs from the base's.
     pub(super) lists: bool,
+    /// The ids of the base's records the projection keeps unchanged (stored,
+    /// with that payload, by the induction hypothesis of the module docs).
+    pub(super) carried: BTreeSet<String>,
 }
 
 /// `project(events)` from `base`, the projection of `events` without
@@ -4181,9 +4318,12 @@ pub(super) struct Appended {
 /// decide. Those passes run again over every entry, from each entry's
 /// register presence (the winner of its alive register, else absent), with
 /// every namespace record removed first: exactly `project`'s passes over the
-/// same entries and heads. The conflict list is sorted as `project` sorts
-/// it. The commit checks (`set_thread_commit_checks`) compare the result with
-/// `project` itself on every commit.
+/// same entries and heads, but evaluated only where they can differ
+/// (`namespace_delta`): the slots `E`'s entities leave or take, and the
+/// chains through an entity whose slot verdict, kind or parent changed. The
+/// conflict list is sorted as `project` sorts it. The commit checks
+/// (`set_thread_commit_checks`) compare the result with `project` itself on
+/// every commit.
 pub(super) fn project_append(
     branch: &str,
     mut p: Projection,
@@ -4194,7 +4334,8 @@ pub(super) fn project_append(
         return Ok(None);
     }
     let e = &events[new];
-    let mut ids: HashMap<&str, usize> = HashMap::with_capacity(events.len());
+    let mut ids: HashMap<&str, usize> =
+        HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
     for (i, event) in events.iter().enumerate() {
         if ids.insert(event.id.as_str(), i).is_some() {
             return Ok(None);
@@ -4234,27 +4375,41 @@ pub(super) fn project_append(
             );
         }
     }
-    // The records the base derives that `E` can change: those of its
-    // registers and every namespace record (the passes run again).
+    // The register records `E` can change (its registers'); the namespace
+    // records are revised by `namespace_delta`.
     let touched: BTreeSet<(&str, &str)> = e
         .changes
         .iter()
         .map(|c| (c.entity.as_str(), c.field.as_str()))
         .collect();
     let replaced = |c: &Conflict| {
-        c.field == "namespace" || touched.contains(&(c.entity.as_str(), c.field.as_str()))
+        c.field != "namespace" && touched.contains(&(c.entity.as_str(), c.field.as_str()))
     };
-    let before: Vec<Conflict> = p
-        .conflicts
+    let mut removed: Vec<Conflict> = vec![];
+    let mut kept = Vec::with_capacity(p.conflicts.len());
+    for c in std::mem::take(&mut p.conflicts) {
+        if replaced(&c) {
+            removed.push(c);
+        } else {
+            kept.push(c);
+        }
+    }
+    p.conflicts = kept;
+    let registers_before = p.conflicts.len();
+    // `E`'s entities as the base had them, for the namespace passes.
+    let entities: BTreeSet<&str> = e.changes.iter().map(|c| c.entity.as_str()).collect();
+    let old: BTreeMap<&str, Option<OldPlacement>> = entities
         .iter()
-        .filter(|c| replaced(c))
-        .cloned()
-        .collect();
-    p.conflicts.retain(|c| !replaced(c));
-    let alive_before: BTreeMap<String, bool> = p
-        .entries
-        .iter()
-        .map(|(id, entry)| (id.clone(), entry.alive))
+        .map(|&entity| {
+            let placement = p.entries.get(entity).map(|entry| OldPlacement {
+                raw_alive: register_presence(&p, entity),
+                parent: entry.parent.clone(),
+                name: entry.name.clone(),
+                alive: entry.alive,
+                kind: entry.kind.clone(),
+            });
+            (entity, placement)
+        })
         .collect();
     for c in &e.changes {
         let key = register(&c.entity, &c.field);
@@ -4324,9 +4479,9 @@ pub(super) fn project_append(
         }
         p.heads.insert(key, heads);
     }
+    let added_registers: Vec<Conflict> = p.conflicts[registers_before..].to_vec();
     // The entries of `E`'s entities, from their registers, as `project`
     // builds them (register key order: alive, basic, content, kind, location).
-    let entities: BTreeSet<&str> = e.changes.iter().map(|c| c.entity.as_str()).collect();
     for &entity in &entities {
         let mut entry = Entry {
             id: entity.into(),
@@ -4358,38 +4513,274 @@ pub(super) fn project_append(
         }
         p.entries.insert(entity.into(), entry);
     }
-    // Every entry's register presence, then the namespace passes again.
-    let presence: Vec<(String, bool)> = p
-        .entries
-        .keys()
-        .map(|id| {
-            let alive = p
-                .heads
-                .get(&register(id, "alive"))
-                .and_then(|h| h.last())
-                .is_some_and(|v| v.value.as_bool().unwrap());
-            (id.clone(), alive)
-        })
+    let (changed, mut removed_ns, mut added) = namespace_delta(branch, &mut p, &old)?;
+    removed.append(&mut removed_ns);
+    added.extend(added_registers);
+    p.conflicts.sort_by(|a, b| a.id.cmp(&b.id));
+    removed.sort_by(|a, b| a.id.cmp(&b.id));
+    added.sort_by(|a, b| a.id.cmp(&b.id));
+    let lists = removed != added;
+    let fresh: HashSet<&str> = added.iter().map(|c| c.id.as_str()).collect();
+    let carried = p
+        .conflicts
+        .iter()
+        .filter(|c| !fresh.contains(c.id.as_str()))
+        .map(|c| c.id.clone())
         .collect();
-    for (id, alive) in presence {
-        p.entries.get_mut(&id).unwrap().alive = alive;
-    }
-    namespace_pass(branch, &mut p)?;
-    let mut changed: BTreeSet<String> = entities.iter().map(|&e| e.to_owned()).collect();
-    for (id, entry) in &p.entries {
-        if alive_before.get(id) != Some(&entry.alive) {
-            changed.insert(id.clone());
-        }
-    }
-    let after: Vec<&Conflict> = p.conflicts.iter().filter(|c| replaced(c)).collect();
-    let mut before: Vec<&Conflict> = before.iter().collect();
-    before.sort_by(|a, b| a.id.cmp(&b.id));
-    let lists = before != after;
     Ok(Some(Appended {
         projection: p,
         changed,
         lists,
+        carried,
     }))
+}
+
+/// An entity of the new event as the base projection had it.
+struct OldPlacement {
+    /// Its alive register's winner (presence before the namespace passes).
+    raw_alive: bool,
+    parent: String,
+    name: String,
+    /// After the passes.
+    alive: bool,
+    kind: String,
+}
+
+/// The winner of `entity`'s alive register in `p` (absent: not alive).
+fn register_presence(p: &Projection, entity: &str) -> bool {
+    p.heads
+        .get(&register(entity, "alive"))
+        .and_then(|h| h.last())
+        .is_some_and(|v| v.value.as_bool().unwrap())
+}
+
+/// `project`'s namespace passes, revised where `E` can change them
+/// (`project_append`). `p` holds the base projection with `E`'s registers
+/// and entries rebuilt (their presence is the register's); `old` the base's
+/// state of `E`'s entities (`None`: new). Returns the entities whose entry
+/// changed, and the namespace records removed and added (the rest of `p`'s
+/// records stay).
+///
+/// Why only these. The slot pass: an entry's presence and slot change only
+/// for `E`'s entities, so only the slots they leave or take can change their
+/// winner or their pair records; those are recomputed from their members.
+/// The chain pass decides an entry from the slot verdicts (presence after
+/// the slot pass), kinds and parents along its path to the root (a path
+/// through an entry the chain pass suppresses is invalid anyway, so reading
+/// that entry's slot verdict instead is the same decision); only `E`'s
+/// entities change kinds and parents, and only the members of the recomputed
+/// slots change their slot verdicts, so only the entries whose path meets
+/// one of those (they and their descendants) are decided again. A slot
+/// verdict outside the recomputed slots is the base's: alive after the
+/// passes, or suppressed by the chain pass (it has that pass's record).
+fn namespace_delta(
+    branch: &str,
+    p: &mut Projection,
+    old: &BTreeMap<&str, Option<OldPlacement>>,
+) -> Result<(BTreeSet<String>, Vec<Conflict>, Vec<Conflict>)> {
+    const COLLISION: &str = "same name / file-directory collision";
+    const INVALID: &str = "deleted/missing parent or directory cycle";
+    let key_of = |name: &str| -> Result<Arc<str>> {
+        match slot_key(name) {
+            Ok(key) => Ok(key),
+            Err(_) => Ok(Arc::from(name_key(name)?)),
+        }
+    };
+    // The slots `E`'s entities leave or take (an invalid new name refuses,
+    // as the slot pass does, in entity order).
+    let mut slots: BTreeSet<(String, Arc<str>)> = BTreeSet::new();
+    for (&entity, before) in old {
+        if let Some(before) = before
+            && before.raw_alive
+        {
+            slots.insert((before.parent.clone(), key_of(&before.name)?));
+        }
+        let entry = &p.entries[entity];
+        if register_presence(p, entity) {
+            slots.insert((entry.parent.clone(), key_of(&entry.name)?));
+        }
+    }
+    // Their members before and after (sorted ids), and the slot verdicts.
+    let mut verdict_after: HashMap<String, bool> = HashMap::default();
+    let mut verdict_before: HashMap<String, bool> = HashMap::default();
+    let mut pairs_before: HashSet<(String, String)> = HashSet::default();
+    let mut added: Vec<Conflict> = vec![];
+    for (parent, key) in &slots {
+        let mut after: Vec<String> = vec![];
+        let mut before: Vec<String> = vec![];
+        for (id, entry) in &p.entries {
+            let moved = old.get(id.as_str());
+            if entry.parent == *parent && register_presence(p, id) && key_of(&entry.name)? == *key {
+                after.push(id.clone());
+            }
+            let was = match moved {
+                Some(Some(b)) => b.raw_alive && b.parent == *parent && key_of(&b.name)? == *key,
+                Some(None) => false,
+                None => {
+                    entry.parent == *parent
+                        && register_presence(p, id)
+                        && key_of(&entry.name)? == *key
+                }
+            };
+            if was {
+                before.push(id.clone());
+            }
+        }
+        if let Some(winner) = after.last() {
+            for id in &after {
+                verdict_after.insert(id.clone(), id == winner);
+            }
+        }
+        if let Some(winner) = before.last() {
+            for id in &before {
+                verdict_before.insert(id.clone(), id == winner);
+            }
+        }
+        for (i, a) in before.iter().enumerate() {
+            for b in &before[i + 1..] {
+                pairs_before.insert((a.clone(), b.clone()));
+            }
+        }
+        for (i, a) in after.iter().enumerate() {
+            for b in &after[i + 1..] {
+                let pair = [
+                    p.heads[&register(a, "location")].clone(),
+                    p.heads[&register(b, "location")].clone(),
+                ]
+                .concat();
+                added.push(make_conflict(
+                    branch,
+                    &format!("{a},{b}"),
+                    "namespace",
+                    COLLISION,
+                    pair,
+                    vec![],
+                ));
+            }
+        }
+    }
+    for &entity in old.keys() {
+        verdict_after.entry(entity.to_owned()).or_insert(false);
+        verdict_before.entry(entity.to_owned()).or_insert(false);
+    }
+    // The chain pass's suppressions in the base (they have its records).
+    let invalid_before: HashSet<String> = p
+        .conflicts
+        .iter()
+        .filter(|c| c.field == "namespace" && c.reason == INVALID)
+        .map(|c| c.entity.clone())
+        .collect();
+    // Entries whose slot verdict, kind or parent changed.
+    let mut origins: Vec<String> = old.keys().map(|&e| e.to_owned()).collect();
+    for (id, after) in &verdict_after {
+        if verdict_before.get(id) != Some(after) && !old.contains_key(id.as_str()) {
+            origins.push(id.clone());
+        }
+    }
+    // They and their descendants: the entries the chain pass decides again.
+    let directories = origins.iter().any(|id| {
+        p.entries.get(id).is_some_and(|e| e.kind == "directory")
+            || old
+                .get(id.as_str())
+                .is_some_and(|b| b.as_ref().is_some_and(|b| b.kind == "directory"))
+    });
+    let mut affected: BTreeSet<String> = origins.iter().cloned().collect();
+    if directories {
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::default();
+        for (id, entry) in &p.entries {
+            children
+                .entry(entry.parent.as_str())
+                .or_default()
+                .push(id.as_str());
+        }
+        let mut todo: Vec<String> = origins.clone();
+        while let Some(next) = todo.pop() {
+            for &child in children.get(next.as_str()).into_iter().flatten() {
+                if affected.insert(child.to_owned()) {
+                    todo.push(child.to_owned());
+                }
+            }
+        }
+    }
+    let verdict = |p: &Projection, id: &str| -> bool {
+        match verdict_after.get(id) {
+            Some(&alive) => alive,
+            None => p.entries.get(id).is_some_and(|e| e.alive) || invalid_before.contains(id),
+        }
+    };
+    let valid = |p: &Projection, entity: &str| -> bool {
+        let mut cursor = entity;
+        let mut visited: Vec<&str> = vec![];
+        while cursor != ROOT {
+            if visited.contains(&cursor) {
+                return false;
+            }
+            visited.push(cursor);
+            let Some(e) = p.entries.get(cursor) else {
+                return false;
+            };
+            if !verdict(p, cursor) || (cursor != entity && e.kind != "directory") {
+                return false;
+            }
+            cursor = &e.parent;
+        }
+        true
+    };
+    let mut decided: Vec<(String, bool, bool)> = vec![];
+    for id in &affected {
+        let alive = verdict(p, id);
+        let ok = valid(p, id);
+        decided.push((id.clone(), alive && ok, alive && !ok));
+    }
+    let mut changed: BTreeSet<String> = old.keys().map(|&e| e.to_owned()).collect();
+    for (id, alive, record) in &decided {
+        let before = match old.get(id.as_str()) {
+            Some(b) => b.as_ref().is_some_and(|b| b.alive),
+            None => p.entries[id].alive,
+        };
+        if before != *alive {
+            changed.insert(id.clone());
+        }
+        p.entries.get_mut(id).unwrap().alive = *alive;
+        if *record {
+            let alternatives = p
+                .heads
+                .get(&register(id, "location"))
+                .cloned()
+                .unwrap_or_default();
+            added.push(make_conflict(
+                branch,
+                id,
+                "namespace",
+                INVALID,
+                alternatives,
+                vec![],
+            ));
+        }
+    }
+    // Out with the revised records: the recomputed slots' pairs and the
+    // decided entries' chain records.
+    let mut removed = vec![];
+    let mut kept = Vec::with_capacity(p.conflicts.len());
+    for c in std::mem::take(&mut p.conflicts) {
+        let revised = c.field == "namespace"
+            && match c.reason.as_str() {
+                COLLISION => c
+                    .entity
+                    .split_once(',')
+                    .is_some_and(|(a, b)| pairs_before.contains(&(a.to_owned(), b.to_owned()))),
+                INVALID => affected.contains(&c.entity),
+                _ => false,
+            };
+        if revised {
+            removed.push(c);
+        } else {
+            kept.push(c);
+        }
+    }
+    p.conflicts = kept;
+    p.conflicts.extend(added.iter().cloned());
+    Ok((changed, removed, added))
 }
 
 /// The visible-namespace passes of `project`: slot collisions (the
@@ -4998,8 +5389,8 @@ mod tests {
         impl SlotKeys {
             pub(super) fn new(budget: usize) -> Self {
                 Self {
-                    current: HashMap::new(),
-                    older: HashMap::new(),
+                    current: HashMap::default(),
+                    older: HashMap::default(),
                     current_bytes: 0,
                     older_bytes: 0,
                     budget,
@@ -5338,6 +5729,7 @@ mod tests {
                     events,
                     new_event: Some(new_id),
                     reviewed: &reviewed,
+                    stored: None,
                 },
                 new_id,
             )
@@ -8560,6 +8952,7 @@ mod tests {
                         events: order,
                         new_event,
                         reviewed: &reviewed,
+                        stored: None,
                     };
                     let current = derive_full_with(&input, new_event);
                     let reference = wave4::derive_full_with(&input, new_event);
@@ -8586,6 +8979,7 @@ mod tests {
                 events: new,
                 new_event: Some(id),
                 reviewed: &[],
+                stored: None,
             };
             let current = plan_text(&derive_append_with(&input, id));
             let reference = wave4_plan_text(&wave4::derive_append_with(&input, id));
@@ -8657,9 +9051,15 @@ mod tests {
     #[test]
     fn project_append_equals_project_on_every_prefix() {
         let (mut appended, mut declined) = (0, 0);
-        for seed in 0..160u64 {
+        for seed in 0..240u64 {
             let mut rng = StdRng::seed_from_u64(41_000 + seed);
-            let events = match seed % 4 {
+            let events = match seed % 5 {
+                4 => {
+                    // Long storms over few names: many collisions, moved
+                    // and deleted directories, chains through them.
+                    let len = rng.gen_range(60..=120);
+                    storm_history(&mut rng, len, 3, 3, 0.25)
+                }
                 0 => {
                     let len = rng.gen_range(4..=16);
                     history(&mut rng, len)
@@ -8693,7 +9093,17 @@ mod tests {
                             projection,
                             changed,
                             lists,
+                            carried,
                         } = appended_projection;
+                        for id in &carried {
+                            assert!(
+                                base.conflicts
+                                    .iter()
+                                    .any(|c| &c.id == id
+                                        && projection.conflicts.iter().any(|d| d == c)),
+                                "seed {seed} k {k}: {id} carried but changed"
+                            );
+                        }
                         assert_eq!(projection, full, "seed {seed} k {k}");
                         for (id, entry) in &full.entries {
                             if base.entries.get(id) != Some(entry) {
@@ -8723,7 +9133,7 @@ mod tests {
             }
         }
         println!("{appended} appended, {declined} declined");
-        assert!(appended > 1500, "{appended} appended, {declined} declined");
+        assert!(appended > 4000, "{appended} appended, {declined} declined");
     }
 
     /// The rows a commit leaves: `stored` upserted with `derived` (the last
