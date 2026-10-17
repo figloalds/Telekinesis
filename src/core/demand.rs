@@ -122,6 +122,42 @@ struct Candidate {
     requested_ms: i64,
 }
 
+/// One row of the want scan (`want_objects`): an object referenced by a
+/// committed shared or a validly staged event that is not shareable and
+/// available here, with what does not depend on the lane, the caller or the
+/// time already resolved (its size).
+#[derive(Clone, Debug)]
+struct WantRow {
+    hash: String,
+    size: u64,
+    /// `spool_state.durable` and `.total`.
+    durable: Option<i64>,
+    spool_total: Option<u64>,
+    /// `object_requests.requested_ms`.
+    requested_ms: Option<i64>,
+    /// `object_error_state.retry_at_ms` and `.code`.
+    retry_at: Option<i64>,
+    code: Option<String>,
+}
+
+/// Want scans of at most this many rows are kept (CCR-WP4.2-5): a store
+/// that misses more is in a catch-up, whose commits change the database
+/// between almost every two wants anyway.
+const WANT_CACHE_ROWS: usize = 4096;
+
+/// The last want scan of one connection, kept while the database is
+/// unchanged as this connection sees it (CCR-WP4.2-5, applied by WP4.INT):
+/// `PRAGMA data_version` (other connections' commits) and this connection's
+/// `total_changes`, outside a transaction. Every bulk lane asks its worker's
+/// wants each sync interval in both directions; with 10K objects each scan
+/// joined six tables per object (the idle worker CPU floor measured 18 %).
+/// An idle replica's scan is empty, and is answered from here.
+pub(crate) struct WantCache {
+    data_version: i64,
+    changes: u64,
+    rows: Arc<Vec<WantRow>>,
+}
+
 impl Store {
     /// The objects the active branch's current projection references (alive
     /// entries with content), read from the stored projection
@@ -174,6 +210,86 @@ impl Store {
         Ok(objects)
     }
 
+    /// The want scan (`want_objects`), from this connection's cache while the
+    /// database is unchanged ([`WantCache`]).
+    fn want_rows(&self) -> Result<Arc<Vec<WantRow>>> {
+        let cacheable = self.db.is_autocommit();
+        let data_version: i64 = self
+            .db
+            .prepare_cached("PRAGMA data_version")?
+            .query_row([], |r| r.get(0))?;
+        let changes = self.db.total_changes();
+        if cacheable
+            && let Some(cached) = self.caches.objects.wants.borrow().as_ref()
+            && cached.data_version == data_version
+            && cached.changes == changes
+        {
+            return Ok(cached.rows.clone());
+        }
+        let mut statement = self.db.prepare_cached(
+            "WITH c(hash) AS (
+                 SELECT hash FROM event_objects WHERE shared=1
+                 UNION
+                 SELECT s.hash FROM staged_objects s JOIN incoming_events i ON i.id=s.event
+                 WHERE i.error IS NULL)
+             SELECT c.hash, z.size, a.state,
+                 EXISTS(SELECT 1 FROM published_objects p WHERE p.hash=c.hash)
+                     OR EXISTS(SELECT 1 FROM received_shared_objects r WHERE r.hash=c.hash),
+                 sp.durable, sp.total, q.requested_ms, e.retry_at_ms, e.code
+             FROM c
+             LEFT JOIN object_sizes z ON z.hash=c.hash
+             LEFT JOIN object_availability a ON a.hash=c.hash
+             LEFT JOIN spool_state sp ON sp.hash=c.hash
+             LEFT JOIN object_requests q ON q.hash=c.hash
+             LEFT JOIN object_error_state e ON e.hash=c.hash",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let object = row.get_ref(0)?.as_str()?;
+            if !super::objects::canonical_object(object) {
+                continue;
+            }
+            let shareable: bool = row.get(3)?;
+            if shareable && row.get::<_, Option<i64>>(2)? == Some(super::objects::AVAILABLE) {
+                continue;
+            }
+            let size: Option<u64> = row
+                .get::<_, Option<i64>>(1)?
+                .and_then(|s| u64::try_from(s).ok());
+            let spool_total: Option<u64> = row
+                .get::<_, Option<i64>>(5)?
+                .and_then(|t| u64::try_from(t).ok());
+            let size = match size {
+                Some(size) => size,
+                None => match self.expected_object_sizes(object)?.first() {
+                    Some(size) => *size,
+                    None => spool_total.unwrap_or(0),
+                },
+            };
+            out.push(WantRow {
+                hash: object.to_owned(),
+                size,
+                durable: row.get(4)?,
+                spool_total,
+                requested_ms: row.get(6)?,
+                retry_at: row.get(7)?,
+                code: row.get(8)?,
+            });
+        }
+        drop(rows);
+        drop(statement);
+        let rows = Arc::new(out);
+        // The scan and the size lookups only read: the key still holds.
+        *self.caches.objects.wants.borrow_mut() = (cacheable && rows.len() <= WANT_CACHE_ROWS)
+            .then(|| WantCache {
+                data_version,
+                changes,
+                rows: rows.clone(),
+            });
+        Ok(rows)
+    }
+
     /// Objects v3 `objects.want` (§6.4): what this replica wants on `lane`,
     /// at most `max_items` items (≤ `MAX_WANT_ITEMS`) and about `max_bytes`
     /// still to transfer (the item that crosses the budget ends the list).
@@ -213,73 +329,37 @@ impl Store {
         }
         let now = time();
         let demand_since = now.saturating_sub(DEMAND_TTL_MS) as i64;
-        let mut statement = self.db.prepare_cached(
-            "WITH c(hash) AS (
-                 SELECT hash FROM event_objects WHERE shared=1
-                 UNION
-                 SELECT s.hash FROM staged_objects s JOIN incoming_events i ON i.id=s.event
-                 WHERE i.error IS NULL)
-             SELECT c.hash, z.size, a.state,
-                 EXISTS(SELECT 1 FROM published_objects p WHERE p.hash=c.hash)
-                     OR EXISTS(SELECT 1 FROM received_shared_objects r WHERE r.hash=c.hash),
-                 sp.durable, sp.total, q.requested_ms, e.retry_at_ms, e.code
-             FROM c
-             LEFT JOIN object_sizes z ON z.hash=c.hash
-             LEFT JOIN object_availability a ON a.hash=c.hash
-             LEFT JOIN spool_state sp ON sp.hash=c.hash
-             LEFT JOIN object_requests q ON q.hash=c.hash
-             LEFT JOIN object_error_state e ON e.hash=c.hash",
-        )?;
-        let mut rows = statement.query([])?;
+        let rows = self.want_rows()?;
         let mut classes: [Vec<Candidate>; 3] = [vec![], vec![], vec![]];
         let mut undecided = vec![];
-        while let Some(row) = rows.next()? {
-            let object = row.get_ref(0)?.as_str()?;
-            if !lane.owns(object) || !super::objects::canonical_object(object) {
+        for row in rows.iter() {
+            let object = row.hash.as_str();
+            if !lane.owns(object) {
                 continue;
             }
-            let shareable: bool = row.get(3)?;
-            if shareable && row.get::<_, Option<i64>>(2)? == Some(super::objects::AVAILABLE) {
-                continue;
-            }
-            let retry_at: Option<i64> = row.get(7)?;
-            let code: Option<String> = row.get(8)?;
-            if retry_at.is_some_and(|at| at > now as i64)
-                && code.as_deref() != Some("CORRUPT_OBJECT")
+            if row.retry_at.is_some_and(|at| at > now as i64)
+                && row.code.as_deref() != Some("CORRUPT_OBJECT")
             {
                 continue;
             }
             if leased_elsewhere(object) {
                 continue;
             }
-            let size: Option<u64> = row
-                .get::<_, Option<i64>>(1)?
-                .and_then(|s| u64::try_from(s).ok());
-            let spool_total: Option<u64> = row
-                .get::<_, Option<i64>>(5)?
-                .and_then(|t| u64::try_from(t).ok());
-            let size = match size {
-                Some(size) => size,
-                None => match self.expected_object_sizes(object)?.first() {
-                    Some(size) => *size,
-                    None => spool_total.unwrap_or(0),
-                },
-            };
+            let size = row.size;
             let durable = row
-                .get::<_, Option<i64>>(4)?
+                .durable
                 .and_then(|d| u64::try_from(d).ok())
-                .filter(|d| *d <= size && spool_total.is_none_or(|t| t == size))
+                .filter(|d| *d <= size && row.spool_total.is_none_or(|t| t == size))
                 .unwrap_or(0);
             let offset = if durable == size && size > 0 {
                 size - 1
             } else {
                 durable
             };
-            let requested_ms: Option<i64> = row.get(6)?;
-            let demand = requested_ms.is_some_and(|at| at >= demand_since);
+            let demand = row.requested_ms.is_some_and(|at| at >= demand_since);
             let candidate = Candidate {
                 remaining: size - offset,
-                requested_ms: requested_ms.unwrap_or(0),
+                requested_ms: row.requested_ms.unwrap_or(0),
                 item: WantItem {
                     hash: object.to_owned(),
                     size,
@@ -297,8 +377,6 @@ impl Store {
                 undecided.push(candidate);
             }
         }
-        drop(rows);
-        drop(statement);
         if !undecided.is_empty() {
             let current = self.current_objects()?;
             for mut candidate in undecided {

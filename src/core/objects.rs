@@ -92,6 +92,8 @@ pub(crate) struct Cache {
     pub(crate) registrations: Cell<u64>,
     /// The last content scan (owned by `core::status`).
     pub(crate) content: RefCell<Option<super::status::ContentCache>>,
+    /// The last want scan (owned by `core::demand`, CCR-WP4.2-5).
+    pub(crate) wants: RefCell<Option<super::demand::WantCache>>,
 }
 
 /// One enumeration of `objects/`: what is physically installed. Reused while

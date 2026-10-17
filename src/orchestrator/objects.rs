@@ -274,9 +274,14 @@ impl LaneOptions {
     /// The frozen limits of §6.4 and the configured interval.
     pub fn for_config(config: &Config) -> Self {
         let interval = sync_interval(config);
+        // An idle round's next anti-entropy run waits longer (CCR-WP4.2-5).
+        let drive = DriveOptions {
+            idle_interval: interval.max(super::scheduler::OBJECTS_IDLE_INTERVAL),
+            ..DriveOptions::new(REPOS_PER_LANE, interval)
+        };
         Self {
-            download: DriveOptions::new(REPOS_PER_LANE, interval),
-            upload: DriveOptions::new(REPOS_PER_LANE, interval),
+            download: drive.clone(),
+            upload: drive,
             window_bytes: WINDOW_BYTES,
             pulls: INFLIGHT_PULLS,
             peer_calls: PEER_CALLS,
@@ -2517,6 +2522,11 @@ struct RoundState {
     pulls: BTreeMap<u64, Pull>,
     next_tag: u64,
     want_dry: bool,
+    /// Items our worker's wants returned in this round, and whether any want
+    /// excluded objects (in their backoff for this source): a round with
+    /// neither found nothing to do (`Next::idle`).
+    offered: usize,
+    excluded: bool,
     written: u64,
     completed: u64,
     corrupt: Vec<String>,
@@ -2702,9 +2712,15 @@ fn download_round(
     }
     let over = started.elapsed() >= lane.options.round;
     let again = moved && (over || state.leftovers || !state.want_dry);
+    let idle = !moved
+        && state.offered == 0
+        && !state.excluded
+        && !state.leftovers
+        && state.pulls.is_empty();
     Ok(Next {
         after: again.then_some(CONTENT_YIELD),
         progress: moved,
+        idle,
     })
 }
 
@@ -3030,6 +3046,7 @@ fn want_more(
         // What this source cannot serve now is excluded, so the worker
         // offers it to another source (module docs, "Leases given up").
         let exclude = lane.excluded(&target.repo);
+        state.excluded |= !exclude.is_empty();
         let items = match want_excluding(client, &header, exclude, worker_client::deadlines::WANT) {
             Ok(items) => items,
             Err(error) => {
@@ -3038,6 +3055,7 @@ fn want_more(
             }
         };
         lane.asked(&target.repo, slot, !items.is_empty());
+        state.offered += items.len();
         // In their backoff for this source although the want excluded what
         // it could (the list is bounded): given up at once.
         let mut refused = Vec::new();
@@ -3361,6 +3379,7 @@ fn upload_round(
             return Ok(Next {
                 after: moved.then_some(CONTENT_YIELD),
                 progress: moved,
+                idle: false,
             });
         }
         let stop = || lane.stopped();
@@ -3392,6 +3411,8 @@ fn upload_round(
             Ok(reply) => reply.items,
             Err(error) => return idle_or(moved, ExchangeError::peer(error)),
         };
+        // The peer wants nothing at all: an idle round (CCR-WP4.2-5).
+        let nothing_wanted = wanted.is_empty();
         let mut seen = HashSet::new();
         // At most the items we asked for (invariant 22; WP3.INT).
         let items: Vec<WantItem> = wanted
@@ -3418,6 +3439,7 @@ fn upload_round(
             return Ok(Next {
                 after: None,
                 progress: moved,
+                idle: nothing_wanted && !moved,
             });
         }
         match push(lane, target, client, &route, items, &spans, slot) {
@@ -3427,6 +3449,7 @@ fn upload_round(
                     return Ok(Next {
                         after: None,
                         progress: moved,
+                        idle: false,
                     });
                 }
             }
@@ -3478,6 +3501,7 @@ fn idle_or(moved: bool, error: ExchangeError) -> Result<Next, ExchangeError> {
         Ok(Next {
             after: Some(CONTENT_YIELD),
             progress: true,
+            idle: false,
         })
     } else {
         Err(error)

@@ -77,6 +77,7 @@ fn run(ctx: &WorkerCtx) {
         vitals: lock_engine(&ctx.engine).vitals.clone(),
         next_full: None,
         next_scrub: None,
+        store: None,
     };
     let mut errors = crate::util::backoff::Backoff::inbox();
     while !ctx.stopping.load(Ordering::Relaxed) {
@@ -117,6 +118,12 @@ struct Maintenance {
     next_full: Option<Instant>,
     /// No scrub step before this (the rate cap).
     next_scrub: Option<Instant>,
+    /// The connection the status refresh runs on, kept so its content scan
+    /// stays cached while the store is unchanged (WP4.INT, CCR-WP4.2-5: on
+    /// whichever pooled connection came up, an idle worker rescanned its
+    /// objects whenever that connection's cache was cold). Dropped after an
+    /// error and opened again at the next refresh.
+    store: Option<crate::core::Store>,
 }
 
 impl Maintenance {
@@ -135,7 +142,7 @@ impl Maintenance {
         }
         if self.next_full.is_none_or(|at| now >= at) {
             let started = Instant::now();
-            match status_cell::refresh_full_with(ctx, Some(&self.vitals)) {
+            match self.refresh_full(ctx) {
                 Ok(()) => {
                     let spacing = started.elapsed().saturating_mul(FULL_REFRESH_SPACING);
                     self.next_full = Some(started + spacing.max(MAINTENANCE_INTERVAL));
@@ -151,6 +158,23 @@ impl Maintenance {
         {
             self.scrub(ctx);
         }
+    }
+
+    /// The status cell's full refresh on this thread's own connection
+    /// ([`Maintenance::store`]).
+    fn refresh_full(&mut self, ctx: &WorkerCtx) -> anyhow::Result<()> {
+        let outcome = (|| {
+            if self.store.is_none() {
+                self.store = Some(ctx.sync_stores.open_dedicated()?);
+            }
+            let store = self.store.as_mut().expect("opened above");
+            crate::runtime::ctx::refresh_view_identity(store)?;
+            status_cell::refresh_full_on(ctx, Some(&self.vitals), store)
+        })();
+        if outcome.is_err() {
+            self.store = None;
+        }
+        outcome
     }
 
     /// Retries due pending saves and publishes the observation, without

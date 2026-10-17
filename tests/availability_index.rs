@@ -1154,3 +1154,58 @@ fn bulk_lane_registers_completed_objects_when_a_part_fails() {
         .stopping
         .store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// WP4.INT (CCR-WP4.2-5): `want_objects` keeps its scan per connection while
+/// the database is unchanged as that connection sees it, and still sees every
+/// change: one made through another connection (a transfer backoff
+/// recorded by the objects RPC's pooled store) and one of its own.
+#[test]
+fn the_cached_want_scan_follows_every_change() {
+    use tkfs::model::{errors::ErrorWire, protocol::LaneSpec};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = Store::initialize(&dir.path().join("a"), &repo, &id()).unwrap();
+    let mut b = Store::initialize(&dir.path().join("b"), &repo, &id()).unwrap();
+    for i in 0..3 {
+        write_file(
+            &mut a,
+            &format!("f{i}.txt"),
+            format!("content {i}").as_bytes(),
+        );
+    }
+    let allowed: BTreeSet<String> = [a.device.clone(), b.device.clone()].into();
+    let mut bundle = a
+        .shared_bundle(&b.shared_event_inventory().unwrap())
+        .unwrap();
+    causal_sort(&mut bundle.events);
+    bundle.objects.clear();
+    b.receive(bundle, &allowed).unwrap();
+    let lane = LaneSpec { index: 0, count: 1 };
+    let wanted = |s: &Store| -> BTreeSet<String> {
+        s.want_objects(lane, 256, u64::MAX, &|_| false)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.hash)
+            .collect()
+    };
+    let first = wanted(&b);
+    // The three contents and the empty object every create references.
+    assert_eq!(first.len(), 4, "{first:?}");
+    assert_eq!(wanted(&b), first, "an unchanged store answers the same");
+    // Another connection records a transfer failure: that object backs off.
+    let mut objects = first.iter().cloned();
+    let (backed, own) = (objects.next().unwrap(), objects.next().unwrap());
+    let other = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    other
+        .record_object_failure(&backed, &ErrorWire::coded("OBJECT_IO_ERROR", "test"))
+        .unwrap();
+    let after = wanted(&b);
+    assert!(!after.contains(&backed), "{after:?}");
+    assert_eq!(after.len(), 3);
+    // This connection's own change is seen too.
+    b.record_object_failure(&own, &ErrorWire::coded("OBJECT_IO_ERROR", "test"))
+        .unwrap();
+    let last = wanted(&b);
+    assert!(!last.contains(&own) && !last.contains(&backed), "{last:?}");
+    assert_eq!(last.len(), 2);
+}

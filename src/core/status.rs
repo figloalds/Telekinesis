@@ -111,8 +111,13 @@ struct ChangeKey {
 
 /// Most missing-content items in `content_status`.
 pub const CONTENT_ITEMS: usize = 20;
-/// A cached scan is recomputed at least this often.
-const CONTENT_CACHE_TTL: Duration = Duration::from_secs(60);
+/// A cached scan is recomputed at least this often. Its key already holds
+/// every input (the database as this connection sees it, the active branch,
+/// the `objects/` listing, which is re-taken when the directory changes), so
+/// this is only a safety net: 10 minutes (it was 60 s, which made every idle
+/// folder rescan all its objects each minute, about 0.3 s of CPU at 10K
+/// objects; CCR-WP4.2-5, WP4.INT).
+const CONTENT_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// The cached part of a content scan (see the module docs).
 pub(crate) struct ContentCache {

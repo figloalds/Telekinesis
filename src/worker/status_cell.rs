@@ -361,7 +361,18 @@ pub fn refresh_full(ctx: &WorkerCtx) -> Result<()> {
 /// [`refresh_full`], recording the engine's store revision it reflects
 /// when `vitals` are given.
 pub fn refresh_full_with(ctx: &WorkerCtx, vitals: Option<&EngineVitals>) -> Result<()> {
-    refresh_content_with(ctx, vitals, true)
+    refresh_content_with(ctx, vitals, true, None)
+}
+
+/// [`refresh_full_with`] on `store` (a connection its caller keeps, so its
+/// caches stay warm: the maintenance thread, WP4.INT) instead of a pooled
+/// one.
+pub fn refresh_full_on(
+    ctx: &WorkerCtx,
+    vitals: Option<&EngineVitals>,
+    store: &crate::core::Store,
+) -> Result<()> {
+    refresh_content_with(ctx, vitals, true, Some(store))
 }
 
 /// The content members (and the cheap ones) for a `status` call that must
@@ -369,23 +380,30 @@ pub fn refresh_full_with(ctx: &WorkerCtx, vitals: Option<&EngineVitals>) -> Resu
 /// maintenance refresh brings those), so a mutation never makes the next
 /// `status` wait for them (post-integration re-review, WP2.INT).
 fn refresh_content(ctx: &WorkerCtx, vitals: &EngineVitals) -> Result<()> {
-    refresh_content_with(ctx, Some(vitals), false)
+    refresh_content_with(ctx, Some(vitals), false, None)
 }
 
 fn refresh_content_with(
     ctx: &WorkerCtx,
     vitals: Option<&EngineVitals>,
     totals: bool,
+    store: Option<&crate::core::Store>,
 ) -> Result<()> {
     let target = ctx.status_generation.load(Ordering::SeqCst);
     let revision = vitals.map(EngineVitals::store_revision);
     let started = Instant::now();
-    let (cheap, full) = {
-        let store = ctx.sync_stores.checkout()?;
-        (
-            compute_cheap(&store, target, revision)?,
-            compute_full(&store, totals)?,
-        )
+    let (cheap, full) = match store {
+        Some(store) => (
+            compute_cheap(store, target, revision)?,
+            compute_full(store, totals)?,
+        ),
+        None => {
+            let store = ctx.sync_stores.checkout()?;
+            (
+                compute_cheap(&store, target, revision)?,
+                compute_full(&store, totals)?,
+            )
+        }
     };
     let full_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     ctx.status_cell.update(|prev| {

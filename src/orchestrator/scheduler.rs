@@ -114,6 +114,16 @@ pub const CONTROL_LANE: u32 = 0;
 /// heartbeat periods absorb both, so two daemons can never keep each other
 /// exchanging on generation bumps alone.
 pub const ABSORB: Duration = Duration::from_secs(3);
+/// The anti-entropy interval of a bulk lane's key after a round that found
+/// nothing to do in its direction (CCR-WP4.2-5, applied by WP4.INT): no
+/// object wanted, none excluded, nothing pushed. Its triggers (the feed
+/// tips, the content generations and counters on both sides, staging) still
+/// make it due at once; this only spaces the rounds that would find nothing
+/// again (each one a worker scan and a peer call per lane and direction:
+/// idle workers measured 18 % CPU at 10K objects and a 500 ms interval).
+/// What only the anti-entropy notices (a lease that lapsed at another
+/// source) waits at most this much longer.
+pub const OBJECTS_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 /// Recheck of a key whose folder, local or remote, answered that it is not
 /// serving (the remote catalog is polled this often too).
 pub const WAITING_RECHECK: Duration = limits::CATALOG_POLL;
@@ -387,6 +397,10 @@ pub struct DriveOptions {
     pub slots: usize,
     /// Idle anti-entropy interval.
     pub interval: Duration,
+    /// The anti-entropy interval after an exchange that found nothing to do
+    /// ([`Next::idle`]); never shorter than `interval`. The interval by
+    /// default; the bulk lanes use [`OBJECTS_IDLE_INTERVAL`] (CCR-WP4.2-5).
+    pub idle_interval: Duration,
     /// See [`ABSORB`].
     pub absorb: Duration,
     /// See [`WAITING_RECHECK`].
@@ -407,6 +421,7 @@ impl DriveOptions {
         Self {
             slots,
             interval,
+            idle_interval: interval,
             absorb: ABSORB,
             waiting_recheck: WAITING_RECHECK,
             recheck_user_action: RECHECK_USER_ACTION,
@@ -546,16 +561,19 @@ impl Job for MetaJob {
             Next {
                 after: Some(Duration::ZERO),
                 progress: true,
+                idle: false,
             }
         } else if outcome.recovered() {
             Next {
                 after: Some(Duration::ZERO),
                 progress: false,
+                idle: false,
             }
         } else {
             Next {
                 after: None,
                 progress: moved,
+                idle: false,
             }
         })
     }
@@ -827,6 +845,10 @@ pub(crate) struct Next {
     pub after: Option<Duration>,
     /// The exchange moved something (an immediate re-run is then unbounded).
     pub progress: bool,
+    /// The exchange found nothing to do at all: the next anti-entropy run
+    /// may wait [`DriveOptions::idle_interval`] instead of the interval
+    /// (triggers still make the key due at once). Bulk lanes, CCR-WP4.2-5.
+    pub idle: bool,
 }
 
 /// The op-specific half of a lane.
@@ -1270,7 +1292,12 @@ impl Engine {
                     key.due = now + after;
                     key.hold = Hold::Due;
                 } else {
-                    key.due = now + self.options.interval;
+                    let wait = if next.idle {
+                        self.options.idle_interval.max(self.options.interval)
+                    } else {
+                        self.options.interval
+                    };
+                    key.due = now + wait;
                     key.hold = Hold::Idle;
                 }
             }
