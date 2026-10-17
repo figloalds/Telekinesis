@@ -3617,8 +3617,9 @@ fn meta_work_of(meta: &MetaProgress) -> u64 {
         .saturating_add(meta.remote_pending)
 }
 
-/// Whether `op` moves object bytes (v3 `objects.*`, the interim
-/// `objects.exchange`, or a legacy bulk op).
+/// Whether `op` moves object bytes (v3 `objects.*`, or a legacy bulk op of
+/// the in-process replica API; the interim `objects.exchange` is gone,
+/// WP4.5).
 fn is_objects_op(op: &str) -> bool {
     op.starts_with("objects") || op.contains("bulk")
 }
