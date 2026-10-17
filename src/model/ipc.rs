@@ -135,7 +135,7 @@ pub struct ProgressLine {
 /// are kept; `mounted` is the actual state. A legacy line without the IPC v3
 /// fields parses with `ipc == 0`, which the controller rejects with
 /// `WORKER_IPC_MISMATCH`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadyLine {
     pub ready: bool,
     pub repo: String,
@@ -155,9 +155,38 @@ pub struct ReadyLine {
     pub version: String,
     #[serde(default)]
     pub ipc: u32,
-    /// Per-instance worker token; always `None` until WP4.1.
+    /// Per-instance worker token (WP4.1). `Debug` prints `<redacted>`
+    /// (CCR-WP4.1-8, applied by WP4.INT): a formatted record never carries
+    /// it into a log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+/// The `Debug` text of a token field: whether there is one, never its value.
+fn redacted(token: &Option<String>) -> &'static str {
+    match token {
+        Some(_) => "Some(<redacted>)",
+        None => "None",
+    }
+}
+
+impl std::fmt::Debug for ReadyLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadyLine")
+            .field("ready", &self.ready)
+            .field("repo", &self.repo)
+            .field("device", &self.device)
+            .field("runtime", &self.runtime)
+            .field("mounted", &self.mounted)
+            .field("mount_error", &self.mount_error)
+            .field("instance", &self.instance)
+            .field("pid", &self.pid)
+            .field("address", &self.address)
+            .field("version", &self.version)
+            .field("ipc", &self.ipc)
+            .field("token", &format_args!("{}", redacted(&self.token)))
+            .finish()
+    }
 }
 
 /// A failure before Ready: printed once, then the process exits `exit_code`.
@@ -237,7 +266,7 @@ pub fn parse_line(line: &str) -> Option<StartupLine> {
 // worker.json
 
 /// `STATE/worker.json`, the adoption record (§3.3, §6.1).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerRecord {
     pub format: u32,
     pub pid: u32,
@@ -253,9 +282,31 @@ pub struct WorkerRecord {
     pub process_start: u64,
     pub executable: PathBuf,
     pub supervised: bool,
-    /// Per-instance worker token; always `None` until WP4.1.
+    /// Per-instance worker token (WP4.1). `Debug` prints `<redacted>`
+    /// (CCR-WP4.1-8, applied by WP4.INT): a formatted record never carries
+    /// it into a log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for WorkerRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerRecord")
+            .field("format", &self.format)
+            .field("pid", &self.pid)
+            .field("instance", &self.instance)
+            .field("address", &self.address)
+            .field("version", &self.version)
+            .field("ipc", &self.ipc)
+            .field("repo", &self.repo)
+            .field("device", &self.device)
+            .field("started_at_ms", &self.started_at_ms)
+            .field("process_start", &self.process_start)
+            .field("executable", &self.executable)
+            .field("supervised", &self.supervised)
+            .field("token", &format_args!("{}", redacted(&self.token)))
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------

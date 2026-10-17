@@ -79,7 +79,10 @@ pub fn worker_call(
     deadline: Duration,
 ) -> Result<Value> {
     let started = Instant::now();
-    let mut socket = ws::connect(&info.address)?;
+    // The worker's instance token (CCR-WP4.1-5, applied by WP4.INT): from
+    // `STATE/runtime.token` beside the `runtime.json` that names the address,
+    // else the one this process knows for it.
+    let mut socket = crate::runtime::connect_worker(info)?;
     // A zero timeout means "block forever" to the OS: keep at least 1 ms.
     let remaining = deadline
         .saturating_sub(started.elapsed())

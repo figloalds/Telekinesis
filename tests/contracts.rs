@@ -2440,6 +2440,17 @@ fn model_helpers_follow_the_spec() {
     // its 16 MiB bound (CCR-WP2.7-1 / CCR-WP2.8-1) and 60 s deadline go too.
     assert_eq!(protocol::max_body(protocol::ops::OBJECTS_EXCHANGE), 1 << 20);
     assert_eq!(protocol::op_deadline(protocol::ops::OBJECTS_EXCHANGE), None);
+    // CCR-WP4.1-2 (WP4.INT): WP4.1's peer ops and feature are registered.
+    assert_eq!(
+        protocol::op_deadline(protocol::ops::PEER_ENROLL),
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        protocol::op_deadline(protocol::ops::PEER_REVOKE),
+        Some(Duration::from_secs(2))
+    );
+    assert_eq!(protocol::op_role(protocol::ops::PEER_ENROLL), None);
+    assert_eq!(protocol::PEER_HMAC_V1, "peer-hmac-v1");
     assert_eq!(protocol::max_body(protocol::ops::OBJECTS_PULL), 1 << 20);
     assert_eq!(protocol::max_body(protocol::ops::PING), 1 << 20);
     assert_eq!(
