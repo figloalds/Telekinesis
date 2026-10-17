@@ -571,3 +571,211 @@ On `revamp/wp4-int` (first parent; every message starts `WP4.INT: `):
 | `5dabe00` | Linux qualification (qualify.sh --all, WSL): every enforced floor |
 | `9dc5720` | the soak's edit rate is configurable, one operation every 1-4 s by default |
 | (this commit) | notes, `qualification-final.json`, VALIDATION's soak results |
+
+## Post-integration re-review
+
+Three reviews of `revamp/wp4-int` at `01f8ca7` (WP4.1, the final auth model,
+production readiness) asked for changes: five majors, one of them reported
+twice (the stale-discovery token leak: WP4.1's major and the security
+review's minor C), and nine minors. Every major and every minor is fixed
+below, except the part of the RC9 minor that moves whole-file I/O out of the
+engine lock (filed, CCR-WP4.INT-5). Each fix has a regression test that fails
+on the source before the fix (checked by running the new test against the
+stashed `src/` of the commit before it; the failure text is quoted).
+
+### Fixes
+
+| # | Finding (review, severity) | Fix | Commit | Regression test (failure before the fix) |
+|---|---|---|---|---|
+| 1 | A fresh control or worker token is paired with a stale `orchestrator.json` / `runtime.json` and sent to a port another local process may hold (WP4.1 major; security minor C) | `install_control_token` removes the previous daemon's `orchestrator.json` (stale under `orchestrator.lock`) before writing the token; `start_rpc_server` removes the previous instance's `runtime.json` (under `owner.lock`) before writing `runtime.token`. `ControlClient` and `runtime::published_token` read the discovery, the token, then the discovery again, and present the token only when both reads name the same endpoint (a starting daemon or worker deletes the stale file before it writes its token and publishes its own after, so a read that finds the new token is followed by one that finds no file or the new one). The test harness's `Control` follows the same rule | `a1d118d` | `security::a_fresh_control_token_is_never_sent_to_a_stale_endpoint` ("the stale discovery is still there", the token reached the squatter), `security::a_restarted_daemon_never_sends_its_token_to_the_old_port` ("the live token reached the old port (12 tokens captured, 178 polls)"), `security::a_new_worker_instance_never_pairs_its_token_with_a_stale_address` ("the stale runtime.json is still there"; `worker_token(&stale)` returned the new token) |
+| 2 | The control endpoint counts unauthenticated connections toward its 64 slots and bounds the upgrade only by a renewable 15 s read timeout: 64 trickling connections lock the CLI and GUI out (security major) | The whole upgrade within `CONTROL_UPGRADE` (5 s, `ws::watchdog`); unauthenticated connections counted apart (`MAX_CONTROL_PREAUTH` = 32), the oldest closed to admit a new one | `30530a3` | `security::unauthenticated_control_connections_never_lock_the_client_out` (80 trickling connections: "32 of 32 management calls failed") |
+| 3 | The worker's listener spawns a thread per connection and holds it through a 5 s peek and a 15 s upgrade read before the token check (400 connections, 400 threads, then the accept-error exit) (security major) | The pre-auth phase (peek plus JSON RPC or loopback upgrade) within `UPGRADE_BUDGET` (5 s, a watchdog); at most `MAX_PREAUTH_CONNECTIONS` (32) at once, the oldest closed for a new one | `30530a3` | `security::unauthenticated_worker_connections_are_bounded_and_closed` (200 bare connections: "only 0 of 200 unauthenticated connections were closed at once") |
+| 4 | One pending save that cannot be restored makes the folder unstoppable and refuses its control requests for good, with a misleading `BUSY_VIEW: 0 open contexts, 0 unsaved files`; later records are never loaded (production major, RC11) | Each `pending_saves` record is restored on its own; one that fails is kept (`Engine.unrecovered`), reported through `Engine::reported_health` (`RECOVERY_REQUIRED: N unsaved files could not be restored (entity …)`: a degraded store), retried with the pending-save backoff (maintenance wakes for it), and never gates `quiet()`. A later save of the same entity supersedes it. New worker control ops `pending-saves` and `discard-pending-save{entity}`, CLI `tkfs pending-saves` / `tkfs discard-pending-save ENTITY` (`docs/CLI.md`), README runbook *Unsaved file that cannot be restored*. `quiet()` names only the health message when nothing else blocks it (the existing texts with open or unsaved files are unchanged) | `c6d159c` | `pending_saves::an_unrestorable_pending_save_degrades_the_store_and_blocks_nothing` (the review's reproduction; before the fix `quiet()` failed with "BUSY_VIEW: 0 open contexts, 0 unsaved files; RECOVERY_REQUIRED: … (os error 2)"), `…a_worker_with_an_unrestorable_pending_save_stops_gracefully`, `…a_pending_save_unreadable_at_startup_is_restored_by_a_retry`, `…a_later_save_of_the_same_file_supersedes_an_unrestored_record` |
+| 5 | Force stop kills the worker 15 s + 10 s after it was sent whatever it does: a save holding the engine longer loses every unsaved session the stop's retain waits for (production major, invariant 8) | While a force stop waits for the exit and the last heartbeat (fresh) reports an engine hold in progress that is not stalled, the exit wait starts again, for at most `FORCE_STOP_ENGINE_PATIENCE` (the 120 s stall bound) after the stop began; checked on every heartbeat and at the deadline. A stalled or silent worker is killed as before | `b559a3c` | `folder_controller::force_stop_waits_for_a_busy_engine_instead_of_killing` ("killed behind a busy engine": `kill:1000` right after the exit wait), `folder_controller::force_stop_kills_a_stalled_or_endlessly_busy_engine` ("killed after 1s of a busy engine") |
+| 6 | One unresolved conflict anywhere on a branch sends every create, rename and delete to the O(history) slow path, local ones included, inline under the engine lock (production major, RC1) | With fast paths on, the creation and namespace successors refuse only when a conflict of the current projection touches what the event changes (`commit::conflicts_touch`: an entity it changes, a parent it leaves or enters, a slot it leaves or takes, named by the conflict or by one of its alternatives' locations); the argument is in `commit.rs`'s module docs. A location in a touched parent counts only in a touched slot (`34588a8`: the first version refused on any alternative located in a touched parent, so one name collision in a directory still slowed every operation in it). `TKFS_REMOTE_FASTPATH=0` keeps the previous gate. New floor `local_namespace_beside_unresolved_conflict_10k` | `7ad3c59`, `34588a8`, `dba6702`, `3809f19` | `scoped_conflict_gate::namespace_operations_beside_an_unrelated_conflict_take_the_fast_path` (`(fast, slow)` `(0, 6)` instead of `(6, 0)`), `…that_touch_a_conflict_take_the_slow_path` (a create and a rename beside an open name collision in the same directory: `(0, 2)` with `7ad3c59`'s first gate, `(2, 0)` now; operations on the conflicted entries stay slow); every commit checked against a rebuild (strict oracle) on both replicas |
+| 7 | `peer.enroll` / `peer.revoke` compete with `meta.exchange` for exchange slots: an unpair's revoke is refused `BUSY` and only logged; a lane-0 enrollment refused `BUSY` waits for lane 0 to reconnect (WP4.1 minor) | Acceptor: both hold one of the session's `CREDENTIAL_SLOTS` (2), never an exchange slot. Dialer: a lane-0 `peer.revoke` that fails is sent again on a probe session within what is left of `REVOKE_BUDGET`; a lane-0 enrollment refused with a Contention or Transient code is retried on the same session after 1, 2, 4 and 8 s while it stays up | `fe7e70e` | `security::credential_requests_do_not_wait_for_exchange_slots` (with no exchange slot left: "BUSY: 0 exchanges are already running on this orchestrator") |
+| 8 | A revamp build before WP4.1 rotates the code and records the new generation and salt itself, so the open-time fold-in sees no salt change and the peer's inbound credential stays active past the rotation (security minor, invariant 21) | `credentials_generation` records the verifier generation the inbound credentials were reconciled with (set by every `bump_verifier_generation`); an open that finds the generation moved revokes them | `fe7e70e` | `security::a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open` ("the credential enrolled before the other build's rotation is still active") |
+| 9 | §6.2 still describes only the code scheme (WP4.1 minor, CCR-WP4.1-2) | §6.2 gains the per-peer variant of steps 1–4 (offer and echo, the `tkfs-peer-hmac-v1` context, `K_peer` proofs, every `GOAWAY` code, the code fallback) and the sealed `EnrollRequest` | `5b2baed` | docs |
+| 10 | Crash leftovers `STATE/staging/*.stage` and `objects/*.part` are never removed (production minor) | At worker startup (after `Engine::new`, under `owner.lock`) `Engine::remove_orphaned_spools` removes staging files no `pending_saves` row names and `objects/<uuid>.part`, and logs the files and bytes | `c6d159c` | `pending_saves::orphaned_spools_are_removed_and_pending_ones_kept` (new API: did not exist before) |
+| 11 | A pending save holds SQLite's writer for the whole copy of the file (production minor, RC9) | `flush_entity` stores the bytes (`put_object` / `put_stream`) before `BEGIN IMMEDIATE`; the transaction commits the event (`Store::write_object_with_base_and_times`, additive) and removes the row together | `c223b2a` | `pending_saves::a_retained_save_takes_the_writer_only_for_its_commit` ("the writer slot was free for 4 of 550 probes during the save"; about half after) |
+| 12 | `worker.log` is rotated only at spawn; a long-running (adopted) worker appends without bound (production minor) | The worker's maintenance thread checks it every 10 s and past 10 MiB rotates it in place (`worker::maintenance::bound_worker_log`: shift the old files, copy to `worker.log.1`, truncate; the append handles of the worker's stderr and the daemon's stdout copy follow the truncation) | `141bd9a` | `logging::a_running_worker_bounds_its_log` ("worker.log was not rotated while the worker runs") |
+| 13 | The review's observations: CONFIGURATION says later sessions authenticate "instead of the code"; README's `revoked` row says a refused credential "is dropped" | CONFIGURATION says the code stays valid until rotated (per-peer credentials add revocation, not protection against another holder of the code); README says the connection sets the credential aside and the catalog keeps it | `5b2baed` | docs |
+
+The other observations of the reviews are recorded under *Known limitations*
+below (the code scheme can be forced by an active attacker; credential rows
+and revocation epochs grow with installation ids a code holder mints; slow
+upgrades of unauthenticated clients, now bounded at 5 s).
+
+### Deviations from the reviews' suggestions, and why
+
+1. **Pre-auth bounds evict the oldest** unauthenticated connection to admit a
+   new one, where the inbound peer server (§3.8) refuses the newest. A
+   refusal lets 32 connections that reconnect every 5 s keep a slot free for
+   nobody; with eviction a client that upgrades at once (the CLI, the GUI,
+   the orchestrator, all sub-millisecond on loopback) is closed only by a
+   flood of 32 new connections during its own upgrade. A determined local
+   flood can still deny service; nothing local can prevent that.
+2. **Force stop waits on the controller side** (heartbeats) rather than
+   retaining dirty sessions without the engine lock (the review's
+   alternative): the sessions live inside the engine, and a lock-free copy of
+   them would be a second source of truth. The wait is bounded by the worker's
+   own stall bound (120 s); a single hold longer than that is a stalled
+   engine and is killed as before.
+3. **The scoped conflict gate** reads the current projection's conflicts (in
+   memory) and no longer the branch's unresolved conflict rows. A stored row
+   that is not in the projection is a record of a historical cut, which a
+   successor (`dependencies == frontier`) leaves unchanged; the projection's
+   own records are the only ones a successor's commit could change, and the
+   gate refuses when one of them touches the event. The kill switch keeps the
+   old gate (no conflict in the projection and no conflict row).
+4. **Unrestorable pending saves gate nothing**, also not a checkout: a
+   record of another branch is kept and restored when that branch is active
+   again (it was `RECOVERY_BRANCH_MISMATCH` for good). A later save of the
+   same file supersedes the record (one row per entity).
+5. **`worker.log` is bounded by copy and truncate** in the worker, not by the
+   launcher's rename: the worker's stderr and the daemon's stdout copy are
+   append handles opened elsewhere, which a rename would leave writing to
+   `worker.log.1`. A line written between the copy and the truncation can be
+   lost (CONFIGURATION says so).
+6. **Frozen contracts, additive only:** `model::errors` registers
+   `PENDING_SAVE_RESTORED` (Transient default list); `core::Store` gains
+   `write_object_with_base_and_times`. No public signature changed
+   (`install_control_token`, `start_rpc_server`, `Engine::quiet`,
+   `successor_conflict_gate` is private, `branch_has_unresolved_conflicts`
+   stays).
+7. **The test harness's `Control`** (`tests/support/node.rs`) re-reads the
+   discovery after the token, as `ControlClient` does, so the harness itself
+   never sends a live token to a stale port (the restart test polls through
+   it).
+
+### CCRs filed
+
+- **CCR-WP4.INT-3, updated:** the part "let remote namespace changes that
+  touch no conflicted entity keep the fast path while unrelated conflicts are
+  open" is done by fix 6, for local and remote events. What stays: an event
+  that conflicts, or touches a conflicted entry, is a full replay whose cost
+  grows with the history and the open conflicts (the two-hour storm), and a
+  prepared replay is still discarded when the branch moved.
+- **CCR-WP4.INT-4** (`src/core/commit.rs`, `src/core/derive.rs`;
+  performance): a rename into a slot the entity never used and a first
+  delete count the branch's competing cuts (`check_namespace_successor`,
+  CCR-WP1.6-5) over its whole history: about 95 ms at 10K events in release,
+  with or without conflicts, under the engine lock for a local operation.
+  Requested: keep per-cone cut counts so a successor recounts only the cones
+  it joins. Adapter: none (README *Filesystem behaviour* gives the cost; the
+  new floor judges creates and reports renames and deletes).
+- **CCR-WP4.INT-5** (`src/runtime/engine.rs`, `src/staging.rs`,
+  `src/core/commit.rs`; the RC9 remainder): saving a file still hashes and
+  copies it into the object store under the engine lock, the first write to
+  a file above 256 KiB copies it to a staging file under it, and the commit
+  re-hashes the new object (`check_commit`'s `verify_object` for local
+  events) under SQLite's writer. Requested: snapshot the session's staged
+  bytes under the lock, store them without it and commit with a base check;
+  skip the re-verification of an object this handle has just installed and
+  verified. Adapter: ARCHITECTURE's lock table states the cost.
+
+### Tests added (re-review)
+
+| Test | Covers |
+|---|---|
+| `security::a_fresh_control_token_is_never_sent_to_a_stale_endpoint` | fix 1, control token, in process |
+| `security::a_restarted_daemon_never_sends_its_token_to_the_old_port` | fix 1, real daemon restart, a squatter on the old port, a client polling every 2 ms |
+| `security::a_new_worker_instance_never_pairs_its_token_with_a_stale_address` | fix 1, worker token at step 6 |
+| `security::unauthenticated_control_connections_never_lock_the_client_out` | fix 2 |
+| `security::unauthenticated_worker_connections_are_bounded_and_closed` | fix 3 |
+| `security::credential_requests_do_not_wait_for_exchange_slots` | fix 7 |
+| `security::a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open` | fix 8 |
+| `pending_saves` (6 tests, new file) | fixes 4, 10, 11 |
+| `folder_controller::force_stop_waits_for_a_busy_engine_instead_of_killing`, `…force_stop_kills_a_stalled_or_endlessly_busy_engine` | fix 5 |
+| `scoped_conflict_gate` (2 tests, new file) | fix 6 |
+| `qual_wp1_6_activation::local_namespace_ops_beside_an_unresolved_conflict_10k` (release, ignored; floor `local_namespace_beside_unresolved_conflict_10k`, wave 4, creates p90 ≤ 20 ms) | fix 6 at 10K events |
+| `logging::a_running_worker_bounds_its_log` | fix 12 |
+
+No existing assertion was changed. The fake worker of `folder_controller`
+gains a heartbeat field (`hold_ms`, default 0) for the new tests.
+
+### Release runs (re-review)
+
+| Run | Result |
+|---|---|
+| `derive_oracle::fuzz_300_seeds_release`, 6 shards × 50 from 1000 (`7ad3c59`'s gate, before the refinement of `34588a8`) | **300 seeds pass** (8–14 min per shard): 21,139 append-mode commits, 10,695 verified, 16 fallbacks, 31,866 slow commits checked against full mode; the strict oracle after every step |
+| `derive_oracle::fuzz_stress_release` (`7ad3c59`'s gate), 2-seed shards | seeds 5000–5003 and 5006–5007 pass every per-seed check (48 refused deliveries, each refused by full mode too); the 5002–5003 shard failed only its shard-level coverage check `total.verified > 0` (neither seed is a multiple of 3, the verify-mode seeds), not a derivation |
+| conflict storm soak, 8 min (`TKFS_SOAK_SHARED_PERCENT=100`, 50–400 ms, settle 5 min; `3809f19`, before the refinement) | **pass** (521 s): 3,113 edits, 3,292 shared events, 264 unresolved conflicts, 12 fault phases, settled in 1.5 s, equal journals and projections, both oracles empty |
+| `derive_oracle::fuzz_300_seeds_release`, 6 shards × 50 from 1000, the refined gate (`34588a8`) | **300 seeds pass** (8–14 min per shard): 20,784 append-mode commits, 10,339 verified, 16 fallbacks, 31,153 slow commits checked |
+| `derive_oracle::fuzz_stress_release`, seeds 5000–5001 and 5007–5008, the refined gate | **pass** (17–19 min per shard; 24 refused deliveries, each refused by full mode too) |
+| conflict storm soak, 8 min, the refined gate (`dba6702`), beside the 8 fuzz processes above | **pass** (552 s): 2,882 edits, 3,106 shared events, 382 unresolved conflicts, 12 fault phases, settled in 36.9 s, equal journals and projections (`up_to_date`, 3,106 events each), both oracles empty |
+| `qual_wp1_6_activation::local_namespace_ops_beside_an_unresolved_conflict_10k` (final code, quiet machine, three runs) | creates p90 2.8–3.1 ms over 100 (floor ≤ 20 ms; the slow path took 262–436 ms), renames p90 76–91 ms, deletes 70–77 ms, 0 slow commits. A first version timed 40 creates against a 10 ms floor: 3.2 / 3.6 ms quiet, 16 ms with the full suite running beside it (a few creates meet SQLite's automatic WAL checkpoint), hence 100 samples and 20 ms |
+
+### VERIFY (re-review)
+
+Run in `C:/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int`,
+`CARGO_TARGET_DIR=C:/tkfs-target/wp4-int` (Windows 11), at `29c1205` (the
+notes commit changes this file only).
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | clean (exit 0) |
+| `cargo build --all-targets` | ok (exit 0) |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` | **ok, exit 0: 74 test binaries, 1,080 passed, 0 failed, 124 ignored** (before the re-review: 72 binaries, 1,062 passed, 123 ignored). A first run at `f35d2e3` failed two: `harness_selftest::qual_files_exist_and_ignores_name_their_owner` (the new scenario's ignore named WP4.INT, not the file's owner WP1.6: fixed in `29c1205`) and `availability_index::tiny_pending_objects_produce_valid_pages` (its 15 s RPC read timed out while a release qualification run of mine loaded the machine; 5.1 s alone, 5.0 s on the source before the re-review, 3 of 3 binary runs pass) |
+| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp4-int`) | ok (exit 0) |
+| WSL: `cargo test --no-fail-fast` for `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle`, `security`, `logging`, `folder_controller`, `pending_saves`, `scoped_conflict_gate`, `derive_oracle`, `activation_inbox`, `inbound_v3`, `peer_supervisor`, `worker_process`, `feed_v7`, `objects_v3_worker`, `status_hub`, `docs_cli`, `harness_selftest` (at `29c1205`) | **20 binaries: 560 passed, 0 failed, 4 ignored** |
+
+Per binary (Windows, new or changed by the re-review): `security` 28,
+`pending_saves` 6, `scoped_conflict_gate` 2, `folder_controller` 59,
+`logging` 21, `harness_selftest` 18 + 2 ignored, `qual_wp1_6_activation`
+0 + 6 ignored.
+
+### Known limitations (re-review)
+
+- **Local denial of service** is bounded, not excluded: a process that floods
+  the control or worker endpoint with new connections faster than a client
+  upgrades can still close that client's upgrade (deviation 1).
+- **A save that holds the engine for more than 120 s** (a file of many GiB on
+  a slow disk) still loses its force stop's unsaved sessions: the controller
+  waits only as long as the worker does not call its engine stalled.
+- **The dialer-side `peer.revoke` fallback and the enrollment retry** (fix 7)
+  have no test of their own: the acceptor fix removes the `BUSY` they recover
+  from, and an older acceptor (a WP4.1 build) is internal.
+- **Renames into new names and first deletes** count the history's competing
+  cuts, O(history) with or without conflicts (CCR-WP4.INT-4).
+- **Whole-file I/O under the engine lock** remains for saves and the first
+  write to a large file (CCR-WP4.INT-5); a pending save's commit still
+  re-hashes the object under SQLite's writer.
+- **`worker.log`'s in-place rotation** can lose a line written during it.
+- **An active attacker can force the code scheme** (not echoing
+  `peer-hmac-v1`, or an unauthenticated `GOAWAY{PEER_REVOKED}`): under the
+  code scheme any other holder of the code can authenticate, so per-peer
+  credentials add revocation, not resistance to impersonation by code holders
+  (as before WP4.1; CONFIGURATION now says so).
+- **Credential rows and revocation epochs** grow with each installation id
+  that authenticates with the code and is never cleared (only a code holder
+  can mint them).
+- **A catalog written by an earlier build of this branch** (WP4.1 to
+  `01f8ca7`) has no `credentials_generation`: its first open by this build
+  revokes its inbound credentials once, and the peers authenticate with
+  their code and enroll again (a catalog of the previous release has none).
+- **Not re-run after these fixes:** `qualify.ps1 -All`, `qualify.sh --all`
+  and the two-hour soak (their last runs are above, at `27802c3`–`9dc5720`);
+  the full suite, the WSL subset, the release oracles, an 8-minute conflict
+  storm and the new floor were run on the final code.
+
+### Commits (re-review)
+
+| Commit | Subject |
+|---|---|
+| `a1d118d` | a fresh local token is never paired with a stale discovery |
+| `30530a3` | unauthenticated local connections are bounded before the token check |
+| `c6d159c` | an unrestorable pending save degrades the store and blocks nothing |
+| `b559a3c` | a force stop waits for a busy engine instead of killing |
+| `7ad3c59` | the successors' conflict gate is scoped to the event's cone |
+| `fe7e70e` | credential requests have slots of their own; a generation bump by an older build revokes credentials |
+| `c223b2a` | a retained save stores its bytes before it takes SQLite's writer |
+| `5b2baed` | §6.2 describes the per-peer handshake; credential docs corrected |
+| `141bd9a` | a running worker bounds its worker.log |
+| `3809f19` | a floor for local creates beside an unresolved conflict at 10K events |
+| `34588a8` | the conflict gate ignores other slots of a touched parent |
+| `dba6702` | commit.rs module docs follow the refined gate |
+| `f35d2e3` | server.rs docs: serve's description back on serve |
+| `29c1205` | the 10K floor samples 100 creates; its ignore names the file's owner |
+| (this commit) | notes: post-integration re-review |
