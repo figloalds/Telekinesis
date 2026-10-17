@@ -23,6 +23,9 @@ pub const UPGRADE_V3: &str = "3";
 pub const UPGRADE_LOOPBACK: &str = "3-loopback";
 /// Local token header (WP4.1).
 pub const TOKEN_HEADER: &str = "X-Tkfs-Token";
+/// The per-peer authentication scheme's name in `ClientHello.features` and
+/// `ServerHello.features` (WP4.1; CCR-WP4.1-2, applied by WP4.INT).
+pub const PEER_HMAC_V1: &str = "peer-hmac-v1";
 /// Domain-separation prefix of the authentication transcript `T` (§6.2).
 pub const AUTH_CONTEXT: &str = "tkfs-peer-auth-v3";
 /// Text JSON reply a v3 server sends to a legacy (v2) client before closing.
@@ -99,6 +102,12 @@ pub mod ops {
     pub const OBJECTS_WANTS: &str = "objects.wants";
     pub const OBJECTS_PUSH: &str = "objects.push";
     pub const OBJECTS_REPORT: &str = "objects.report";
+    /// WP4.1 (CCR-WP4.1-2, applied by WP4.INT): the dialer's enrollment of a
+    /// per-peer credential (`session::auth::EnrollRequest`), and its
+    /// best-effort revocation before it unpairs. Any session role; the
+    /// acceptor applies them to the session's authenticated installation.
+    pub const PEER_ENROLL: &str = "peer.enroll";
+    pub const PEER_REVOKE: &str = "peer.revoke";
 }
 
 /// Per-op deadlines (§6.2 table). Streaming ops use an idle deadline.
@@ -111,6 +120,9 @@ pub mod deadlines {
     pub const OBJECTS_IDLE: Duration = Duration::from_secs(30);
     pub const OBJECTS_WANTS: Duration = Duration::from_secs(10);
     pub const OBJECTS_REPORT: Duration = Duration::from_secs(10);
+    /// WP4.1 (CCR-WP4.1-2): an unpair waits for `peer.revoke` at most this.
+    pub const PEER_ENROLL: Duration = Duration::from_secs(10);
+    pub const PEER_REVOKE: Duration = Duration::from_secs(2);
 }
 
 /// The absolute deadline of a non-streaming op (`None` for streaming ops,
@@ -122,6 +134,8 @@ pub fn op_deadline(op: &str) -> Option<Duration> {
         ops::META_EXCHANGE => Some(deadlines::META_EXCHANGE),
         ops::OBJECTS_WANTS => Some(deadlines::OBJECTS_WANTS),
         ops::OBJECTS_REPORT => Some(deadlines::OBJECTS_REPORT),
+        ops::PEER_ENROLL => Some(deadlines::PEER_ENROLL),
+        ops::PEER_REVOKE => Some(deadlines::PEER_REVOKE),
         _ => None,
     }
 }

@@ -618,15 +618,39 @@ pub struct FolderView {
     pub published_error: Option<ErrorRecord>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerEndpoint {
     pub instance: String,
     pub pid: u32,
     pub address: String,
     pub version: String,
-    /// Per-instance worker token; `None` until WP4.1.
+    /// Per-instance worker token (WP4.1). `Debug` prints `<redacted>`
+    /// (CCR-WP4.1-8, applied by WP4.INT): a formatted record never carries
+    /// it into a log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for WorkerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerEndpoint")
+            .field("instance", &self.instance)
+            .field("pid", &self.pid)
+            .field("address", &self.address)
+            .field("version", &self.version)
+            .field(
+                "token",
+                &format_args!(
+                    "{}",
+                    if self.token.is_some() {
+                        "Some(<redacted>)"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

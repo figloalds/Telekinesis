@@ -1837,3 +1837,43 @@ fn no_pairing_code_secret_or_token_in_status_or_logs() {
     }
     assert!(found.is_empty(), "secrets found: {found:#?}");
 }
+
+/// CCR-WP4.1-8 (applied by WP4.INT): the token-bearing model records print
+/// `<redacted>` in their `Debug` text, so formatting one never logs a token.
+#[test]
+fn debug_text_of_token_bearing_records_redacts_the_token() {
+    use tkfs::model::{
+        ipc::{ReadyLine, WorkerRecord},
+        orchestrator::WorkerEndpoint,
+    };
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let endpoint = WorkerEndpoint {
+        instance: "i".into(),
+        pid: 1,
+        address: "ws://127.0.0.1:1".into(),
+        version: "v".into(),
+        token: Some(token.into()),
+    };
+    let ready: ReadyLine = serde_json::from_value(json!({
+        "ready": true, "repo": "r", "device": "d", "runtime": "x", "mounted": false,
+        "instance": "i", "pid": 1, "address": "ws://127.0.0.1:1", "version": "v",
+        "ipc": 3, "token": token,
+    }))
+    .unwrap();
+    let record: WorkerRecord = serde_json::from_value(json!({
+        "format": 1, "pid": 1, "instance": "i", "address": "a", "version": "v", "ipc": 3,
+        "repo": "r", "device": "d", "started_at_ms": 1, "process_start": 1,
+        "executable": "tkfs", "supervised": true, "token": token,
+    }))
+    .unwrap();
+    for text in [
+        format!("{endpoint:?}"),
+        format!("{ready:?}"),
+        format!("{record:?}"),
+    ] {
+        assert!(!text.contains(token), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+    // The wire keeps it.
+    assert_eq!(serde_json::to_value(&endpoint).unwrap()["token"], token);
+}

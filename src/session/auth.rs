@@ -98,8 +98,8 @@ impl fmt::Debug for PeerAuth {
 }
 
 /// The per-peer scheme's name in `ClientHello.features` and
-/// `ServerHello.features`.
-pub const PEER_HMAC_V1: &str = "peer-hmac-v1";
+/// `ServerHello.features` (`model::protocol::PEER_HMAC_V1`).
+pub use crate::model::protocol::PEER_HMAC_V1;
 /// Domain separation of the per-peer transcript (in place of
 /// `AUTH_CONTEXT`).
 pub const PEER_AUTH_CONTEXT: &str = "tkfs-peer-hmac-v1";
@@ -108,23 +108,24 @@ pub const PEER_SECRET_CONTEXT: &[u8] = b"tkfs-peer-secret-v1";
 /// Domain separation of the enrollment pad and MAC.
 const ENROLL_CONTEXT: &[u8] = b"tkfs-peer-enroll-v1";
 
-/// The peer ops WP4.1 adds (§14 WP4.1; CCR-WP4.1-2 asks for them in
-/// `model::protocol::ops`). Both are allowed on any session role; the server
-/// applies them to the session's **authenticated** installation only.
+/// The peer ops WP4.1 adds (§14 WP4.1), registered in
+/// `model::protocol::ops` (CCR-WP4.1-2, applied by WP4.INT). Both are
+/// allowed on any session role; the server applies them to the session's
+/// **authenticated** installation only.
 pub mod ops {
     /// `peer.enroll`: header [`EnrollRequest`](super::EnrollRequest), reply
     /// [`EnrollReply`](super::EnrollReply).
-    pub const PEER_ENROLL: &str = "peer.enroll";
+    pub use crate::model::protocol::ops::PEER_ENROLL;
     /// `peer.revoke`: header `{}`, reply [`RevokeReply`](super::RevokeReply).
     /// The dialer's best-effort notice before it unpairs: the acceptor
     /// revokes the dialer's credential and closes its sessions.
-    pub const PEER_REVOKE: &str = "peer.revoke";
+    pub use crate::model::protocol::ops::PEER_REVOKE;
 }
 
-/// Deadline of `peer.enroll`.
-pub const ENROLL_DEADLINE: Duration = Duration::from_secs(10);
+/// Deadline of `peer.enroll` (`model::protocol::deadlines::PEER_ENROLL`).
+pub const ENROLL_DEADLINE: Duration = crate::model::protocol::deadlines::PEER_ENROLL;
 /// Deadline of `peer.revoke` (an unpair waits for it at most this long).
-pub const REVOKE_DEADLINE: Duration = Duration::from_secs(2);
+pub const REVOKE_DEADLINE: Duration = crate::model::protocol::deadlines::PEER_REVOKE;
 
 /// A fresh per-peer secret `S`.
 pub fn new_secret() -> [u8; 32] {
