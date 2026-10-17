@@ -1446,16 +1446,22 @@ impl Engine {
             .collect();
         let mut committed = 0;
         for entity in due {
-            // Saved without the engine lock when the shared engine is known
-            // and the background queue has room: a saver saves it and
-            // reports a failure back (`retry_failed`).
-            if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade)
-                && schedule(&shared, entity.clone())
-            {
-                if let Some(session) = self.sessions.get_mut(&entity) {
-                    session.queued = true;
+            // Saved without the engine lock when the shared engine is known:
+            // a saver saves it and reports a failure back (`retry_failed`).
+            // With the queue full the savers are busy and their sweep
+            // (`orphan_dirty`) picks it up: never saved here then, under the
+            // lock (a backlog of closed files saved one after the other here
+            // held the engine for seconds).
+            if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade) {
+                if schedule(&shared, entity.clone()) {
+                    if let Some(session) = self.sessions.get_mut(&entity) {
+                        session.queued = true;
+                    }
+                    continue;
                 }
-                continue;
+                if saver_threads() > 0 {
+                    continue;
+                }
             }
             match self.flush_entity(&entity) {
                 Ok(()) => {
@@ -2499,6 +2505,11 @@ fn savers() -> &'static Savers {
         state: Mutex::new(SaversState::default()),
         wake: std::sync::Condvar::new(),
     })
+}
+
+/// Background saver threads alive now.
+fn saver_threads() -> usize {
+    crate::util::lock::lock(&savers().state).threads
 }
 
 /// Saves running or waiting in the background now.
