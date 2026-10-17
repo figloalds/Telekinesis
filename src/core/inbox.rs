@@ -882,7 +882,11 @@ impl Store {
         }
         let incremental = fast.is_some();
         // Row bookkeeping first, the commit last: the commit's view patch then
-        // stays valid for the next event (no write follows it).
+        // stays valid for the next event (no write follows it). The inbox rows
+        // are no projection state: a fresh view stays fresh across them, so a
+        // slow commit after another one in the slice derives from it instead
+        // of reloading it (WP5.1).
+        let view = self.keep_view();
         self.db.execute_batch("SAVEPOINT inbox_event")?;
         let released = match self.finish_row(id) {
             Ok(released) => released,
@@ -891,6 +895,7 @@ impl Store {
                 return Err(error);
             }
         };
+        self.rekey_view(view);
         match self.commit_checked(event, false, checked, fast) {
             Ok(()) => {
                 self.db.execute_batch("RELEASE inbox_event")?;

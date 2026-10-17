@@ -286,6 +286,8 @@ fn event_cost_5k_1k() {
     causal_sort(&mut bundle.events);
     let start = thread_derive_counters();
     let slow_before = storm.b.commit_path_counters().slow;
+    let phases_before = tkfs::core::derive::thread_phase_micros();
+    let loads_before = storm.b.view_loads();
     s.measure_from_now();
     let mut cpu = vec![];
     let mut wall = vec![];
@@ -333,10 +335,17 @@ fn event_cost_5k_1k() {
     if std::env::var("TKFS_WP51_PHASES").is_ok() {
         let mut phases: Vec<_> = tkfs::core::derive::thread_phase_micros()
             .into_iter()
-            .map(|(k, (calls, micros))| (k, calls, micros / 1000))
+            .map(|(k, (calls, micros))| {
+                let (c0, m0) = phases_before.get(k).copied().unwrap_or((0, 0));
+                (k, calls - c0, (micros - m0) / 1000)
+            })
+            .filter(|p| p.1 > 0)
             .collect();
         phases.sort_by(|a, b| b.2.cmp(&a.2));
-        eprintln!("PHASES {phases:?}");
+        eprintln!(
+            "PHASES view_loads {} {phases:?}",
+            storm.b.view_loads() - loads_before
+        );
     }
     let (diff, oracle_ms) = time_ms(|| storm.b.verify_derived_state().unwrap());
     s.metric("oracle_ms", oracle_ms, "ms");
