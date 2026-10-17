@@ -32,8 +32,15 @@
 //! derivation), and for those `derive::check_successor_cuts` counts every
 //! cone that contains a touched entity exactly as full mode does and refuses
 //! with full mode's error. The creation successor needs no count (a fresh
-//! entity joins one existing cone), nor does the content successor (it adds
-//! no relevant event and only a TRUE version that descends from all).
+//! entity joins one existing cone). The content successor counts when its
+//! event saves an entity that has a tombstone (CCR-WP4.4-5, WP4.INT): it
+//! needs one head per register it changes, not the whole frontier, so its
+//! event may be concurrent with other events of the branch, and every save
+//! asserts `alive = true`, which is a TRUE-presence witness (a relevant
+//! event) of an entity with a tombstone: such a commit can tip a cone over
+//! `MAX_NAMESPACE_CUTS` (found by the stress fuzz, `derive_oracle`). Without
+//! a tombstone a TRUE version is never relevant, so ordinary saves never
+//! count (`derive::content_successor_may_add_cuts`).
 //!
 //! # Off-lock slow path (WP2.4, REVAMP_PLAN §4.4, §14 WP2.4)
 //!
@@ -535,6 +542,9 @@ impl Store {
     ) -> Result<Option<Projection>> {
         self.drop_rolled_back_view();
         let mut fast = self.content_successor(event)?;
+        if fast.is_some() {
+            self.check_content_successor(event, committed_view)?;
+        }
         if fast.is_none() && (local || remote_fast_paths_enabled()) {
             fast = self.creation_successor(event)?;
             if fast.is_none() {
@@ -553,6 +563,34 @@ impl Store {
         self.with_branch_events(branch, Some(event), committed_view, |events| {
             let new = events.len() - 1;
             if !derive::successor_may_add_cuts(events, new) {
+                return Ok(());
+            }
+            let counted = &self.caches.commit.successor_checks;
+            counted.set(counted.get().saturating_add(1));
+            derive::check_successor_cuts(branch, events, new)
+        })?
+    }
+    /// CCR-WP4.4-5: refuse a content successor commit exactly when full
+    /// replay would refuse it with `NAMESPACE_HISTORY_LIMIT` (module docs):
+    /// only an event that saves an entity with a tombstone and is concurrent
+    /// with another event of the branch can change a count, and only those
+    /// are counted. A save that follows the whole frontier (every local save,
+    /// a linear remote history) is in no antichain of two or more events and
+    /// can only displace an older TRUE witness from the relevant set, which
+    /// never adds a cut; it is not even scanned.
+    fn check_content_successor(&self, event: &Event, committed_view: bool) -> Result<()> {
+        if !event.changes.iter().any(|c| c.field == "alive") {
+            return Ok(());
+        }
+        let mut dependencies = event.dependencies.clone();
+        dependencies.sort();
+        if dependencies == self.frontier(&event.branch.id)? {
+            return Ok(());
+        }
+        let branch = event.branch.id.as_str();
+        self.with_branch_events(branch, Some(event), committed_view, |events| {
+            let new = events.len() - 1;
+            if !derive::content_successor_may_add_cuts(events, new) {
                 return Ok(());
             }
             let counted = &self.caches.commit.successor_checks;

@@ -1633,6 +1633,35 @@ pub(super) fn successor_may_add_cuts(events: &[Event], new: usize) -> bool {
     false
 }
 
+/// CCR-WP4.4-5 (WP4.INT): whether committing `events[new]` through the
+/// content successor can change the competing-cut count of a dependency
+/// cone, so that `check_successor_cuts` must count. A content successor
+/// changes `content`, `basic` and `alive = true` only, and needs one head per
+/// register it changes, not the whole frontier: its event may be concurrent
+/// with other events of the branch. Its only namespace-relevant change is
+/// `alive = true`, which is a relevant event (a TRUE-presence witness,
+/// `NsContext::relevant`) exactly when the entity's alive register has a
+/// tombstone; then it may join antichains of the cone. Without a tombstone
+/// (every ordinary save) it never counts.
+pub(super) fn content_successor_may_add_cuts(events: &[Event], new: usize) -> bool {
+    let saved: BTreeSet<&str> = events[new]
+        .changes
+        .iter()
+        .filter(|c| c.field == "alive")
+        .map(|c| c.entity.as_str())
+        .collect();
+    !saved.is_empty()
+        && events
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != new)
+            .any(|(_, e)| {
+                e.changes.iter().any(|c| {
+                    c.field == "alive" && c.value == false && saved.contains(c.entity.as_str())
+                })
+            })
+}
+
 /// Whether every cone `check_successor_cuts` would count is certainly within
 /// `MAX_NAMESPACE_CUTS`, by a cheap sound bound: a cone with `r` relevant
 /// events has at most `2^r - 1 - r` competing cuts (its antichains of two or
