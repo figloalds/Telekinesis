@@ -1764,3 +1764,54 @@ fn every_daemon_installs_its_log_and_reports_it() {
         "manage status shows the log row:\n{text}"
     );
 }
+
+/// WP4.INT re-review (the production review's minor): `worker.log` was
+/// rotated only when a worker was spawned, so a worker that kept running
+/// (one adopted by daemon after daemon) appended to it without bound. The
+/// worker's maintenance thread rotates it in place past 10 MiB: it copies it
+/// to `worker.log.1` and truncates it, and an append handle (the worker's
+/// standard error, the daemon's copy of its standard output) keeps writing
+/// to the live file from its new end.
+#[test]
+fn a_running_worker_bounds_its_log() {
+    use tkfs::orchestrator::process::WORKER_LOG_ROTATE_BYTES;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let log_path = state.join("worker.log");
+    let rotated = state.join("worker.log.1");
+    let mut stderr = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let line = vec![b'x'; 1023];
+    let lines = (WORKER_LOG_ROTATE_BYTES / 1024 + 64) as usize;
+    for _ in 0..lines {
+        stderr.write_all(&line).unwrap();
+        stderr.write_all(b"\n").unwrap();
+    }
+    stderr.flush().unwrap();
+    let written = fs::metadata(&log_path).unwrap().len();
+    assert!(written > WORKER_LOG_ROTATE_BYTES);
+    let store = tkfs::core::Store::open(state, Some("log-bound")).unwrap();
+    let engine = Arc::new(Mutex::new(tkfs::runtime::Engine::new(store)));
+    let _discovery = tkfs::runtime::start_rpc(engine, state, None).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(15), || fs::metadata(&rotated)
+            .is_ok_and(|m| m.len() == written)),
+        "worker.log was not rotated while the worker runs"
+    );
+    assert!(fs::metadata(&log_path).unwrap().len() < WORKER_LOG_ROTATE_BYTES);
+    stderr.write_all(b"after the rotation\n").unwrap();
+    stderr.flush().unwrap();
+    let live = fs::read_to_string(&log_path).unwrap();
+    assert!(
+        live.ends_with("after the rotation\n"),
+        "{:?}",
+        &live[..live.len().min(200)]
+    );
+    assert!(
+        fs::metadata(&log_path).unwrap().len() < 1024 * 1024,
+        "the append handle did not follow the truncation"
+    );
+}
