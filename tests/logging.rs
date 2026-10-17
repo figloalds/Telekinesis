@@ -1036,6 +1036,33 @@ fn worker_log_rotates_at_spawn_and_never_keeps_the_ready_token() {
     );
     assert!(text.contains("worker stderr line"));
     assert!(!text.contains("an earlier worker's output"));
+    // CCR-WP4.1-4 (applied by WP4.INT): `worker.log` is owner-only, also
+    // when an earlier file was not.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "worker.log is {mode:o}");
+        fs::set_permissions(&log_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let sink: tkfs::model::orchestrator::ProcessSink = Arc::new(move |event| {
+            let _ = tkfs::util::lock::lock(&tx).send(event);
+        });
+        let _again = launcher
+            .launch_command(child(TEST, "worker"), &log_path, "test", sink)
+            .unwrap();
+        while !matches!(
+            rx.recv_timeout(Duration::from_secs(60))
+                .expect("the worker exits"),
+            ProcessEvent::Exited { .. }
+        ) {}
+        let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an older worker.log is made owner-only: {mode:o}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -1246,11 +1273,12 @@ fn logs_of(node: &Node) -> Vec<(PathBuf, String)> {
 /// Two paired daemons with a synchronized folder: their logs and status hold
 /// no secret, and each diagnostics bundle has every part and no secret even
 /// after a pairing code and a token were planted in a worker log. Until
-/// CCR-WP4.2-1 these daemons log to the harness's `daemon.log` only (no
-/// installed log): the reply's `log_path` is null, and a
-/// `DATA/logs/orchestrator.log` left by an earlier daemon is bundled only as
-/// `orchestrator.log.not-installed.tail`. With the CCR applied, `log_path` is
-/// `DATA/logs/orchestrator.log` and its tail is `orchestrator.log.tail`.
+/// CCR-WP4.2-1 these daemons logged to the harness's `daemon.log` only (no
+/// installed log): the reply's `log_path` was null, and a
+/// `DATA/logs/orchestrator.log` left by an earlier daemon was bundled only as
+/// `orchestrator.log.not-installed.tail`. With the CCR applied (WP4.INT),
+/// every daemon installs its log: `log_path` is `DATA/logs/orchestrator.log`
+/// and its tail is `orchestrator.log.tail` (asserted).
 #[test]
 fn diagnostics_bundles_have_every_part_and_no_secret() {
     let a = Node::new();
@@ -1308,6 +1336,10 @@ fn diagnostics_bundles_have_every_part_and_no_secret() {
     for (node, folder) in [(&a, &pa), (&b, &pb)] {
         let reply = node.call(json!({"op":"diagnostics"}));
         assert_eq!(reply["schema"], 1, "{reply}");
+        assert!(
+            !reply["log_path"].is_null(),
+            "CCR-WP4.2-1: every daemon installs DATA/logs/orchestrator.log: {reply}"
+        );
         let dir = PathBuf::from(reply["path"].as_str().unwrap());
         assert!(
             fs::canonicalize(&dir)
@@ -1616,4 +1648,65 @@ impl Drop for KillOnDrop {
             let _ = self.0.wait();
         }
     }
+}
+
+/// CCR-WP4.2-1 (applied by WP4.INT): a daemon started from a console (here
+/// the harness, whose stderr is its `daemon.log`) installs
+/// `DATA/logs/orchestrator.log` and reports it in `Status` (`daemon.log_path`,
+/// the `log` row of `manage status`); its events land in that file as JSON
+/// lines and are still teed to its stderr.
+#[test]
+fn every_daemon_installs_its_log_and_reports_it() {
+    let node = Node::new();
+    let status: StatusSnapshot = serde_json::from_value(node.call(json!({"op":"status"}))).unwrap();
+    let reported = status
+        .daemon
+        .log_path
+        .clone()
+        .expect("the daemon reports its log");
+    assert!(
+        !reported.starts_with(r"\?\"),
+        "a path as the user knows it: {reported}"
+    );
+    let path = log::daemon_log_path(&node.data_dir());
+    assert_eq!(
+        fs::canonicalize(&reported).unwrap(),
+        fs::canonicalize(&path).unwrap()
+    );
+    // A failed inbound handshake is an event: in the file and on stderr.
+    let network = node.endpoint();
+    let network = network.trim_start_matches("ws://");
+    if let Ok(mut stream) = TcpStream::connect(network) {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+        let mut sink = Vec::new();
+        let _ = stream.read_to_end(&mut sink);
+    }
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains("inbound handshake failed")
+                && fs::read_to_string(node.log_path())
+                    .unwrap_or_default()
+                    .contains("inbound handshake failed")
+        }),
+        "the event reaches the installed log and the teed stderr"
+    );
+    for line in fs::read_to_string(&path).unwrap().lines() {
+        serde_json::from_str::<Value>(line)
+            .unwrap_or_else(|e| panic!("not a JSON line ({e}): {line}"));
+    }
+    let text = Command::new(bin())
+        .arg("-f")
+        .arg(node.config_path())
+        .args(["manage", "status"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("log") && line.contains("orchestrator.log")),
+        "manage status shows the log row:\n{text}"
+    );
 }
