@@ -24,7 +24,14 @@
 //! * **Stop ladder**: `desired=0` is persisted before the stop RPC
 //!   (invariant 26); graceful `stop`, `BUSY_VIEW` → StopBlocked (retried every
 //!   2 s), ForceStop → `stop{force}`, wait 10 s for the exit, then a verified
-//!   kill. A worker that has not printed Ready is killed directly.
+//!   kill. A worker that has not printed Ready is killed directly. A force
+//!   stop does not kill a worker whose heartbeat shows its engine busy (WP4.INT
+//!   re-review, invariant 8: a long save holds the engine, and the stop's
+//!   retain of the unsaved files waits for it): while a fresh heartbeat
+//!   reports an engine hold in progress that is not stalled, the exit wait
+//!   starts again, for at most [`FORCE_STOP_ENGINE_PATIENCE`] after the stop
+//!   began; a wedged worker (stalled engine, or no heartbeat) is killed as
+//!   before.
 //! * **Shutdown** never changes `desired_running` and never kills a worker that
 //!   may hold dirty sessions (invariant 8): busy or silent workers are
 //!   `left_running` and adopted by the next daemon.
@@ -157,6 +164,11 @@ const ADOPT_HELLO_RETRY: Duration = Duration::from_secs(1);
 /// A stop RPC that has not come back this long after its own deadline is
 /// treated as timed out (a client that ignores its deadline).
 const RPC_GRACE: Duration = Duration::from_secs(1);
+/// How long a force stop waits, after it began, for a worker whose engine is
+/// held by a live, progressing hold (module docs; WP4.INT re-review): the
+/// worker's own stall bound, past which its heartbeat reports the engine
+/// `stalled`.
+pub const FORCE_STOP_ENGINE_PATIENCE: Duration = ipc::timing::ENGINE_STALLED_AFTER;
 /// Kill attempts before a never-exiting worker is given up on.
 const KILL_ATTEMPTS: u32 = 2;
 /// Watch loop pauses (interruptible): after a failure, and after a reply that
@@ -427,6 +439,8 @@ struct StopPlan {
     /// followed by a probe and a kill, and after `adopt_patience` the folder
     /// is `Failed{PREVIOUS_WORKER_UNRESPONSIVE}` like a silent adoption.
     unverified_since: Option<Instant>,
+    /// A force stop's wait for a busy engine was logged (once per stop).
+    engine_wait_logged: bool,
 }
 
 struct BackoffState {
@@ -2524,6 +2538,7 @@ impl Controller {
             _ => {}
         }
         self.heartbeat = Some(heartbeat.clone());
+        self.extend_force_stop_while_busy();
         self.update_entry_from_heartbeat(&heartbeat);
         if !self.retired {
             // Nothing follows FolderRemoved (see `publish`).
@@ -2692,6 +2707,7 @@ impl Controller {
                     retry_at: None,
                     kills: 0,
                     unverified_since,
+                    engine_wait_logged: false,
                 });
             }
         }
@@ -2837,9 +2853,11 @@ impl Controller {
                 }
             }
             StopStage::AwaitExit => {
-                if self.shutdown.is_none() {
-                    let after = plan.after.clone();
-                    self.kill_then(after);
+                if self.shutdown.is_none() && !self.extend_force_stop_while_busy() {
+                    let after = self.stop.as_ref().map(|plan| plan.after.clone());
+                    if let Some(after) = after {
+                        self.kill_then(after);
+                    }
                 }
             }
             StopStage::Killing => {
@@ -2861,6 +2879,53 @@ impl Controller {
                 }
             }
         }
+    }
+
+    /// While a force stop waits for the worker's exit and the last heartbeat
+    /// (fresh: within `heartbeat_timeout`) reports an engine hold in progress
+    /// that is not stalled, the exit wait starts again from now, for at most
+    /// [`FORCE_STOP_ENGINE_PATIENCE`] after the stop began (module docs).
+    /// Returns whether it waits. A kill now would drop every unsaved session
+    /// the stop's retain is waiting for the engine to persist (invariant 8).
+    fn extend_force_stop_while_busy(&mut self) -> bool {
+        let now = self.now();
+        let now_ms = self.now_ms();
+        let exit_wait = self.limits().stop_exit_wait;
+        let fresh = now.saturating_duration_since(self.liveness.last_heartbeat)
+            < self.limits().heartbeat_timeout;
+        let busy = self.heartbeat.as_ref().is_some_and(|heartbeat| {
+            heartbeat.engine.current_hold_ms > 0 && !heartbeat.engine.stalled
+        });
+        let hold_ms = self
+            .heartbeat
+            .as_ref()
+            .map_or(0, |heartbeat| heartbeat.engine.current_hold_ms);
+        let state = self.state.clone();
+        let Some(plan) = self.stop.as_mut() else {
+            return false;
+        };
+        if !plan.force
+            || plan.stage != StopStage::AwaitExit
+            || !fresh
+            || !busy
+            || now_ms.saturating_sub(plan.since_ms) >= ms(FORCE_STOP_ENGINE_PATIENCE)
+        {
+            return false;
+        }
+        let until = now + exit_wait;
+        if plan.deadline.is_none_or(|deadline| deadline < until) {
+            if !plan.engine_wait_logged {
+                plan.engine_wait_logged = true;
+                event!(info, WORKER_BUSY, {
+                    "folder": state,
+                    "detail": "force stop: the worker's engine is busy (a save in progress); waiting for it to persist the unsaved files",
+                    "current_hold_ms": hold_ms,
+                });
+            }
+            plan.deadline = Some(until);
+            plan.deadline_ms = now_ms.saturating_add(ms(exit_wait));
+        }
+        true
     }
 
     /// Kills the worker after the launcher re-verifies its identity, then
@@ -2901,6 +2966,7 @@ impl Controller {
             retry_at: None,
             kills: kills + 1,
             unverified_since: None,
+            engine_wait_logged: false,
         });
     }
 

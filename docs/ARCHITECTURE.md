@@ -99,8 +99,13 @@ One actor per folder runs the worker's lifecycle and publishes a `FolderView`:
 - **Stop ladder.** `desired=0` is persisted first; then a graceful `stop`
   (5 s; `BUSY_VIEW` → `StopBlocked`); ForceStop sends `stop{force}` (the
   worker saves dirty files to its pending saves, detaches and exits); then 10 s
-  for the exit; then a kill of the verified process. A worker that has not
-  printed Ready yet is killed directly (store recovery is crash-safe).
+  for the exit; then a kill of the verified process. While the worker's
+  heartbeat reports its engine held by a hold that is not stalled (a large
+  save: the stop's save of the dirty files waits for the engine), the 10 s
+  start again, for at most 120 s after the stop began, so a busy save does not
+  turn a force stop into a loss of unsaved files; a stalled or silent worker
+  is killed as before. A worker that has not printed Ready yet is killed
+  directly (store recovery is crash-safe).
 - **Liveness.** A dedicated connection long-polls `watch` (2 s waits, 4 s
   deadline). No heartbeat for 8 s or 3 failed watches → a `hello` probe; if it
   fails, the worker is killed and backs off. An engine lock held for more
