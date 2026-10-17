@@ -54,24 +54,43 @@
 //! computed. It never sets
 //! `busy`; `stale` only when the cell is older than `STATUS_CELL_STALE` and
 //! could not be refreshed.
+//!
+//! **Feed peers (CCR-WP4.INT-1, applied by WP5.4).** The peers `caught_up`
+//! and `upload_state` count are the legacy lanes' (`sync_peers`, set only
+//! by `paired_sync`) and, on this release's peer path, the feed's: every
+//! replica with feed counters in `ctx.sync_obs` (both ends of a feed
+//! exchange record them). `caught_up` (and `metadata_caught_up`, the same
+//! claim as before) then holds when, besides the local conditions, every
+//! feed peer's last exchange said its metadata was caught up and is fresh,
+//! and the peer acknowledged every shared committed event (the inventory
+//! match). Fresh means younger than three of that peer's exchange
+//! intervals, between 15 s and 180 s ([`FeedCadence`]): the worker does not
+//! know the daemon's `sync_interval_ms` (50 ms to 60 s), so it measures the
+//! interval from the exchange stamps it samples. The legacy rule's fixed
+//! 15 s would read a folder synced every 60 s as behind for most of every
+//! interval. Before WP5.4 only the legacy observations counted, so on the
+//! v3 path `caught_up` stayed `false` and `upload_state` said
+//! `peer-not-configured`.
 use crate::{
     core::{
         Store,
         status::{InventoryMatch, StatusCounters, merge_object},
     },
     model::{
-        health::{ActivationCounters, ContentCounters, InboxCounts, JournalCounters},
+        health::{
+            ActivationCounters, ContentCounters, InboxCounts, JournalCounters, PeerFeedCounters,
+        },
         ipc::timing::STATUS_CELL_STALE,
         orchestrator::FeedTip,
     },
-    runtime::{EngineVitals, ctx::WorkerCtx},
+    runtime::{EngineVitals, ctx::WorkerCtx, engine::SyncObservation},
     util::{lock::lock, time::now_ms},
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex, atomic::Ordering},
     thread,
@@ -80,6 +99,23 @@ use std::{
 
 /// How long a peer's last sync observation counts for `caught_up` (legacy).
 const SYNC_FRESH_MS: u64 = 15_000;
+/// The feed peers' freshness rule (CCR-WP4.INT-1, applied by WP5.4): a feed
+/// peer's last exchange counts for `caught_up` for
+/// [`FEED_FRESH_INTERVALS`] of that peer's exchange cadence
+/// ([`FeedCadence`]), and at least this long (the legacy window, which also
+/// holds while the cadence is not known yet).
+pub const FEED_FRESH_MIN: Duration = Duration::from_millis(SYNC_FRESH_MS);
+/// Exchange intervals a feed peer's last exchange counts for.
+pub const FEED_FRESH_INTERVALS: u32 = 3;
+/// The most a feed peer's last exchange counts for: three of the longest
+/// anti-entropy interval the daemon accepts (`sync_interval_ms` ≤ 60 s).
+pub const FEED_FRESH_MAX: Duration = Duration::from_secs(180);
+/// The longest gap between two exchanges with a peer that counts as its
+/// cadence (and the length of a [`FeedCadence`] window): the longest
+/// anti-entropy interval (60 s) plus an exchange's deadline
+/// (`limits::EXCHANGE_DEADLINE`, 30 s). A longer gap is an outage, and
+/// never stretches the window.
+pub const FEED_CADENCE_MAX: Duration = Duration::from_secs(90);
 /// A `status` call after a client mutation waits for the background content
 /// refresh when one is expected to take at most this long (a cold content
 /// scan: 17 ms at 2K entries, 47 ms at 5K, 220 ms at 20K, release), so it
@@ -142,12 +178,135 @@ pub struct CellMeta {
     /// counters when the engine's connection changed the database since
     /// (writes through the mount move no `status_generation`).
     pub store_revision: Option<u64>,
+    /// The exchange cadence of each feed peer, by replica (CCR-WP4.INT-1):
+    /// what its last exchange's freshness is measured against.
+    pub feed: BTreeMap<String, FeedCadence>,
 }
 
 impl CellMeta {
     pub fn of(cell: &Value) -> Self {
         serde_json::from_value(cell["cell"].clone()).unwrap_or_default()
     }
+
+    /// Records the feed peers' exchange stamps (`last_exchange_ms`) in
+    /// their cadences.
+    fn observe_feed(&mut self, feed: &BTreeMap<String, PeerFeedCounters>) {
+        for (replica, counters) in feed {
+            if let Some(at) = counters.last_exchange_ms {
+                self.feed.entry(replica.clone()).or_default().observe(at);
+            }
+        }
+    }
+
+    /// Whether a feed peer exchanged since its cadence last saw it.
+    fn feed_moved(&self, feed: &BTreeMap<String, PeerFeedCounters>) -> bool {
+        feed.iter().any(|(replica, counters)| {
+            counters.last_exchange_ms.is_some_and(|at| {
+                self.feed
+                    .get(replica)
+                    .is_none_or(|cadence| at > cadence.stamp_ms)
+            })
+        })
+    }
+}
+
+/// One feed peer's exchange cadence, as the cell sees it (CCR-WP4.INT-1):
+/// the longest gap between two of the peer's successive exchange stamps
+/// (`PeerFeedCounters::last_exchange_ms`) in the current window of
+/// [`FEED_CADENCE_MAX`] or in the one before it.
+///
+/// The stamps are sampled, by every refresh of the cell (maintenance about
+/// once a second, every activator slice and mutation) and every `status`
+/// call, so a gap is at least the real interval: never shorter, which would
+/// make the window too short for a long sync interval. The longest gap of
+/// the last two windows, and not the last gap: a burst of exchanges (a tip
+/// that moved, a mutual pairing's two schedules) never shortens it. A gap
+/// longer than [`FEED_CADENCE_MAX`] is an outage and is left out, so an
+/// outage never stretches the window.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FeedCadence {
+    /// The newest exchange stamp seen (0: none yet).
+    pub stamp_ms: u64,
+    /// The stamp the current window began at.
+    pub window_ms: u64,
+    /// The longest gap that ended in the current window.
+    pub longest_ms: u64,
+    /// The longest gap that ended in the window before.
+    pub previous_ms: u64,
+}
+
+impl FeedCadence {
+    /// Records the exchange stamp `at`; whether it is newer than the last.
+    pub fn observe(&mut self, at: u64) -> bool {
+        if at <= self.stamp_ms {
+            return false;
+        }
+        let window = duration_ms(FEED_CADENCE_MAX);
+        if self.stamp_ms == 0 {
+            self.window_ms = at;
+        } else {
+            let elapsed = at.saturating_sub(self.window_ms);
+            if elapsed >= window.saturating_mul(2) {
+                self.previous_ms = 0;
+                self.longest_ms = 0;
+                self.window_ms = at;
+            } else if elapsed >= window {
+                self.previous_ms = self.longest_ms;
+                self.longest_ms = 0;
+                self.window_ms = at;
+            }
+            let gap = at - self.stamp_ms;
+            if gap <= window {
+                self.longest_ms = self.longest_ms.max(gap);
+            }
+        }
+        self.stamp_ms = at;
+        true
+    }
+
+    /// The peer's exchange interval as seen lately (0 while unknown).
+    pub fn cadence_ms(&self) -> u64 {
+        self.longest_ms.max(self.previous_ms)
+    }
+
+    /// How long the peer's last exchange counts for `caught_up`:
+    /// [`FEED_FRESH_INTERVALS`] cadences, within [`FEED_FRESH_MIN`] and
+    /// [`FEED_FRESH_MAX`].
+    pub fn fresh_for(&self) -> Duration {
+        Duration::from_millis(
+            self.cadence_ms()
+                .saturating_mul(u64::from(FEED_FRESH_INTERVALS)),
+        )
+        .clamp(FEED_FRESH_MIN, FEED_FRESH_MAX)
+    }
+}
+
+/// Whether the feed peers' last observations hold `caught_up` at `now_ms`
+/// (CCR-WP4.INT-1): each says the metadata is caught up (our cursor at the
+/// peer's tip, nothing it listed still missing, no row from it still to
+/// activate; quarantined and blocked rows do not hold it, CCR-WP1.6-3) and
+/// is fresh: its exchange is younger than [`FeedCadence::fresh_for`] of the
+/// peer's cadence ([`FEED_FRESH_MIN`] while none is known). True for no
+/// feed peer; the caller requires a peer.
+pub fn feed_peers_caught_up(
+    feed: &BTreeMap<String, PeerFeedCounters>,
+    cadence: &BTreeMap<String, FeedCadence>,
+    now_ms: u64,
+) -> bool {
+    feed.iter().all(|(replica, counters)| {
+        let fresh_for = cadence
+            .get(replica)
+            .map_or(FEED_FRESH_MIN, FeedCadence::fresh_for);
+        counters.caught_up
+            && counters
+                .last_exchange_ms
+                .is_some_and(|at| now_ms.saturating_sub(at) < duration_ms(fresh_for))
+    })
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The typed members of the cell (for the heartbeat).
@@ -267,9 +426,11 @@ fn refresh_inventory(ctx: &WorkerCtx) -> Result<()> {
         };
         (feed, store.inventory_match()?)
     };
+    let peers = feed_peers(ctx);
     ctx.status_cell.update(|prev| {
         let mut next = object_or_empty(prev);
         let mut meta = CellMeta::of(prev);
+        meta.observe_feed(&peers);
         if at_ms >= meta.inventory_at_ms {
             next["inventory"] = json!(inventory);
             meta.inventory_at_ms = at_ms;
@@ -330,10 +491,12 @@ fn refresh_cheap_with(
         let store = ctx.sync_stores.checkout()?;
         compute_cheap(&store, target, revision)?
     };
+    let feed = feed_peers(ctx);
     ctx.status_cell.update(|prev| {
         let mut next = object_or_empty(prev);
         let mut meta = CellMeta::of(prev);
         merge_cheap(&mut next, &mut meta, &cheap);
+        meta.observe_feed(&feed);
         if let Some(activation) = activation {
             next["activation"] = json!(activation);
         }
@@ -406,10 +569,12 @@ fn refresh_content_with(
         }
     };
     let full_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let feed = feed_peers(ctx);
     ctx.status_cell.update(|prev| {
         let mut next = object_or_empty(prev);
         let mut meta = CellMeta::of(prev);
         merge_cheap(&mut next, &mut meta, &cheap);
+        meta.observe_feed(&feed);
         if target >= meta.content_generation {
             let previous: Option<ContentCounters> =
                 serde_json::from_value(next["content_counters"].clone()).ok();
@@ -555,16 +720,34 @@ pub fn reply(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>) -> Result<Value> 
     if cell.get("repo").is_none() {
         return Err(failure.unwrap_or_else(|| anyhow::anyhow!("ENGINE_NOT_READY: no status yet")));
     }
+    // The feed peers' exchange stamps, into their cadences (the
+    // freshness of `caught_up`, CCR-WP4.INT-1).
+    let feed = feed_peers(ctx);
+    if meta.feed_moved(&feed) {
+        ctx.status_cell.update(|prev| {
+            let mut next = object_or_empty(prev);
+            let mut meta = CellMeta::of(prev);
+            meta.observe_feed(&feed);
+            next["cell"] = json!(meta);
+            next
+        });
+        cell = ctx.status_cell.load();
+        meta = CellMeta::of(&cell);
+    }
     // `caught_up`'s inventory check reads `peer_known`, which only an
     // exchange changes, and the shared committed events: recompute it when
-    // every cheaper condition holds and an exchange was observed or the
-    // journal moved since it was computed.
+    // every cheaper condition holds and an exchange was observed (on a
+    // legacy lane or the feed) or the journal moved since it was computed.
     let sync = vitals.sync_observation();
     let latest_exchange = sync
         .last_sync
         .iter()
         .chain(sync.peers.values())
         .filter_map(|observation| observation["at"].as_u64())
+        .chain(
+            feed.values()
+                .filter_map(|counters| counters.last_exchange_ms),
+        )
         .max()
         .unwrap_or(0);
     // Like with like: the cell's `tip` is the feed tip, as `inventory_tip`.
@@ -573,7 +756,7 @@ pub fn reply(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>) -> Result<Value> 
     if (latest_exchange >= meta.inventory_at_ms
         || tip != meta.inventory_tip
         || epoch != meta.inventory_epoch)
-        && cheap_caught_up(&cell, vitals)
+        && cheap_caught_up(&cell, &meta, vitals, &feed, now_ms())
     {
         if let Err(error) = refresh_inventory(ctx) {
             failure.get_or_insert(error);
@@ -582,7 +765,21 @@ pub fn reply(ctx: &Arc<WorkerCtx>, vitals: &Arc<EngineVitals>) -> Result<Value> 
         meta = CellMeta::of(&cell);
     }
     let stale = now_ms().saturating_sub(meta.refreshed_at_ms) > stale_ms;
-    Ok(compose(&cell, &meta, ctx, vitals, stale))
+    Ok(compose(&cell, &meta, ctx, vitals, &feed, stale))
+}
+
+/// The feed peers' counters (`ctx.sync_obs`), by replica.
+fn feed_peers(ctx: &WorkerCtx) -> BTreeMap<String, PeerFeedCounters> {
+    lock(&ctx.sync_obs).clone()
+}
+
+/// Every peer `caught_up` and `upload_state` count: the legacy lanes'
+/// (`sync_peers`) and the feed's (`ctx.sync_obs`), by replica.
+fn sync_peers(
+    sync: &SyncObservation,
+    feed: &BTreeMap<String, PeerFeedCounters>,
+) -> BTreeSet<String> {
+    sync.sync_peers.iter().chain(feed.keys()).cloned().collect()
 }
 
 /// One worker store's read-your-writes content refresh: at most one runs at
@@ -724,28 +921,45 @@ fn spawn_content_refresh(
         .map(drop)
 }
 
-/// Every `caught_up` condition except the per-peer inventory match.
-fn cheap_caught_up(cell: &Value, vitals: &EngineVitals) -> bool {
-    let now = now_ms();
+/// Every `caught_up` condition except the per-peer inventory match: no
+/// local work left (nothing unacknowledged, nothing to activate, no pending
+/// causal event, no unflushed file, a healthy store), at least one peer,
+/// and every peer's last observation caught up and fresh:
+///
+/// * the legacy lanes' peers (`sync_peers`, legacy rule): the last lane
+///   exchange caught up and every peer's observation younger than
+///   [`SYNC_FRESH_MS`];
+/// * the feed peers (`ctx.sync_obs`, CCR-WP4.INT-1): [`feed_peers_caught_up`].
+fn cheap_caught_up(
+    cell: &Value,
+    meta: &CellMeta,
+    vitals: &EngineVitals,
+    feed: &BTreeMap<String, PeerFeedCounters>,
+    now: u64,
+) -> bool {
     let sync = vitals.sync_observation();
     let fresh = |observation: &Value| {
         observation["at"]
             .as_u64()
             .is_some_and(|at| now.saturating_sub(at) < SYNC_FRESH_MS)
     };
-    sync.last_sync
-        .as_ref()
-        .is_some_and(|v| v["caught_up"] == true && fresh(v))
-        && cell["outgoing_unacknowledged"] == 0
+    let legacy = sync.sync_peers.is_empty()
+        || (sync
+            .last_sync
+            .as_ref()
+            .is_some_and(|v| v["caught_up"] == true && fresh(v))
+            && sync
+                .sync_peers
+                .iter()
+                .all(|peer| sync.peers.get(peer).is_some_and(fresh)));
+    cell["outgoing_unacknowledged"] == 0
         && cell["incoming_active"] == 0
         && cell["pending_causal_events"] == json!([])
         && vitals.unflushed_files() == 0
         && vitals.health().is_none()
-        && !sync.sync_peers.is_empty()
-        && sync
-            .sync_peers
-            .iter()
-            .all(|peer| sync.peers.get(peer).is_some_and(fresh))
+        && !(sync.sync_peers.is_empty() && feed.is_empty())
+        && legacy
+        && feed_peers_caught_up(feed, &meta.feed, now)
 }
 
 /// The reply from a cell: the engine overlay and the derived members.
@@ -754,6 +968,7 @@ fn compose(
     meta: &CellMeta,
     ctx: &WorkerCtx,
     vitals: &EngineVitals,
+    feed: &BTreeMap<String, PeerFeedCounters>,
     stale: bool,
 ) -> Value {
     let mut s = cell.clone();
@@ -776,14 +991,17 @@ fn compose(
     s["last_sync"] = json!(sync.last_sync);
     s["peers"] = json!(sync.peers);
     s["sampled_at_ms"] = json!(now);
-    let caught_up =
-        cheap_caught_up(cell, vitals) && sync.sync_peers.iter().all(|peer| inventory.matches(peer));
+    // The previous release's claim, from the legacy lanes' observations and
+    // (CCR-WP4.INT-1) the feed's: both members carry it, as they did.
+    let peers = sync_peers(&sync, feed);
+    let caught_up = cheap_caught_up(cell, meta, vitals, feed, now)
+        && peers.iter().all(|peer| inventory.matches(peer));
     s["caught_up"] = json!(caught_up);
     s["metadata_caught_up"] = json!(caught_up);
     s["content_complete"] = s["content"]["complete"].clone();
     s["upload_state"] = json!(if s["branch"]["shared"] != true {
         "local-only"
-    } else if sync.sync_peers.is_empty() {
+    } else if peers.is_empty() {
         "peer-not-configured"
     } else if s["outgoing_unacknowledged"] != 0 {
         "queued"
@@ -794,10 +1012,7 @@ fn compose(
         serde_json::from_value(s["activation"].clone()).unwrap_or_default();
     activation.running = ctx.activator_running.load(Ordering::SeqCst);
     s["activation"] = json!(activation);
-    let mut feed: Vec<_> = crate::util::lock::lock(&ctx.sync_obs)
-        .values()
-        .cloned()
-        .collect();
+    let mut feed: Vec<_> = feed.values().cloned().collect();
     feed.sort_by(|a, b| a.replica.cmp(&b.replica));
     s["feed_peers"] = json!(feed);
     s["status_generation"] = json!(meta.generation);
