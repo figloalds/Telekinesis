@@ -5,6 +5,36 @@
 //! remote events (kill switch `TKFS_REMOTE_FASTPATH=0`), and their conflict
 //! gate reads only the unresolved conflicts of the event's own branch.
 //!
+//! **The conflict gate is scoped to the event's cone (WP4.INT re-review,
+//! RC1).** One unresolved conflict anywhere on the branch used to send every
+//! creation, rename and delete to the slow path, local filesystem operations
+//! included (inline under the engine lock, O(history) each: about one
+//! namespace operation per second on a 30K-event folder). With fast paths on,
+//! the successors now refuse only when a conflict of the current projection
+//! touches what the event changes ([`conflicts_touch`]): an entity the event
+//! changes, the parent directory it leaves or enters, the slot it leaves or
+//! takes, by name in the conflict or in its alternatives' locations. Why
+//! that is exact: full replay of `N = O ∪ {E}` stores its projection's
+//! records and those of every antichain cut; with `dependencies == frontier`
+//! the old antichains keep their cuts (their records are already stored) and
+//! `{E}`'s cut is the new projection, so exactness needs only `project(N)` =
+//! the delta applied to `project(O)`, conflicts included (then full mode's
+//! DELETE of rows no longer derived removes nothing). The successor checks
+//! give that for the entries (a free slot under a live parent, which, being
+//! live, has a valid chain, so every register-alive member of a slot under
+//! it is live or a slot loser beside a live winner the view's slots hold; a
+//! single head parented by the event; no live child of a deleted entry; no
+//! cycle); a conflict that names none of the touched entities, parents and
+//! slots is derived from registers and slots the event leaves alone (its
+//! pairs, its suppressed entries and its invalid-parent records keep their
+//! inputs: a moved directory is live, so the validity of everything below
+//! it is decided below it), so it is the same record before and after. A
+//! stored conflict row that is no longer in the projection is a historical
+//! record, re-derived from an unchanged cut. The oracle (`derive_oracle`,
+//! every commit checked against a rebuild) is the executable check; with
+//! `TKFS_REMOTE_FASTPATH=0` the previous gate (no conflict in the projection
+//! and no conflict row on the branch) applies.
+//!
 //! Why a successor is a restriction of full replay: it requires
 //! `dependencies == frontier` (sorted list equality), so every committed event
 //! of the branch is a causal ancestor of the new event E. The only antichain
@@ -1538,19 +1568,28 @@ impl Store {
             |r| r.get(0),
         )?)
     }
-    /// The conflict gate of the creation and namespace successors. With
-    /// remote fast paths, only unresolved conflicts of the event's own branch
-    /// disable them; with `TKFS_REMOTE_FASTPATH=0`, any conflict row of that
-    /// branch does (the previous gate, also the oracle fallback of §5.1).
-    fn successor_conflict_gate(&self, branch: &str) -> Result<bool> {
+    /// The conflict gate of the creation and namespace successors: `true`
+    /// refuses the fast path. With remote fast paths, a conflict of the
+    /// current projection that touches what the event changes
+    /// ([`conflicts_touch`], module docs; WP4.INT re-review: it was any
+    /// unresolved conflict of the branch); with `TKFS_REMOTE_FASTPATH=0`, any
+    /// conflict of the projection or any conflict row of the branch (the
+    /// previous gate, also the oracle fallback of §5.1).
+    fn successor_conflict_gate(
+        &self,
+        branch: &str,
+        current: &Projection,
+        touched: &Touched<'_>,
+    ) -> Result<bool> {
         if remote_fast_paths_enabled() {
-            return self.branch_has_unresolved_conflicts(branch);
+            return Ok(conflicts_touch(current, touched));
         }
-        Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM conflicts WHERE branch=?)",
-            [branch],
-            |r| r.get(0),
-        )?)
+        Ok(!current.conflicts.is_empty()
+            || self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conflicts WHERE branch=?)",
+                [branch],
+                |r| r.get(0),
+            )?)
     }
     /// Whether the successors may handle an event of `device`.
     fn successor_device_allowed(&self, device: &str) -> bool {
@@ -1707,19 +1746,22 @@ impl Store {
             return Ok(None);
         };
         let current = &view.projection;
-        if current.entries.contains_key(entity)
-            || !current.pending.is_empty()
-            || !current.conflicts.is_empty()
-            || self.successor_conflict_gate(&event.branch.id)?
-        {
-            return Ok(None);
-        }
         let parent = fields["location"]["parent"]
             .as_str()
             .context("INVALID_LOCATION")?;
         let name = fields["location"]["name"]
             .as_str()
             .context("INVALID_LOCATION")?;
+        let touched = Touched {
+            ids: BTreeSet::from([entity.as_str(), parent]),
+            slots: BTreeSet::from([(parent.to_owned(), name_key(name)?)]),
+        };
+        if current.entries.contains_key(entity)
+            || !current.pending.is_empty()
+            || self.successor_conflict_gate(&event.branch.id, current, &touched)?
+        {
+            return Ok(None);
+        }
         if parent != ROOT
             && !current
                 .entries
@@ -1804,9 +1846,27 @@ impl Store {
             return Ok(None);
         };
         let current = &view.projection;
+        let mut touched = Touched::default();
+        for change in &event.changes {
+            let Some(entry) = current.entries.get(&change.entity) else {
+                return Ok(None);
+            };
+            touched.ids.insert(&change.entity);
+            touched.ids.insert(&entry.parent);
+            touched
+                .slots
+                .insert((entry.parent.clone(), name_key(&entry.name)?));
+            if change.field == "location" {
+                let parent = change.value["parent"]
+                    .as_str()
+                    .context("INVALID_LOCATION")?;
+                let name = change.value["name"].as_str().context("INVALID_LOCATION")?;
+                touched.ids.insert(parent);
+                touched.slots.insert((parent.to_owned(), name_key(name)?));
+            }
+        }
         if !current.pending.is_empty()
-            || !current.conflicts.is_empty()
-            || self.successor_conflict_gate(&event.branch.id)?
+            || self.successor_conflict_gate(&event.branch.id, current, &touched)?
         {
             return Ok(None);
         }
@@ -1910,6 +1970,44 @@ impl Store {
         }
         Ok(Some(delta))
     }
+}
+
+/// What a creation or namespace successor touches: the entities it changes
+/// and the parent directories they leave or enter (`ids`), and the
+/// `(parent, name key)` slots they leave or take.
+#[derive(Default)]
+struct Touched<'a> {
+    ids: BTreeSet<&'a str>,
+    slots: BTreeSet<(String, String)>,
+}
+
+/// Whether a conflict of `current` touches what a successor changes (module
+/// docs): the conflict names one of `touched.ids` (a pair `a,b` by either
+/// side), or one of its alternatives or bases is a location in one of them
+/// (as the parent) or in one of `touched.slots`.
+fn conflicts_touch(current: &Projection, touched: &Touched<'_>) -> bool {
+    current.conflicts.iter().any(|conflict| {
+        conflict
+            .entity
+            .split(',')
+            .any(|id| touched.ids.contains(id))
+            || conflict
+                .alternatives
+                .iter()
+                .chain(&conflict.bases)
+                .any(|version| {
+                    let Some(parent) = version.value.get("parent").and_then(Value::as_str) else {
+                        return false;
+                    };
+                    touched.ids.contains(parent)
+                        || version
+                            .value
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|name| name_key(name).ok())
+                            .is_some_and(|key| touched.slots.contains(&(parent.to_owned(), key)))
+                })
+    })
 }
 
 /// `project`'s `modified_ms` of `entity`: the latest `created_ms` among the
