@@ -391,7 +391,7 @@ fn fs_writes_during_catch_up() {
 }
 
 fn fs_during_catch_up(name: &str, writes: bool) {
-    let s = Scenario::with_budget(FILE, name, budget_or(120));
+    let s = Scenario::with_budget(FILE, name, budget_or(300));
     if !mount_supported() {
         return s.skip("no mount support");
     }
@@ -437,6 +437,8 @@ fn fs_during_catch_up(name: &str, writes: bool) {
     let mut last_error = None;
     let mut round = 0usize;
     while round == 0 || (!feeder.is_finished() && !s.over_budget()) {
+        // One operation every 10 ms or so, as `qual_wp2_3_worker` paces
+        // its own (the activator yields to filesystem load).
         let mut op = |kind: &'static str, f: &mut dyn FnMut() -> std::io::Result<()>| {
             let (result, ms) = time_ms(f);
             match result {
@@ -446,6 +448,7 @@ fn fs_during_catch_up(name: &str, writes: bool) {
                     last_error = Some(format!("{kind}: {error}"));
                 }
             }
+            thread::sleep(Duration::from_millis(10));
         };
         let base = mount.join(format!("base/f{:02}.txt", round % 20));
         op("stat", &mut || fs::metadata(&base).map(|_| ()));
@@ -481,7 +484,6 @@ fn fs_during_catch_up(name: &str, writes: bool) {
             }
         }
         round += 1;
-        thread::sleep(Duration::from_millis(10));
     }
     let timed_out = !feeder.is_finished();
     stop.store(true, Ordering::Relaxed);

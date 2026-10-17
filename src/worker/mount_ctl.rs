@@ -725,13 +725,20 @@ pub mod adapter {
     /// short-lived handles.
     pub const QUIET_WAIT: Duration = Duration::from_secs(1);
 
+    /// How long a graceful detach waits for the saves of files closed
+    /// through the mount (`Engine::settling`, WP5.2) while nothing else keeps
+    /// the engine from being quiet: they usually take milliseconds; a save of
+    /// several GiB takes seconds.
+    pub const SETTLE_WAIT: Duration = Duration::from_secs(8);
+
     /// Step 1 of a detach: fences new opens. A graceful detach first requires
     /// quiet, waiting up to [`QUIET_WAIT`]: no dirty session and no handle the
     /// application still holds (a cleaned-up WinFsp handle only awaits its
-    /// `Close`, accepts no writes and holds no unsaved bytes). Not quiet:
+    /// `Close`, accepts no writes and holds no unsaved bytes); up to
+    /// [`SETTLE_WAIT`] when only saves of closed files remain. Not quiet:
     /// `BUSY_VIEW`, unfenced.
     pub fn fence(engine: &Shared, force: bool) -> Result<()> {
-        let deadline = Instant::now() + QUIET_WAIT;
+        let started = Instant::now();
         loop {
             {
                 let mut e = lock_engine(engine);
@@ -742,8 +749,12 @@ pub mod adapter {
                     set_fenced(true);
                     return Ok(());
                 }
+                // Files closed through the mount and being saved are waited
+                // for longer (`Engine::settling`, WP5.2).
+                let settling = open == 0 && dirty == e.settling();
+                let wait = if settling { SETTLE_WAIT } else { QUIET_WAIT };
                 ensure!(
-                    Instant::now() < deadline,
+                    started.elapsed() < wait,
                     "BUSY_VIEW: {open} open contexts, {dirty} unsaved files"
                 );
             }

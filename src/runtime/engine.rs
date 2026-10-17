@@ -115,6 +115,10 @@ pub struct Session {
     /// [`Engine::finish_save`]): no second save starts, and while the bytes
     /// are a staging file nothing writes them ([`Engine::write_blocked`]).
     pub saving: bool,
+    /// A background saver has the save of this session queued
+    /// ([`save_handle_in_background`]); cleared when a save of it begins or
+    /// ends.
+    pub queued: bool,
 }
 pub struct Handle {
     pub entity: String,
@@ -879,6 +883,7 @@ impl Engine {
                 references: 0,
                 edits: 0,
                 saving: false,
+                queued: false,
             },
         );
         Ok(())
@@ -1242,7 +1247,9 @@ impl Engine {
             root: self.store.root.clone(),
             notes: self.notes.clone(),
         };
-        self.sessions.get_mut(entity).unwrap().saving = true;
+        let session = self.sessions.get_mut(entity).unwrap();
+        session.saving = true;
+        session.queued = false;
         Ok(SaveStart::Started(job))
     }
     /// Phase 3 of a save, under the engine lock: commits the object phase 2
@@ -1260,6 +1267,7 @@ impl Engine {
         let entity = job.entity.as_str();
         if let Some(session) = self.sessions.get_mut(entity) {
             session.saving = false;
+            session.queued = false;
             if !session.dirty && session.references == 0 {
                 // Closed while it was saved: nothing keeps it now.
                 self.sessions.remove(entity);
@@ -1444,6 +1452,9 @@ impl Engine {
             if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade)
                 && schedule(&shared, entity.clone())
             {
+                if let Some(session) = self.sessions.get_mut(&entity) {
+                    session.queued = true;
+                }
                 continue;
             }
             match self.flush_entity(&entity) {
@@ -1545,6 +1556,13 @@ impl Engine {
     /// unsaved bytes were lost. A restored record is a dirty session, which
     /// `quiet()` refuses already; records of other branches do not block.
     pub fn checkout_allowed(&self) -> Result<()> {
+        // Files closed through the mount and still being saved pass `quiet`
+        // (WP5.2); a checkout waits for them.
+        let unsaved = self.sessions.values().filter(|s| s.dirty).count();
+        ensure!(
+            unsaved == 0,
+            "BUSY_VIEW: {unsaved} unsaved files are being saved; the checkout waits for them"
+        );
         let blocking: Vec<String> = self
             .pending_records()?
             .into_iter()
@@ -1654,6 +1672,7 @@ impl Engine {
                     preserve_times: 0,
                     edits: 0,
                     saving: false,
+                    queued: false,
                 },
             );
         }
@@ -1908,9 +1927,20 @@ impl Engine {
     /// A `pending_saves` record that could not be restored does not count
     /// (module docs): its row stays and is retried; only a checkout waits for
     /// it ([`Engine::checkout_allowed`]).
+    ///
+    /// While mounted, files closed through the mount whose saves the
+    /// background savers run or have queued ([`Engine::settling`]) do not
+    /// count either (WP5.2): a graceful stop or detach waits for them in the
+    /// adapter's fence (`worker::mount_ctl::adapter::fence`), a force stop or
+    /// a poison exit retains them, and a checkout refuses them
+    /// ([`Engine::checkout_allowed`]). Without this a stop right after a
+    /// copy into the mount was refused as blocked by open files.
     pub fn quiet(&self) -> Result<()> {
         let open = self.handles.len();
-        let dirty = self.sessions.values().filter(|s| s.dirty).count();
+        let mut dirty = self.sessions.values().filter(|s| s.dirty).count();
+        if self.mounted {
+            dirty -= self.settling();
+        }
         if open == 0 && dirty == 0 {
             if let Some(health) = &self.health {
                 bail!("BUSY_VIEW: {health}");
@@ -1921,6 +1951,18 @@ impl Engine {
             "BUSY_VIEW: {open} open contexts, {dirty} unsaved files; {}",
             self.health.as_deref().unwrap_or("healthy")
         )
+    }
+    /// Dirty sessions no handle holds whose save a background saver runs or
+    /// has queued: files closed through the mount, being saved.
+    pub fn settling(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|(entity, s)| {
+                s.dirty
+                    && (s.saving || s.queued)
+                    && !self.handles.values().any(|h| &h.entity == *entity)
+            })
+            .count()
     }
     pub fn receive_peer(
         &mut self,
@@ -2580,20 +2622,28 @@ fn yield_to_foreground() {
 /// pending-save backoff.
 pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
     let entity = {
-        let e = super::lock_engine(engine);
-        match e.handles.get(&h) {
-            Some(handle)
-                if e.sessions
-                    .get(&handle.entity)
-                    .is_some_and(|s| s.dirty && !s.saving) =>
-            {
-                handle.entity.clone()
-            }
+        let mut e = super::lock_engine(engine);
+        let Some(entity) = e.handles.get(&h).map(|handle| handle.entity.clone()) else {
+            return Ok(());
+        };
+        match e.sessions.get_mut(&entity) {
+            Some(session) if session.dirty && !session.saving => session.queued = true,
             _ => return Ok(()),
         }
+        entity
     };
-    schedule(engine, entity);
+    queue(engine, entity);
     Ok(())
+}
+
+/// [`schedule`]s the save of `entity`, marked `queued` by the caller; a full
+/// queue clears the mark (the savers' sweep picks the file up).
+fn queue(engine: &Shared, entity: String) {
+    if !schedule(engine, entity.clone())
+        && let Some(session) = super::lock_engine(engine).sessions.get_mut(&entity)
+    {
+        session.queued = false;
+    }
 }
 
 /// A dirty session no save covers and the application no longer writes:
@@ -2699,10 +2749,16 @@ pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
             })
             .map(|(handle, _)| handle.entity.clone());
         e.release_handle(h)?;
+        if let Some(session) = unsaved
+            .as_ref()
+            .and_then(|entity| e.sessions.get_mut(entity))
+        {
+            session.queued = true;
+        }
         unsaved
     };
     if let Some(entity) = unsaved {
-        schedule(engine, entity);
+        queue(engine, entity);
     }
     Ok(())
 }

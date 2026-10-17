@@ -984,3 +984,55 @@ fn a_mounted_read_waits_for_a_download_and_returns_its_bytes() {
         .collect();
     assert!(unrelated.contains(std::ffi::OsStr::new("downloading.bin")));
 }
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn a_graceful_detach_right_after_writes_waits_for_their_saves() {
+    let _serial = serial();
+    let Some(m) = mounted::Mounted::new() else {
+        return;
+    };
+    use tkfs::model::health::{MountControl, MountState};
+    let mut written = BTreeMap::new();
+    for i in 0..40u64 {
+        let relative = format!("w{i:02}.bin");
+        let data = bytes(5000 + i, 4096 + i as usize * 1000);
+        fs::write(m.mount.join(&relative), &data).unwrap();
+        written.insert(relative, data);
+    }
+    // At once: files closed through the mount and being saved do not make
+    // the engine busy for a stop, but a checkout waits for them.
+    {
+        let e = lock(&m.engine);
+        if e.settling() > 0 {
+            assert!(
+                format!("{:#}", e.checkout_allowed().unwrap_err()).contains("BUSY_VIEW"),
+                "a checkout waits for the saves"
+            );
+        }
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || lock(&m.engine)
+            .handles
+            .is_empty()),
+        "the kernel closed every handle"
+    );
+    assert!(
+        lock(&m.engine).quiet().is_ok(),
+        "settling saves keep it quiet"
+    );
+    // The graceful detach waits for the saves instead of refusing.
+    let status = m.controller.detach(false).unwrap();
+    assert_eq!(status.state, MountState::Detached);
+    let e = lock(&m.engine);
+    assert!(
+        e.sessions.values().all(|s| !s.dirty),
+        "nothing left unsaved"
+    );
+    for (relative, data) in &written {
+        assert_eq!(&content(&e, relative), data, "{relative}");
+    }
+    assert!(pending_rows(&e).is_empty());
+    assert!(e.checkout_allowed().is_ok());
+    no_conflicts(&e);
+}
