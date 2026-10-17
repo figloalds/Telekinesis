@@ -295,10 +295,11 @@ fallbacks ever dominate (they are counted per reason,
 
 A slow ticket is still prepared on a pooled read store and committed under
 the lock, and a ticket whose branch moved is still `Stale` and re-queued.
-What changed is the price: the read store keeps its event cache, view and
-branch index across tickets (they are extended, not reloaded), so a
-preparation costs the event's cones, and a stale one is re-prepared for
-milliseconds, not minutes. Batching several tickets into one preparation, or
+What changed is the price: the read store keeps its event cache and branch
+index across tickets (both are extended from the journal, not reloaded; its
+view is reloaded when the engine's commits changed the stored projection),
+so a preparation costs the event's cones plus that reload, and a stale one
+is re-prepared in milliseconds, not minutes. Batching several tickets into one preparation, or
 rebasing a prepared result over unrelated commits, would save that
 re-preparation only; neither was built (the scenarios' stale counts and
 backlogs are in `wp5-1.md`).
