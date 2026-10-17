@@ -447,33 +447,6 @@ pub fn thread_derive_counters() -> DeriveCounters {
     THREAD_COUNTERS.with(Cell::get)
 }
 
-thread_local! {
-    static PHASES: RefCell<BTreeMap<&'static str, (u64, u64)>> = const { RefCell::new(BTreeMap::new()) };
-}
-/// Time `f` as phase `name` on the calling thread (profiling).
-#[doc(hidden)]
-pub fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
-    let started = std::time::Instant::now();
-    let value = f();
-    record_phase(name, started.elapsed().as_micros() as u64);
-    value
-}
-/// Add `micros` to phase `name` (profiling).
-#[doc(hidden)]
-pub fn record_phase(name: &'static str, micros: u64) {
-    PHASES.with(|cell| {
-        let mut map = cell.borrow_mut();
-        let entry = map.entry(name).or_default();
-        entry.0 += 1;
-        entry.1 += micros;
-    });
-}
-/// The calling thread's phase timings: name -> (calls, micros).
-#[doc(hidden)]
-pub fn thread_phase_micros() -> BTreeMap<&'static str, (u64, u64)> {
-    PHASES.with(|cell| cell.borrow().clone())
-}
-
 /// Why the calling thread's most recent append attempt derived in full.
 #[doc(hidden)]
 pub fn thread_last_fallback() -> Option<&'static str> {
@@ -855,7 +828,7 @@ fn derive_full_with(input: &DeriveInput, new_event: Option<&str>) -> Result<Vec<
     if new_event.is_some() {
         conflicts.extend(input.reviewed.iter().cloned());
     }
-    let base = timed("f.base", || NsBase::build(events));
+    let base = NsBase::build(events);
     let ns = NsContext::new(branch, events, &base);
     let pending: HashSet<&str> = p.pending.iter().map(String::as_str).collect();
     let activated: Vec<bool> = events
@@ -865,24 +838,20 @@ fn derive_full_with(input: &DeriveInput, new_event: Option<&str>) -> Result<Vec<
     // Namespace collisions also have a deterministic historical basis. A later
     // rename arriving first must not erase evidence of concurrent same-name
     // placement. Sequential temp replacement is ordered by event context.
-    conflicts.extend(timed("f.location_pairs", || {
-        full_location_pairs(&ns, &activated)
-    })?);
+    conflicts.extend(full_location_pairs(&ns, &activated)?);
     // Explicit reviews carry their observed cut. Recover namespace records from
     // it even when resolution was delivered before its prerequisites.
     for (i, e) in events.iter().enumerate() {
         if activated[i] && !e.reviewed.is_empty() {
-            conflicts.extend(timed("f.reviewed_cut", || ns.reviewed_cut(i))?);
+            conflicts.extend(ns.reviewed_cut(i)?);
         }
     }
     // Every namespace causal cut is represented by an antichain of maximal
     // namespace-changing events. Include arbitrary-width concurrency, not just
     // pairs; content-only events add no new namespace projection. The explicit
     // budget refuses a commit before acknowledgement rather than losing history.
-    conflicts.extend(timed("f.ns", || ns.full())?);
-    conflicts.extend(timed("f.register_pairs", || {
-        register_pairs(branch, p, events, new_event)
-    }));
+    conflicts.extend(ns.full()?);
+    conflicts.extend(register_pairs(branch, p, events, new_event));
     Ok(conflicts)
 }
 
@@ -1623,44 +1592,37 @@ fn derive_append_scan(input: &DeriveInput, new: usize) -> Result<Plan> {
         events,
         ..
     } = *input;
-    if let Some(reason) = timed("a.guard", || append_guard(p, events, new)) {
+    if let Some(reason) = append_guard(p, events, new) {
         return Ok(Plan::Fallback(reason));
     }
     let e = &events[new];
-    let index = timed("a.index", || BranchIndex::build_marked(events, Some(new)));
+    let index = BranchIndex::build_marked(events, Some(new));
     let ns = NsContext::new(branch, events, &index.ns);
     if ns.irregular {
         // Only crafted journals (see `NsBase::irregular`): the reference decides.
         return Ok(Plan::Fallback("an irregular history"));
     }
-    let locations = timed("a.locations", || Locations::new(events));
+    let locations = Locations::new(events);
     // Same source order as full mode, so a refusal surfaces with the same error.
     let (mut conflicts, skipped) = projection_sources(input);
     conflicts.extend(input.reviewed.iter().cloned());
-    conflicts.extend(timed("a.location_pairs", || {
-        location_pairs_with(&ns, &locations, new)
-    })?);
+    conflicts.extend(location_pairs_with(&ns, &locations, new)?);
     if !e.reviewed.is_empty() {
-        conflicts.extend(timed("a.reviewed_cut", || ns.reviewed_cut(new))?);
+        conflicts.extend(ns.reviewed_cut(new)?);
     }
     // Full mode's cone analysis reads every name next.
     locations.first_error()?;
     let graph = ConeGraph::new(&index);
-    let plan = match timed("a.plan", || ns.append_plan(new, &graph))? {
+    let plan = match ns.append_plan(new, &graph)? {
         Ok(plan) => plan,
         Err(reason) => return Ok(Plan::Fallback(reason)),
     };
-    let restricted = !plan.cones.is_empty()
-        && timed("a.cannot_fail", || projection_cannot_fail(&ns, &locations));
+    let restricted = !plan.cones.is_empty() && projection_cannot_fail(&ns, &locations);
     if restricted {
         count(Count::Restricted);
     }
-    conflicts.extend(timed("a.derive_planned", || {
-        ns.derive_planned(&plan, restricted)
-    })?);
-    conflicts.extend(timed("a.register_pairs", || {
-        register_pairs(branch, p, events, Some(&e.id))
-    }));
+    conflicts.extend(ns.derive_planned(&plan, restricted)?);
+    conflicts.extend(register_pairs(branch, p, events, Some(&e.id)));
     Ok(survive(&ns, new, &plan, conflicts, &skipped))
 }
 
@@ -1744,7 +1706,7 @@ fn derive_append_indexed(
     }
     let checks = checks_projections();
     let before = if checks { cell.borrow().clone() } else { None };
-    let undo = timed("a.push", || cell.borrow_mut().as_mut()?.push(events))?;
+    let undo = cell.borrow_mut().as_mut()?.push(events)?;
     let pushed = Pushed {
         cell,
         events,
@@ -1807,14 +1769,12 @@ fn derive_append_core(input: &DeriveInput, new: usize, index: &BranchIndex) -> R
     }
     let (mut conflicts, skipped) = projection_sources(input);
     conflicts.extend(input.reviewed.iter().cloned());
-    conflicts.extend(timed("a.location_pairs", || {
-        location_pairs_indexed(&ns, index, new)
-    }));
+    conflicts.extend(location_pairs_indexed(&ns, index, new));
     if !e.reviewed.is_empty() {
-        conflicts.extend(timed("a.reviewed_cut", || ns.reviewed_cut(new))?);
+        conflicts.extend(ns.reviewed_cut(new)?);
     }
     let graph = ConeGraph::new(index);
-    let plan = match timed("a.plan", || ns.append_plan(new, &graph))? {
+    let plan = match ns.append_plan(new, &graph)? {
         Ok(plan) => plan,
         Err(reason) => return Ok(Plan::Fallback(reason)),
     };
@@ -1822,12 +1782,8 @@ fn derive_append_core(input: &DeriveInput, new: usize, index: &BranchIndex) -> R
     if restricted {
         count(Count::Restricted);
     }
-    conflicts.extend(timed("a.derive_planned", || {
-        ns.derive_planned(&plan, restricted)
-    })?);
-    conflicts.extend(timed("a.register_pairs", || {
-        register_pairs_indexed(branch, &ns, new)
-    }));
+    conflicts.extend(ns.derive_planned(&plan, restricted)?);
+    conflicts.extend(register_pairs_indexed(branch, &ns, new));
     Ok(survive(&ns, new, &plan, conflicts, &skipped))
 }
 
@@ -1864,9 +1820,7 @@ fn survive(
         derived.extend(skipped.iter().copied());
         // Nothing above can fail on accepted history; a failure here is left
         // to full mode, which raises or derives whatever the reference does.
-        timed("a.survive", || {
-            ns.current_records_survive(new, plan, &derived)
-        })
+        ns.current_records_survive(new, plan, &derived)
     };
     match survives {
         Ok(true) => Plan::Derived(conflicts),
@@ -2270,7 +2224,40 @@ fn successor_cones_are_small<'a>(events: &'a [Event], new: usize) -> bool {
 /// within the limit (`successor_cones_are_small`). A cone's count is
 /// memoized by its relevant events (CCR-WP4.INT-4), so a recount of a cone
 /// the event did not change costs a digest of its event ids.
-pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -> Result<()> {
+///
+/// WP5.1: with the branch's index (`index`, as for append mode), the cones
+/// come from the index with the event pushed onto it, and the bound is not
+/// evaluated (it scans every event; counting the touched cones decides the
+/// same); under the commit checks the scan runs too and must agree.
+pub(super) fn check_successor_cuts(
+    branch: &str,
+    events: &[Event],
+    new: usize,
+    index: Option<&IndexCell>,
+) -> Result<()> {
+    if let Some(cell) = index
+        && let Some(result) = successor_cuts_indexed(branch, events, new, cell)
+    {
+        if checks_projections() {
+            let reference = successor_cuts_scan(branch, events, new);
+            let same = match (&result, &reference) {
+                (Ok(()), Ok(())) => true,
+                (Err(a), Err(b)) => format!("{a:#}") == format!("{b:#}"),
+                _ => false,
+            };
+            ensure!(
+                same,
+                "CONFLICT_MODE_MISMATCH: the indexed successor count of {} differs from the scan",
+                events[new].id
+            );
+        }
+        return result;
+    }
+    successor_cuts_scan(branch, events, new)
+}
+
+/// `check_successor_cuts` reading every event.
+fn successor_cuts_scan(branch: &str, events: &[Event], new: usize) -> Result<()> {
     if successor_cones_are_small(events, new) {
         return Ok(());
     }
@@ -2278,8 +2265,58 @@ pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -
     locations.first_error()?;
     let index = BranchIndex::build_marked(events, Some(new));
     let ns = NsContext::new(branch, events, &index.ns);
-    let graph = ConeGraph::new(&index);
-    let touched = touched_entities(&ns, new);
+    count_touched_cones(&ns, &ConeGraph::new(&index), new)
+}
+
+/// `check_successor_cuts` through the branch's index (which must index every
+/// event but the new one, the last); `None` when it does not cover the
+/// history (a location value that is not a pair of strings, a name without a
+/// key: `Locations::first_error` decides), and the scan counts.
+fn successor_cuts_indexed(
+    branch: &str,
+    events: &[Event],
+    new: usize,
+    cell: &IndexCell,
+) -> Option<Result<()>> {
+    {
+        let index = cell.try_borrow().ok()?;
+        let index = index.as_ref()?;
+        if new + 1 != events.len()
+            || index.len() != new
+            || index.facts.malformed > 0
+            || index.facts.key_errors > 0
+        {
+            return None;
+        }
+    }
+    for c in events[new].changes.iter().filter(|c| c.field == "location") {
+        let (Some(_), Some(name)) = (c.value["parent"].as_str(), c.value["name"].as_str()) else {
+            return None;
+        };
+        if slot_key(name).is_err() {
+            return None;
+        }
+    }
+    let undo = cell.borrow_mut().as_mut()?.push(events)?;
+    let pushed = Pushed {
+        cell,
+        events,
+        undo: Some(undo),
+    };
+    let result = {
+        let index = cell.borrow();
+        let index = index.as_ref().expect("the pushed index");
+        let ns = NsContext::new(branch, events, &index.ns);
+        count_touched_cones(&ns, &ConeGraph::new(index), new)
+    };
+    drop(pushed);
+    Some(result)
+}
+
+/// Counts the competing cuts of every cone (with event `new`) that contains
+/// an entity the event touches (`check_successor_cuts`).
+fn count_touched_cones(ns: &NsContext, graph: &ConeGraph, new: usize) -> Result<()> {
+    let touched = touched_entities(ns, new);
     let mut memo = ConeMemo::default();
     let cones: BTreeSet<Rc<[u32]>> = graph
         .reaching(&touched)
@@ -2292,6 +2329,15 @@ pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -
         ns.count_cuts(&relevant)?;
     }
     Ok(())
+}
+
+/// Builds `cell`'s index of `events` when it has none (the first commit of
+/// a cache entry that needs it).
+pub(crate) fn ensure_index(cell: &IndexCell, events: &[Event]) {
+    if cell.borrow().is_none() {
+        let built = BranchIndex::build(events);
+        *cell.borrow_mut() = Some(built);
+    }
 }
 
 /// The location pairs that include the new event's location change, in the
@@ -4421,13 +4467,12 @@ impl<'a> NsContext<'a> {
             }
             if let Some(relations) = &relations {
                 let cut = cut_over(relations, &events);
-                for c in timed("e.records", || {
-                    self.namespace_records(members, relations, &cut)
-                })? {
+                for c in self.namespace_records(members, relations, &cut)? {
                     out.insert(c.id.clone(), c);
                 }
             } else {
-                for c in timed("e.cut", || self.cut_conflicts(&events))?
+                for c in self
+                    .cut_conflicts(&events)?
                     .iter()
                     .filter(|c| c.entity.split(',').any(|e| member_names.contains(e)))
                 {
@@ -4472,14 +4517,12 @@ impl<'a> NsContext<'a> {
         let restricted = !self.memo.borrow().unrestricted
             && !self.irregular
             && locations.first_error().is_ok()
-            && timed("f.cannot_fail", || projection_cannot_fail(self, &locations));
+            && projection_cannot_fail(self, &locations);
         let mut conflicts = BTreeMap::new();
-        for members in timed("f.cones", || cones.members()) {
+        for members in cones.members() {
             crate::startup::progress("rebuilding namespace history");
-            let relevant = timed("f.relevant", || self.relevant(&members, None));
-            timed("f.cone_conflicts", || {
-                self.cone_conflicts(&members, &relevant, None, restricted, &mut conflicts)
-            })?;
+            let relevant = self.relevant(&members, None);
+            self.cone_conflicts(&members, &relevant, None, restricted, &mut conflicts)?;
         }
         Ok(conflicts
             .into_values()
@@ -4513,8 +4556,8 @@ impl<'a> NsContext<'a> {
         graph: &ConeGraph,
     ) -> Result<std::result::Result<AppendPlan, &'static str>> {
         let touched: Vec<u32> = touched_entities(self, new);
-        let reaching = timed("p.reaching", || graph.reaching(&touched));
-        let (after, before) = timed("p.cones", || {
+        let reaching = graph.reaching(&touched);
+        let (after, before) = {
             let mut after_cones = ConeMemo::default();
             let mut before_cones = ConeMemo::default();
             let after: BTreeMap<u32, Rc<[u32]>> = reaching
@@ -4527,12 +4570,11 @@ impl<'a> NsContext<'a> {
                 .map(|&entity| (entity, graph.cone_memo(&mut before_cones, entity, true)))
                 .collect();
             (after, before)
-        });
+        };
         let after_set: BTreeSet<&Rc<[u32]>> = after.values().collect();
         let before_set: BTreeSet<&Rc<[u32]>> = before.values().collect();
-        let relevant_now = |members: &[u32]| timed("p.relevant", || self.relevant(members, None));
-        let relevant_then =
-            |members: &[u32]| timed("p.relevant", || self.relevant(members, Some(new)));
+        let relevant_now = |members: &[u32]| self.relevant(members, None);
+        let relevant_then = |members: &[u32]| self.relevant(members, Some(new));
         // Sorted-slice subset test.
         let subset =
             |small: &[usize], large: &[usize]| small.iter().all(|i| large.binary_search(i).is_ok());
@@ -5120,7 +5162,6 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
             return project_refs_reference(branch, events);
         }
     }
-    let t0 = std::time::Instant::now();
     for e in events {
         for c in &e.changes {
             for parent in &c.parents {
@@ -5136,8 +5177,6 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
             }
         }
     }
-    record_phase("pr.parent_check", t0.elapsed().as_micros() as u64);
-    let t0 = std::time::Instant::now();
     // Activation: an event is active once every parent (dependency or change
     // parent, present or not) is; a missing parent keeps it pending.
     let n = events.len();
@@ -5182,8 +5221,6 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
     if !pending.is_empty() {
         ensure!(has_missing, "CAUSAL_CYCLE");
     }
-    record_phase("pr.activation", t0.elapsed().as_micros() as u64);
-    let t0 = std::time::Instant::now();
     let mut registers: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::default();
     for (i, e) in events.iter().enumerate().filter(|(i, _)| active[*i]) {
         for c in &e.changes {
@@ -5212,8 +5249,6 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
             value: c.value.clone(),
         }
     };
-    record_phase("pr.registers", t0.elapsed().as_micros() as u64);
-    let t0 = std::time::Instant::now();
     for (key, (entity, field)) in keys {
         crate::startup::progress("projecting registers");
         let versions = &registers[&(entity, field)];
@@ -5319,8 +5354,7 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
                 .insert(key, heads.iter().map(|&v| version(v)).collect());
         }
     }
-    record_phase("pr.heads", t0.elapsed().as_micros() as u64);
-    timed("pr.namespace", || namespace_pass(branch, &mut p))?;
+    namespace_pass(branch, &mut p)?;
     Ok(p)
 }
 
@@ -5601,8 +5635,7 @@ pub(super) fn project_append(
         }
         p.entries.insert(entity.into(), entry);
     }
-    let (changed, mut removed_ns, mut added) =
-        timed("pa.delta", || namespace_delta(branch, &mut p, &old))?;
+    let (changed, mut removed_ns, mut added) = namespace_delta(branch, &mut p, &old)?;
     removed.append(&mut removed_ns);
     added.extend(added_registers);
     p.conflicts.sort_by(|a, b| a.id.cmp(&b.id));
@@ -6318,7 +6351,6 @@ mod tests {
             // Each change's slot name key is computed once, in the order the pairwise
             // comparison first needs it (so a failure surfaces at the same pair).
             let mut keys: Vec<Option<String>> = vec![None; locations.len()];
-            let pairs_started = std::time::Instant::now();
             for (i, &(a, ac)) in locations.iter().enumerate() {
                 crate::startup::progress("rebuilding namespace conflicts");
                 for (j, &(b, bc)) in locations.iter().enumerate().skip(i + 1) {
@@ -6339,25 +6371,19 @@ mod tests {
                     }
                 }
             }
-            record_phase(
-                "f.location_pairs",
-                pairs_started.elapsed().as_micros() as u64,
-            );
             // Explicit reviews carry their observed cut. Recover namespace records from
             // it even when resolution was delivered before its prerequisites.
             for e in &activated {
                 if !e.reviewed.is_empty() {
-                    conflicts.extend(timed("f.reviewed_cut", || reviewed_cut(branch, events, e))?);
+                    conflicts.extend(reviewed_cut(branch, events, e)?);
                 }
             }
             // Every namespace causal cut is represented by an antichain of maximal
             // namespace-changing events. Include arbitrary-width concurrency, not just
             // pairs; content-only events add no new namespace projection. The explicit
             // budget refuses a commit before acknowledgement rather than losing history.
-            conflicts.extend(timed("f.ns", || NsContext::new(branch, events).full())?);
-            conflicts.extend(timed("f.register_pairs", || {
-                register_pairs(branch, p, events, new_event)
-            }));
+            conflicts.extend(NsContext::new(branch, events).full()?);
+            conflicts.extend(register_pairs(branch, p, events, new_event));
             Ok(conflicts)
         }
 
@@ -6897,45 +6923,35 @@ mod tests {
             let (Some(new), None) = (positions.next(), positions.next()) else {
                 return Ok(Plan::Fallback("new event not exactly once in the branch"));
             };
-            if let Some(reason) = timed("a.guard", || append_guard(p, events, new)) {
+            if let Some(reason) = append_guard(p, events, new) {
                 return Ok(Plan::Fallback(reason));
             }
             let e = &events[new];
-            let locations = timed("a.locations", || Locations::new(events));
+            let locations = Locations::new(events);
             // Same source order as full mode, so a refusal surfaces with the same error.
-            let mut conflicts = timed("a.pconflicts", || p.conflicts.clone());
+            let mut conflicts = p.conflicts.clone();
             conflicts.extend(input.reviewed.iter().cloned());
-            conflicts.extend(timed("a.location_pairs", || {
-                location_pairs_with(branch, events, &locations, new)
-            })?);
+            conflicts.extend(location_pairs_with(branch, events, &locations, new)?);
             if !e.reviewed.is_empty() {
-                conflicts.extend(timed("a.reviewed_cut", || reviewed_cut(branch, events, e))?);
+                conflicts.extend(reviewed_cut(branch, events, e)?);
             }
             // Full mode's cone analysis reads every name next.
             locations.first_error()?;
-            let ns = timed("a.nscontext", || NsContext::new(branch, events));
-            let plan = match timed("a.plan", || ns.append_plan(new, &locations))? {
+            let ns = NsContext::new(branch, events);
+            let plan = match ns.append_plan(new, &locations)? {
                 Ok(plan) => plan,
                 Err(reason) => return Ok(Plan::Fallback(reason)),
             };
-            let restricted = !plan.cones.is_empty()
-                && timed("a.cannot_fail", || {
-                    projection_cannot_fail(events, &locations, &ns.alive)
-                });
+            let restricted =
+                !plan.cones.is_empty() && projection_cannot_fail(events, &locations, &ns.alive);
             if restricted {
                 count(Count::Restricted);
             }
-            conflicts.extend(timed("a.derive_planned", || {
-                ns.derive_planned(&plan, restricted)
-            })?);
-            conflicts.extend(timed("a.register_pairs", || {
-                register_pairs(branch, p, events, Some(new_id))
-            }));
+            conflicts.extend(ns.derive_planned(&plan, restricted)?);
+            conflicts.extend(register_pairs(branch, p, events, Some(new_id)));
             // Nothing above can fail on accepted history; a failure here is left to
             // full mode, which raises or derives whatever the reference does.
-            match timed("a.survive", || {
-                ns.current_records_survive(new, &plan, &conflicts)
-            }) {
+            match ns.current_records_survive(new, &plan, &conflicts) {
                 Ok(true) => Ok(Plan::Derived(conflicts)),
                 Ok(false) => Ok(Plan::Fallback(
                     "a current namespace record is not derived from history",
@@ -8004,9 +8020,7 @@ mod tests {
                 restricted: bool,
                 out: &mut BTreeMap<String, Conflict>,
             ) -> Result<()> {
-                let ancestors: Vec<_> = timed("e.closures", || {
-                    relevant.iter().map(|&i| self.closure(i, false)).collect()
-                });
+                let ancestors: Vec<_> = relevant.iter().map(|&i| self.closure(i, false)).collect();
                 let mut antichains: Vec<Vec<usize>> = vec![vec![]];
                 let mut competing_cuts = 0;
                 for (i, &event) in relevant.iter().enumerate() {
@@ -8038,17 +8052,14 @@ mod tests {
                                     cut.union_with(&ancestors[j]);
                                     cut.insert(relevant[j]);
                                 }
-                                for c in
-                                    timed("e.records", || self.namespace_records(members, &cut))?
-                                {
+                                for c in self.namespace_records(members, &cut)? {
                                     out.insert(c.id.clone(), c);
                                 }
                             } else {
-                                for c in timed("e.cut", || {
-                                    self.cut_conflicts(&selected, relevant, &ancestors)
-                                })?
-                                .iter()
-                                .filter(|c| c.entity.split(',').any(|e| members.contains(e)))
+                                for c in self
+                                    .cut_conflicts(&selected, relevant, &ancestors)?
+                                    .iter()
+                                    .filter(|c| c.entity.split(',').any(|e| members.contains(e)))
                                 {
                                     out.insert(c.id.clone(), c.clone());
                                 }
@@ -8095,13 +8106,11 @@ mod tests {
             pub(super) fn full(&self) -> Result<Vec<Conflict>> {
                 let cones = NamespaceCones::new(self.events)?;
                 let mut conflicts = BTreeMap::new();
-                for members in timed("f.cones", || cones.members()) {
+                for members in cones.members() {
                     crate::startup::progress("rebuilding namespace history");
                     let members: BTreeSet<&str> = members.iter().map(String::as_str).collect();
-                    let relevant = timed("f.relevant", || self.relevant(&members, None));
-                    timed("f.cone_conflicts", || {
-                        self.cone_conflicts(&members, &relevant, None, false, &mut conflicts)
-                    })?;
+                    let relevant = self.relevant(&members, None);
+                    self.cone_conflicts(&members, &relevant, None, false, &mut conflicts)?;
                 }
                 Ok(conflicts.into_values().collect())
             }
@@ -8123,27 +8132,23 @@ mod tests {
                 new: usize,
                 locations: &'a Locations<'a>,
             ) -> Result<std::result::Result<AppendPlan<'a>, &'static str>> {
-                let graph = timed("p.graph", || ConeGraph::new(self.events, locations, new));
+                let graph = ConeGraph::new(self.events, locations, new);
                 let touched: BTreeSet<&str> = self.events[new]
                     .changes
                     .iter()
                     .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
                     .map(|c| c.entity.as_str())
                     .collect();
-                let reaching = timed("p.reaching", || graph.reaching(&touched));
-                let after: BTreeMap<&str, BTreeSet<&str>> = timed("p.cones", || {
-                    reaching
-                        .iter()
-                        .map(|&entity| (entity, graph.cone(entity, false)))
-                        .collect()
-                });
-                let before: BTreeMap<&str, BTreeSet<&str>> = timed("p.cones", || {
-                    reaching
-                        .iter()
-                        .filter(|&&entity| graph.existed(entity))
-                        .map(|&entity| (entity, graph.cone(entity, true)))
-                        .collect()
-                });
+                let reaching = graph.reaching(&touched);
+                let after: BTreeMap<&str, BTreeSet<&str>> = reaching
+                    .iter()
+                    .map(|&entity| (entity, graph.cone(entity, false)))
+                    .collect();
+                let before: BTreeMap<&str, BTreeSet<&str>> = reaching
+                    .iter()
+                    .filter(|&&entity| graph.existed(entity))
+                    .map(|&entity| (entity, graph.cone(entity, true)))
+                    .collect();
                 let after_set: BTreeSet<&BTreeSet<&str>> = after.values().collect();
                 let before_set: BTreeSet<&BTreeSet<&str>> = before.values().collect();
                 let mut cache: BTreeMap<BTreeSet<&str>, Rc<Vec<usize>>> = BTreeMap::new();
@@ -8151,13 +8156,11 @@ mod tests {
                     if let Some(found) = cache.get(members) {
                         return found.clone();
                     }
-                    let found = Rc::new(timed("p.relevant", || self.relevant(members, None)));
+                    let found = Rc::new(self.relevant(members, None));
                     cache.insert(members.clone(), found.clone());
                     found
                 };
-                let relevant_then = |members: &BTreeSet<&str>| {
-                    timed("p.relevant", || self.relevant(members, Some(new)))
-                };
+                let relevant_then = |members: &BTreeSet<&str>| self.relevant(members, Some(new));
                 // Sorted-slice subset test.
                 let subset = |small: &[usize], large: &[usize]| {
                     small.iter().all(|i| large.binary_search(i).is_ok())
@@ -10130,12 +10133,31 @@ mod tests {
             let current = plan_text(&derive_append_with(&input, id));
             let reference = wave4_plan_text(&wave4::derive_append_with(&input, id));
             assert_eq!(current, reference, "{name} k {k}: append plan differs");
+            // Through a branch index of the events before (WP5.1).
+            let cell: IndexCell = RefCell::new(Some(BranchIndex::build(&new[..k])));
+            let indexed = plan_text(&derive_append_with(
+                &DeriveInput {
+                    index: Some(&cell),
+                    ..input
+                },
+                id,
+            ));
+            assert_eq!(
+                indexed, reference,
+                "{name} k {k}: indexed append plan differs"
+            );
             appended += usize::from(current.starts_with("derived"));
             fallbacks += usize::from(current.starts_with("fallback"));
-            let counted = check_successor_cuts(BRANCH, new, k).map_err(|e| format!("{e:#}"));
+            let counted = check_successor_cuts(BRANCH, new, k, None).map_err(|e| format!("{e:#}"));
             let reference =
                 wave4::check_successor_cuts(BRANCH, new, k).map_err(|e| format!("{e:#}"));
             assert_eq!(counted, reference, "{name} k {k}: successor count differs");
+            let counted =
+                check_successor_cuts(BRANCH, new, k, Some(&cell)).map_err(|e| format!("{e:#}"));
+            assert_eq!(
+                counted, reference,
+                "{name} k {k}: indexed successor count differs"
+            );
         }
         (appended, fallbacks)
     }
@@ -11342,7 +11364,7 @@ current {current:#?}"
                 let mut new = old.to_vec();
                 new.push(successor_shaped(old, &events[k]));
                 let full = NsContext::new(BRANCH, &new, &NsBase::build(&new)).full();
-                let check = check_successor_cuts(BRANCH, &new, k);
+                let check = check_successor_cuts(BRANCH, &new, k, None);
                 if successor_cones_are_small(&new, k) {
                     small += 1;
                     assert!(

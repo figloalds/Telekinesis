@@ -271,7 +271,6 @@ fn measure_deliveries(
     let start = thread_derive_counters();
     let indexed_before = thread_indexed_appends();
     let slow_before = b.commit_path_counters().slow;
-    let phases_before = tkfs::core::derive::thread_phase_micros();
     let loads_before = b.view_loads();
     s.measure_from_now();
     let mut cpu = vec![];
@@ -327,18 +326,6 @@ fn measure_deliveries(
         slow as usize * 2 >= cpu.len(),
         format!("{slow} of {} slow commits", cpu.len()),
     );
-    if std::env::var("TKFS_WP51_PHASES").is_ok() {
-        let mut phases: Vec<_> = tkfs::core::derive::thread_phase_micros()
-            .into_iter()
-            .map(|(k, (calls, micros))| {
-                let (c0, m0) = phases_before.get(k).copied().unwrap_or((0, 0));
-                (k, calls - c0, (micros - m0) / 1000)
-            })
-            .filter(|p| p.1 > 0)
-            .collect();
-        phases.sort_by_key(|p| std::cmp::Reverse(p.2));
-        eprintln!("PHASES {phases:?}");
-    }
     let (diff, oracle_ms) = time_ms(|| b.verify_derived_state().unwrap());
     s.metric("oracle_ms", oracle_ms, "ms");
     s.check(diff.is_empty(), format!("oracle empty: {diff:?}"));
@@ -790,13 +777,7 @@ mod heavy {
         let faults = env_u64("TKFS_WP51_FAULTS", 1) != 0;
         let mut s =
             Scenario::with_budget(FILE, name, duration + settle + Duration::from_secs(1800));
-        let config = || {
-            let config = NodeConfig::default().interval(200).connections(3);
-            match std::env::var("TKFS_DERIVE_PHASES") {
-                Ok(value) => config.env("TKFS_DERIVE_PHASES", &value),
-                Err(_) => config,
-            }
-        };
+        let config = || NodeConfig::default().interval(200).connections(3);
         let a = Node::start(config());
         let b = Node::start(config());
         let pa = a.create("Heavy", true);
@@ -988,16 +969,6 @@ mod heavy {
             ),
         );
         s.check(journals[0].1 == journals[1].1, "equal projections");
-        // Profiling aid: the workers' derivation phase dumps.
-        for (who, folder) in [("A", &pa), ("B", &pb)] {
-            for name in ["worker.log.3", "worker.log.2", "worker.log.1", "worker.log"] {
-                if let Ok(text) = std::fs::read_to_string(state_dir(folder).join(name)) {
-                    for line in text.lines().filter(|l| l.starts_with("DERIVE_PHASES")) {
-                        eprintln!("{who} {line}");
-                    }
-                }
-            }
-        }
         let edits: Vec<u64> = editors
             .iter()
             .map(|e| e.edits.load(Ordering::Relaxed))
