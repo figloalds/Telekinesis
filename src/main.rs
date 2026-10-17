@@ -156,6 +156,15 @@ enum Command {
     Delete {
         path: String,
     },
+    /// List the folder's pending saves (unsaved files kept for a retry), and
+    /// why one could not be restored.
+    PendingSaves,
+    /// Drop a pending save that cannot be restored (its staging file is gone
+    /// or unreadable). Its unsaved bytes are lost.
+    DiscardPendingSave {
+        /// The entity id `pending-saves` lists.
+        entity: String,
+    },
 }
 /// Shown after `tkfs manage --help`.
 const MANAGE_HELP: &str = "Folder arguments take the full state id, a unique prefix of it (the \
@@ -883,6 +892,10 @@ fn run() -> Result<()> {
             replace,
         } => json!({"op":"rename","path":path,"target":target,"replace":replace}),
         Command::Delete { path } => json!({"op":"delete","path":path}),
+        Command::PendingSaves => json!({"op":"pending-saves"}),
+        Command::DiscardPendingSave { entity } => {
+            json!({"op":"discard-pending-save","entity":entity})
+        }
         _ => unreachable!(),
     };
     if let Some(g) = args.generation {

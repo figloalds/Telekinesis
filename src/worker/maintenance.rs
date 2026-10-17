@@ -179,12 +179,14 @@ impl Maintenance {
 
     /// Retries due pending saves and publishes the observation, without
     /// waiting for the engine, and only when the vitals show work: a dirty
-    /// session (a save to retry) or, without filesystem notifications,
-    /// control notifications to drop. An idle worker's maintenance never
+    /// session (a save to retry), a pending save not yet restored (WP4.INT
+    /// re-review) or, without filesystem notifications, control
+    /// notifications to drop. An idle worker's maintenance never
     /// takes the engine (every other vital is refreshed by the engine guards
     /// themselves).
     fn pending_saves(&mut self, ctx: &WorkerCtx, now: Instant) {
         let work = self.vitals.unflushed_files() > 0
+            || self.vitals.unrecovered_saves() > 0
             || (!cfg!(windows) && self.vitals.control_notifications() > 0);
         if !work {
             return;

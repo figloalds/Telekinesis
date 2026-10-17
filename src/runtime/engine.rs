@@ -16,9 +16,23 @@
 //!   heartbeat need from the engine: handles, dirty sessions, health,
 //!   notification state, the last sync observations, and a store revision
 //!   that moves whenever the engine's connection changed the database.
+//!
+//! **Pending saves that cannot be restored (WP4.INT re-review).** Each
+//! `pending_saves` record is restored on its own: one whose staging file is
+//! missing or unreadable (an antivirus scanner holding it at startup), whose
+//! record does not parse or that belongs to another branch is kept, reported
+//! (`unrecovered`: the store is degraded with `RECOVERY_REQUIRED`, naming the
+//! entity) and retried with the pending-save backoff, while the others load.
+//! It no longer writes `Engine.health`, so it never gates `quiet()`, Stop,
+//! Shutdown or control requests (it used to, for good, with a misleading
+//! `BUSY_VIEW: 0 open contexts, 0 unsaved files`). The `pending-saves`
+//! control op lists the records, and `discard-pending-save{entity}` drops one
+//! that cannot be restored (README runbook). A later save of the same file
+//! supersedes such a record.
 use super::notify::{NotifyQueue, delta_notifications};
 use crate::core::{inbox::SliceBudget, *};
 use anyhow::{Context, Result, bail, ensure};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -84,6 +98,9 @@ pub struct Engine {
     pub notify_queue: Arc<NotifyQueue>,
     /// Per-entity backoff of [`Engine::retry_pending_due`].
     retry_state: BTreeMap<String, RetryState>,
+    /// `pending_saves` records not restored into a session, by entity (module
+    /// docs); retried by [`Engine::retry_pending_due`].
+    unrecovered: BTreeMap<String, Unrecovered>,
 }
 
 /// What one activation committed, for [`Engine::after_activation`].
@@ -114,6 +131,22 @@ pub struct SyncObservation {
 struct RetryState {
     failures: u32,
     next_at: Instant,
+}
+
+/// A `pending_saves` record that could not be restored into a session (see
+/// the module docs), retried with the pending-save backoff.
+#[derive(Debug, Clone)]
+struct Unrecovered {
+    error: String,
+    failures: u32,
+    next_at: Instant,
+}
+
+/// The delay before retry number `failures + 1` (1 s → 60 s).
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_BASE
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(6))
+        .min(RETRY_CAP)
 }
 /// Pending-save retry backoff (WP2.3 task 5).
 const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -163,6 +196,8 @@ pub struct EngineVitals {
     /// number of the latest one that finished as an activation pass.
     activator_cycles_begun: AtomicU64,
     activator_cycles_finished: AtomicU64,
+    /// `pending_saves` records not restored into a session (module docs).
+    unrecovered_saves: AtomicU32,
 }
 /// `(last_sync.at, last_sync.caught_up, peers, Σ peers.at, sync peers)`.
 type SyncFingerprint = (Option<u64>, bool, usize, u64, usize);
@@ -175,6 +210,11 @@ impl EngineVitals {
     }
     pub fn pending_saves(&self) -> u32 {
         self.pending_saves.load(Ordering::Relaxed)
+    }
+    /// `pending_saves` records not restored into a session (WP4.INT
+    /// re-review; the maintenance thread retries them).
+    pub fn unrecovered_saves(&self) -> u32 {
+        self.unrecovered_saves.load(Ordering::Relaxed)
     }
     pub fn mounted(&self) -> bool {
         self.mounted.load(Ordering::Relaxed)
@@ -348,6 +388,13 @@ impl Drop for ActivatorHold {
             .store(false, Ordering::Relaxed);
     }
 }
+/// Removes `STATE/staging/<name>` when `name` is a staging file's name (a
+/// uuid with `.stage`); anything else is left alone.
+fn remove_stage(root: &std::path::Path, name: &str) {
+    if name.ends_with(".stage") && uuid::Uuid::parse_str(name.trim_end_matches(".stage")).is_ok() {
+        let _ = std::fs::remove_file(root.join("staging").join(name));
+    }
+}
 fn count(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -390,6 +437,7 @@ impl Engine {
             background_activation: false,
             notify_queue: Arc::new(NotifyQueue::default()),
             retry_state: BTreeMap::new(),
+            unrecovered: BTreeMap::new(),
         };
         if let Err(error) = engine.load_pending() {
             engine.health = Some(format!("RECOVERY_REQUIRED: {error:#}"));
@@ -403,7 +451,7 @@ impl Engine {
         *crate::util::lock::lock(&self.observation) = json!({"repo":self.store.repo,"device":self.store.device,
             "branch":branch,"generation":self.store.generation,"mounted":self.mounted,
             "open_handles":self.handles.len(),"unflushed_files":self.sessions.values().filter(|s|s.dirty).count(),
-            "health":self.health,"sampled_at_ms":time(),"caught_up":false});
+            "health":self.reported_health(),"sampled_at_ms":time(),"caught_up":false});
     }
     /// Copies the cheap counters into [`EngineVitals`] (no SQL: the store
     /// revision compares the connection's `total_changes`, the sync
@@ -417,10 +465,13 @@ impl Engine {
             Ordering::Relaxed,
         );
         v.mounted.store(self.mounted, Ordering::Relaxed);
+        v.unrecovered_saves
+            .store(count(self.unrecovered.len()), Ordering::Relaxed);
         {
+            let reported = self.reported_health();
             let mut health = crate::util::lock::lock(&v.health);
-            if *health != self.health {
-                health.clone_from(&self.health);
+            if *health != reported {
+                *health = reported;
             }
         }
         let changes = self.store.db.total_changes();
@@ -638,43 +689,238 @@ impl Engine {
     fn refresh_pending_saves(&self) {
         count_pending_saves(&self.store, &self.vitals);
     }
+    /// Restores every `pending_saves` record into a dirty session, each on
+    /// its own: one that cannot be restored is kept, reported and retried
+    /// (module docs) and the others still load. Only a failure to read the
+    /// table itself is an error (`Engine::new` then reports
+    /// `RECOVERY_REQUIRED` as the engine's health, as before).
     fn load_pending(&mut self) -> Result<()> {
         self.store.db.execute_batch("CREATE TABLE IF NOT EXISTS pending_saves(entity TEXT PRIMARY KEY,payload TEXT NOT NULL)")?;
-        let records = self
-            .store
-            .db
-            .prepare("SELECT payload FROM pending_saves")?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let records = self.pending_records()?;
         self.refresh_pending_saves();
-        for record in records {
+        let now = Instant::now();
+        for (entity, record) in records {
             crate::startup::progress("recovering pending saves");
             // Qualification: slows recovery down to observe its progress.
             crate::util::fault::hang("engine.recover_pending");
-            let pending: PendingSave = serde_json::from_str(&record)?;
-            ensure!(
-                pending.branch == self.store.active,
-                "RECOVERY_BRANCH_MISMATCH"
-            );
-            let bytes = crate::staging::Staged::recover(&self.store.root, &pending.stage)?;
-            self.sessions.insert(
-                pending.entry.id.clone(),
-                Session {
-                    entry: pending.entry,
-                    bytes,
-                    content_base: pending.content_base,
-                    alive_base: pending.alive_base,
-                    preserve_times: pending.preserve_times,
-                    dirty: true,
-                    references: 0,
-                },
-            );
+            if let Err(error) = self.restore_pending(&record) {
+                self.note_unrecovered(&entity, &error, now);
+            }
         }
-        if !self.sessions.is_empty() {
+        if self.sessions.values().any(|s| s.dirty) {
             self.health = Some("PENDING_SAVES: recovery in progress".into());
             self.recovery_health = true;
         }
         Ok(())
+    }
+    /// Every `pending_saves` row: `(entity, payload)`.
+    fn pending_records(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .store
+            .db
+            .prepare("SELECT entity,payload FROM pending_saves ORDER BY entity")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    /// Restores one `pending_saves` record into a dirty session.
+    fn restore_pending(&mut self, record: &str) -> Result<()> {
+        let pending: PendingSave = serde_json::from_str(record)
+            .context("RECOVERY_REQUIRED: the pending-save record cannot be read")?;
+        ensure!(
+            pending.branch == self.store.active,
+            "RECOVERY_BRANCH_MISMATCH: the unsaved file belongs to branch {}, not the active branch",
+            pending.branch
+        );
+        let bytes = crate::staging::Staged::recover(&self.store.root, &pending.stage)
+            .with_context(|| {
+                format!(
+                    "RECOVERY_REQUIRED: the staging file {} of the unsaved file cannot be opened",
+                    pending.stage
+                )
+            })?;
+        self.sessions.insert(
+            pending.entry.id.clone(),
+            Session {
+                entry: pending.entry,
+                bytes,
+                content_base: pending.content_base,
+                alive_base: pending.alive_base,
+                preserve_times: pending.preserve_times,
+                dirty: true,
+                references: 0,
+            },
+        );
+        Ok(())
+    }
+    /// Records that `entity`'s pending save could not be restored (again).
+    fn note_unrecovered(&mut self, entity: &str, error: &anyhow::Error, now: Instant) {
+        let failures = self
+            .unrecovered
+            .get(entity)
+            .map_or(1, |known| known.failures.saturating_add(1));
+        let message = format!("{error:#}");
+        let first = self
+            .unrecovered
+            .get(entity)
+            .is_none_or(|known| known.error != message);
+        if first {
+            let wire = crate::model::errors::ErrorWire::from_error(error);
+            crate::util::log::event!(warn, (wire.code.as_str()), {
+                "site": "engine.recover_pending",
+                "entity": entity,
+                "failures": failures,
+                "message": wire.message,
+            });
+        }
+        self.unrecovered.insert(
+            entity.to_owned(),
+            Unrecovered {
+                error: message,
+                failures,
+                next_at: now + retry_delay(failures),
+            },
+        );
+    }
+    /// Forgets an unrestored record of `entity` that a newer save of the same
+    /// entity replaced or committed (its row is gone or rewritten), and
+    /// removes its staging file. `keep` is the newer record's staging file.
+    fn forget_unrecovered(&mut self, entity: &str, record: Option<&str>, keep: Option<&str>) {
+        if self.unrecovered.remove(entity).is_none() {
+            return;
+        }
+        if let Some(stage) = record
+            .and_then(|record| serde_json::from_str::<PendingSave>(record).ok())
+            .map(|pending| pending.stage)
+            .filter(|stage| Some(stage.as_str()) != keep)
+        {
+            remove_stage(&self.store.root, &stage);
+        }
+    }
+    /// The health this engine reports: [`Engine::health`], else the
+    /// `pending_saves` records it could not restore (`RECOVERY_REQUIRED`,
+    /// a degraded store that gates nothing).
+    pub fn reported_health(&self) -> Option<String> {
+        if self.health.is_some() {
+            return self.health.clone();
+        }
+        let (entity, first) = self.unrecovered.iter().next()?;
+        let count = self.unrecovered.len();
+        Some(format!(
+            "RECOVERY_REQUIRED: {count} unsaved file{} could not be restored (entity {entity}: {}); \
+             they are retried; `tkfs pending-saves` lists them and `tkfs discard-pending-save` drops one",
+            if count == 1 { "" } else { "s" },
+            first.error
+        ))
+    }
+    /// The `pending-saves` control op: every record, restored or not.
+    pub(crate) fn pending_saves_report(&self) -> Result<Value> {
+        let records = self.pending_records()?;
+        let saves: Vec<Value> = records
+            .iter()
+            .map(|(entity, record)| {
+                let pending = serde_json::from_str::<PendingSave>(record).ok();
+                let size = pending.as_ref().and_then(|pending| {
+                    std::fs::metadata(self.store.root.join("staging").join(&pending.stage))
+                        .ok()
+                        .map(|metadata| metadata.len())
+                });
+                json!({
+                    "entity": entity,
+                    "name": pending.as_ref().map(|pending| pending.entry.name.clone()),
+                    "branch": pending.as_ref().map(|pending| pending.branch.clone()),
+                    "size": size,
+                    "restored": self.sessions.get(entity).is_some_and(|s| s.dirty),
+                    "error": self.unrecovered.get(entity).map(|u| u.error.clone()),
+                })
+            })
+            .collect();
+        Ok(json!({"pending_saves": saves}))
+    }
+    /// The `discard-pending-save{entity}` control op: drops a record that
+    /// could not be restored (its row and staging file). A restored one is a
+    /// dirty session being retried and is refused (`PENDING_SAVE_RESTORED`);
+    /// an entity without a record answers `discarded: false`.
+    pub(crate) fn discard_pending_save(&mut self, entity: &str) -> Result<Value> {
+        ensure!(
+            !self.sessions.get(entity).is_some_and(|s| s.dirty),
+            "PENDING_SAVE_RESTORED: the unsaved file {entity} was restored and is being saved; it cannot be discarded"
+        );
+        let record: Option<String> = self
+            .store
+            .db
+            .query_row(
+                "SELECT payload FROM pending_saves WHERE entity=?",
+                [entity],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(record) = record else {
+            self.unrecovered.remove(entity);
+            self.refresh_vitals();
+            return Ok(json!({"entity": entity, "discarded": false}));
+        };
+        self.store
+            .db
+            .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
+        self.refresh_pending_saves();
+        self.unrecovered.remove(entity);
+        if let Ok(pending) = serde_json::from_str::<PendingSave>(&record) {
+            remove_stage(&self.store.root, &pending.stage);
+        }
+        crate::util::log::event!(warn, PENDING_SAVE, {
+            "site": "engine.discard_pending_save",
+            "entity": entity,
+            "detail": "an unsaved file that could not be restored was discarded",
+        });
+        self.refresh_vitals();
+        Ok(json!({"entity": entity, "discarded": true}))
+    }
+    /// Removes the staging files (`STATE/staging/*.stage`) no
+    /// `pending_saves` row names and no session of this engine uses, and the
+    /// temporary object files (`STATE/objects/*.part`) of interrupted object
+    /// writes (WP4.INT re-review: a crash, a kill or a power loss left them,
+    /// and nothing removed them). Only the worker that holds `owner.lock`
+    /// calls this, right after `Engine::new`. Returns the files and bytes
+    /// removed.
+    pub fn remove_orphaned_spools(&self) -> Result<(u64, u64)> {
+        let mut named: BTreeSet<String> = self
+            .pending_records()?
+            .into_iter()
+            .filter_map(|(_, record)| serde_json::from_str::<PendingSave>(&record).ok())
+            .map(|pending| pending.stage)
+            .collect();
+        named.extend(self.sessions.values().filter_map(|session| {
+            match &session.bytes {
+                crate::staging::Staged::Disk { path, .. } => path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned()),
+                _ => None,
+            }
+        }));
+        let mut removed = (0u64, 0u64);
+        let mut sweep = |folder: std::path::PathBuf, orphan: &dyn Fn(&str) -> bool| {
+            let Ok(entries) = std::fs::read_dir(&folder) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !orphan(&name) {
+                    continue;
+                }
+                let size = entry.metadata().map_or(0, |metadata| metadata.len());
+                if std::fs::remove_file(entry.path()).is_ok() {
+                    removed.0 += 1;
+                    removed.1 += size;
+                }
+            }
+        };
+        sweep(self.store.root.join("staging"), &|name| {
+            name.ends_with(".stage") && !named.contains(name)
+        });
+        sweep(self.store.root.join("objects"), &|name| {
+            name.ends_with(".part") && uuid::Uuid::parse_str(name.trim_end_matches(".part")).is_ok()
+        });
+        Ok(removed)
     }
     pub(crate) fn retain_pending(&mut self, entity: &str, error: &anyhow::Error) -> Result<()> {
         self.recovery_health = self.health.is_none() || self.recovery_health;
@@ -694,9 +940,23 @@ impl Engine {
             alive_base: session.alive_base.clone(),
             preserve_times: session.preserve_times,
         };
+        let replaced: Option<String> = if self.unrecovered.contains_key(entity) {
+            self.store
+                .db
+                .query_row(
+                    "SELECT payload FROM pending_saves WHERE entity=?",
+                    [entity],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
         self.store.db.execute("INSERT INTO pending_saves VALUES(?,?) ON CONFLICT(entity) DO UPDATE SET payload=excluded.payload",
             rusqlite::params![entity,serde_json::to_string(&record)?])?;
         self.refresh_pending_saves();
+        // A newer save of the entity replaces a record that was not restored.
+        self.forget_unrecovered(entity, replaced.as_deref(), Some(&record.stage));
         Ok(())
     }
     /// Persist every dirty session into `pending_saves` without committing it,
@@ -792,6 +1052,20 @@ impl Engine {
             [entity],
             |r| r.get(0),
         )?;
+        // A record of this entity that was not restored is superseded by
+        // this save (its row goes with the commit below).
+        let replaced: Option<String> = if pending && self.unrecovered.contains_key(entity) {
+            self.store
+                .db
+                .query_row(
+                    "SELECT payload FROM pending_saves WHERE entity=?",
+                    [entity],
+                    |row| row.get(0),
+                )
+                .optional()?
+        } else {
+            None
+        };
         // A retained save commits its write and the removal of its row
         // together. From autocommit that transaction begins IMMEDIATE, taking
         // SQLite's writer slot before the write reads the projection (as
@@ -843,6 +1117,9 @@ impl Engine {
                 session.dirty = false;
                 session.bytes.release();
                 session.entry = self.store.entry(entity)?;
+                if pending {
+                    self.forget_unrecovered(entity, replaced.as_deref(), None);
+                }
                 if self.recovery_health && !self.sessions.values().any(|s| s.dirty) {
                     self.health = None;
                     self.recovery_health = false;
@@ -878,6 +1155,7 @@ impl Engine {
     /// failure (the session stays retained) delays only that entity, and the
     /// others are still tried. Returns how many were committed.
     pub fn retry_pending_due(&mut self, now: Instant) -> usize {
+        self.retry_unrecovered_due(now);
         self.retry_state
             .retain(|entity, _| self.sessions.get(entity).is_some_and(|s| s.dirty));
         let due: Vec<_> = self
@@ -904,9 +1182,7 @@ impl Engine {
                             next_at: now,
                         });
                     state.failures = state.failures.saturating_add(1);
-                    let delay = RETRY_BASE
-                        .saturating_mul(1u32 << state.failures.saturating_sub(1).min(6))
-                        .min(RETRY_CAP);
+                    let delay = retry_delay(state.failures);
                     state.next_at = now + delay;
                     crate::util::log::event!(warn, PENDING_SAVE, {
                         "site": "engine.retry_pending",
@@ -919,6 +1195,51 @@ impl Engine {
             }
         }
         committed
+    }
+    /// Tries again to restore the due records that could not be restored
+    /// (module docs): a staging file a scanner held at startup, a record of
+    /// a branch that is active again. A restored one becomes a dirty session
+    /// that [`Engine::retry_pending_due`] commits. A record of an entity with
+    /// a session (the file is open) waits for it to go.
+    fn retry_unrecovered_due(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .unrecovered
+            .iter()
+            .filter(|(entity, unrecovered)| {
+                unrecovered.next_at <= now && !self.sessions.contains_key(*entity)
+            })
+            .map(|(entity, _)| entity.clone())
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        let records: BTreeMap<String, String> = match self.pending_records() {
+            Ok(records) => records.into_iter().collect(),
+            Err(_) => return,
+        };
+        for entity in due {
+            let Some(record) = records.get(&entity) else {
+                // The row is gone (discarded, or superseded elsewhere).
+                self.unrecovered.remove(&entity);
+                continue;
+            };
+            match self.restore_pending(record) {
+                Ok(()) => {
+                    self.unrecovered.remove(&entity);
+                    crate::util::log::event!(info, PENDING_SAVE, {
+                        "site": "engine.recover_pending",
+                        "entity": entity,
+                        "detail": "an unsaved file that could not be restored before was restored",
+                    });
+                    if self.health.is_none() {
+                        self.health = Some("PENDING_SAVES: recovery in progress".into());
+                        self.recovery_health = true;
+                    }
+                }
+                Err(error) => self.note_unrecovered(&entity, &error, now),
+            }
+        }
+        self.refresh_vitals();
     }
     pub fn open(
         &mut self,
@@ -1185,17 +1506,23 @@ impl Engine {
         }
         result
     }
+    /// No open handle, no unsaved session and no pending-save health
+    /// (`PENDING_SAVES`/`PENDING_SAVE`, set only while sessions are unsaved).
+    /// A `pending_saves` record that could not be restored does not count
+    /// (module docs): its row stays for the next start.
     pub fn quiet(&self) -> Result<()> {
-        ensure!(
-            self.handles.is_empty()
-                && self.health.is_none()
-                && !self.sessions.values().any(|s| s.dirty),
-            "BUSY_VIEW: {} open contexts, {} unsaved files; {}",
-            self.handles.len(),
-            self.sessions.values().filter(|s| s.dirty).count(),
+        let open = self.handles.len();
+        let dirty = self.sessions.values().filter(|s| s.dirty).count();
+        if open == 0 && dirty == 0 {
+            if let Some(health) = &self.health {
+                bail!("BUSY_VIEW: {health}");
+            }
+            return Ok(());
+        }
+        bail!(
+            "BUSY_VIEW: {open} open contexts, {dirty} unsaved files; {}",
             self.health.as_deref().unwrap_or("healthy")
-        );
-        Ok(())
+        )
     }
     pub fn receive_peer(
         &mut self,

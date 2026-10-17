@@ -12,7 +12,10 @@
 //!    (`defer_activation`, WP2.3): the background activator drains them after
 //!    Ready, so a large inbox no longer delays Ready (invariant 24: deferred
 //!    activation is not recovery);
-//! 4. `Engine::new` (recovers pending saves);
+//! 4. `Engine::new` (recovers pending saves, each on its own: one that
+//!    cannot be restored is reported and retried, never fatal), then the
+//!    staging and temporary object files no pending save names are removed
+//!    (WP4.INT re-review: a crash or kill left them);
 //! 5. build the `WorkerCtx`;
 //! 6. start the RPC listener: recovery is complete before any RPC (invariant
 //!    24); then the heartbeat thread (§4.1 step 10, moved here so that
@@ -311,6 +314,24 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     // 4. pending-save recovery
     crate::startup::progress("recovering pending saves");
     let engine = Engine::new(store);
+    // WP4.INT re-review: staging and temporary object files an interrupted
+    // run left behind (no pending save names them; `owner.lock` is held).
+    match engine.remove_orphaned_spools() {
+        Ok((0, _)) => {}
+        Ok((files, bytes)) => {
+            crate::util::log::event!(info, WORKER_START, {
+                "detail": "removed staging and temporary object files an interrupted run left behind",
+                "files": files,
+                "bytes": bytes,
+            });
+        }
+        Err(error) => {
+            crate::util::log::event!(warn, WORKER_START, {
+                "detail": "cannot look for staging files an interrupted run left behind",
+                "message": format!("{error:#}"),
+            });
+        }
+    }
     let vitals = engine.vitals.clone();
     let engine: Shared = Arc::new(Mutex::new(engine));
     fault::trigger("worker.startup").map_err(internal)?;

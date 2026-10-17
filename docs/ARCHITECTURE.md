@@ -230,11 +230,21 @@ accepting host shows its peers too.
    availability row is trusted; others are hashed), journal validation,
    frontiers, snapshot resume or rebuild, inbox classification. Activation
    is deferred to the background.
-4. Recover pending saves; build the worker context.
+4. Recover pending saves, each on its own: one whose staging file is
+   missing or unreadable, or that belongs to another branch, is kept,
+   reported (`RECOVERY_REQUIRED`, a degraded store that gates nothing) and
+   retried with the pending-save backoff, and the others load. Remove the
+   staging files no pending save names and the temporary object files
+   (`objects/*.part`) an interrupted run left. Build the worker context.
 5. Open the RPC listener, which requires the instance's token (a fresh
-   random token, written owner-only to `runtime.token`), and start the
-   heartbeat (1 Hz); then write `runtime.json` and `worker.json` (with the
-   token) atomically.
+   random token, written owner-only to `runtime.token` once a previous
+   instance's `runtime.json` is removed, so the token never sits next to a
+   dead listener's address), and start the heartbeat (1 Hz); then write
+   `runtime.json` and `worker.json` (with the token) atomically. Before its
+   upgrade carries the token a connection is bounded: 5 s for the whole
+   upgrade (a watchdog) and at most 32 such connections (the oldest is
+   closed for a new one); the daemon's control endpoint has the same
+   bounds, counted apart from its authenticated connections.
 6. Standalone with `--mount`: attach now (a failure is reported, never fatal).
    Supervised: wait for `mount-attach`.
 7. Print the Ready line (`{"ready":true, repo, device, instance, pid,
@@ -332,7 +342,8 @@ maintenance at 1 Hz; content counters of large stores are refreshed on a
 background thread, `content_pending: true` meanwhile). The heartbeat thread
 publishes `WorkerHeartbeat` at 1 Hz from atomics, the cell and the mount
 status; `watch{after_seq}` returns as soon as a newer one exists. Maintenance
-retries pending saves (1 s → 60 s), checkpoints the WAL (truncating a large
+retries pending saves (1 s → 60 s; also the ones not yet restored),
+checkpoints the WAL (truncating a large
 copied one), and scrubs stored objects in the background (≤ 32 MiB/s, only
 while the activator is idle, objects not verified for 7 days).
 
