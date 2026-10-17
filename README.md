@@ -404,7 +404,7 @@ up`, `last exchange`.
 | `offline for …` | `Offline N min` | No lane and no inbound session. |
 | `needs upgrade (incompatible protocol)` | `Peer needs upgrade` | The peer runs the previous release or an incompatible protocol; rechecked every 10 min. |
 | `unauthorized: pair again with the current code` | `Unauthorized — re-pair` | The peer refused our pairing code or our per-peer credential (code rotated or wrong, credential revoked); rechecked every 60 s. |
-| `revoked` | `Revoked` | Reserved; this release does not show it. A refused per-peer credential (`PEER_REVOKED`: an unpair or a rotation of the accepting host's code revoked it) is dropped and the dialer retries with its pairing code: it reconnects (and enrolls a new credential) when that code is still accepted, and reads `unauthorized` when it is not. |
+| `revoked` | `Revoked` | Reserved; this release does not show it. A refused per-peer credential (`PEER_REVOKED`: an unpair or a rotation of the accepting host's code revoked it) is set aside by that connection (the catalog keeps it) and the dialer retries with its pairing code: it reconnects (and enrolls a new credential) when that code is still accepted, and reads `unauthorized` when it is not. |
 
 Direction: `outbound` (we dial it), `inbound` (it dials us; we have no
 pairing record for it), `both ways`. Lanes: lane 0 is the control lane

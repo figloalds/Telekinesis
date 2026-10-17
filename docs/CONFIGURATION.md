@@ -111,9 +111,12 @@ runs; `orchestrator.token` is written by each daemon when it starts.
   random 32-byte secret `S` with the accepting host (`peer.enroll`), and both
   keep the key derived from it, `K_peer = SHA-256("tkfs-peer-secret-v1" ‖ S)`,
   in `folders.sqlite`. Later sessions authenticate with `K_peer` (scheme
-  `peer-hmac-v1`) instead of the code, so each pairing has its own
-  credential that can be revoked alone. A missing or revoked credential is
-  refused with `PEER_REVOKED`. `K_peer` is as sensitive as a code.
+  `peer-hmac-v1`), so each pairing has its own credential that can be
+  revoked alone. A missing or revoked credential is refused with
+  `PEER_REVOKED`, and the dialer then authenticates with the code again
+  (and enrolls a new credential): the code stays valid until it is rotated,
+  so per-peer credentials add revocation, not protection against another
+  holder of the same code. `K_peer` is as sensitive as a code.
 - A **dialing** host also keeps the remote host's code in its catalog
   (`folders.sqlite`).
 - The pairing code never crosses the network: sessions authenticate with an
