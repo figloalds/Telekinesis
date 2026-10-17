@@ -1310,6 +1310,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
 - No user bandwidth limits or QoS. No cross-peer global scheduler.
 - No v2 interoperability after cutover (WP3.1): old peers fail closed. Waves 1–2 remain wire-compatible with 6298d0b peers.
 - No automatic kill of a worker whose engine lock is stalled (Degraded status only).
+- No off-lock save of a file's bytes in this release (CCR-WP4.INT-5, the RC9 remainder; deferred by WP4.INT, the coordinator's ratification pending): saving a file hashes and copies it into the object store under the engine lock, and the first write to a file above 256 KiB copies it to a staging file under it (about 2 s per 256 MiB). A pending save's commit takes SQLite's writer only after its bytes are stored. A force stop waits for such a hold for at most 120 s from the force stop; a longer one (a file of more than about 15 GiB on the reference disk) is a stalled engine, and the kill loses the unsaved sessions the stop was retaining.
 
 ---
 
