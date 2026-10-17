@@ -1753,7 +1753,8 @@ impl Store {
             .as_str()
             .context("INVALID_LOCATION")?;
         let touched = Touched {
-            ids: BTreeSet::from([entity.as_str(), parent]),
+            entities: BTreeSet::from([entity.as_str()]),
+            parents: BTreeSet::from([parent]),
             slots: BTreeSet::from([(parent.to_owned(), name_key(name)?)]),
         };
         if current.entries.contains_key(entity)
@@ -1851,8 +1852,8 @@ impl Store {
             let Some(entry) = current.entries.get(&change.entity) else {
                 return Ok(None);
             };
-            touched.ids.insert(&change.entity);
-            touched.ids.insert(&entry.parent);
+            touched.entities.insert(&change.entity);
+            touched.parents.insert(&entry.parent);
             touched
                 .slots
                 .insert((entry.parent.clone(), name_key(&entry.name)?));
@@ -1861,7 +1862,7 @@ impl Store {
                     .as_str()
                     .context("INVALID_LOCATION")?;
                 let name = change.value["name"].as_str().context("INVALID_LOCATION")?;
-                touched.ids.insert(parent);
+                touched.parents.insert(parent);
                 touched.slots.insert((parent.to_owned(), name_key(name)?));
             }
         }
@@ -1972,25 +1973,30 @@ impl Store {
     }
 }
 
-/// What a creation or namespace successor touches: the entities it changes
-/// and the parent directories they leave or enter (`ids`), and the
-/// `(parent, name key)` slots they leave or take.
+/// What a creation or namespace successor touches: the entities it changes,
+/// the parent directories they leave or enter, and the `(parent, name key)`
+/// slots they leave or take.
 #[derive(Default)]
 struct Touched<'a> {
-    ids: BTreeSet<&'a str>,
+    entities: BTreeSet<&'a str>,
+    parents: BTreeSet<&'a str>,
     slots: BTreeSet<(String, String)>,
 }
 
 /// Whether a conflict of `current` touches what a successor changes (module
-/// docs): the conflict names one of `touched.ids` (a pair `a,b` by either
-/// side), or one of its alternatives or bases is a location in one of them
-/// (as the parent) or in one of `touched.slots`.
+/// docs): the conflict names a touched entity or parent (a pair `a,b` by
+/// either side), or one of its alternatives or bases is a location inside a
+/// touched entity (a created entity that a conflicted entry names as its
+/// missing parent, a moved directory) or in a touched slot. A location in a
+/// touched parent's other slots does not count: that parent is a live
+/// directory (the successors check it), so no entry under it has an invalid
+/// chain, and its collisions are per slot.
 fn conflicts_touch(current: &Projection, touched: &Touched<'_>) -> bool {
     current.conflicts.iter().any(|conflict| {
         conflict
             .entity
             .split(',')
-            .any(|id| touched.ids.contains(id))
+            .any(|id| touched.entities.contains(id) || touched.parents.contains(id))
             || conflict
                 .alternatives
                 .iter()
@@ -1999,7 +2005,7 @@ fn conflicts_touch(current: &Projection, touched: &Touched<'_>) -> bool {
                     let Some(parent) = version.value.get("parent").and_then(Value::as_str) else {
                         return false;
                     };
-                    touched.ids.contains(parent)
+                    touched.entities.contains(parent)
                         || version
                             .value
                             .get("name")
