@@ -162,6 +162,10 @@ pub struct SliceOutcome {
     /// Commits through full replay.
     pub slow: u32,
     pub quarantined: Vec<(String, ErrorWire)>,
+    /// Rows this slice moved to `retry` (a transient failure; CCR-WP2.3-3 /
+    /// CCR-WP4.2-2, applied by WP4.INT): the activator counts them in
+    /// `activation.retried`.
+    pub retried: u32,
     /// Set when `inline_slow` is false and the next event needs the slow
     /// path; its row stays `ready`.
     pub slow_ticket: Option<SlowTicket>,
@@ -791,7 +795,10 @@ impl Store {
                     stats.attempts += 1;
                     out.quarantined.push((id, error));
                 }
-                Attempt::Retried(_) => stats.attempts += 1,
+                Attempt::Retried(_) => {
+                    stats.attempts += 1;
+                    out.retried = out.retried.saturating_add(1);
+                }
                 Attempt::Deferred | Attempt::Gone => {}
                 Attempt::Ticket(ticket) => {
                     out.slow_ticket = Some(ticket);

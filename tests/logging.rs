@@ -153,6 +153,47 @@ fn rotating_file_rotates_by_size_and_keeps_its_files() {
     assert!(file.rotations() >= 1);
 }
 
+/// A log directory removed while the daemon runs (a user cleared
+/// `DATA/logs`) is made again at the next rotation: the log does not stop for
+/// the rest of the process (WP4.INT, the WP4.2 review's minor).
+#[test]
+fn a_removed_log_directory_is_made_again_at_the_next_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let logs = dir.path().join("logs");
+    let path = logs.join("cleared.log");
+    let rotation = Rotation {
+        max_bytes: 1024,
+        files: 3,
+    };
+    let mut file = RotatingFile::open(&path, rotation).unwrap();
+    let line = |n: usize| {
+        format!(
+            "{{\"n\":{n},\"pad\":\"{}\"}}
+",
+            "c".repeat(60)
+        )
+    };
+    file.write_all(line(0).as_bytes()).unwrap();
+    if let Err(error) = fs::remove_dir_all(&logs) {
+        // A platform that keeps an open file's directory: nothing to test.
+        eprintln!("the log directory could not be removed while open: {error}");
+        return;
+    }
+    assert!(!logs.exists());
+    // Past `max_bytes`: the rotation closes the handle and reopens the path.
+    for n in 1..40 {
+        file.write_all(line(n).as_bytes()).unwrap();
+    }
+    assert!(path.is_file(), "the live file is back in a new directory");
+    let numbers: Vec<u64> = json_lines(&path)
+        .iter()
+        .map(|v| v["n"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers.last(), Some(&39), "{numbers:?}");
+    file.write_all(line(40).as_bytes()).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("\"n\":40,"));
+}
+
 #[test]
 fn a_one_file_rotation_keeps_no_history_and_an_oversized_line_is_written_whole() {
     let dir = tempfile::tempdir().unwrap();
