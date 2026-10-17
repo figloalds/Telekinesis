@@ -1243,6 +1243,8 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
                 }
                 _ => {}
             }
+            // Background saves let this request take the engine first.
+            let _foreground = crate::runtime::engine::foreground();
             let mut e = lock_engine(&engine);
             let result = lock(&fs).dispatch(&mut e, op, inode, &p[40..]);
             e.publish_observation();
@@ -1299,6 +1301,7 @@ fn threaded(
             if op == 16 {
                 content::prepare_writable(engine, handle, None)?;
             }
+            let _foreground = crate::runtime::engine::foreground();
             let mut e = if op == 16 {
                 crate::runtime::engine::lock_for_write(engine, handle)
             } else {

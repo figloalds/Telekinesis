@@ -371,6 +371,8 @@ pub unsafe extern "C" fn tk_call(
             }
             _ => {}
         }
+        // Background saves let this callback take the engine first.
+        let _foreground = crate::runtime::engine::foreground();
         // A write waits (without the lock) for a save that reads its file.
         let mut e = if op == 5 || op == 6 {
             crate::runtime::engine::lock_for_write(engine, h)

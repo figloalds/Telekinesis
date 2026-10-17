@@ -1402,31 +1402,14 @@ impl Engine {
             .collect();
         let mut committed = 0;
         for entity in due {
-            // A staging file (a large file) is hashed and copied without the
-            // engine lock when the shared engine is known: a thread saves it
-            // (`save_entity`) and reports a failure back here.
-            if self.sessions[&entity].bytes.is_file()
-                && let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade)
+            // Saved without the engine lock when the shared engine is known
+            // and a background slot is free: a thread saves it and reports a
+            // failure back (`retry_failed`).
+            if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade)
+                && let Some(slot) = BackgroundSlot::take()
             {
-                let name = entity.clone();
-                let spawned = std::thread::Builder::new()
-                    .name("save".into())
-                    .spawn(move || {
-                        if let Err(error) = save_entity(&shared, &name) {
-                            super::lock_engine(&shared).retry_failed(&name, Instant::now(), &error);
-                        }
-                    });
-                if spawned.is_ok() {
-                    // Not due again before the backoff, should it fail.
-                    self.retry_state
-                        .entry(entity)
-                        .or_insert(RetryState {
-                            failures: 0,
-                            next_at: now,
-                        })
-                        .next_at = now + RETRY_BASE;
-                    continue;
-                }
+                spawn_background(&shared, entity, slot);
+                continue;
             }
             match self.flush_entity(&entity) {
                 Ok(()) => {
@@ -2307,7 +2290,17 @@ fn store_file(
 /// for a save of the same entity that runs. A panic in phase 2 still ends
 /// the save (the session is retained).
 pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
+    save_entity_as(engine, entity, false)
+}
+
+/// [`save_entity`]; `background`: before each phase that takes the engine
+/// lock, give it to the filesystem callbacks in progress first
+/// ([`foreground`], at most [`YIELD_MAX`] each time).
+fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()> {
     loop {
+        if background {
+            yield_to_foreground();
+        }
         let mut e = super::lock_engine(engine);
         let job = match e.begin_save(entity)? {
             SaveStart::Clean => return Ok(()),
@@ -2323,6 +2316,9 @@ pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
         let stored =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store_snapshot(&job)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("UNKNOWN_ERROR: storing a save panicked")));
+        if background {
+            yield_to_foreground();
+        }
         return super::lock_engine(engine).finish_save(job, stored);
     }
 }
@@ -2375,14 +2371,16 @@ pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
 /// The longest single wait for a save's end before the waiter looks again.
 const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 
-/// Saves running on threads of their own ([`save_handle_in_background`]) at
-/// most at once, in this process: a close beyond it saves before it returns.
-/// It bounds what a hard crash (power loss, a killed process) can lose of
-/// files that were closed but not yet committed.
+/// Saves running in the background ([`save_handle_in_background`], a close,
+/// the pending-save retry) at most at once, in this process. It bounds the
+/// adapter threads saves occupy, and what a hard crash (power loss, a killed
+/// process) can lose of files that were closed but not committed yet: past
+/// it, a closed file waits for a slot (the background saves pick up the
+/// closed files left unsaved, [`orphan_dirty`]).
 pub const MAX_BACKGROUND_SAVES: usize = 8;
 static BACKGROUND_SAVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Saves running in the background now ([`save_handle_in_background`]).
+/// Saves running in the background now.
 pub fn background_saves() -> usize {
     BACKGROUND_SAVES.load(Ordering::SeqCst)
 }
@@ -2405,16 +2403,47 @@ impl Drop for BackgroundSlot {
     }
 }
 
+/// Filesystem callbacks in progress that take the engine lock for the
+/// application ([`foreground`]); background saves let them go first.
+static FOREGROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The longest a background save defers one engine-lock phase to
+/// [`foreground`] callbacks.
+pub const YIELD_MAX: Duration = Duration::from_millis(20);
+
+/// Marks a filesystem callback that takes the engine lock for the
+/// application until the returned guard drops (the mount adapters).
+pub fn foreground() -> Foreground {
+    FOREGROUND.fetch_add(1, Ordering::SeqCst);
+    Foreground(())
+}
+
+/// Returned by [`foreground`].
+pub struct Foreground(());
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        FOREGROUND.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits while [`foreground`] callbacks run, at most [`YIELD_MAX`].
+fn yield_to_foreground() {
+    let deadline = Instant::now() + YIELD_MAX;
+    while FOREGROUND.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
 /// The save of a closed file (WinFsp cleanup, FUSE flush): when the session
 /// of handle `h` is dirty and no save of it runs, it is saved on a thread of
-/// its own ([`save_entity`]) and this returns at once, so the application's
-/// close does not wait for the hashing, copying and commits (module docs,
-/// *Saves off the engine lock*); with every background slot taken it is
-/// saved here. Until it is committed the session is a dirty session like any
-/// other: reads see its bytes, a graceful stop or detach waits for it
-/// (`quiet`), a forced one or a poison exit retains it (invariant 8), and a
-/// flush (`FlushFileBuffers`, `fsync`) waits for it ([`save_handle`]). A
-/// failed background save is retained (`pending_saves`) and retried.
+/// its own and this returns at once, so the application's close does not
+/// wait for the hashing, copying and commits (module docs, *Saves off the
+/// engine lock*). With every background slot taken, the close of the handle
+/// or a background save that ends picks it up. Until it is committed the
+/// session is a dirty session like any other: reads see its bytes, a
+/// graceful stop or detach waits for it (`quiet`), a forced one or a poison
+/// exit retains it (invariant 8), and a flush (`FlushFileBuffers`, `fsync`)
+/// waits for it ([`save_handle`]). A failed background save is retained
+/// (`pending_saves`) and retried with the pending-save backoff.
 pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
     let entity = {
         let e = super::lock_engine(engine);
@@ -2429,47 +2458,75 @@ pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
             _ => return Ok(()),
         }
     };
-    let Some(slot) = BackgroundSlot::take() else {
-        return save_entity(engine, &entity);
-    };
+    if let Some(slot) = BackgroundSlot::take() {
+        spawn_background(engine, entity, slot);
+    }
+    Ok(())
+}
+
+/// Starts a thread that saves `entity` and then every other closed file left
+/// unsaved ([`orphan_dirty`]), holding `slot`. A thread that cannot start
+/// leaves them to a close or the pending-save retry.
+fn spawn_background(engine: &Shared, entity: String, slot: BackgroundSlot) {
     let shared = engine.clone();
-    let name = entity.clone();
-    let spawned = std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("save".into())
         .spawn(move || {
             let _slot = slot;
-            if let Err(error) = save_entity(&shared, &name) {
-                let wire = crate::model::errors::ErrorWire::from_error(&error);
-                crate::util::log::event!(warn, (wire.code.as_str()), {
-                    "site": "engine.background_save",
-                    "entity": name,
-                    "message": wire.message,
-                });
+            let mut next = Some(entity);
+            while let Some(entity) = next {
+                if let Err(error) = save_entity_as(&shared, &entity, true) {
+                    let wire = crate::model::errors::ErrorWire::from_error(&error);
+                    crate::util::log::event!(warn, (wire.code.as_str()), {
+                        "site": "engine.background_save",
+                        "entity": entity,
+                        "message": wire.message,
+                    });
+                    super::lock_engine(&shared).retry_failed(&entity, Instant::now(), &error);
+                }
+                yield_to_foreground();
+                next = orphan_dirty(&super::lock_engine(&shared), Instant::now());
             }
         });
-    match spawned {
-        Ok(_) => Ok(()),
-        Err(_) => save_entity(engine, &entity),
-    }
 }
 
-/// Closes handle `h` (WinFsp close, FUSE release): saves its session first
-/// when it is dirty and no save of it runs (without the engine lock), then
-/// removes the handle. A save that runs in the background is not waited for
-/// (it ends the session once committed). A failed save retained the
-/// session; the handle goes either way, and the failure is returned.
+/// A dirty session no save covers and the application no longer writes:
+/// every handle of it is cleaned up (closed), or none is left, and its
+/// pending-save backoff (if any) is due.
+fn orphan_dirty(e: &Engine, now: Instant) -> Option<String> {
+    e.sessions
+        .iter()
+        .filter(|(_, s)| s.dirty && !s.saving)
+        .map(|(entity, _)| entity)
+        .find(|entity| {
+            e.retry_state.get(*entity).is_none_or(|s| s.next_at <= now)
+                && !e
+                    .handles
+                    .values()
+                    .any(|handle| &handle.entity == *entity && !handle.cleaned)
+        })
+        .cloned()
+}
+
+/// Closes handle `h` (WinFsp close, FUSE release): when its session is
+/// dirty and no save of it runs, saves it first (without the engine lock)
+/// if a background slot is free, then removes the handle. A save that runs
+/// is not waited for (it ends the session once committed); with no slot
+/// free, a background save that ends, or the pending-save retry, saves it.
+/// A failed save retained the session; the handle goes either way, and the
+/// failure is returned.
 pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
     let unsaved = {
         let e = super::lock_engine(engine);
         e.handles
             .get(&h)
-            .and_then(|handle| e.sessions.get(&handle.entity))
-            .is_some_and(|s| s.dirty && !s.saving)
+            .and_then(|handle| e.sessions.get(&handle.entity).map(|s| (handle, s)))
+            .filter(|(_, s)| s.dirty && !s.saving)
+            .map(|(handle, _)| handle.entity.clone())
     };
-    let saved = if unsaved {
-        save_handle(engine, h)
-    } else {
-        Ok(())
+    let saved = match unsaved.zip(BackgroundSlot::take()) {
+        Some((entity, _slot)) => save_entity_as(engine, &entity, true),
+        None => Ok(()),
     };
     let released = super::lock_engine(engine).release_handle(h);
     saved.and(released)
