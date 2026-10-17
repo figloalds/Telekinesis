@@ -102,7 +102,8 @@ One actor per folder runs the worker's lifecycle and publishes a `FolderView`:
   for the exit; then a kill of the verified process. While the worker's
   heartbeat reports its engine held by a hold that is not stalled (a large
   save: the stop's save of the dirty files waits for the engine), the 10 s
-  start again, for at most 120 s after the stop began, so a busy save does not
+  start again, for at most 120 s after the force stop was requested (a
+  graceful stop blocked before it does not count), so a busy save does not
   turn a force stop into a loss of unsaved files; a stalled or silent worker
   is killed as before. A worker that has not printed Ready yet is killed
   directly (store recovery is crash-safe).

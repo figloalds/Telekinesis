@@ -29,9 +29,10 @@
 //!   re-review, invariant 8: a long save holds the engine, and the stop's
 //!   retain of the unsaved files waits for it): while a fresh heartbeat
 //!   reports an engine hold in progress that is not stalled, the exit wait
-//!   starts again, for at most [`FORCE_STOP_ENGINE_PATIENCE`] after the stop
-//!   began; a wedged worker (stalled engine, or no heartbeat) is killed as
-//!   before.
+//!   starts again, for at most [`FORCE_STOP_ENGINE_PATIENCE`] after the force
+//!   stop was requested (a graceful stop blocked before it does not count:
+//!   WP4.INT confirmation review); a wedged worker (stalled engine, or no
+//!   heartbeat) is killed as before.
 //! * **Shutdown** never changes `desired_running` and never kills a worker that
 //!   may hold dirty sessions (invariant 8): busy or silent workers are
 //!   `left_running` and adopted by the next daemon.
@@ -164,10 +165,12 @@ const ADOPT_HELLO_RETRY: Duration = Duration::from_secs(1);
 /// A stop RPC that has not come back this long after its own deadline is
 /// treated as timed out (a client that ignores its deadline).
 const RPC_GRACE: Duration = Duration::from_secs(1);
-/// How long a force stop waits, after it began, for a worker whose engine is
-/// held by a live, progressing hold (module docs; WP4.INT re-review): the
-/// worker's own stall bound, past which its heartbeat reports the engine
-/// `stalled`.
+/// How long a force stop waits, after it was requested, for a worker whose
+/// engine is held by a live, progressing hold (module docs; WP4.INT
+/// re-review): the worker's own stall bound, past which its heartbeat reports
+/// the engine `stalled`. Measured from the force stop itself
+/// (`StopPlan::force_since_ms`), not from a graceful stop that was blocked
+/// before it.
 pub const FORCE_STOP_ENGINE_PATIENCE: Duration = ipc::timing::ENGINE_STALLED_AFTER;
 /// Kill attempts before a never-exiting worker is given up on.
 const KILL_ATTEMPTS: u32 = 2;
@@ -427,6 +430,11 @@ struct StopPlan {
     force: bool,
     stage: StopStage,
     since_ms: u64,
+    /// When `force` first became true (ForceStop, or a stop sent forced):
+    /// [`FORCE_STOP_ENGINE_PATIENCE`] runs from here (WP4.INT confirmation
+    /// review: measured from `since_ms`, a graceful stop blocked for 120 s
+    /// left a following force stop no patience at all).
+    force_since_ms: Option<u64>,
     deadline: Option<Instant>,
     deadline_ms: u64,
     after: AfterStop,
@@ -2612,6 +2620,7 @@ impl Controller {
 
     /// Stops the worker (or cancels a start without one) and then does `after`.
     fn stop_worker(&mut self, force: bool, after: AfterStop) {
+        let now_ms = self.now_ms();
         if let Some(plan) = self.stop.as_mut() {
             // Retire overrides any plan (a kill bound for Backoff or Fail too).
             if matches!(after, AfterStop::Retire)
@@ -2620,6 +2629,9 @@ impl Controller {
                 plan.after = after;
             }
             let upgrade = force && !plan.force && plan.stage == StopStage::Requested;
+            if force {
+                plan.force_since_ms.get_or_insert(now_ms);
+            }
             plan.force |= force;
             if upgrade {
                 // ForceStop while a graceful stop is pending or blocked.
@@ -2686,6 +2698,9 @@ impl Controller {
         match self.stop.as_mut() {
             Some(plan) => {
                 plan.rpc = Some(ticket);
+                if force {
+                    plan.force_since_ms.get_or_insert(now_ms);
+                }
                 plan.force |= force;
                 plan.retry_at = None;
                 if plan.blocked.is_none() {
@@ -2699,6 +2714,7 @@ impl Controller {
                     force,
                     stage: StopStage::Requested,
                     since_ms: now_ms,
+                    force_since_ms: force.then_some(now_ms),
                     deadline: Some(now + stage_deadline),
                     deadline_ms: now_ms.saturating_add(ms(stage_deadline)),
                     after,
@@ -2884,7 +2900,8 @@ impl Controller {
     /// While a force stop waits for the worker's exit and the last heartbeat
     /// (fresh: within `heartbeat_timeout`) reports an engine hold in progress
     /// that is not stalled, the exit wait starts again from now, for at most
-    /// [`FORCE_STOP_ENGINE_PATIENCE`] after the stop began (module docs).
+    /// [`FORCE_STOP_ENGINE_PATIENCE`] after the force stop was requested
+    /// (module docs).
     /// Returns whether it waits. A kill now would drop every unsaved session
     /// the stop's retain is waiting for the engine to persist (invariant 8).
     fn extend_force_stop_while_busy(&mut self) -> bool {
@@ -2904,11 +2921,13 @@ impl Controller {
         let Some(plan) = self.stop.as_mut() else {
             return false;
         };
-        if !plan.force
-            || plan.stage != StopStage::AwaitExit
+        let Some(force_since_ms) = plan.force_since_ms.filter(|_| plan.force) else {
+            return false;
+        };
+        if plan.stage != StopStage::AwaitExit
             || !fresh
             || !busy
-            || now_ms.saturating_sub(plan.since_ms) >= ms(FORCE_STOP_ENGINE_PATIENCE)
+            || now_ms.saturating_sub(force_since_ms) >= ms(FORCE_STOP_ENGINE_PATIENCE)
         {
             return false;
         }
@@ -2934,10 +2953,14 @@ impl Controller {
         let now = self.now();
         let now_ms = self.now_ms();
         let exit_wait = self.limits().stop_exit_wait;
-        let (since_ms, kills) = self
-            .stop
-            .as_ref()
-            .map_or((now_ms, 0), |plan| (plan.since_ms, plan.kills));
+        let (since_ms, force_since_ms, kills) =
+            self.stop.as_ref().map_or((now_ms, now_ms, 0), |plan| {
+                (
+                    plan.since_ms,
+                    plan.force_since_ms.unwrap_or(now_ms),
+                    plan.kills,
+                )
+            });
         let Some(worker) = self.worker.as_mut() else {
             self.stop = None;
             let exit = self.no_exit();
@@ -2958,6 +2981,7 @@ impl Controller {
             force: true,
             stage: StopStage::Killing,
             since_ms,
+            force_since_ms: Some(force_since_ms),
             deadline: Some(now + exit_wait),
             deadline_ms: now_ms.saturating_add(ms(exit_wait)),
             after,
