@@ -1072,21 +1072,54 @@ impl Engine {
         // `Engine::control` does): a deferred read-then-write transaction fails
         // at once with SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT when another connection
         // (the bulk transfer view, a pooled secondary store) writes meanwhile.
+        // The bytes of a retained save are stored (hashed, copied, synced,
+        // installed) before the writer slot is taken below, so the slot is
+        // held for the commit, not for the copy (WP4.INT re-review: another
+        // connection's writer failed after its 5 s busy timeout behind a
+        // multi-GiB pending save). A failure is retained as below.
+        let stored: Result<Option<String>> = if pending {
+            match &mut session.bytes {
+                crate::staging::Staged::Memory(bytes) => self.store.put_object(bytes),
+                staged => staged
+                    .reader()
+                    .and_then(|mut source| self.store.put_stream(&mut source)),
+            }
+            .map(Some)
+        } else {
+            Ok(None)
+        };
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.retain_pending(entity, &error)
+                    .context("PENDING_SAVE_PERSIST_FAILED")?;
+                return Err(error);
+            }
+        };
         let outer = if pending {
             Some(begin_staged_save(&self.store.db)?)
         } else {
             None
         };
         let result = (|| {
-            let revision = match &mut session.bytes {
-                crate::staging::Staged::Memory(bytes) => self.store.write_with_base_and_times(
+            let revision = match (stored, &mut session.bytes) {
+                (Some(object), _) => self.store.write_object_with_base_and_times(
                     entity,
                     session.content_base.clone(),
                     session.alive_base.clone(),
-                    bytes,
+                    object,
                     session.preserve_times,
                 )?,
-                staged => {
+                (None, crate::staging::Staged::Memory(bytes)) => {
+                    self.store.write_with_base_and_times(
+                        entity,
+                        session.content_base.clone(),
+                        session.alive_base.clone(),
+                        bytes,
+                        session.preserve_times,
+                    )?
+                }
+                (None, staged) => {
                     let mut source = staged.reader()?;
                     self.store.write_stream_with_base_and_times(
                         entity,

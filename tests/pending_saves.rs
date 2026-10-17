@@ -300,3 +300,59 @@ fn orphaned_spools_are_removed_and_pending_ones_kept() {
     assert!(kept.exists(), "a pending save's staging file was removed");
     assert_eq!(engine.sessions.len(), 1);
 }
+
+/// The production review's minor (RC9): a retained save opened its
+/// `BEGIN IMMEDIATE` before storing the file's bytes, so SQLite's writer slot
+/// was held for the whole hash, copy and sync of the object (another
+/// connection's writer failed after its 5 s busy timeout behind a 3 GiB
+/// save). The bytes are now stored first: while the flush runs, another
+/// connection finds the writer slot free for a good part of it (before the
+/// fix: never after the first moments).
+#[test]
+fn a_retained_save_takes_the_writer_only_for_its_commit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::new(Store::open(dir.path(), Some(REPO)).unwrap());
+    let large: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+    let (h, entry) = engine.open("large.bin", Some("file"), true).unwrap();
+    engine.write(h, 0, &large, false, false).unwrap();
+    assert_eq!(engine.retain_all_dirty().unwrap(), 1);
+    let flushing = Arc::new(AtomicBool::new(true));
+    let probe = {
+        let flushing = flushing.clone();
+        let database = dir.path().join("metadata.sqlite");
+        std::thread::spawn(move || {
+            let other = rusqlite::Connection::open(database).unwrap();
+            other.busy_timeout(Duration::ZERO).unwrap();
+            let (mut free, mut held) = (0u32, 0u32);
+            while flushing.load(Ordering::Relaxed) {
+                match other.execute_batch("BEGIN IMMEDIATE") {
+                    Ok(()) => {
+                        other.execute_batch("ROLLBACK").unwrap();
+                        free += 1;
+                    }
+                    Err(_) => held += 1,
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            (free, held)
+        })
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    engine.flush(h).unwrap();
+    flushing.store(false, Ordering::Relaxed);
+    let (free, held) = probe.join().unwrap();
+    assert!(!engine.sessions[&entry.id].dirty);
+    assert!(pending_entities(&engine).is_empty());
+    let saved = engine.store.lookup("large.bin").unwrap();
+    assert_eq!(saved.content.as_deref(), Some(hash(&large).as_str()));
+    let samples = free + held;
+    eprintln!("writer slot free for {free} of {samples} probes during the save");
+    assert!(samples >= 20, "{free} free, {held} held");
+    // The probe ran 20 ms before the flush; the copy phase must leave the
+    // slot free for a good part of the rest.
+    assert!(
+        f64::from(free) / f64::from(samples) >= 0.3,
+        "the writer slot was free for {free} of {samples} probes during the save"
+    );
+}

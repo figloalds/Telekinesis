@@ -267,7 +267,7 @@ dirty file, logs, and exits 70; the daemon restarts the worker.
 
 | Holder | Engine lock? |
 |---|---|
-| filesystem callbacks | yes, short holds; content hydration and hashing outside it |
+| filesystem callbacks | yes; content hydration (a read of bytes still downloading) waits outside it, but saving a file hashes and copies it into the object store under it, and the first write to a file larger than 256 KiB copies it to a staging file under it, so those holds grow with the file (about 2 s per 256 MiB); a pending save's commit takes SQLite's writer slot only after its bytes are stored |
 | activator | slices of ≤ 64 events or 25 ms; yields while filesystem callbacks wait |
 | feed RPCs, `objects.*`, `status`, `hello`, `watch` | no: pooled secondary SQLite connections; status from the status cell |
 | control ops (mkdir, resolve, checkout, …) | yes |
