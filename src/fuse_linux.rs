@@ -1223,6 +1223,9 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if [18, 20, 29, 10, 11, 12, 45].contains(&op) {
+                fenced(&engine)?;
+            }
             match op {
                 // A close(2): the save goes on in the background
                 // (`save_handle_in_background`; an fsync waits for it).
@@ -1279,6 +1282,12 @@ fn content_wait() -> crate::runtime::content::ContentWait {
         cancelled: adapter::fenced,
     }
 }
+/// `BUSY_VIEW` while a detach or checkout fences the engine (`dispatch`'s
+/// rule, applied before the work a request does without the lock).
+fn fenced(engine: &Shared) -> Result<()> {
+    ensure!(!lock_engine(engine).switching, "BUSY_VIEW");
+    Ok(())
+}
 /// `body` with its `setattr` valid mask replaced by `valid`.
 fn with_valid(body: &[u8], valid: u32) -> Vec<u8> {
     let mut body = body.to_vec();
@@ -1298,6 +1307,9 @@ fn threaded(
     body: &[u8],
 ) -> Result<Vec<u8>> {
     use crate::runtime::{content, engine::save_handle};
+    // The work before the lock honours the fence as `dispatch` does: a
+    // detach or checkout stops every request but the few `dispatch` exempts.
+    fenced(engine)?;
     match op {
         15 | 16 => {
             let handle = u64_at(body, 0)?;
@@ -1394,7 +1406,7 @@ fn setattr_size(
         let mut e = lock_engine(engine);
         match &truncated {
             Ok(()) => e.close(handle)?,
-            Err(_) => e.release_handle(handle),
+            Err(_) => e.release_handle(handle)?,
         }
     }
     truncated?;
