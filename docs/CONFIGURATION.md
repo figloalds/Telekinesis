@@ -69,7 +69,7 @@ data/                            data_directory
     worker.json                  the running worker's identity (pid, start time,
                                  executable, version) and token
     worker.log                   the worker's startup lines and errors
-                                 (rotated at start: worker.log.1 …)
+                                 (rotated at start and past 10 MiB: worker.log.1 …)
 mounts/<label>/                  default mount points
 ```
 
@@ -90,9 +90,11 @@ runs; `orchestrator.token` is written by each daemon when it starts.
   desktop's **Log** button opens it; `manage status` shows its path (`log`).
 - **Workers**: `DATA/states/<state>/worker.log`: the startup lines, the Ready
   line (its token redacted) and the worker's JSON log lines, appended while
-  it runs. When a worker
-  starts and the file is larger than 10 MiB, it is rotated first
-  (`worker.log.1` …). The last lines of it are shown as a folder's
+  it runs. When a worker starts and the file is larger than 10 MiB, it is
+  rotated first (`worker.log.1` …, five files at most); while it runs, the
+  worker checks every 10 s and rotates it the same way past 10 MiB (it
+  copies the file to `worker.log.1` and empties it, so a line written at
+  that moment can be lost). The last lines of it are shown as a folder's
   `last exit` when no fatal line explains an exit.
 - No log line carries a pairing code, a per-peer secret or a token: fields
   with such names are written `<redacted>`.

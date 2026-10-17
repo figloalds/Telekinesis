@@ -38,7 +38,9 @@
 //! rotation is logged and the worker still starts, appending to the old file.
 //! A worker only appends while it runs, and a new one is spawned only after
 //! the previous one released `owner.lock` (invariant 23), so nothing writes
-//! the file while it is renamed. [`RealLauncher::new`] also adopts the
+//! the file while it is renamed. While a worker runs, its maintenance thread
+//! bounds the file in place (`worker::maintenance::bound_worker_log`, WP4.INT
+//! re-review: copy and truncate, which the append handles follow). [`RealLauncher::new`] also adopts the
 //! desktop's daemon log (`util::log::adopt_desktop_log`): a daemon the desktop
 //! started has its stdout and stderr appended to `DATA/logs/orchestrator.log`,
 //! and that file becomes its rotating JSON-line log. The launcher is built

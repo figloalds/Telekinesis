@@ -32,6 +32,17 @@
 //!   nothing to scrub; the scrubber verifies `Lazy` startups' rows and re-reads
 //!   old objects for bit rot.
 //!
+//! * **`worker.log`** (WP4.INT re-review): every [`LOG_CHECK_INTERVAL`], a
+//!   `STATE/worker.log` larger than the launcher's rotation size (10 MiB) is
+//!   rotated in place ([`bound_worker_log`]): the older files shift
+//!   (`worker.log.1` → `.2` …, at most the launcher's file count), the live
+//!   file is copied to `worker.log.1` and truncated. Copy and truncate, not
+//!   rename: the worker's standard error and the daemon's copy of its
+//!   standard output write it through append handles that follow a
+//!   truncation, so nothing has to reopen it. The launcher rotated it only at
+//!   spawn, and a worker adopted by later daemons appended to it without
+//!   bound. A line written between the copy and the truncation is lost.
+//!
 //! Every step runs on a pooled secondary store or under a brief `try_lock`:
 //! maintenance never waits for the engine. Failures are logged.
 use crate::{
@@ -64,6 +75,40 @@ pub const WAL_TRUNCATE_FRAMES: i64 = 16_384;
 /// How long that truncation waits for readers still reading the WAL. It holds
 /// SQLite's writer lock meanwhile, so writers wait at most as long.
 pub const WAL_TRUNCATE_WAIT: Duration = Duration::from_millis(20);
+/// How often `worker.log`'s size is checked ([`bound_worker_log`]).
+pub const LOG_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Rotates `log` in place when it is larger than `max_bytes` (module docs):
+/// `log.<files-2>` → `log.<files-1>` … `log.1` → `log.2` (the oldest
+/// dropped), then `log` is copied to `log.1` and truncated. Returns whether
+/// it rotated. A missing file is not an error.
+pub fn bound_worker_log(
+    log: &std::path::Path,
+    max_bytes: u64,
+    files: usize,
+) -> std::io::Result<bool> {
+    use std::fs;
+    let numbered = |index: usize| {
+        let mut name = log.as_os_str().to_owned();
+        name.push(format!(".{index}"));
+        std::path::PathBuf::from(name)
+    };
+    match fs::metadata(log) {
+        Ok(metadata) if metadata.len() > max_bytes && files >= 2 => {}
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    }
+    for index in (1..files - 1).rev() {
+        let from = numbered(index);
+        if from.exists() {
+            fs::rename(&from, numbered(index + 1))?;
+        }
+    }
+    fs::copy(log, numbered(1))?;
+    fs::OpenOptions::new().write(true).open(log)?.set_len(0)?;
+    Ok(true)
+}
 
 /// Starts the `maintenance` thread; it ends when the worker is stopping.
 pub fn spawn(ctx: Arc<WorkerCtx>) -> std::io::Result<JoinHandle<()>> {
@@ -77,6 +122,7 @@ fn run(ctx: &WorkerCtx) {
         vitals: lock_engine(&ctx.engine).vitals.clone(),
         next_full: None,
         next_scrub: None,
+        next_log_check: None,
         store: None,
     };
     let mut errors = crate::util::backoff::Backoff::inbox();
@@ -116,6 +162,8 @@ struct Maintenance {
     vitals: Arc<EngineVitals>,
     /// No full refresh before this.
     next_full: Option<Instant>,
+    /// No `worker.log` size check before this.
+    next_log_check: Option<Instant>,
     /// No scrub step before this (the rate cap).
     next_scrub: Option<Instant>,
     /// The connection the status refresh runs on, kept so its content scan
@@ -157,6 +205,16 @@ impl Maintenance {
             && status_cell::activator_idle(ctx, SCRUB_QUIET)
         {
             self.scrub(ctx);
+        }
+        if self.next_log_check.is_none_or(|at| now >= at) {
+            self.next_log_check = Some(now + LOG_CHECK_INTERVAL);
+            if let Err(error) = bound_worker_log(
+                &ctx.state.join("worker.log"),
+                crate::orchestrator::process::WORKER_LOG_ROTATE_BYTES,
+                crate::orchestrator::process::WORKER_LOG_FILES,
+            ) {
+                log("worker.maintenance.log", &error.into());
+            }
         }
     }
 
