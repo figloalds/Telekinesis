@@ -710,6 +710,9 @@ struct Activator {
     starving: BTreeMap<String, Starving>,
     /// When `starving` was last checked against the inbox.
     starving_checked: Option<Instant>,
+    /// Phase timings at the last dump (`dump_phases`).
+    phases: BTreeMap<String, (u64, u64)>,
+    phases_at: Option<Instant>,
 }
 
 /// One event whose slow commit keeps going `Stale`.
@@ -733,6 +736,8 @@ impl Activator {
             writer_busy_since: None,
             starving: BTreeMap::new(),
             starving_checked: None,
+            phases: BTreeMap::new(),
+            phases_at: None,
         }
     }
 
@@ -894,7 +899,40 @@ impl Activator {
             thread::sleep(IDLE_SLICE_PAUSE);
         }
         self.checkpoint(ctx, journaled);
+        self.dump_phases();
         Ok(more)
+    }
+
+    /// Profiling aid (temporary): with `TKFS_DERIVE_PHASES=1`, the activator
+    /// thread's derivation phase timings since the last dump, every 60 s.
+    fn dump_phases(&mut self) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("TKFS_DERIVE_PHASES").as_deref() == Ok("1")) {
+            return;
+        }
+        if self
+            .phases_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return;
+        }
+        self.phases_at = Some(Instant::now());
+        let now = crate::core::derive::thread_phase_micros();
+        let mut diff: Vec<(String, u64, u64)> = now
+            .iter()
+            .map(|(k, (c, m))| {
+                let (c0, m0) = self.phases.get(*k).copied().unwrap_or((0, 0));
+                (k.to_string(), c - c0, (m - m0) / 1000)
+            })
+            .filter(|(_, c, _)| *c > 0)
+            .collect();
+        diff.sort_by(|a, b| b.2.cmp(&a.2));
+        eprintln!(
+            "DERIVE_PHASES {} {}",
+            now_ms(),
+            serde_json::to_string(&diff).unwrap_or_default()
+        );
+        self.phases = now.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     }
 
     /// The off-lock WAL checkpoint after a seal, or after

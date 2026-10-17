@@ -852,7 +852,7 @@ impl Store {
                 return Ok(Attempt::Deferred);
             }
         }
-        let checked = match self.check_commit(&event, false) {
+        let checked = match super::derive::timed("i.check", || self.check_commit(&event, false)) {
             Ok(Check::Committed) => {
                 let released = self.finish_row(id)?;
                 return Ok(Attempt::Activated {
@@ -863,10 +863,11 @@ impl Store {
             Ok(Check::Ready(checked)) => checked,
             Err(error) => return self.fail(id, error),
         };
-        let fast = match self.fast_successor(&event, false) {
-            Ok(fast) => fast,
-            Err(error) => return self.fail(id, error),
-        };
+        let fast =
+            match super::derive::timed("i.fast_successor", || self.fast_successor(&event, false)) {
+                Ok(fast) => fast,
+                Err(error) => return self.fail(id, error),
+            };
         if fast.is_none() {
             if !inline_slow {
                 return Ok(Attempt::Ticket(SlowTicket {
