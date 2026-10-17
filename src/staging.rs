@@ -153,6 +153,9 @@ impl Staged {
             verified: OnceLock::new(),
         })
     }
+    /// `(path, object, size)` of a reference whose bytes were not verified
+    /// yet (`runtime::prepare_content` verifies them off the engine lock).
+    /// An empty one has no bytes to verify (every new file's session is one).
     pub fn reference(&self) -> Option<(&Path, &str, usize)> {
         if let Self::Reference {
             path,
@@ -161,6 +164,7 @@ impl Staged {
             verified,
         } = self
             && verified.get().is_none()
+            && *size > 0
         {
             return Some((path, object, *size));
         }
