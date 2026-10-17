@@ -457,10 +457,11 @@ impl Store {
         }
     }
     pub(super) fn commit_ready(&mut self, event: Event, local: bool) -> Result<()> {
-        let Check::Ready(checked) = self.check_commit(&event, local)? else {
+        let Check::Ready(checked) = derive::timed("c.check", || self.check_commit(&event, local))?
+        else {
             return Ok(());
         };
-        let fast = self.fast_successor(&event, local)?;
+        let fast = derive::timed("c.fast_successor", || self.fast_successor(&event, local))?;
         self.commit_checked(event, local, checked, fast)
     }
     /// Every validation of the commit path that needs no projection.
@@ -765,7 +766,7 @@ impl Store {
     /// happens only if the branch is still in that state (`commit_prepared`).
     fn projection_delta(&self, branch: &str, p: &Projection) -> Stored {
         self.drop_rolled_back_view();
-        let Ok(view) = self.view(branch) else {
+        let Ok(view) = derive::timed("s.view", || self.view(branch)) else {
             return Stored::Rewrite;
         };
         let stored = &view.projection;
@@ -830,26 +831,31 @@ impl Store {
         precompute: bool,
     ) -> Result<Option<Box<SlowPlan>>> {
         let branch = event.branch.id.as_str();
-        let computed =
+        let computed = derive::timed("s.compute", || {
+            let t0 = std::time::Instant::now();
             self.with_branch_events(branch, Some(event), committed_view, |events| {
-                let projection = project(branch, events)?;
+                derive::record_phase("s.events", t0.elapsed().as_micros() as u64);
+                let projection = derive::timed("s.project", || project(branch, events))?;
                 if !projection.pending.is_empty() {
                     return Ok(None);
                 }
                 let reviewed = derive::read_reviewed(&self.db, branch, event)?;
-                let derived = derive_conflicts(&DeriveInput {
-                    branch,
-                    projection: &projection,
-                    events,
-                    new_event: Some(&event.id),
-                    reviewed: &reviewed,
+                let derived = derive::timed("s.derive", || {
+                    derive_conflicts(&DeriveInput {
+                        branch,
+                        projection: &projection,
+                        events,
+                        new_event: Some(&event.id),
+                        reviewed: &reviewed,
+                    })
                 })?;
                 Ok::<_, anyhow::Error>(Some((projection, derived)))
-            })??;
+            })
+        })??;
         let Some((projection, derived)) = computed else {
             return Ok(None);
         };
-        let stored = self.projection_delta(branch, &projection);
+        let stored = derive::timed("s.delta", || self.projection_delta(branch, &projection));
         let (json, slots) = if precompute {
             let json = (!stored.is_delta() || !snapshot::sealed_as_rows(&self.db, branch))
                 .then(|| serde_json::to_string(&projection))
@@ -906,7 +912,10 @@ impl Store {
         if crate::util::fault::hit(BUSY_FAULT).is_some() {
             return Err(injected_busy().into());
         }
-        let result = self.write_commit_inner(event, local, checked, plan, view_base);
+        let slow = matches!(plan, Plan::Slow(_));
+        let result = derive::timed(if slow { "w.slow" } else { "w.fast" }, || {
+            self.write_commit_inner(event, local, checked, plan, view_base)
+        });
         if result.is_err() {
             // The view may have been patched for the seal.
             self.view_cache.borrow_mut().take();
@@ -1012,7 +1021,9 @@ impl Store {
                     tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload", params![branch, state])?;
                     snapshot::clear_header(&tx, &branch)?;
                 }
-                derive::write_projection(&tx, &branch, &slow.derived)?;
+                derive::timed("w.write_projection", || {
+                    derive::write_projection(&tx, &branch, &slow.derived)
+                })?;
             }
         }
         for parent in event
@@ -1084,16 +1095,18 @@ impl Store {
                     }
                     Stored::Rewrite => snapshot::Changed::All,
                 };
-                let report = snapshot::seal(
-                    &tx,
-                    &branch,
-                    snapshot::Seal {
-                        cursor: Some(seq),
-                        projection: Some(&slow.projection),
-                        json: slow.json.as_deref(),
-                        changed,
-                    },
-                )?;
+                let report = derive::timed("w.seal_slow", || {
+                    snapshot::seal(
+                        &tx,
+                        &branch,
+                        snapshot::Seal {
+                            cursor: Some(seq),
+                            projection: Some(&slow.projection),
+                            json: slow.json.as_deref(),
+                            changed,
+                        },
+                    )
+                })?;
                 record_seal(&self.caches.commit, &report);
                 if report.used_json {
                     let seals = &self.caches.commit.prepared_seals;

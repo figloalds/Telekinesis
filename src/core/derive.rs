@@ -172,7 +172,7 @@
 use super::*;
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{
         Arc, Mutex, OnceLock, PoisonError,
@@ -366,6 +366,33 @@ pub fn derive_counters() -> DeriveCounters {
 #[doc(hidden)]
 pub fn thread_derive_counters() -> DeriveCounters {
     THREAD_COUNTERS.with(Cell::get)
+}
+
+thread_local! {
+    static PHASES: RefCell<BTreeMap<&'static str, (u64, u64)>> = const { RefCell::new(BTreeMap::new()) };
+}
+/// Time `f` as phase `name` on the calling thread (profiling).
+#[doc(hidden)]
+pub fn timed<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let value = f();
+    record_phase(name, started.elapsed().as_micros() as u64);
+    value
+}
+/// Add `micros` to phase `name` (profiling).
+#[doc(hidden)]
+pub fn record_phase(name: &'static str, micros: u64) {
+    PHASES.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let entry = map.entry(name).or_default();
+        entry.0 += 1;
+        entry.1 += micros;
+    });
+}
+/// The calling thread's phase timings: name -> (calls, micros).
+#[doc(hidden)]
+pub fn thread_phase_micros() -> BTreeMap<&'static str, (u64, u64)> {
+    PHASES.with(|cell| cell.borrow().clone())
 }
 
 /// Why the calling thread's most recent append attempt derived in full.
@@ -734,56 +761,111 @@ fn derive_full_with(input: &DeriveInput, new_event: Option<&str>) -> Result<Vec<
     if new_event.is_some() {
         conflicts.extend(input.reviewed.iter().cloned());
     }
+    let ns = NsContext::new(branch, events);
+    let pending: HashSet<&str> = p.pending.iter().map(String::as_str).collect();
+    let activated: Vec<bool> = events
+        .iter()
+        .map(|e| !pending.contains(e.id.as_str()))
+        .collect();
     // Namespace collisions also have a deterministic historical basis. A later
     // rename arriving first must not erase evidence of concurrent same-name
     // placement. Sequential temp replacement is ordered by event context.
-    let activated: Vec<_> = events
-        .iter()
-        .filter(|e| !p.pending.contains(&e.id))
-        .collect();
-    let mut locations = vec![];
-    for e in &activated {
-        for c in &e.changes {
-            if c.field == "location" {
-                locations.push((*e, c));
-            }
-        }
-    }
-    // Each change's slot name key is computed once, in the order the pairwise
-    // comparison first needs it (so a failure surfaces at the same pair).
-    let mut keys: Vec<Option<String>> = vec![None; locations.len()];
-    for (i, &(a, ac)) in locations.iter().enumerate() {
-        crate::startup::progress("rebuilding namespace conflicts");
-        for (j, &(b, bc)) in locations.iter().enumerate().skip(i + 1) {
-            if ac.entity == bc.entity || ac.value["parent"] != bc.value["parent"] {
-                continue;
-            }
-            for k in [i, j] {
-                if keys[k].is_none() {
-                    keys[k] = Some(name_key(locations[k].1.value["name"].as_str().unwrap())?);
-                }
-            }
-            if keys[i] != keys[j] {
-                continue;
-            }
-            if let Some(c) = concurrent_placement(branch, events, (a, ac), (b, bc)) {
-                conflicts.push(c);
-            }
-        }
-    }
+    conflicts.extend(timed("f.location_pairs", || {
+        full_location_pairs(&ns, &activated)
+    })?);
     // Explicit reviews carry their observed cut. Recover namespace records from
     // it even when resolution was delivered before its prerequisites.
-    for e in &activated {
-        if !e.reviewed.is_empty() {
-            conflicts.extend(reviewed_cut(branch, events, e)?);
+    for (i, e) in events.iter().enumerate() {
+        if activated[i] && !e.reviewed.is_empty() {
+            conflicts.extend(timed("f.reviewed_cut", || ns.reviewed_cut(i))?);
         }
     }
     // Every namespace causal cut is represented by an antichain of maximal
     // namespace-changing events. Include arbitrary-width concurrency, not just
     // pairs; content-only events add no new namespace projection. The explicit
     // budget refuses a commit before acknowledgement rather than losing history.
-    conflicts.extend(NsContext::new(branch, events).full()?);
-    conflicts.extend(register_pairs(branch, p, events, new_event));
+    conflicts.extend(timed("f.ns", || ns.full())?);
+    conflicts.extend(timed("f.register_pairs", || {
+        register_pairs(branch, p, events, new_event)
+    }));
+    Ok(conflicts)
+}
+
+/// Every pair of location changes of activated events (in event, then
+/// change order) that place two different entities into one slot without
+/// one event being an ancestor of the other: full mode's location pairs, in
+/// the order full mode evaluates them (WP5.1: grouped by slot, with the
+/// ancestry read from the memoized closures instead of one `BTreeSet` of
+/// ids per event and pair). A name that cannot be keyed, or a location
+/// value that is not a `{parent, name}` pair of strings, takes the reference
+/// loop (`reference_location_pairs`), which raises or panics exactly where
+/// the historical code does.
+fn full_location_pairs(ns: &NsContext, activated: &[bool]) -> Result<Vec<Conflict>> {
+    let events = ns.events;
+    let mut rows: Vec<(usize, &Change)> = vec![];
+    for (i, e) in events.iter().enumerate() {
+        if activated[i] {
+            rows.extend(
+                e.changes
+                    .iter()
+                    .filter(|c| c.field == "location")
+                    .map(|c| (i, c)),
+            );
+        }
+    }
+    let mut slots: HashMap<(&str, Arc<str>), Vec<usize>> = HashMap::new();
+    for (k, (_, c)) in rows.iter().enumerate() {
+        let (Some(parent), Some(name)) = (c.value["parent"].as_str(), c.value["name"].as_str())
+        else {
+            return reference_location_pairs(ns, &rows);
+        };
+        let Ok(key) = slot_key(name) else {
+            return reference_location_pairs(ns, &rows);
+        };
+        slots.entry((parent, key)).or_default().push(k);
+    }
+    let mut found: Vec<(usize, usize)> = vec![];
+    for members in slots.values() {
+        for (x, &i) in members.iter().enumerate() {
+            crate::startup::progress("rebuilding namespace conflicts");
+            for &j in &members[x + 1..] {
+                if rows[i].1.entity != rows[j].1.entity && !ns.related(rows[i].0, rows[j].0) {
+                    found.push((i, j));
+                }
+            }
+        }
+    }
+    found.sort_unstable();
+    Ok(found
+        .into_iter()
+        .map(|(i, j)| placement_record(ns.branch, events, rows[i], rows[j]))
+        .collect())
+}
+
+/// The historical location-pair loop (Wave 0), for histories whose location
+/// values the grouped evaluation does not handle.
+fn reference_location_pairs(ns: &NsContext, rows: &[(usize, &Change)]) -> Result<Vec<Conflict>> {
+    let mut conflicts = vec![];
+    let mut keys: Vec<Option<String>> = vec![None; rows.len()];
+    for (i, &(a, ac)) in rows.iter().enumerate() {
+        crate::startup::progress("rebuilding namespace conflicts");
+        for (j, &(b, bc)) in rows.iter().enumerate().skip(i + 1) {
+            if ac.entity == bc.entity || ac.value["parent"] != bc.value["parent"] {
+                continue;
+            }
+            for k in [i, j] {
+                if keys[k].is_none() {
+                    keys[k] = Some(name_key(rows[k].1.value["name"].as_str().unwrap())?);
+                }
+            }
+            if keys[i] != keys[j] {
+                continue;
+            }
+            if !ns.related(a, b) {
+                conflicts.push(placement_record(ns.branch, ns.events, (a, ac), (b, bc)));
+            }
+        }
+    }
     Ok(conflicts)
 }
 
@@ -801,88 +883,79 @@ fn reviewed_rows(
     }
 }
 
-/// The record of two placements of different entities into one slot, unless
-/// one event is an ancestor of the other.
-fn concurrent_placement(
+/// The record of two placements of different entities into one slot (the
+/// caller has checked that neither event is an ancestor of the other).
+fn placement_record(
     branch: &str,
     events: &[Event],
-    (a, ac): (&Event, &Change),
-    (b, bc): (&Event, &Change),
-) -> Option<Conflict> {
-    if event_ancestors(a, events).contains(&b.id) || event_ancestors(b, events).contains(&a.id) {
-        return None;
-    }
+    (a, ac): (usize, &Change),
+    (b, bc): (usize, &Change),
+) -> Conflict {
     let mut entities = [ac.entity.clone(), bc.entity.clone()];
     entities.sort();
     let alternatives = [(a, ac), (b, bc)]
         .into_iter()
-        .map(|(e, c)| Version {
-            revision: e.id.clone(),
-            device: e.device.clone(),
-            created_ms: e.created_ms,
-            parents: c.parents.clone(),
-            value: c.value.clone(),
-        })
+        .map(|v| version_of(events, v))
         .collect();
-    Some(make_conflict(
+    make_conflict(
         branch,
         &entities.join(","),
         "namespace",
         "same name / file-directory collision",
         alternatives,
         vec![],
-    ))
-}
-
-/// Every record of the projection of a review's observed (ancestor) cut.
-fn reviewed_cut(branch: &str, events: &[Event], e: &Event) -> Result<Vec<Conflict>> {
-    let ancestors = event_ancestors(e, events);
-    let cut: Vec<&Event> = events
-        .iter()
-        .filter(|prior| ancestors.contains(&prior.id))
-        .collect();
-    Ok(project_refs(branch, &cut)?.conflicts)
+    )
 }
 
 /// Historical register pairs: on append, the new event's version against every
-/// other version of each register it changes; on rebuild, every pair.
+/// other version of each register it changes; on rebuild, every pair. WP5.1:
+/// over borrowed versions; only the records' versions are cloned.
 fn register_pairs(
     branch: &str,
     p: &Projection,
     events: &[Event],
     new_event: Option<&str>,
 ) -> Vec<Conflict> {
+    let pending: HashSet<&str> = p.pending.iter().map(String::as_str).collect();
     // On append only the new event's registers can yield pairs (any other
     // register has no candidate version and is skipped below).
-    let wanted: Option<BTreeSet<String>> = new_event.map(|id| {
+    let wanted: Option<HashSet<(&str, &str)>> = new_event.map(|id| {
         events
             .iter()
-            .filter(|e| e.id == id && !p.pending.contains(&e.id))
-            .flat_map(|e| e.changes.iter().map(|c| register(&c.entity, &c.field)))
+            .filter(|e| e.id == id && !pending.contains(e.id.as_str()))
+            .flat_map(|e| {
+                e.changes
+                    .iter()
+                    .map(|c| (c.entity.as_str(), c.field.as_str()))
+            })
             .collect()
     });
     // Derive historical concurrent pairs from the full activated DAG too, so a
     // fast-forward delivered before a competitor cannot hide the earlier pair.
-    let mut history: BTreeMap<String, Vec<Version>> = BTreeMap::new();
-    for e in events.iter().filter(|e| !p.pending.contains(&e.id)) {
+    let mut history: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::new();
+    for (i, e) in events.iter().enumerate() {
+        if pending.contains(e.id.as_str()) {
+            continue;
+        }
         for c in &e.changes {
-            let key = register(&c.entity, &c.field);
+            let key = (c.entity.as_str(), c.field.as_str());
             if wanted.as_ref().is_some_and(|wanted| !wanted.contains(&key)) {
                 continue;
             }
-            history.entry(key).or_default().push(Version {
-                revision: e.id.clone(),
-                device: e.device.clone(),
-                created_ms: e.created_ms,
-                parents: c.parents.clone(),
-                value: c.value.clone(),
-            });
+            history.entry(key).or_default().push((i, c));
         }
     }
+    let mut keys: Vec<(String, (&str, &str))> = history
+        .keys()
+        .map(|&(entity, field)| (register(entity, field), (entity, field)))
+        .collect();
+    keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut conflicts = vec![];
-    for (key, versions) in &history {
+    for (_, (entity, field)) in keys {
         crate::startup::progress("rebuilding register conflicts");
-        let candidate = new_event.and_then(|id| versions.iter().position(|v| v.revision == id));
+        let versions = &history[&(entity, field)];
+        let candidate =
+            new_event.and_then(|id| versions.iter().position(|(i, _)| events[*i].id == id));
         if new_event.is_some() && candidate.is_none() {
             continue;
         }
@@ -891,8 +964,7 @@ fn register_pairs(
         if linear_versions(versions) {
             continue;
         }
-        let reach = VersionReach::new(versions);
-        let (entity, field) = key.rsplit_once('/').unwrap();
+        let reach = VersionReach::new(events, versions);
         // Appending a validated event cannot change old/old register ancestry.
         // Keep their durable records and derive only new/old pairs on append.
         // Startup/repair still derives the entire historical set from the DAG.
@@ -909,15 +981,13 @@ fn register_pairs(
         };
         for (i, j) in pairs {
             crate::startup::progress("rebuilding register conflicts");
-            let a = &versions[i];
-            let b = &versions[j];
-            if a.value != b.value && !reach.has(i, j) && !reach.has(j, i) {
-                let mut bases: Vec<_> = versions
+            let (a, b) = (versions[i], versions[j]);
+            if a.1.value != b.1.value && !reach.has(i, j) && !reach.has(j, i) {
+                let mut bases: Vec<Version> = versions
                     .iter()
                     .enumerate()
                     .filter(|(k, _)| reach.has(i, *k) && reach.has(j, *k))
-                    .map(|(_, v)| v)
-                    .cloned()
+                    .map(|(_, &v)| version_of(events, v))
                     .collect();
                 bases.sort_by(|a, b| a.revision.cmp(&b.revision));
                 conflicts.push(make_conflict(
@@ -925,7 +995,7 @@ fn register_pairs(
                     entity,
                     field,
                     "concurrent revisions",
-                    vec![a.clone(), b.clone()],
+                    vec![version_of(events, a), version_of(events, b)],
                     bases,
                 ));
             }
@@ -1181,11 +1251,8 @@ impl<'a> Locations<'a> {
 /// causally before it (through its presence parents). Then no visible entry
 /// of any cut lacks a valid name, so a cone's records can be projected from
 /// its own registers (`NsContext::namespace_records`).
-fn projection_cannot_fail(
-    events: &[Event],
-    locations: &Locations,
-    alive: &BTreeMap<&str, Vec<(usize, &Change)>>,
-) -> bool {
+fn projection_cannot_fail(ns: &NsContext, locations: &Locations) -> bool {
+    let events = ns.events;
     if locations.rows.iter().any(|row| row.key.is_err()) {
         return false;
     }
@@ -1200,8 +1267,12 @@ fn projection_cannot_fail(
             return false;
         }
     }
-    for (&entity, versions) in alive {
-        let index: BTreeMap<&str, usize> = versions
+    for (entity, versions) in ns.alive.iter().enumerate() {
+        if versions.is_empty() {
+            continue;
+        }
+        let entity = ns.names[entity];
+        let index: HashMap<&str, usize> = versions
             .iter()
             .enumerate()
             .map(|(k, (i, _))| (events[*i].id.as_str(), k))
@@ -1267,109 +1338,180 @@ impl Contributions {
 
 /// `NamespaceCones` of the whole branch, built once, with per-edge
 /// contributions so the cones without the new event come from the same
-/// graph (the new event adds at most one placement).
-struct ConeGraph<'a> {
-    nodes: BTreeMap<&'a str, Contributions>,
-    parents: BTreeMap<&'a str, BTreeMap<&'a str, Contributions>>,
-    children: BTreeMap<&'a str, BTreeSet<&'a str>>,
-    entity_slots: BTreeMap<&'a str, BTreeSet<(&'a str, &'a str)>>,
-    slots: BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Contributions>>,
+/// graph (the new event adds at most one placement). WP5.1: entities as
+/// numbers (`NsContext::names`), slots as numbers.
+struct ConeGraph {
+    nodes: Vec<Contributions>,
+    /// Per entity: its parent directories and their contributions.
+    parents: Vec<Vec<(u32, Contributions)>>,
+    /// Per entity: the entities placed under it (distinct).
+    children: Vec<Vec<u32>>,
+    /// Per entity: its slots (distinct).
+    entity_slots: Vec<Vec<u32>>,
+    /// Per slot: its occupants and their contributions.
+    slots: Vec<Vec<(u32, Contributions)>>,
 }
-impl<'a> ConeGraph<'a> {
-    fn new(events: &'a [Event], locations: &'a Locations<'a>, new: usize) -> Self {
+
+/// Cones computed for one `before` setting: entities that share a slot
+/// (transitively, over the edges present then) have one cone.
+#[derive(Default)]
+struct ConeMemo {
+    group: Option<Vec<usize>>,
+    cones: HashMap<usize, Rc<[u32]>>,
+}
+
+impl ConeGraph {
+    fn new(ns: &NsContext, locations: &Locations, new: usize) -> Self {
+        let n = ns.names.len();
         let mut graph = Self {
-            nodes: BTreeMap::new(),
-            parents: BTreeMap::new(),
-            children: BTreeMap::new(),
-            entity_slots: BTreeMap::new(),
-            slots: BTreeMap::new(),
+            nodes: vec![Contributions::default(); n],
+            parents: vec![vec![]; n],
+            children: vec![vec![]; n],
+            entity_slots: vec![vec![]; n],
+            slots: vec![],
         };
-        for (i, e) in events.iter().enumerate() {
+        for (i, e) in ns.events.iter().enumerate() {
             for c in &e.changes {
-                graph.nodes.entry(&c.entity).or_default().add(i == new);
+                graph.nodes[ns.entities[c.entity.as_str()] as usize].add(i == new);
             }
         }
+        let mut slot_ids: HashMap<(&str, &str), u32> = HashMap::new();
         for row in &locations.rows {
             let is_new = row.event == new;
-            let entity = row.change.entity.as_str();
+            let entity = ns.entities[row.change.entity.as_str()];
             if row.parent != ROOT {
-                graph
-                    .parents
-                    .entry(entity)
-                    .or_default()
-                    .entry(row.parent)
-                    .or_default()
-                    .add(is_new);
-                graph.children.entry(row.parent).or_default().insert(entity);
-                graph.nodes.entry(row.parent).or_default().add(is_new);
+                let parent = ns.entities[row.parent];
+                let list = &mut graph.parents[entity as usize];
+                match list.iter_mut().find(|(p, _)| *p == parent) {
+                    Some((_, c)) => c.add(is_new),
+                    None => {
+                        let mut c = Contributions::default();
+                        c.add(is_new);
+                        list.push((parent, c));
+                    }
+                }
+                if !graph.children[parent as usize].contains(&entity) {
+                    graph.children[parent as usize].push(entity);
+                }
+                graph.nodes[parent as usize].add(is_new);
             }
             // Callers check `Locations::first_error` first.
             let key: &str = row.key.as_deref().unwrap_or_default();
-            let slot = (row.parent, key);
-            graph.entity_slots.entry(entity).or_default().insert(slot);
-            graph
-                .slots
-                .entry(slot)
-                .or_default()
-                .entry(entity)
-                .or_default()
-                .add(is_new);
+            let next = slot_ids.len() as u32;
+            let slot = *slot_ids.entry((row.parent, key)).or_insert(next);
+            if slot as usize == graph.slots.len() {
+                graph.slots.push(vec![]);
+            }
+            if !graph.entity_slots[entity as usize].contains(&slot) {
+                graph.entity_slots[entity as usize].push(slot);
+            }
+            let occupants = &mut graph.slots[slot as usize];
+            match occupants.iter_mut().find(|(m, _)| *m == entity) {
+                Some((_, c)) => c.add(is_new),
+                None => {
+                    let mut c = Contributions::default();
+                    c.add(is_new);
+                    occupants.push((entity, c));
+                }
+            }
         }
         graph
     }
     /// Whether `entity` is a node of the history without the new event.
-    fn existed(&self, entity: &str) -> bool {
-        self.nodes.get(entity).is_some_and(|c| c.present(true))
+    fn existed(&self, entity: u32) -> bool {
+        self.nodes[entity as usize].present(true)
     }
     /// The cone of `entity` (`NamespaceCones::cone`), with or without the new
-    /// event's contributions.
-    fn cone(&self, entity: &'a str, before: bool) -> BTreeSet<&'a str> {
+    /// event's contributions. Sorted.
+    fn cone(&self, entity: u32, before: bool) -> Vec<u32> {
         crate::startup::progress("analyzing namespace dependencies");
-        let mut members = BTreeSet::new();
-        let mut visited_slots = BTreeSet::new();
+        let mut members = Bits::new(self.nodes.len());
+        let mut visited_slots = Bits::new(self.slots.len());
         let mut pending = vec![entity];
         while let Some(next) = pending.pop() {
-            if !members.insert(next) {
+            if !members.insert(next as usize) {
                 continue;
             }
-            for (&parent, c) in self.parents.get(next).into_iter().flatten() {
+            for &(parent, c) in &self.parents[next as usize] {
                 if c.present(before) {
                     pending.push(parent);
                 }
             }
-            for &slot in self.entity_slots.get(next).into_iter().flatten() {
-                let occupants = &self.slots[&slot];
-                if occupants[next].present(before) && visited_slots.insert(slot) {
+            for &slot in &self.entity_slots[next as usize] {
+                let occupants = &self.slots[slot as usize];
+                let here = occupants
+                    .iter()
+                    .find(|(m, _)| *m == next)
+                    .is_some_and(|(_, c)| c.present(before));
+                if here && visited_slots.insert(slot as usize) {
                     pending.extend(
                         occupants
                             .iter()
                             .filter(|(_, c)| c.present(before))
-                            .map(|(&m, _)| m),
+                            .map(|&(m, _)| m),
                     );
                 }
             }
         }
-        members
+        members.iter().map(|m| m as u32).collect()
+    }
+    /// `cone`, computed once per group of entities that share a slot
+    /// (transitively, over the edges present with `before`): they have the
+    /// same cone (each one's cone holds the others and so their cones).
+    fn cone_memo(&self, memo: &mut ConeMemo, entity: u32, before: bool) -> Rc<[u32]> {
+        let group = memo.group.get_or_insert_with(|| {
+            let mut group: Vec<usize> = (0..self.nodes.len()).collect();
+            for occupants in &self.slots {
+                let present: Vec<u32> = occupants
+                    .iter()
+                    .filter(|(_, c)| c.present(before))
+                    .map(|&(m, _)| m)
+                    .collect();
+                for pair in present.windows(2) {
+                    let a = union_find(&mut group, pair[0] as usize);
+                    let b = union_find(&mut group, pair[1] as usize);
+                    if a != b {
+                        group[a.max(b)] = a.min(b);
+                    }
+                }
+            }
+            group
+        });
+        let root = union_find(group, entity as usize);
+        memo.cones
+            .entry(root)
+            .or_insert_with(|| self.cone(entity, before).into())
+            .clone()
     }
     /// The entities whose cone (with the new event) contains one of
-    /// `targets`: reverse reachability over parent and slot edges.
-    fn reaching(&self, targets: &BTreeSet<&str>) -> BTreeSet<&'a str> {
-        let mut found = BTreeSet::new();
-        let mut pending: Vec<&'a str> = targets
+    /// `targets`: reverse reachability over parent and slot edges. Sorted.
+    fn reaching(&self, targets: &[u32]) -> Vec<u32> {
+        let mut found = Bits::new(self.nodes.len());
+        let mut pending: Vec<u32> = targets
             .iter()
-            .filter_map(|t| self.nodes.get_key_value(*t).map(|(&k, _)| k))
+            .copied()
+            .filter(|&t| self.nodes[t as usize].present(false))
             .collect();
         while let Some(next) = pending.pop() {
-            if !found.insert(next) {
+            if !found.insert(next as usize) {
                 continue;
             }
-            pending.extend(self.children.get(next).into_iter().flatten().copied());
-            for slot in self.entity_slots.get(next).into_iter().flatten() {
-                pending.extend(self.slots[slot].keys().copied());
+            pending.extend(&self.children[next as usize]);
+            for &slot in &self.entity_slots[next as usize] {
+                pending.extend(self.slots[slot as usize].iter().map(|&(m, _)| m));
             }
         }
-        found
+        found.iter().map(|m| m as u32).collect()
     }
+}
+
+/// The representative of `x`'s group (path halving).
+fn union_find(group: &mut [usize], mut x: usize) -> usize {
+    while group[x] != x {
+        group[x] = group[group[x]];
+        x = group[x];
+    }
+    x
 }
 
 /// `derive_append_with` reading the stored rows the new event reviews from
@@ -1413,35 +1555,43 @@ fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
     let (Some(new), None) = (positions.next(), positions.next()) else {
         return Ok(Plan::Fallback("new event not exactly once in the branch"));
     };
-    if let Some(reason) = append_guard(p, events, new) {
+    if let Some(reason) = timed("a.guard", || append_guard(p, events, new)) {
         return Ok(Plan::Fallback(reason));
     }
     let e = &events[new];
-    let locations = Locations::new(events);
+    let ns = timed("a.nscontext", || NsContext::new(branch, events));
+    let locations = timed("a.locations", || Locations::new(events));
     // Same source order as full mode, so a refusal surfaces with the same error.
-    let mut conflicts = p.conflicts.clone();
+    let mut conflicts = timed("a.pconflicts", || p.conflicts.clone());
     conflicts.extend(input.reviewed.iter().cloned());
-    conflicts.extend(location_pairs_with(branch, events, &locations, new)?);
+    conflicts.extend(timed("a.location_pairs", || {
+        location_pairs_with(&ns, &locations, new)
+    })?);
     if !e.reviewed.is_empty() {
-        conflicts.extend(reviewed_cut(branch, events, e)?);
+        conflicts.extend(timed("a.reviewed_cut", || ns.reviewed_cut(new))?);
     }
     // Full mode's cone analysis reads every name next.
     locations.first_error()?;
-    let ns = NsContext::new(branch, events);
-    let plan = match ns.append_plan(new, &locations)? {
+    let plan = match timed("a.plan", || ns.append_plan(new, &locations))? {
         Ok(plan) => plan,
         Err(reason) => return Ok(Plan::Fallback(reason)),
     };
-    let restricted =
-        !plan.cones.is_empty() && projection_cannot_fail(events, &locations, &ns.alive);
+    let restricted = !plan.cones.is_empty()
+        && timed("a.cannot_fail", || projection_cannot_fail(&ns, &locations));
     if restricted {
         count(Count::Restricted);
     }
-    conflicts.extend(ns.derive_planned(&plan, restricted)?);
-    conflicts.extend(register_pairs(branch, p, events, Some(new_id)));
+    conflicts.extend(timed("a.derive_planned", || {
+        ns.derive_planned(&plan, restricted)
+    })?);
+    conflicts.extend(timed("a.register_pairs", || {
+        register_pairs(branch, p, events, Some(new_id))
+    }));
     // Nothing above can fail on accepted history; a failure here is left to
     // full mode, which raises or derives whatever the reference does.
-    match ns.current_records_survive(new, &plan, &conflicts) {
+    match timed("a.survive", || {
+        ns.current_records_survive(new, &plan, &conflicts)
+    }) {
         Ok(true) => Ok(Plan::Derived(conflicts)),
         Ok(false) => Ok(Plan::Fallback(
             "a current namespace record is not derived from history",
@@ -1763,27 +1913,25 @@ fn successor_cones_are_small<'a>(events: &'a [Event], new: usize) -> bool {
 /// event, with the same relevant events (`successor_may_add_cuts`), whose
 /// count the accepted history already bounds. Pure; only the counting, no
 /// cut is projected, and nothing at all when a bound shows every count is
-/// within the limit (`successor_cones_are_small`).
+/// within the limit (`successor_cones_are_small`). A cone's count is
+/// memoized by its relevant events (CCR-WP4.INT-4), so a recount of a cone
+/// the event did not change costs a digest of its event ids.
 pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -> Result<()> {
     if successor_cones_are_small(events, new) {
         return Ok(());
     }
     let locations = Locations::new(events);
     locations.first_error()?;
-    let graph = ConeGraph::new(events, &locations, new);
-    let touched: BTreeSet<&str> = events[new]
-        .changes
-        .iter()
-        .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
-        .map(|c| c.entity.as_str())
-        .collect();
-    let cones: BTreeSet<BTreeSet<&str>> = graph
+    let ns = NsContext::new(branch, events);
+    let graph = ConeGraph::new(&ns, &locations, new);
+    let touched = touched_entities(&ns, new);
+    let mut memo = ConeMemo::default();
+    let cones: BTreeSet<Rc<[u32]>> = graph
         .reaching(&touched)
         .into_iter()
-        .map(|entity| graph.cone(entity, false))
-        .filter(|cone| cone.iter().any(|m| touched.contains(m)))
+        .map(|entity| graph.cone_memo(&mut memo, entity, false))
+        .filter(|cone| cone.iter().any(|m| touched.binary_search(m).is_ok()))
         .collect();
-    let ns = NsContext::new(branch, events);
     for members in &cones {
         let relevant = ns.relevant(members, None);
         ns.count_cuts(&relevant)?;
@@ -1793,12 +1941,7 @@ pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -
 
 /// The location pairs that include the new event's location change, in the
 /// order full mode evaluates them (pairs of two older changes are stored).
-fn location_pairs_with(
-    branch: &str,
-    events: &[Event],
-    locations: &Locations,
-    new: usize,
-) -> Result<Vec<Conflict>> {
+fn location_pairs_with(ns: &NsContext, locations: &Locations, new: usize) -> Result<Vec<Conflict>> {
     let rows = &locations.rows;
     let mut conflicts = vec![];
     for q in (0..rows.len()).filter(|&q| rows[q].event == new) {
@@ -1815,13 +1958,13 @@ fn location_pairs_with(
             if locations.key(i)? != locations.key(j)? {
                 continue;
             }
-            if let Some(c) = concurrent_placement(
-                branch,
-                events,
-                (&events[a.event], a.change),
-                (&events[b.event], b.change),
-            ) {
-                conflicts.push(c);
+            if !ns.related(a.event, b.event) {
+                conflicts.push(placement_record(
+                    ns.branch,
+                    ns.events,
+                    (a.event, a.change),
+                    (b.event, b.change),
+                ));
             }
         }
     }
@@ -2038,29 +2181,30 @@ fn ancestors(version: &Version, versions: &[Version]) -> BTreeSet<String> {
     }
     found
 }
-fn event_ancestors(event: &Event, events: &[Event]) -> BTreeSet<String> {
-    let index: BTreeMap<_, _> = events.iter().map(|e| (e.id.as_str(), e)).collect();
-    let mut seen = BTreeSet::new();
-    let mut todo = event.dependencies.clone();
-    todo.extend(event.changes.iter().flat_map(|c| c.parents.iter().cloned()));
-    while let Some(revision) = todo.pop() {
-        if seen.insert(revision.clone())
-            && let Some(e) = index.get(revision.as_str())
-        {
-            todo.extend(e.dependencies.iter().cloned());
-            todo.extend(e.changes.iter().flat_map(|c| c.parents.iter().cloned()));
-        }
+/// One version of a register, borrowed: its event's position and the change.
+type VersionRef<'a> = (usize, &'a Change);
+
+/// The register version a borrowed one stands for.
+fn version_of(events: &[Event], (i, c): VersionRef) -> Version {
+    let e = &events[i];
+    Version {
+        revision: e.id.clone(),
+        device: e.device.clone(),
+        created_ms: e.created_ms,
+        parents: c.parents.clone(),
+        value: c.value.clone(),
     }
-    seen
 }
-fn linear_versions(versions: &[Version]) -> bool {
-    let mut children = BTreeSet::new();
+/// Whether the versions (in event order) form one single-parent chain from
+/// a single root: no historical concurrency.
+fn linear_versions(versions: &[VersionRef]) -> bool {
+    let mut children = HashSet::new();
     let mut roots = 0;
-    for v in versions {
-        if v.parents.is_empty() {
+    for (_, c) in versions {
+        if c.parents.is_empty() {
             roots += 1;
         }
-        if v.parents.len() > 1 || v.parents.iter().any(|p| !children.insert(p)) {
+        if c.parents.len() > 1 || c.parents.iter().any(|p| !children.insert(p.as_str())) {
             return false;
         }
     }
@@ -2070,34 +2214,34 @@ struct VersionReach {
     rows: Vec<Vec<u64>>,
 }
 impl VersionReach {
-    fn new(versions: &[Version]) -> Self {
-        let index: BTreeMap<_, _> = versions
+    fn new(events: &[Event], versions: &[VersionRef]) -> Self {
+        let index: HashMap<&str, usize> = versions
             .iter()
             .enumerate()
-            .map(|(i, v)| (v.revision.as_str(), i))
+            .map(|(k, (i, _))| (events[*i].id.as_str(), k))
             .collect();
         let mut children = vec![vec![]; versions.len()];
         let mut degree = vec![0; versions.len()];
         let mut parents = vec![vec![]; versions.len()];
-        for (i, v) in versions.iter().enumerate() {
-            for parent in &v.parents {
+        for (k, (_, c)) in versions.iter().enumerate() {
+            for parent in &c.parents {
                 if let Some(&j) = index.get(parent.as_str()) {
-                    parents[i].push(j);
-                    children[j].push(i);
-                    degree[i] += 1;
+                    parents[k].push(j);
+                    children[j].push(k);
+                    degree[k] += 1;
                 }
             }
         }
-        let mut ready: Vec<_> = (0..versions.len()).filter(|&i| degree[i] == 0).collect();
+        let mut ready: Vec<_> = (0..versions.len()).filter(|&k| degree[k] == 0).collect();
         let mut rows = vec![vec![0; versions.len().div_ceil(64)]; versions.len()];
-        while let Some(i) = ready.pop() {
-            for &parent in &parents[i] {
-                for word in 0..rows[i].len() {
-                    rows[i][word] |= rows[parent][word];
+        while let Some(k) = ready.pop() {
+            for &parent in &parents[k] {
+                for word in 0..rows[k].len() {
+                    rows[k][word] |= rows[parent][word];
                 }
-                rows[i][parent / 64] |= 1 << (parent % 64);
+                rows[k][parent / 64] |= 1 << (parent % 64);
             }
-            for &child in &children[i] {
+            for &child in &children[k] {
                 degree[child] -= 1;
                 if degree[child] == 0 {
                     ready.push(child);
@@ -2158,8 +2302,8 @@ fn causal_order_refs<'a>(events: &[&'a Event]) -> Vec<&'a Event> {
     active
 }
 
-/// A fixed-size bitset over event (or version) indices.
-#[derive(Clone)]
+/// A fixed-size bitset over event (or version, entity) indices.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct Bits {
     words: Vec<u64>,
 }
@@ -2185,6 +2329,11 @@ impl Bits {
     fn union_with(&mut self, other: &Bits) {
         for (word, other) in self.words.iter_mut().zip(&other.words) {
             *word |= other;
+        }
+    }
+    fn intersect_with(&mut self, other: &Bits) {
+        for (word, other) in self.words.iter_mut().zip(&other.words) {
+            *word &= other;
         }
     }
     fn iter(&self) -> impl Iterator<Item = usize> + '_ {
@@ -2236,6 +2385,9 @@ const CLOSURE_MEMO_BYTES: usize = 64 * 1024 * 1024;
 /// memo would hold (cuts × records per cut). Past the budget, cuts are
 /// projected again when they recur.
 const CUT_MEMO_BYTES: usize = 16 * 1024 * 1024;
+/// Bound on the transient bitsets of one causal sweep (`Relations::over`):
+/// past it, the relations are computed per universe event instead.
+const SWEEP_BYTES: usize = 96 * 1024 * 1024;
 
 /// The estimated heap a JSON value holds (map nodes at 64 bytes per entry).
 fn value_bytes(value: &Value) -> usize {
@@ -2283,6 +2435,34 @@ struct RegisterFacts<'a> {
     segments: Vec<usize>,
 }
 
+/// The causal relations among a set of events (the *universe*, sorted
+/// positions): for each universe event, the universe events among its
+/// ancestors (`up`) and its descendants (`down`), as bitsets over universe
+/// indices. WP5.1: one topological sweep over the branch instead of one
+/// depth-first closure over the whole history per event.
+struct Relations {
+    universe: Vec<usize>,
+    /// Event position -> universe index (`u32::MAX`: not in the universe).
+    at: Vec<u32>,
+    up: Vec<Bits>,
+    down: Vec<Bits>,
+}
+impl Relations {
+    fn index(&self, event: usize) -> Option<usize> {
+        let k = self.at[event];
+        (k != u32::MAX).then_some(k as usize)
+    }
+}
+
+/// A namespace record, memoized per derivation (`Memo::records`): built (and
+/// hashed) once however many cuts derive it.
+type Record = Rc<Conflict>;
+
+/// What identifies a restricted namespace record within one derivation:
+/// a collision of two members (`Some(b)`), or an invalid chain of `a`; with
+/// the location head versions it lists, as (member, event position).
+type RecordKey = (u32, Option<u32>, Vec<(u32, usize)>);
+
 #[derive(Default)]
 struct Memo<'a> {
     ancestors: Vec<Option<Rc<Bits>>>,
@@ -2293,27 +2473,71 @@ struct Memo<'a> {
     /// Estimated bytes `cuts` holds, and its budget (`CUT_MEMO_BYTES`).
     cut_bytes: usize,
     cut_budget: usize,
+    /// The topological order of the branch (`None`: it has a cycle), once.
+    topo: Option<Option<Rc<Vec<usize>>>>,
+    /// Relations over the touching events of a member set.
+    relations: HashMap<Vec<u32>, Rc<Relations>>,
+    /// Relevant sets by member set and excluded event.
+    relevant: HashMap<(Vec<u32>, Option<usize>), Rc<Vec<usize>>>,
+    records: HashMap<RecordKey, Record>,
+    /// Full mode projects every cut in full (tests of the cut memo).
+    unrestricted: bool,
+}
+
+/// The namespace registers' field numbers.
+const KIND: usize = 0;
+const LOCATION: usize = 1;
+const ALIVE: usize = 2;
+
+fn ns_field(field: &str) -> Option<usize> {
+    match field {
+        "kind" => Some(KIND),
+        "location" => Some(LOCATION),
+        "alive" => Some(ALIVE),
+        _ => None,
+    }
+}
+
+/// One namespace register version (`NsContext::regs`): its event, the
+/// change, and its parents among the register's versions.
+struct RegVersion<'a> {
+    event: usize,
+    change: &'a Change,
+    parents: Vec<usize>,
 }
 
 /// Namespace-history derivation over one branch's events (both modes), with
 /// per-call memoization. Event indices are positions in `events`.
+///
+/// WP5.1: entities are interned as numbers in the order of their ids
+/// (`names`), so every set of entities is a sorted `Vec<u32>` or a bitset
+/// and iterates in the order the historical `BTreeSet<&str>` did; namespace
+/// registers are pre-indexed per entity and field with their version
+/// parents resolved; causal relations among the events a cone reads come
+/// from one sweep (`Relations`).
 struct NsContext<'a> {
     branch: &'a str,
     events: &'a [Event],
     /// The causal DAG: dependencies and change parents present in `events`.
     parents: Vec<Vec<usize>>,
     children: Vec<Vec<usize>>,
-    index: BTreeMap<&'a str, usize>,
+    index: HashMap<&'a str, usize>,
+    /// Entity ids (change entities and location parents other than `ROOT`),
+    /// sorted; an entity's number is its position.
+    names: Vec<&'a str>,
+    entities: HashMap<&'a str, u32>,
     /// Alive versions per entity, in event order.
-    alive: BTreeMap<&'a str, Vec<(usize, &'a Change)>>,
+    alive: Vec<Vec<(usize, &'a Change)>>,
     /// Events with a kind, location or alive change, per entity.
-    touching: BTreeMap<&'a str, Vec<usize>>,
+    touching: Vec<Vec<usize>>,
+    /// Kind, location and alive versions per entity, in event order.
+    regs: Vec<[Vec<RegVersion<'a>>; 3]>,
     memo: RefCell<Memo<'a>>,
 }
 
 /// One cone append mode derives.
-struct PlannedCone<'a> {
-    members: BTreeSet<&'a str>,
+struct PlannedCone {
+    members: Rc<[u32]>,
     relevant: Rc<Vec<usize>>,
     /// An old cone: project only the antichains containing one of these
     /// newly relevant events (sorted). `None`, a new cone: every antichain.
@@ -2321,8 +2545,8 @@ struct PlannedCone<'a> {
 }
 
 /// The cones append mode derives.
-struct AppendPlan<'a> {
-    cones: Vec<PlannedCone<'a>>,
+struct AppendPlan {
+    cones: Vec<PlannedCone>,
     /// Old cones that grew into a covering cone (checked, not derived).
     #[cfg_attr(not(test), allow(dead_code))]
     covered: usize,
@@ -2330,10 +2554,10 @@ struct AppendPlan<'a> {
     /// entity the new event touches: the only entities whose records in the
     /// current projection the new event can change. Closed under parents
     /// and slot competitors (a union of cones).
-    members: BTreeSet<&'a str>,
+    members: Vec<u32>,
     /// The old cone (without the new event) of every entity that reaches a
     /// touched entity and existed before.
-    before: BTreeMap<&'a str, BTreeSet<&'a str>>,
+    before: BTreeMap<u32, Rc<[u32]>>,
 }
 
 /// Memoized alive-register analyses, by (entity, excluded event).
@@ -2341,36 +2565,84 @@ type RegisterMemo<'a> = BTreeMap<(&'a str, Option<usize>), Option<Rc<RegisterFac
 
 impl<'a> NsContext<'a> {
     fn new(branch: &'a str, events: &'a [Event]) -> Self {
-        let index: BTreeMap<&str, usize> = events
+        let mut index: HashMap<&'a str, usize> = HashMap::with_capacity(events.len());
+        for (i, e) in events.iter().enumerate() {
+            index.insert(e.id.as_str(), i);
+        }
+        let mut parents: Vec<Vec<usize>> = Vec::with_capacity(events.len());
+        for e in events {
+            let mut ps: Vec<usize> = e
+                .dependencies
+                .iter()
+                .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
+                .filter_map(|p| index.get(p.as_str()).copied())
+                .collect();
+            ps.sort_unstable();
+            ps.dedup();
+            parents.push(ps);
+        }
+        let children = children_of(&parents);
+        let mut unique: HashSet<&'a str> = HashSet::new();
+        for e in events {
+            for c in &e.changes {
+                unique.insert(c.entity.as_str());
+                if c.field == "location"
+                    && let Some(parent) = c.value["parent"].as_str()
+                    && parent != ROOT
+                {
+                    unique.insert(parent);
+                }
+            }
+        }
+        let mut names: Vec<&'a str> = unique.into_iter().collect();
+        names.sort_unstable();
+        let entities: HashMap<&'a str, u32> = names
             .iter()
             .enumerate()
-            .map(|(i, e)| (e.id.as_str(), i))
+            .map(|(k, &name)| (name, k as u32))
             .collect();
-        let parents: Vec<Vec<usize>> = events
-            .iter()
-            .map(|e| {
-                e.dependencies
-                    .iter()
-                    .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
-                    .filter_map(|p| index.get(p.as_str()).copied())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
-            })
-            .collect();
-        let children = children_of(&parents);
-        let mut alive: BTreeMap<&str, Vec<(usize, &Change)>> = BTreeMap::new();
-        let mut touching: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+        let n = names.len();
+        let mut alive: Vec<Vec<(usize, &Change)>> = vec![vec![]; n];
+        let mut touching: Vec<Vec<usize>> = vec![vec![]; n];
+        let mut regs: Vec<[Vec<RegVersion>; 3]> = (0..n).map(|_| Default::default()).collect();
         for (i, e) in events.iter().enumerate() {
             for c in &e.changes {
+                let entity = entities[c.entity.as_str()] as usize;
                 if c.field == "alive" {
-                    alive.entry(c.entity.as_str()).or_default().push((i, c));
+                    alive[entity].push((i, c));
                 }
-                if ["kind", "location", "alive"].contains(&c.field.as_str()) {
-                    let list = touching.entry(c.entity.as_str()).or_default();
+                if let Some(field) = ns_field(&c.field) {
+                    let list = &mut touching[entity];
                     if list.last() != Some(&i) {
                         list.push(i);
                     }
+                    regs[entity][field].push(RegVersion {
+                        event: i,
+                        change: c,
+                        parents: vec![],
+                    });
+                }
+            }
+        }
+        // Version parents within each register (by revision).
+        for fields in &mut regs {
+            for versions in fields.iter_mut() {
+                if versions.iter().all(|v| v.change.parents.is_empty()) {
+                    continue;
+                }
+                let at: HashMap<&str, usize> = versions
+                    .iter()
+                    .enumerate()
+                    .map(|(k, v)| (events[v.event].id.as_str(), k))
+                    .collect();
+                for k in 0..versions.len() {
+                    let ps: Vec<usize> = versions[k]
+                        .change
+                        .parents
+                        .iter()
+                        .filter_map(|p| at.get(p.as_str()).copied())
+                        .collect();
+                    versions[k].parents = ps;
                 }
             }
         }
@@ -2386,10 +2658,23 @@ impl<'a> NsContext<'a> {
             parents,
             children,
             index,
+            names,
+            entities,
             alive,
             touching,
+            regs,
             memo: RefCell::new(memo),
         }
+    }
+
+    /// The number of `entity`, if it is one of the branch's.
+    fn entity(&self, entity: &str) -> Option<u32> {
+        self.entities.get(entity).copied()
+    }
+
+    /// The members as sorted entity ids.
+    fn member_set(&self, members: &[u32]) -> BTreeSet<&'a str> {
+        members.iter().map(|&m| self.names[m as usize]).collect()
     }
 
     /// Ancestors (`forward == false`) or descendants of event `i`.
@@ -2424,6 +2709,150 @@ impl<'a> NsContext<'a> {
         found
     }
 
+    /// Whether one of two events is a causal ancestor of the other.
+    fn related(&self, a: usize, b: usize) -> bool {
+        self.closure(a, false).contains(b) || self.closure(b, false).contains(a)
+    }
+
+    /// The topological order of the branch's events, or `None` if the
+    /// causal graph has a cycle (memoized).
+    fn topo(&self) -> Option<Rc<Vec<usize>>> {
+        if let Some(found) = &self.memo.borrow().topo {
+            return found.clone();
+        }
+        let n = self.events.len();
+        let mut degree: Vec<usize> = self.parents.iter().map(Vec::len).collect();
+        let mut ready: Vec<usize> = (0..n).filter(|&i| degree[i] == 0).collect();
+        let mut order = Vec::with_capacity(n);
+        while let Some(i) = ready.pop() {
+            order.push(i);
+            for &child in &self.children[i] {
+                degree[child] -= 1;
+                if degree[child] == 0 {
+                    ready.push(child);
+                }
+            }
+        }
+        let found = (order.len() == n).then(|| Rc::new(order));
+        self.memo.borrow_mut().topo = Some(found.clone());
+        found
+    }
+
+    /// The causal relations among `universe` (sorted, distinct positions).
+    fn relations_over(&self, universe: Vec<usize>) -> Relations {
+        let n = self.events.len();
+        let mut at = vec![u32::MAX; n];
+        for (k, &i) in universe.iter().enumerate() {
+            at[i] = k as u32;
+        }
+        let u = universe.len();
+        let words = u.div_ceil(64);
+        let sweep = self
+            .topo()
+            .filter(|_| n.saturating_mul(words).saturating_mul(8) <= SWEEP_BYTES);
+        let Some(order) = sweep else {
+            // A cycle, or too large a sweep: per-event closures (the
+            // reference's own computation, restricted to the universe).
+            let restrict = |closure: &Bits| {
+                let mut bits = Bits::new(u);
+                for i in closure.iter() {
+                    if at[i] != u32::MAX {
+                        bits.insert(at[i] as usize);
+                    }
+                }
+                bits
+            };
+            let up = universe
+                .iter()
+                .map(|&i| restrict(&self.closure(i, false)))
+                .collect();
+            let down = universe
+                .iter()
+                .map(|&i| restrict(&self.closure(i, true)))
+                .collect();
+            return Relations {
+                universe,
+                at,
+                up,
+                down,
+            };
+        };
+        let pass = |order: &mut dyn Iterator<Item = usize>, edges: &[Vec<usize>]| -> Vec<Bits> {
+            // Bitsets of events whose successors still need them: dropped
+            // once the last one has read them.
+            let mut pending: Vec<usize> = (0..n).map(|i| self.edge_users(edges, i)).collect();
+            let mut cur: Vec<Option<Bits>> = vec![None; n];
+            let mut out: Vec<Bits> = vec![Bits::new(0); u];
+            for i in order {
+                let mut bits: Option<Bits> = None;
+                for &p in &edges[i] {
+                    let from = cur[p].as_ref();
+                    if from.is_none() && at[p] == u32::MAX {
+                        continue;
+                    }
+                    let set = bits.get_or_insert_with(|| Bits::new(u));
+                    if let Some(from) = from {
+                        set.union_with(from);
+                    }
+                    if at[p] != u32::MAX {
+                        set.insert(at[p] as usize);
+                    }
+                }
+                for &p in &edges[i] {
+                    pending[p] -= 1;
+                    if pending[p] == 0 {
+                        cur[p] = None;
+                    }
+                }
+                if at[i] != u32::MAX {
+                    out[at[i] as usize] = bits.clone().unwrap_or_else(|| Bits::new(u));
+                }
+                if pending[i] > 0 {
+                    cur[i] = bits;
+                }
+            }
+            out
+        };
+        let up = pass(&mut order.iter().copied(), &self.parents);
+        let down = pass(&mut order.iter().rev().copied(), &self.children);
+        Relations {
+            universe,
+            at,
+            up,
+            down,
+        }
+    }
+
+    /// How many events read event `i`'s set in a sweep along `edges`
+    /// (`parents`: its children; `children`: its parents).
+    fn edge_users(&self, edges: &[Vec<usize>], i: usize) -> usize {
+        if std::ptr::eq(edges, self.parents.as_slice()) {
+            self.children[i].len()
+        } else {
+            self.parents[i].len()
+        }
+    }
+
+    /// The relations over the touching events of `members` (memoized per
+    /// member set).
+    fn relations(&self, members: &[u32]) -> Rc<Relations> {
+        if let Some(found) = self.memo.borrow().relations.get(members) {
+            return found.clone();
+        }
+        let mut universe: Vec<usize> = members
+            .iter()
+            .flat_map(|&m| self.touching[m as usize].iter().copied())
+            .collect();
+        universe.sort_unstable();
+        universe.dedup();
+        let found = Rc::new(self.relations_over(universe));
+        self.memo
+            .borrow_mut()
+            .relations
+            .insert(members.to_vec(), found.clone());
+        found
+    }
+
     /// Whether `c` (a change of a cone member) makes its event relevant to
     /// the cone's namespace: kind, location, a tombstone, or presence
     /// re-asserted over a tombstone.
@@ -2441,53 +2870,90 @@ impl<'a> NsContext<'a> {
     }
 
     /// The relevant events of a cone (relevance plus TRUE presence
-    /// compression), as if event `exclude` did not exist. Sorted.
-    fn relevant(&self, members: &BTreeSet<&str>, exclude: Option<usize>) -> Vec<usize> {
-        let mut relevant = BTreeSet::new();
+    /// compression), as if event `exclude` did not exist. Sorted. Memoized
+    /// per member set and excluded event.
+    ///
+    /// The historical computation keys each TRUE version's group by its
+    /// unbranched segment and its relation (ancestor, descendant, neither)
+    /// to every primary event and every tombstone of its register. The
+    /// relation to the primary events is read here from the cone's
+    /// `Relations`: version `i` is an ancestor of primary `p` iff `p` is
+    /// among `i`'s descendants, a descendant iff `p` is among its ancestors.
+    fn relevant(&self, members: &[u32], exclude: Option<usize>) -> Rc<Vec<usize>> {
+        let key = (members.to_vec(), exclude);
+        if let Some(found) = self.memo.borrow().relevant.get(&key) {
+            return found.clone();
+        }
+        let found = Rc::new(self.compute_relevant(members, exclude));
+        self.memo.borrow_mut().relevant.insert(key, found.clone());
+        found
+    }
+
+    fn compute_relevant(&self, members: &[u32], exclude: Option<usize>) -> Vec<usize> {
+        let mut relevant: Vec<usize> = vec![];
         for &member in members {
-            for &i in self.touching.get(member).into_iter().flatten() {
+            let name = self.names[member as usize];
+            for &i in &self.touching[member as usize] {
                 if Some(i) != exclude
                     && self.events[i]
                         .changes
                         .iter()
-                        .any(|c| c.entity == member && self.primary_change(c))
+                        .any(|c| c.entity == name && self.primary_change(c))
                 {
-                    relevant.insert(i);
+                    relevant.push(i);
                 }
             }
         }
-        let primary: Vec<_> = relevant
-            .iter()
-            .map(|&i| (self.closure(i, false), self.closure(i, true)))
-            .collect();
+        relevant.sort_unstable();
+        relevant.dedup();
         // Pure TRUE presence assertions cannot change namespace when there is
         // no tombstone. If tombstones exist, retain rank extrema per unbranched
         // TRUE segment and topology/false-revision causal relationship signature.
         // This preserves possible boolean winners without counting every save.
-        for &entity in members {
-            let Some((&entity, _)) = self.alive.get_key_value(entity) else {
-                continue;
-            };
-            let Some(facts) = self.register_facts(entity, exclude) else {
-                continue;
-            };
-            let mut groups: BTreeMap<(usize, Vec<u8>), (usize, usize)> = BTreeMap::new();
+        let compressed: Vec<(u32, Rc<RegisterFacts<'a>>)> = members
+            .iter()
+            .filter(|&&m| !self.alive[m as usize].is_empty())
+            .filter_map(|&m| {
+                self.register_facts(self.names[m as usize], m, exclude)
+                    .map(|facts| (m, facts))
+            })
+            .collect();
+        if compressed.is_empty() {
+            return relevant;
+        }
+        let relations = self.relations(members);
+        // The primary events as a bitset over the relations' universe.
+        let mut primary = Bits::new(relations.universe.len());
+        for &i in &relevant {
+            if let Some(k) = relations.index(i) {
+                primary.insert(k);
+            }
+        }
+        let is_primary: HashSet<usize> = relevant.iter().copied().collect();
+        let mut extrema: Vec<usize> = vec![];
+        for (_, facts) in &compressed {
+            type Group = (usize, Bits, Bits, Vec<u8>);
+            let mut groups: HashMap<Group, (usize, usize)> = HashMap::new();
             for (k, &(i, c)) in facts.versions.iter().enumerate() {
-                if c.value != true || relevant.contains(&i) {
+                if c.value != true || is_primary.contains(&i) {
                     continue;
                 }
-                let signature = primary
+                let Some(at) = relations.index(i) else {
+                    continue;
+                };
+                // Primary events that `i` is an ancestor of (1), then those
+                // it descends from and is not an ancestor of (2).
+                let mut before = relations.down[at].clone();
+                before.intersect_with(&primary);
+                let mut after = relations.up[at].clone();
+                after.intersect_with(&primary);
+                for (word, b) in after.words.iter_mut().zip(&before.words) {
+                    *word &= !b;
+                }
+                let tombs: Vec<u8> = facts
+                    .false_context
                     .iter()
                     .map(|(anc, desc)| {
-                        if anc.contains(i) {
-                            1
-                        } else if desc.contains(i) {
-                            2
-                        } else {
-                            0
-                        }
-                    })
-                    .chain(facts.false_context.iter().map(|(anc, desc)| {
                         if anc.contains(k) {
                             1
                         } else if desc.contains(k) {
@@ -2495,10 +2961,10 @@ impl<'a> NsContext<'a> {
                         } else {
                             0
                         }
-                    }))
+                    })
                     .collect();
                 let range = groups
-                    .entry((facts.segments[k], signature))
+                    .entry((facts.segments[k], before, after, tombs))
                     .or_insert((i, i));
                 let rank = |j: usize| (&self.events[j].device, &self.events[j].id);
                 if rank(i) < rank(range.0) {
@@ -2509,10 +2975,13 @@ impl<'a> NsContext<'a> {
                 }
             }
             for (min, max) in groups.values() {
-                relevant.extend([*min, *max]);
+                extrema.extend([*min, *max]);
             }
         }
-        relevant.into_iter().collect()
+        relevant.extend(extrema);
+        relevant.sort_unstable();
+        relevant.dedup();
+        relevant
     }
 
     /// The alive register of `entity` (without event `exclude`), analysed;
@@ -2520,12 +2989,13 @@ impl<'a> NsContext<'a> {
     fn register_facts(
         &self,
         entity: &'a str,
+        number: u32,
         exclude: Option<usize>,
     ) -> Option<Rc<RegisterFacts<'a>>> {
         if let Some(found) = self.memo.borrow().registers.get(&(entity, exclude)) {
             return found.clone();
         }
-        let facts = self.analyse_register(entity, exclude).map(Rc::new);
+        let facts = self.analyse_register(number, exclude).map(Rc::new);
         self.memo
             .borrow_mut()
             .registers
@@ -2536,10 +3006,8 @@ impl<'a> NsContext<'a> {
     /// The historical `FactGraph::register` analysis, on a compact graph whose
     /// nodes are the register's versions in event order (the other events are
     /// isolated nodes there and never change closures, ranks or segments).
-    fn analyse_register(&self, entity: &str, exclude: Option<usize>) -> Option<RegisterFacts<'a>> {
-        let versions: Vec<(usize, &'a Change)> = self
-            .alive
-            .get(entity)?
+    fn analyse_register(&self, entity: u32, exclude: Option<usize>) -> Option<RegisterFacts<'a>> {
+        let versions: Vec<(usize, &'a Change)> = self.alive[entity as usize]
             .iter()
             .copied()
             .filter(|(i, _)| Some(*i) != exclude)
@@ -2553,7 +3021,7 @@ impl<'a> NsContext<'a> {
         if tombstones.is_empty() {
             return None;
         }
-        let index: BTreeMap<&str, usize> = versions
+        let index: HashMap<&str, usize> = versions
             .iter()
             .enumerate()
             .map(|(k, (i, _))| (self.events[*i].id.as_str(), k))
@@ -2630,20 +3098,15 @@ impl<'a> NsContext<'a> {
     /// The namespace records of one antichain's cut (memoized per antichain,
     /// within `Memo::cut_budget`: an antichain recurs across the cones that
     /// share its events, such as the cones of a directory's entries).
-    fn cut_conflicts(
-        &self,
-        selected: &[usize],
-        relevant: &[usize],
-        ancestors: &[Rc<Bits>],
-    ) -> Result<Rc<Vec<Conflict>>> {
-        let key: Vec<usize> = selected.iter().map(|&j| relevant[j]).collect();
+    fn cut_conflicts(&self, events: &[usize]) -> Result<Rc<Vec<Conflict>>> {
+        let key: Vec<usize> = events.to_vec();
         if let Some(found) = self.memo.borrow().cuts.get(&key) {
             return Ok(found.clone());
         }
         let mut ids = Bits::new(self.events.len());
-        for &j in selected {
-            ids.union_with(&ancestors[j]);
-            ids.insert(relevant[j]);
+        for &i in events {
+            ids.union_with(&self.closure(i, false));
+            ids.insert(i);
         }
         let cut: Vec<&Event> = ids.iter().map(|i| &self.events[i]).collect();
         let conflicts: Rc<Vec<Conflict>> = Rc::new(
@@ -2664,6 +3127,94 @@ impl<'a> NsContext<'a> {
         Ok(conflicts)
     }
 
+    /// Visit every antichain of `relevant` (as sorted indices into it) in
+    /// the order the historical enumeration built them, counting the
+    /// competing cuts (antichains of two or more events) against
+    /// `MAX_NAMESPACE_CUTS` exactly as it did.
+    ///
+    /// The historical loop appended, for each relevant event `i` in order,
+    /// `A ∪ {i}` for every antichain `A` built before it and compatible
+    /// with `i` (every element neither an ancestor nor a descendant of
+    /// `i`). Those `A` are exactly the antichains inside `conc(i)` (the
+    /// earlier events unrelated to `i`), and they appeared in the order
+    /// `L(S) = [∅] ++ concat_{m ∈ S ascending} [B ∪ {m} : B ∈ L(S ∩ conc(m))]`
+    /// (induction on `i`: filtering the list built so far to subsets of `S`
+    /// keeps its order). So visiting `L(conc(i))`, each set plus `i`, in
+    /// that recursive order yields the same antichains in the same order,
+    /// touching only antichains, never the whole list per event.
+    fn antichains(
+        &self,
+        relevant: &[usize],
+        visit: impl FnMut(&[usize]) -> Result<()>,
+    ) -> Result<usize> {
+        let relations = self.relations_over(relevant.to_vec());
+        Self::antichains_over(&relations, visit)
+    }
+
+    /// `antichains` with the relations among the relevant events given
+    /// (`relations_over(relevant)`).
+    fn antichains_over(
+        relations: &Relations,
+        mut visit: impl FnMut(&[usize]) -> Result<()>,
+    ) -> Result<usize> {
+        let r = relations.universe.len();
+        // conc[i]: the earlier relevant events unrelated to event i.
+        let conc: Vec<Bits> = (0..r)
+            .map(|i| {
+                let mut bits = Bits::new(r);
+                for w in 0..bits.words.len() {
+                    let below = if (w + 1) * 64 <= i {
+                        u64::MAX
+                    } else if w * 64 >= i {
+                        0
+                    } else {
+                        (1u64 << (i - w * 64)) - 1
+                    };
+                    bits.words[w] =
+                        below & !(relations.up[i].words[w] | relations.down[i].words[w]);
+                }
+                bits
+            })
+            .collect();
+        let mut competing = 0usize;
+        let mut stack: Vec<usize> = vec![];
+        for i in 0..r {
+            stack.clear();
+            stack.push(i);
+            walk(&conc, &conc[i], &mut stack, &mut competing, &mut visit)?;
+        }
+        return Ok(competing);
+
+        /// Visit `stack` (an antichain, largest element first) and every
+        /// antichain `B ∪ stack` for `B` in `L(set)`, in order.
+        fn walk(
+            conc: &[Bits],
+            set: &Bits,
+            stack: &mut Vec<usize>,
+            competing: &mut usize,
+            visit: &mut impl FnMut(&[usize]) -> Result<()>,
+        ) -> Result<()> {
+            crate::startup::progress("replaying namespace cuts");
+            if stack.len() > 1 {
+                *competing += 1;
+                ensure!(
+                    *competing <= MAX_NAMESPACE_CUTS,
+                    "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
+                );
+            }
+            let sorted: Vec<usize> = stack.iter().rev().copied().collect();
+            visit(&sorted)?;
+            for m in set.iter() {
+                let mut next = set.clone();
+                next.intersect_with(&conc[m]);
+                stack.push(m);
+                walk(conc, &next, stack, competing, visit)?;
+                stack.pop();
+            }
+            Ok(())
+        }
+    }
+
     /// Enumerate every antichain of a cone's relevant events (counting them
     /// against `MAX_NAMESPACE_CUTS`) and record the cone's namespace records
     /// of each antichain's cut; with `only`, only of the antichains containing
@@ -2672,107 +3223,96 @@ impl<'a> NsContext<'a> {
     /// fail to project, see `projection_cannot_fail`).
     fn cone_conflicts(
         &self,
-        members: &BTreeSet<&str>,
+        members: &[u32],
         relevant: &[usize],
         only: Option<&[usize]>,
         restricted: bool,
-        out: &mut BTreeMap<String, Conflict>,
+        out: &mut BTreeMap<String, Record>,
     ) -> Result<()> {
-        let ancestors: Vec<_> = relevant.iter().map(|&i| self.closure(i, false)).collect();
-        let mut antichains: Vec<Vec<usize>> = vec![vec![]];
-        let mut competing_cuts = 0;
-        for (i, &event) in relevant.iter().enumerate() {
-            let before = antichains.len();
-            for index in 0..before {
-                crate::startup::progress("replaying namespace cuts");
-                if !antichains[index]
-                    .iter()
-                    .all(|&j| !ancestors[i].contains(relevant[j]) && !ancestors[j].contains(event))
-                {
-                    continue;
-                }
-                let mut selected = antichains[index].clone();
-                selected.push(i);
-                if selected.len() > 1 {
-                    competing_cuts += 1;
-                    ensure!(
-                        competing_cuts <= MAX_NAMESPACE_CUTS,
-                        "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
-                    );
-                }
-                if only.is_none_or(|only| {
-                    selected
-                        .iter()
-                        .any(|&j| only.binary_search(&relevant[j]).is_ok())
-                }) {
-                    if restricted {
-                        let mut cut = Bits::new(self.events.len());
-                        for &j in &selected {
-                            cut.union_with(&ancestors[j]);
-                            cut.insert(relevant[j]);
-                        }
-                        for c in self.namespace_records(members, &cut)? {
-                            out.insert(c.id.clone(), c);
-                        }
-                    } else {
-                        for c in self
-                            .cut_conflicts(&selected, relevant, &ancestors)?
-                            .iter()
-                            .filter(|c| c.entity.split(',').any(|e| members.contains(e)))
-                        {
-                            out.insert(c.id.clone(), c.clone());
-                        }
-                    }
-                }
-                antichains.push(selected);
+        let relations = if restricted {
+            Some(self.relations(members))
+        } else {
+            None
+        };
+        let member_names: BTreeSet<&str> = self.member_set(members);
+        self.antichains(relevant, |selected| {
+            let events: Vec<usize> = selected.iter().map(|&j| relevant[j]).collect();
+            if only.is_some_and(|only| !events.iter().any(|i| only.binary_search(i).is_ok())) {
+                return Ok(());
             }
-        }
+            if let Some(relations) = &relations {
+                let cut = cut_over(relations, &events);
+                for c in timed("e.records", || {
+                    self.namespace_records(members, relations, &cut)
+                })? {
+                    out.insert(c.id.clone(), c);
+                }
+            } else {
+                for c in timed("e.cut", || self.cut_conflicts(&events))?
+                    .iter()
+                    .filter(|c| c.entity.split(',').any(|e| member_names.contains(e)))
+                {
+                    out.insert(c.id.clone(), Rc::new(c.clone()));
+                }
+            }
+            Ok(())
+        })?;
         Ok(())
     }
 
     /// The competing cuts (antichains of two or more events) of a cone's
     /// relevant events, enumerated and refused exactly as `cone_conflicts`
-    /// does, without projecting any cut (CCR-WP1.6-5).
+    /// does, without projecting any cut (CCR-WP1.6-5). Memoized process-wide
+    /// (CCR-WP4.INT-4): the count is a function of the events and of the
+    /// ancestry among them alone, so it is keyed by their ids and that
+    /// ancestry; a recount of a cone whose relevant events did not change
+    /// skips the enumeration. A refusal is not memoized.
     fn count_cuts(&self, relevant: &[usize]) -> Result<usize> {
-        let ancestors: Vec<_> = relevant.iter().map(|&i| self.closure(i, false)).collect();
-        let mut antichains: Vec<Vec<usize>> = vec![vec![]];
-        let mut competing_cuts = 0;
-        for (i, &event) in relevant.iter().enumerate() {
-            let before = antichains.len();
-            for index in 0..before {
-                if !antichains[index]
-                    .iter()
-                    .all(|&j| !ancestors[i].contains(relevant[j]) && !ancestors[j].contains(event))
-                {
-                    continue;
-                }
-                let mut selected = antichains[index].clone();
-                selected.push(i);
-                if selected.len() > 1 {
-                    competing_cuts += 1;
-                    ensure!(
-                        competing_cuts <= MAX_NAMESPACE_CUTS,
-                        "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
-                    );
-                }
-                antichains.push(selected);
-            }
+        let relations = self.relations_over(relevant.to_vec());
+        let key = cut_counts::key(
+            self.branch,
+            relevant.iter().map(|&i| self.events[i].id.as_str()),
+            &relations,
+        );
+        if let Some(count) = cut_counts::get(&key) {
+            return Ok(count);
         }
-        Ok(competing_cuts)
+        let count = Self::antichains_over(&relations, |_| Ok(()))?;
+        cut_counts::put(key, count);
+        Ok(count)
     }
 
     /// Full mode: every antichain of every cone (the historical
-    /// `namespace_history`).
+    /// `namespace_history`). WP5.1: a cut's records come from the cone's own
+    /// registers (`namespace_records`) whenever no cut of the branch can fail
+    /// to project (`projection_cannot_fail`, the condition append mode
+    /// already projects under), else from the whole cut, as before.
     fn full(&self) -> Result<Vec<Conflict>> {
-        let cones = NamespaceCones::new(self.events)?;
+        let cones = NamespaceCones::new(self)?;
+        let locations = Locations::new(self.events);
+        let restricted = !self.memo.borrow().unrestricted
+            && locations.first_error().is_ok()
+            && timed("f.cannot_fail", || projection_cannot_fail(self, &locations));
         let mut conflicts = BTreeMap::new();
-        for members in cones.members() {
+        for members in timed("f.cones", || cones.members()) {
             crate::startup::progress("rebuilding namespace history");
-            let members: BTreeSet<&str> = members.iter().map(String::as_str).collect();
-            let relevant = self.relevant(&members, None);
-            self.cone_conflicts(&members, &relevant, None, false, &mut conflicts)?;
+            let relevant = timed("f.relevant", || self.relevant(&members, None));
+            timed("f.cone_conflicts", || {
+                self.cone_conflicts(&members, &relevant, None, restricted, &mut conflicts)
+            })?;
         }
-        Ok(conflicts.into_values().collect())
+        Ok(conflicts
+            .into_values()
+            .map(|c| Rc::try_unwrap(c).unwrap_or_else(|c| (*c).clone()))
+            .collect())
+    }
+
+    /// Every record of the projection of review `i`'s observed (ancestor)
+    /// cut, in event order.
+    fn reviewed_cut(&self, i: usize) -> Result<Vec<Conflict>> {
+        let ancestors = self.closure(i, false);
+        let cut: Vec<&Event> = ancestors.iter().map(|k| &self.events[k]).collect();
+        Ok(project_refs(self.branch, &cut)?.conflicts)
     }
 
     /// The §5.2 exactness precondition (module docs) for appending event
@@ -2790,44 +3330,38 @@ impl<'a> NsContext<'a> {
     fn append_plan(
         &self,
         new: usize,
-        locations: &'a Locations<'a>,
-    ) -> Result<std::result::Result<AppendPlan<'a>, &'static str>> {
-        let graph = ConeGraph::new(self.events, locations, new);
-        let touched: BTreeSet<&str> = self.events[new]
-            .changes
-            .iter()
-            .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
-            .map(|c| c.entity.as_str())
-            .collect();
-        let reaching = graph.reaching(&touched);
-        let after: BTreeMap<&str, BTreeSet<&str>> = reaching
-            .iter()
-            .map(|&entity| (entity, graph.cone(entity, false)))
-            .collect();
-        let before: BTreeMap<&str, BTreeSet<&str>> = reaching
-            .iter()
-            .filter(|&&entity| graph.existed(entity))
-            .map(|&entity| (entity, graph.cone(entity, true)))
-            .collect();
-        let after_set: BTreeSet<&BTreeSet<&str>> = after.values().collect();
-        let before_set: BTreeSet<&BTreeSet<&str>> = before.values().collect();
-        let mut cache: BTreeMap<BTreeSet<&str>, Rc<Vec<usize>>> = BTreeMap::new();
-        let mut relevant_now = |members: &BTreeSet<&'a str>| -> Rc<Vec<usize>> {
-            if let Some(found) = cache.get(members) {
-                return found.clone();
-            }
-            let found = Rc::new(self.relevant(members, None));
-            cache.insert(members.clone(), found.clone());
-            found
-        };
-        let relevant_then = |members: &BTreeSet<&str>| self.relevant(members, Some(new));
+        locations: &Locations<'a>,
+    ) -> Result<std::result::Result<AppendPlan, &'static str>> {
+        let graph = timed("p.graph", || ConeGraph::new(self, locations, new));
+        let touched: Vec<u32> = touched_entities(self, new);
+        let reaching = timed("p.reaching", || graph.reaching(&touched));
+        let (after, before) = timed("p.cones", || {
+            let mut after_cones = ConeMemo::default();
+            let mut before_cones = ConeMemo::default();
+            let after: BTreeMap<u32, Rc<[u32]>> = reaching
+                .iter()
+                .map(|&entity| (entity, graph.cone_memo(&mut after_cones, entity, false)))
+                .collect();
+            let before: BTreeMap<u32, Rc<[u32]>> = reaching
+                .iter()
+                .filter(|&&entity| graph.existed(entity))
+                .map(|&entity| (entity, graph.cone_memo(&mut before_cones, entity, true)))
+                .collect();
+            (after, before)
+        });
+        let after_set: BTreeSet<&Rc<[u32]>> = after.values().collect();
+        let before_set: BTreeSet<&Rc<[u32]>> = before.values().collect();
+        let relevant_now = |members: &[u32]| timed("p.relevant", || self.relevant(members, None));
+        let relevant_then =
+            |members: &[u32]| timed("p.relevant", || self.relevant(members, Some(new)));
         // Sorted-slice subset test.
         let subset =
             |small: &[usize], large: &[usize]| small.iter().all(|i| large.binary_search(i).is_ok());
+        let touches = |members: &[u32]| members.iter().any(|m| touched.binary_search(m).is_ok());
         let mut cones = vec![];
         for &members in &after_set {
             if before_set.contains(members) {
-                if !members.iter().any(|m| touched.contains(m)) {
+                if !touches(members) {
                     continue;
                 }
                 // Every old antichain must survive (its records are stored and
@@ -2865,7 +3399,7 @@ impl<'a> NsContext<'a> {
                 continue;
             }
             let cover = &after[entity];
-            if !old.is_subset(cover) {
+            if !is_sorted_subset(old, cover) {
                 return Ok(Err("a cone shrank"));
             }
             let was = relevant_then(old);
@@ -2881,12 +3415,13 @@ impl<'a> NsContext<'a> {
             }
         }
         let covered = seen.len();
-        let members = after
+        let mut members: Vec<u32> = after
             .values()
-            .filter(|cone| cone.iter().any(|m| touched.contains(m)))
-            .flatten()
-            .copied()
+            .filter(|cone| touches(cone))
+            .flat_map(|cone| cone.iter().copied())
             .collect();
+        members.sort_unstable();
+        members.dedup();
         Ok(Ok(AppendPlan {
             cones,
             covered,
@@ -2912,38 +3447,39 @@ impl<'a> NsContext<'a> {
     fn current_records_survive(
         &self,
         new: usize,
-        plan: &AppendPlan<'a>,
+        plan: &AppendPlan,
         derived: &[Conflict],
     ) -> Result<bool> {
         if plan.members.is_empty() {
             return Ok(true);
         }
-        let mut old = Bits::new(self.events.len());
-        for i in (0..self.events.len()).filter(|&i| i != new) {
-            old.insert(i);
+        let relations = self.relations(&plan.members);
+        let mut old = Bits::new(relations.universe.len());
+        for (k, &i) in relations.universe.iter().enumerate() {
+            if i != new {
+                old.insert(k);
+            }
         }
-        let derived: BTreeSet<&str> = derived.iter().map(|c| c.id.as_str()).collect();
-        let mut maximal: BTreeMap<&BTreeSet<&str>, BTreeSet<String>> = BTreeMap::new();
-        for record in self.namespace_records(&plan.members, &old)? {
+        let derived: HashSet<&str> = derived.iter().map(|c| c.id.as_str()).collect();
+        let mut maximal: HashMap<Rc<[u32]>, HashSet<String>> = HashMap::new();
+        for record in self.namespace_records(&plan.members, &relations, &old)? {
             if derived.contains(record.id.as_str()) {
                 continue;
             }
             let entity = record.entity.split(',').next().unwrap_or_default();
-            let Some(cone) = plan.before.get(entity) else {
+            let Some(cone) = self.entity(entity).and_then(|e| plan.before.get(&e)) else {
                 return Ok(false);
             };
             if !maximal.contains_key(cone) {
-                let mut cut = Bits::new(self.events.len());
-                for i in self.relevant(cone, Some(new)) {
-                    cut.union_with(&self.closure(i, false));
-                    cut.insert(i);
-                }
+                let cone_relations = self.relations(cone);
+                let events: Vec<usize> = self.relevant(cone, Some(new)).to_vec();
+                let cut = cut_over(&cone_relations, &events);
                 let ids = self
-                    .namespace_records(cone, &cut)?
-                    .into_iter()
-                    .map(|c| c.id)
+                    .namespace_records(cone, &cone_relations, &cut)?
+                    .iter()
+                    .map(|c| c.id.clone())
                     .collect();
-                maximal.insert(cone, ids);
+                maximal.insert(cone.clone(), ids);
             }
             if !maximal[cone].contains(&record.id) {
                 return Ok(false);
@@ -2965,11 +3501,13 @@ impl<'a> NsContext<'a> {
                 &mut conflicts,
             )?;
         }
-        Ok(conflicts.into_values().collect())
+        Ok(conflicts.into_values().map(|c| (*c).clone()).collect())
     }
 
     /// The namespace records of `project(cut)` that mention a cone member,
     /// computed from the members' kind, location and alive registers alone.
+    /// `cut` is a bitset over `relations`' universe, which must hold every
+    /// touching event of the members.
     ///
     /// Exact because a member's slot competitors and every directory it was
     /// ever placed in are members (the cone is closed under both, over the
@@ -2977,213 +3515,401 @@ impl<'a> NsContext<'a> {
     /// entity's registers; and an entity without these registers behaves as
     /// an absent one (never alive, never a directory). The only other effect
     /// of the other entities, a failure of `project` on them, is ruled out by
-    /// the caller (`projection_cannot_fail`).
-    fn namespace_records(&self, members: &BTreeSet<&str>, cut: &Bits) -> Result<Vec<Conflict>> {
-        let mut registers: BTreeMap<String, Vec<Version>> = BTreeMap::new();
+    /// the caller (`projection_cannot_fail`). Records are built once per
+    /// derivation (`Memo::records`).
+    fn namespace_records(
+        &self,
+        members: &[u32],
+        relations: &Relations,
+        cut: &Bits,
+    ) -> Result<Vec<Record>> {
+        let in_cut = |event: usize| relations.index(event).is_some_and(|k| cut.contains(k));
+        // As in `project`: each register's winner among its heads.
+        struct Placement<'p> {
+            kind: Option<&'p str>,
+            parent: &'p str,
+            name: &'p str,
+            alive: bool,
+            /// Location heads (member, event position), sorted as `project`
+            /// sorts heads.
+            location: Vec<(u32, usize)>,
+        }
+        let mut entries: Vec<Option<Placement>> = Vec::with_capacity(members.len());
         for &member in members {
-            for &i in self.touching.get(member).into_iter().flatten() {
-                if !cut.contains(i) {
+            let mut entry: Option<Placement> = None;
+            for field in [KIND, LOCATION, ALIVE] {
+                let versions = &self.regs[member as usize][field];
+                let present: Vec<usize> = (0..versions.len())
+                    .filter(|&k| in_cut(versions[k].event))
+                    .collect();
+                if present.is_empty() {
                     continue;
                 }
-                let e = &self.events[i];
-                for c in e.changes.iter().filter(|c| {
-                    c.entity == member && ["kind", "location", "alive"].contains(&c.field.as_str())
-                }) {
-                    registers
-                        .entry(register(&c.entity, &c.field))
-                        .or_default()
-                        .push(Version {
-                            revision: e.id.clone(),
-                            device: e.device.clone(),
-                            created_ms: e.created_ms,
-                            parents: c.parents.clone(),
-                            value: c.value.clone(),
-                        });
+                let mut dominated = vec![false; versions.len()];
+                for &k in &present {
+                    for &p in &versions[k].parents {
+                        dominated[p] = true;
+                    }
+                }
+                let mut heads: Vec<usize> =
+                    present.into_iter().filter(|&k| !dominated[k]).collect();
+                heads.sort_by(|&a, &b| {
+                    let (ea, eb) = (
+                        &self.events[versions[a].event],
+                        &self.events[versions[b].event],
+                    );
+                    (&ea.device, &ea.id).cmp(&(&eb.device, &eb.id))
+                });
+                let winner = versions[*heads.last().unwrap()].change;
+                let placement = entry.get_or_insert(Placement {
+                    kind: None,
+                    parent: "",
+                    name: "",
+                    alive: false,
+                    location: vec![],
+                });
+                match field {
+                    KIND => placement.kind = Some(winner.value.as_str().unwrap()),
+                    LOCATION => {
+                        placement.parent = winner.value["parent"].as_str().unwrap();
+                        placement.name = winner.value["name"].as_str().unwrap();
+                        placement.location =
+                            heads.iter().map(|&k| (member, versions[k].event)).collect();
+                    }
+                    _ => placement.alive = winner.value.as_bool().unwrap(),
                 }
             }
+            entries.push(entry);
         }
-        // As in `project`: each register's winner among its heads.
-        #[derive(Default)]
-        struct Placement {
-            kind: String,
-            parent: String,
-            name: String,
-            alive: bool,
-        }
-        let mut entries: BTreeMap<String, Placement> = BTreeMap::new();
-        let mut locations: BTreeMap<String, Vec<Version>> = BTreeMap::new();
-        for (key, versions) in registers {
-            let dominated: BTreeSet<&str> = versions
-                .iter()
-                .flat_map(|v| v.parents.iter().map(String::as_str))
-                .collect();
-            let mut heads: Vec<Version> = versions
-                .iter()
-                .filter(|v| !dominated.contains(v.revision.as_str()))
-                .cloned()
-                .collect();
-            heads.sort_by(|a, b| (&a.device, &a.revision).cmp(&(&b.device, &b.revision)));
-            let winner = heads.last().unwrap();
-            let (entity, field) = key.rsplit_once('/').unwrap();
-            let entry = entries.entry(entity.into()).or_default();
-            match field {
-                "kind" => entry.kind = winner.value.as_str().unwrap().into(),
-                "location" => {
-                    entry.parent = winner.value["parent"].as_str().unwrap().into();
-                    entry.name = winner.value["name"].as_str().unwrap().into();
-                }
-                "alive" => entry.alive = winner.value.as_bool().unwrap(),
-                _ => {}
-            }
-            if field == "location" {
-                locations.insert(entity.into(), heads);
-            }
-        }
+        let local = |entity: &str| -> Option<usize> {
+            let number = self.entity(entity)?;
+            members.binary_search(&number).ok()
+        };
         // As in `project`: slot collisions, then missing parents and cycles.
-        let mut conflicts = vec![];
-        let ids: Vec<_> = entries.keys().cloned().collect();
-        let mut slots: BTreeMap<(String, Arc<str>), Vec<String>> = BTreeMap::new();
-        for entity in &ids {
-            let e = &entries[entity];
-            if e.alive {
+        let mut records: Vec<Record> = vec![];
+        let mut slots: BTreeMap<(&str, Arc<str>), Vec<usize>> = BTreeMap::new();
+        for (k, entry) in entries.iter().enumerate() {
+            if let Some(e) = entry.as_ref().filter(|e| e.alive) {
                 slots
-                    .entry((e.parent.clone(), slot_key(&e.name)?))
+                    .entry((e.parent, slot_key(e.name)?))
                     .or_default()
-                    .push(entity.clone());
+                    .push(k);
             }
         }
-        for members in slots.values().filter(|m| m.len() > 1) {
-            let winner = members.iter().max().unwrap();
-            for entity in members {
-                if entity != winner {
-                    entries.get_mut(entity).unwrap().alive = false;
+        for occupants in slots.values().filter(|m| m.len() > 1) {
+            let winner = *occupants.last().unwrap();
+            for &k in occupants {
+                if k != winner {
+                    entries[k].as_mut().unwrap().alive = false;
                 }
             }
-            for (i, a) in members.iter().enumerate() {
-                for b in &members[i + 1..] {
-                    let pair = [locations[a].clone(), locations[b].clone()].concat();
-                    conflicts.push(make_conflict(
-                        self.branch,
-                        &format!("{a},{b}"),
-                        "namespace",
-                        "same name / file-directory collision",
-                        pair,
-                        vec![],
-                    ));
+            for (x, &a) in occupants.iter().enumerate() {
+                for &b in &occupants[x + 1..] {
+                    records.push(
+                        self.record(
+                            members[a],
+                            Some(members[b]),
+                            [&entries[a], &entries[b]]
+                                .iter()
+                                .flat_map(|e| e.as_ref().unwrap().location.iter().copied())
+                                .collect(),
+                        ),
+                    );
                 }
             }
         }
-        for entity in &ids {
-            let mut cursor = entity.clone();
-            let mut visited = BTreeSet::new();
+        for k in 0..entries.len() {
+            // `project`'s walk starts at the entity and stops at `ROOT`.
+            if entries[k].is_none() || self.names[members[k] as usize] == ROOT {
+                continue;
+            }
+            let mut cursor = k;
+            let mut visited: Vec<usize> = vec![];
             let mut invalid = false;
-            while cursor != ROOT {
-                if !visited.insert(cursor.clone()) {
+            loop {
+                if visited.contains(&cursor) {
                     invalid = true;
                     break;
                 }
-                if let Some(e) = entries.get(&cursor) {
-                    if !e.alive || (cursor != *entity && e.kind != "directory") {
+                visited.push(cursor);
+                let Some(e) = entries[cursor].as_ref() else {
+                    invalid = true;
+                    break;
+                };
+                if !e.alive || (cursor != k && e.kind != Some("directory")) {
+                    invalid = true;
+                    break;
+                }
+                if e.parent == ROOT {
+                    break;
+                }
+                match local(e.parent) {
+                    Some(parent) => cursor = parent,
+                    None => {
                         invalid = true;
                         break;
                     }
-                    cursor = e.parent.clone();
-                } else {
-                    invalid = true;
-                    break;
                 }
             }
-            if invalid && entries[entity].alive {
-                entries.get_mut(entity).unwrap().alive = false;
-                conflicts.push(make_conflict(
-                    self.branch,
-                    entity,
-                    "namespace",
-                    "deleted/missing parent or directory cycle",
-                    locations.get(entity).cloned().unwrap_or_default(),
-                    vec![],
-                ));
+            if invalid && entries[k].as_ref().unwrap().alive {
+                entries[k].as_mut().unwrap().alive = false;
+                let location = entries[k].as_ref().unwrap().location.clone();
+                records.push(self.record(members[k], None, location));
             }
         }
-        conflicts.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(conflicts)
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(records)
+    }
+
+    /// The namespace record of a collision of members `a` and `b` (or the
+    /// invalid chain of `a`), listing the location head versions `heads`
+    /// ((member, event position), in `project`'s order): built once per
+    /// derivation.
+    fn record(&self, a: u32, b: Option<u32>, heads: Vec<(u32, usize)>) -> Record {
+        let key = (a, b, heads);
+        if let Some(found) = self.memo.borrow().records.get(&key) {
+            return found.clone();
+        }
+        let (a, b, heads) = key;
+        let alternatives: Vec<Version> = heads
+            .iter()
+            .map(|&(member, event)| self.location_version(member, event))
+            .collect();
+        let record = Rc::new(match b {
+            Some(b) => make_conflict(
+                self.branch,
+                &format!("{},{}", self.names[a as usize], self.names[b as usize]),
+                "namespace",
+                "same name / file-directory collision",
+                alternatives,
+                vec![],
+            ),
+            None => make_conflict(
+                self.branch,
+                self.names[a as usize],
+                "namespace",
+                "deleted/missing parent or directory cycle",
+                alternatives,
+                vec![],
+            ),
+        });
+        self.memo
+            .borrow_mut()
+            .records
+            .insert((a, b, heads), record.clone());
+        record
+    }
+
+    /// The location version of `member` that event `event` writes.
+    fn location_version(&self, member: u32, event: usize) -> Version {
+        let change = self.regs[member as usize][LOCATION]
+            .iter()
+            .find(|v| v.event == event)
+            .map(|v| v.change)
+            .expect("a location head is a location version of its member");
+        version_of(self.events, (event, change))
     }
 }
 
+/// The cut of an antichain (`events`, positions) over a cone's relations:
+/// the events and their ancestors, as universe indices.
+fn cut_over(relations: &Relations, events: &[usize]) -> Bits {
+    let mut cut = Bits::new(relations.universe.len());
+    for &i in events {
+        if let Some(k) = relations.index(i) {
+            cut.union_with(&relations.up[k]);
+            cut.insert(k);
+        }
+    }
+    cut
+}
+
+/// Whether sorted `small` is a subset of sorted `large`.
+fn is_sorted_subset(small: &[u32], large: &[u32]) -> bool {
+    small.iter().all(|m| large.binary_search(m).is_ok())
+}
+
+/// The entities whose kind, location or alive register `events[new]` changes,
+/// sorted.
+fn touched_entities(ns: &NsContext, new: usize) -> Vec<u32> {
+    let mut touched: Vec<u32> = ns.events[new]
+        .changes
+        .iter()
+        .filter(|c| ns_field(&c.field).is_some())
+        .filter_map(|c| ns.entity(&c.entity))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    touched
+}
+
+/// Process-wide memo of competing-cut counts (CCR-WP4.INT-4): a cone's count
+/// depends only on its relevant events and the ancestry among them (the
+/// antichains), so it is keyed by a SHA-256 digest of the branch, the events'
+/// ids and that ancestry (`Relations::up` over them). Bounded; a miss
+/// recounts.
+mod cut_counts {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    const MAX: usize = 4096;
+
+    pub(super) fn key<'k>(
+        branch: &str,
+        ids: impl Iterator<Item = &'k str>,
+        relations: &Relations,
+    ) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update((branch.len() as u64).to_le_bytes());
+        digest.update(branch.as_bytes());
+        for id in ids {
+            digest.update((id.len() as u64).to_le_bytes());
+            digest.update(id.as_bytes());
+        }
+        for up in &relations.up {
+            digest.update((up.words.len() as u64).to_le_bytes());
+            for word in &up.words {
+                digest.update(word.to_le_bytes());
+            }
+        }
+        digest.finalize().into()
+    }
+
+    fn memo() -> &'static Mutex<HashMap<[u8; 32], usize>> {
+        static MEMO: OnceLock<Mutex<HashMap<[u8; 32], usize>>> = OnceLock::new();
+        MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn get(key: &[u8; 32]) -> Option<usize> {
+        memo()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .copied()
+    }
+
+    pub(super) fn put(key: [u8; 32], count: usize) {
+        let mut memo = memo().lock().unwrap_or_else(PoisonError::into_inner);
+        if memo.len() >= MAX {
+            memo.clear();
+        }
+        memo.insert(key, count);
+    }
+}
+
+/// The dependency cones of the whole branch (full mode): each entity's cone
+/// is itself, its parents and slot competitors, transitively, over the
+/// whole history. WP5.1: entities as numbers; entities that share a slot
+/// (transitively) have the same cone, so it is computed once per such group.
 struct NamespaceCones {
-    parents: BTreeMap<String, BTreeSet<String>>,
-    entity_slots: BTreeMap<String, BTreeSet<(String, String)>>,
-    slots: BTreeMap<(String, String), BTreeSet<String>>,
+    /// Per entity: its historical parent directories.
+    parents: Vec<Vec<u32>>,
+    /// Per entity: the slots it was placed in.
+    entity_slots: Vec<Vec<u32>>,
+    /// Per slot: the entities placed in it.
+    slots: Vec<Vec<u32>>,
 }
 impl NamespaceCones {
-    fn new<'e>(events: impl IntoIterator<Item = &'e Event>) -> Result<Self> {
+    fn new(ns: &NsContext) -> Result<Self> {
+        let n = ns.names.len();
         let mut result = Self {
-            parents: BTreeMap::new(),
-            entity_slots: BTreeMap::new(),
-            slots: BTreeMap::new(),
+            parents: vec![vec![]; n],
+            entity_slots: vec![vec![]; n],
+            slots: vec![],
         };
-        for e in events {
+        let mut slot_ids: HashMap<(&str, String), u32> = HashMap::new();
+        for e in ns.events {
             for c in &e.changes {
-                result.parents.entry(c.entity.clone()).or_default();
-                if c.field == "location" {
-                    let parent = c.value["parent"].as_str().unwrap();
-                    if parent != ROOT {
-                        result
-                            .parents
-                            .entry(c.entity.clone())
-                            .or_default()
-                            .insert(parent.to_owned());
-                        result.parents.entry(parent.to_owned()).or_default();
-                    }
-                    let key = (
-                        parent.to_owned(),
-                        name_key(c.value["name"].as_str().unwrap())?,
-                    );
-                    result
-                        .entity_slots
-                        .entry(c.entity.clone())
-                        .or_default()
-                        .insert(key.clone());
-                    result
-                        .slots
-                        .entry(key)
-                        .or_default()
-                        .insert(c.entity.clone());
+                if c.field != "location" {
+                    continue;
                 }
+                let entity = ns.entities[c.entity.as_str()];
+                let parent = c.value["parent"].as_str().unwrap();
+                if parent != ROOT {
+                    result.parents[entity as usize].push(ns.entities[parent]);
+                }
+                // As the historical code: the first invalid name refuses.
+                let key = match slot_key(c.value["name"].as_str().unwrap()) {
+                    Ok(key) => key.to_string(),
+                    Err(_) => name_key(c.value["name"].as_str().unwrap())?,
+                };
+                let next = slot_ids.len() as u32;
+                let slot = *slot_ids.entry((parent, key)).or_insert(next);
+                if slot as usize == result.slots.len() {
+                    result.slots.push(vec![]);
+                }
+                result.slots[slot as usize].push(entity);
+                result.entity_slots[entity as usize].push(slot);
             }
+        }
+        for list in result
+            .parents
+            .iter_mut()
+            .chain(&mut result.entity_slots)
+            .chain(&mut result.slots)
+        {
+            list.sort_unstable();
+            list.dedup();
         }
         Ok(result)
     }
     /// The dependency cone of `entity`: itself, its parents and slot
-    /// competitors, transitively.
-    fn cone(&self, entity: &str) -> BTreeSet<String> {
+    /// competitors, transitively. Sorted.
+    fn cone(&self, entity: u32) -> Vec<u32> {
         crate::startup::progress("analyzing namespace dependencies");
-        let mut members = BTreeSet::new();
-        let mut visited_slots = BTreeSet::new();
-        let mut pending = vec![entity.to_owned()];
+        let mut members = Bits::new(self.parents.len());
+        let mut visited_slots = Bits::new(self.slots.len());
+        let mut pending = vec![entity];
         while let Some(next) = pending.pop() {
-            if !members.insert(next.clone()) {
+            if !members.insert(next as usize) {
                 continue;
             }
-            pending.extend(self.parents[&next].iter().cloned());
-            if let Some(slots) = self.entity_slots.get(&next) {
-                for slot in slots {
-                    if visited_slots.insert(slot.clone()) {
-                        pending.extend(self.slots[slot].iter().cloned());
-                    }
+            pending.extend(&self.parents[next as usize]);
+            for &slot in &self.entity_slots[next as usize] {
+                if visited_slots.insert(slot as usize) {
+                    pending.extend(&self.slots[slot as usize]);
                 }
             }
         }
         // Ancestors and slot competitors can affect this entry's visibility.
         // Sharing an ancestor alone does not make sibling histories interact.
-        members
+        members.iter().map(|m| m as u32).collect()
     }
-    /// The distinct cones.
-    fn members(&self) -> BTreeSet<BTreeSet<String>> {
-        self.parents
-            .keys()
-            .map(|entity| self.cone(entity))
-            .collect()
+    /// The distinct cones, in the historical order (the cones' member ids
+    /// compared as sorted sets).
+    fn members(&self) -> BTreeSet<Rc<[u32]>> {
+        let n = self.parents.len();
+        // Entities that share a slot, transitively, have one cone.
+        let mut group: Vec<usize> = (0..n).collect();
+        fn find(group: &mut [usize], mut x: usize) -> usize {
+            while group[x] != x {
+                group[x] = group[group[x]];
+                x = group[x];
+            }
+            x
+        }
+        for slot in &self.slots {
+            for pair in slot.windows(2) {
+                let (a, b) = (
+                    find(&mut group, pair[0] as usize),
+                    find(&mut group, pair[1] as usize),
+                );
+                if a != b {
+                    group[a.max(b)] = a.min(b);
+                }
+            }
+        }
+        let mut cones: HashMap<usize, Rc<[u32]>> = HashMap::new();
+        let mut distinct = BTreeSet::new();
+        for entity in 0..n {
+            let root = find(&mut group, entity);
+            let cone = cones
+                .entry(root)
+                .or_insert_with(|| self.cone(entity as u32).into())
+                .clone();
+            distinct.insert(cone);
+        }
+        distinct
     }
 }
 
@@ -3192,8 +3918,324 @@ impl NamespaceCones {
 pub fn project(branch: &str, events: &[Event]) -> Result<Projection> {
     project_refs(branch, &events.iter().collect::<Vec<_>>())
 }
+
 /// `project` over borrowed events (cuts are projected without cloning them).
+///
+/// WP5.1: the historical computation on positions instead of cloned ids:
+/// the same causal-parent check (first failure in event order), the same
+/// activation (an event is active once all its parents are), the same
+/// registers in the order of their `entity/field` keys (so the first
+/// metadata error is the same), heads, winners, `modified_ms`, register
+/// conflicts with their bases, and the same slot and chain passes; only the
+/// heads and the records are cloned. Inputs with repeated event ids take
+/// the historical code (`project_refs_reference`), whose bookkeeping keeps
+/// the last of them.
 fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(events.len());
+    for (i, e) in events.iter().enumerate() {
+        if index.insert(e.id.as_str(), i).is_some() {
+            return project_refs_reference(branch, events);
+        }
+    }
+    let t0 = std::time::Instant::now();
+    for e in events {
+        for c in &e.changes {
+            for parent in &c.parents {
+                if let Some(&p) = index.get(parent.as_str()) {
+                    ensure!(
+                        events[p]
+                            .changes
+                            .iter()
+                            .any(|pc| pc.entity == c.entity && pc.field == c.field),
+                        "INVALID_CAUSAL_PARENT"
+                    );
+                }
+            }
+        }
+    }
+    record_phase("pr.parent_check", t0.elapsed().as_micros() as u64);
+    let t0 = std::time::Instant::now();
+    // Activation: an event is active once every parent (dependency or change
+    // parent, present or not) is; a missing parent keeps it pending.
+    let n = events.len();
+    let mut degree = vec![0usize; n];
+    let mut children: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut has_missing = false;
+    for (i, e) in events.iter().enumerate() {
+        let mut parents: Vec<&str> = e
+            .dependencies
+            .iter()
+            .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
+            .map(String::as_str)
+            .collect();
+        parents.sort_unstable();
+        parents.dedup();
+        degree[i] = parents.len();
+        for parent in parents {
+            match index.get(parent) {
+                Some(&p) => children[p].push(i),
+                None => has_missing = true,
+            }
+        }
+    }
+    let mut active = vec![false; n];
+    let mut ready: Vec<usize> = (0..n).filter(|&i| degree[i] == 0).collect();
+    while let Some(i) = ready.pop() {
+        crate::startup::progress("validating causal history");
+        active[i] = true;
+        for &child in &children[i] {
+            degree[child] -= 1;
+            if degree[child] == 0 {
+                ready.push(child);
+            }
+        }
+    }
+    // A known closed dependency cycle is malformed, rather than permanently pending.
+    let mut pending: Vec<&str> = (0..n)
+        .filter(|&i| !active[i])
+        .map(|i| events[i].id.as_str())
+        .collect();
+    pending.sort_unstable();
+    if !pending.is_empty() {
+        ensure!(has_missing, "CAUSAL_CYCLE");
+    }
+    record_phase("pr.activation", t0.elapsed().as_micros() as u64);
+    let t0 = std::time::Instant::now();
+    let mut registers: HashMap<(&str, &str), Vec<VersionRef>> = HashMap::new();
+    for (i, e) in events.iter().enumerate().filter(|(i, _)| active[*i]) {
+        for c in &e.changes {
+            registers
+                .entry((c.entity.as_str(), c.field.as_str()))
+                .or_default()
+                .push((i, c));
+        }
+    }
+    let mut keys: Vec<(String, (&str, &str))> = registers
+        .keys()
+        .map(|&(entity, field)| (register(entity, field), (entity, field)))
+        .collect();
+    keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut p = Projection {
+        pending: pending.into_iter().map(str::to_owned).collect(),
+        ..Default::default()
+    };
+    let version = |(i, c): VersionRef| -> Version {
+        let e = events[i];
+        Version {
+            revision: e.id.clone(),
+            device: e.device.clone(),
+            created_ms: e.created_ms,
+            parents: c.parents.clone(),
+            value: c.value.clone(),
+        }
+    };
+    record_phase("pr.registers", t0.elapsed().as_micros() as u64);
+    let t0 = std::time::Instant::now();
+    for (key, (entity, field)) in keys {
+        crate::startup::progress("projecting registers");
+        let versions = &registers[&(entity, field)];
+        // All ancestors are dominated before the stable concurrent rank is used.
+        let mut heads: Vec<VersionRef> = if versions.len() == 1 {
+            versions.clone()
+        } else {
+            let dominated: HashSet<&str> = versions
+                .iter()
+                .flat_map(|(_, c)| c.parents.iter().map(String::as_str))
+                .collect();
+            versions
+                .iter()
+                .copied()
+                .filter(|&(i, _)| !dominated.contains(events[i].id.as_str()))
+                .collect()
+        };
+        heads.sort_by(|&(a, _), &(b, _)| {
+            (&events[a].device, &events[a].id).cmp(&(&events[b].device, &events[b].id))
+        });
+        let (winner_event, winner) = *heads.last().unwrap();
+        let winner_event = events[winner_event];
+        let entry = p.entries.entry(entity.into()).or_insert_with(|| Entry {
+            id: entity.into(),
+            ..Default::default()
+        });
+        entry
+            .revisions
+            .insert(field.into(), winner_event.id.clone());
+        if field != "basic" {
+            entry.modified_ms = entry.modified_ms.max(winner_event.created_ms);
+        }
+        match field {
+            "kind" => {
+                entry.kind = winner.value.as_str().unwrap().into();
+                entry.created_ms = winner_event.created_ms;
+            }
+            "location" => {
+                entry.parent = winner.value["parent"].as_str().unwrap().into();
+                entry.name = winner.value["name"].as_str().unwrap().into();
+            }
+            "alive" => entry.alive = winner.value.as_bool().unwrap(),
+            "content" => entry.content = winner.value.as_str().map(str::to_owned),
+            "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
+            _ => {}
+        }
+        if heads.len() > 1
+            && heads
+                .iter()
+                .map(|(_, c)| serde_json::to_string(&c.value).unwrap())
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        {
+            // The register's versions in revision order, and each head's
+            // ancestors among them (the historical `ancestors`, over
+            // positions: the common ones are the record's bases).
+            let mut order: Vec<usize> = (0..versions.len()).collect();
+            order.sort_by(|&a, &b| events[versions[a].0].id.cmp(&events[versions[b].0].id));
+            let at: HashMap<&str, usize> = versions
+                .iter()
+                .enumerate()
+                .map(|(k, (i, _))| (events[*i].id.as_str(), k))
+                .collect();
+            let ancestry = |(_, c): VersionRef| -> Bits {
+                let mut found = Bits::new(versions.len());
+                let mut todo: Vec<&str> = c.parents.iter().map(String::as_str).collect();
+                while let Some(revision) = todo.pop() {
+                    if let Some(&k) = at.get(revision)
+                        && found.insert(k)
+                    {
+                        todo.extend(versions[k].1.parents.iter().map(String::as_str));
+                    }
+                }
+                found
+            };
+            let ancestors: Vec<Bits> = heads.iter().map(|&v| ancestry(v)).collect();
+            let owned: Vec<Version> = heads.iter().map(|&v| version(v)).collect();
+            // Pair records have stable identity even when a third competitor is
+            // learned later. No delivery-dependent subset record is persisted.
+            for (i, a) in owned.iter().enumerate() {
+                for (j, b) in owned.iter().enumerate().skip(i + 1) {
+                    if a.value != b.value {
+                        let bases = order
+                            .iter()
+                            .filter(|&&k| ancestors[i].contains(k) && ancestors[j].contains(k))
+                            .map(|&k| version(versions[k]))
+                            .collect();
+                        p.conflicts.push(make_conflict(
+                            branch,
+                            entity,
+                            field,
+                            "concurrent revisions",
+                            vec![a.clone(), b.clone()],
+                            bases,
+                        ));
+                    }
+                }
+            }
+            p.heads.insert(key, owned);
+        } else {
+            p.heads
+                .insert(key, heads.iter().map(|&v| version(v)).collect());
+        }
+    }
+    record_phase("pr.heads", t0.elapsed().as_micros() as u64);
+    timed("pr.namespace", || namespace_pass(branch, &mut p))?;
+    Ok(p)
+}
+
+/// The visible-namespace passes of `project`: slot collisions (the
+/// largest entity id of a slot stays alive), then missing parents and
+/// directory cycles; each records its conflicts, and the list is sorted.
+fn namespace_pass(branch: &str, p: &mut Projection) -> Result<()> {
+    // Make a deterministic, acyclic visible namespace, retaining suppressed
+    // entities and their complete registers in conflicts/current-state.
+    let ids: Vec<String> = p.entries.keys().cloned().collect();
+    let mut slots: BTreeMap<(&str, Arc<str>), Vec<&str>> = BTreeMap::new();
+    for entity in &ids {
+        let e = &p.entries[entity];
+        if e.alive {
+            let key = match slot_key(&e.name) {
+                Ok(key) => key,
+                Err(_) => Arc::from(name_key(&e.name)?),
+            };
+            slots
+                .entry((e.parent.as_str(), key))
+                .or_default()
+                .push(entity.as_str());
+        }
+    }
+    let collisions: Vec<Vec<String>> = slots
+        .into_values()
+        .filter(|m| m.len() > 1)
+        .map(|m| m.into_iter().map(str::to_owned).collect())
+        .collect();
+    for members in collisions {
+        let winner = members.iter().max().unwrap().clone();
+        for entity in &members {
+            if entity != &winner {
+                p.entries.get_mut(entity).unwrap().alive = false;
+            }
+        }
+        for (i, a) in members.iter().enumerate() {
+            for b in &members[i + 1..] {
+                let pair = [
+                    p.heads[&register(a, "location")].clone(),
+                    p.heads[&register(b, "location")].clone(),
+                ]
+                .concat();
+                p.conflicts.push(make_conflict(
+                    branch,
+                    &format!("{a},{b}"),
+                    "namespace",
+                    "same name / file-directory collision",
+                    pair,
+                    vec![],
+                ));
+            }
+        }
+    }
+    for entity in &ids {
+        let mut cursor = entity.as_str();
+        let mut visited: Vec<&str> = vec![];
+        let mut invalid = false;
+        while cursor != ROOT {
+            if visited.contains(&cursor) {
+                invalid = true;
+                break;
+            }
+            visited.push(cursor);
+            if let Some(e) = p.entries.get(cursor) {
+                if !e.alive || (cursor != entity && e.kind != "directory") {
+                    invalid = true;
+                    break;
+                }
+                cursor = &e.parent;
+            } else {
+                invalid = true;
+                break;
+            }
+        }
+        if invalid && p.entries[entity].alive {
+            p.entries.get_mut(entity).unwrap().alive = false;
+            let alternatives = p
+                .heads
+                .get(&register(entity, "location"))
+                .cloned()
+                .unwrap_or_default();
+            p.conflicts.push(make_conflict(
+                branch,
+                entity,
+                "namespace",
+                "deleted/missing parent or directory cycle",
+                alternatives,
+                vec![],
+            ));
+        }
+    }
+    p.conflicts.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(())
+}
+/// The historical `project_refs` (Wave 0, unchanged): the reference for
+/// inputs with repeated event ids, and for the unit tests.
+fn project_refs_reference(branch: &str, events: &[&Event]) -> Result<Projection> {
     let by_id: BTreeMap<_, _> = events.iter().map(|e| (e.id.clone(), *e)).collect();
     for e in events {
         for c in &e.changes {
@@ -3432,6 +4474,2500 @@ mod tests {
     use super::*;
     use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 
+    /// `namespace_records` over a cut given as event positions.
+    fn records_of(ns: &NsContext, members: &[u32], cut: &Bits) -> Vec<Conflict> {
+        let relations = ns.relations(members);
+        let mut over = Bits::new(relations.universe.len());
+        for (k, &i) in relations.universe.iter().enumerate() {
+            if cut.contains(i) {
+                over.insert(k);
+            }
+        }
+        ns.namespace_records(members, &relations, &over)
+            .unwrap()
+            .into_iter()
+            .map(|c| (*c).clone())
+            .collect()
+    }
+
+    /// The derivation as of Wave 4 (WP4.INT, `c6948c9`), verbatim apart from
+    /// its phase timers: the reference the WP5.1 interned implementation must
+    /// reproduce exactly (sources in order, append plans, fallbacks, refusals).
+    mod wave4 {
+        #![allow(dead_code, clippy::all)]
+        use super::super::*;
+        use super::super::{Count, count, reviewed_rows};
+
+        /// Every full-mode source, in the historical order (the deduplication keeps
+        /// the last record of each id). The stored rows the new event reviews come
+        /// from `input.reviewed` (none for a rebuild).
+        pub(super) fn derive_full_with(
+            input: &DeriveInput,
+            new_event: Option<&str>,
+        ) -> Result<Vec<Conflict>> {
+            let DeriveInput {
+                branch,
+                projection: p,
+                events,
+                ..
+            } = *input;
+            let mut conflicts = p.conflicts.clone();
+            if new_event.is_some() {
+                conflicts.extend(input.reviewed.iter().cloned());
+            }
+            // Namespace collisions also have a deterministic historical basis. A later
+            // rename arriving first must not erase evidence of concurrent same-name
+            // placement. Sequential temp replacement is ordered by event context.
+            let activated: Vec<_> = events
+                .iter()
+                .filter(|e| !p.pending.contains(&e.id))
+                .collect();
+            let mut locations = vec![];
+            for e in &activated {
+                for c in &e.changes {
+                    if c.field == "location" {
+                        locations.push((*e, c));
+                    }
+                }
+            }
+            // Each change's slot name key is computed once, in the order the pairwise
+            // comparison first needs it (so a failure surfaces at the same pair).
+            let mut keys: Vec<Option<String>> = vec![None; locations.len()];
+            let pairs_started = std::time::Instant::now();
+            for (i, &(a, ac)) in locations.iter().enumerate() {
+                crate::startup::progress("rebuilding namespace conflicts");
+                for (j, &(b, bc)) in locations.iter().enumerate().skip(i + 1) {
+                    if ac.entity == bc.entity || ac.value["parent"] != bc.value["parent"] {
+                        continue;
+                    }
+                    for k in [i, j] {
+                        if keys[k].is_none() {
+                            keys[k] =
+                                Some(name_key(locations[k].1.value["name"].as_str().unwrap())?);
+                        }
+                    }
+                    if keys[i] != keys[j] {
+                        continue;
+                    }
+                    if let Some(c) = concurrent_placement(branch, events, (a, ac), (b, bc)) {
+                        conflicts.push(c);
+                    }
+                }
+            }
+            record_phase(
+                "f.location_pairs",
+                pairs_started.elapsed().as_micros() as u64,
+            );
+            // Explicit reviews carry their observed cut. Recover namespace records from
+            // it even when resolution was delivered before its prerequisites.
+            for e in &activated {
+                if !e.reviewed.is_empty() {
+                    conflicts.extend(timed("f.reviewed_cut", || reviewed_cut(branch, events, e))?);
+                }
+            }
+            // Every namespace causal cut is represented by an antichain of maximal
+            // namespace-changing events. Include arbitrary-width concurrency, not just
+            // pairs; content-only events add no new namespace projection. The explicit
+            // budget refuses a commit before acknowledgement rather than losing history.
+            conflicts.extend(timed("f.ns", || NsContext::new(branch, events).full())?);
+            conflicts.extend(timed("f.register_pairs", || {
+                register_pairs(branch, p, events, new_event)
+            }));
+            Ok(conflicts)
+        }
+
+        /// The record of two placements of different entities into one slot, unless
+        /// one event is an ancestor of the other.
+        pub(super) fn concurrent_placement(
+            branch: &str,
+            events: &[Event],
+            (a, ac): (&Event, &Change),
+            (b, bc): (&Event, &Change),
+        ) -> Option<Conflict> {
+            if event_ancestors(a, events).contains(&b.id)
+                || event_ancestors(b, events).contains(&a.id)
+            {
+                return None;
+            }
+            let mut entities = [ac.entity.clone(), bc.entity.clone()];
+            entities.sort();
+            let alternatives = [(a, ac), (b, bc)]
+                .into_iter()
+                .map(|(e, c)| Version {
+                    revision: e.id.clone(),
+                    device: e.device.clone(),
+                    created_ms: e.created_ms,
+                    parents: c.parents.clone(),
+                    value: c.value.clone(),
+                })
+                .collect();
+            Some(make_conflict(
+                branch,
+                &entities.join(","),
+                "namespace",
+                "same name / file-directory collision",
+                alternatives,
+                vec![],
+            ))
+        }
+
+        /// Every record of the projection of a review's observed (ancestor) cut.
+        pub(super) fn reviewed_cut(
+            branch: &str,
+            events: &[Event],
+            e: &Event,
+        ) -> Result<Vec<Conflict>> {
+            let ancestors = event_ancestors(e, events);
+            let cut: Vec<&Event> = events
+                .iter()
+                .filter(|prior| ancestors.contains(&prior.id))
+                .collect();
+            Ok(project_refs(branch, &cut)?.conflicts)
+        }
+
+        /// Historical register pairs: on append, the new event's version against every
+        /// other version of each register it changes; on rebuild, every pair.
+        pub(super) fn register_pairs(
+            branch: &str,
+            p: &Projection,
+            events: &[Event],
+            new_event: Option<&str>,
+        ) -> Vec<Conflict> {
+            // On append only the new event's registers can yield pairs (any other
+            // register has no candidate version and is skipped below).
+            let wanted: Option<BTreeSet<String>> = new_event.map(|id| {
+                events
+                    .iter()
+                    .filter(|e| e.id == id && !p.pending.contains(&e.id))
+                    .flat_map(|e| e.changes.iter().map(|c| register(&c.entity, &c.field)))
+                    .collect()
+            });
+            // Derive historical concurrent pairs from the full activated DAG too, so a
+            // fast-forward delivered before a competitor cannot hide the earlier pair.
+            let mut history: BTreeMap<String, Vec<Version>> = BTreeMap::new();
+            for e in events.iter().filter(|e| !p.pending.contains(&e.id)) {
+                for c in &e.changes {
+                    let key = register(&c.entity, &c.field);
+                    if wanted.as_ref().is_some_and(|wanted| !wanted.contains(&key)) {
+                        continue;
+                    }
+                    history.entry(key).or_default().push(Version {
+                        revision: e.id.clone(),
+                        device: e.device.clone(),
+                        created_ms: e.created_ms,
+                        parents: c.parents.clone(),
+                        value: c.value.clone(),
+                    });
+                }
+            }
+            let mut conflicts = vec![];
+            for (key, versions) in &history {
+                crate::startup::progress("rebuilding register conflicts");
+                let candidate =
+                    new_event.and_then(|id| versions.iter().position(|v| v.revision == id));
+                if new_event.is_some() && candidate.is_none() {
+                    continue;
+                }
+                // The overwhelmingly common single-parent chain has no historical
+                // concurrency. Detect it in O(revisions), without enumerating pairs.
+                if linear_versions(versions) {
+                    continue;
+                }
+                let reach = VersionReach::new(versions);
+                let (entity, field) = key.rsplit_once('/').unwrap();
+                // Appending a validated event cannot change old/old register ancestry.
+                // Keep their durable records and derive only new/old pairs on append.
+                // Startup/repair still derives the entire historical set from the DAG.
+                let pairs: Box<dyn Iterator<Item = (usize, usize)>> = if let Some(i) = candidate {
+                    Box::new(
+                        (0..versions.len())
+                            .filter(move |&j| j != i)
+                            .map(move |j| (i, j)),
+                    )
+                } else {
+                    Box::new(
+                        (0..versions.len())
+                            .flat_map(|i| ((i + 1)..versions.len()).map(move |j| (i, j))),
+                    )
+                };
+                for (i, j) in pairs {
+                    crate::startup::progress("rebuilding register conflicts");
+                    let a = &versions[i];
+                    let b = &versions[j];
+                    if a.value != b.value && !reach.has(i, j) && !reach.has(j, i) {
+                        let mut bases: Vec<_> = versions
+                            .iter()
+                            .enumerate()
+                            .filter(|(k, _)| reach.has(i, *k) && reach.has(j, *k))
+                            .map(|(_, v)| v)
+                            .cloned()
+                            .collect();
+                        bases.sort_by(|a, b| a.revision.cmp(&b.revision));
+                        conflicts.push(make_conflict(
+                            branch,
+                            entity,
+                            field,
+                            "concurrent revisions",
+                            vec![a.clone(), b.clone()],
+                            bases,
+                        ));
+                    }
+                }
+            }
+            conflicts
+        }
+
+        /// The outcome of the append-mode precondition.
+        pub(super) enum Plan {
+            /// The records append mode derives (written without the namespace DELETE).
+            Derived(Vec<Conflict>),
+            /// The precondition does not hold: derive in full.
+            Fallback(&'static str),
+        }
+
+        /// Bound on the process-wide slot-key memo (`slot_key`), in estimated bytes.
+        pub(super) const SLOT_KEY_MEMO_BYTES: usize = 16 * 1024 * 1024;
+
+        /// A slot key, or the text of the error `name_key` raises for the name.
+        pub(super) type SlotKey = std::result::Result<Arc<str>, Arc<str>>;
+
+        /// A memo of slot keys bounded by an estimate of the bytes it holds, in two
+        /// generations of at most half the budget each: a hit in the older one moves
+        /// the entry to the current one, and a current generation that would outgrow
+        /// its half becomes the older one (the previous older one is dropped). Names
+        /// used on every commit stay; a branch with more distinct names than the
+        /// budget holds recomputes some keys instead of growing the memo.
+        pub(super) struct SlotKeys {
+            current: HashMap<String, SlotKey>,
+            older: HashMap<String, SlotKey>,
+            current_bytes: usize,
+            older_bytes: usize,
+            budget: usize,
+        }
+        impl SlotKeys {
+            pub(super) fn new(budget: usize) -> Self {
+                Self {
+                    current: HashMap::new(),
+                    older: HashMap::new(),
+                    current_bytes: 0,
+                    older_bytes: 0,
+                    budget,
+                }
+            }
+            /// The heap an entry holds: the name, the key or error text, the
+            /// `String` and `Arc` headers and the table slot.
+            pub(super) fn entry_bytes(name: &str, key: &SlotKey) -> usize {
+                let text = match key {
+                    Ok(key) | Err(key) => key.len(),
+                };
+                name.len() + text + 96
+            }
+            pub(super) fn get(&mut self, name: &str) -> Option<SlotKey> {
+                if let Some(key) = self.current.get(name) {
+                    return Some(key.clone());
+                }
+                let key = self.older.remove(name)?;
+                self.older_bytes -= Self::entry_bytes(name, &key);
+                self.insert(name, key.clone());
+                Some(key)
+            }
+            pub(super) fn insert(&mut self, name: &str, key: SlotKey) {
+                let bytes = Self::entry_bytes(name, &key);
+                if bytes > self.budget / 2 {
+                    return;
+                }
+                if self.current_bytes + bytes > self.budget / 2 {
+                    self.older = std::mem::take(&mut self.current);
+                    self.older_bytes = self.current_bytes;
+                    self.current_bytes = 0;
+                }
+                // Another thread may have inserted it since this one looked.
+                if let Some(previous) = self.current.insert(name.to_owned(), key) {
+                    self.current_bytes -= Self::entry_bytes(name, &previous);
+                }
+                self.current_bytes += bytes;
+            }
+            /// Estimated bytes held (at most the budget).
+            #[cfg(test)]
+            pub(super) fn bytes(&self) -> usize {
+                self.current_bytes + self.older_bytes
+            }
+        }
+
+        /// `name_key`, memoized process-wide (bounded, see `SlotKeys`): a pure
+        /// function of the name, needed for every location change of the branch on
+        /// every append. Errors keep their text.
+        pub(super) fn slot_key(name: &str) -> Result<Arc<str>> {
+            static KEYS: OnceLock<Mutex<SlotKeys>> = OnceLock::new();
+            let keys = KEYS.get_or_init(|| Mutex::new(SlotKeys::new(SLOT_KEY_MEMO_BYTES)));
+            let found = keys
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(name);
+            let key = match found {
+                Some(key) => key,
+                None => {
+                    let key: SlotKey = match name_key(name) {
+                        Ok(key) => Ok(Arc::from(key)),
+                        Err(error) => Err(Arc::from(format!("{error:#}"))),
+                    };
+                    keys.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(name, key.clone());
+                    key
+                }
+            };
+            key.map_err(|error| anyhow::anyhow!("{error}"))
+        }
+
+        /// One location change of the branch with its slot key (or the error its
+        /// name gives).
+        pub(super) struct Location<'a> {
+            event: usize,
+            change: &'a Change,
+            parent: &'a str,
+            key: std::result::Result<Arc<str>, String>,
+        }
+
+        /// Every location change of the branch, in event then change order (the
+        /// order in which full mode first evaluates their names).
+        pub(super) struct Locations<'a> {
+            rows: Vec<Location<'a>>,
+        }
+        impl<'a> Locations<'a> {
+            pub(super) fn new(events: &'a [Event]) -> Self {
+                let mut rows = vec![];
+                for (event, e) in events.iter().enumerate() {
+                    for change in e.changes.iter().filter(|c| c.field == "location") {
+                        rows.push(Location {
+                            event,
+                            change,
+                            parent: change.value["parent"].as_str().unwrap(),
+                            key: slot_key(change.value["name"].as_str().unwrap())
+                                .map_err(|error| format!("{error:#}")),
+                        });
+                    }
+                }
+                Self { rows }
+            }
+            /// Row `k`'s key, or its name's error (as `name_key` raises it).
+            pub(super) fn key(&self, k: usize) -> Result<&str> {
+                match &self.rows[k].key {
+                    Ok(key) => Ok(key),
+                    Err(error) => Err(anyhow::anyhow!("{error}")),
+                }
+            }
+            /// The first name error, where full mode's cone analysis raises it.
+            pub(super) fn first_error(&self) -> Result<()> {
+                for k in 0..self.rows.len() {
+                    self.key(k)?;
+                }
+                Ok(())
+            }
+        }
+
+        /// Whether `project` succeeds on every downward-closed cut of `events` (it
+        /// succeeded on the whole branch): every name is valid, every kind is a
+        /// string and every presence a boolean, every metadata value parses, and
+        /// every presence version has a placement of its entity in its own event or
+        /// causally before it (through its presence parents). Then no visible entry
+        /// of any cut lacks a valid name, so a cone's records can be projected from
+        /// its own registers (`NsContext::namespace_records`).
+        pub(super) fn projection_cannot_fail(
+            events: &[Event],
+            locations: &Locations,
+            alive: &BTreeMap<&str, Vec<(usize, &Change)>>,
+        ) -> bool {
+            if locations.rows.iter().any(|row| row.key.is_err()) {
+                return false;
+            }
+            for c in events.iter().flat_map(|e| &e.changes) {
+                let valid = match c.field.as_str() {
+                    "kind" => c.value.is_string(),
+                    "alive" => c.value.is_boolean(),
+                    "basic" => BasicInfo::deserialize(&c.value).is_ok(),
+                    _ => true,
+                };
+                if !valid {
+                    return false;
+                }
+            }
+            for (&entity, versions) in alive {
+                let index: BTreeMap<&str, usize> = versions
+                    .iter()
+                    .enumerate()
+                    .map(|(k, (i, _))| (events[*i].id.as_str(), k))
+                    .collect();
+                // placed[k]: version k's event places the entity, or a presence
+                // parent of it is placed (resolved in topological order).
+                let parents: Vec<Vec<usize>> = versions
+                    .iter()
+                    .map(|(_, c)| {
+                        c.parents
+                            .iter()
+                            .filter_map(|p| index.get(p.as_str()).copied())
+                            .collect()
+                    })
+                    .collect();
+                let children = children_of(&parents);
+                let mut degree: Vec<usize> = parents.iter().map(Vec::len).collect();
+                let mut ready: Vec<usize> =
+                    (0..versions.len()).filter(|&k| degree[k] == 0).collect();
+                let mut placed = vec![false; versions.len()];
+                let mut seen = 0;
+                while let Some(k) = ready.pop() {
+                    seen += 1;
+                    placed[k] = events[versions[k].0]
+                        .changes
+                        .iter()
+                        .any(|c| c.entity == entity && c.field == "location")
+                        || parents[k].iter().any(|&p| placed[p]);
+                    for &child in &children[k] {
+                        degree[child] -= 1;
+                        if degree[child] == 0 {
+                            ready.push(child);
+                        }
+                    }
+                }
+                if seen < versions.len() || placed.contains(&false) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        /// Per edge of the namespace dependency graph: how many location changes of
+        /// the branch contribute it, and whether the new event is one of them.
+        #[derive(Clone, Copy, Default)]
+        pub(super) struct Contributions {
+            all: usize,
+            new: usize,
+        }
+        impl Contributions {
+            pub(super) fn add(&mut self, new: bool) {
+                self.all += 1;
+                self.new += usize::from(new);
+            }
+            /// Present before the new event (`before`) or with it.
+            pub(super) fn present(self, before: bool) -> bool {
+                if before {
+                    self.all > self.new
+                } else {
+                    self.all > 0
+                }
+            }
+        }
+
+        /// `NamespaceCones` of the whole branch, built once, with per-edge
+        /// contributions so the cones without the new event come from the same
+        /// graph (the new event adds at most one placement).
+        pub(super) struct ConeGraph<'a> {
+            nodes: BTreeMap<&'a str, Contributions>,
+            parents: BTreeMap<&'a str, BTreeMap<&'a str, Contributions>>,
+            children: BTreeMap<&'a str, BTreeSet<&'a str>>,
+            entity_slots: BTreeMap<&'a str, BTreeSet<(&'a str, &'a str)>>,
+            slots: BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, Contributions>>,
+        }
+        impl<'a> ConeGraph<'a> {
+            pub(super) fn new(
+                events: &'a [Event],
+                locations: &'a Locations<'a>,
+                new: usize,
+            ) -> Self {
+                let mut graph = Self {
+                    nodes: BTreeMap::new(),
+                    parents: BTreeMap::new(),
+                    children: BTreeMap::new(),
+                    entity_slots: BTreeMap::new(),
+                    slots: BTreeMap::new(),
+                };
+                for (i, e) in events.iter().enumerate() {
+                    for c in &e.changes {
+                        graph.nodes.entry(&c.entity).or_default().add(i == new);
+                    }
+                }
+                for row in &locations.rows {
+                    let is_new = row.event == new;
+                    let entity = row.change.entity.as_str();
+                    if row.parent != ROOT {
+                        graph
+                            .parents
+                            .entry(entity)
+                            .or_default()
+                            .entry(row.parent)
+                            .or_default()
+                            .add(is_new);
+                        graph.children.entry(row.parent).or_default().insert(entity);
+                        graph.nodes.entry(row.parent).or_default().add(is_new);
+                    }
+                    // Callers check `Locations::first_error` first.
+                    let key: &str = row.key.as_deref().unwrap_or_default();
+                    let slot = (row.parent, key);
+                    graph.entity_slots.entry(entity).or_default().insert(slot);
+                    graph
+                        .slots
+                        .entry(slot)
+                        .or_default()
+                        .entry(entity)
+                        .or_default()
+                        .add(is_new);
+                }
+                graph
+            }
+            /// Whether `entity` is a node of the history without the new event.
+            pub(super) fn existed(&self, entity: &str) -> bool {
+                self.nodes.get(entity).is_some_and(|c| c.present(true))
+            }
+            /// The cone of `entity` (`NamespaceCones::cone`), with or without the new
+            /// event's contributions.
+            pub(super) fn cone(&self, entity: &'a str, before: bool) -> BTreeSet<&'a str> {
+                crate::startup::progress("analyzing namespace dependencies");
+                let mut members = BTreeSet::new();
+                let mut visited_slots = BTreeSet::new();
+                let mut pending = vec![entity];
+                while let Some(next) = pending.pop() {
+                    if !members.insert(next) {
+                        continue;
+                    }
+                    for (&parent, c) in self.parents.get(next).into_iter().flatten() {
+                        if c.present(before) {
+                            pending.push(parent);
+                        }
+                    }
+                    for &slot in self.entity_slots.get(next).into_iter().flatten() {
+                        let occupants = &self.slots[&slot];
+                        if occupants[next].present(before) && visited_slots.insert(slot) {
+                            pending.extend(
+                                occupants
+                                    .iter()
+                                    .filter(|(_, c)| c.present(before))
+                                    .map(|(&m, _)| m),
+                            );
+                        }
+                    }
+                }
+                members
+            }
+            /// The entities whose cone (with the new event) contains one of
+            /// `targets`: reverse reachability over parent and slot edges.
+            pub(super) fn reaching(&self, targets: &BTreeSet<&str>) -> BTreeSet<&'a str> {
+                let mut found = BTreeSet::new();
+                let mut pending: Vec<&'a str> = targets
+                    .iter()
+                    .filter_map(|t| self.nodes.get_key_value(*t).map(|(&k, _)| k))
+                    .collect();
+                while let Some(next) = pending.pop() {
+                    if !found.insert(next) {
+                        continue;
+                    }
+                    pending.extend(self.children.get(next).into_iter().flatten().copied());
+                    for slot in self.entity_slots.get(next).into_iter().flatten() {
+                        pending.extend(self.slots[slot].keys().copied());
+                    }
+                }
+                found
+            }
+        }
+
+        /// `derive_append_with` reading the stored rows the new event reviews from
+        /// `tx` (the historical signature, for the unit tests).
+        #[cfg(test)]
+        pub(super) fn derive_append(
+            tx: &Connection,
+            branch: &str,
+            p: &Projection,
+            events: &[Event],
+            new_id: &str,
+        ) -> Result<Plan> {
+            let reviewed = reviewed_rows(tx, branch, events, Some(new_id))?;
+            derive_append_with(
+                &DeriveInput {
+                    branch,
+                    projection: p,
+                    events,
+                    new_event: Some(new_id),
+                    reviewed: &reviewed,
+                },
+                new_id,
+            )
+        }
+
+        /// Append mode (§5.2): the records the new event adds, or a fallback reason.
+        /// Errors are refusals, raised exactly where full mode raises them (module
+        /// docs): nothing here fails on history that a rebuild accepts.
+        pub(super) fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
+            let DeriveInput {
+                branch,
+                projection: p,
+                events,
+                ..
+            } = *input;
+            let mut positions = events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.id == new_id)
+                .map(|(i, _)| i);
+            let (Some(new), None) = (positions.next(), positions.next()) else {
+                return Ok(Plan::Fallback("new event not exactly once in the branch"));
+            };
+            if let Some(reason) = timed("a.guard", || append_guard(p, events, new)) {
+                return Ok(Plan::Fallback(reason));
+            }
+            let e = &events[new];
+            let locations = timed("a.locations", || Locations::new(events));
+            // Same source order as full mode, so a refusal surfaces with the same error.
+            let mut conflicts = timed("a.pconflicts", || p.conflicts.clone());
+            conflicts.extend(input.reviewed.iter().cloned());
+            conflicts.extend(timed("a.location_pairs", || {
+                location_pairs_with(branch, events, &locations, new)
+            })?);
+            if !e.reviewed.is_empty() {
+                conflicts.extend(timed("a.reviewed_cut", || reviewed_cut(branch, events, e))?);
+            }
+            // Full mode's cone analysis reads every name next.
+            locations.first_error()?;
+            let ns = timed("a.nscontext", || NsContext::new(branch, events));
+            let plan = match timed("a.plan", || ns.append_plan(new, &locations))? {
+                Ok(plan) => plan,
+                Err(reason) => return Ok(Plan::Fallback(reason)),
+            };
+            let restricted = !plan.cones.is_empty()
+                && timed("a.cannot_fail", || {
+                    projection_cannot_fail(events, &locations, &ns.alive)
+                });
+            if restricted {
+                count(Count::Restricted);
+            }
+            conflicts.extend(timed("a.derive_planned", || {
+                ns.derive_planned(&plan, restricted)
+            })?);
+            conflicts.extend(timed("a.register_pairs", || {
+                register_pairs(branch, p, events, Some(new_id))
+            }));
+            // Nothing above can fail on accepted history; a failure here is left to
+            // full mode, which raises or derives whatever the reference does.
+            match timed("a.survive", || {
+                ns.current_records_survive(new, &plan, &conflicts)
+            }) {
+                Ok(true) => Ok(Plan::Derived(conflicts)),
+                Ok(false) => Ok(Plan::Fallback(
+                    "a current namespace record is not derived from history",
+                )),
+                Err(_) => Ok(Plan::Fallback(
+                    "the current namespace records failed to project",
+                )),
+            }
+        }
+
+        /// Structural preconditions of append mode (facts 1 and 3 of the module
+        /// docs). `None` when append mode may run.
+        pub(super) fn append_guard(
+            p: &Projection,
+            events: &[Event],
+            new: usize,
+        ) -> Option<&'static str> {
+            if !p.pending.is_empty() {
+                return Some("the branch has pending events");
+            }
+            let id = &events[new].id;
+            let mut multi = vec![];
+            for (i, e) in events.iter().enumerate() {
+                if i != new
+                    && (e.dependencies.contains(id)
+                        || e.changes.iter().any(|c| c.parents.contains(id)))
+                {
+                    return Some("the new event is a parent of a committed event");
+                }
+                if e.changes.iter().any(|c| c.entity.contains(',')) {
+                    return Some("an entity id contains a comma");
+                }
+                let locations: Vec<&Change> =
+                    e.changes.iter().filter(|c| c.field == "location").collect();
+                if locations.len() > 1 {
+                    if i == new {
+                        return Some("the new event relocates several entities");
+                    }
+                    multi.push(locations);
+                }
+            }
+            // Several location changes in one event are a fork or restore root (or
+            // crafted). They keep ids unambiguous unless one event places two entities
+            // in one slot, or two events both relocate the same two entities.
+            for locations in &multi {
+                let mut slots = BTreeSet::new();
+                for c in locations {
+                    let (Some(parent), Some(name)) =
+                        (c.value["parent"].as_str(), c.value["name"].as_str())
+                    else {
+                        return Some("a location change without parent or name");
+                    };
+                    let key = if name.is_ascii() {
+                        name.to_ascii_lowercase()
+                    } else {
+                        match name_key(name) {
+                            Ok(key) => key,
+                            Err(_) => return Some("a location change with an invalid name"),
+                        }
+                    };
+                    if !slots.insert((parent, key)) {
+                        return Some("one event places two entities in one slot");
+                    }
+                }
+            }
+            if multi.len() > 1 {
+                if multi.len() > 16 {
+                    return Some("too many events relocate several entities");
+                }
+                let sets: Vec<BTreeSet<&str>> = multi
+                    .iter()
+                    .map(|locations| locations.iter().map(|c| c.entity.as_str()).collect())
+                    .collect();
+                for (i, a) in sets.iter().enumerate() {
+                    for b in &sets[i + 1..] {
+                        if a.intersection(b).nth(1).is_some() {
+                            return Some("two events relocate the same entities");
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        /// CCR-WP1.6-5: whether committing `events[new]` through the namespace
+        /// successor can change the competing-cut count of a dependency cone, so
+        /// that `check_successor_cuts` must count. A successor's event follows the
+        /// whole branch (`dependencies == frontier`), so it is in no antichain of two
+        /// or more events and adds no competing cut itself; it is also a descendant
+        /// of every version of the registers it changes (one head, parented by it),
+        /// so it changes no presence-witness group of an existing tombstone. A cone
+        /// can only gain competing cuts when the event
+        ///
+        /// - places an existing entity under a parent it never had (its cone takes
+        ///   in the parent's), or into a slot it never used that another entity
+        ///   used (it takes in the slot competitors' cones), or
+        /// - writes the first tombstone of an entity that has `alive = true`
+        ///   versions outside its placements (TRUE presence compression starts, and
+        ///   the witnesses join the relevant set).
+        ///
+        /// A fresh entity (a create) only joins the cone of its parent or of its
+        /// slot's past occupants, which already contains that parent: never two
+        /// cones. Conservative: anything unexpected answers `true`.
+        pub(super) fn successor_may_add_cuts(events: &[Event], new: usize) -> bool {
+            let others = || {
+                events
+                    .iter()
+                    .enumerate()
+                    .filter(move |(i, _)| *i != new)
+                    .map(|(_, e)| e)
+            };
+            for c in &events[new].changes {
+                let x = c.entity.as_str();
+                match c.field.as_str() {
+                    "location" => {
+                        let (Some(parent), Some(name)) =
+                            (c.value["parent"].as_str(), c.value["name"].as_str())
+                        else {
+                            return true;
+                        };
+                        let Ok(key) = slot_key(name) else {
+                            return true;
+                        };
+                        let mut fresh = true;
+                        let mut new_parent = parent != ROOT;
+                        let mut new_slot = true;
+                        let mut occupied = false;
+                        for prior in others() {
+                            for pc in &prior.changes {
+                                if pc.entity == x {
+                                    fresh = false;
+                                }
+                                if pc.field != "location"
+                                    || pc.value["parent"].as_str() != Some(parent)
+                                {
+                                    continue;
+                                }
+                                if pc.entity == x {
+                                    new_parent = false;
+                                }
+                                let Some(other) = pc.value["name"].as_str() else {
+                                    return true;
+                                };
+                                // ASCII names share a slot exactly when they are equal
+                                // ignoring ASCII case (`name_key` is NFC plus lower
+                                // case; validity is the same for both spellings).
+                                let same_slot = if name.is_ascii() && other.is_ascii() {
+                                    name.eq_ignore_ascii_case(other)
+                                } else {
+                                    match slot_key(other) {
+                                        Ok(k) => k == key,
+                                        Err(_) => return true,
+                                    }
+                                };
+                                if same_slot {
+                                    if pc.entity == x {
+                                        new_slot = false;
+                                    } else {
+                                        occupied = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !fresh && (new_parent || (new_slot && occupied)) {
+                            return true;
+                        }
+                    }
+                    "alive" if c.value == false => {
+                        let mut tombstone = false;
+                        let mut witness = false;
+                        for prior in others() {
+                            let places = prior.changes.iter().any(|pc| {
+                                pc.entity == x && (pc.field == "location" || pc.field == "kind")
+                            });
+                            for pc in prior
+                                .changes
+                                .iter()
+                                .filter(|pc| pc.entity == x && pc.field == "alive")
+                            {
+                                if pc.value == false {
+                                    tombstone = true;
+                                } else if !places {
+                                    witness = true;
+                                }
+                            }
+                        }
+                        if !tombstone && witness {
+                            return true;
+                        }
+                    }
+                    "kind"
+                        if others().any(|prior| prior.changes.iter().any(|pc| pc.entity == x)) =>
+                    {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+
+        /// CCR-WP4.4-5 (WP4.INT): whether committing `events[new]` through the
+        /// content successor can change the competing-cut count of a dependency
+        /// cone, so that `check_successor_cuts` must count. A content successor
+        /// changes `content`, `basic` and `alive = true` only, and needs one head per
+        /// register it changes, not the whole frontier: its event may be concurrent
+        /// with other events of the branch. Its only namespace-relevant change is
+        /// `alive = true`, which is a relevant event (a TRUE-presence witness,
+        /// `NsContext::relevant`) exactly when the entity's alive register has a
+        /// tombstone; then it may join antichains of the cone. Without a tombstone
+        /// (every ordinary save) it never counts.
+        pub(super) fn content_successor_may_add_cuts(events: &[Event], new: usize) -> bool {
+            let saved: BTreeSet<&str> = events[new]
+                .changes
+                .iter()
+                .filter(|c| c.field == "alive")
+                .map(|c| c.entity.as_str())
+                .collect();
+            !saved.is_empty()
+                && events
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != new)
+                    .any(|(_, e)| {
+                        e.changes.iter().any(|c| {
+                            c.field == "alive"
+                                && c.value == false
+                                && saved.contains(c.entity.as_str())
+                        })
+                    })
+        }
+
+        /// Whether every cone `check_successor_cuts` would count is certainly within
+        /// `MAX_NAMESPACE_CUTS`, by a cheap sound bound: a cone with `r` relevant
+        /// events has at most `2^r - 1 - r` competing cuts (its antichains of two or
+        /// more events), which is 4,083 for `r = 12`. The cones that contain an
+        /// entity the event touches are the cones of the entities that reach one
+        /// (`ConeGraph::reaching`: the closure over children and slot sharers), and
+        /// each lies in the closure of those over parents and slot sharers
+        /// (`NamespaceCones::cone`); every relevant event of such a cone changes a
+        /// member's kind, location or presence. So at most 12 such events among the
+        /// members of that closure means no count can exceed the limit. Gives up
+        /// (`false`) as soon as the closure grows past a small size.
+        pub(super) fn successor_cones_are_small<'a>(events: &'a [Event], new: usize) -> bool {
+            pub(super) const SMALL: usize = 12;
+            pub(super) const MEMBERS: usize = 64;
+            let rows: Vec<(&'a str, &'a str, &'a str)> = events
+                .iter()
+                .flat_map(|e| e.changes.iter().filter(|c| c.field == "location"))
+                .filter_map(|c| {
+                    Some((
+                        c.entity.as_str(),
+                        c.value["parent"].as_str()?,
+                        c.value["name"].as_str()?,
+                    ))
+                })
+                .collect();
+            // Two names share a slot (conservatively `true` for a name that cannot
+            // be keyed).
+            let same_slot = |a: &str, b: &str| {
+                if a.is_ascii() && b.is_ascii() {
+                    a.eq_ignore_ascii_case(b)
+                } else {
+                    match (slot_key(a), slot_key(b)) {
+                        (Ok(a), Ok(b)) => a == b,
+                        _ => true,
+                    }
+                }
+            };
+            // Close `set` over slot sharers and, `up`, parents (else children).
+            let close = |set: &mut BTreeSet<&'a str>, up: bool| -> bool {
+                loop {
+                    if set.len() > MEMBERS {
+                        return false;
+                    }
+                    let slots: Vec<(&str, &str)> = rows
+                        .iter()
+                        .filter(|(e, _, _)| set.contains(e))
+                        .map(|&(_, p, n)| (p, n))
+                        .collect();
+                    let mut grew = false;
+                    for &(entity, parent, name) in &rows {
+                        if set.contains(entity) {
+                            if up && parent != ROOT && set.insert(parent) {
+                                grew = true;
+                            }
+                            continue;
+                        }
+                        let joins = (!up && set.contains(parent))
+                            || slots
+                                .iter()
+                                .any(|&(p, n)| p == parent && same_slot(n, name));
+                        if joins {
+                            set.insert(entity);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        return true;
+                    }
+                }
+            };
+            let mut members: BTreeSet<&'a str> = events[new]
+                .changes
+                .iter()
+                .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
+                .map(|c| c.entity.as_str())
+                .collect();
+            if !close(&mut members, false) || !close(&mut members, true) {
+                return false;
+            }
+            let candidates = events
+                .iter()
+                .filter(|e| {
+                    e.changes.iter().any(|c| {
+                        ["kind", "location", "alive"].contains(&c.field.as_str())
+                            && members.contains(c.entity.as_str())
+                    })
+                })
+                .count();
+            candidates <= SMALL
+        }
+
+        /// CCR-WP1.6-5: the `NAMESPACE_HISTORY_LIMIT` count that full replay makes
+        /// when `events[new]` is committed, for a successor commit (which derives
+        /// no record and so never counted before). Counts the competing cuts of
+        /// every dependency cone (with the new event) that contains an entity the
+        /// event touches, exactly as full mode enumerates them (`cone_conflicts`),
+        /// and refuses with full mode's error when one exceeds `MAX_NAMESPACE_CUTS`.
+        /// Every other cone of the branch is a cone of the history without the
+        /// event, with the same relevant events (`successor_may_add_cuts`), whose
+        /// count the accepted history already bounds. Pure; only the counting, no
+        /// cut is projected, and nothing at all when a bound shows every count is
+        /// within the limit (`successor_cones_are_small`).
+        pub(super) fn check_successor_cuts(
+            branch: &str,
+            events: &[Event],
+            new: usize,
+        ) -> Result<()> {
+            if successor_cones_are_small(events, new) {
+                return Ok(());
+            }
+            let locations = Locations::new(events);
+            locations.first_error()?;
+            let graph = ConeGraph::new(events, &locations, new);
+            let touched: BTreeSet<&str> = events[new]
+                .changes
+                .iter()
+                .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
+                .map(|c| c.entity.as_str())
+                .collect();
+            let cones: BTreeSet<BTreeSet<&str>> = graph
+                .reaching(&touched)
+                .into_iter()
+                .map(|entity| graph.cone(entity, false))
+                .filter(|cone| cone.iter().any(|m| touched.contains(m)))
+                .collect();
+            let ns = NsContext::new(branch, events);
+            for members in &cones {
+                let relevant = ns.relevant(members, None);
+                ns.count_cuts(&relevant)?;
+            }
+            Ok(())
+        }
+
+        /// The location pairs that include the new event's location change, in the
+        /// order full mode evaluates them (pairs of two older changes are stored).
+        pub(super) fn location_pairs_with(
+            branch: &str,
+            events: &[Event],
+            locations: &Locations,
+            new: usize,
+        ) -> Result<Vec<Conflict>> {
+            let rows = &locations.rows;
+            let mut conflicts = vec![];
+            for q in (0..rows.len()).filter(|&q| rows[q].event == new) {
+                for k in (0..rows.len()).filter(|&k| k != q) {
+                    crate::startup::progress("rebuilding namespace conflicts");
+                    let (i, j) = if k < q { (k, q) } else { (q, k) };
+                    let (a, b) = (&rows[i], &rows[j]);
+                    if a.change.entity == b.change.entity
+                        || a.change.value["parent"] != b.change.value["parent"]
+                    {
+                        continue;
+                    }
+                    // Keys are read in full mode's order, so a bad name fails alike.
+                    if locations.key(i)? != locations.key(j)? {
+                        continue;
+                    }
+                    if let Some(c) = concurrent_placement(
+                        branch,
+                        events,
+                        (&events[a.event], a.change),
+                        (&events[b.event], b.change),
+                    ) {
+                        conflicts.push(c);
+                    }
+                }
+            }
+            Ok(conflicts)
+        }
+
+        pub(super) fn ancestors(version: &Version, versions: &[Version]) -> BTreeSet<String> {
+            let index: BTreeMap<_, _> = versions.iter().map(|v| (v.revision.as_str(), v)).collect();
+            let mut found = BTreeSet::new();
+            let mut todo = version.parents.clone();
+            while let Some(revision) = todo.pop() {
+                if found.insert(revision.clone())
+                    && let Some(v) = index.get(revision.as_str())
+                {
+                    todo.extend(v.parents.iter().cloned());
+                }
+            }
+            found
+        }
+        pub(super) fn event_ancestors(event: &Event, events: &[Event]) -> BTreeSet<String> {
+            let index: BTreeMap<_, _> = events.iter().map(|e| (e.id.as_str(), e)).collect();
+            let mut seen = BTreeSet::new();
+            let mut todo = event.dependencies.clone();
+            todo.extend(event.changes.iter().flat_map(|c| c.parents.iter().cloned()));
+            while let Some(revision) = todo.pop() {
+                if seen.insert(revision.clone())
+                    && let Some(e) = index.get(revision.as_str())
+                {
+                    todo.extend(e.dependencies.iter().cloned());
+                    todo.extend(e.changes.iter().flat_map(|c| c.parents.iter().cloned()));
+                }
+            }
+            seen
+        }
+        pub(super) fn linear_versions(versions: &[Version]) -> bool {
+            let mut children = BTreeSet::new();
+            let mut roots = 0;
+            for v in versions {
+                if v.parents.is_empty() {
+                    roots += 1;
+                }
+                if v.parents.len() > 1 || v.parents.iter().any(|p| !children.insert(p)) {
+                    return false;
+                }
+            }
+            roots == 1
+        }
+        pub(super) struct VersionReach {
+            rows: Vec<Vec<u64>>,
+        }
+        impl VersionReach {
+            pub(super) fn new(versions: &[Version]) -> Self {
+                let index: BTreeMap<_, _> = versions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (v.revision.as_str(), i))
+                    .collect();
+                let mut children = vec![vec![]; versions.len()];
+                let mut degree = vec![0; versions.len()];
+                let mut parents = vec![vec![]; versions.len()];
+                for (i, v) in versions.iter().enumerate() {
+                    for parent in &v.parents {
+                        if let Some(&j) = index.get(parent.as_str()) {
+                            parents[i].push(j);
+                            children[j].push(i);
+                            degree[i] += 1;
+                        }
+                    }
+                }
+                let mut ready: Vec<_> = (0..versions.len()).filter(|&i| degree[i] == 0).collect();
+                let mut rows = vec![vec![0; versions.len().div_ceil(64)]; versions.len()];
+                while let Some(i) = ready.pop() {
+                    for &parent in &parents[i] {
+                        for word in 0..rows[i].len() {
+                            rows[i][word] |= rows[parent][word];
+                        }
+                        rows[i][parent / 64] |= 1 << (parent % 64);
+                    }
+                    for &child in &children[i] {
+                        degree[child] -= 1;
+                        if degree[child] == 0 {
+                            ready.push(child);
+                        }
+                    }
+                }
+                Self { rows }
+            }
+            pub(super) fn has(&self, child: usize, parent: usize) -> bool {
+                self.rows[child][parent / 64] & (1 << (parent % 64)) != 0
+            }
+        }
+        pub(super) fn activated_ids(events: &[Event]) -> BTreeSet<String> {
+            causal_order(events)
+                .into_iter()
+                .map(|e| e.id.clone())
+                .collect()
+        }
+        pub(super) fn causal_order(events: &[Event]) -> Vec<&Event> {
+            causal_order_refs(&events.iter().collect::<Vec<_>>())
+        }
+        pub(super) fn causal_order_refs<'a>(events: &[&'a Event]) -> Vec<&'a Event> {
+            let by_id: BTreeMap<_, _> = events.iter().map(|e| (e.id.as_str(), *e)).collect();
+            let mut degrees = BTreeMap::new();
+            let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            let mut ready = BTreeSet::new();
+            for e in events {
+                let parents: BTreeSet<_> = e
+                    .dependencies
+                    .iter()
+                    .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
+                    .collect();
+                degrees.insert(e.id.as_str(), parents.len());
+                if parents.is_empty() {
+                    ready.insert(e.id.as_str());
+                }
+                for parent in parents {
+                    children
+                        .entry(parent.as_str())
+                        .or_default()
+                        .push(e.id.as_str());
+                }
+            }
+            let mut active = Vec::new();
+            while let Some(id) = ready.pop_first() {
+                crate::startup::progress("validating causal history");
+                active.push(by_id[id]);
+                if let Some(children) = children.get(id) {
+                    for child in children {
+                        let degree = degrees.get_mut(child).unwrap();
+                        *degree -= 1;
+                        if *degree == 0 {
+                            ready.insert(*child);
+                        }
+                    }
+                }
+            }
+            active
+        }
+
+        /// A fixed-size bitset over event (or version) indices.
+        #[derive(Clone)]
+        pub(super) struct Bits {
+            words: Vec<u64>,
+        }
+        impl Bits {
+            pub(super) fn new(len: usize) -> Self {
+                Self {
+                    words: vec![0; len.div_ceil(64)],
+                }
+            }
+            pub(super) fn contains(&self, i: usize) -> bool {
+                self.words
+                    .get(i / 64)
+                    .is_some_and(|word| word & (1 << (i % 64)) != 0)
+            }
+            /// Whether `i` was newly inserted.
+            pub(super) fn insert(&mut self, i: usize) -> bool {
+                let word = &mut self.words[i / 64];
+                let bit = 1 << (i % 64);
+                let new = *word & bit == 0;
+                *word |= bit;
+                new
+            }
+            pub(super) fn union_with(&mut self, other: &Bits) {
+                for (word, other) in self.words.iter_mut().zip(&other.words) {
+                    *word |= other;
+                }
+            }
+            pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+                self.words.iter().enumerate().flat_map(|(w, &word)| {
+                    let mut word = word;
+                    std::iter::from_fn(move || {
+                        (word != 0).then(|| {
+                            let bit = word.trailing_zeros() as usize;
+                            word &= word - 1;
+                            w * 64 + bit
+                        })
+                    })
+                })
+            }
+            pub(super) fn bytes(&self) -> usize {
+                self.words.len() * 8
+            }
+        }
+
+        /// Everything reachable from `from` along `edges` (excluding `from` itself
+        /// unless it lies on a cycle): the historical `FactGraph::closure`.
+        pub(super) fn reach(edges: &[Vec<usize>], from: usize) -> Bits {
+            let mut found = Bits::new(edges.len());
+            let mut todo = edges[from].clone();
+            while let Some(i) = todo.pop() {
+                if found.insert(i) {
+                    todo.extend(&edges[i]);
+                }
+            }
+            found
+        }
+
+        pub(super) fn children_of(parents: &[Vec<usize>]) -> Vec<Vec<usize>> {
+            let mut children = vec![vec![]; parents.len()];
+            for (i, ps) in parents.iter().enumerate() {
+                for &p in ps {
+                    children[p].push(i);
+                }
+            }
+            children
+        }
+
+        /// Memoized closures are bounded so a very long history cannot exhaust
+        /// memory; past the budget, closures are recomputed on demand.
+        pub(super) const CLOSURE_MEMO_BYTES: usize = 64 * 1024 * 1024;
+        /// Bound on memoized cut projections, in estimated bytes (`conflict_bytes`).
+        /// A cut's namespace records are all of the cut's, not only the cone's, so
+        /// with many unresolved collisions they grow with the cut: unbounded, the
+        /// memo would hold (cuts × records per cut). Past the budget, cuts are
+        /// projected again when they recur.
+        pub(super) const CUT_MEMO_BYTES: usize = 16 * 1024 * 1024;
+
+        /// The estimated heap a JSON value holds (map nodes at 64 bytes per entry).
+        pub(super) fn value_bytes(value: &Value) -> usize {
+            std::mem::size_of::<Value>()
+                + match value {
+                    Value::String(s) => s.len(),
+                    Value::Array(items) => items.iter().map(value_bytes).sum(),
+                    Value::Object(map) => {
+                        map.iter().map(|(k, v)| 64 + k.len() + value_bytes(v)).sum()
+                    }
+                    _ => 0,
+                }
+        }
+
+        /// The estimated heap a conflict record holds (strings, versions, values).
+        pub(super) fn conflict_bytes(c: &Conflict) -> usize {
+            let version = |v: &Version| {
+                std::mem::size_of::<Version>()
+                    + v.revision.len()
+                    + v.device.len()
+                    + v.parents
+                        .iter()
+                        .map(|p| std::mem::size_of::<String>() + p.len())
+                        .sum::<usize>()
+                    + value_bytes(&v.value)
+            };
+            std::mem::size_of::<Conflict>()
+                + c.id.len()
+                + c.branch.len()
+                + c.entity.len()
+                + c.field.len()
+                + c.reason.len()
+                + c.resolved_by.as_ref().map_or(0, String::len)
+                + c.alternatives
+                    .iter()
+                    .chain(&c.bases)
+                    .map(version)
+                    .sum::<usize>()
+        }
+
+        /// One alive register analysed for TRUE presence compression: its versions,
+        /// the causal context of each tombstone and the unbranched segments, all over
+        /// the transitively reduced register graph (indices into `versions`).
+        pub(super) struct RegisterFacts<'a> {
+            versions: Vec<(usize, &'a Change)>,
+            false_context: Vec<(Bits, Bits)>,
+            segments: Vec<usize>,
+        }
+
+        #[derive(Default)]
+        pub(super) struct Memo<'a> {
+            ancestors: Vec<Option<Rc<Bits>>>,
+            descendants: Vec<Option<Rc<Bits>>>,
+            closure_bytes: usize,
+            registers: RegisterMemo<'a>,
+            cuts: BTreeMap<Vec<usize>, Rc<Vec<Conflict>>>,
+            /// Estimated bytes `cuts` holds, and its budget (`CUT_MEMO_BYTES`).
+            cut_bytes: usize,
+            cut_budget: usize,
+        }
+
+        /// Namespace-history derivation over one branch's events (both modes), with
+        /// per-call memoization. Event indices are positions in `events`.
+        pub(super) struct NsContext<'a> {
+            branch: &'a str,
+            events: &'a [Event],
+            /// The causal DAG: dependencies and change parents present in `events`.
+            parents: Vec<Vec<usize>>,
+            children: Vec<Vec<usize>>,
+            index: BTreeMap<&'a str, usize>,
+            /// Alive versions per entity, in event order.
+            alive: BTreeMap<&'a str, Vec<(usize, &'a Change)>>,
+            /// Events with a kind, location or alive change, per entity.
+            touching: BTreeMap<&'a str, Vec<usize>>,
+            memo: RefCell<Memo<'a>>,
+        }
+
+        /// One cone append mode derives.
+        pub(super) struct PlannedCone<'a> {
+            members: BTreeSet<&'a str>,
+            relevant: Rc<Vec<usize>>,
+            /// An old cone: project only the antichains containing one of these
+            /// newly relevant events (sorted). `None`, a new cone: every antichain.
+            only: Option<Vec<usize>>,
+        }
+
+        /// The cones append mode derives.
+        pub(super) struct AppendPlan<'a> {
+            cones: Vec<PlannedCone<'a>>,
+            /// Old cones that grew into a covering cone (checked, not derived).
+            #[cfg_attr(not(test), allow(dead_code))]
+            covered: usize,
+            /// The members of every cone (with the new event) that contains an
+            /// entity the new event touches: the only entities whose records in the
+            /// current projection the new event can change. Closed under parents
+            /// and slot competitors (a union of cones).
+            members: BTreeSet<&'a str>,
+            /// The old cone (without the new event) of every entity that reaches a
+            /// touched entity and existed before.
+            before: BTreeMap<&'a str, BTreeSet<&'a str>>,
+        }
+
+        /// Memoized alive-register analyses, by (entity, excluded event).
+        pub(super) type RegisterMemo<'a> =
+            BTreeMap<(&'a str, Option<usize>), Option<Rc<RegisterFacts<'a>>>>;
+
+        impl<'a> NsContext<'a> {
+            pub(super) fn new(branch: &'a str, events: &'a [Event]) -> Self {
+                let index: BTreeMap<&str, usize> = events
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (e.id.as_str(), i))
+                    .collect();
+                let parents: Vec<Vec<usize>> = events
+                    .iter()
+                    .map(|e| {
+                        e.dependencies
+                            .iter()
+                            .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
+                            .filter_map(|p| index.get(p.as_str()).copied())
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect()
+                    })
+                    .collect();
+                let children = children_of(&parents);
+                let mut alive: BTreeMap<&str, Vec<(usize, &Change)>> = BTreeMap::new();
+                let mut touching: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+                for (i, e) in events.iter().enumerate() {
+                    for c in &e.changes {
+                        if c.field == "alive" {
+                            alive.entry(c.entity.as_str()).or_default().push((i, c));
+                        }
+                        if ["kind", "location", "alive"].contains(&c.field.as_str()) {
+                            let list = touching.entry(c.entity.as_str()).or_default();
+                            if list.last() != Some(&i) {
+                                list.push(i);
+                            }
+                        }
+                    }
+                }
+                let memo = Memo {
+                    ancestors: vec![None; events.len()],
+                    descendants: vec![None; events.len()],
+                    cut_budget: CUT_MEMO_BYTES,
+                    ..Default::default()
+                };
+                Self {
+                    branch,
+                    events,
+                    parents,
+                    children,
+                    index,
+                    alive,
+                    touching,
+                    memo: RefCell::new(memo),
+                }
+            }
+
+            /// Ancestors (`forward == false`) or descendants of event `i`.
+            pub(super) fn closure(&self, i: usize, forward: bool) -> Rc<Bits> {
+                {
+                    let memo = self.memo.borrow();
+                    let slot = if forward {
+                        &memo.descendants[i]
+                    } else {
+                        &memo.ancestors[i]
+                    };
+                    if let Some(found) = slot {
+                        return found.clone();
+                    }
+                }
+                let edges = if forward {
+                    &self.children
+                } else {
+                    &self.parents
+                };
+                let found = Rc::new(reach(edges, i));
+                let mut memo = self.memo.borrow_mut();
+                if memo.closure_bytes + found.bytes() <= CLOSURE_MEMO_BYTES {
+                    memo.closure_bytes += found.bytes();
+                    let slot = if forward {
+                        &mut memo.descendants[i]
+                    } else {
+                        &mut memo.ancestors[i]
+                    };
+                    *slot = Some(found.clone());
+                }
+                found
+            }
+
+            /// Whether `c` (a change of a cone member) makes its event relevant to
+            /// the cone's namespace: kind, location, a tombstone, or presence
+            /// re-asserted over a tombstone.
+            pub(super) fn primary_change(&self, c: &Change) -> bool {
+                ["kind", "location"].contains(&c.field.as_str())
+                    || (c.field == "alive"
+                        && (c.value == false
+                            || c.parents.iter().any(|parent| {
+                                self.index.get(parent.as_str()).is_some_and(|&j| {
+                                    self.events[j].changes.iter().any(|p| {
+                                        p.entity == c.entity
+                                            && p.field == "alive"
+                                            && p.value == false
+                                    })
+                                })
+                            })))
+            }
+
+            /// The relevant events of a cone (relevance plus TRUE presence
+            /// compression), as if event `exclude` did not exist. Sorted.
+            pub(super) fn relevant(
+                &self,
+                members: &BTreeSet<&str>,
+                exclude: Option<usize>,
+            ) -> Vec<usize> {
+                let mut relevant = BTreeSet::new();
+                for &member in members {
+                    for &i in self.touching.get(member).into_iter().flatten() {
+                        if Some(i) != exclude
+                            && self.events[i]
+                                .changes
+                                .iter()
+                                .any(|c| c.entity == member && self.primary_change(c))
+                        {
+                            relevant.insert(i);
+                        }
+                    }
+                }
+                let primary: Vec<_> = relevant
+                    .iter()
+                    .map(|&i| (self.closure(i, false), self.closure(i, true)))
+                    .collect();
+                // Pure TRUE presence assertions cannot change namespace when there is
+                // no tombstone. If tombstones exist, retain rank extrema per unbranched
+                // TRUE segment and topology/false-revision causal relationship signature.
+                // This preserves possible boolean winners without counting every save.
+                for &entity in members {
+                    let Some((&entity, _)) = self.alive.get_key_value(entity) else {
+                        continue;
+                    };
+                    let Some(facts) = self.register_facts(entity, exclude) else {
+                        continue;
+                    };
+                    let mut groups: BTreeMap<(usize, Vec<u8>), (usize, usize)> = BTreeMap::new();
+                    for (k, &(i, c)) in facts.versions.iter().enumerate() {
+                        if c.value != true || relevant.contains(&i) {
+                            continue;
+                        }
+                        let signature = primary
+                            .iter()
+                            .map(|(anc, desc)| {
+                                if anc.contains(i) {
+                                    1
+                                } else if desc.contains(i) {
+                                    2
+                                } else {
+                                    0
+                                }
+                            })
+                            .chain(facts.false_context.iter().map(|(anc, desc)| {
+                                if anc.contains(k) {
+                                    1
+                                } else if desc.contains(k) {
+                                    2
+                                } else {
+                                    0
+                                }
+                            }))
+                            .collect();
+                        let range = groups
+                            .entry((facts.segments[k], signature))
+                            .or_insert((i, i));
+                        let rank = |j: usize| (&self.events[j].device, &self.events[j].id);
+                        if rank(i) < rank(range.0) {
+                            range.0 = i;
+                        }
+                        if rank(i) > rank(range.1) {
+                            range.1 = i;
+                        }
+                    }
+                    for (min, max) in groups.values() {
+                        relevant.extend([*min, *max]);
+                    }
+                }
+                relevant.into_iter().collect()
+            }
+
+            /// The alive register of `entity` (without event `exclude`), analysed;
+            /// `None` without a tombstone (no compression applies).
+            pub(super) fn register_facts(
+                &self,
+                entity: &'a str,
+                exclude: Option<usize>,
+            ) -> Option<Rc<RegisterFacts<'a>>> {
+                if let Some(found) = self.memo.borrow().registers.get(&(entity, exclude)) {
+                    return found.clone();
+                }
+                let facts = self.analyse_register(entity, exclude).map(Rc::new);
+                self.memo
+                    .borrow_mut()
+                    .registers
+                    .insert((entity, exclude), facts.clone());
+                facts
+            }
+
+            /// The historical `FactGraph::register` analysis, on a compact graph whose
+            /// nodes are the register's versions in event order (the other events are
+            /// isolated nodes there and never change closures, ranks or segments).
+            pub(super) fn analyse_register(
+                &self,
+                entity: &str,
+                exclude: Option<usize>,
+            ) -> Option<RegisterFacts<'a>> {
+                let versions: Vec<(usize, &'a Change)> = self
+                    .alive
+                    .get(entity)?
+                    .iter()
+                    .copied()
+                    .filter(|(i, _)| Some(*i) != exclude)
+                    .collect();
+                let tombstones: Vec<usize> = versions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, c))| c.value == false)
+                    .map(|(k, _)| k)
+                    .collect();
+                if tombstones.is_empty() {
+                    return None;
+                }
+                let index: BTreeMap<&str, usize> = versions
+                    .iter()
+                    .enumerate()
+                    .map(|(k, (i, _))| (self.events[*i].id.as_str(), k))
+                    .collect();
+                let parents: Vec<Vec<usize>> = versions
+                    .iter()
+                    .map(|(_, c)| {
+                        c.parents
+                            .iter()
+                            .filter_map(|p| index.get(p.as_str()).copied())
+                            .collect()
+                    })
+                    .collect();
+                let children = children_of(&parents);
+                // Explicit review can list many ancestors as parents. Such redundant
+                // edges are evidence, not new branches in an unchanged-TRUE segment.
+                // Reduce only this analysis graph; immutable event parents stay intact.
+                let mut degree: Vec<_> = parents.iter().map(Vec::len).collect();
+                let mut ready: Vec<_> = (0..degree.len()).filter(|&k| degree[k] == 0).collect();
+                let mut rank = vec![0; degree.len()];
+                let mut sequence = 0;
+                while let Some(k) = ready.pop() {
+                    rank[k] = sequence;
+                    sequence += 1;
+                    for &child in &children[k] {
+                        degree[child] -= 1;
+                        if degree[child] == 0 {
+                            ready.push(child);
+                        }
+                    }
+                }
+                let mut reduced = parents.clone();
+                for ps in &mut reduced {
+                    if ps.len() < 2 {
+                        continue;
+                    }
+                    ps.sort_by_key(|&p| std::cmp::Reverse(rank[p]));
+                    let mut covered = Bits::new(parents.len());
+                    ps.retain(|&p| {
+                        if covered.contains(p) {
+                            false
+                        } else {
+                            covered.union_with(&reach(&parents, p));
+                            true
+                        }
+                    });
+                }
+                let reduced_children = children_of(&reduced);
+                let false_context = tombstones
+                    .iter()
+                    .map(|&k| (reach(&reduced, k), reach(&reduced_children, k)))
+                    .collect();
+                let mut degree: Vec<_> = reduced.iter().map(Vec::len).collect();
+                let mut ready: Vec<_> = (0..degree.len()).filter(|&k| degree[k] == 0).collect();
+                let mut segments: Vec<_> = (0..degree.len()).collect();
+                while let Some(k) = ready.pop() {
+                    if reduced[k].len() == 1 && reduced_children[reduced[k][0]].len() == 1 {
+                        segments[k] = segments[reduced[k][0]];
+                    }
+                    for &child in &reduced_children[k] {
+                        degree[child] -= 1;
+                        if degree[child] == 0 {
+                            ready.push(child);
+                        }
+                    }
+                }
+                Some(RegisterFacts {
+                    versions,
+                    false_context,
+                    segments,
+                })
+            }
+
+            /// The namespace records of one antichain's cut (memoized per antichain,
+            /// within `Memo::cut_budget`: an antichain recurs across the cones that
+            /// share its events, such as the cones of a directory's entries).
+            pub(super) fn cut_conflicts(
+                &self,
+                selected: &[usize],
+                relevant: &[usize],
+                ancestors: &[Rc<Bits>],
+            ) -> Result<Rc<Vec<Conflict>>> {
+                let key: Vec<usize> = selected.iter().map(|&j| relevant[j]).collect();
+                if let Some(found) = self.memo.borrow().cuts.get(&key) {
+                    return Ok(found.clone());
+                }
+                let mut ids = Bits::new(self.events.len());
+                for &j in selected {
+                    ids.union_with(&ancestors[j]);
+                    ids.insert(relevant[j]);
+                }
+                let cut: Vec<&Event> = ids.iter().map(|i| &self.events[i]).collect();
+                let conflicts: Rc<Vec<Conflict>> = Rc::new(
+                    project_refs(self.branch, &cut)?
+                        .conflicts
+                        .into_iter()
+                        .filter(|c| c.field == "namespace")
+                        .collect(),
+                );
+                let bytes = 64
+                    + key.len() * std::mem::size_of::<usize>()
+                    + conflicts.iter().map(conflict_bytes).sum::<usize>();
+                let mut memo = self.memo.borrow_mut();
+                if memo.cut_bytes + bytes <= memo.cut_budget {
+                    memo.cut_bytes += bytes;
+                    memo.cuts.insert(key, conflicts.clone());
+                }
+                Ok(conflicts)
+            }
+
+            /// Enumerate every antichain of a cone's relevant events (counting them
+            /// against `MAX_NAMESPACE_CUTS`) and record the cone's namespace records
+            /// of each antichain's cut; with `only`, only of the antichains containing
+            /// one of those events (sorted). `restricted` projects a cut from the
+            /// members' registers alone (`namespace_records`; only when no cut can
+            /// fail to project, see `projection_cannot_fail`).
+            pub(super) fn cone_conflicts(
+                &self,
+                members: &BTreeSet<&str>,
+                relevant: &[usize],
+                only: Option<&[usize]>,
+                restricted: bool,
+                out: &mut BTreeMap<String, Conflict>,
+            ) -> Result<()> {
+                let ancestors: Vec<_> = timed("e.closures", || {
+                    relevant.iter().map(|&i| self.closure(i, false)).collect()
+                });
+                let mut antichains: Vec<Vec<usize>> = vec![vec![]];
+                let mut competing_cuts = 0;
+                for (i, &event) in relevant.iter().enumerate() {
+                    let before = antichains.len();
+                    for index in 0..before {
+                        crate::startup::progress("replaying namespace cuts");
+                        if !antichains[index].iter().all(|&j| {
+                            !ancestors[i].contains(relevant[j]) && !ancestors[j].contains(event)
+                        }) {
+                            continue;
+                        }
+                        let mut selected = antichains[index].clone();
+                        selected.push(i);
+                        if selected.len() > 1 {
+                            competing_cuts += 1;
+                            ensure!(
+                                competing_cuts <= MAX_NAMESPACE_CUTS,
+                                "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
+                            );
+                        }
+                        if only.is_none_or(|only| {
+                            selected
+                                .iter()
+                                .any(|&j| only.binary_search(&relevant[j]).is_ok())
+                        }) {
+                            if restricted {
+                                let mut cut = Bits::new(self.events.len());
+                                for &j in &selected {
+                                    cut.union_with(&ancestors[j]);
+                                    cut.insert(relevant[j]);
+                                }
+                                for c in
+                                    timed("e.records", || self.namespace_records(members, &cut))?
+                                {
+                                    out.insert(c.id.clone(), c);
+                                }
+                            } else {
+                                for c in timed("e.cut", || {
+                                    self.cut_conflicts(&selected, relevant, &ancestors)
+                                })?
+                                .iter()
+                                .filter(|c| c.entity.split(',').any(|e| members.contains(e)))
+                                {
+                                    out.insert(c.id.clone(), c.clone());
+                                }
+                            }
+                        }
+                        antichains.push(selected);
+                    }
+                }
+                Ok(())
+            }
+
+            /// The competing cuts (antichains of two or more events) of a cone's
+            /// relevant events, enumerated and refused exactly as `cone_conflicts`
+            /// does, without projecting any cut (CCR-WP1.6-5).
+            pub(super) fn count_cuts(&self, relevant: &[usize]) -> Result<usize> {
+                let ancestors: Vec<_> = relevant.iter().map(|&i| self.closure(i, false)).collect();
+                let mut antichains: Vec<Vec<usize>> = vec![vec![]];
+                let mut competing_cuts = 0;
+                for (i, &event) in relevant.iter().enumerate() {
+                    let before = antichains.len();
+                    for index in 0..before {
+                        if !antichains[index].iter().all(|&j| {
+                            !ancestors[i].contains(relevant[j]) && !ancestors[j].contains(event)
+                        }) {
+                            continue;
+                        }
+                        let mut selected = antichains[index].clone();
+                        selected.push(i);
+                        if selected.len() > 1 {
+                            competing_cuts += 1;
+                            ensure!(
+                                competing_cuts <= MAX_NAMESPACE_CUTS,
+                                "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
+                            );
+                        }
+                        antichains.push(selected);
+                    }
+                }
+                Ok(competing_cuts)
+            }
+
+            /// Full mode: every antichain of every cone (the historical
+            /// `namespace_history`).
+            pub(super) fn full(&self) -> Result<Vec<Conflict>> {
+                let cones = NamespaceCones::new(self.events)?;
+                let mut conflicts = BTreeMap::new();
+                for members in timed("f.cones", || cones.members()) {
+                    crate::startup::progress("rebuilding namespace history");
+                    let members: BTreeSet<&str> = members.iter().map(String::as_str).collect();
+                    let relevant = timed("f.relevant", || self.relevant(&members, None));
+                    timed("f.cone_conflicts", || {
+                        self.cone_conflicts(&members, &relevant, None, false, &mut conflicts)
+                    })?;
+                }
+                Ok(conflicts.into_values().collect())
+            }
+
+            /// The §5.2 exactness precondition (module docs) for appending event
+            /// `new`: the cones to derive, or why append mode cannot run.
+            ///
+            /// Only cones that contain an entity `E` touches can differ, and only the
+            /// entities that reach a touched entity (`ConeGraph::reaching`) can have
+            /// such a cone, before or after: every other cone of the old history is a
+            /// cone of the new one with the same relevant set (module docs), and
+            /// every other cone of the new history is either such a cone or the cone
+            /// of an entity `E` only mentions, which has no relevant event. A cone
+            /// equal to one of these is itself the cone of an entity that reaches a
+            /// touched entity (it contains the entity whose cone it equals), so the
+            /// comparisons below between old and new cones are exact.
+            pub(super) fn append_plan(
+                &self,
+                new: usize,
+                locations: &'a Locations<'a>,
+            ) -> Result<std::result::Result<AppendPlan<'a>, &'static str>> {
+                let graph = timed("p.graph", || ConeGraph::new(self.events, locations, new));
+                let touched: BTreeSet<&str> = self.events[new]
+                    .changes
+                    .iter()
+                    .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
+                    .map(|c| c.entity.as_str())
+                    .collect();
+                let reaching = timed("p.reaching", || graph.reaching(&touched));
+                let after: BTreeMap<&str, BTreeSet<&str>> = timed("p.cones", || {
+                    reaching
+                        .iter()
+                        .map(|&entity| (entity, graph.cone(entity, false)))
+                        .collect()
+                });
+                let before: BTreeMap<&str, BTreeSet<&str>> = timed("p.cones", || {
+                    reaching
+                        .iter()
+                        .filter(|&&entity| graph.existed(entity))
+                        .map(|&entity| (entity, graph.cone(entity, true)))
+                        .collect()
+                });
+                let after_set: BTreeSet<&BTreeSet<&str>> = after.values().collect();
+                let before_set: BTreeSet<&BTreeSet<&str>> = before.values().collect();
+                let mut cache: BTreeMap<BTreeSet<&str>, Rc<Vec<usize>>> = BTreeMap::new();
+                let mut relevant_now = |members: &BTreeSet<&'a str>| -> Rc<Vec<usize>> {
+                    if let Some(found) = cache.get(members) {
+                        return found.clone();
+                    }
+                    let found = Rc::new(timed("p.relevant", || self.relevant(members, None)));
+                    cache.insert(members.clone(), found.clone());
+                    found
+                };
+                let relevant_then = |members: &BTreeSet<&str>| {
+                    timed("p.relevant", || self.relevant(members, Some(new)))
+                };
+                // Sorted-slice subset test.
+                let subset = |small: &[usize], large: &[usize]| {
+                    small.iter().all(|i| large.binary_search(i).is_ok())
+                };
+                let mut cones = vec![];
+                for &members in &after_set {
+                    if before_set.contains(members) {
+                        if !members.iter().any(|m| touched.contains(m)) {
+                            continue;
+                        }
+                        // Every old antichain must survive (its records are stored and
+                        // full mode would re-derive them); the antichains that contain
+                        // a newly relevant event (the new event, or a presence witness
+                        // its tombstone brings in) are new.
+                        let now = relevant_now(members);
+                        let then = relevant_then(members);
+                        if !subset(&then, &now) {
+                            return Ok(Err("a touched cone lost a relevant event"));
+                        }
+                        let added: Vec<usize> = now
+                            .iter()
+                            .copied()
+                            .filter(|i| then.binary_search(i).is_err())
+                            .collect();
+                        if !added.is_empty() {
+                            cones.push(PlannedCone {
+                                members: members.clone(),
+                                relevant: now,
+                                only: Some(added),
+                            });
+                        }
+                    } else {
+                        cones.push(PlannedCone {
+                            members: members.clone(),
+                            relevant: relevant_now(members),
+                            only: None,
+                        });
+                    }
+                }
+                let mut seen = BTreeSet::new();
+                for (entity, old) in &before {
+                    if after_set.contains(old) || !seen.insert(old) {
+                        continue;
+                    }
+                    let cover = &after[entity];
+                    if !old.is_subset(cover) {
+                        return Ok(Err("a cone shrank"));
+                    }
+                    let was = relevant_then(old);
+                    if before_set.contains(cover) {
+                        // An old cover keeps its old antichains (a superset of this
+                        // cone's) only if it lost no relevant event.
+                        let cover_then = relevant_then(cover);
+                        if !subset(&was, &cover_then) || !subset(&cover_then, &relevant_now(cover))
+                        {
+                            return Ok(Err("a grown cone is not covered by an old cone"));
+                        }
+                    } else if !subset(&was, &relevant_now(cover)) {
+                        return Ok(Err("a grown cone lost a relevant event"));
+                    }
+                }
+                let covered = seen.len();
+                let members = after
+                    .values()
+                    .filter(|cone| cone.iter().any(|m| touched.contains(m)))
+                    .flatten()
+                    .copied()
+                    .collect();
+                Ok(Ok(AppendPlan {
+                    cones,
+                    covered,
+                    members,
+                    before,
+                }))
+            }
+
+            /// The step the namespace history alone does not give (module docs,
+            /// "current records"): every namespace record of the old current
+            /// projection that the new event takes out of the projection must still
+            /// be derived, or full mode's DELETE would remove it. `derived` is
+            /// everything append mode derives (the new projection's records
+            /// included). A record that is neither derived nor a record of its old
+            /// cone's maximal cut (an antichain cut of the old namespace history,
+            /// which full mode re-derives) fails the check.
+            ///
+            /// Records of entities outside `plan.members` are unchanged (their cones
+            /// contain no entity the new event touches). Both projections over the
+            /// members are computed from the members' registers: the old history and
+            /// every antichain cut of it project (the rebuild succeeded), so the
+            /// restricted records equal the projection's (`namespace_records`).
+            pub(super) fn current_records_survive(
+                &self,
+                new: usize,
+                plan: &AppendPlan<'a>,
+                derived: &[Conflict],
+            ) -> Result<bool> {
+                if plan.members.is_empty() {
+                    return Ok(true);
+                }
+                let mut old = Bits::new(self.events.len());
+                for i in (0..self.events.len()).filter(|&i| i != new) {
+                    old.insert(i);
+                }
+                let derived: BTreeSet<&str> = derived.iter().map(|c| c.id.as_str()).collect();
+                let mut maximal: BTreeMap<&BTreeSet<&str>, BTreeSet<String>> = BTreeMap::new();
+                for record in self.namespace_records(&plan.members, &old)? {
+                    if derived.contains(record.id.as_str()) {
+                        continue;
+                    }
+                    let entity = record.entity.split(',').next().unwrap_or_default();
+                    let Some(cone) = plan.before.get(entity) else {
+                        return Ok(false);
+                    };
+                    if !maximal.contains_key(cone) {
+                        let mut cut = Bits::new(self.events.len());
+                        for i in self.relevant(cone, Some(new)) {
+                            cut.union_with(&self.closure(i, false));
+                            cut.insert(i);
+                        }
+                        let ids = self
+                            .namespace_records(cone, &cut)?
+                            .into_iter()
+                            .map(|c| c.id)
+                            .collect();
+                        maximal.insert(cone, ids);
+                    }
+                    if !maximal[cone].contains(&record.id) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+
+            /// Append mode: the planned cones' records.
+            pub(super) fn derive_planned(
+                &self,
+                plan: &AppendPlan,
+                restricted: bool,
+            ) -> Result<Vec<Conflict>> {
+                let mut conflicts = BTreeMap::new();
+                for cone in &plan.cones {
+                    crate::startup::progress("rebuilding namespace history");
+                    self.cone_conflicts(
+                        &cone.members,
+                        &cone.relevant,
+                        cone.only.as_deref(),
+                        restricted,
+                        &mut conflicts,
+                    )?;
+                }
+                Ok(conflicts.into_values().collect())
+            }
+
+            /// The namespace records of `project(cut)` that mention a cone member,
+            /// computed from the members' kind, location and alive registers alone.
+            ///
+            /// Exact because a member's slot competitors and every directory it was
+            /// ever placed in are members (the cone is closed under both, over the
+            /// whole branch), so the namespace verdicts on members never read another
+            /// entity's registers; and an entity without these registers behaves as
+            /// an absent one (never alive, never a directory). The only other effect
+            /// of the other entities, a failure of `project` on them, is ruled out by
+            /// the caller (`projection_cannot_fail`).
+            pub(super) fn namespace_records(
+                &self,
+                members: &BTreeSet<&str>,
+                cut: &Bits,
+            ) -> Result<Vec<Conflict>> {
+                let mut registers: BTreeMap<String, Vec<Version>> = BTreeMap::new();
+                for &member in members {
+                    for &i in self.touching.get(member).into_iter().flatten() {
+                        if !cut.contains(i) {
+                            continue;
+                        }
+                        let e = &self.events[i];
+                        for c in e.changes.iter().filter(|c| {
+                            c.entity == member
+                                && ["kind", "location", "alive"].contains(&c.field.as_str())
+                        }) {
+                            registers
+                                .entry(register(&c.entity, &c.field))
+                                .or_default()
+                                .push(Version {
+                                    revision: e.id.clone(),
+                                    device: e.device.clone(),
+                                    created_ms: e.created_ms,
+                                    parents: c.parents.clone(),
+                                    value: c.value.clone(),
+                                });
+                        }
+                    }
+                }
+                // As in `project`: each register's winner among its heads.
+                #[derive(Default)]
+                struct Placement {
+                    kind: String,
+                    parent: String,
+                    name: String,
+                    alive: bool,
+                }
+                let mut entries: BTreeMap<String, Placement> = BTreeMap::new();
+                let mut locations: BTreeMap<String, Vec<Version>> = BTreeMap::new();
+                for (key, versions) in registers {
+                    let dominated: BTreeSet<&str> = versions
+                        .iter()
+                        .flat_map(|v| v.parents.iter().map(String::as_str))
+                        .collect();
+                    let mut heads: Vec<Version> = versions
+                        .iter()
+                        .filter(|v| !dominated.contains(v.revision.as_str()))
+                        .cloned()
+                        .collect();
+                    heads.sort_by(|a, b| (&a.device, &a.revision).cmp(&(&b.device, &b.revision)));
+                    let winner = heads.last().unwrap();
+                    let (entity, field) = key.rsplit_once('/').unwrap();
+                    let entry = entries.entry(entity.into()).or_default();
+                    match field {
+                        "kind" => entry.kind = winner.value.as_str().unwrap().into(),
+                        "location" => {
+                            entry.parent = winner.value["parent"].as_str().unwrap().into();
+                            entry.name = winner.value["name"].as_str().unwrap().into();
+                        }
+                        "alive" => entry.alive = winner.value.as_bool().unwrap(),
+                        _ => {}
+                    }
+                    if field == "location" {
+                        locations.insert(entity.into(), heads);
+                    }
+                }
+                // As in `project`: slot collisions, then missing parents and cycles.
+                let mut conflicts = vec![];
+                let ids: Vec<_> = entries.keys().cloned().collect();
+                let mut slots: BTreeMap<(String, Arc<str>), Vec<String>> = BTreeMap::new();
+                for entity in &ids {
+                    let e = &entries[entity];
+                    if e.alive {
+                        slots
+                            .entry((e.parent.clone(), slot_key(&e.name)?))
+                            .or_default()
+                            .push(entity.clone());
+                    }
+                }
+                for members in slots.values().filter(|m| m.len() > 1) {
+                    let winner = members.iter().max().unwrap();
+                    for entity in members {
+                        if entity != winner {
+                            entries.get_mut(entity).unwrap().alive = false;
+                        }
+                    }
+                    for (i, a) in members.iter().enumerate() {
+                        for b in &members[i + 1..] {
+                            let pair = [locations[a].clone(), locations[b].clone()].concat();
+                            conflicts.push(make_conflict(
+                                self.branch,
+                                &format!("{a},{b}"),
+                                "namespace",
+                                "same name / file-directory collision",
+                                pair,
+                                vec![],
+                            ));
+                        }
+                    }
+                }
+                for entity in &ids {
+                    let mut cursor = entity.clone();
+                    let mut visited = BTreeSet::new();
+                    let mut invalid = false;
+                    while cursor != ROOT {
+                        if !visited.insert(cursor.clone()) {
+                            invalid = true;
+                            break;
+                        }
+                        if let Some(e) = entries.get(&cursor) {
+                            if !e.alive || (cursor != *entity && e.kind != "directory") {
+                                invalid = true;
+                                break;
+                            }
+                            cursor = e.parent.clone();
+                        } else {
+                            invalid = true;
+                            break;
+                        }
+                    }
+                    if invalid && entries[entity].alive {
+                        entries.get_mut(entity).unwrap().alive = false;
+                        conflicts.push(make_conflict(
+                            self.branch,
+                            entity,
+                            "namespace",
+                            "deleted/missing parent or directory cycle",
+                            locations.get(entity).cloned().unwrap_or_default(),
+                            vec![],
+                        ));
+                    }
+                }
+                conflicts.sort_by(|a, b| a.id.cmp(&b.id));
+                Ok(conflicts)
+            }
+        }
+
+        pub(super) struct NamespaceCones {
+            parents: BTreeMap<String, BTreeSet<String>>,
+            entity_slots: BTreeMap<String, BTreeSet<(String, String)>>,
+            slots: BTreeMap<(String, String), BTreeSet<String>>,
+        }
+        impl NamespaceCones {
+            pub(super) fn new<'e>(events: impl IntoIterator<Item = &'e Event>) -> Result<Self> {
+                let mut result = Self {
+                    parents: BTreeMap::new(),
+                    entity_slots: BTreeMap::new(),
+                    slots: BTreeMap::new(),
+                };
+                for e in events {
+                    for c in &e.changes {
+                        result.parents.entry(c.entity.clone()).or_default();
+                        if c.field == "location" {
+                            let parent = c.value["parent"].as_str().unwrap();
+                            if parent != ROOT {
+                                result
+                                    .parents
+                                    .entry(c.entity.clone())
+                                    .or_default()
+                                    .insert(parent.to_owned());
+                                result.parents.entry(parent.to_owned()).or_default();
+                            }
+                            let key = (
+                                parent.to_owned(),
+                                name_key(c.value["name"].as_str().unwrap())?,
+                            );
+                            result
+                                .entity_slots
+                                .entry(c.entity.clone())
+                                .or_default()
+                                .insert(key.clone());
+                            result
+                                .slots
+                                .entry(key)
+                                .or_default()
+                                .insert(c.entity.clone());
+                        }
+                    }
+                }
+                Ok(result)
+            }
+            /// The dependency cone of `entity`: itself, its parents and slot
+            /// competitors, transitively.
+            pub(super) fn cone(&self, entity: &str) -> BTreeSet<String> {
+                crate::startup::progress("analyzing namespace dependencies");
+                let mut members = BTreeSet::new();
+                let mut visited_slots = BTreeSet::new();
+                let mut pending = vec![entity.to_owned()];
+                while let Some(next) = pending.pop() {
+                    if !members.insert(next.clone()) {
+                        continue;
+                    }
+                    pending.extend(self.parents[&next].iter().cloned());
+                    if let Some(slots) = self.entity_slots.get(&next) {
+                        for slot in slots {
+                            if visited_slots.insert(slot.clone()) {
+                                pending.extend(self.slots[slot].iter().cloned());
+                            }
+                        }
+                    }
+                }
+                // Ancestors and slot competitors can affect this entry's visibility.
+                // Sharing an ancestor alone does not make sibling histories interact.
+                members
+            }
+            /// The distinct cones.
+            pub(super) fn members(&self) -> BTreeSet<BTreeSet<String>> {
+                self.parents
+                    .keys()
+                    .map(|entity| self.cone(entity))
+                    .collect()
+            }
+        }
+
+        /// Complete topological activation followed by per-register ancestry. Unknown
+        /// parents keep the entire atomic event pending; child-before-parent is durable.
+        pub fn project(branch: &str, events: &[Event]) -> Result<Projection> {
+            project_refs(branch, &events.iter().collect::<Vec<_>>())
+        }
+        /// `project` over borrowed events (cuts are projected without cloning them).
+        pub(super) fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
+            let by_id: BTreeMap<_, _> = events.iter().map(|e| (e.id.clone(), *e)).collect();
+            for e in events {
+                for c in &e.changes {
+                    for parent in &c.parents {
+                        if let Some(parent) = by_id.get(parent) {
+                            ensure!(
+                                parent
+                                    .changes
+                                    .iter()
+                                    .any(|pc| pc.entity == c.entity && pc.field == c.field),
+                                "INVALID_CAUSAL_PARENT"
+                            );
+                        }
+                    }
+                }
+            }
+            let active: BTreeSet<String> = causal_order_refs(events)
+                .into_iter()
+                .map(|e| e.id.clone())
+                .collect();
+            // A known closed dependency cycle is malformed, rather than permanently pending.
+            let pending: Vec<_> = by_id
+                .keys()
+                .filter(|e| !active.contains(*e))
+                .cloned()
+                .collect();
+            if !pending.is_empty() {
+                let has_missing = events.iter().any(|e| {
+                    e.dependencies.iter().any(|p| !by_id.contains_key(p))
+                        || e.changes
+                            .iter()
+                            .any(|c| c.parents.iter().any(|p| !by_id.contains_key(p)))
+                });
+                ensure!(has_missing, "CAUSAL_CYCLE");
+            }
+            let mut registers: BTreeMap<String, Vec<Version>> = BTreeMap::new();
+            for e in events.iter().filter(|e| active.contains(&e.id)) {
+                for c in &e.changes {
+                    registers
+                        .entry(register(&c.entity, &c.field))
+                        .or_default()
+                        .push(Version {
+                            revision: e.id.clone(),
+                            device: e.device.clone(),
+                            created_ms: e.created_ms,
+                            parents: c.parents.clone(),
+                            value: c.value.clone(),
+                        });
+                }
+            }
+            let mut p = Projection {
+                pending,
+                ..Default::default()
+            };
+            for (key, mut versions) in registers {
+                crate::startup::progress("projecting registers");
+                // All ancestors are dominated before the stable concurrent rank is used.
+                let dominated: BTreeSet<_> = versions
+                    .iter()
+                    .flat_map(|v| v.parents.iter().cloned())
+                    .collect();
+                let mut heads: Vec<_> = versions
+                    .iter()
+                    .filter(|v| !dominated.contains(&v.revision))
+                    .cloned()
+                    .collect();
+                heads.sort_by(|a, b| (&a.device, &a.revision).cmp(&(&b.device, &b.revision)));
+                let winner = heads.last().unwrap();
+                let (entity, field) = key.rsplit_once('/').unwrap();
+                let entry = p.entries.entry(entity.into()).or_insert_with(|| Entry {
+                    id: entity.into(),
+                    ..Default::default()
+                });
+                entry
+                    .revisions
+                    .insert(field.into(), winner.revision.clone());
+                if field != "basic" {
+                    entry.modified_ms = entry.modified_ms.max(winner.created_ms);
+                }
+                match field {
+                    "kind" => {
+                        entry.kind = winner.value.as_str().unwrap().into();
+                        entry.created_ms = winner.created_ms;
+                    }
+                    "location" => {
+                        entry.parent = winner.value["parent"].as_str().unwrap().into();
+                        entry.name = winner.value["name"].as_str().unwrap().into();
+                    }
+                    "alive" => entry.alive = winner.value.as_bool().unwrap(),
+                    "content" => entry.content = winner.value.as_str().map(str::to_owned),
+                    "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
+                    _ => {}
+                }
+                if heads.len() > 1
+                    && heads
+                        .iter()
+                        .map(|v| serde_json::to_string(&v.value).unwrap())
+                        .collect::<BTreeSet<_>>()
+                        .len()
+                        > 1
+                {
+                    versions.sort_by(|a, b| a.revision.cmp(&b.revision));
+                    // Pair records have stable identity even when a third competitor is
+                    // learned later. No delivery-dependent subset record is persisted.
+                    for (i, a) in heads.iter().enumerate() {
+                        for b in &heads[i + 1..] {
+                            if a.value != b.value {
+                                let aa = ancestors(a, &versions);
+                                let ba = ancestors(b, &versions);
+                                let bases = versions
+                                    .iter()
+                                    .filter(|v| {
+                                        aa.contains(&v.revision) && ba.contains(&v.revision)
+                                    })
+                                    .cloned()
+                                    .collect();
+                                p.conflicts.push(make_conflict(
+                                    branch,
+                                    entity,
+                                    field,
+                                    "concurrent revisions",
+                                    vec![a.clone(), b.clone()],
+                                    bases,
+                                ));
+                            }
+                        }
+                    }
+                }
+                p.heads.insert(key, heads);
+            }
+            // Make a deterministic, acyclic visible namespace, retaining suppressed
+            // entities and their complete registers in conflicts/current-state.
+            let ids: Vec<_> = p.entries.keys().cloned().collect();
+            let mut slots: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+            for entity in &ids {
+                let e = &p.entries[entity];
+                if e.alive {
+                    slots
+                        .entry((e.parent.clone(), name_key(&e.name)?))
+                        .or_default()
+                        .push(entity.clone());
+                }
+            }
+            for members in slots.values().filter(|m| m.len() > 1) {
+                let mut alternatives = vec![];
+                for entity in members {
+                    alternatives.extend(p.heads[&register(entity, "location")].clone());
+                }
+                let winner = members.iter().max().unwrap();
+                for entity in members {
+                    if entity != winner {
+                        p.entries.get_mut(entity).unwrap().alive = false;
+                    }
+                }
+                for (i, a) in members.iter().enumerate() {
+                    for b in &members[i + 1..] {
+                        let pair = [
+                            p.heads[&register(a, "location")].clone(),
+                            p.heads[&register(b, "location")].clone(),
+                        ]
+                        .concat();
+                        p.conflicts.push(make_conflict(
+                            branch,
+                            &format!("{a},{b}"),
+                            "namespace",
+                            "same name / file-directory collision",
+                            pair,
+                            vec![],
+                        ));
+                    }
+                }
+            }
+            for entity in &ids {
+                let mut cursor = entity.clone();
+                let mut visited = BTreeSet::new();
+                let mut invalid = false;
+                while cursor != ROOT {
+                    if !visited.insert(cursor.clone()) {
+                        invalid = true;
+                        break;
+                    }
+                    if let Some(e) = p.entries.get(&cursor) {
+                        if !e.alive || (cursor != *entity && e.kind != "directory") {
+                            invalid = true;
+                            break;
+                        }
+                        cursor = e.parent.clone();
+                    } else {
+                        invalid = true;
+                        break;
+                    }
+                }
+                if invalid && p.entries[entity].alive {
+                    p.entries.get_mut(entity).unwrap().alive = false;
+                    let alternatives = p
+                        .heads
+                        .get(&register(entity, "location"))
+                        .cloned()
+                        .unwrap_or_default();
+                    p.conflicts.push(make_conflict(
+                        branch,
+                        entity,
+                        "namespace",
+                        "deleted/missing parent or directory cycle",
+                        alternatives,
+                        vec![],
+                    ));
+                }
+            }
+            p.conflicts.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(p)
+        }
+    }
     /// The Wave 0 derivation, verbatim: the reference the memoized
     /// implementation must reproduce exactly.
     mod legacy {
@@ -4574,6 +8110,295 @@ mod tests {
         events
     }
 
+    /// A storm-shaped history (WP5.1): `devices` devices edit a small shared
+    /// name pool in two directories, each from its own view of the history
+    /// (parents are the heads it sees), syncing now and then (`sync`): new
+    /// entities created into names others used (historical slot sharing),
+    /// saves (resurrecting over tombstones), deletes, renames between names
+    /// and directories, a few directory creations. Every event depends on the
+    /// device's frontier, as a local operation does.
+    fn storm_history(
+        rng: &mut StdRng,
+        len: usize,
+        names: usize,
+        devices: usize,
+        sync: f64,
+    ) -> Vec<Event> {
+        let devices: Vec<String> = (0..devices).map(|d| format!("dev-{d}")).collect();
+        let mut events: Vec<Event> = vec![];
+        let mut seen: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); devices.len()];
+        let mut entities: Vec<(String, &'static str)> = vec![];
+        let mut serial = 0;
+        while events.len() < len && serial < len * 6 {
+            serial += 1;
+            let d = rng.gen_range(0..devices.len());
+            if rng.gen_bool(sync) {
+                let other = seen[rng.gen_range(0..devices.len())].clone();
+                seen[d].extend(other);
+            }
+            let view = &seen[d];
+            let heads = |entity: &str, field: &str| -> Vec<String> {
+                let versions: Vec<&Event> = view
+                    .iter()
+                    .map(|&i| &events[i])
+                    .filter(|e| {
+                        e.changes
+                            .iter()
+                            .any(|c| c.entity == entity && c.field == field)
+                    })
+                    .collect();
+                let dominated: BTreeSet<&str> = versions
+                    .iter()
+                    .flat_map(|e| &e.changes)
+                    .filter(|c| c.entity == entity && c.field == field)
+                    .flat_map(|c| c.parents.iter().map(String::as_str))
+                    .collect();
+                versions
+                    .iter()
+                    .filter(|e| !dominated.contains(e.id.as_str()))
+                    .map(|e| e.id.clone())
+                    .collect()
+            };
+            let change = |entity: &str, field: &str, value: Value| Change {
+                entity: entity.into(),
+                field: field.into(),
+                parents: heads(entity, field),
+                value,
+            };
+            let known: Vec<(String, &str)> = entities
+                .iter()
+                .filter(|(e, _)| !heads(e, "kind").is_empty())
+                .cloned()
+                .collect();
+            let dirs: Vec<String> = known
+                .iter()
+                .filter(|(_, k)| *k == "directory")
+                .map(|(e, _)| e.clone())
+                .collect();
+            let parent = if !dirs.is_empty() && rng.gen_bool(0.5) {
+                dirs[rng.gen_range(0..dirs.len())].clone()
+            } else {
+                ROOT.to_string()
+            };
+            let name = format!("n{}", rng.gen_range(0..names));
+            let location = json!({"parent": parent, "name": name});
+            let op = rng.gen_range(0..100);
+            let changes = if known.is_empty() || op < 20 {
+                let kind = if rng.gen_bool(0.15) {
+                    "directory"
+                } else {
+                    "file"
+                };
+                let entity = format!("e{:03}", entities.len());
+                entities.push((entity.clone(), kind));
+                let mut changes = vec![
+                    change(&entity, "kind", json!(kind)),
+                    change(&entity, "location", location),
+                    change(&entity, "alive", json!(true)),
+                ];
+                if kind == "file" {
+                    changes.push(change(
+                        &entity,
+                        "content",
+                        json!(hash(&rng.r#gen::<u64>().to_le_bytes())),
+                    ));
+                }
+                changes
+            } else {
+                let (entity, kind) = known[rng.gen_range(0..known.len())].clone();
+                match op {
+                    20..=64 => {
+                        let mut changes = vec![change(&entity, "alive", json!(true))];
+                        if kind == "file" {
+                            changes.push(change(
+                                &entity,
+                                "content",
+                                json!(hash(&rng.r#gen::<u64>().to_le_bytes())),
+                            ));
+                        }
+                        changes
+                    }
+                    65..=79 => vec![change(&entity, "alive", json!(false))],
+                    _ => vec![change(&entity, "location", location)],
+                }
+            };
+            let referenced: BTreeSet<&str> = view
+                .iter()
+                .flat_map(|&i| {
+                    events[i]
+                        .dependencies
+                        .iter()
+                        .chain(events[i].changes.iter().flat_map(|c| c.parents.iter()))
+                        .map(String::as_str)
+                })
+                .collect();
+            let dependencies: Vec<String> = view
+                .iter()
+                .map(|&i| events[i].id.clone())
+                .filter(|id| !referenced.contains(id.as_str()))
+                .collect();
+            let id = format!("{:04x}-{:04}", rng.gen_range(0..0x10000), events.len());
+            seen[d].insert(events.len());
+            events.push(Event {
+                id,
+                repo: "repo".into(),
+                branch: Branch {
+                    id: BRANCH.into(),
+                    name: "main".into(),
+                    shared: true,
+                },
+                device: devices[d].clone(),
+                created_ms: serial as u64,
+                changes,
+                dependencies,
+                reviewed: vec![],
+                object_sizes: BTreeMap::new(),
+            });
+        }
+        events
+    }
+
+    /// `Plan` compared by value (it has no `PartialEq`).
+    fn plan_text(plan: &Result<Plan>) -> String {
+        match plan {
+            Ok(Plan::Derived(conflicts)) => format!("derived {conflicts:?}"),
+            Ok(Plan::Fallback(reason)) => format!("fallback {reason}"),
+            Err(error) => format!("refused {error:#}"),
+        }
+    }
+    fn wave4_plan_text(plan: &Result<wave4::Plan>) -> String {
+        match plan {
+            Ok(wave4::Plan::Derived(conflicts)) => format!("derived {conflicts:?}"),
+            Ok(wave4::Plan::Fallback(reason)) => format!("fallback {reason}"),
+            Err(error) => format!("refused {error:#}"),
+        }
+    }
+
+    /// One history checked against the Wave 4 implementation: the
+    /// projection, full mode's source list (a rebuild, and a commit of the
+    /// last event), the namespace history in two event orders, and for
+    /// every prefix the append plan (records in order, or the same fallback
+    /// reason, or the same refusal) and the successor count. Returns
+    /// (appended prefixes, fallbacks).
+    fn compare_with_wave4(name: &str, events: &[Event], rng: &mut StdRng) -> (usize, usize) {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);")
+            .unwrap();
+        let mut shuffled = events.to_vec();
+        shuffled.shuffle(rng);
+        for order in [events, &shuffled[..]] {
+            let p = project(BRANCH, order);
+            assert!(
+                same(&p, &wave4::project(BRANCH, order)),
+                "{name}: projection differs"
+            );
+            assert!(
+                same(
+                    &NsContext::new(BRANCH, order).full(),
+                    &wave4::NsContext::new(BRANCH, order).full()
+                ),
+                "{name}: namespace history differs"
+            );
+            if let Ok(p) = &p {
+                let last = order.last().map(|e| e.id.as_str());
+                for new_event in [None, last] {
+                    let reviewed = reviewed_rows(&db, BRANCH, order, new_event).unwrap();
+                    let input = DeriveInput {
+                        branch: BRANCH,
+                        projection: p,
+                        events: order,
+                        new_event,
+                        reviewed: &reviewed,
+                    };
+                    let current = derive_full_with(&input, new_event);
+                    let reference = wave4::derive_full_with(&input, new_event);
+                    assert!(
+                        same(&current, &reference),
+                        "{name} {new_event:?}: full source list differs\ncurrent {current:#?}\nreference {reference:#?}"
+                    );
+                }
+            }
+        }
+        let (mut appended, mut fallbacks) = (0, 0);
+        for k in 1..events.len() {
+            let new = &events[..=k];
+            let Ok(p) = project(BRANCH, new) else {
+                continue;
+            };
+            if !p.pending.is_empty() {
+                continue;
+            }
+            let id = new[k].id.as_str();
+            let input = DeriveInput {
+                branch: BRANCH,
+                projection: &p,
+                events: new,
+                new_event: Some(id),
+                reviewed: &[],
+            };
+            let current = plan_text(&derive_append_with(&input, id));
+            let reference = wave4_plan_text(&wave4::derive_append_with(&input, id));
+            assert_eq!(current, reference, "{name} k {k}: append plan differs");
+            appended += usize::from(current.starts_with("derived"));
+            fallbacks += usize::from(current.starts_with("fallback"));
+            let counted = check_successor_cuts(BRANCH, new, k).map_err(|e| format!("{e:#}"));
+            let reference =
+                wave4::check_successor_cuts(BRANCH, new, k).map_err(|e| format!("{e:#}"));
+            assert_eq!(counted, reference, "{name} k {k}: successor count differs");
+        }
+        (appended, fallbacks)
+    }
+
+    /// WP5.1: the interned derivation (numbers for entities, one causal
+    /// sweep per cone, the antichain enumeration over concurrent sets,
+    /// restricted records in full mode, the borrowed `project`) reproduces
+    /// the Wave 4 implementation exactly, on the four history generators
+    /// (`TKFS_DERIVE_WAVE4_SEEDS`, default 120; release runs take more and
+    /// longer storms).
+    #[test]
+    fn interned_derivation_matches_wave4() {
+        let seeds: u64 = std::env::var("TKFS_DERIVE_WAVE4_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let storm_len: usize = std::env::var("TKFS_DERIVE_WAVE4_STORM_LEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(48);
+        let (mut appended, mut fallbacks) = (0, 0);
+        for seed in 0..seeds {
+            let mut rng = StdRng::seed_from_u64(31_000 + seed);
+            let events = match seed % 4 {
+                0 => {
+                    let len = rng.gen_range(4..=16);
+                    history(&mut rng, len)
+                }
+                1 => {
+                    let len = rng.gen_range(8..=24);
+                    device_history(&mut rng, len)
+                }
+                2 => {
+                    let len = rng.gen_range(8..=20);
+                    device_history_with(&mut rng, len, true)
+                }
+                _ => {
+                    let len = rng.gen_range(storm_len / 2..=storm_len);
+                    let names = rng.gen_range(2..=6);
+                    let devices = rng.gen_range(2..=3);
+                    storm_history(&mut rng, len, names, devices, 0.3)
+                }
+            };
+            let (a, f) = compare_with_wave4(&format!("seed {seed}"), &events, &mut rng);
+            appended += a;
+            fallbacks += f;
+        }
+        println!("{appended} appended, {fallbacks} fallbacks");
+        assert!(
+            appended > 200 && fallbacks > 0,
+            "{appended} appended, {fallbacks} fallbacks"
+        );
+    }
+
     /// The rows a commit leaves: `stored` upserted with `derived` (the last
     /// record of an id wins), after full mode's DELETE of the namespace rows
     /// `derived` lacks when `delete`.
@@ -4830,7 +8655,7 @@ current {current:#?}"
                 partial += usize::from(plan.cones.iter().any(|c| c.only.is_some()));
                 // Full cut projections always; restricted ones when allowed.
                 let mut variants = vec![false];
-                if projection_cannot_fail(new, &locations, &ctx.alive) {
+                if projection_cannot_fail(&ctx, &locations) {
                     variants.push(true);
                     restricted_runs += 1;
                 }
@@ -4886,13 +8711,11 @@ current {current:#?}"
             let events = history(&mut rng, len);
             let locations = Locations::new(&events);
             let ctx = NsContext::new(BRANCH, &events);
-            if project(BRANCH, &events).is_err()
-                || !projection_cannot_fail(&events, &locations, &ctx.alive)
-            {
+            if project(BRANCH, &events).is_err() || !projection_cannot_fail(&ctx, &locations) {
                 unsafe_histories += 1;
                 continue;
             }
-            let cones = NamespaceCones::new(&events).unwrap().members();
+            let cones = NamespaceCones::new(&ctx).unwrap().members();
             for _ in 0..6 {
                 let mut cut = Bits::new(events.len());
                 for i in 0..events.len() {
@@ -4904,18 +8727,17 @@ current {current:#?}"
                 let refs: Vec<&Event> = cut.iter().map(|i| &events[i]).collect();
                 let full = project_refs(BRANCH, &refs).expect("a cut projects");
                 for members in &cones {
-                    let members: BTreeSet<&str> = members.iter().map(String::as_str).collect();
+                    let names = ctx.member_set(members);
                     let expected: Vec<Conflict> = full
                         .conflicts
                         .iter()
                         .filter(|c| {
-                            c.field == "namespace"
-                                && c.entity.split(',').any(|e| members.contains(e))
+                            c.field == "namespace" && c.entity.split(',').any(|e| names.contains(e))
                         })
                         .cloned()
                         .collect();
-                    let actual = ctx.namespace_records(&members, &cut).unwrap();
-                    assert_eq!(actual, expected, "seed {seed} cone {members:?}");
+                    let actual = records_of(&ctx, members, &cut);
+                    assert_eq!(actual, expected, "seed {seed} cone {names:?}");
                     compared += 1;
                 }
             }
@@ -5067,7 +8889,11 @@ current {current:#?}"
             Ok(Ok(plan)) => plan,
             _ => panic!("the cone precondition holds"),
         };
-        assert!(plan.members.contains("f") && plan.members.contains("y"));
+        assert!(
+            ["f", "y"]
+                .iter()
+                .all(|e| ctx.entity(e).is_some_and(|e| plan.members.contains(&e)))
+        );
         assert!(matches!(
             derive_append(&db, BRANCH, &p_new, new, "c2"),
             Ok(Plan::Fallback(
@@ -5127,12 +8953,19 @@ current {current:#?}"
     fn cut_memo_is_bounded_by_retained_bytes() {
         let events = collisions(150);
         let reference = by_id(&legacy::namespace_history(BRANCH, &events).unwrap());
+        // Restricted records (the default when no cut can fail) use no cut
+        // memo; the memo serves the whole-cut projections.
+        let restricted = NsContext::new(BRANCH, &events);
+        assert_eq!(by_id(&restricted.full().unwrap()), reference);
+        assert!(restricted.memo.borrow().cuts.is_empty());
         let unbounded = NsContext::new(BRANCH, &events);
         unbounded.memo.borrow_mut().cut_budget = usize::MAX;
+        unbounded.memo.borrow_mut().unrestricted = true;
         assert_eq!(by_id(&unbounded.full().unwrap()), reference);
         let budget = 256 * 1024;
         let bounded = NsContext::new(BRANCH, &events);
         bounded.memo.borrow_mut().cut_budget = budget;
+        bounded.memo.borrow_mut().unrestricted = true;
         assert_eq!(by_id(&bounded.full().unwrap()), reference);
         let (all, kept) = (unbounded.memo.borrow(), bounded.memo.borrow());
         let records = |memo: &Memo| memo.cuts.values().map(|c| c.len()).sum::<usize>();
@@ -5178,6 +9011,8 @@ current {current:#?}"
             return;
         }
         let ctx = NsContext::new(BRANCH, &events);
+        ctx.memo.borrow_mut().unrestricted =
+            std::env::var("TKFS_DERIVE_PROBE_UNRESTRICTED").is_ok_and(|v| v == "1");
         let records = ctx.full().unwrap().len();
         let memo = ctx.memo.borrow();
         println!(
@@ -5420,25 +9255,21 @@ current {current:#?}"
                 if locations.first_error().is_err() {
                     continue;
                 }
-                let graph = ConeGraph::new(&new, &locations, k);
-                let touched: BTreeSet<&str> = new[k]
-                    .changes
-                    .iter()
-                    .filter(|c| ["kind", "location", "alive"].contains(&c.field.as_str()))
-                    .map(|c| c.entity.as_str())
-                    .collect();
                 let existing: BTreeSet<&str> = old
                     .iter()
                     .flat_map(|e| e.changes.iter().map(|c| c.entity.as_str()))
                     .collect();
                 let (ns_new, ns_old) = (NsContext::new(BRANCH, &new), NsContext::new(BRANCH, old));
+                let graph = ConeGraph::new(&ns_new, &locations, k);
+                let touched = touched_entities(&ns_new, k);
                 for entity in graph.reaching(&touched) {
-                    let members = graph.cone(entity, false);
-                    let now = ns_new.count_cuts(&ns_new.relevant(&members, None)).unwrap();
-                    let before: BTreeSet<&str> = members
+                    let numbers = graph.cone(entity, false);
+                    let members = ns_new.member_set(&numbers);
+                    let now = ns_new.count_cuts(&ns_new.relevant(&numbers, None)).unwrap();
+                    let before: Vec<u32> = members
                         .iter()
-                        .copied()
-                        .filter(|m| existing.contains(m))
+                        .filter(|m| existing.contains(*m))
+                        .filter_map(|m| ns_old.entity(m))
                         .collect();
                     let then = ns_old.count_cuts(&ns_old.relevant(&before, None)).unwrap();
                     assert!(
@@ -5505,9 +9336,8 @@ current {current:#?}"
         for events in histories {
             let n = events.len();
             let ns = NsContext::new(BRANCH, &events);
-            let cones = NamespaceCones::new(&events).unwrap();
+            let cones = NamespaceCones::new(&ns).unwrap();
             for members in cones.members() {
-                let members: BTreeSet<&str> = members.iter().map(String::as_str).collect();
                 let relevant = ns.relevant(&members, None);
                 let mut out = BTreeMap::new();
                 let enumerated = ns.cone_conflicts(&members, &relevant, None, false, &mut out);
