@@ -723,6 +723,7 @@ fn scope_text(scope: &Scope, names: &Names) -> Option<String> {
             "peer {} lane {lane}",
             names.peer_or_id(installation)
         )),
+        Scope::Endpoint { endpoint } => Some(format!("endpoint {endpoint}")),
     }
 }
 

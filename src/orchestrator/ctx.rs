@@ -466,8 +466,8 @@ pub const MAX_REFUSED_PAIRINGS: usize = 16;
 ///   (6298d0b) acceptor fails with `PEER_NEEDS_UPGRADE` before anything is
 ///   sent (§6.2), and there is no catalog peer, hence no lane, to show it:
 ///   the refusal is recorded as an error scoped to the endpoint
-///   (`Scope::Peer{installation: <endpoint>}`, the only identity a peer we
-///   never authenticated has), so Status shows it until that endpoint pairs
+///   (`Scope::Endpoint`, CCR-WP3.1-3 applied by WP4.INT; it was
+///   `Scope::Peer{installation: <endpoint>}`), so Status shows it until that endpoint pairs
 ///   (or a later pairing with it fails otherwise). A paired peer that turns
 ///   out to be legacy shows on its lanes (`Incompatible`), as any peer state.
 ///
@@ -541,8 +541,8 @@ impl DaemonNetwork {
     }
 
     fn refusal_scope(endpoint: &str) -> Scope {
-        Scope::Peer {
-            installation: endpoint.to_owned(),
+        Scope::Endpoint {
+            endpoint: endpoint.to_owned(),
         }
     }
 

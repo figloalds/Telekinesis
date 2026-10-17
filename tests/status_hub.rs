@@ -5554,3 +5554,45 @@ fn an_inbound_only_peer_that_unpaired_us_is_forgotten() {
     assert_eq!(fx.folder().sync.state, FolderSyncState::NotShared);
     assert!(fx.snap().peers.is_empty());
 }
+
+/// CCR-WP3.1-3 (applied by WP4.INT): a pairing an endpoint refused is scoped
+/// to that endpoint (`Scope::Endpoint`), not to a peer named by it: it is a
+/// daemon error, no peer appears for it, and it resolves in its scope.
+#[test]
+fn an_endpoint_scoped_refusal_is_a_daemon_error() {
+    let fx = Fx::new();
+    let scope = Scope::Endpoint {
+        endpoint: "ws://192.0.2.7:43180".into(),
+    };
+    fx.rec(StatusEvent::Error {
+        scope: scope.clone(),
+        error: wire("PEER_NEEDS_UPGRADE"),
+    });
+    let snap = fx.snap();
+    let open: Vec<_> = snap
+        .daemon
+        .errors
+        .iter()
+        .filter(|e| e.error.code == "PEER_NEEDS_UPGRADE" && e.resolved_at_ms.is_none())
+        .collect();
+    assert_eq!(open.len(), 1, "{:?}", snap.daemon.errors);
+    assert_eq!(open[0].scope, scope);
+    assert!(
+        snap.peers
+            .iter()
+            .all(|p| !p.installation.contains("192.0.2.7")),
+        "no peer for an endpoint: {:?}",
+        snap.peers
+    );
+    fx.rec(StatusEvent::Resolved {
+        scope,
+        code: "PEER_NEEDS_UPGRADE".into(),
+    });
+    assert!(
+        fx.snap()
+            .daemon
+            .errors
+            .iter()
+            .all(|e| e.error.code != "PEER_NEEDS_UPGRADE" || e.resolved_at_ms.is_some())
+    );
+}

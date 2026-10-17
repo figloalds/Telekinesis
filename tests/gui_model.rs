@@ -2429,6 +2429,20 @@ fn error_lines_show_a_first_time_that_differs_and_unlisted_peers_once() {
         ui_model::error_line(&listed, &names, now).scope.as_deref(),
         Some("peer office")
     );
+    // CCR-WP3.1-3 (WP4.INT): a refused pairing is scoped to its endpoint.
+    let endpoint = record(
+        "PEER_NEEDS_UPGRADE",
+        Scope::Endpoint {
+            endpoint: "ws://10.0.0.5:43180".into(),
+        },
+        NOW,
+    );
+    assert_eq!(
+        ui_model::error_line(&endpoint, &names, now)
+            .scope
+            .as_deref(),
+        Some("endpoint ws://10.0.0.5:43180")
+    );
 }
 
 /// The activation rate of a folder whose activator stopped reads idle (ux
