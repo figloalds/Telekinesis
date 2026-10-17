@@ -5505,6 +5505,15 @@ fn qual_wp4_5_control_latency_under_a_saturated_lane() {
         p99 < 100.0,
         "control-session p99 {p99:.1} ms under a saturated bulk lane"
     );
+    // A regression bound on the saturated session's own control frames
+    // (WP4.INT, the WP4.5 review's minor): about 126-141 ms with the
+    // loopback send-buffer horizon (the emulator queues about 100 ms itself),
+    // about 300 ms before it.
+    let bulk_p99 = percentile(&on_bulk, 99.0);
+    assert!(
+        bulk_p99 < 200.0,
+        "bulk-session p99 {bulk_p99:.1} ms under its own saturation"
+    );
 }
 
 /// A session server for the throughput scenarios: `download{count}`

@@ -643,3 +643,39 @@ fn the_send_buffer_follows_the_drain_rate() {
     assert_eq!(fresh.resize(start + SEND_BUFFER_WINDOW, 5), None);
     assert_eq!(fresh.size(), None);
 }
+
+/// WP4.INT (the WP4.5 review's minor): a loopback socket's send buffer
+/// (`SendBuffer::for_loopback`) holds two `LOOPBACK_SEND_HORIZON_MS` of data
+/// at its drain rate, whatever round trip the session measured (a session
+/// to a proxy or an emulator on this machine has the far link's), clamped
+/// to [`SEND_BUFFER_MIN`, max].
+#[test]
+fn a_loopback_send_buffer_follows_its_own_horizon() {
+    use std::time::Instant;
+    use tkfs::session::io::{
+        LOOPBACK_SEND_HORIZON_MS, SEND_BUFFER_MIN, SEND_BUFFER_WINDOW, SendBuffer,
+    };
+    const MIB: usize = 1024 * 1024;
+    let max = 4 * MIB;
+    // 25 MiB in a 250 ms window: 100 MiB/s, two 10 ms horizons: 2 MiB.
+    let sized = |rtt: u64, bytes: usize| -> Option<usize> {
+        let start = Instant::now();
+        let mut buffer = SendBuffer::for_loopback(max, start);
+        buffer.took(bytes);
+        buffer.refused();
+        buffer.resize(start + SEND_BUFFER_WINDOW, rtt)
+    };
+    let expected = (100.0 * MIB as f64 * 2.0 * LOOPBACK_SEND_HORIZON_MS as f64 / 1000.0) as usize;
+    for rtt in [1, 50, 100, 400, u64::MAX] {
+        let size = sized(rtt, 25 * MIB).expect("a saturated window resizes");
+        assert!(
+            size.abs_diff(expected) < 64 * 1024,
+            "rtt {rtt}: {size} (expected about {expected})"
+        );
+    }
+    // Clamped to the largest size at loopback rates, and never below the
+    // smallest.
+    assert_eq!(sized(50, 200 * MIB), Some(max));
+    assert_eq!(sized(400, 256 * 1024), None, "the system's size is kept");
+    let _ = SEND_BUFFER_MIN;
+}

@@ -442,8 +442,20 @@ fn release_op(ctx: &WorkerCtx, header: ReleaseHeader) -> Result<(Value, Vec<u8>)
     release_list(ops::RELEASE, &header.hashes)?;
     let released = {
         let mut state = lock(&ctx.inflight_objects);
-        sweep_lapsed(&mut state, now_ms());
-        give_up(&mut state, &header.session, &header.hashes)
+        let now = now_ms();
+        sweep_lapsed(&mut state, now);
+        let released = give_up(&mut state, &header.session, &header.hashes);
+        // The dialer's own backoff for this source, kept here so later wants
+        // of this source leave them out whatever its exclusion list holds
+        // (WP4.INT, the WP4.5 review's minor).
+        if let Some(hold) = header.hold_ms.filter(|hold| *hold > 0) {
+            let source = header.route.remote_replica.as_str();
+            for hash in &header.hashes {
+                let entry = source_entry(&mut state, source, hash, now);
+                entry.1 = entry.1.max(now.saturating_add(hold));
+            }
+        }
+        released
     };
     if released > 0 {
         // A write of this session waiting for its earlier writes (ordered

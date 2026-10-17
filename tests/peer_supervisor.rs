@@ -1760,13 +1760,18 @@ fn a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed() 
     )));
 
     // Both lanes are inside their dial: the unpair interrupts them (their
-    // sockets are shut down), joins them well before the 2 s deadline, and
-    // they are reported Closed before PeerRemoved.
+    // sockets are shut down), joins them before the 2 s deadline, and they
+    // are reported Closed before PeerRemoved. An interrupted dial still waits
+    // out the slow proxy's current 1.5 s chunk delay (on Windows the proxy
+    // keeps the client side open after its FIN until that chunk is written),
+    // so the bound has a margin over it (CCR-WP4.1-10, applied by WP4.INT:
+    // it was the delay itself and failed at 1.501-1.578 s on loaded runs);
+    // an uninterrupted dial takes about 4.5 s and the join would detach it.
     let started = Instant::now();
     manager.unpair(&proxy).unwrap();
     let took = started.elapsed();
     assert!(
-        took < Duration::from_millis(1500),
+        took < Duration::from_millis(2500),
         "unpair took {took:?} (the dials are interrupted at once)"
     );
     assert_eq!(manager.detached_lanes(), 0, "every lane was joined");
