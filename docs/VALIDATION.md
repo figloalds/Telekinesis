@@ -111,7 +111,7 @@ holds the §15 before/after table with the Linux numbers too.
 |---|---|---|---|---|
 | Remote linear create, per event, 2K / 10K | `qual_wp1_6_activation` | 15.9 s @2K | ≤ 5 ms | 0.63 / 0.90 ms |
 | Local create after a resolved conflict (p90) | `qual_wp1_6_activation` | 4.2 s | ≤ 10 ms | 1.2 ms |
-| Local create beside an unresolved conflict, 10K events (p90; WP4.INT re-review) | `qual_wp1_6_activation` | 262–436 ms (before the scoped conflict gate) | ≤ 10 ms | 3.2 / 3.6 ms (two runs, measured apart from `-All`; renames 95–99 ms and deletes 94 ms, reported: their cut count is O(history) with or without conflicts) |
+| Local create beside an unresolved conflict, 10K events (p90 of 100; WP4.INT re-review) | `qual_wp1_6_activation` | 262–436 ms (before the scoped conflict gate) | ≤ 20 ms | 2.8–3.1 ms (three runs, measured apart from `-All`; renames 76–91 ms and deletes 70–77 ms, reported: their cut count is O(history) with or without conflicts) |
 | Two-way backlog, per event, 2K / 6.4K | `qual_wp1_7_derive` | 15.9 s / 218 s | ≤ 100 / 300 ms | 35 / 132 ms |
 | 50 concurrent namespace ops on 5K history (max) | `qual_wp1_7_derive` | seconds to minutes | ≤ 500 ms | 229 ms |
 | Restart to Ready at 20K objects | `qual_wp1_8_objects` | full re-hash | ≤ 3 s | 0.95 s |

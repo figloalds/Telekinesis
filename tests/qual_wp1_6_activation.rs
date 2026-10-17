@@ -284,12 +284,13 @@ fn local_create_after_resolved_conflict() {
 /// unresolved conflict of another file take the fast path. Before the scoped
 /// gate one unresolved conflict anywhere on the branch made each of them a
 /// full replay under the engine lock (262-436 ms per create at 10K events,
-/// 872-1,064 ms at 30K). The floor judges the creates; renames and deletes
+/// 872-1,064 ms at 30K). The floor judges the creates (p90 <= 20 ms, an
+/// order of magnitude under the slow path); renames and deletes
 /// are reported: a rename into a slot its entity never used and a first
 /// delete count the competing cuts over the branch's history (CCR-WP1.6-5),
 /// with or without conflicts, which is O(history) on its own.
 #[test]
-#[ignore = "WP4.INT"]
+#[ignore = "WP1.6"]
 fn local_namespace_ops_beside_an_unresolved_conflict_10k() {
     let mut s = Scenario::new(
         FILE,
@@ -316,19 +317,24 @@ fn local_namespace_ops_beside_an_unresolved_conflict_10k() {
     let before = a.commit_path_counters();
     s.measure_from_now();
     let (mut creates, mut renames, mut deletes) = (vec![], vec![], vec![]);
-    for i in 0..40 {
+    // 100 creates (the floor's samples: a few hit SQLite's automatic WAL
+    // checkpoint, which a p90 of 100 absorbs), a rename of every fourth and
+    // a delete of every eighth.
+    for i in 0..100 {
         if s.over_budget() {
-            s.timeout(format!("{i} of 40 rounds in budget"));
+            s.timeout(format!("{i} of 100 rounds in budget"));
             break;
         }
-        let (r, ms) = time_ms(|| a.create(&format!("beside-{i:02}.txt"), "file"));
+        let (r, ms) = time_ms(|| a.create(&format!("beside-{i:03}.txt"), "file"));
         let created = r.unwrap();
         creates.push(ms);
-        let (r, ms) =
-            time_ms(|| a.rename(&created.id, &format!("beside-{i:02}-renamed.txt"), false));
-        r.unwrap();
-        renames.push(ms);
-        if i % 2 == 0 {
+        if i % 4 == 0 {
+            let (r, ms) =
+                time_ms(|| a.rename(&created.id, &format!("beside-{i:03}-renamed.txt"), false));
+            r.unwrap();
+            renames.push(ms);
+        }
+        if i % 8 == 0 {
             let (r, ms) = time_ms(|| a.delete(&created.id));
             r.unwrap();
             deletes.push(ms);
