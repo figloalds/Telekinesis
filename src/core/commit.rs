@@ -156,6 +156,74 @@ use std::{
     sync::OnceLock,
 };
 
+/// Objects this process verified (WP5.1 task 5): `(state root, hash)` →
+/// the file's size and mtime when it was verified, and when. Process-wide,
+/// bounded; `check_commit` skips the re-hash of an object recorded here
+/// within [`FRESH_MS`](verified::FRESH_MS) whose file still has that size
+/// and mtime.
+pub mod verified {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{
+            Mutex, OnceLock, PoisonError,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    /// How long a verification counts as "moments ago".
+    pub const FRESH_MS: u64 = 300_000;
+    const FRESH: Duration = Duration::from_millis(FRESH_MS);
+    /// Entries kept (the oldest are dropped past it).
+    const CAPACITY: usize = 4096;
+
+    type Entries = HashMap<(PathBuf, String), (u64, i64, Instant)>;
+
+    fn entries() -> &'static Mutex<Entries> {
+        static ENTRIES: OnceLock<Mutex<Entries>> = OnceLock::new();
+        ENTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// Record that this process verified `hash` under `root` while its file
+    /// had `len` bytes and mtime `mtime_ns`.
+    pub fn note(root: &Path, hash: &str, len: u64, mtime_ns: i64) {
+        let mut entries = entries().lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.len() >= CAPACITY {
+            entries.retain(|_, (_, _, at)| at.elapsed() < FRESH);
+            if entries.len() >= CAPACITY {
+                entries.clear();
+            }
+        }
+        entries.insert(
+            (root.to_owned(), hash.to_owned()),
+            (len, mtime_ns, Instant::now()),
+        );
+    }
+
+    /// Whether `hash` under `root` was verified within [`FRESH_MS`] with the
+    /// file at `len` bytes and mtime `mtime_ns`.
+    pub fn recent(root: &Path, hash: &str, len: u64, mtime_ns: i64) -> bool {
+        entries()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(root.to_owned(), hash.to_owned()))
+            .is_some_and(|&(l, m, at)| l == len && m == mtime_ns && at.elapsed() < FRESH)
+    }
+
+    pub(super) fn count_skip() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Re-verifications `check_commit` skipped in this process (tests).
+    #[doc(hidden)]
+    pub fn skipped() -> u64 {
+        SKIPPED.load(Ordering::Relaxed)
+    }
+}
+
 /// The view slots (`(parent, name key)` → entity) of the alive entries of
 /// `projection`; `None` if a name cannot be keyed, which a committed
 /// projection never has.
@@ -515,7 +583,7 @@ impl Store {
                     |r| r.get::<_, bool>(0),
                 )?
             {
-                self.verify_object(object)?;
+                self.verify_new_object(object)?;
             }
         }
         let mut seen = BTreeSet::new();
@@ -555,6 +623,47 @@ impl Store {
             ensure!(b == event.branch, "BRANCH_DESCRIPTOR_CHANGED");
         }
         Ok(Check::Ready(Checked { payload, objects }))
+    }
+    /// `check_commit`'s verification of newly authored bytes (WP5.1 task 5,
+    /// CCR-WP4.INT-5's re-hash): skipped when this process verified the
+    /// object moments ago and the file still has the size and mtime it had
+    /// then ([`verified`]), else a full `verify_object`, recorded on success.
+    /// The bytes were hashed by this process (or installed from bytes it
+    /// hashed: the availability marker `put_object` / `put_stream` leave,
+    /// read within [`verified::FRESH_MS`]) and `stat` shows them unchanged:
+    /// the rule startup trusts markers by (`VerifyMode::Changed`), narrowed
+    /// to moments ago, so invariant 1 (a verified, durable install) holds.
+    fn verify_new_object(&self, object: &str) -> Result<()> {
+        let path = self.root.join("objects").join(object);
+        let before = fs::metadata(&path).ok();
+        if let Some(metadata) = &before {
+            let (len, mtime) = (metadata.len(), objects::mtime_ns(metadata));
+            if verified::recent(&self.root, object, len, mtime) {
+                verified::count_skip();
+                return Ok(());
+            }
+            // The install marker this process's `put_object` / `put_stream`
+            // left (the adapter of CCR-WP5.1-1).
+            let fresh = self.availability_row(object)?.is_some_and(|row| {
+                row.trusted(len, mtime)
+                    && time().saturating_sub(row.verified_ms.max(0) as u64) <= verified::FRESH_MS
+            });
+            if fresh {
+                verified::note(&self.root, object, len, mtime);
+                verified::count_skip();
+                return Ok(());
+            }
+        }
+        self.verify_object(object)?;
+        if let Some(metadata) = before {
+            verified::note(
+                &self.root,
+                object,
+                metadata.len(),
+                objects::mtime_ns(&metadata),
+            );
+        }
+        Ok(())
     }
     /// The incremental projection delta for `event`, if a successor proves it
     /// equal to full replay; `None` means the slow path. A namespace
@@ -815,6 +924,52 @@ impl Store {
             Some(_) => Stored::Fold { changed },
         }
     }
+    /// The branch's projection as this handle's fresh view (loaded if
+    /// needed), taken out of the view cache; `None` when it cannot be read.
+    fn take_view(&self, branch: &str) -> Option<Projection> {
+        self.drop_rolled_back_view();
+        if self.view(branch).is_err() {
+            return None;
+        }
+        self.view_cache
+            .try_borrow_mut()
+            .ok()?
+            .take()
+            .filter(|view| view.branch == branch)
+            .map(|view| view.projection)
+    }
+    /// `projection_delta` for a projection `derive::project_append` made from
+    /// the stored one: it knows the entities that changed and whether the
+    /// lists did, so nothing is compared (WP5.1). The same layout decision:
+    /// a delta, or a fold of a small projection whose parts would outnumber
+    /// half of its entries.
+    fn appended_delta(
+        &self,
+        branch: &str,
+        p: &Projection,
+        changed: BTreeSet<String>,
+        header: bool,
+    ) -> Stored {
+        if p.entries.len() > FOLD_MAX_ENTRIES {
+            return Stored::Delta { changed, header };
+        }
+        let parts: Option<usize> = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM current_parts WHERE branch=?",
+                [branch],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|parts| usize::try_from(parts).ok());
+        match parts {
+            None => Stored::Rewrite,
+            Some(parts) if parts.saturating_add(changed.len()) <= p.entries.len() / 2 => {
+                Stored::Delta { changed, header }
+            }
+            Some(_) => Stored::Fold { changed },
+        }
+    }
     /// The slow path's computation for `event` (WP2.4): the branch's events
     /// (the event cache) plus `event`, projected; `None` when the projection
     /// is pending (a prerequisite outside the branch's journal); then the
@@ -831,11 +986,38 @@ impl Store {
         precompute: bool,
     ) -> Result<Option<Box<SlowPlan>>> {
         let branch = event.branch.id.as_str();
+        // The stored projection of the branch, as this handle's view: the
+        // base of `derive::project_append` (WP5.1). It is consumed; a
+        // committing slow commit leaves its own projection as the view.
+        let base = derive::timed("s.view", || self.take_view(branch));
         let computed = derive::timed("s.compute", || {
             let t0 = std::time::Instant::now();
             self.with_branch_events(branch, Some(event), committed_view, |events| {
                 derive::record_phase("s.events", t0.elapsed().as_micros() as u64);
-                let projection = derive::timed("s.project", || project(branch, events))?;
+                let new = events.len() - 1;
+                let appended = match base {
+                    Some(base) => derive::timed("s.append", || {
+                        derive::project_append(branch, base, events, new)
+                    })?,
+                    None => None,
+                };
+                let (projection, delta) = match appended {
+                    Some(appended) => (
+                        appended.projection,
+                        Some((appended.changed, appended.lists)),
+                    ),
+                    None => (derive::timed("s.project", || project(branch, events))?, None),
+                };
+                if delta.is_some() && derive::checks_projections() {
+                    // The commit checks (and verify mode) compare it with
+                    // `project` itself.
+                    let full = project(branch, events)?;
+                    ensure!(
+                        full == projection,
+                        "CONFLICT_MODE_MISMATCH: the appended projection of {} differs from project",
+                        event.id
+                    );
+                }
                 if !projection.pending.is_empty() {
                     return Ok(None);
                 }
@@ -849,13 +1031,16 @@ impl Store {
                         reviewed: &reviewed,
                     })
                 })?;
-                Ok::<_, anyhow::Error>(Some((projection, derived)))
+                Ok::<_, anyhow::Error>(Some((projection, derived, delta)))
             })
         })??;
-        let Some((projection, derived)) = computed else {
+        let Some((projection, derived, delta)) = computed else {
             return Ok(None);
         };
-        let stored = derive::timed("s.delta", || self.projection_delta(branch, &projection));
+        let stored = derive::timed("s.delta", || match delta {
+            Some((changed, lists)) => self.appended_delta(branch, &projection, changed, lists),
+            None => self.projection_delta(branch, &projection),
+        });
         let (json, slots) = if precompute {
             let json = (!stored.is_delta() || !snapshot::sealed_as_rows(&self.db, branch))
                 .then(|| serde_json::to_string(&projection))
@@ -2057,6 +2242,46 @@ fn injected_busy() -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WP5.1 task 5: a local commit of bytes this process has just stored
+    /// (`put_object`, `put_stream`) does not hash them again; bytes that
+    /// changed on disk since (another size or mtime) are verified, and
+    /// corrupt ones are refused as before.
+    #[test]
+    fn a_local_commit_skips_the_rehash_of_bytes_just_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), None).unwrap();
+        let file = s.create("f.txt", "file").unwrap();
+        let skipped = verified::skipped();
+        let hashes = s.object_hashes();
+        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
+        s.write_revision(&file.id, content, b"fresh bytes").unwrap();
+        assert_eq!(
+            s.object_hashes(),
+            hashes,
+            "the fresh object was hashed again"
+        );
+        assert!(verified::skipped() > skipped);
+        let mut stream: &[u8] = b"streamed bytes";
+        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
+        s.write_stream_with_base_and_times(&file.id, content, None, &mut stream, 0)
+            .unwrap();
+        assert_eq!(
+            s.object_hashes(),
+            hashes,
+            "the streamed object was hashed again"
+        );
+        // Changed behind the store's back (same size): verified, refused.
+        let object = s.put_object(b"other bytes").unwrap();
+        fs::write(s.root.join("objects").join(&object), b"OTHER BYTES").unwrap();
+        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
+        let refused = s.write_object_with_base_and_times(&file.id, content, None, object, 0);
+        assert!(
+            format!("{:#}", refused.unwrap_err()).contains("CORRUPT_OBJECT"),
+            "corrupt bytes accepted"
+        );
+        assert_eq!(s.object_hashes(), hashes + 1);
+    }
 
     /// WP4.4 (CCR-WP2.4-2): every seal is written by `snapshot::seal`, so a
     /// prepared commit's seal from the JSON it serialized off-lock is the

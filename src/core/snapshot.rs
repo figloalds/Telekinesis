@@ -620,6 +620,17 @@ fn incremental_schema(db: &Connection) -> Result<()> {
 /// key, with startup progress after each chunk, then the marker. The
 /// triggers already cover every row written since the table was created.
 fn backfill_journal_branch(db: &Connection) -> Result<()> {
+    backfill_journal_branch_with(db, JOURNAL_BRANCH_CHUNK, &mut |_| Ok(()))
+}
+
+/// `backfill_journal_branch` in chunks of `chunk` rows; `after_chunk` runs
+/// after each committed chunk with its upper sequence (tests: an error there
+/// stands for a crash between chunks).
+fn backfill_journal_branch_with(
+    db: &Connection,
+    chunk: i64,
+    after_chunk: &mut dyn FnMut(i64) -> Result<()>,
+) -> Result<()> {
     let value = |key: &str| -> Result<Option<String>> {
         Ok(db
             .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
@@ -638,7 +649,7 @@ fn backfill_journal_branch(db: &Connection) -> Result<()> {
         loop {
             let upper: Option<i64> = db.query_row(
                 "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",
-                params![cursor, JOURNAL_BRANCH_CHUNK],
+                params![cursor, chunk],
                 |r| r.get(0),
             )?;
             let Some(upper) = upper else { break };
@@ -647,14 +658,19 @@ fn backfill_journal_branch(db: &Connection) -> Result<()> {
                     "INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT s.seq,e.branch FROM journal_sequence s JOIN events e ON e.id=s.event WHERE s.seq>?1 AND s.seq<=?2",
                     params![cursor, upper],
                 )?;
+                // An upsert: the cursor key is missing when an earlier build
+                // crashed between creating the table and writing its keys
+                // (an `UPDATE` would then record no progress, and a crash
+                // would restart the build from the beginning).
                 db.execute(
-                    "UPDATE config SET value=?2 WHERE key=?1",
+                    "INSERT INTO config(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![JOURNAL_BRANCH_CURSOR, upper.to_string()],
                 )?;
                 Ok(())
             })?;
             cursor = upper;
             crate::startup::progress("indexing the journal");
+            after_chunk(upper)?;
         }
     }
     in_savepoint(db, || {
@@ -2171,6 +2187,71 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WP5.1 (the WP4.INT review minor): a `journal_branch` build that starts
+    /// without its cursor key (an earlier build crashed between creating the
+    /// table and writing its keys) records its progress from the first
+    /// chunk, so a crash after a chunk resumes after it instead of from the
+    /// start; the resumed build completes the index row for row.
+    #[test]
+    fn a_journal_index_build_without_its_cursor_resumes_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), None).unwrap();
+        for i in 0..25 {
+            s.create(&format!("f{i:03}"), "file").unwrap();
+        }
+        let db = &s.db;
+        let indexed = |db: &Connection| -> Vec<(i64, String)> {
+            db.prepare("SELECT seq,branch FROM journal_branch ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let expected = indexed(db);
+        assert!(expected.len() >= 25);
+        let cursor = |db: &Connection| -> Option<String> {
+            db.query_row(
+                "SELECT value FROM config WHERE key=?1",
+                [JOURNAL_BRANCH_CURSOR],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        db.execute_batch(
+            "DELETE FROM journal_branch; DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+        )
+        .unwrap();
+        // A crash after the first chunk of 10 rows.
+        let mut first = None;
+        let crashed = backfill_journal_branch_with(db, 10, &mut |upper| {
+            first = Some(upper);
+            anyhow::bail!("crash after a chunk")
+        });
+        assert!(crashed.is_err());
+        let first = first.expect("one chunk ran");
+        assert_eq!(
+            cursor(db),
+            Some(first.to_string()),
+            "the first chunk's progress"
+        );
+        assert_eq!(indexed(db).len(), 10);
+        // The resumed build starts after the recorded cursor.
+        let mut chunks = vec![];
+        backfill_journal_branch_with(db, 10, &mut |upper| {
+            chunks.push(upper);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            chunks.iter().all(|&upper| upper > first),
+            "{chunks:?} after {first}"
+        );
+        assert_eq!(indexed(db), expected);
+        assert_eq!(cursor(db), None);
+    }
 
     /// The anchor's JSON parses back into what was written, in both
     /// layouts, and the head parse skips the bulk.

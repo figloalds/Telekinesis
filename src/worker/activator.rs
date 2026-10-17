@@ -928,9 +928,11 @@ impl Activator {
             .collect();
         diff.sort_by(|a, b| b.2.cmp(&a.2));
         eprintln!(
-            "DERIVE_PHASES {} {}",
+            "DERIVE_PHASES {} {} {}",
             now_ms(),
-            serde_json::to_string(&diff).unwrap_or_default()
+            serde_json::to_string(&diff).unwrap_or_default(),
+            serde_json::to_string(&crate::core::derive::thread_fallback_reasons())
+                .unwrap_or_default()
         );
         self.phases = now.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     }

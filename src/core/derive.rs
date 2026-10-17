@@ -242,6 +242,13 @@ pub fn set_thread_commit_checks(enabled: bool) -> bool {
     COMMIT_CHECKS.with(|cell| cell.replace(enabled))
 }
 
+/// Whether the commit path compares what it computes incrementally with the
+/// reference computation (the commit checks of `set_thread_commit_checks`,
+/// or verify mode).
+pub(super) fn checks_projections() -> bool {
+    COMMIT_CHECKS.with(Cell::get) || conflict_mode() == ConflictMode::Verify
+}
+
 /// The conflict derivation mode: a thread override (tests), else
 /// `TKFS_CONFLICT_MODE` read once per process. Unset or empty means `append`.
 /// An unrecognised value selects `full`, the conservative reference.
@@ -4139,6 +4146,250 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
     record_phase("pr.heads", t0.elapsed().as_micros() as u64);
     timed("pr.namespace", || namespace_pass(branch, &mut p))?;
     Ok(p)
+}
+
+/// What `project_append` made of a projection.
+pub(super) struct Appended {
+    /// `project` of the events, the new one included.
+    pub(super) projection: Projection,
+    /// The entities whose entry or head registers differ from the base's.
+    pub(super) changed: BTreeSet<String>,
+    /// Whether the conflict or pending list differs from the base's.
+    pub(super) lists: bool,
+}
+
+/// `project(events)` from `base`, the projection of `events` without
+/// `events[new]` (WP5.1: a slow commit no longer projects the whole branch).
+/// `None` when the shortcut does not apply (the base has pending events, the
+/// new event is a parent of another or has a parent outside `events`, an id
+/// repeats): the caller projects in full.
+///
+/// Why it equals `project`. Every event of `O = events \ {E}` is active in
+/// the base (no pending event) and none names `E` as a parent, so `E` is the
+/// only addition to the active set (its parents are all present, hence
+/// active), the causal-parent check over `N` is the base's (which passed)
+/// plus `E`'s own changes (checked here), and no cycle can appear. A register
+/// `E` does not change has the same versions in `N`, hence the same heads,
+/// winner and records. A register it changes has `E`'s version added:
+/// `dominated` gains `E`'s parents and nothing names `E`, so its heads are
+/// the base's minus `E`'s parents, plus `E`; its winner, its entry fields
+/// and its records (from the register's whole version list, read from
+/// `events`) are computed as `project` computes them. An entity's entry is a
+/// function of its registers' winners alone, so only `E`'s entities' entries
+/// are rebuilt (in register key order, as `project` builds them); every
+/// other entry keeps its fields except presence, which the namespace passes
+/// decide. Those passes run again over every entry, from each entry's
+/// register presence (the winner of its alive register, else absent), with
+/// every namespace record removed first: exactly `project`'s passes over the
+/// same entries and heads. The conflict list is sorted as `project` sorts
+/// it. The commit checks (`set_thread_commit_checks`) compare the result with
+/// `project` itself on every commit.
+pub(super) fn project_append(
+    branch: &str,
+    mut p: Projection,
+    events: &[Event],
+    new: usize,
+) -> Result<Option<Appended>> {
+    if !p.pending.is_empty() {
+        return Ok(None);
+    }
+    let e = &events[new];
+    let mut ids: HashMap<&str, usize> = HashMap::with_capacity(events.len());
+    for (i, event) in events.iter().enumerate() {
+        if ids.insert(event.id.as_str(), i).is_some() {
+            return Ok(None);
+        }
+    }
+    let names_new = |event: &Event| {
+        event.dependencies.iter().any(|d| d == &e.id)
+            || event
+                .changes
+                .iter()
+                .any(|c| c.parents.iter().any(|p| p == &e.id))
+    };
+    if events
+        .iter()
+        .enumerate()
+        .any(|(i, event)| i != new && names_new(event))
+    {
+        return Ok(None);
+    }
+    let parents = e
+        .dependencies
+        .iter()
+        .chain(e.changes.iter().flat_map(|c| c.parents.iter()));
+    for parent in parents {
+        if parent == &e.id || !ids.contains_key(parent.as_str()) {
+            return Ok(None);
+        }
+    }
+    for c in &e.changes {
+        for parent in &c.parents {
+            let p = &events[ids[parent.as_str()]];
+            ensure!(
+                p.changes
+                    .iter()
+                    .any(|pc| pc.entity == c.entity && pc.field == c.field),
+                "INVALID_CAUSAL_PARENT"
+            );
+        }
+    }
+    // The records the base derives that `E` can change: those of its
+    // registers and every namespace record (the passes run again).
+    let touched: BTreeSet<(&str, &str)> = e
+        .changes
+        .iter()
+        .map(|c| (c.entity.as_str(), c.field.as_str()))
+        .collect();
+    let replaced = |c: &Conflict| {
+        c.field == "namespace" || touched.contains(&(c.entity.as_str(), c.field.as_str()))
+    };
+    let before: Vec<Conflict> = p
+        .conflicts
+        .iter()
+        .filter(|c| replaced(c))
+        .cloned()
+        .collect();
+    p.conflicts.retain(|c| !replaced(c));
+    let alive_before: BTreeMap<String, bool> = p
+        .entries
+        .iter()
+        .map(|(id, entry)| (id.clone(), entry.alive))
+        .collect();
+    for c in &e.changes {
+        let key = register(&c.entity, &c.field);
+        let mut heads = p.heads.remove(&key).unwrap_or_default();
+        heads.retain(|v| !c.parents.contains(&v.revision));
+        heads.push(version_of(events, (new, c)));
+        heads.sort_by(|a, b| (&a.device, &a.revision).cmp(&(&b.device, &b.revision)));
+        if heads.len() > 1
+            && heads
+                .iter()
+                .map(|v| serde_json::to_string(&v.value).unwrap())
+                .collect::<BTreeSet<_>>()
+                .len()
+                > 1
+        {
+            // `project`'s records of the register, from its whole history.
+            let versions: Vec<VersionRef> = events
+                .iter()
+                .enumerate()
+                .flat_map(|(i, event)| {
+                    event
+                        .changes
+                        .iter()
+                        .filter(|pc| pc.entity == c.entity && pc.field == c.field)
+                        .map(move |pc| (i, pc))
+                })
+                .collect();
+            let mut order: Vec<usize> = (0..versions.len()).collect();
+            order.sort_by(|&a, &b| events[versions[a].0].id.cmp(&events[versions[b].0].id));
+            let at: HashMap<&str, usize> = versions
+                .iter()
+                .enumerate()
+                .map(|(k, (i, _))| (events[*i].id.as_str(), k))
+                .collect();
+            let ancestry = |head: &Version| -> Bits {
+                let mut found = Bits::new(versions.len());
+                let mut todo: Vec<&str> = head.parents.iter().map(String::as_str).collect();
+                while let Some(revision) = todo.pop() {
+                    if let Some(&k) = at.get(revision)
+                        && found.insert(k)
+                    {
+                        todo.extend(versions[k].1.parents.iter().map(String::as_str));
+                    }
+                }
+                found
+            };
+            let ancestors: Vec<Bits> = heads.iter().map(ancestry).collect();
+            for (i, a) in heads.iter().enumerate() {
+                for (j, b) in heads.iter().enumerate().skip(i + 1) {
+                    if a.value != b.value {
+                        let bases = order
+                            .iter()
+                            .filter(|&&k| ancestors[i].contains(k) && ancestors[j].contains(k))
+                            .map(|&k| version_of(events, versions[k]))
+                            .collect();
+                        p.conflicts.push(make_conflict(
+                            branch,
+                            &c.entity,
+                            &c.field,
+                            "concurrent revisions",
+                            vec![a.clone(), b.clone()],
+                            bases,
+                        ));
+                    }
+                }
+            }
+        }
+        p.heads.insert(key, heads);
+    }
+    // The entries of `E`'s entities, from their registers, as `project`
+    // builds them (register key order: alive, basic, content, kind, location).
+    let entities: BTreeSet<&str> = e.changes.iter().map(|c| c.entity.as_str()).collect();
+    for &entity in &entities {
+        let mut entry = Entry {
+            id: entity.into(),
+            ..Default::default()
+        };
+        for field in ["alive", "basic", "content", "kind", "location"] {
+            let Some(winner) = p.heads.get(&register(entity, field)).and_then(|h| h.last()) else {
+                continue;
+            };
+            entry
+                .revisions
+                .insert(field.into(), winner.revision.clone());
+            if field != "basic" {
+                entry.modified_ms = entry.modified_ms.max(winner.created_ms);
+            }
+            match field {
+                "kind" => {
+                    entry.kind = winner.value.as_str().unwrap().into();
+                    entry.created_ms = winner.created_ms;
+                }
+                "location" => {
+                    entry.parent = winner.value["parent"].as_str().unwrap().into();
+                    entry.name = winner.value["name"].as_str().unwrap().into();
+                }
+                "alive" => entry.alive = winner.value.as_bool().unwrap(),
+                "content" => entry.content = winner.value.as_str().map(str::to_owned),
+                _ => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
+            }
+        }
+        p.entries.insert(entity.into(), entry);
+    }
+    // Every entry's register presence, then the namespace passes again.
+    let presence: Vec<(String, bool)> = p
+        .entries
+        .keys()
+        .map(|id| {
+            let alive = p
+                .heads
+                .get(&register(id, "alive"))
+                .and_then(|h| h.last())
+                .is_some_and(|v| v.value.as_bool().unwrap());
+            (id.clone(), alive)
+        })
+        .collect();
+    for (id, alive) in presence {
+        p.entries.get_mut(&id).unwrap().alive = alive;
+    }
+    namespace_pass(branch, &mut p)?;
+    let mut changed: BTreeSet<String> = entities.iter().map(|&e| e.to_owned()).collect();
+    for (id, entry) in &p.entries {
+        if alive_before.get(id) != Some(&entry.alive) {
+            changed.insert(id.clone());
+        }
+    }
+    let after: Vec<&Conflict> = p.conflicts.iter().filter(|c| replaced(c)).collect();
+    let mut before: Vec<&Conflict> = before.iter().collect();
+    before.sort_by(|a, b| a.id.cmp(&b.id));
+    let lists = before != after;
+    Ok(Some(Appended {
+        projection: p,
+        changed,
+        lists,
+    }))
 }
 
 /// The visible-namespace passes of `project`: slot collisions (the
@@ -8397,6 +8648,82 @@ mod tests {
             appended > 200 && fallbacks > 0,
             "{appended} appended, {fallbacks} fallbacks"
         );
+    }
+
+    /// WP5.1: `project_append` from the projection of every prefix equals
+    /// `project` of the prefix plus the next event (or declines), and its
+    /// `changed` set and `lists` flag cover every difference from the base,
+    /// on the four history generators.
+    #[test]
+    fn project_append_equals_project_on_every_prefix() {
+        let (mut appended, mut declined) = (0, 0);
+        for seed in 0..160u64 {
+            let mut rng = StdRng::seed_from_u64(41_000 + seed);
+            let events = match seed % 4 {
+                0 => {
+                    let len = rng.gen_range(4..=16);
+                    history(&mut rng, len)
+                }
+                1 => {
+                    let len = rng.gen_range(8..=24);
+                    device_history(&mut rng, len)
+                }
+                2 => {
+                    let len = rng.gen_range(8..=20);
+                    device_history_with(&mut rng, len, true)
+                }
+                _ => {
+                    let len = rng.gen_range(20..=48);
+                    storm_history(&mut rng, len, 4, 2, 0.3)
+                }
+            };
+            for k in 1..events.len() {
+                let (old, new) = (&events[..k], &events[..=k]);
+                let Ok(base) = project(BRANCH, old) else {
+                    continue;
+                };
+                let full = project(BRANCH, new);
+                match project_append(BRANCH, base.clone(), new, k) {
+                    Ok(None) => declined += 1,
+                    Ok(Some(appended_projection)) => {
+                        let full = full.unwrap_or_else(|e| {
+                            panic!("seed {seed} k {k}: project refused ({e:#}), append accepted")
+                        });
+                        let Appended {
+                            projection,
+                            changed,
+                            lists,
+                        } = appended_projection;
+                        assert_eq!(projection, full, "seed {seed} k {k}");
+                        for (id, entry) in &full.entries {
+                            if base.entries.get(id) != Some(entry) {
+                                assert!(changed.contains(id), "seed {seed} k {k}: entry {id}");
+                            }
+                        }
+                        for (key, heads) in &full.heads {
+                            if base.heads.get(key) != Some(heads) {
+                                let entity = key.rsplit_once('/').unwrap().0;
+                                assert!(changed.contains(entity), "seed {seed} k {k}: {key}");
+                            }
+                        }
+                        assert_eq!(
+                            lists,
+                            base.conflicts != full.conflicts || base.pending != full.pending,
+                            "seed {seed} k {k}: lists"
+                        );
+                        appended += 1;
+                    }
+                    Err(error) => assert!(
+                        full.as_ref()
+                            .is_err_and(|full| format!("{full:#}") == format!("{error:#}")),
+                        "seed {seed} k {k}: append refused ({error:#}), project {:?}",
+                        full.as_ref().err()
+                    ),
+                }
+            }
+        }
+        println!("{appended} appended, {declined} declined");
+        assert!(appended > 1500, "{appended} appended, {declined} declined");
     }
 
     /// The rows a commit leaves: `stored` upserted with `derived` (the last
