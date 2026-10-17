@@ -99,58 +99,77 @@ CARGO_TARGET_DIR=$HOME/tkfs-target/qual bash scripts/qualify.sh --wave 3   # Lin
 ### Floors and the latest measurements
 
 Release build, Windows 11, AMD Ryzen 9 7950X3D (16 cores, 128 GB), a shared
-development machine. Measured on 2026-10-16 for the Wave 3 integration
-(`test-evidence/qualification-wave-3.json`: 77 scenarios, 76 passed, 1 skipped
-— SIGTERM has no Windows equivalent — and 41 of 41 floors held). The
-baseline column is the previous release (`6298d0b`).
+development machine (no other build running at the start). Measured on
+2026-10-17 by the final integration (`test-evidence/qualification-all.json`,
+`qualify.ps1 -All -Priority Normal` at `27802c3`: 91 scenarios, 90 passed,
+1 skipped — SIGTERM has no Windows equivalent — and 54 of 54 floors held;
+scenario data on a SATA SSD, `TMP` on `F:`, as WP4.2's run). The baseline
+column is the previous release (`6298d0b`); `test-evidence/qualification-final.json`
+holds the §15 before/after table with the Linux numbers too.
 
 | Floor | Scenario | Baseline | Floor | Measured |
 |---|---|---|---|---|
-| Remote linear create, per event, 2K / 10K | `qual_wp1_6_activation` | 15.9 s @2K | ≤ 5 ms | 0.91 / 0.88 ms |
-| Local create after a resolved conflict (p90) | `qual_wp1_6_activation` | 4.2 s | ≤ 10 ms | 2.2 ms |
-| Two-way backlog, per event, 2K / 6.4K | `qual_wp1_7_derive` | 15.9 s / 218 s | ≤ 100 / 300 ms | 62 / 237 ms |
-| 50 concurrent namespace ops on 5K history (max) | `qual_wp1_7_derive` | seconds to minutes | ≤ 500 ms | 412 ms |
-| Restart to Ready at 20K objects | `qual_wp1_8_objects` | full re-hash | ≤ 3 s | 1.6 s |
-| `content_status` at 50K objects | `qual_wp1_8_objects` | 6.5 s | < 50 ms | 0.07 ms |
+| Remote linear create, per event, 2K / 10K | `qual_wp1_6_activation` | 15.9 s @2K | ≤ 5 ms | 0.63 / 0.90 ms |
+| Local create after a resolved conflict (p90) | `qual_wp1_6_activation` | 4.2 s | ≤ 10 ms | 1.2 ms |
+| Two-way backlog, per event, 2K / 6.4K | `qual_wp1_7_derive` | 15.9 s / 218 s | ≤ 100 / 300 ms | 35 / 132 ms |
+| 50 concurrent namespace ops on 5K history (max) | `qual_wp1_7_derive` | seconds to minutes | ≤ 500 ms | 229 ms |
+| Restart to Ready at 20K objects | `qual_wp1_8_objects` | full re-hash | ≤ 3 s | 0.95 s |
+| `content_status` at 50K objects | `qual_wp1_8_objects` | 6.5 s | < 50 ms | 0.06 ms |
 | 12K tiny pending objects complete | `qual_wp1_8_objects` | page cliff | completes | completes |
 | Worker `watch` latency | `qual_wp1_4_worker` | no `watch` op | ≤ 1.5 s | 1.0 s |
-| Fast call behind a slow one (p99) / control under 30 MiB queued | `qual_wp1_9_session` | head-of-line blocking | < 50 ms | 0.3 / 4.3 ms |
-| Session loopback throughput | `qual_wp1_9_session` | JSON+hex request/response | ≥ 300 MiB/s | 2,406 MiB/s |
-| Healthy repo beside a hung one (legacy lanes) | `qual_wp1_12_legacy` | lane-wide resets, 30 s backoff | ≤ 45 s | 0.9 s |
+| Fast call behind a slow one (p99) / control under 30 MiB queued | `qual_wp1_9_session` | head-of-line blocking | < 50 ms | 0.2 / 2.2 ms |
+| Session loopback throughput | `qual_wp1_9_session` | JSON+hex request/response | ≥ 300 MiB/s | 2,732 MiB/s |
+| Healthy repo beside a hung one (legacy lanes) | `qual_wp1_12_legacy` | lane-wide resets, 30 s backoff | ≤ 45 s | 0.7 s |
 | Reconnects at `sync_interval_ms = 20000` over 60 s (legacy, v3) | `qual_wp1_12_legacy`, `qual_wp3_1_transport` | every idle cycle | 0 | 0 / 0 |
 | Restarts of a crashing worker in 20 s | `qual_wp1_12_legacy` | every 2 s | ≤ 5 | 5 |
-| Management API p99 under lifecycle churn | `qual_wp2_1_lifecycle` | 23–41 s | < 100 ms | 3.1 ms |
-| Status subscription latency | `qual_wp2_1_lifecycle` | 5 s poll | ≤ 1 s | 76 ms |
-| Shutdown with a busy folder | `qual_wp2_1_lifecycle` | aborts on the first busy folder | ≤ 30 s | 0.49 s |
-| File-system op p99 during a 2K catch-up | `qual_wp2_3_worker` | seconds | < 50 ms | 16 ms |
-| Status p99 during activation | `qual_wp2_3_worker` | blanked | < 20 ms | 3.4 ms |
-| Ready with 5K staged events | `qual_wp2_3_worker` | unbounded startup drain | < 3 s | 0.28 s |
-| Engine-lock hold for a slow event at 2K | `qual_wp2_4_offlock` | full replay | < 50 ms | 16 ms |
+| Management API p99 under lifecycle churn (lifecycle / scale) | `qual_wp2_1_lifecycle`, `qual_scale` | 23–41 s | < 100 ms | 1.3 / 2.0 ms |
+| Status subscription latency | `qual_wp2_1_lifecycle` | 5 s poll | ≤ 1 s | 26 ms |
+| Shutdown with a busy folder | `qual_wp2_1_lifecycle` | aborts on the first busy folder | ≤ 30 s | 0.39 s |
+| File-system op p99 during a 2K catch-up | `qual_wp2_3_worker` | seconds | < 50 ms | 12 ms |
+| Status p99 during activation | `qual_wp2_3_worker` | blanked | < 20 ms | 7.5 ms |
+| Ready with 5K staged events | `qual_wp2_3_worker` | unbounded startup drain | < 3 s | 0.18 s |
+| Engine-lock hold for a slow event at 2K | `qual_wp2_4_offlock` | full replay | < 50 ms | 1.7 ms |
 | 150K-event feed / 8 MiB event | `qual_wp2_5_feed` | `INVENTORY_TOO_LARGE` / stall | completes | completes |
-| Idle exchange at 50K events (CPU per side / bytes) | `qual_wp2_5_feed` | 1.13 s / 251 KB @6.4K | ≤ 10 ms / 4 KiB | 3.1 ms / 1,621 B |
-| Extra delay of a healthy repo beside a hung one (v3) | `qual_wp3_1_transport` | 30 s backoff | < 2 s | 0.5 ms |
-| Worker to worker, 256 MiB object / 10K tiny objects | `qual_wp3_2_objects` | about 2 MiB/s / stop-and-wait pages | ≥ 100 MiB/s / ≥ 300/s | 108 MiB/s / 310/s |
-| 256 MiB object between daemons on loopback | `qual_wp3_int_e2e` | 2.0 MiB/s | ≥ 40 MiB/s | 109 MiB/s |
-| 1 GiB through a 100 Mbit/s, 50 ms RTT proxy | `qual_wp3_int_e2e` | not measured | ≥ 80 % of the link | 97.8 % |
-| 10K × 4 KiB files between daemons | `qual_wp3_int_e2e` | page cliff | ≥ 300 files/s | 315 files/s |
-| 10K-event catch-up between daemons | `qual_wp3_int_e2e` | hours | ≤ 60 s | 17.8 s |
-| Objects before activation | `qual_wp3_int_e2e` | 0-byte bulk rounds | ≥ 1 | 60 |
+| Idle exchange at 50K events (CPU per side / bytes) | `qual_wp2_5_feed` | 1.13 s / 251 KB @6.4K | ≤ 10 ms / 4 KiB | 0.8 ms / 1,621 B |
+| Extra delay of a healthy repo beside a hung one (v3) | `qual_wp3_1_transport` | 30 s backoff | < 2 s | 1.0 ms |
+| Worker to worker, 256 MiB object / 10K tiny objects | `qual_wp3_2_objects` | about 2 MiB/s / stop-and-wait pages | ≥ 100 MiB/s / ≥ 300/s | 120 MiB/s / 907/s |
+| 256 MiB object between daemons on loopback / 1 GiB object | `qual_wp3_int_e2e`, `qual_scale` | 2.0 MiB/s | ≥ 40 MiB/s | 108 / 115 MiB/s |
+| 1 GiB through a 100 Mbit/s, 50 ms RTT proxy | `qual_wp3_int_e2e` | not measured | ≥ 80 % of the link | 97.9 % |
+| 10K × 4 KiB files between daemons (e2e / scale) | `qual_wp3_int_e2e`, `qual_scale` | page cliff | ≥ 300 files/s | 771 / 770 files/s |
+| 10K-event catch-up between daemons | `qual_wp3_int_e2e` | hours | ≤ 60 s | 10.8 s |
+| Objects before activation | `qual_wp3_int_e2e` | 0-byte bulk rounds | ≥ 1 | 54 |
 | Mutual pairing, duplicate bytes | `qual_wp3_int_e2e` | up to 2× | ≤ 1.1× | 1.002× |
-| Two-way backlog between daemons | `qual_wp3_int_e2e` | slow path | ≤ 180 s | 2.4 s |
-| Idle exchange between daemons | `qual_wp3_int_e2e` | 251 KB @6.4K | ≤ 4 KiB | 2,695 B |
-| 150K-event feed / 8 MiB event between daemons | `qual_wp3_int_e2e` | stall | completes | completes (150K at 205 events/s) |
+| Two-way backlog between daemons | `qual_wp3_int_e2e` | slow path | ≤ 180 s | 3.7 s |
+| Idle exchange between daemons | `qual_wp3_int_e2e` | 251 KB @6.4K | ≤ 4 KiB | 1,913 B |
+| 150K-event feed / 8 MiB event between daemons | `qual_wp3_int_e2e` | stall | completes | completes |
+| Remote linear activation 2K / 6.4K, two-way backlog (daemons) | `qual_scale` | 15.9 s / 218 s | ≤ 5 / 5 / 100 ms | 0.86 / 1.04 / 1.9 ms |
+| Startup to Ready at 50K objects | `qual_scale` | minutes | < 10 s | 2.6 s |
+| Idle worker CPU (5K events, 10K objects) | `qual_scale` | 4 sweeps + 2 parses per 500 ms per lane × repo | ≤ 1 % | 0.52 % |
+| Bytes written by seals in a 150K catch-up / longest seal | `qual_wp4_4_seal` | 14 GB / 2.9 s per seal | ≥ 10× less / < 50 ms | 72× / 8.6 ms |
+| Seal after a 150K-commit gap on another branch | `qual_wp4_4_seal` | 355 ms | < 50 ms | 0.30 ms |
+| Restart at 50K entries, rows against inline layout | `qual_wp4_4_seal` | 1.0 | ≤ 1.15 | 1.006 |
 
-The Wave 4 floors (`qual_scale`: startup to Ready at 50K objects < 10 s, idle
-worker CPU ≤ 1 %, management API p99 under churn, 1 GiB object, 10K tiny
-files, 150K feed, remote linear and two-way activation) are defined in
-`tests/qualification-floors.json` and enforced by `qualify.ps1 -All`; their
-measurements are recorded in `test-evidence/qualification-all.json` and are
-added to this table with the final integration's run.
+The Linux subset (`qualify.sh --all` in WSL 2, Ubuntu, kernel 6.18,
+scenario data on the image's ext4, `test-evidence/qualification-all-linux.json`,
+at `2a7d96b` with `qual_wp1_9_session` re-run at `2e62858`): 92 scenarios,
+91 passed, 1 skipped (the 6298d0b upgrade needs a Linux baseline binary);
+52 of 54 floors held, every enforced one. The two misses are the
+Windows-only tiny-file floors (219 and 196 files/s; WSL's ext4 image runs a
+bare create/write/fsync/rename loop at about 140/s), recorded and not
+enforced there. Linux measured, among others: idle worker CPU 0.37 %,
+startup at 50K objects 2.2 s, the 10K catch-up 12.9 s, the longest seal
+16.9 ms, 1 GiB through the 50 ms proxy at 97.9 % of the link.
 
-Floors bound by fsync latency (tiny files, the 256 MiB worker transfer) and by
-single slow operations (`fs_p99_during_catchup`, `concurrent_namespace_ops_5k`)
-can miss on a busy machine; the WP3.INT notes list every run of the day,
-including the misses.
+Floors bound by fsync latency (tiny files, the 256 MiB worker transfer, the
+catch-up) and by single slow operations (`fs_p99_during_catchup`,
+`concurrent_namespace_ops_5k`) depend on the disk and miss on a busy
+machine: a preliminary `-All` run of this integration with 25 release fuzz
+and crash processes running beside it measured 28 tiny objects/s, 263 files/s,
+a 72 s catch-up and a 74 ms FS p99 (five floors missed); the evidence above
+is the run on a quiet machine. On the NVMe system disk the tiny-file
+floors measured 310–315/s at Wave 3 and 180–280/s in WP4.5's runs, made
+while that disk was full (0–11 GB free); WP4.2's and this run kept scenario
+data on the SATA SSD (`F:`), where they hold with margin.
 
 ### Interoperability and upgrade checks
 
