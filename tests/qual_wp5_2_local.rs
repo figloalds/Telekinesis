@@ -463,7 +463,7 @@ fn fs_during_catch_up(name: &str, writes: bool) {
                 Err(std::io::Error::other("a saved file read back wrong"))
             }
         });
-        if round % 10 == 0 {
+        if round.is_multiple_of(10) {
             op("list", &mut || {
                 fs::read_dir(mount.join("base")).map(|d| {
                     let _ = d.count();
@@ -475,7 +475,7 @@ fn fs_during_catch_up(name: &str, writes: bool) {
             let bytes = seeded_bytes(round as u64, 1024 + (round * 4099) % (60 * 1024));
             let target = mount.join(&name);
             op("create_write_close", &mut || fs::write(&target, &bytes));
-            if round % 4 == 0 {
+            if round.is_multiple_of(4) {
                 let renamed = format!("work/r{round:05}.bin");
                 op("rename", &mut || fs::rename(&target, mount.join(&renamed)));
                 written.insert(renamed, bytes);
