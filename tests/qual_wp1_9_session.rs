@@ -84,6 +84,16 @@ fn peer() -> PeerInfo {
 
 /// A (client, server) session pair, optionally through a `FaultProxy`.
 fn session(tls: bool, proxied: bool, options: ConnOptions) -> (Conn, Conn, Option<FaultProxy>) {
+    session_with(tls, proxied, options, options)
+}
+
+/// [`session`] with the server's own options.
+fn session_with(
+    tls: bool,
+    proxied: bool,
+    options: ConnOptions,
+    server_options: ConnOptions,
+) -> (Conn, Conn, Option<FaultProxy>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let proxy = proxied.then(|| FaultProxy::start(&format!("127.0.0.1:{port}")));
@@ -91,7 +101,8 @@ fn session(tls: bool, proxied: bool, options: ConnOptions) -> (Conn, Conn, Optio
     let client = connect(proxy.as_ref().map_or(port, |p| p.addr().port()), tls);
     let client = Conn::from_established(client, Side::Client, peer(), options).unwrap();
     let server =
-        Conn::from_established(server.join().unwrap(), Side::Server, peer(), options).unwrap();
+        Conn::from_established(server.join().unwrap(), Side::Server, peer(), server_options)
+            .unwrap();
     (client, server, proxy)
 }
 
@@ -389,7 +400,16 @@ fn dead_peer_detection() {
         "session::Conn through a FaultProxy blackhole; heartbeat {:?}, dead after {:?}",
         options.heartbeat, options.dead_after
     ));
-    let (client, server, proxy) = session(false, true, options);
+    // The server declares the link dead later than the client (WP4.INT):
+    // with equal timers both sides close at about the same moment, and the
+    // proxy then hands the client the server's close as a reset, which
+    // reads `CONNECTION_LOST` instead of the client's own `TRANSPORT_DEAD`
+    // (1 run in 4 on WSL). The client's detection is what is measured.
+    let server_options = ConnOptions {
+        dead_after: options.dead_after * 3,
+        ..options
+    };
+    let (client, server, proxy) = session_with(false, true, options, server_options);
     let proxy = proxy.unwrap();
     server.serve(Arc::new(FnHandler(|req: Incoming| {
         while !req.responder.cancelled() {
