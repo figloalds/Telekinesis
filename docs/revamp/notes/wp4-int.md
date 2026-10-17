@@ -590,8 +590,8 @@ stashed `src/` of the commit before it; the failure text is quoted).
 | 1 | A fresh control or worker token is paired with a stale `orchestrator.json` / `runtime.json` and sent to a port another local process may hold (WP4.1 major; security minor C) | `install_control_token` removes the previous daemon's `orchestrator.json` (stale under `orchestrator.lock`) before writing the token; `start_rpc_server` removes the previous instance's `runtime.json` (under `owner.lock`) before writing `runtime.token`. `ControlClient` and `runtime::published_token` read the discovery, the token, then the discovery again, and present the token only when both reads name the same endpoint (a starting daemon or worker deletes the stale file before it writes its token and publishes its own after, so a read that finds the new token is followed by one that finds no file or the new one). The test harness's `Control` follows the same rule | `a1d118d` | `security::a_fresh_control_token_is_never_sent_to_a_stale_endpoint` ("the stale discovery is still there", the token reached the squatter), `security::a_restarted_daemon_never_sends_its_token_to_the_old_port` ("the live token reached the old port (12 tokens captured, 178 polls)"), `security::a_new_worker_instance_never_pairs_its_token_with_a_stale_address` ("the stale runtime.json is still there"; `worker_token(&stale)` returned the new token) |
 | 2 | The control endpoint counts unauthenticated connections toward its 64 slots and bounds the upgrade only by a renewable 15 s read timeout: 64 trickling connections lock the CLI and GUI out (security major) | The whole upgrade within `CONTROL_UPGRADE` (5 s, `ws::watchdog`); unauthenticated connections counted apart (`MAX_CONTROL_PREAUTH` = 32), the oldest closed to admit a new one | `30530a3` | `security::unauthenticated_control_connections_never_lock_the_client_out` (80 trickling connections: "32 of 32 management calls failed") |
 | 3 | The worker's listener spawns a thread per connection and holds it through a 5 s peek and a 15 s upgrade read before the token check (400 connections, 400 threads, then the accept-error exit) (security major) | The pre-auth phase (peek plus JSON RPC or loopback upgrade) within `UPGRADE_BUDGET` (5 s, a watchdog); at most `MAX_PREAUTH_CONNECTIONS` (32) at once, the oldest closed for a new one | `30530a3` | `security::unauthenticated_worker_connections_are_bounded_and_closed` (200 bare connections: "only 0 of 200 unauthenticated connections were closed at once") |
-| 4 | One pending save that cannot be restored makes the folder unstoppable and refuses its control requests for good, with a misleading `BUSY_VIEW: 0 open contexts, 0 unsaved files`; later records are never loaded (production major, RC11) | Each `pending_saves` record is restored on its own; one that fails is kept (`Engine.unrecovered`), reported through `Engine::reported_health` (`RECOVERY_REQUIRED: N unsaved files could not be restored (entity …)`: a degraded store), retried with the pending-save backoff (maintenance wakes for it), and never gates `quiet()`. A later save of the same entity supersedes it. New worker control ops `pending-saves` and `discard-pending-save{entity}`, CLI `tkfs pending-saves` / `tkfs discard-pending-save ENTITY` (`docs/CLI.md`), README runbook *Unsaved file that cannot be restored*. `quiet()` names only the health message when nothing else blocks it (the existing texts with open or unsaved files are unchanged) | `c6d159c` | `pending_saves::an_unrestorable_pending_save_degrades_the_store_and_blocks_nothing` (the review's reproduction; before the fix `quiet()` failed with "BUSY_VIEW: 0 open contexts, 0 unsaved files; RECOVERY_REQUIRED: … (os error 2)"), `…a_worker_with_an_unrestorable_pending_save_stops_gracefully`, `…a_pending_save_unreadable_at_startup_is_restored_by_a_retry`, `…a_later_save_of_the_same_file_supersedes_an_unrestored_record` |
-| 5 | Force stop kills the worker 15 s + 10 s after it was sent whatever it does: a save holding the engine longer loses every unsaved session the stop's retain waits for (production major, invariant 8) | While a force stop waits for the exit and the last heartbeat (fresh) reports an engine hold in progress that is not stalled, the exit wait starts again, for at most `FORCE_STOP_ENGINE_PATIENCE` (the 120 s stall bound) after the stop began; checked on every heartbeat and at the deadline. A stalled or silent worker is killed as before | `b559a3c` | `folder_controller::force_stop_waits_for_a_busy_engine_instead_of_killing` ("killed behind a busy engine": `kill:1000` right after the exit wait), `folder_controller::force_stop_kills_a_stalled_or_endlessly_busy_engine` ("killed after 1s of a busy engine") |
+| 4 | One pending save that cannot be restored makes the folder unstoppable and refuses its control requests for good, with a misleading `BUSY_VIEW: 0 open contexts, 0 unsaved files`; later records are never loaded (production major, RC11) | Each `pending_saves` record is restored on its own; one that fails is kept (`Engine.unrecovered`), reported through `Engine::reported_health` (`RECOVERY_REQUIRED: N unsaved files could not be restored (entity …)`: a degraded store), retried with the pending-save backoff (maintenance wakes for it), and never gates `quiet()`. A later save of the same entity supersedes it (corrected by the confirmation review: only on the same branch; a checkout waits for it, *Confirmation review* fix 2). New worker control ops `pending-saves` and `discard-pending-save{entity}`, CLI `tkfs pending-saves` / `tkfs discard-pending-save ENTITY` (`docs/CLI.md`), README runbook *Unsaved file that cannot be restored*. `quiet()` names only the health message when nothing else blocks it (the existing texts with open or unsaved files are unchanged) | `c6d159c` | `pending_saves::an_unrestorable_pending_save_degrades_the_store_and_blocks_nothing` (the review's reproduction; before the fix `quiet()` failed with "BUSY_VIEW: 0 open contexts, 0 unsaved files; RECOVERY_REQUIRED: … (os error 2)"), `…a_worker_with_an_unrestorable_pending_save_stops_gracefully`, `…a_pending_save_unreadable_at_startup_is_restored_by_a_retry`, `…a_later_save_of_the_same_file_supersedes_an_unrestored_record` |
+| 5 | Force stop kills the worker 15 s + 10 s after it was sent whatever it does: a save holding the engine longer loses every unsaved session the stop's retain waits for (production major, invariant 8) | While a force stop waits for the exit and the last heartbeat (fresh) reports an engine hold in progress that is not stalled, the exit wait starts again, for at most `FORCE_STOP_ENGINE_PATIENCE` (the 120 s stall bound) after the stop began (corrected by the confirmation review: after the force stop, *Confirmation review* fix 1); checked on every heartbeat and at the deadline. A stalled or silent worker is killed as before | `b559a3c` | `folder_controller::force_stop_waits_for_a_busy_engine_instead_of_killing` ("killed behind a busy engine": `kill:1000` right after the exit wait), `folder_controller::force_stop_kills_a_stalled_or_endlessly_busy_engine` ("killed after 1s of a busy engine") |
 | 6 | One unresolved conflict anywhere on a branch sends every create, rename and delete to the O(history) slow path, local ones included, inline under the engine lock (production major, RC1) | With fast paths on, the creation and namespace successors refuse only when a conflict of the current projection touches what the event changes (`commit::conflicts_touch`: an entity it changes, a parent it leaves or enters, a slot it leaves or takes, named by the conflict or by one of its alternatives' locations); the argument is in `commit.rs`'s module docs. A location in a touched parent counts only in a touched slot (`34588a8`: the first version refused on any alternative located in a touched parent, so one name collision in a directory still slowed every operation in it). `TKFS_REMOTE_FASTPATH=0` keeps the previous gate. New floor `local_namespace_beside_unresolved_conflict_10k` | `7ad3c59`, `34588a8`, `dba6702`, `3809f19` | `scoped_conflict_gate::namespace_operations_beside_an_unrelated_conflict_take_the_fast_path` (`(fast, slow)` `(0, 6)` instead of `(6, 0)`), `…that_touch_a_conflict_take_the_slow_path` (a create and a rename beside an open name collision in the same directory: `(0, 2)` with `7ad3c59`'s first gate, `(2, 0)` now; operations on the conflicted entries stay slow); every commit checked against a rebuild (strict oracle) on both replicas |
 | 7 | `peer.enroll` / `peer.revoke` compete with `meta.exchange` for exchange slots: an unpair's revoke is refused `BUSY` and only logged; a lane-0 enrollment refused `BUSY` waits for lane 0 to reconnect (WP4.1 minor) | Acceptor: both hold one of the session's `CREDENTIAL_SLOTS` (2), never an exchange slot. Dialer: a lane-0 `peer.revoke` that fails is sent again on a probe session within what is left of `REVOKE_BUDGET`; a lane-0 enrollment refused with a Contention or Transient code is retried on the same session after 1, 2, 4 and 8 s while it stays up | `fe7e70e` | `security::credential_requests_do_not_wait_for_exchange_slots` (with no exchange slot left: "BUSY: 0 exchanges are already running on this orchestrator") |
 | 8 | A revamp build before WP4.1 rotates the code and records the new generation and salt itself, so the open-time fold-in sees no salt change and the peer's inbound credential stays active past the rotation (security minor, invariant 21) | `credentials_generation` records the verifier generation the inbound credentials were reconciled with (set by every `bump_verifier_generation`); an open that finds the generation moved revokes them | `fe7e70e` | `security::a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open` ("the credential enrolled before the other build's rotation is still active") |
@@ -628,10 +628,15 @@ upgrades of unauthenticated clients, now bounded at 5 s).
    own records are the only ones a successor's commit could change, and the
    gate refuses when one of them touches the event. The kill switch keeps the
    old gate (no conflict in the projection and no conflict row).
-4. **Unrestorable pending saves gate nothing**, also not a checkout: a
-   record of another branch is kept and restored when that branch is active
-   again (it was `RECOVERY_BRANCH_MISMATCH` for good). A later save of the
-   same file supersedes the record (one row per entity).
+4. **Unrestorable pending saves gate nothing but a checkout.** As first
+   written here they gated nothing, also not a checkout, and a later save
+   of the same file superseded the record whatever its branch: the
+   confirmation review showed that this loses the first branch's unsaved
+   bytes (one row per entity). Corrected (*Confirmation review*, fix 2): a
+   checkout is refused while a record of the active branch is not
+   restored, a record of another branch (left by an earlier build) is never
+   superseded and is restored when that branch is checked out, and only a
+   save on the same branch supersedes a record.
 5. **`worker.log` is bounded by copy and truncate** in the worker, not by the
    launcher's rename: the worker's stderr and the daemon's stdout copy are
    append handles opened elsewhere, which a rename would leave writing to
@@ -733,7 +738,9 @@ Per binary (Windows, new or changed by the re-review): `security` 28,
   upgrades can still close that client's upgrade (deviation 1).
 - **A save that holds the engine for more than 120 s** (a file of many GiB on
   a slow disk) still loses its force stop's unsaved sessions: the controller
-  waits only as long as the worker does not call its engine stalled.
+  waits only as long as the worker does not call its engine stalled (counted
+  from the force stop since the confirmation review; the off-lock save that
+  would remove the long hold is deferred, CCR-WP4.INT-5).
 - **The dialer-side `peer.revoke` fallback and the enrollment retry** (fix 7)
   have no test of their own: the acceptor fix removes the `BUSY` they recover
   from, and an older acceptor (a WP4.1 build) is internal.
@@ -778,4 +785,108 @@ Per binary (Windows, new or changed by the re-review): `security` 28,
 | `dba6702` | commit.rs module docs follow the refined gate |
 | `f35d2e3` | server.rs docs: serve's description back on serve |
 | `29c1205` | the 10K floor samples 100 creates; its ignore names the file's owner |
-| (this commit) | notes: post-integration re-review |
+| `8c4c03e` | notes: post-integration re-review |
+
+## Confirmation review (re-review fix 2)
+
+The confirmation review of the fixes above (`a1d118d`..`8c4c03e`) confirmed
+fixes 1–4 and 6–13 and found two blockers in them and one minor left from the
+earlier reviews. Both blockers are fixed below. The minor's remainder is
+deferred, and this package records that decision explicitly (fix 3).
+
+### Fixes
+
+| # | Finding (severity) | Fix | Commit | Regression test (failure before the fix) |
+|---|---|---|---|---|
+| 1 | `FORCE_STOP_ENGINE_PATIENCE` was measured from `StopPlan::since_ms`, the first graceful Stop. A ForceStop of a folder that was `StopBlocked` (open files) for 120 s or more reused that plan. That ForceStop is the README's remedy for *Stop blocked*. The worker was then killed at the first exit wait, while a fresh heartbeat reported a busy, non-stalled engine, and the unsaved sessions the stop's retain was waiting for were lost (blocker, invariant 8) | `StopPlan::force_since_ms` records when `force` first became true: in `stop_worker`, in `send_stop`, or in a plan created forced. `kill_then` carries it over. The patience runs from it. README (*Stop blocked*) and ARCHITECTURE (*Stop ladder*) say that the bound counts from the force stop | `dfcc953` | `folder_controller::force_stop_after_a_long_blocked_stop_still_waits_for_a_busy_engine`. The flow is the review's: graceful Stop blocked for 130 s, busy heartbeat, ForceStop, 20 s of busy steps, then the bound measured from the ForceStop. Before the fix: "killed behind a busy engine 500ms after the force stop's exit wait began", `kill:1000` |
+| 2 | Since `c6d159c`, an unrestored pending save no longer gated `quiet()`, so a checkout to another branch was allowed. The retry then kept the record (`RECOVERY_BRANCH_MISMATCH`), and a save of the same entity on the new branch superseded it: `flush_entity` deleted the row and `forget_unrecovered` removed the staging file, and a force-stop retain overwrote the row through `ON CONFLICT`. The first branch's unsaved bytes were gone (blocker, invariant 8). README and deviation 4 claimed the opposite | `pending_saves` keeps one row per entity: it is a positional table (§9), so its key cannot become `(entity, branch)`. Instead: (a) `Engine::checkout_allowed` refuses a checkout (`RECOVERY_REQUIRED: checkout refused …`) while a record that could belong to the active branch is not restored. `Engine::control`'s `checkout` checks it, and the WinFsp and FUSE checkouts check it before the mount stops. A restored record is a dirty session, which `quiet()` refuses already. The record is first retried, or discarded by the user. (b) A record of another branch, which only an earlier build can leave, is never superseded. `flush_entity` commits a save of the same entity without touching it. `retain_pending` refuses to overwrite it. A writable open of the entity on this branch is refused (`ACCESS_DENIED`) until that branch is checked out (which restores the record) or the record is discarded. Such a record is not retried while its branch is inactive, and a checkout makes every unrestored record due at once. The README runbook and error table, CLI (`checkout`, `pending-saves`), ARCHITECTURE (startup step 4) and deviation 4 are corrected | `d33651f` | `pending_saves::a_checkout_never_leaves_an_unrestored_save_of_its_branch_behind`: the review's reproduction (main's 300 KiB unsaved file with its staging file held at startup; the checkout is refused; once the scanner lets go the save is restored and committed on main; then a checkout, a save on `other` and a checkout back leave main's bytes intact). Before the fix: the checkout was allowed (`unwrap_err` on `Ok`), the step that led to the review's "main's unsaved file is lost". `…a_discarded_unrestorable_save_no_longer_blocks_a_checkout` (before: the checkout was allowed). `…a_pending_save_of_another_branch_is_never_superseded`: a record of `other` left by an earlier build's checkout. The writable open is refused. A session written anyway commits on main, and its retain fails, both without touching the record. A checkout of `other` restores and commits it there. Before: the writable open was allowed |
+| 3 | RC9 remainder (minor): saving a file still hashes and copies it under the engine lock, and so does the first write to a file above 256 KiB. This also bounds fix 1 (a hold over 120 s is a stalled engine) | **Deferred, decided by the integrator; the coordinator's ratification is pending.** §12 (*Scope cuts*) records the cut and its consequence for force stops. CCR-WP4.INT-5 stays open. Why it is not done in this round: the fix needs a snapshot of the session's staged bytes that later writes cannot tear. That means copy-on-write staging (a session written during its own save), a three-phase save (snapshot under the lock, store without it, commit with a base check) in both mount adapters' flush, cleanup, close and setattr paths, and a new failure mode (the base moved during the store). That is a redesign of the staging and save path at the end of the final wave, not a fix. The bound it leaves is measured: about 2 s per 256 MiB on the reference disk, so a single save reaches 120 s only for files above about 15 GiB (`MAX_CONTENT` is 16 GiB) on that disk, or for smaller files on a slow disk | `e503d41` | — (documented: plan §12, ARCHITECTURE's lock table, *Known limitations*) |
+
+### Deviations from the review's suggestions, and why
+
+1. **Blocker 2 uses the review's second option** (refuse the checkout), plus
+   the first option's rule "a save on one branch never supersedes another
+   branch's record". The first option's storage change (`pending_saves`
+   keyed by `(entity, branch)`, or a second record beside the first) is not
+   possible: `pending_saves` is a positional-INSERT table (§9: never ALTER),
+   and a 6298d0b build's retain writes it with `ON CONFLICT(entity)`, which
+   needs `entity` to stay the key. With the checkout refused, this build
+   never creates a record of an inactive branch. For a record an earlier
+   build left, refusing writable opens of its file on the other branches is
+   what keeps the one row free for it. The alternative was to fail the
+   current session's retain at a force stop, which would lose those bytes
+   instead.
+2. **A record that does not parse** counts as possibly the active branch's:
+   it blocks a checkout, and a later save of the same file supersedes it, as
+   before. It cannot be restored on any branch, and `discard-pending-save`
+   drops it.
+
+### CCRs
+
+- **CCR-WP4.INT-5** (open): unchanged request. The release ships without
+  it, and §12 records the cut (fix 3).
+- No other CCR filed. All the changes are in files this integration package
+  already changed, or are additive: `Engine::checkout_allowed` is a new
+  public method, and `StopPlan` is private.
+
+### Tests added (confirmation review)
+
+| Test | Covers |
+|---|---|
+| `folder_controller::force_stop_after_a_long_blocked_stop_still_waits_for_a_busy_engine` | fix 1 |
+| `pending_saves::a_checkout_never_leaves_an_unrestored_save_of_its_branch_behind` | fix 2 (a), the review's reproduction |
+| `pending_saves::a_discarded_unrestorable_save_no_longer_blocks_a_checkout` | fix 2 (a), the discard remedy |
+| `pending_saves::a_pending_save_of_another_branch_is_never_superseded` | fix 2 (b) |
+
+No existing assertion was changed.
+
+### VERIFY (confirmation review)
+
+Run in `C:/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int`,
+`CARGO_TARGET_DIR=C:/tkfs-target/wp4-int` (Windows 11), at `e503d41`. The
+notes commit after it changes only this file.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | clean (exit 0) |
+| `cargo build --all-targets` | ok (exit 0) |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` | **ok, exit 0: 74 test binaries, 1,084 passed, 0 failed, 124 ignored**. Before this round: 1,080 passed, 124 ignored; the difference is the 4 new tests. `folder_controller` 60, `pending_saves` 9 |
+| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp4-int`) | ok (exit 0) |
+| WSL: `cargo test --no-fail-fast` for `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle` (`fuse_linux.rs`'s checkout changed), `folder_controller`, `pending_saves`, `worker_concurrency`, `harness_selftest`, `security`, `logging` | **11 binaries: 302 passed, 0 failed, 2 ignored** (exit 0) |
+
+Each new test was also run against the source before its fix: the
+commit's `src/` files were replaced by `HEAD`'s and then restored. The
+failure texts are quoted under *Fixes*.
+
+### Known limitations (confirmation review)
+
+- **Off-lock saves are deferred** (fix 3, CCR-WP4.INT-5). A force stop
+  behind a save that holds the engine for more than 120 s still kills the
+  worker, and that kill loses the unsaved sessions being retained.
+- **A checkout waits for every unrestored save of its branch.** If a staging
+  file is gone for good, the user has to discard the record
+  (`tkfs discard-pending-save`) before switching branches. The error names
+  the entity and the command.
+- **A record left by an earlier build on another branch** makes its file
+  read-only on the other branches (access denied on a writable open) until
+  that branch is checked out or the record is discarded.
+- **Observations of the review that were not findings, unchanged:** a
+  daemon that cannot remove a previous daemon's `orchestrator.json` (for
+  example, a transient sharing violation) fails closed and stays
+  unmanageable until it is restarted. The enrollment retries (1, 2, 4 and
+  8 s) run on the shared peer-credentials thread, so a peer that refuses
+  with a Transient code delays other peers' enrollments.
+- **Not re-run after these fixes:** `qualify.ps1 -All`, `qualify.sh --all`,
+  the soak and the release oracles. These fixes touch no derivation, feed,
+  object or session code: they change the folder controller's stop ladder
+  and the engine's pending-save and checkout paths, which the suite covers.
+
+### Commits (confirmation review)
+
+| Commit | Subject |
+|---|---|
+| `dfcc953` | a force stop's patience runs from the force stop |
+| `d33651f` | a pending save is never lost to another branch |
+| `e503d41` | plan: the off-lock save is deferred (CCR-WP4.INT-5) |
+| (this commit) | notes: confirmation review |
