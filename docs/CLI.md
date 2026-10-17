@@ -280,9 +280,8 @@ tkfs manage unpair wss://files.example.com
 - `peers` prints the outbound peers and their lanes in the JSON shape of the
   previous release; it never shows a pairing code.
 - `remote-list ENDPOINT` lists the running folders a paired host publishes
-  (`repo`, `replica`, `branches`, `label`). The `label` of a running folder is
-  its repository id, not the name it has on that host: match the `repo` with
-  `manage list` (or `manage status --json`) there.
+  (`repo`, `replica`, `branches`, `label`). The `label` is the folder's name
+  on that host (it follows a rename there); the `repo` names the repository.
 - `receive ENDPOINT REPO LABEL` creates a local replica of that repository
   (a new device of it) and starts its worker. The folder syncs at once; its
   mount (at `--mount`, or `default_mount_directory/LABEL`) waits for the

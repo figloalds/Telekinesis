@@ -3414,12 +3414,9 @@ impl Controller {
                 self.published.entry = Some(entry.clone());
                 entry
             }
-            // Renamed while no worker serves it: the label follows the record.
-            Some(entry)
-                if entry.state == EntryState::Unavailable
-                    && self.running.is_none()
-                    && entry.label != self.record.label =>
-            {
+            // Renamed: the label follows the record, whether a worker serves
+            // the folder or not (CCR-WP4.3-2).
+            Some(entry) if entry.label != self.record.label => {
                 entry.label = self.record.label.clone();
                 entry.updated_at_ms = now_ms;
                 entry.clone()
@@ -3470,7 +3467,12 @@ impl Controller {
                 let entry = PublishedEntry {
                     repo: summary.repo,
                     replica: summary.replica,
-                    label: summary.label,
+                    // The folder's catalog label, as its `unavailable` entry
+                    // has (CCR-WP4.3-2, applied by WP4.INT): the worker does
+                    // not know it and names its repository id there (as the
+                    // previous release published), so peers read the id while
+                    // it ran and the label while it did not.
+                    label: self.record.label.clone(),
                     branches: summary.branches,
                     state: self.entry_state(),
                     tip: heartbeat

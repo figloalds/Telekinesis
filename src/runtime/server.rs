@@ -954,6 +954,9 @@ impl Core {
         Ok(json!(PublishedSummary {
             repo: self.ctx.repo.clone(),
             replica: self.ctx.device.clone(),
+            // The worker does not know its catalog label: its repository id,
+            // as the previous release published. The orchestrator publishes
+            // the catalog label instead (CCR-WP4.3-2).
             label: self.ctx.repo.clone(),
             branches,
             // The feed tip (WP2.5): shared events only, so the remote catalog

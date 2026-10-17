@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tkfs::{
+    core::Branch,
     model::{
         errors::{ErrorClass, ErrorWire},
         health::{EngineGauges, Generations, MountIntent, MountState, MountStatus},
@@ -555,9 +556,16 @@ impl FakeWorker {
                 Mode::Ok => Ok(serde_json::to_value(PublishedSummary {
                     repo: self.repo.clone(),
                     replica: self.device.clone(),
-                    // The label names the branches generation the summary saw.
-                    label: format!("fake-b{}", self.hb.lock().unwrap().branches),
-                    branches: Vec::new(),
+                    // Ignored: the controller publishes the catalog label
+                    // (CCR-WP4.3-2).
+                    label: format!("fake-label-{}", self.repo),
+                    // One branch, named after the branches generation the
+                    // summary saw (WP4.INT: the label named it before).
+                    branches: vec![Branch {
+                        id: "main".into(),
+                        name: format!("fake-b{}", self.hb.lock().unwrap().branches),
+                        shared: true,
+                    }],
                     tip: FeedTip::default(),
                     sync_generation: 1,
                 })
@@ -2936,6 +2944,14 @@ fn shutdown_racing_catalog_additions_reaches_every_controller() {
     }
 }
 
+/// The branches generation the fake worker's summary saw (its one branch).
+fn summary_seen(entry: &PublishedEntry) -> &str {
+    entry
+        .branches
+        .first()
+        .map_or("", |branch| branch.name.as_str())
+}
+
 #[test]
 fn published_entry_taken_before_the_first_heartbeat_is_refreshed_once() {
     // The summary on Ready precedes every heartbeat, so its branches
@@ -2953,7 +2969,7 @@ fn published_entry_taken_before_the_first_heartbeat_is_refreshed_once() {
             .entry("a")
             .is_some_and(|entry| entry.state == EntryState::Running)
     });
-    assert_eq!(env.published.entry("a").unwrap().label, "fake-b0");
+    assert_eq!(summary_seen(&env.published.entry("a").unwrap()), "fake-b0");
     assert_eq!(env.log.count("rpc:published-summary"), 1);
     let worker = env.worker("a");
     worker.hb.lock().unwrap().branches = 5;
@@ -2961,7 +2977,7 @@ fn published_entry_taken_before_the_first_heartbeat_is_refreshed_once() {
     wait_for("refreshed entry", || {
         env.published
             .entry("a")
-            .is_some_and(|e| e.label == "fake-b5")
+            .is_some_and(|e| summary_seen(&e) == "fake-b5")
     });
     env.wait_view("a", "heartbeats", |v| {
         v.heartbeat.as_ref().is_some_and(|hb| hb.seq >= 4)
@@ -3043,8 +3059,9 @@ fn published_summary_failure_marks_the_entry_unavailable_and_branch_changes_refr
 /// `unavailable`, built from its record (WP3.INT re-review 2): its peers keep
 /// the pair and wait for it, instead of reading the share as withdrawn ("Not
 /// shared with any peer") until it runs again. Its label follows the record
-/// while it is stopped; the worker's summary replaces it once it runs; only
-/// leaving the catalog removes it.
+/// while it is stopped; the worker's summary replaces it once it runs (with
+/// the record's label still, CCR-WP4.3-2); only leaving the catalog removes
+/// it.
 #[test]
 fn a_folder_stopped_at_start_is_published_unavailable() {
     let env = EnvBuilder::new()
@@ -3089,10 +3106,27 @@ fn a_folder_stopped_at_start_is_published_unavailable() {
         .request("a", FolderCmd::Start, Duration::from_secs(10))
         .unwrap();
     env.running("a");
+    // (Its label stays the catalog's, never the worker's repository id:
+    // CCR-WP4.3-2, applied by WP4.INT; this checked the fake's label.)
     wait_for("running entry a", || {
-        env.published
-            .entry("a")
-            .is_some_and(|entry| entry.state == EntryState::Running && entry.label == "fake-b0")
+        env.published.entry("a").is_some_and(|entry| {
+            entry.state == EntryState::Running
+                && summary_seen(&entry) == "fake-b0"
+                && entry.label == "renamed"
+        })
+    });
+    // Renamed while it runs: the entry follows too.
+    env.catalog.mutate(|snapshot| {
+        for folder in &mut snapshot.folders {
+            if folder.state == "a" {
+                folder.label = "renamed again".into();
+            }
+        }
+    });
+    wait_for("renamed running entry", || {
+        env.published.entry("a").is_some_and(|entry| {
+            entry.state == EntryState::Running && entry.label == "renamed again"
+        })
     });
     // Stopped again: unavailable, and kept.
     env.registry
