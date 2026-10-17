@@ -679,6 +679,12 @@ fn legacy_server() -> LegacyServer {
 /// and it cannot be interrupted (CCR-WP2.6-2). End-of-stream is forwarded
 /// both ways.
 fn slow_proxy(target: SocketAddr, delay: Duration) -> String {
+    delay_proxy(target, Duration::ZERO, delay)
+}
+
+/// A TCP proxy in front of `target` that holds every client-to-server chunk
+/// for `up` and every server-to-client chunk for `down`.
+fn delay_proxy(target: SocketAddr, up: Duration, down: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     thread::spawn(move || {
@@ -690,8 +696,8 @@ fn slow_proxy(target: SocketAddr, delay: Duration) -> String {
             let (Ok(client_out), Ok(server_in)) = (client.try_clone(), server.try_clone()) else {
                 continue;
             };
-            pump(client, server_in, Duration::ZERO);
-            pump(server, client_out, delay);
+            pump(client, server_in, up);
+            pump(server, client_out, down);
         }
     });
     endpoint
@@ -2467,9 +2473,9 @@ fn a_lost_peer_redials_on_one_cadence_and_is_back_within_a_spacing() {
     manager.shutdown(Duration::from_secs(5));
 }
 
-/// When one lane connects, its siblings in backoff dial at once instead of
-/// waiting for their own timers (eight lanes whose 3 s ±20 % timers would
-/// spread over more than a second).
+/// When one lane connects, its siblings backing off after a failed dial
+/// dial at once instead of waiting for their own timers (eight lanes whose
+/// 3 s ±20 % timers would spread over more than a second).
 #[test]
 fn lanes_in_backoff_redial_at_once_when_a_sibling_connects() {
     let node = local();
@@ -2577,4 +2583,73 @@ fn a_dial_into_a_silent_link_is_interrupted_when_a_sibling_connects() {
         last.duration_since(first)
     );
     manager.shutdown(Duration::from_secs(5));
+}
+
+/// A peer that closes every session as soon as it is established (a
+/// flapping acceptor: a lane runner that gives up on every session, a
+/// protocol-violation close), through a link with a real round trip. A
+/// lane's session then ends before a sibling's dial does, so lanes that
+/// woke each other on every connect would redial at one session per dial
+/// time for as long as the peer flaps (the WP5.3 review's blocker). Each
+/// lane keeps its own escalating backoff instead: no lane redials before
+/// the delay it declared after a session the peer ended, and the session
+/// rate decays.
+#[test]
+fn a_flapping_peer_keeps_escalating_over_a_slow_link() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    server.state.close_next.store(1_000_000, Ordering::SeqCst);
+    // Every chunk is held 30 ms each way (a 60 ms round trip).
+    let endpoint = delay_proxy(
+        server.addr,
+        Duration::from_millis(30),
+        Duration::from_millis(30),
+    );
+    node.add_peer(&endpoint, &code, SERVER, 4);
+    let options = PeerOptions {
+        lane_backoff_base: Duration::from_millis(200),
+        lane_backoff_cap: Duration::from_secs(5),
+        ..fast()
+    };
+    let start = Instant::now();
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    let established_at = |at: Duration| {
+        thread::sleep((start + at).saturating_duration_since(Instant::now()));
+        server.established()
+    };
+    let early = established_at(Duration::from_secs(3));
+    let before_late = established_at(Duration::from_secs(6));
+    let total = established_at(Duration::from_secs(9));
+    manager.shutdown(Duration::from_secs(5));
+    let late = total - before_late;
+    // Escalating (200 ms, 400 ms, … up to 5 s, ±20 %, plus a dial each
+    // time), each lane connects about four times in the first 3 s and once
+    // or twice from 6 s to 9 s; lanes waking each other connect at a
+    // constant rate (one session per dial time and lane pair).
+    assert!(early >= 4, "{early} sessions in the first 3 s");
+    assert!(
+        late * 2 < early,
+        "the session rate does not decay: {early} sessions in the first 3 s, {late} from 6 s to 9 s ({total} in all)"
+    );
+    for lane in 0..4 {
+        let events = node.recorder.lane(SERVER, lane);
+        for (index, (at, ms, state, _, until)) in events.iter().enumerate() {
+            // A backoff after a session (Ready before it), not after a dial.
+            if *state != LaneState::Backoff || index == 0 || events[index - 1].2 != LaneState::Ready
+            {
+                continue;
+            }
+            let delay = declared_delay(*ms, *until);
+            if let Some((next, ..)) = events[index + 1..]
+                .iter()
+                .find(|(_, _, state, _, _)| *state == LaneState::Dialing)
+            {
+                let waited = next.duration_since(*at).as_millis() as u64;
+                assert!(
+                    waited + 20 >= delay,
+                    "lane {lane}: redialed {waited} ms into the {delay} ms backoff after a session the peer closed"
+                );
+            }
+        }
+    }
 }

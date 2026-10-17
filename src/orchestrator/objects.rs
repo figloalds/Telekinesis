@@ -88,7 +88,8 @@
 //!    installed here resolves the errors every source had for it.
 //!
 //! 5. **Demand** (WP5.3): while the round is busy (pulls in flight or a
-//!    plan left), every [`DEMAND_POLL`] (500 ms) it asks our worker which of
+//!    plan left), every [`DEMAND_POLL`] (500 ms after the last probe ended)
+//!    it asks our worker which of
 //!    the lane's objects a reader waits for (`objects.demand`, read-only,
 //!    newest demand first). Those it planned move to the front of its plan,
 //!    so the next pull carries them; one it has not planned is asked of the
@@ -256,7 +257,7 @@ const BACKOFF_MAX: usize = 16 * 1024;
 const BACKOFF_KEEP: usize = BACKOFF_MAX / 4 * 3;
 /// How often a download round busy with other objects asks our worker which
 /// objects a reader waits for (`objects.demand`; WP5.3): those get the
-/// round's next pull.
+/// round's next pull. Counted from the end of the previous probe.
 pub const DEMAND_POLL: Duration = Duration::from_millis(500);
 /// Items of the want a busy round makes for demanded objects it has not
 /// planned (the worker lists demand first).
@@ -2896,8 +2897,12 @@ fn download_round(
                     && (in_flight > 0 || !state.plan.is_empty())
                     && probed.elapsed() >= lane.options.demand_poll
                 {
-                    probed = Instant::now();
                     promote_demand(lane, target, client, &route, &mut state);
+                    // From the probe's end: a slow answer (its deadline is
+                    // longer than the poll) never makes the round probe
+                    // back to back instead of pulling (the WP5.3 review's
+                    // minor).
+                    probed = Instant::now();
                 }
                 if !over && !state.plan.is_empty() && in_flight < lane.options.pulls.max(1) {
                     let issued =

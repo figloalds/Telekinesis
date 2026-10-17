@@ -157,6 +157,9 @@ struct Faults {
     busy_reads: usize,
     /// Every want call fails with this error (a store outage).
     fail_wants: Option<ErrorWire>,
+    /// Every `objects.release` sleeps this long first (WP5.3 review: a
+    /// reap still releasing when the lane's next session asks).
+    release_delay: Option<Duration>,
 }
 
 enum Held {
@@ -222,6 +225,8 @@ struct FakeWorker {
     write_calls: AtomicU64,
     want_calls: AtomicU64,
     demand_calls: AtomicU64,
+    /// `objects.release` calls begun (counted before `release_delay`).
+    release_calls: AtomicU64,
     /// Every read: (hash, offset, len).
     read_log: Mutex<Vec<(String, u64, u64)>>,
     /// Every write item: (session, hash, offset, len).
@@ -255,6 +260,7 @@ impl FakeWorker {
             write_calls: AtomicU64::new(0),
             want_calls: AtomicU64::new(0),
             demand_calls: AtomicU64::new(0),
+            release_calls: AtomicU64::new(0),
             read_log: Mutex::new(Vec::new()),
             write_log: Mutex::new(Vec::new()),
             want_log: Mutex::new(Vec::new()),
@@ -596,6 +602,11 @@ impl FakeWorker {
     fn op_release(&self, header: Value) -> Result<(Value, Vec<u8>), ErrorWire> {
         let header: ReleaseHeader = parse(header)?;
         self.route_check(&header.route)?;
+        self.release_calls.fetch_add(1, Ordering::SeqCst);
+        let delay = self.faults().release_delay;
+        if let Some(delay) = delay {
+            thread::sleep(delay);
+        }
         let mut released = Vec::new();
         {
             let mut state = self.state.lock().unwrap();
@@ -5214,6 +5225,90 @@ fn an_offer_whose_session_went_away_gives_up_its_leases() {
             .iter()
             .any(|(session, released)| *session == lease && released.contains(&hash))
     );
+}
+
+/// `objects.wants` on `conn` for lane [`LANE`]: the hashes offered.
+fn offered_on(conn: &Conn) -> Vec<String> {
+    let request = json!({
+        "repo": REPO,
+        "sender": REPLICA_A,
+        "receiver": REPLICA_B,
+        "lane": LANE,
+        "max_items": 8,
+        "max_bytes": MIB,
+    });
+    let reply = conn
+        .call(
+            "objects.wants",
+            request,
+            Vec::new(),
+            Priority::Control,
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    let offered: ObjectsWantsReply = if reply.body.is_empty() {
+        serde_json::from_value(reply.header).unwrap()
+    } else {
+        serde_json::from_slice(&reply.body).unwrap()
+    };
+    offered.items.into_iter().map(|item| item.hash).collect()
+}
+
+/// Lease ids are per dialer lane, so the lane's next session shares the
+/// dead one's. When that session asks (`objects.wants`) while the reaper is
+/// still giving up the dead session's offer, its want waits for the
+/// release: the release never ends the lease the new want takes (the WP5.3
+/// review's minor; without the wait the worker's want keeps the object as
+/// the lane's own, then the release ends that lease).
+#[test]
+fn a_reap_never_ends_the_lease_of_the_lanes_next_session() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let a = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let hash = sha(&content(5331, 1024));
+    b.worker.want(&hash, 1024);
+    let lease = objects::push_lease(&a.ctx.installation, LANE);
+    let first = a.dial(&b.endpoint, &b.code, LANE);
+    assert_eq!(offered_on(&first), vec![hash.clone()]);
+    assert_eq!(b.worker.lease_of(&hash), Some(lease.clone()));
+    // The worker's releases take 1.5 s; the session goes away before any
+    // push, and the reaper begins to give its offer up.
+    b.worker.faults().release_delay = Some(Duration::from_millis(1500));
+    let before = b.worker.release_calls.load(Ordering::SeqCst);
+    first.close();
+    assert!(
+        wait_until(
+            inbound_objects::OFFER_GRACE + Duration::from_secs(5),
+            || { b.worker.release_calls.load(Ordering::SeqCst) > before }
+        ),
+        "the reaper never gave the dead session's offer up"
+    );
+    // Inside that release, the lane comes back on a new session and asks.
+    let second = a.dial(&b.endpoint, &b.code, LANE);
+    assert_eq!(offered_on(&second), vec![hash.clone()]);
+    b.worker.faults().release_delay = None;
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            b.worker
+                .release_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(session, released)| *session == lease && released.contains(&hash))
+        }),
+        "the reaper's release did not end the dead session's lease"
+    );
+    // The new session's offer stands: its lease was taken after the release.
+    assert_eq!(
+        b.worker.lease_of(&hash),
+        Some(lease),
+        "the reap ended the lease the lane's next session was offered"
+    );
+    drop(second);
 }
 
 // ---------------------------------------------------------------------------
