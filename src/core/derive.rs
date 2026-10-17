@@ -155,6 +155,26 @@
 //! antichain's cut is projected once (up to `CUT_MEMO_BYTES` of retained
 //! records; past it, a recurring cut is projected again).
 //!
+//! ## The branch index (WP5.1)
+//!
+//! What append mode read from every event on every commit (event positions,
+//! entity numbers and namespace registers: `NsBase`; the cone graph:
+//! `GraphBase`; the location changes by slot and the precondition's facts:
+//! `Facts`) is a function of the branch's events alone, so the event cache
+//! keeps it per branch (`BranchIndex`, in `commit.rs`'s `EventCache`) and
+//! extends it as events join the cache (`BranchIndex::extend`: positions
+//! move, nothing is recomputed). A slow commit pushes its event onto it (the
+//! event is the last one, so everything it adds goes to the end of a row),
+//! derives, and pops it again (`BranchIndex::push`, `undo`); the appended
+//! projection (`project_append`) and the successor counts
+//! (`check_successor_cuts`) read it too. The indexed derivation is the
+//! scan's with those reads replaced (`derive_append_indexed`); a history the
+//! index does not cover (crafted ones: a comma in an entity id, a location
+//! value that is not a pair of strings, a name without a key, an event that
+//! names the new one) takes the scan. Under the commit checks every
+//! extension is compared with a fresh build, every indexed derivation with
+//! the scan's, and the popped index with the index before.
+//!
 //! ## Append-mode shortcuts (exact; full mode, the oracle's reference, keeps
 //! the plain computation)
 //!
@@ -485,7 +505,7 @@ pub(super) fn persist_projection(
         events,
         new_event,
         reviewed: &reviewed,
-        stored: None,
+        fresh: None,
         index: None,
     })?;
     write_projection(tx, branch, &out)
@@ -511,11 +531,12 @@ pub struct DeriveInput<'a> {
     /// The stored conflict rows (payloads) that the new event reviews, in
     /// its `reviewed` order; missing ones are skipped. Empty for a rebuild.
     pub reviewed: &'a [Conflict],
-    /// Ids of `projection`'s records that are stored with exactly that
-    /// payload already (WP5.1: a projection `project_append` made from the
-    /// stored one keeps them): append mode does not write them again. `None`:
+    /// WP5.1: the ids of `projection`'s records that may not be stored with
+    /// that payload (the records `project_append` added to the stored
+    /// projection it started from); every other record of the projection is
+    /// stored already, and append mode does not write it again. `None`:
     /// unknown, every record is written.
-    pub stored: Option<&'a BTreeSet<String>>,
+    pub fresh: Option<&'a BTreeSet<String>>,
     /// WP5.1: the branch's index of every event but the new one (the last of
     /// `events`), kept with the event cache (`BranchIndex`); `None`: append
     /// mode scans the events.
@@ -631,7 +652,7 @@ pub fn derive_conflicts(input: &DeriveInput) -> Result<DeriveOutput> {
         &DeriveInput {
             new_event: None,
             reviewed: &[],
-            stored: None,
+            fresh: None,
             index: None,
             ..*input
         },
@@ -807,7 +828,7 @@ fn derive_full(
             events,
             new_event,
             reviewed: &reviewed,
-            stored: None,
+            fresh: None,
             index: None,
         },
         new_event,
@@ -1536,7 +1557,7 @@ fn derive_append(
             events,
             new_event: Some(new_id),
             reviewed: &reviewed,
-            stored: None,
+            fresh: None,
             index: None,
         },
         new_id,
@@ -1788,26 +1809,35 @@ fn derive_append_core(input: &DeriveInput, new: usize, index: &BranchIndex) -> R
 }
 
 /// Append mode's first source, the current projection's records, without
-/// those stored with that payload already (`DeriveInput::stored`): writing
-/// them again would upsert an identical row (a later source that derives
-/// the same id is written after it anyway, the last record of an id being
-/// the one kept). Also the ids it skips, which the survival check reads.
+/// those stored with that payload already (all but `DeriveInput::fresh`):
+/// writing them again would upsert an identical row (a later source that
+/// derives the same id is written after it anyway, the last record of an id
+/// being the one kept). Also the ids it skips, sorted, which the survival
+/// check reads.
 fn projection_sources<'i>(input: &DeriveInput<'i>) -> (Vec<Conflict>, Vec<&'i str>) {
+    let Some(fresh) = input.fresh else {
+        return (input.projection.conflicts.clone(), vec![]);
+    };
     let mut kept = vec![];
     let mut skipped = vec![];
     for c in &input.projection.conflicts {
-        if input.stored.is_some_and(|stored| stored.contains(&c.id)) {
-            skipped.push(c.id.as_str());
-        } else {
+        if fresh.contains(&c.id) {
             kept.push(c.clone());
+        } else {
+            skipped.push(c.id.as_str());
         }
+    }
+    // A projection's list is sorted by id; sort only one that is not.
+    if !skipped.is_sorted() {
+        skipped.sort_unstable();
     }
     (kept, skipped)
 }
 
 /// The last step of append mode (`current_records_survive`): the records,
 /// or the fallback when a current namespace record does not survive.
-/// `skipped`: the ids of the projection's records left out of `conflicts`.
+/// `skipped`: the ids of the projection's records left out of `conflicts`
+/// (sorted).
 fn survive(
     ns: &NsContext,
     new: usize,
@@ -1816,8 +1846,8 @@ fn survive(
     skipped: &[&str],
 ) -> Plan {
     let survives = {
-        let mut derived: HashSet<&str> = conflicts.iter().map(|c| c.id.as_str()).collect();
-        derived.extend(skipped.iter().copied());
+        let listed: HashSet<&str> = conflicts.iter().map(|c| c.id.as_str()).collect();
+        let derived = |id: &str| listed.contains(id) || skipped.binary_search(&id).is_ok();
         // Nothing above can fail on accepted history; a failure here is left
         // to full mode, which raises or derives whatever the reference does.
         ns.current_records_survive(new, plan, &derived)
@@ -4669,7 +4699,7 @@ impl<'a> NsContext<'a> {
         &self,
         new: usize,
         plan: &AppendPlan,
-        derived: &HashSet<&str>,
+        derived: &dyn Fn(&str) -> bool,
     ) -> Result<bool> {
         if plan.members.is_empty() {
             return Ok(true);
@@ -4683,7 +4713,7 @@ impl<'a> NsContext<'a> {
         }
         let mut maximal: HashMap<Rc<[u32]>, HashSet<String>> = HashMap::default();
         for record in self.namespace_records(&plan.members, &relations, &old)? {
-            if derived.contains(record.id.as_str()) {
+            if derived(record.id.as_str()) {
                 continue;
             }
             let entity = record.entity.split(',').next().unwrap_or_default();
@@ -5366,9 +5396,11 @@ pub(super) struct Appended {
     pub(super) changed: BTreeSet<String>,
     /// Whether the conflict or pending list differs from the base's.
     pub(super) lists: bool,
-    /// The ids of the base's records the projection keeps unchanged (stored,
-    /// with that payload, by the induction hypothesis of the module docs).
-    pub(super) carried: BTreeSet<String>,
+    /// The ids of the records the projection added to the base's; every
+    /// other record of the projection is one of the base's, unchanged (so
+    /// stored with that payload, by the induction hypothesis of the module
+    /// docs).
+    pub(super) fresh: BTreeSet<String>,
     /// Per entity of `changed`, its visible placement (parent, name) in the
     /// base, `None` when it was not visible: with `projection`'s entries, the
     /// view slots move only there (`commit::patched_slots`).
@@ -5642,13 +5674,7 @@ pub(super) fn project_append(
     removed.sort_by(|a, b| a.id.cmp(&b.id));
     added.sort_by(|a, b| a.id.cmp(&b.id));
     let lists = removed != added;
-    let fresh: HashSet<&str> = added.iter().map(|c| c.id.as_str()).collect();
-    let carried = p
-        .conflicts
-        .iter()
-        .filter(|c| !fresh.contains(c.id.as_str()))
-        .map(|c| c.id.clone())
-        .collect();
+    let fresh = added.iter().map(|c| c.id.clone()).collect();
     // An entity outside `E`'s that changed changed presence only (the chain
     // pass flipped it, `namespace_delta`): it was visible exactly when it is
     // not now, at the same placement.
@@ -5670,7 +5696,7 @@ pub(super) fn project_append(
         projection: p,
         changed,
         lists,
-        carried,
+        fresh,
         placements,
     }))
 }
@@ -6898,7 +6924,7 @@ mod tests {
                     events,
                     new_event: Some(new_id),
                     reviewed: &reviewed,
-                    stored: None,
+                    fresh: None,
                     index: None,
                 },
                 new_id,
@@ -10099,7 +10125,7 @@ mod tests {
                         events: order,
                         new_event,
                         reviewed: &reviewed,
-                        stored: None,
+                        fresh: None,
                         index: None,
                     };
                     let current = derive_full_with(&input, new_event);
@@ -10127,7 +10153,7 @@ mod tests {
                 events: new,
                 new_event: Some(id),
                 reviewed: &[],
-                stored: None,
+                fresh: None,
                 index: None,
             };
             let current = plan_text(&derive_append_with(&input, id));
@@ -10356,7 +10382,13 @@ mod tests {
                 let Ok(p) = project(BRANCH, new) else {
                     continue;
                 };
-                let stored: BTreeSet<String> = p.conflicts.iter().map(|c| c.id.clone()).collect();
+                // Every other record counts as stored.
+                let fresh: BTreeSet<String> = p
+                    .conflicts
+                    .iter()
+                    .step_by(2)
+                    .map(|c| c.id.clone())
+                    .collect();
                 let cell: IndexCell = RefCell::new(Some(BranchIndex::build(old)));
                 let input = DeriveInput {
                     branch: BRANCH,
@@ -10364,7 +10396,7 @@ mod tests {
                     events: new,
                     new_event: Some(&new[k].id),
                     reviewed: &[],
-                    stored: (k % 2 == 0).then_some(&stored),
+                    fresh: (k % 2 == 0).then_some(&fresh),
                     index: Some(&cell),
                 };
                 let scan = derive_append_scan(&input, k);
@@ -10450,13 +10482,13 @@ mod tests {
                             &a.projection,
                             &a.changed,
                             a.lists,
-                            &a.carried,
+                            &a.fresh,
                             &a.placements
                         )) == b.as_ref().map(|b| (
                             &b.projection,
                             &b.changed,
                             b.lists,
-                            &b.carried,
+                            &b.fresh,
                             &b.placements
                         )),
                         "seed {seed} k {k}: indexed and scanned appends differ"
@@ -10476,7 +10508,7 @@ mod tests {
                             projection,
                             changed,
                             lists,
-                            carried,
+                            fresh,
                             placements,
                         } = appended_projection;
                         // The changed entities' visible placements in the base.
@@ -10493,13 +10525,15 @@ mod tests {
                                 .map(|e| (e.parent.clone(), e.name.clone()));
                             assert_eq!(before, &visible, "seed {seed} k {k}: placement of {id}");
                         }
-                        for id in &carried {
+                        for c in projection
+                            .conflicts
+                            .iter()
+                            .filter(|c| !fresh.contains(&c.id))
+                        {
                             assert!(
-                                base.conflicts
-                                    .iter()
-                                    .any(|c| &c.id == id
-                                        && projection.conflicts.iter().any(|d| d == c)),
-                                "seed {seed} k {k}: {id} carried but changed"
+                                base.conflicts.contains(c),
+                                "seed {seed} k {k}: {} not fresh but not the base's",
+                                c.id
                             );
                         }
                         assert_eq!(projection, full, "seed {seed} k {k}");
