@@ -323,6 +323,8 @@ pub(crate) struct Cache {
     /// Views dropped because a commit was rolled back around the store
     /// (tests).
     rolled_back_views: Cell<u64>,
+    /// The anchors this handle's seals wrote (WP5.1, `snapshot::AnchorCache`).
+    pub(super) anchors: snapshot::AnchorCache,
     /// Full loads of the view from the stored projection (tests; WP3.INT).
     view_loads: Cell<u64>,
 }
@@ -1263,6 +1265,8 @@ impl Store {
                             projection: known,
                             json: None,
                             changed: snapshot::Changed::Marked,
+                            anchors: Some(&self.caches.commit.anchors),
+                            lists_unchanged: true,
                         },
                     )?;
                     drop(cache);
@@ -1286,6 +1290,7 @@ impl Store {
                     }
                     Stored::Rewrite => snapshot::Changed::All,
                 };
+                let lists_unchanged = matches!(slow.stored, Stored::Delta { header: false, .. });
                 let report = derive::timed("w.seal_slow", || {
                     snapshot::seal(
                         &tx,
@@ -1295,6 +1300,8 @@ impl Store {
                             projection: Some(&slow.projection),
                             json: slow.json.as_deref(),
                             changed,
+                            anchors: Some(&self.caches.commit.anchors),
+                            lists_unchanged,
                         },
                     )
                 })?;
@@ -2320,6 +2327,8 @@ mod tests {
                         projection: Some(&projection),
                         json,
                         changed: snapshot::Changed::All,
+                        anchors: None,
+                        lists_unchanged: false,
                     },
                 )
                 .unwrap()
