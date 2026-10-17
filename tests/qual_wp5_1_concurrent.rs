@@ -223,13 +223,19 @@ mod storm {
             }
         }
 
-        /// Exchange until both replicas hold the same events.
+        /// Exchange until both replicas hold the same events, or until an
+        /// exchange adds no event to either (an event a replica refuses,
+        /// such as one past the competing-cut limit, stays out of it and is
+        /// offered again on every exchange).
         pub fn converge(&mut self) {
+            let mut held = (events(&self.a), events(&self.b));
             for _ in 0..8 {
                 let moved = self.sync(0) + self.sync(1);
-                if moved == 0 {
+                let now = (events(&self.a), events(&self.b));
+                if moved == 0 || now == held {
                     return;
                 }
+                held = now;
             }
             panic!("the storm replicas did not converge");
         }
