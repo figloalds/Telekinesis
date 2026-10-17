@@ -3,13 +3,16 @@
   "kind": "all",
   "platform": "linux",
   "wave": 4,
-  "generated_at": "2026-10-16T10:19:16-0300",
-  "duration_s": 3312,
+  "generated_at": "2026-10-17T06:28:27-0300",
+  "duration_s": 81,
   "git": {
-    "commit": "",
-    "branch": "",
-    "dirty": false,
-    "dirty_paths": []
+    "commit": "2e62858ce1bfffb057f4edf160d1021d4f89e978",
+    "branch": "revamp/wp4-int",
+    "dirty": true,
+    "dirty_paths": [
+      "M docs/VALIDATION.md",
+      " M test-evidence/qualification-all-linux.json"
+    ]
   },
   "toolchain": "rustc 1.88.0 (6b00bc388 2025-06-23)",
   "hardware": {
@@ -22,16 +25,16 @@
     "disks": [
       {
         "role": "temp",
-        "path": "/dev/shm/wp42-qual",
-        "free_gb": 31.3,
-        "size_gb": 31.3,
-        "device": "none",
-        "file_system": "tmpfs"
+        "path": "/home/figloalds/tkfs-qual-tmp/wp4-int",
+        "free_gb": 836.7,
+        "size_gb": 1006.9,
+        "device": "/dev/sdd",
+        "file_system": "ext4"
       },
       {
         "role": "target",
-        "path": "/home/figloalds/tkfs-target/wp4-2",
-        "free_gb": 842.0,
+        "path": "/home/figloalds/tkfs-target/wp4-int",
+        "free_gb": 836.7,
         "size_gb": 1006.9,
         "device": "/dev/sdd",
         "file_system": "ext4"
@@ -39,7 +42,7 @@
     ]
   },
   "load_at_start": {
-    "loadavg": "0.69 0.15 0.05 1/457 524",
+    "loadavg": "0.18 0.59 1.38 1/476 415",
     "build_processes": "0"
   },
   "settings": {
@@ -49,36 +52,33 @@
     "profile": "release"
   },
   "summary": {
-    "ok": false,
-    "scenarios": 87,
+    "ok": true,
+    "scenarios": 92,
     "by_status": {
-      "pass": 84,
-      "fail": 2,
+      "pass": 91,
       "skipped": 1
     },
-    "floors_evaluated": 50,
-    "floors_passed": 49,
-    "floors_failed": 1,
+    "floors_evaluated": 54,
+    "floors_passed": 52,
+    "floors_failed": 2,
     "floors_missing": 0,
     "floors_not_run": 0,
     "floors_incomplete": 0,
-    "enforced_failures": [
-      "scale_idle_worker_cpu"
-    ]
+    "enforced_failures": []
   },
   "files": [
     {
       "file": "qual_wp1_4_worker",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 16,
-      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.85s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_4_worker.log",
+      "duration_s": 5,
+      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.79s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp1_4_worker.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_4_worker::accept_loop_survives_faults",
           "status": "pass",
-          "elapsed_ms": 439,
+          "elapsed_ms": 539,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -93,7 +93,7 @@
         {
           "scenario": "qual_wp1_4_worker::mount_failure_keeps_worker_serving",
           "status": "pass",
-          "elapsed_ms": 14,
+          "elapsed_ms": 189,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -102,7 +102,7 @@
         {
           "scenario": "qual_wp1_4_worker::poison_exit_persists_dirty",
           "status": "pass",
-          "elapsed_ms": 35,
+          "elapsed_ms": 43,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -117,24 +117,24 @@
         {
           "scenario": "qual_wp1_4_worker::rpc_before_mount",
           "status": "pass",
-          "elapsed_ms": 117,
+          "elapsed_ms": 218,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "ready_ms",
-              "value": 5.028047,
+              "value": 31.471403000000002,
               "unit": "ms"
             },
             {
               "metric": "status_ms",
-              "value": 0.948758,
+              "value": 0.952321,
               "unit": "ms"
             },
             {
               "metric": "attach_ms",
-              "value": 2.434358,
+              "value": 8.49697,
               "unit": "ms"
             }
           ]
@@ -142,14 +142,14 @@
         {
           "scenario": "qual_wp1_4_worker::watch_latency",
           "status": "pass",
-          "elapsed_ms": 4167,
+          "elapsed_ms": 4353,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "watch_ms",
-              "value": 1008.3174100000001,
+              "value": 1034.276299,
               "unit": "ms"
             }
           ]
@@ -160,21 +160,21 @@
       "file": "qual_wp1_5_mount",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 2,
-      "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.74s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_5_mount.log",
+      "duration_s": 3,
+      "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp1_5_mount.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_5_mount::attach_detach_attach_same_pid",
           "status": "pass",
-          "elapsed_ms": 38,
+          "elapsed_ms": 218,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "reattach_ms",
-              "value": 1.9936099999999999,
+              "value": 2.294339,
               "unit": "ms"
             }
           ]
@@ -182,7 +182,7 @@
         {
           "scenario": "qual_wp1_5_mount::force_detach_persists_dirty",
           "status": "pass",
-          "elapsed_ms": 1028,
+          "elapsed_ms": 1224,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -191,10 +191,10 @@
         {
           "scenario": "qual_wp1_5_mount::foreign_mount_untouched",
           "status": "pass",
-          "elapsed_ms": 120,
+          "elapsed_ms": 206,
           "failures": [],
           "notes": [
-            "outcome: Ok(Object {\"address\": String(\"ws://127.0.0.1:33591\"), \"device\": String(\"e7a926cd-d6ae-4d5f-a225-b849911c756e\"), \"instance\": String(\"35b600f1-4e32-463a-88d0-9687dd497c23\"), \"ipc\": Number(3), \"mount_error\": Object {\"class\": String(\"needs_user_action\"), \"code\": String(\"MOUNT_PATH_MUST_NOT_EXIST\"), \"message\": String(\"MOUNT_PATH_MUST_NOT_EXIST: /dev/shm/wp42-qual/.tmp5sLWWU/foreign\")}, \"mounted\": Bool(false), \"pid\": Number(875), \"ready\": Bool(true), \"repo\": String(\"08b8af71-b966-43aa-9377-1df87d38b978\"), \"runtime\": String(\"/dev/shm/wp42-qual/.tmp5sLWWU/state/runtime.json\"), \"version\": String(\"0.1.0+3866e41f8b01\")})"
+            "outcome: Ok(Object {\"address\": String(\"ws://127.0.0.1:39771\"), \"device\": String(\"2c6e6bd2-f3a0-4273-bcb4-e955bd85522f\"), \"instance\": String(\"7ba6419f-07b1-4d37-ab3e-8341d51a11d1\"), \"ipc\": Number(3), \"mount_error\": Object {\"class\": String(\"needs_user_action\"), \"code\": String(\"MOUNT_PATH_MUST_NOT_EXIST\"), \"message\": String(\"MOUNT_PATH_MUST_NOT_EXIST: /home/figloalds/tkfs-qual-tmp/wp4-int/.tmpilnJfq/foreign\")}, \"mounted\": Bool(false), \"pid\": Number(3215), \"ready\": Bool(true), \"repo\": String(\"a31c331c-3054-497e-b57f-e9ab89cd56fe\"), \"runtime\": String(\"/home/figloalds/tkfs-qual-tmp/wp4-int/.tmpilnJfq/state/runtime.json\"), \"token\": String(\"df5b5bfffdbd23a67318084227d06134d50b661f2bc097a7113b47bb61f3017d\"), \"version\": String(\"0.1.0+8551dbd06c45\")})"
           ],
           "unsupported": [],
           "metrics": []
@@ -202,14 +202,14 @@
         {
           "scenario": "qual_wp1_5_mount::stale_owned_mount_recovered_after_crash",
           "status": "pass",
-          "elapsed_ms": 51,
+          "elapsed_ms": 297,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "recover_attach_ms",
-              "value": 5.208173,
+              "value": 11.794501,
               "unit": "ms"
             }
           ]
@@ -220,26 +220,26 @@
       "file": "qual_wp1_6_activation",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 10,
-      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.83s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_6_activation.log",
+      "duration_s": 13,
+      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.34s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp1_6_activation.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_6_activation::local_create_after_resolved_conflict",
           "status": "pass",
-          "elapsed_ms": 83,
+          "elapsed_ms": 124,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "p90_ms",
-              "value": 0.464013,
+              "value": 3.7456460000000003,
               "unit": "ms"
             },
             {
               "metric": "p50_ms",
-              "value": 0.303083,
+              "value": 3.12044,
               "unit": "ms"
             },
             {
@@ -252,14 +252,14 @@
         {
           "scenario": "qual_wp1_6_activation::quarantine_not_pending",
           "status": "pass",
-          "elapsed_ms": 125,
+          "elapsed_ms": 135,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "caught_up_ms",
-              "value": 54.717702,
+              "value": 54.378597,
               "unit": "ms"
             }
           ]
@@ -267,16 +267,16 @@
         {
           "scenario": "qual_wp1_6_activation::remote_linear_create_10k",
           "status": "pass",
-          "elapsed_ms": 4153,
+          "elapsed_ms": 6243,
           "failures": [],
           "notes": [
-            "authored 10000 local creates in 1386 ms"
+            "authored 10000 local creates in 2007 ms"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 0.4056045329999999,
+              "value": 0.6151589355999999,
               "unit": "ms"
             }
           ]
@@ -284,16 +284,16 @@
         {
           "scenario": "qual_wp1_6_activation::remote_linear_create_2k",
           "status": "pass",
-          "elapsed_ms": 833,
+          "elapsed_ms": 1075,
           "failures": [],
           "notes": [
-            "authored 2000 local creates in 210 ms"
+            "authored 2000 local creates in 358 ms"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 0.3206092049999999,
+              "value": 0.5205386545,
               "unit": "ms"
             }
           ]
@@ -301,7 +301,7 @@
         {
           "scenario": "qual_wp1_6_activation::transient_retry",
           "status": "pass",
-          "elapsed_ms": 191,
+          "elapsed_ms": 319,
           "failures": [],
           "notes": [
             "first receive: Ok(0)"
@@ -321,26 +321,26 @@
       "file": "qual_wp1_7_derive",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 988,
-      "result": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1026.89s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_7_derive.log",
+      "duration_s": 730,
+      "result": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 792.48s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp1_7_derive.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_7_derive::concurrent_namespace_ops_5k",
           "status": "pass",
-          "elapsed_ms": 7839,
+          "elapsed_ms": 7196,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "max_op_ms",
-              "value": 226.059924,
+              "value": 190.958105,
               "unit": "ms"
             },
             {
               "metric": "p50_op_ms",
-              "value": 147.49557399999998,
+              "value": 139.225395,
               "unit": "ms"
             },
             {
@@ -355,7 +355,7 @@
             },
             {
               "metric": "derive_ms_per_commit",
-              "value": 17.405340000000002,
+              "value": 18.84824,
               "unit": "ms"
             }
           ]
@@ -363,14 +363,14 @@
         {
           "scenario": "qual_wp1_7_derive::two_way_backlog_2k",
           "status": "pass",
-          "elapsed_ms": 107547,
+          "elapsed_ms": 87467,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 33.417345322499976,
+              "value": 28.928326561000002,
               "unit": "ms"
             },
             {
@@ -385,12 +385,12 @@
             },
             {
               "metric": "derive_ms_per_commit",
-              "value": 3.140304,
+              "value": 2.88565,
               "unit": "ms"
             },
             {
               "metric": "oracle_ms",
-              "value": 36854.247815,
+              "value": 29497.491313000002,
               "unit": "ms"
             }
           ]
@@ -398,14 +398,14 @@
         {
           "scenario": "qual_wp1_7_derive::two_way_backlog_6400",
           "status": "pass",
-          "elapsed_ms": 908308,
+          "elapsed_ms": 693105,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 141.88419690765596,
+              "value": 108.24099328718785,
               "unit": "ms"
             },
             {
@@ -420,7 +420,7 @@
             },
             {
               "metric": "derive_ms_per_commit",
-              "value": 18.003979375,
+              "value": 15.3389565625,
               "unit": "ms"
             }
           ]
@@ -431,28 +431,28 @@
       "file": "qual_wp1_8_objects",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 31,
-      "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.23s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_8_objects.log",
+      "duration_s": 92,
+      "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 101.13s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp1_8_objects.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_8_objects::content_status_50k",
           "status": "pass",
-          "elapsed_ms": 678,
+          "elapsed_ms": 614,
           "failures": [],
           "notes": [
-            "50000 objects stored in 11493 ms"
+            "50000 objects stored in 16180 ms"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "cold_content_status_ms",
-              "value": 440.938062,
+              "value": 416.46659600000004,
               "unit": "ms"
             },
             {
               "metric": "content_status_ms",
-              "value": 0.011672,
+              "value": 0.010183000000000001,
               "unit": "ms"
             }
           ]
@@ -460,7 +460,7 @@
         {
           "scenario": "qual_wp1_8_objects::corrupt_mid_page_keeps_completed",
           "status": "pass",
-          "elapsed_ms": 50,
+          "elapsed_ms": 396,
           "failures": [],
           "notes": [
             "receive_parts: Err(CORRUPT_OBJECT: 7798e59cbf9c2e9d992684e3be9c0ec5115af62282910609f033b77ed11c3e38)"
@@ -477,26 +477,26 @@
         {
           "scenario": "qual_wp1_8_objects::restart_without_rehash_20k",
           "status": "pass",
-          "elapsed_ms": 1486,
+          "elapsed_ms": 1384,
           "failures": [],
           "notes": [
-            "20000 objects stored in 3918 ms"
+            "20000 objects stored in 5601 ms"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "first_ready_ms",
-              "value": 1929.986332,
+              "value": 1100.0613150000001,
               "unit": "ms"
             },
             {
               "metric": "ready_ms",
-              "value": 783.315699,
+              "value": 714.487674,
               "unit": "ms"
             },
             {
               "metric": "open_ms",
-              "value": 634.9777130000001,
+              "value": 615.6618860000001,
               "unit": "ms"
             }
           ]
@@ -504,7 +504,7 @@
         {
           "scenario": "qual_wp1_8_objects::tiny_pending_objects_12k",
           "status": "pass",
-          "elapsed_ms": 1819,
+          "elapsed_ms": 66084,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -516,7 +516,7 @@
             },
             {
               "metric": "objects_per_s",
-              "value": 6651.0993034858075,
+              "value": 181.6437433999824,
               "unit": "objects/s"
             }
           ]
@@ -527,14 +527,14 @@
       "file": "qual_wp1_9_session",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 82,
-      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.20s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_9_session.log",
+      "duration_s": 78,
+      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 84.12s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-062706/qual_wp1_9_session.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_9_session::dead_peer_detection",
           "status": "pass",
-          "elapsed_ms": 20174,
+          "elapsed_ms": 20049,
           "failures": [],
           "notes": [
             "session::Conn through a FaultProxy blackhole; heartbeat 5s, dead after 20s"
@@ -543,7 +543,7 @@
           "metrics": [
             {
               "metric": "detect_ms",
-              "value": 19999.283288000002,
+              "value": 20007.407692,
               "unit": "ms"
             }
           ]
@@ -551,19 +551,19 @@
         {
           "scenario": "qual_wp1_9_session::duplex_32mib",
           "status": "pass",
-          "elapsed_ms": 222,
+          "elapsed_ms": 192,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "duplex_ms",
-              "value": 17.534419,
+              "value": 22.547273,
               "unit": "ms"
             },
             {
               "metric": "duplex_wss_ms",
-              "value": 71.615476,
+              "value": 70.921212,
               "unit": "ms"
             }
           ]
@@ -571,7 +571,7 @@
         {
           "scenario": "qual_wp1_9_session::idle_60s",
           "status": "pass",
-          "elapsed_ms": 60057,
+          "elapsed_ms": 60062,
           "failures": [],
           "notes": [
             "session::Conn through a FaultProxy, production heartbeat 5 s / dead 20 s"
@@ -580,12 +580,12 @@
           "metrics": [
             {
               "metric": "ping_after_idle_ms",
-              "value": 0.480883,
+              "value": 0.504106,
               "unit": "ms"
             },
             {
               "metric": "rtt_ms",
-              "value": 1.0,
+              "value": 0.0,
               "unit": "ms"
             }
           ]
@@ -593,7 +593,7 @@
         {
           "scenario": "qual_wp1_9_session::loopback_throughput",
           "status": "pass",
-          "elapsed_ms": 2973,
+          "elapsed_ms": 3345,
           "failures": [],
           "notes": [
             "session::Conn streamed response, 1024 x 1 MiB chunks (plain WS), best of 3 runs; upload and WSS recorded too"
@@ -602,17 +602,17 @@
           "metrics": [
             {
               "metric": "mib_per_s",
-              "value": 4502.937188093821,
+              "value": 4371.824492832497,
               "unit": "MiB/s"
             },
             {
               "metric": "upload_mib_per_s",
-              "value": 4011.8150146141725,
+              "value": 3656.9991109563744,
               "unit": "MiB/s"
             },
             {
               "metric": "wss_mib_per_s",
-              "value": 544.5952470639145,
+              "value": 466.7312395413802,
               "unit": "MiB/s"
             }
           ]
@@ -620,7 +620,7 @@
         {
           "scenario": "qual_wp1_9_session::slow_does_not_block_fast",
           "status": "pass",
-          "elapsed_ms": 289,
+          "elapsed_ms": 276,
           "failures": [],
           "notes": [
             "session::Conn, production options; one 20 s handler on stream A, 50 calls on stream B"
@@ -629,12 +629,12 @@
           "metrics": [
             {
               "metric": "fast_p99_ms",
-              "value": 0.439524,
+              "value": 0.287898,
               "unit": "ms"
             },
             {
               "metric": "control_queued_30mib_p99_ms",
-              "value": 1.316073,
+              "value": 1.342784,
               "unit": "ms"
             }
           ]
@@ -645,14 +645,14 @@
       "file": "qual_wp1_12_legacy",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 132,
-      "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 137.29s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp1_12_legacy.log",
+      "duration_s": 124,
+      "result": "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 136.41s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp1_12_legacy.log",
       "scenarios": [
         {
           "scenario": "qual_wp1_12_legacy::crash_backoff",
           "status": "pass",
-          "elapsed_ms": 20162,
+          "elapsed_ms": 20131,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -664,7 +664,7 @@
             },
             {
               "metric": "list_p99_ms",
-              "value": 1.6391470000000001,
+              "value": 0.975149,
               "unit": "ms"
             }
           ]
@@ -672,14 +672,14 @@
         {
           "scenario": "qual_wp1_12_legacy::hung_remote_repo_charged",
           "status": "pass",
-          "elapsed_ms": 27557,
+          "elapsed_ms": 26041,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "healthy_delay_ms",
-              "value": 688.307212,
+              "value": 759.281599,
               "unit": "ms"
             },
             {
@@ -692,7 +692,7 @@
         {
           "scenario": "qual_wp1_12_legacy::interval_20s_no_reconnects",
           "status": "pass",
-          "elapsed_ms": 60027,
+          "elapsed_ms": 60021,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -707,7 +707,7 @@
         {
           "scenario": "qual_wp1_12_legacy::worker_busy_not_counted",
           "status": "pass",
-          "elapsed_ms": 20107,
+          "elapsed_ms": 20169,
           "failures": [],
           "notes": [
             "no WORKER_BUSY observed in the window; nothing to judge"
@@ -737,14 +737,14 @@
       "file": "qual_wp2_1_lifecycle",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 63,
-      "result": "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 67.19s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp2_1_lifecycle.log",
+      "duration_s": 61,
+      "result": "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 66.54s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp2_1_lifecycle.log",
       "scenarios": [
         {
           "scenario": "qual_wp2_1_lifecycle::adoption_after_daemon_kill",
           "status": "pass",
-          "elapsed_ms": 101,
+          "elapsed_ms": 62,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -756,7 +756,7 @@
             },
             {
               "metric": "resume_ms",
-              "value": 0.9322729999999999,
+              "value": 0.879819,
               "unit": "ms"
             }
           ]
@@ -764,14 +764,14 @@
         {
           "scenario": "qual_wp2_1_lifecycle::api_latency_under_churn",
           "status": "pass",
-          "elapsed_ms": 4270,
+          "elapsed_ms": 4242,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "list_p99_ms",
-              "value": 1.354891,
+              "value": 0.855705,
               "unit": "ms"
             }
           ]
@@ -779,14 +779,14 @@
         {
           "scenario": "qual_wp2_1_lifecycle::crash_loop_reaches_failed",
           "status": "pass",
-          "elapsed_ms": 14796,
+          "elapsed_ms": 13886,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "time_to_failed_ms",
-              "value": 14780.842972,
+              "value": 13870.974233,
               "unit": "ms"
             }
           ]
@@ -794,14 +794,14 @@
         {
           "scenario": "qual_wp2_1_lifecycle::hung_worker_restarted",
           "status": "pass",
-          "elapsed_ms": 11017,
+          "elapsed_ms": 11113,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "restart_ms",
-              "value": 11000.324873,
+              "value": 11096.626459,
               "unit": "ms"
             }
           ]
@@ -809,7 +809,7 @@
         {
           "scenario": "qual_wp2_1_lifecycle::mount_failure_end_to_end",
           "status": "pass",
-          "elapsed_ms": 56,
+          "elapsed_ms": 73,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -818,14 +818,14 @@
         {
           "scenario": "qual_wp2_1_lifecycle::shutdown_with_busy_folder",
           "status": "pass",
-          "elapsed_ms": 574,
+          "elapsed_ms": 536,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "shutdown_ms",
-              "value": 474.621738,
+              "value": 473.34749700000003,
               "unit": "ms"
             }
           ]
@@ -833,7 +833,7 @@
         {
           "scenario": "qual_wp2_1_lifecycle::sigterm_matches_shutdown",
           "status": "pass",
-          "elapsed_ms": 1168,
+          "elapsed_ms": 1469,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -842,14 +842,14 @@
         {
           "scenario": "qual_wp2_1_lifecycle::subscribe_latency",
           "status": "pass",
-          "elapsed_ms": 360,
+          "elapsed_ms": 514,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "subscribe_ms",
-              "value": 7.409488,
+              "value": 129.519455,
               "unit": "ms"
             }
           ]
@@ -857,7 +857,7 @@
         {
           "scenario": "qual_wp2_1_lifecycle::watch_hang_alone_is_not_unresponsive",
           "status": "pass",
-          "elapsed_ms": 26516,
+          "elapsed_ms": 25005,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -869,21 +869,21 @@
       "file": "qual_wp2_3_worker",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 49,
-      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.16s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp2_3_worker.log",
+      "duration_s": 64,
+      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 69.53s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp2_3_worker.log",
       "scenarios": [
         {
           "scenario": "qual_wp2_3_worker::fs_p99_during_catchup",
           "status": "pass",
-          "elapsed_ms": 1961,
+          "elapsed_ms": 2706,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "fs_p99_ms",
-              "value": 14.036171999999999,
+              "value": 15.023385000000001,
               "unit": "ms"
             }
           ]
@@ -891,14 +891,14 @@
         {
           "scenario": "qual_wp2_3_worker::fs_p99_during_legacy_catchup",
           "status": "pass",
-          "elapsed_ms": 2911,
+          "elapsed_ms": 5530,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "fs_p99_legacy_ms",
-              "value": 42.789761000000006,
+              "value": 41.064211,
               "unit": "ms"
             }
           ]
@@ -906,19 +906,19 @@
         {
           "scenario": "qual_wp2_3_worker::startup_with_5k_staged",
           "status": "pass",
-          "elapsed_ms": 1969,
+          "elapsed_ms": 3550,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "ready_ms",
-              "value": 108.086836,
+              "value": 198.53583999999998,
               "unit": "ms"
             },
             {
               "metric": "drain_ms",
-              "value": 1764.354144,
+              "value": 3218.0909610000003,
               "unit": "ms"
             },
             {
@@ -931,14 +931,14 @@
         {
           "scenario": "qual_wp2_3_worker::status_after_mutation_large",
           "status": "pass",
-          "elapsed_ms": 27681,
+          "elapsed_ms": 33279,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "status_after_mutation_ms",
-              "value": 0.9706130000000001,
+              "value": 0.52207,
               "unit": "ms"
             }
           ]
@@ -946,14 +946,14 @@
         {
           "scenario": "qual_wp2_3_worker::status_latency_during_activation",
           "status": "pass",
-          "elapsed_ms": 2199,
+          "elapsed_ms": 4083,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "status_p99_ms",
-              "value": 3.100396,
+              "value": 4.213425,
               "unit": "ms"
             }
           ]
@@ -964,31 +964,31 @@
       "file": "qual_wp2_4_offlock",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 148,
-      "result": "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 154.62s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp2_4_offlock.log",
+      "duration_s": 209,
+      "result": "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 229.57s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp2_4_offlock.log",
       "scenarios": [
         {
           "scenario": "qual_wp2_4_offlock::lock_hold_slow_conflict_event_2k",
           "status": "pass",
-          "elapsed_ms": 15248,
+          "elapsed_ms": 14056,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "max_blocked_ms",
-              "value": 26.190051999999998,
+              "value": 14.497651000000001,
               "unit": "ms"
             },
             {
               "metric": "max_hold_ms",
-              "value": 28.140024999999998,
+              "value": 15.848324,
               "unit": "ms"
             },
             {
               "metric": "commit_prepared_ms",
-              "value": 28.140024999999998,
+              "value": 15.848324,
               "unit": "ms"
             }
           ]
@@ -996,29 +996,29 @@
         {
           "scenario": "qual_wp2_4_offlock::lock_hold_slow_event_2k",
           "status": "pass",
-          "elapsed_ms": 16331,
+          "elapsed_ms": 13743,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "max_blocked_ms",
-              "value": 3.675616,
+              "value": 4.9582690000000005,
               "unit": "ms"
             },
             {
               "metric": "max_hold_ms",
-              "value": 4.969041000000001,
+              "value": 6.954406,
               "unit": "ms"
             },
             {
               "metric": "prepare_ms",
-              "value": 38.462011999999994,
+              "value": 46.692981,
               "unit": "ms"
             },
             {
               "metric": "inline_slow_commit_ms",
-              "value": 48.992045999999995,
+              "value": 61.597143,
               "unit": "ms"
             }
           ]
@@ -1026,7 +1026,7 @@
         {
           "scenario": "qual_wp2_4_offlock::lock_hold_slow_event_2k_worker",
           "status": "pass",
-          "elapsed_ms": 574,
+          "elapsed_ms": 561,
           "failures": [],
           "notes": [
             "exchange: Ok(\"ok\")",
@@ -1036,7 +1036,7 @@
           "metrics": [
             {
               "metric": "max_blocked_ms",
-              "value": 44.20882,
+              "value": 56.300741,
               "unit": "ms"
             }
           ]
@@ -1044,24 +1044,24 @@
         {
           "scenario": "qual_wp2_4_offlock::stale_convergence",
           "status": "pass",
-          "elapsed_ms": 38357,
+          "elapsed_ms": 35256,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "converge_ms",
-              "value": 16124.291443,
+              "value": 17163.407105000002,
               "unit": "ms"
             },
             {
               "metric": "stale",
-              "value": 29.0,
+              "value": 50.0,
               "unit": "tickets"
             },
             {
               "metric": "max_blocked_ms",
-              "value": 50.82204,
+              "value": 133.93512299999998,
               "unit": "ms"
             }
           ]
@@ -1069,14 +1069,14 @@
         {
           "scenario": "qual_wp2_4_offlock::stale_convergence_worker",
           "status": "pass",
-          "elapsed_ms": 28497,
+          "elapsed_ms": 24217,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "converge_ms",
-              "value": 28478.232185,
+              "value": 24198.223563,
               "unit": "ms"
             }
           ]
@@ -1084,14 +1084,14 @@
         {
           "scenario": "qual_wp2_4_offlock::stale_convergence_worker_steady_writer",
           "status": "pass",
-          "elapsed_ms": 51575,
+          "elapsed_ms": 134839,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "converge_ms",
-              "value": 51532.997094000006,
+              "value": 134795.98294,
               "unit": "ms"
             }
           ]
@@ -1102,14 +1102,14 @@
       "file": "qual_wp2_5_feed",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 211,
-      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 221.43s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp2_5_feed.log",
+      "duration_s": 150,
+      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 164.40s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp2_5_feed.log",
       "scenarios": [
         {
           "scenario": "qual_wp2_5_feed::feed_150k_events",
           "status": "pass",
-          "elapsed_ms": 103258,
+          "elapsed_ms": 47214,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -1121,7 +1121,7 @@
             },
             {
               "metric": "events_per_s",
-              "value": 1452.876852495068,
+              "value": 3178.1208442641564,
               "unit": "events/s"
             }
           ]
@@ -1129,14 +1129,14 @@
         {
           "scenario": "qual_wp2_5_feed::idle_exchange_50k",
           "status": "pass",
-          "elapsed_ms": 58,
+          "elapsed_ms": 61,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "cpu_ms_per_side",
-              "value": 0.0,
+              "value": 1.0,
               "unit": "ms"
             },
             {
@@ -1149,7 +1149,7 @@
         {
           "scenario": "qual_wp2_5_feed::large_event_8mib",
           "status": "pass",
-          "elapsed_ms": 3121,
+          "elapsed_ms": 3502,
           "failures": [],
           "notes": [
             "event payload 1658845 bytes"
@@ -1166,14 +1166,14 @@
         {
           "scenario": "qual_wp2_5_feed::peer_restore",
           "status": "pass",
-          "elapsed_ms": 57,
+          "elapsed_ms": 127,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "restore_ms",
-              "value": 40.480154999999996,
+              "value": 110.620189,
               "unit": "ms"
             }
           ]
@@ -1181,7 +1181,7 @@
         {
           "scenario": "qual_wp2_5_feed::staged_events_not_resent",
           "status": "pass",
-          "elapsed_ms": 278,
+          "elapsed_ms": 697,
           "failures": [],
           "notes": [
             "first round: {\"acked\":0,\"blocked\":0,\"bytes_down\":306774,\"bytes_up\":512,\"caught_up\":false,\"cursor_in\":300,\"cursor_out\":0,\"local_pending\":300,\"local_tip\":0,\"metadata_advanced\":true,\"quarantined\":0,\"received_events\":300,\"rejected\":0,\"remote_pending\":0,\"remote_tip\":300,\"sent_events\":0,\"staged\":300,\"to_receive\":0,\"to_send\":0}"
@@ -1201,31 +1201,31 @@
       "file": "qual_wp3_1_transport",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 157,
-      "result": "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 163.64s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp3_1_transport.log",
+      "duration_s": 150,
+      "result": "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 167.27s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp3_1_transport.log",
       "scenarios": [
         {
           "scenario": "qual_wp3_1_transport::faulty_link_no_stuck_sync_no_replay",
           "status": "pass",
-          "elapsed_ms": 49120,
+          "elapsed_ms": 50711,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "latency_bandwidth_sync_ms",
-              "value": 4493.896957999999,
+              "value": 4563.122936,
               "unit": "ms"
             },
             {
               "metric": "stall_recovery_ms",
-              "value": 26624.942525000002,
+              "value": 26368.844777,
               "unit": "ms"
             },
             {
               "metric": "reset_transfers_ms",
-              "value": 17798.860161,
+              "value": 19567.43821,
               "unit": "ms"
             },
             {
@@ -1238,33 +1238,25 @@
         {
           "scenario": "qual_wp3_1_transport::hung_remote_repo_extra_delay",
           "status": "pass",
-          "elapsed_ms": 27678,
+          "elapsed_ms": 27119,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "extra_delay_ms",
-              "value": 1.1147980000000004,
+              "value": 1.568456999999995,
               "unit": "ms"
             }
           ]
         },
         {
           "scenario": "qual_wp3_1_transport::inbound_status",
-          "status": "fail",
-          "elapsed_ms": 312,
-          "failures": [
-            "inbound peer listed on the acceptor",
-            "direction: null",
-            "inbound control and bulk lanes ready: null",
-            "inbound sessions counted",
-            "rates",
-            "per-folder state for the inbound peer",
-            "the served exchanges are on record: null"
-          ],
+          "status": "pass",
+          "elapsed_ms": 694,
+          "failures": [],
           "notes": [
-            "peer: null"
+            "peer: {\"direction\":\"inbound\",\"endpoint\":null,\"error\":null,\"inbound_sessions\":3,\"installation\":\"514d7880-bd1b-42cd-b06c-81ad0d470469\",\"label\":null,\"lanes\":[{\"backoff_until_ms\":null,\"bytes_down\":4715,\"bytes_up\":5180,\"direction\":\"inbound\",\"error\":null,\"inflight\":[],\"lane\":0,\"rate_down_bps\":0,\"rate_up_bps\":0,\"reconnects\":0,\"role\":\"control\",\"since_ms\":1792227361610,\"state\":\"ready\"},{\"backoff_until_ms\":null,\"bytes_down\":0,\"bytes_up\":0,\"direction\":\"inbound\",\"error\":null,\"inflight\":[{\"bytes\":0,\"op\":\"objects.pull\",\"repo\":\"0738fcc0-1187-4d02-a220-387f0a50bd60\",\"since_ms\":1792227361872},{\"bytes\":0,\"op\":\"objects.push\",\"repo\":\"0738fcc0-1187-4d02-a220-387f0a50bd60\",\"since_ms\":1792227361873}],\"lane\":1,\"rate_down_bps\":0,\"rate_up_bps\":0,\"reconnects\":0,\"role\":\"bulk\",\"since_ms\":1792227361610,\"state\":\"ready\"},{\"backoff_until_ms\":null,\"bytes_down\":0,\"bytes_up\":0,\"direction\":\"inbound\",\"error\":null,\"inflight\":[],\"lane\":2,\"rate_down_bps\":0,\"rate_up_bps\":0,\"reconnects\":0,\"role\":\"bulk\",\"since_ms\":1792227361610,\"state\":\"ready\"}],\"protocol\":null,\"rate_down_bps\":0,\"rate_up_bps\":0,\"rtt_ms\":null,\"shared_folders\":[\"0738fcc0-1187-4d02-a220-387f0a50bd60\"],\"since_ms\":1792227361610,\"state\":\"online\"}"
           ],
           "unsupported": [],
           "metrics": []
@@ -1272,7 +1264,7 @@
         {
           "scenario": "qual_wp3_1_transport::interval_20s_no_reconnects",
           "status": "pass",
-          "elapsed_ms": 60020,
+          "elapsed_ms": 60038,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -1287,14 +1279,14 @@
         {
           "scenario": "qual_wp3_1_transport::rotation_unauthorized_until_repaired",
           "status": "pass",
-          "elapsed_ms": 10966,
+          "elapsed_ms": 11014,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "unauthorized_ms",
-              "value": 891.188941,
+              "value": 905.2191899999999,
               "unit": "ms"
             }
           ]
@@ -1311,17 +1303,17 @@
         {
           "scenario": "qual_wp3_1_transport::v2_peer_fails_closed",
           "status": "pass",
-          "elapsed_ms": 88,
+          "elapsed_ms": 142,
           "failures": [],
           "notes": [
-            "v3 \u2192 v2: Err(PEER_NEEDS_UPGRADE: ws://127.0.0.1:46731 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent)",
+            "v3 \u2192 v2: Err(PEER_NEEDS_UPGRADE: ws://127.0.0.1:45849 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent)",
             "v2 \u2192 v3: Err(PEER_NEEDS_UPGRADE: remote runs tkfs peer protocol 3; upgrade this orchestrator)"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "v3_to_v2_refusal_ms",
-              "value": 0.773476,
+              "value": 0.77793,
               "unit": "ms"
             }
           ]
@@ -1332,18 +1324,18 @@
       "file": "qual_wp3_2_objects",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 11,
-      "result": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.03s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp3_2_objects.log",
+      "duration_s": 41,
+      "result": "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 43.80s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp3_2_objects.log",
       "scenarios": [
         {
           "scenario": "qual_wp3_2_objects::crash_resume",
           "status": "pass",
-          "elapsed_ms": 109,
+          "elapsed_ms": 375,
           "failures": [],
           "notes": [
-            "first leg: Err(objects.write: CONNECTION_LOST: CONNECTION_LOST: IO error: Connection reset by peer (os error 104)) in 56.821356ms",
-            "killed with 36700160 spool bytes, 36700160 durable"
+            "first leg: Err(objects.write: CONNECTION_LOST: CONNECTION_LOST: connection reset by peer) in 160.114644ms",
+            "killed with 20971520 spool bytes, 20971520 durable"
           ],
           "unsupported": [],
           "metrics": [
@@ -1357,16 +1349,16 @@
         {
           "scenario": "qual_wp3_2_objects::object_256mib_worker_to_worker",
           "status": "pass",
-          "elapsed_ms": 435,
+          "elapsed_ms": 1957,
           "failures": [],
           "notes": [
-            "time in objects.want 0.0 s, objects.read 0.3 s, objects.write 1.0 s (summed over threads)"
+            "time in objects.want 0.0 s, objects.read 0.4 s, objects.write 8.9 s (summed over threads)"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "mib_per_s",
-              "value": 629.5056621870389,
+              "value": 132.79949533950779,
               "unit": "MiB/s"
             }
           ]
@@ -1374,21 +1366,21 @@
         {
           "scenario": "qual_wp3_2_objects::tiny_objects_10k",
           "status": "pass",
-          "elapsed_ms": 4278,
+          "elapsed_ms": 31356,
           "failures": [],
           "notes": [
-            "time in objects.want 0.9 s, objects.read 3.1 s, objects.write 1.6 s (summed over threads)"
+            "time in objects.want 1.1 s, objects.read 3.4 s, objects.write 110.0 s (summed over threads)"
           ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "fs_objects_per_s",
-              "value": 74312.48484686739,
+              "value": 391.1203071254712,
               "unit": "objects/s"
             },
             {
               "metric": "objects_per_s",
-              "value": 2495.7142427644862,
+              "value": 348.42906095482846,
               "unit": "objects/s"
             }
           ]
@@ -1399,21 +1391,21 @@
       "file": "qual_wp3_int_e2e",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 768,
-      "result": "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 806.11s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_wp3_int_e2e.log",
+      "duration_s": 611,
+      "result": "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 671.80s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp3_int_e2e.log",
       "scenarios": [
         {
           "scenario": "qual_wp3_int_e2e::catch_up_10k_events",
           "status": "pass",
-          "elapsed_ms": 6948,
+          "elapsed_ms": 12924,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "seconds",
-              "value": 6.932167699,
+              "value": 12.877756385,
               "unit": "s"
             }
           ]
@@ -1421,7 +1413,7 @@
         {
           "scenario": "qual_wp3_int_e2e::feed_150k_daemons",
           "status": "pass",
-          "elapsed_ms": 545074,
+          "elapsed_ms": 358746,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -1433,7 +1425,7 @@
             },
             {
               "metric": "events_per_s",
-              "value": 287.02108682033173,
+              "value": 435.9672847519651,
               "unit": "events/s"
             }
           ]
@@ -1441,14 +1433,14 @@
         {
           "scenario": "qual_wp3_int_e2e::idle_exchange_daemons",
           "status": "pass",
-          "elapsed_ms": 30054,
+          "elapsed_ms": 30049,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "bytes_per_exchange",
-              "value": 2646.5824372759857,
+              "value": 1911.4049429657794,
               "unit": "bytes"
             }
           ]
@@ -1456,7 +1448,7 @@
         {
           "scenario": "qual_wp3_int_e2e::large_event_8mib_daemons",
           "status": "pass",
-          "elapsed_ms": 3542,
+          "elapsed_ms": 3895,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -1471,14 +1463,14 @@
         {
           "scenario": "qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync",
           "status": "pass",
-          "elapsed_ms": 191,
+          "elapsed_ms": 371,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "sync_ms",
-              "value": 119.337992,
+              "value": 288.907727,
               "unit": "ms"
             }
           ]
@@ -1486,14 +1478,14 @@
         {
           "scenario": "qual_wp3_int_e2e::mutual_pairing_duplicate_bytes",
           "status": "pass",
-          "elapsed_ms": 192,
+          "elapsed_ms": 580,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "wire_ratio",
-              "value": 1.0018819868564606,
+              "value": 1.00205796957016,
               "unit": "ratio"
             }
           ]
@@ -1501,14 +1493,14 @@
         {
           "scenario": "qual_wp3_int_e2e::object_256mib_loopback",
           "status": "pass",
-          "elapsed_ms": 1579,
+          "elapsed_ms": 3558,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "mib_per_s",
-              "value": 318.82946663328636,
+              "value": 93.02994599220618,
               "unit": "MiB/s"
             }
           ]
@@ -1516,19 +1508,19 @@
         {
           "scenario": "qual_wp3_int_e2e::objects_before_activation",
           "status": "pass",
-          "elapsed_ms": 517,
+          "elapsed_ms": 1396,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "objects_ahead",
-              "value": 162.0,
+              "value": 11.0,
               "unit": "objects"
             },
             {
               "metric": "complete_ms",
-              "value": 501.755892,
+              "value": 1379.294374,
               "unit": "ms"
             }
           ]
@@ -1536,14 +1528,14 @@
         {
           "scenario": "qual_wp3_int_e2e::one_gib_through_proxy",
           "status": "pass",
-          "elapsed_ms": 92327,
+          "elapsed_ms": 87768,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "link_utilization",
-              "value": 0.9306495495572736,
+              "value": 0.9789599498007424,
               "unit": "ratio"
             }
           ]
@@ -1551,14 +1543,14 @@
         {
           "scenario": "qual_wp3_int_e2e::relay_with_objects",
           "status": "pass",
-          "elapsed_ms": 244,
+          "elapsed_ms": 355,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "relay_ms",
-              "value": 229.481464,
+              "value": 337.551544,
               "unit": "ms"
             }
           ]
@@ -1566,14 +1558,18 @@
         {
           "scenario": "qual_wp3_int_e2e::tiny_files_10k",
           "status": "pass",
-          "elapsed_ms": 9634,
-          "failures": [],
-          "notes": [],
+          "elapsed_ms": 46515,
+          "failures": [
+            "FLOOR e2e_tiny_files_10k: files_per_s >= 300 (measured Some(219.22608042706054))"
+          ],
+          "notes": [
+            "only floors not enforced on linux failed: FLOOR e2e_tiny_files_10k: files_per_s >= 300 (measured Some(219.22608042706054))"
+          ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "files_per_s",
-              "value": 1131.033257496315,
+              "value": 219.22608042706054,
               "unit": "files/s"
             }
           ]
@@ -1581,14 +1577,14 @@
         {
           "scenario": "qual_wp3_int_e2e::two_way_backlog_e2e",
           "status": "pass",
-          "elapsed_ms": 3138,
+          "elapsed_ms": 3669,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "seconds",
-              "value": 3.120278962,
+              "value": 3.650324084,
               "unit": "s"
             }
           ]
@@ -1596,7 +1592,7 @@
         {
           "scenario": "qual_wp3_int_e2e::v2_peer_fails_closed",
           "status": "pass",
-          "elapsed_ms": 32,
+          "elapsed_ms": 58,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -1608,14 +1604,14 @@
       "file": "qual_scale",
       "status": "pass",
       "exit_code": 0,
-      "duration_s": 602,
-      "result": "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 634.91s",
-      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404/qual_scale.log",
+      "duration_s": 567,
+      "result": "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 623.10s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_scale.log",
       "scenarios": [
         {
           "scenario": "qual_scale::feed_150k",
           "status": "pass",
-          "elapsed_ms": 474307,
+          "elapsed_ms": 369454,
           "failures": [],
           "notes": [],
           "unsupported": [],
@@ -1627,24 +1623,22 @@
             },
             {
               "metric": "events_per_s",
-              "value": 331.17526665775057,
+              "value": 423.1101048856484,
               "unit": "events/s"
             }
           ]
         },
         {
           "scenario": "qual_scale::idle_worker_cpu",
-          "status": "fail",
-          "elapsed_ms": 30020,
-          "failures": [
-            "FLOOR scale_idle_worker_cpu: cpu_percent <= 1 (measured Some(18.333333333333332))"
-          ],
+          "status": "pass",
+          "elapsed_ms": 30033,
+          "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "cpu_percent",
-              "value": 18.333333333333332,
+              "value": 0.36666666666666664,
               "unit": "%"
             }
           ]
@@ -1652,14 +1646,14 @@
         {
           "scenario": "qual_scale::management_api_p99_under_churn",
           "status": "pass",
-          "elapsed_ms": 6471,
+          "elapsed_ms": 6379,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "list_p99_ms",
-              "value": 2.554517,
+              "value": 1.209629,
               "unit": "ms"
             }
           ]
@@ -1667,14 +1661,14 @@
         {
           "scenario": "qual_scale::one_gib_object",
           "status": "pass",
-          "elapsed_ms": 2321,
+          "elapsed_ms": 9545,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "mib_per_s",
-              "value": 444.5789942316765,
+              "value": 107.50695509316817,
               "unit": "MiB/s"
             }
           ]
@@ -1682,14 +1676,14 @@
         {
           "scenario": "qual_scale::remote_linear_activation_2k",
           "status": "pass",
-          "elapsed_ms": 1339,
+          "elapsed_ms": 2396,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 0.6603907595,
+              "value": 1.1881066745,
               "unit": "ms"
             }
           ]
@@ -1697,14 +1691,14 @@
         {
           "scenario": "qual_scale::remote_linear_activation_6400",
           "status": "pass",
-          "elapsed_ms": 4526,
+          "elapsed_ms": 7323,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 0.7043655076562501,
+              "value": 1.13941506640625,
               "unit": "ms"
             }
           ]
@@ -1712,14 +1706,14 @@
         {
           "scenario": "qual_scale::startup_ready_50k_objects",
           "status": "pass",
-          "elapsed_ms": 2014,
+          "elapsed_ms": 2221,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "ready_ms",
-              "value": 1998.834846,
+              "value": 2202.8307489999997,
               "unit": "ms"
             }
           ]
@@ -1727,14 +1721,18 @@
         {
           "scenario": "qual_scale::tiny_files_10k",
           "status": "pass",
-          "elapsed_ms": 7432,
-          "failures": [],
-          "notes": [],
+          "elapsed_ms": 51063,
+          "failures": [
+            "FLOOR scale_tiny_files_10k: files_per_s >= 300 (measured Some(195.933994581332))"
+          ],
+          "notes": [
+            "only floors not enforced on linux failed: FLOOR scale_tiny_files_10k: files_per_s >= 300 (measured Some(195.933994581332))"
+          ],
           "unsupported": [],
           "metrics": [
             {
               "metric": "files_per_s",
-              "value": 1348.9693192160732,
+              "value": 195.933994581332,
               "unit": "files/s"
             }
           ]
@@ -1742,15 +1740,165 @@
         {
           "scenario": "qual_scale::two_way_backlog",
           "status": "pass",
-          "elapsed_ms": 2940,
+          "elapsed_ms": 3536,
           "failures": [],
           "notes": [],
           "unsupported": [],
           "metrics": [
             {
               "metric": "per_event_ms",
-              "value": 1.460996509,
+              "value": 1.7576581065,
               "unit": "ms"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "file": "qual_wp4_4_seal",
+      "status": "pass",
+      "exit_code": 0,
+      "duration_s": 252,
+      "result": "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 277.40s",
+      "log": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806/qual_wp4_4_seal.log",
+      "scenarios": [
+        {
+          "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+          "status": "pass",
+          "elapsed_ms": 140939,
+          "failures": [],
+          "notes": [],
+          "unsupported": [],
+          "metrics": [
+            {
+              "metric": "seal_bytes",
+              "value": 193636259.0,
+              "unit": "bytes"
+            },
+            {
+              "metric": "wp3int_model_bytes",
+              "value": 13997854232.42952,
+              "unit": "bytes"
+            },
+            {
+              "metric": "seal_bytes_reduction",
+              "value": 72.28942711824193,
+              "unit": "x"
+            },
+            {
+              "metric": "max_seal_ms",
+              "value": 16.92,
+              "unit": "ms"
+            },
+            {
+              "metric": "sealing_hold_p99_ms",
+              "value": 13.707146,
+              "unit": "ms"
+            },
+            {
+              "metric": "events_per_s",
+              "value": 1174.1910339488622,
+              "unit": "events/s"
+            },
+            {
+              "metric": "restart_open_ms",
+              "value": 6852.3060749999995,
+              "unit": "ms"
+            }
+          ]
+        },
+        {
+          "scenario": "qual_wp4_4_seal::catch_up_20k_inline_vs_rows",
+          "status": "pass",
+          "elapsed_ms": 31074,
+          "failures": [],
+          "notes": [],
+          "unsupported": [],
+          "metrics": [
+            {
+              "metric": "inline_seal_bytes",
+              "value": 274701584.0,
+              "unit": "bytes"
+            },
+            {
+              "metric": "rows_seal_bytes",
+              "value": 28004178.0,
+              "unit": "bytes"
+            },
+            {
+              "metric": "wp3int_model_bytes",
+              "value": 261778206.31224996,
+              "unit": "bytes"
+            },
+            {
+              "metric": "model_error",
+              "value": 0.04704515168631151,
+              "unit": "ratio"
+            },
+            {
+              "metric": "seal_bytes_reduction",
+              "value": 9.809307168380375,
+              "unit": "x"
+            }
+          ]
+        },
+        {
+          "scenario": "qual_wp4_4_seal::restart_50k_rows_vs_inline",
+          "status": "pass",
+          "elapsed_ms": 22036,
+          "failures": [],
+          "notes": [],
+          "unsupported": [],
+          "metrics": [
+            {
+              "metric": "restart_rows_ms",
+              "value": 1600.933978,
+              "unit": "ms"
+            },
+            {
+              "metric": "restart_inline_ms",
+              "value": 1612.878627,
+              "unit": "ms"
+            },
+            {
+              "metric": "restart_rows_vs_inline",
+              "value": 0.99259420467229,
+              "unit": "ratio"
+            }
+          ]
+        },
+        {
+          "scenario": "qual_wp4_4_seal::seal_after_other_branch_gap",
+          "status": "pass",
+          "elapsed_ms": 46,
+          "failures": [],
+          "notes": [],
+          "unsupported": [],
+          "metrics": [
+            {
+              "metric": "seal_ms",
+              "value": 0.204,
+              "unit": "ms"
+            }
+          ]
+        },
+        {
+          "scenario": "qual_wp4_4_seal::staging_cost_at_large_inboxes",
+          "status": "pass",
+          "elapsed_ms": 16748,
+          "failures": [],
+          "notes": [],
+          "unsupported": [],
+          "metrics": [
+            {
+              "metric": "staging_us_per_event_at_40000",
+              "value": 69.341437,
+              "unit": "us"
+            },
+            {
+              "metric": "staging_us_per_event_at_100000",
+              "value": 80.56393100000001,
+              "unit": "us"
             }
           ]
         }
@@ -1768,7 +1916,7 @@
       "baseline": "15.9 s per event @2K",
       "platforms": null,
       "floor": 5,
-      "measured": 0.3206092049999999,
+      "measured": 0.5205386545,
       "verdict": "pass",
       "enforced": true
     },
@@ -1782,7 +1930,7 @@
       "baseline": "6.2 s @1K, 15.9 s @2K, 218 s @6.4K",
       "platforms": null,
       "floor": 5,
-      "measured": 0.4056045329999999,
+      "measured": 0.6151589355999999,
       "verdict": "pass",
       "enforced": true
     },
@@ -1796,7 +1944,7 @@
       "baseline": "4.2 s",
       "platforms": null,
       "floor": 10,
-      "measured": 0.464013,
+      "measured": 3.7456460000000003,
       "verdict": "pass",
       "enforced": true
     },
@@ -1810,7 +1958,7 @@
       "baseline": "slow path, 15.9 s @2K",
       "platforms": null,
       "floor": 100,
-      "measured": 33.417345322499976,
+      "measured": 28.928326561000002,
       "verdict": "pass",
       "enforced": true
     },
@@ -1824,7 +1972,7 @@
       "baseline": "slow path, 218 s @6.4K",
       "platforms": null,
       "floor": 300,
-      "measured": 141.88419690765596,
+      "measured": 108.24099328718785,
       "verdict": "pass",
       "enforced": true
     },
@@ -1838,7 +1986,7 @@
       "baseline": "O(N^2) seconds to minutes",
       "platforms": null,
       "floor": 500,
-      "measured": 226.059924,
+      "measured": 190.958105,
       "verdict": "pass",
       "enforced": true
     },
@@ -1852,7 +2000,7 @@
       "baseline": "full re-hash",
       "platforms": null,
       "floor": 3000,
-      "measured": 783.315699,
+      "measured": 714.487674,
       "verdict": "pass",
       "enforced": true
     },
@@ -1866,7 +2014,7 @@
       "baseline": "about 6.5 s",
       "platforms": null,
       "floor": 50,
-      "measured": 0.011672,
+      "measured": 0.010183000000000001,
       "verdict": "pass",
       "enforced": true
     },
@@ -1894,7 +2042,7 @@
       "baseline": "no watch op",
       "platforms": null,
       "floor": 1500,
-      "measured": 1008.3174100000001,
+      "measured": 1034.276299,
       "verdict": "pass",
       "enforced": true
     },
@@ -1908,7 +2056,7 @@
       "baseline": "head-of-line blocking",
       "platforms": null,
       "floor": 50,
-      "measured": 0.439524,
+      "measured": 0.287898,
       "verdict": "pass",
       "enforced": true
     },
@@ -1922,7 +2070,7 @@
       "baseline": "head-of-line blocking (CCR-WP1.9-3)",
       "platforms": null,
       "floor": 50,
-      "measured": 1.316073,
+      "measured": 1.342784,
       "verdict": "pass",
       "enforced": true
     },
@@ -1936,7 +2084,7 @@
       "baseline": "JSON+hex request/response",
       "platforms": null,
       "floor": 300,
-      "measured": 4502.937188093821,
+      "measured": 4371.824492832497,
       "verdict": "pass",
       "enforced": true
     },
@@ -1950,7 +2098,7 @@
       "baseline": "lane-wide resets, 30 s backoff",
       "platforms": null,
       "floor": 45000,
-      "measured": 688.307212,
+      "measured": 759.281599,
       "verdict": "pass",
       "enforced": true
     },
@@ -1992,7 +2140,7 @@
       "baseline": "locks held 23-41 s",
       "platforms": null,
       "floor": 100,
-      "measured": 1.354891,
+      "measured": 0.855705,
       "verdict": "pass",
       "enforced": true
     },
@@ -2006,7 +2154,7 @@
       "baseline": "5 s poll",
       "platforms": null,
       "floor": 1000,
-      "measured": 7.409488,
+      "measured": 129.519455,
       "verdict": "pass",
       "enforced": true
     },
@@ -2020,7 +2168,7 @@
       "baseline": "Shutdown aborts on the first busy folder",
       "platforms": null,
       "floor": 30000,
-      "measured": 474.621738,
+      "measured": 473.34749700000003,
       "verdict": "pass",
       "enforced": true
     },
@@ -2034,7 +2182,7 @@
       "baseline": "engine held for seconds",
       "platforms": null,
       "floor": 50,
-      "measured": 14.036171999999999,
+      "measured": 15.023385000000001,
       "verdict": "pass",
       "enforced": true
     },
@@ -2048,7 +2196,7 @@
       "baseline": "blanked (busy/stale)",
       "platforms": null,
       "floor": 20,
-      "measured": 3.100396,
+      "measured": 4.213425,
       "verdict": "pass",
       "enforced": true
     },
@@ -2062,7 +2210,7 @@
       "baseline": "unbounded startup drain",
       "platforms": null,
       "floor": 3000,
-      "measured": 108.086836,
+      "measured": 198.53583999999998,
       "verdict": "pass",
       "enforced": true
     },
@@ -2076,7 +2224,7 @@
       "baseline": "full O(N^2) derivation under the lock",
       "platforms": null,
       "floor": 50,
-      "measured": 3.675616,
+      "measured": 4.9582690000000005,
       "verdict": "pass",
       "enforced": true
     },
@@ -2104,7 +2252,7 @@
       "baseline": "1.13 s @6.4K",
       "platforms": null,
       "floor": 10,
-      "measured": 0.0,
+      "measured": 1.0,
       "verdict": "pass",
       "enforced": true
     },
@@ -2146,7 +2294,7 @@
       "baseline": "lane-wide resets, 30 s backoff",
       "platforms": null,
       "floor": 2000,
-      "measured": 1.1147980000000004,
+      "measured": 1.568456999999995,
       "verdict": "pass",
       "enforced": true
     },
@@ -2176,7 +2324,7 @@
         "windows"
       ],
       "floor": 100,
-      "measured": 629.5056621870389,
+      "measured": 132.79949533950779,
       "verdict": "pass",
       "enforced": false
     },
@@ -2192,7 +2340,7 @@
         "windows"
       ],
       "floor": 300,
-      "measured": 2495.7142427644862,
+      "measured": 348.42906095482846,
       "verdict": "pass",
       "enforced": false
     },
@@ -2206,7 +2354,7 @@
       "baseline": "2.0 MiB/s",
       "platforms": null,
       "floor": 40,
-      "measured": 318.82946663328636,
+      "measured": 93.02994599220618,
       "verdict": "pass",
       "enforced": true
     },
@@ -2220,7 +2368,7 @@
       "baseline": "not measured",
       "platforms": null,
       "floor": 0.8,
-      "measured": 0.9306495495572736,
+      "measured": 0.9789599498007424,
       "verdict": "pass",
       "enforced": true
     },
@@ -2236,8 +2384,8 @@
         "windows"
       ],
       "floor": 300,
-      "measured": 1131.033257496315,
-      "verdict": "pass",
+      "measured": 219.22608042706054,
+      "verdict": "fail",
       "enforced": false
     },
     {
@@ -2250,7 +2398,7 @@
       "baseline": "hours",
       "platforms": null,
       "floor": 60,
-      "measured": 6.932167699,
+      "measured": 12.877756385,
       "verdict": "pass",
       "enforced": true
     },
@@ -2264,7 +2412,7 @@
       "baseline": "0-byte bulk rounds",
       "platforms": null,
       "floor": 1,
-      "measured": 162.0,
+      "measured": 11.0,
       "verdict": "pass",
       "enforced": true
     },
@@ -2278,7 +2426,7 @@
       "baseline": "up to 2x",
       "platforms": null,
       "floor": 1.1,
-      "measured": 1.0018819868564606,
+      "measured": 1.00205796957016,
       "verdict": "pass",
       "enforced": true
     },
@@ -2292,7 +2440,7 @@
       "baseline": "slow path",
       "platforms": null,
       "floor": 180,
-      "measured": 3.120278962,
+      "measured": 3.650324084,
       "verdict": "pass",
       "enforced": true
     },
@@ -2306,7 +2454,7 @@
       "baseline": "251 KB @6.4K",
       "platforms": null,
       "floor": 4096,
-      "measured": 2646.5824372759857,
+      "measured": 1911.4049429657794,
       "verdict": "pass",
       "enforced": true
     },
@@ -2348,7 +2496,7 @@
       "baseline": "15.9 s @2K",
       "platforms": null,
       "floor": 5,
-      "measured": 0.6603907595,
+      "measured": 1.1881066745,
       "verdict": "pass",
       "enforced": true
     },
@@ -2362,7 +2510,7 @@
       "baseline": "218 s @6.4K",
       "platforms": null,
       "floor": 5,
-      "measured": 0.7043655076562501,
+      "measured": 1.13941506640625,
       "verdict": "pass",
       "enforced": true
     },
@@ -2376,7 +2524,7 @@
       "baseline": "slow path",
       "platforms": null,
       "floor": 100,
-      "measured": 1.460996509,
+      "measured": 1.7576581065,
       "verdict": "pass",
       "enforced": true
     },
@@ -2406,8 +2554,8 @@
         "windows"
       ],
       "floor": 300,
-      "measured": 1348.9693192160732,
-      "verdict": "pass",
+      "measured": 195.933994581332,
+      "verdict": "fail",
       "enforced": false
     },
     {
@@ -2420,7 +2568,7 @@
       "baseline": "2.0 MiB/s",
       "platforms": null,
       "floor": 40,
-      "measured": 444.5789942316765,
+      "measured": 107.50695509316817,
       "verdict": "pass",
       "enforced": true
     },
@@ -2434,7 +2582,7 @@
       "baseline": "minutes",
       "platforms": null,
       "floor": 10000,
-      "measured": 1998.834846,
+      "measured": 2202.8307489999997,
       "verdict": "pass",
       "enforced": true
     },
@@ -2448,7 +2596,7 @@
       "baseline": "locks held 23-41 s",
       "platforms": null,
       "floor": 100,
-      "measured": 2.554517,
+      "measured": 1.209629,
       "verdict": "pass",
       "enforced": true
     },
@@ -2462,11 +2610,76 @@
       "baseline": "4 sweeps + 2 parses per 500 ms per lane x repo",
       "platforms": null,
       "floor": 1,
-      "measured": 18.333333333333332,
-      "verdict": "fail",
+      "measured": 0.36666666666666664,
+      "verdict": "pass",
+      "enforced": true
+    },
+    {
+      "id": "seal_bytes_reduction_150k",
+      "wave": 4,
+      "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+      "metric": "seal_bytes_reduction",
+      "op": ">=",
+      "unit": "x",
+      "baseline": "WP3.INT: each seal rewrote the whole projection (about 14 GB of seals for a 150K catch-up)",
+      "platforms": null,
+      "floor": 10,
+      "measured": 72.28942711824193,
+      "verdict": "pass",
+      "enforced": true
+    },
+    {
+      "id": "seal_max_ms_150k",
+      "wave": 4,
+      "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+      "metric": "max_seal_ms",
+      "op": "<",
+      "unit": "ms",
+      "baseline": "WP3.INT: 2.9 s per seal at 150K entries",
+      "platforms": null,
+      "floor": 50,
+      "measured": 16.92,
+      "verdict": "pass",
+      "enforced": true
+    },
+    {
+      "id": "seal_after_other_branch_gap",
+      "wave": 4,
+      "scenario": "qual_wp4_4_seal::seal_after_other_branch_gap",
+      "metric": "seal_ms",
+      "op": "<",
+      "unit": "ms",
+      "baseline": "WP3.INT: 355 ms after a 150K-commit gap",
+      "platforms": null,
+      "floor": 50,
+      "measured": 0.204,
+      "verdict": "pass",
+      "enforced": true
+    },
+    {
+      "id": "restart_rows_vs_inline_50k",
+      "wave": 4,
+      "scenario": "qual_wp4_4_seal::restart_50k_rows_vs_inline",
+      "metric": "restart_rows_vs_inline",
+      "op": "<=",
+      "unit": "ratio",
+      "baseline": "WP3.INT's inline layout (1.0 by definition)",
+      "platforms": null,
+      "floor": 1.15,
+      "measured": 0.99259420467229,
+      "verdict": "pass",
       "enforced": true
     }
   ],
-  "run_dir": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-2/test-runs/qualify-all-linux-20261016-092404",
-  "merged_from": null
+  "run_dir": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-062706",
+  "merged_from": {
+    "generated_at": "2026-10-17T06:21:49-0300",
+    "git": {
+      "commit": "2a7d96b61323cf585dc25720fb6c11cea67caceb",
+      "branch": "revamp/wp4-int",
+      "dirty": false,
+      "dirty_paths": []
+    },
+    "run_dir": "/mnt/c/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int/test-runs/qualify-all-linux-20261017-052806"
+  }
 }
