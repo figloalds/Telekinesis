@@ -53,8 +53,9 @@
 //! peek and the upgrade) within [`UPGRADE_BUDGET`] (a watchdog), and at most
 //! [`MAX_PREAUTH_CONNECTIONS`] of them at once (the oldest is closed for a
 //! new one), so connections that never present the token cannot exhaust the
-//! worker's threads (a crash-restart loop through the accept-error exit). `worker::run` also puts it in
-//! `worker.json` and the Ready line ([`RpcServer::token`]). Clients of this
+//! worker's threads (a crash-restart loop through the accept-error exit).
+//! `worker::run` also puts it in `worker.json` and the Ready line
+//! ([`RpcServer::token`]). Clients of this
 //! process find it through `ws::tokens` (the server remembers its own
 //! address there); `runtime::rpc` and `runtime::connect_worker` read the file.
 use super::{
@@ -552,9 +553,6 @@ impl Core {
         std::process::exit(crate::model::ipc::EXIT_INTERNAL)
     }
 
-    /// One connection: a v3 loopback session ([`Core::serve_session`]), or
-    /// the JSON RPC's persistent request loop. Notifications are delivered by
-    /// the notifier thread, never on the reply path.
     /// Registers connection `id` in its pre-auth phase; when
     /// [`MAX_PREAUTH_CONNECTIONS`] are already there, the oldest is closed
     /// (its thread sees its socket shut down and ends).
@@ -584,8 +582,10 @@ impl Core {
 
     /// One connection: its pre-auth phase (the upgrade peek, then the JSON
     /// RPC or loopback session upgrade with the token) within
-    /// [`UPGRADE_BUDGET`] (a watchdog; no watchdog, no connection), then its
-    /// requests.
+    /// [`UPGRADE_BUDGET`] (a watchdog; no watchdog, no connection), then a v3
+    /// loopback session ([`Core::serve_session`]) or the JSON RPC's
+    /// persistent request loop. Notifications are delivered by the notifier
+    /// thread, never on the reply path.
     fn serve(self: Arc<Self>, id: u64, stream: TcpStream) {
         let slot = PreauthSlot { core: &self, id };
         let Ok(watchdog) = crate::ws::watchdog::Watchdog::start(&stream) else {
