@@ -1752,6 +1752,117 @@ fn force_stop_kills_a_stalled_or_endlessly_busy_engine() {
     );
 }
 
+/// WP4.INT confirmation review (blocker): the README's remedy for `Stop
+/// blocked — files open` is a ForceStop, which reuses the blocked graceful
+/// stop's plan. The patience was measured from that plan's start (the first
+/// graceful Stop), so after a graceful stop blocked for 120 s or more the
+/// force stop killed the worker at its first exit wait, behind a fresh
+/// heartbeat of a busy, non-stalled engine, and lost every unsaved session
+/// the stop's retain was waiting for (invariant 8). The patience now runs
+/// from the force stop: no kill while the engine stays busy, and the bound
+/// still holds, counted from the ForceStop.
+#[test]
+fn force_stop_after_a_long_blocked_stop_still_waits_for_a_busy_engine() {
+    use tkfs::orchestrator::folder::FORCE_STOP_ENGINE_PATIENCE;
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .limits(|limits| {
+            limits.stop_graceful = Duration::from_millis(100);
+            limits.stop_exit_wait = Duration::from_millis(400);
+        })
+        .behavior(|b| {
+            b.stop = StopB::Busy;
+            b.force = StopB::Hang;
+        })
+        .start();
+    env.running("a");
+    let view = env
+        .registry
+        .request(
+            "a",
+            FolderCmd::Stop {
+                mode: StopMode::Graceful,
+            },
+            Duration::from_secs(10),
+        )
+        .unwrap();
+    assert!(
+        matches!(view.phase, FolderPhase::StopBlocked { .. }),
+        "{view:#?}"
+    );
+    // Blocked (open files) for longer than the patience, retried every 2 s.
+    let mut blocked_for = Duration::ZERO;
+    while blocked_for < FORCE_STOP_ENGINE_PATIENCE + Duration::from_secs(10) {
+        env.advance(Duration::from_secs(2));
+        blocked_for += Duration::from_secs(2);
+        thread::sleep(Duration::from_millis(60));
+    }
+    assert!(
+        matches!(env.view("a").phase, FolderPhase::StopBlocked { .. }),
+        "{:#?}",
+        env.view("a")
+    );
+    assert!(
+        env.log.count("rpc:stop:graceful") >= 10,
+        "{:?}",
+        env.log.all()
+    );
+    assert_eq!(env.kills(), 0);
+    // A long save holds the engine; the user force-stops.
+    {
+        let worker = env.worker("a");
+        let mut hb = worker.hb.lock().unwrap();
+        hb.hold_ms = 30_000;
+        hb.stalled = false;
+    }
+    thread::sleep(Duration::from_millis(150));
+    env.registry.send("a", FolderCmd::ForceStop).unwrap();
+    env.wait_view("a", "await exit", |v| {
+        matches!(
+            v.phase,
+            FolderPhase::Stopping {
+                stage: StopStage::AwaitExit,
+                ..
+            }
+        )
+    });
+    let mut since_force = Duration::ZERO;
+    for _ in 0..40 {
+        env.advance(Duration::from_millis(500));
+        since_force += Duration::from_millis(500);
+        // A heartbeat (every 50 ms) arrives before the next step.
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            env.kills(),
+            0,
+            "killed behind a busy engine {since_force:?} after the force stop's exit wait \
+             began: {:?}",
+            env.log.all()
+        );
+    }
+    assert!(env.worker("a").alive());
+    // The bound runs from the ForceStop, not from the blocked graceful stop.
+    let started = Instant::now();
+    while env.kills() == 0 {
+        assert!(
+            started.elapsed() < WAIT,
+            "never killed: {:?}",
+            env.log.all()
+        );
+        env.advance(Duration::from_secs(1));
+        since_force += Duration::from_secs(1);
+        thread::sleep(Duration::from_millis(60));
+    }
+    assert!(
+        since_force >= FORCE_STOP_ENGINE_PATIENCE,
+        "killed {since_force:?} after the force stop"
+    );
+    assert!(
+        since_force <= FORCE_STOP_ENGINE_PATIENCE + Duration::from_secs(5),
+        "{since_force:?}"
+    );
+}
+
 #[test]
 fn starting_worker_is_killed_directly_on_stop() {
     let env = EnvBuilder::new()
