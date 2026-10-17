@@ -1001,12 +1001,17 @@ impl Store {
                     })?,
                     None => None,
                 };
-                let (projection, delta) = match appended {
+                let (projection, delta, carried) = match appended {
                     Some(appended) => (
                         appended.projection,
                         Some((appended.changed, appended.lists)),
+                        Some(appended.carried),
                     ),
-                    None => (derive::timed("s.project", || project(branch, events))?, None),
+                    None => (
+                        derive::timed("s.project", || project(branch, events))?,
+                        None,
+                        None,
+                    ),
                 };
                 if delta.is_some() && derive::checks_projections() {
                     // The commit checks (and verify mode) compare it with
@@ -1029,6 +1034,7 @@ impl Store {
                         events,
                         new_event: Some(&event.id),
                         reviewed: &reviewed,
+                        stored: carried.as_ref(),
                     })
                 })?;
                 Ok::<_, anyhow::Error>(Some((projection, derived, delta)))

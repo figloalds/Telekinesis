@@ -9,7 +9,9 @@
 //!   the activation backlog has no upward trend over the second half of the
 //!   edit phase, and the replicas converge.
 //! - (c) `event_cost_5k_1k`: CPU per concurrent namespace event on a store with
-//!   5K events and at least 1K open conflicts.
+//!   5K events and at least 1K open conflicts (WP1.7's
+//!   `concurrent_namespace_ops_5k` with 1K unresolved name collisions);
+//!   `event_cost_storm_5k_1k` measures the same on a conflict-storm store.
 //! - (d) `rebuild_9k_conflicts`: a full rebuild (startup reconstruction and
 //!   the oracle) of a store with at least 9K open conflicts.
 //!
@@ -254,44 +256,24 @@ fn fixture(name: &str, work: &Path, build: impl FnOnce(&Path)) -> PathBuf {
     root
 }
 
-/// (c) CPU per concurrent namespace event at 5K events and 1K open conflicts.
-/// A store-level storm builds the history (both replicas converged), B makes
-/// three unseen local edits on the shared pool, A makes 60 namespace
-/// operations (creates, renames, deletes) on it, and B receives them one per
-/// page: each is concurrent with B's edits, so each takes the slow path.
-#[test]
-#[ignore = "WP5.1"]
-fn event_cost_5k_1k() {
-    let mut s = Scenario::with_budget(FILE, "event_cost_5k_1k", budget_or(1800));
-    let work = tempfile::tempdir().unwrap();
-    let root = fixture("event_cost_5k_1k", work.path(), |root| {
-        let mut storm = storm::Storm::create(root, 51, 40, 0.15);
-        storm.run_until(|st| storm::events(&st.a) >= 5000 && storm::unresolved(&st.a) >= 1000);
-        storm.converge();
-    });
-    let mut storm = storm::Storm::open(&root, 52, 40, 0.15);
-    let (events, unresolved) = (storm::events(&storm.b), storm::unresolved(&storm.b));
-    s.check(events >= 5000, format!("{events} events"));
-    s.check(unresolved >= 1000, format!("{unresolved} open conflicts"));
-    // Three unseen local edits on B (refused operations commit nothing).
-    let seen = storm.b.shared_event_inventory().unwrap().len();
-    while storm.b.shared_event_inventory().unwrap().len() < seen + 3 {
-        storm.op(1, storm::Ops::Namespace);
-    }
-    let before = storm.a.shared_event_inventory().unwrap();
-    while storm.a.shared_bundle(&before).unwrap().events.len() < 60 {
-        storm.op(0, storm::Ops::Namespace);
-    }
-    let mut bundle = storm.a.shared_bundle(&before).unwrap();
-    causal_sort(&mut bundle.events);
+/// Delivers `bundle`'s events to `b` one per page (each with the objects it
+/// references) and records the CPU and wall time of each receive, the slow
+/// commits and the derivations, as `scenario`'s metrics; then the oracle.
+fn measure_deliveries(
+    s: &mut Scenario,
+    b: &mut Store,
+    allowed: &std::collections::BTreeSet<String>,
+    bundle: &tkfs::core::Bundle,
+    shape: serde_json::Value,
+) {
     let start = thread_derive_counters();
-    let slow_before = storm.b.commit_path_counters().slow;
+    let slow_before = b.commit_path_counters().slow;
     let phases_before = tkfs::core::derive::thread_phase_micros();
-    let loads_before = storm.b.view_loads();
+    let loads_before = b.view_loads();
     s.measure_from_now();
     let mut cpu = vec![];
     let mut wall = vec![];
-    for event in bundle.events.iter().take(60) {
+    for event in &bundle.events {
         let referenced = event.objects();
         let page = tkfs::core::Bundle {
             repo: bundle.repo.clone(),
@@ -305,23 +287,32 @@ fn event_cost_5k_1k() {
                 .collect(),
         };
         let (c0, t0) = (cpu_ms(), Instant::now());
-        storm.b.receive(page, &storm.allowed).unwrap();
+        b.receive(page, allowed).unwrap();
         cpu.push(cpu_ms() - c0);
         wall.push(t0.elapsed().as_secs_f64() * 1000.0);
         if s.over_budget() {
-            s.timeout(format!("{} of 60 events in budget", cpu.len()));
+            s.timeout(format!(
+                "{} of {} events in budget",
+                cpu.len(),
+                bundle.events.len()
+            ));
             break;
         }
     }
-    let slow = storm.b.commit_path_counters().slow - slow_before;
-    let summary = summarize(&cpu);
+    let slow = b.commit_path_counters().slow - slow_before;
+    let mut extra = shape;
+    extra["delivered"] = json!(cpu.len());
+    extra["slow_commits"] = json!(slow);
+    extra["cpu"] = summarize(&cpu).json();
+    extra["wall"] = summarize(&wall).json();
+    extra["derivations"] = since(start);
+    extra["fallback_reasons"] = json!(thread_fallback_reasons());
+    extra["view_loads"] = json!(b.view_loads() - loads_before);
     s.metric_with(
         "cpu_ms_per_event",
         cpu.iter().sum::<f64>() / cpu.len().max(1) as f64,
         "ms",
-        json!({"events": events, "open_conflicts": unresolved, "delivered": cpu.len(),
-            "slow_commits": slow, "cpu": summary.json(), "wall": summarize(&wall).json(),
-            "derivations": since(start), "fallback_reasons": thread_fallback_reasons()}),
+        extra,
     );
     s.metric(
         "wall_ms_per_event",
@@ -342,14 +333,119 @@ fn event_cost_5k_1k() {
             .filter(|p| p.1 > 0)
             .collect();
         phases.sort_by(|a, b| b.2.cmp(&a.2));
-        eprintln!(
-            "PHASES view_loads {} {phases:?}",
-            storm.b.view_loads() - loads_before
-        );
+        eprintln!("PHASES {phases:?}");
     }
-    let (diff, oracle_ms) = time_ms(|| storm.b.verify_derived_state().unwrap());
+    let (diff, oracle_ms) = time_ms(|| b.verify_derived_state().unwrap());
     s.metric("oracle_ms", oracle_ms, "ms");
     s.check(diff.is_empty(), format!("oracle empty: {diff:?}"));
+}
+
+/// (c) CPU per concurrent namespace event at 5K events and 1K open conflicts,
+/// the shape of WP1.7's `concurrent_namespace_ops_5k` with the conflicts
+/// added: A creates 3,000 files, B is its replica, both create the same
+/// 1,000 names concurrently and exchange them (1,000 unresolved name
+/// collisions, 5,000 events); then B makes one unseen local edit, A makes 50
+/// namespace operations (25 directories, 25 renames into them) and B
+/// receives them one per page: each is concurrent with B's edit, so each
+/// takes the slow path.
+#[test]
+#[ignore = "WP5.1"]
+fn event_cost_5k_1k() {
+    let mut s = Scenario::with_budget(FILE, "event_cost_5k_1k", budget_or(1800));
+    let work = tempfile::tempdir().unwrap();
+    let root = fixture("event_cost_5k_1k", work.path(), |root| {
+        let repo = tkfs::core::id();
+        let mut a = Store::open(&root.join("a"), Some(&repo)).unwrap();
+        linear_history(&mut a, 3000).unwrap();
+        let (mut a, mut b) = clone_replica(a, &root.join("b")).unwrap();
+        let allowed = devices([&a, &b]);
+        for store in [&mut a, &mut b] {
+            batched(store, |s| {
+                for i in 0..1000 {
+                    s.create(&format!("c-{i:04}.txt"), "file")?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        sync_into(&a, &mut b, &allowed).unwrap();
+        sync_into(&b, &mut a, &allowed).unwrap();
+    });
+    let mut a = Store::open_existing(&root.join("a")).unwrap();
+    let mut b = Store::open_existing(&root.join("b")).unwrap();
+    let allowed = devices([&a, &b]);
+    let (events, unresolved) = (storm::events(&b), storm::unresolved(&b));
+    s.check(events >= 5000, format!("{events} events"));
+    s.check(unresolved >= 1000, format!("{unresolved} open conflicts"));
+    let lin = b.lookup("lin-000100.txt").unwrap();
+    b.rename(&lin.id, "b-local.txt", false).unwrap();
+    let before = b.shared_event_inventory().unwrap();
+    batched(&mut a, |a| {
+        for i in 0..25 {
+            a.create(&format!("ns-dir-{i:02}"), "directory")?;
+            let file = a.lookup(&format!("lin-{i:06}.txt"))?;
+            a.rename(&file.id, &format!("ns-dir-{i:02}/moved-{i:02}.txt"), false)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let mut bundle = a.shared_bundle(&before).unwrap();
+    causal_sort(&mut bundle.events);
+    s.check(bundle.events.len() == 50, "50 namespace events");
+    measure_deliveries(
+        &mut s,
+        &mut b,
+        &allowed,
+        &bundle,
+        json!({"events": events, "open_conflicts": unresolved}),
+    );
+    s.check(
+        b.lookup("ns-dir-24/moved-24.txt").is_ok() && b.lookup("b-local.txt").is_ok(),
+        "the moves and the local edit are visible",
+    );
+    s.finish();
+}
+
+/// (c'), measured beside (c): the same measurement on a store-level conflict
+/// storm (`storm::Storm`, 40 names in each of 4 directories, an exchange
+/// with probability 0.15 per round) grown to 5K events and 1K open
+/// conflicts, whose shared names make one dependency cone hold most
+/// entries: B makes three unseen local edits on the shared pool, A makes 60
+/// namespace operations (creates, renames, deletes) on it.
+#[test]
+#[ignore = "WP5.1"]
+fn event_cost_storm_5k_1k() {
+    let mut s = Scenario::with_budget(FILE, "event_cost_storm_5k_1k", budget_or(1800));
+    let work = tempfile::tempdir().unwrap();
+    let root = fixture("event_cost_storm_5k_1k", work.path(), |root| {
+        let mut storm = storm::Storm::create(root, 51, 40, 0.15);
+        storm.run_until(|st| storm::events(&st.a) >= 5000 && storm::unresolved(&st.a) >= 1000);
+        storm.converge();
+    });
+    let mut storm = storm::Storm::open(&root, 52, 40, 0.15);
+    let (events, unresolved) = (storm::events(&storm.b), storm::unresolved(&storm.b));
+    s.check(events >= 5000, format!("{events} events"));
+    s.check(unresolved >= 1000, format!("{unresolved} open conflicts"));
+    // Three unseen local edits on B (refused operations commit nothing).
+    let seen = storm.b.shared_event_inventory().unwrap().len();
+    while storm.b.shared_event_inventory().unwrap().len() < seen + 3 {
+        storm.op(1, storm::Ops::Namespace);
+    }
+    let before = storm.a.shared_event_inventory().unwrap();
+    while storm.a.shared_bundle(&before).unwrap().events.len() < 60 {
+        storm.op(0, storm::Ops::Namespace);
+    }
+    let mut bundle = storm.a.shared_bundle(&before).unwrap();
+    causal_sort(&mut bundle.events);
+    bundle.events.truncate(60);
+    let allowed = storm.allowed.clone();
+    measure_deliveries(
+        &mut s,
+        &mut storm.b,
+        &allowed,
+        &bundle,
+        json!({"events": events, "open_conflicts": unresolved}),
+    );
     s.finish();
 }
 
@@ -952,81 +1048,4 @@ fn conflict_storm() {
 #[ignore = "WP5.1"]
 fn fast_two_way_editing() {
     heavy::run("fast_two_way_editing", 10, true);
-}
-
-/// Profiling aid (temporary): the fixed costs of a derivation on a store.
-#[test]
-#[ignore = "WP5.1"]
-fn profile_derivation() {
-    let Ok(dir) = std::env::var("TKFS_WP51_PROFILE_STORE") else {
-        return;
-    };
-    let store = Store::open_existing(Path::new(&dir)).unwrap();
-    let branch = store.active.clone();
-    let events: Vec<tkfs::core::Event> = store
-        .events()
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.branch.id == branch)
-        .collect();
-    for _ in 0..3 {
-        let before = tkfs::core::derive::thread_phase_micros();
-        let (p, ms) = time_ms(|| tkfs::core::derive::project(&branch, &events).unwrap());
-        let now = tkfs::core::derive::thread_phase_micros();
-        let phases: Vec<_> = now
-            .iter()
-            .filter(|(k, _)| k.starts_with("pr."))
-            .map(|(k, (_, m))| (*k, m - before.get(k).map_or(0, |b| b.1)))
-            .collect();
-        eprintln!(
-            "project {ms:.1} ms: {} entries {} conflicts {phases:?}",
-            p.entries.len(),
-            p.conflicts.len()
-        );
-    }
-    let p = tkfs::core::derive::project(&branch, &events).unwrap();
-    let (_, clone_ms) = time_ms(|| p.clone());
-    let (json, json_ms) = time_ms(|| serde_json::to_string(&p.conflicts).unwrap());
-    let (_, all_ms) = time_ms(|| serde_json::to_string(&p).unwrap());
-    let bases: usize = p.conflicts.iter().map(|c| c.bases.len()).sum();
-    eprintln!(
-        "clone {clone_ms:.2} ms, conflicts json {json_ms:.2} ms ({} bytes, {bases} bases), projection json {all_ms:.2} ms",
-        json.len()
-    );
-    let last = events
-        .iter()
-        .max_by_key(|e| e.created_ms)
-        .unwrap()
-        .id
-        .clone();
-    let mut ordered: Vec<tkfs::core::Event> =
-        events.iter().filter(|e| e.id != last).cloned().collect();
-    ordered.push(events.iter().find(|e| e.id == last).unwrap().clone());
-    for _ in 0..3 {
-        let before = tkfs::core::derive::thread_phase_micros();
-        let (out, ms) = time_ms(|| {
-            tkfs::core::derive::derive_conflicts(&tkfs::core::derive::DeriveInput {
-                branch: &branch,
-                projection: &p,
-                events: &ordered,
-                new_event: Some(&last),
-                reviewed: &[],
-            })
-            .unwrap()
-        });
-        let now = tkfs::core::derive::thread_phase_micros();
-        let mut phases: Vec<_> = now
-            .iter()
-            .map(|(k, (c, m))| {
-                let (c0, m0) = before.get(k).copied().unwrap_or((0, 0));
-                (*k, c - c0, (m - m0) / 1000)
-            })
-            .filter(|p| p.1 > 0)
-            .collect();
-        phases.sort_by(|a, b| b.2.cmp(&a.2));
-        eprintln!(
-            "derive {ms:.1} ms ({} rows): {phases:?}",
-            out.conflicts().len()
-        );
-    }
 }
