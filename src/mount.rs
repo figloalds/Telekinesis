@@ -358,8 +358,18 @@ pub unsafe extern "C" fn tk_call(
             )?,
             // A flush (`FlushFileBuffers`) and a rename wait for the save; so
             // does a delete-on-close cleanup (the save comes before the delete).
-            7 | 12 => crate::runtime::engine::save_handle(engine, h)?,
-            9 if flags & 1 != 0 => crate::runtime::engine::save_handle(engine, h)?,
+            7 => crate::runtime::engine::save_handle(engine, h)?,
+            12 => {
+                crate::runtime::engine::save_handle(engine, h)?;
+                if flags & 1 != 0 {
+                    // The file a rename replaces is final first.
+                    crate::runtime::engine::settle_path(engine, &path)?;
+                }
+            }
+            9 if flags & 1 != 0 => {
+                crate::runtime::engine::save_handle(engine, h)?;
+                crate::runtime::engine::settle_handle(engine, h)?;
+            }
             9 => {
                 // The application's close: the save goes on in the background
                 // (`save_handle_in_background`, durable before a stop).
@@ -563,9 +573,10 @@ pub fn dispatcher_threads() -> u32 {
         .clamp(8, 64) as u32
 }
 fn content_wait() -> crate::runtime::content::ContentWait {
+    let (stall, bound) = crate::runtime::content::wait_bounds(CONTENT_STALL, CONTENT_BOUND);
     crate::runtime::content::ContentWait {
-        stall: CONTENT_STALL,
-        bound: CONTENT_BOUND,
+        stall,
+        bound,
         slots: Some(&CONTENT_WAITERS),
         cancelled: adapter::fenced,
     }
