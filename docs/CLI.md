@@ -357,7 +357,7 @@ tkfs -C D:\Work\Projects stop --force
 
 | Command | Effect |
 |---|---|
-| `status` | The worker's status: metadata and content counters (`metadata_caught_up`, `content_complete` and the per-peer observations are separate claims), up to 20 current files with missing bytes, activation, inbox, mount and store health. |
+| `status` | The worker's status: metadata and content counters (`content_complete` and the per-peer feed state `feed_peers`, each with its `caught_up`, cursor and the peer's tip, are separate claims), up to 20 current files with missing bytes, activation, inbox, mount and store health. `caught_up` and `metadata_caught_up` at the top are the previous release's lane observations and stay `false` on this release's peer path; `manage status` shows each folder's sync with each peer. |
 | `branches`, `conflicts`, `state`, `events`, `history` | Read the branches, unresolved conflicts, current projection, journal and checkpoints. |
 | `branch NAME`, `checkout NAME` | Create a private branch; switch the mount to a branch (refused while files are open). |
 | `publish NAME --current-state-only` | Publish only the visible state as a new shared branch; private history stays here. |

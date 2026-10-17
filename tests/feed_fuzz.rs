@@ -107,6 +107,11 @@ struct Fuzz {
     log: Vec<String>,
     stats: BTreeMap<&'static str, usize>,
     serial: usize,
+    /// An exchange since the flag was last cleared did something: entries,
+    /// needs or served events either way, a cursor mismatch or reset, a
+    /// probe page or a missing cursor (a side about to re-read the other).
+    /// `converge` stops only after rounds in which no exchange did.
+    moved: bool,
     /// Apply kept replies again (`TKFS_FEED_STALE_REPLIES=1`): off by
     /// default, since the session layer delivers each reply once, to its own
     /// request, and the orchestrator never replays `feed-apply` (invariant
@@ -165,6 +170,7 @@ impl Fuzz {
             log: Vec::new(),
             stats: BTreeMap::new(),
             serial: 0,
+            moved: false,
             stale_replies: std::env::var("TKFS_FEED_STALE_REPLIES").as_deref() == Ok("1"),
         };
         let routes = fuzz.routes.clone();
@@ -174,7 +180,13 @@ impl Fuzz {
     }
 
     fn fail(&self, what: impl AsRef<str>) -> ! {
-        let tail: Vec<&String> = self.log.iter().rev().take(40).collect();
+        // `TKFS_FEED_FULL_LOG=1`: every step, not the last 40.
+        let keep = if std::env::var("TKFS_FEED_FULL_LOG").as_deref() == Ok("1") {
+            usize::MAX
+        } else {
+            40
+        };
+        let tail: Vec<&String> = self.log.iter().rev().take(keep).collect();
         panic!(
             "feed fuzz seed {}: {}\nlast steps (newest first):\n{:#?}",
             self.seed,
@@ -339,11 +351,71 @@ impl Fuzz {
             self.fail(format!("r{dialer} apply_exchange_reply: {error:#}"));
         }
         self.count("exchange");
+        use tkfs::model::protocol::feed::PageStatus;
+        self.moved |= !request.page.entries.is_empty()
+            || !reply.page.entries.is_empty()
+            || !request.need.is_empty()
+            || !request.need_served.is_empty()
+            || !reply.need_served.is_empty()
+            || !reply.unknown.is_empty()
+            || reply.page_status != PageStatus::Accepted
+            || request.page.reset
+            || reply.page.reset
+            || request.page.after.is_none()
+            || request.cursor.is_none()
+            || reply.cursor.epoch.is_empty();
         self.log.push(format!(
             "exchange r{dialer}->r{acceptor}: {} up, {} down",
             request.page.entries.len(),
             reply.page.entries.len()
         ));
+        if std::env::var("TKFS_FEED_TRACE").as_deref() == Ok("1") {
+            // Every id moved (8 characters; `+` with its payload).
+            let short = |id: &str| id.chars().take(8).collect::<String>();
+            let entries = |page: &tkfs::model::protocol::feed::FeedPage| {
+                page.entries
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{}{}",
+                            short(&e.id),
+                            if e.event.is_some() { "+" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let events = |list: &[tkfs::core::Event]| {
+                list.iter()
+                    .map(|e| short(&e.id))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            self.log.push(format!(
+                "  up [after {:?} reset {}]: {} | cursor {:?} | need [{}] | served [{}]",
+                request.page.after.as_ref().map(|c| c.seq),
+                request.page.reset,
+                entries(&request.page),
+                request.cursor.as_ref().map(|c| c.seq),
+                request
+                    .need
+                    .iter()
+                    .map(|id| short(id))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                events(&request.need_served),
+            ));
+            self.log.push(format!(
+                "  down [{:?} after {:?} reset {}]: {} | cursor {} | served [{}] | unknown {}",
+                reply.page_status,
+                reply.page.after.as_ref().map(|c| c.seq),
+                reply.page.reset,
+                entries(&reply.page),
+                reply.cursor.seq,
+                events(&reply.need_served),
+                reply.unknown.len(),
+            ));
+        }
         if self.rng.gen_bool(0.1) {
             self.kept.push(Kept {
                 dialer,
@@ -565,6 +637,7 @@ impl Fuzz {
                     )
                 })
                 .collect();
+            self.moved = false;
             for &(dialer, acceptor) in &routes {
                 self.exchange(dialer, acceptor, 0);
             }
@@ -584,7 +657,10 @@ impl Fuzz {
                     )
                 })
                 .collect();
-            quiet_rounds = if activated == 0 && before == after {
+            // A round whose exchanges only re-synchronized cursors (a probe
+            // after a restore) changes no inventory, but the next one moves
+            // events (WP4.INT: seed 10631 stopped there).
+            quiet_rounds = if activated == 0 && before == after && !self.moved {
                 quiet_rounds + 1
             } else {
                 0
@@ -615,8 +691,35 @@ impl Fuzz {
                 self.fail(format!("r{r} left rows staged"));
             }
             if s.outgoing_unacknowledged().unwrap() != 0 {
+                let devices: Vec<String> = self.replicas.iter().map(Replica::device).collect();
+                let name = |device: &str| {
+                    devices
+                        .iter()
+                        .position(|d| d == device)
+                        .map_or(device.to_owned(), |i| format!("r{i}"))
+                };
+                let authors: BTreeMap<String, String> = s
+                    .events()
+                    .unwrap()
+                    .into_iter()
+                    .map(|e| (e.id, name(&e.device)))
+                    .collect();
+                let rows: Vec<String> =
+                    s.db.prepare("SELECT event FROM outbox WHERE acknowledged=0")
+                        .unwrap()
+                        .query_map([], |row| row.get(0))
+                        .unwrap()
+                        .collect::<rusqlite::Result<_>>()
+                        .unwrap();
+                let unacked: Vec<(String, String)> = rows
+                    .into_iter()
+                    .map(|id| {
+                        let author = authors.get(&id).cloned().unwrap_or_default();
+                        (id, author)
+                    })
+                    .collect();
                 self.fail(format!(
-                    "r{r} has {} unacknowledged outbox rows",
+                    "r{r} has {} unacknowledged outbox rows (id, author): {unacked:?}",
                     s.outgoing_unacknowledged().unwrap()
                 ));
             }
@@ -626,8 +729,26 @@ impl Fuzz {
                 let (sx, sy) = (self.replicas[x].get(), self.replicas[y].get());
                 let known = sx.known_by_peer(&sy.device).unwrap();
                 if known != shared {
+                    // Which ones, and whose (the replica that authored each).
+                    let devices: Vec<String> = self.replicas.iter().map(Replica::device).collect();
+                    let authors: BTreeMap<String, String> = sx
+                        .events()
+                        .unwrap()
+                        .into_iter()
+                        .map(|e| {
+                            let author = devices
+                                .iter()
+                                .position(|d| *d == e.device)
+                                .map_or(e.device.clone(), |i| format!("r{i}"));
+                            (e.id, author)
+                        })
+                        .collect();
+                    let missing: Vec<(String, String)> = shared
+                        .difference(&known)
+                        .map(|id| (id.clone(), authors.get(id).cloned().unwrap_or_default()))
+                        .collect();
                     self.fail(format!(
-                        "r{x} has evidence of {} of r{y}'s {} shared events",
+                        "r{x} has evidence of {} of r{y}'s {} shared events; missing (id, author): {missing:?}",
                         known.len(),
                         shared.len()
                     ));
@@ -696,6 +817,18 @@ fn run_seeds(seeds: impl Iterator<Item = u64>, steps: std::ops::RangeInclusive<u
 #[test]
 fn fuzz_seeds_debug() {
     run_seeds(0..8, 40..=80);
+}
+
+/// Seeds the release run found (WP4.INT), kept in the debug suite: 10023
+/// (an entry a peer's feed listed while we lacked the event became evidence
+/// only once `Store`'s receiver kept it, `evidence_from_needs`; it failed
+/// before with a short known set) and 10631 (the convergence loop stopped
+/// after a round that only re-synchronized cursors; a harness fix).
+#[test]
+fn seeds_found_by_the_release_run() {
+    for seed in [10023, 10631] {
+        run_seed(seed, 100..=200);
+    }
 }
 
 /// Qualification: `cargo test --release --test feed_fuzz -- --ignored`.

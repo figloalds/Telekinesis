@@ -25,8 +25,10 @@
 //!
 //! **Acks** (invariant 10): `peer_known(P, id)` is written only for an entry
 //! of P's committed feed (or an event P served from its committed journal
-//! through `need`) whose digest equals our own committed or staged payload,
-//! and `outbox.acknowledged` is set only from `peer_known`, for events we have
+//! through `need`) whose digest equals our own committed or staged payload
+//! (an entry listed while we lacked the event is checked once we hold it:
+//! its `feed_needs` row keeps the digest), and `outbox.acknowledged` is set
+//! only from `peer_known`, for events we have
 //! committed. The cursor never acks; a staged or rejected event never acks;
 //! an outbox row inserted later (a staged event that commits) is acked by the
 //! `feed_outbox_known` trigger when the evidence is already there.
@@ -1750,7 +1752,10 @@ impl Store {
                 received.acked += acked as u32;
             }
             if needed {
-                // Nobody needs to serve an event this replica holds.
+                // What other peers' feeds listed of it while we lacked it is
+                // evidence now (`evidence_from_needs`); then nobody needs to
+                // serve an event this replica holds.
+                self.evidence_from_needs(peer, &id)?;
                 self.db
                     .prepare_cached("DELETE FROM feed_needs WHERE event=?")?
                     .execute([&id])?;
@@ -1783,6 +1788,52 @@ impl Store {
                 code: error.code,
                 class: error.class,
             });
+        }
+        Ok(())
+    }
+    /// Per-id evidence from the other peers' listings of `id`: an elided or
+    /// `large` entry of a peer's (committed) feed that we could not check
+    /// while we lacked the event is a `feed_needs` row with the entry's
+    /// digest; once we hold a payload with that digest (received from
+    /// `from`), that peer committed it too (§6.3.4), so it becomes
+    /// `peer_known` before the row goes. WP4.INT, found by the feed fuzz
+    /// (`tests/feed_fuzz.rs`, seed 10023): the rows were deleted unread, so a
+    /// replica that got an event from one peer after another peer's feed had
+    /// listed it never learned that the other one held it. Its known set of
+    /// that peer stayed short of the shared inventory for good (the legacy
+    /// lanes' `caught_up` check), and its feed kept sending that peer the
+    /// payload instead of eliding it. Outbox acks follow as usual: a staged
+    /// event's row is acked by `feed_outbox_known` when it commits.
+    fn evidence_from_needs(&self, from: &str, id: &str) -> Result<()> {
+        let listed: Vec<(String, String)> = self
+            .db
+            .prepare_cached(
+                "SELECT peer,digest FROM feed_needs WHERE event=?1 AND peer<>?2
+                AND digest IS NOT NULL AND reason IN (?3,?4)",
+            )?
+            .query_map(params![id, from, NEED_LISTED[0], NEED_LISTED[1]], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        if listed.is_empty() {
+            return Ok(());
+        }
+        let Some(held) = self.held(id)? else {
+            return Ok(());
+        };
+        for (peer, digest) in listed {
+            if payload_matches(&held.payload, &digest) {
+                self.db
+                    .prepare_cached("INSERT OR IGNORE INTO peer_known(peer,event) VALUES(?,?)")?
+                    .execute(params![peer, id])?;
+                if held.committed {
+                    self.db
+                        .prepare_cached(
+                            "UPDATE outbox SET acknowledged=1 WHERE event=? AND acknowledged=0",
+                        )?
+                        .execute([id])?;
+                }
+            }
         }
         Ok(())
     }
