@@ -1187,11 +1187,11 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
         let inode = u64_at(p, 16)?;
         // Content waits and saves must not stop the single /dev/fuse reader
         // from serving unrelated lookups and metadata requests: reads,
-        // writes, flushes, fsyncs and size changes run on their own threads
-        // (WP5.2 added the last three: their saves hash and copy without the
-        // engine lock, but they still take time). Bound outstanding requests.
+        // writes, fsyncs and size changes run on their own threads (WP5.2
+        // added the last two: their saves hash and copy without the engine
+        // lock, but they still take time). Bound outstanding requests.
         let size_change = op == 4 && u32_at(p, 40).is_ok_and(|valid| valid & (1 << 3) != 0);
-        if [15, 16, 20, 25].contains(&op) || size_change {
+        if [15, 16, 25].contains(&op) || size_change {
             let body = p[40..].to_vec();
             if content.fetch_add(1, Ordering::Relaxed) >= MAX_THREADED {
                 content.fetch_sub(1, Ordering::Relaxed);
@@ -1223,14 +1223,25 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if [18, 29].contains(&op) {
-                // A release saves without the engine lock first (WP5.2); a
-                // failed save retained the session, and the handle goes.
-                let handle = u64_at(&p[40..], 0)?;
-                if let Err(error) = crate::runtime::engine::save_handle(&engine, handle) {
-                    lock_engine(&engine).release_handle(handle);
-                    return Err(error);
+            match op {
+                // A close(2): the save goes on in the background
+                // (`save_handle_in_background`; an fsync waits for it).
+                20 => {
+                    crate::runtime::engine::save_handle_in_background(
+                        &engine,
+                        u64_at(&p[40..], 0)?,
+                    )?;
+                    return Ok(vec![]);
                 }
+                // The last close: saves without the engine lock what no save
+                // covers yet, then the handle goes (`close_handle`).
+                18 | 29 => {
+                    crate::runtime::engine::close_handle(&engine, u64_at(&p[40..], 0)?)?;
+                    // Qualification hook: a close-path failure after the handle closed.
+                    crate::util::fault::fail("fs.close")?;
+                    return Ok(vec![]);
+                }
+                _ => {}
             }
             let mut e = lock_engine(&engine);
             let result = lock(&fs).dispatch(&mut e, op, inode, &p[40..]);
@@ -1297,7 +1308,7 @@ fn threaded(
             e.publish_observation();
             result
         }
-        20 | 25 => {
+        25 => {
             save_handle(engine, u64_at(body, 0)?)?;
             let mut e = lock_engine(engine);
             let result = lock(fs).dispatch(&mut e, op, inode, body);

@@ -352,13 +352,22 @@ pub unsafe extern "C" fn tk_call(
                 h,
                 Some((offset, flags & 1 != 0)),
             )?,
-            7 | 9 | 12 => crate::runtime::engine::save_handle(engine, h)?,
+            // A flush (`FlushFileBuffers`) and a rename wait for the save; so
+            // does a delete-on-close cleanup (the save comes before the delete).
+            7 | 12 => crate::runtime::engine::save_handle(engine, h)?,
+            9 if flags & 1 != 0 => crate::runtime::engine::save_handle(engine, h)?,
+            9 => {
+                // The application's close: the save goes on in the background
+                // (`save_handle_in_background`, durable before a stop).
+                lock_engine(engine).cleanup_unsaved(h)?;
+                crate::runtime::engine::save_handle_in_background(engine, h)?;
+                return Ok(0);
+            }
             10 => {
-                if let Err(error) = crate::runtime::engine::save_handle(engine, h) {
-                    // The failed save retained the session; the handle goes.
-                    lock_engine(engine).release_handle(h);
-                    return Err(error);
-                }
+                crate::runtime::engine::close_handle(engine, h)?;
+                // Qualification hook: a close-path failure after the handle closed.
+                crate::util::fault::fail("fs.close")?;
+                return Ok(0);
             }
             _ => {}
         }
@@ -430,11 +439,8 @@ pub unsafe extern "C" fn tk_call(
             7 => e.flush(h)?,
             8 => {}
             9 => e.cleanup(h, flags & 1 != 0)?,
-            10 => {
-                e.close(h)?;
-                // Qualification hook: a close-path failure after the handle closed.
-                crate::util::fault::fail("fs.close")?;
-            }
+            // Closed before the lock (`close_handle`).
+            10 => {}
             11 => {
                 let s = e.session(h)?;
                 ensure!(
