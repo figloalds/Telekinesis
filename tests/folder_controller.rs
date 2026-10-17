@@ -303,6 +303,8 @@ fn alive(version: &str) -> AdoptPlan {
 struct HbTemplate {
     branches: u64,
     stalled: bool,
+    /// The engine hold in progress the heartbeat reports (0: unlocked).
+    hold_ms: u64,
     mount: Option<MountStatus>,
 }
 
@@ -382,6 +384,7 @@ impl FakeWorker {
             mount: hb.mount.clone().unwrap_or_default(),
             engine: EngineGauges {
                 stalled: hb.stalled,
+                current_hold_ms: hb.hold_ms,
                 ..EngineGauges::default()
             },
             generations: Generations {
@@ -1650,6 +1653,103 @@ fn acknowledged_stop_that_never_exits_is_killed() {
     env.advance(Duration::from_secs(2));
     env.wait_view("a", "stopped", |v| v.phase == FolderPhase::Stopped);
     assert_eq!(env.kills(), 1);
+}
+
+/// A force-stopped worker whose stop RPC does not come back (its handler
+/// waits for the engine) and whose heartbeat keeps reporting an engine hold
+/// in progress (a long save), not stalled.
+fn force_stop_behind_a_busy_engine(hold_ms: u64, stalled: bool) -> Env {
+    let env = EnvBuilder::new()
+        .folder("a", true)
+        .limits(|limits| {
+            limits.stop_graceful = Duration::from_millis(100);
+            limits.stop_exit_wait = Duration::from_millis(400);
+        })
+        .behavior(|b| b.force = StopB::Hang)
+        .start();
+    env.running("a");
+    {
+        let worker = env.worker("a");
+        let mut hb = worker.hb.lock().unwrap();
+        hb.hold_ms = hold_ms;
+        hb.stalled = stalled;
+    }
+    env.registry.send("a", FolderCmd::ForceStop).unwrap();
+    env.wait_view("a", "await exit", |v| {
+        matches!(
+            v.phase,
+            FolderPhase::Stopping {
+                stage: StopStage::AwaitExit,
+                ..
+            }
+        )
+    });
+    env
+}
+
+/// WP4.INT re-review (the production review's major, invariant 8): a force
+/// stop killed the worker 15 s + 10 s after it was sent whatever the worker
+/// was doing, so a save holding the engine longer than that (a multi-GiB
+/// file) lost every unsaved session the stop's retain was waiting for. Now,
+/// while fresh heartbeats report an engine hold in progress that is not
+/// stalled, the exit wait starts again: 20 s of manual time pass (50 exit
+/// waits) without a kill, and the worker exits by itself once the hold ends.
+#[test]
+fn force_stop_waits_for_a_busy_engine_instead_of_killing() {
+    let env = force_stop_behind_a_busy_engine(30_000, false);
+    for _ in 0..40 {
+        env.advance(Duration::from_millis(500));
+        // A heartbeat (every 50 ms) arrives before the next step.
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            env.kills(),
+            0,
+            "killed behind a busy engine: {:?}",
+            env.log.all()
+        );
+    }
+    assert!(env.worker("a").alive());
+    // The save ends; the stop's retain runs and the worker exits.
+    env.worker("a").hb.lock().unwrap().hold_ms = 0;
+    env.worker("a").exit(Some(0), None);
+    env.wait_view("a", "stopped", |v| v.phase == FolderPhase::Stopped);
+    assert_eq!(env.kills(), 0);
+}
+
+/// The wait has bounds: a stalled engine (a hold beyond the worker's stall
+/// bound) is killed at the exit wait as before, and so is a busy one once
+/// `FORCE_STOP_ENGINE_PATIENCE` has passed since the stop began.
+#[test]
+fn force_stop_kills_a_stalled_or_endlessly_busy_engine() {
+    use tkfs::orchestrator::folder::FORCE_STOP_ENGINE_PATIENCE;
+    let env = force_stop_behind_a_busy_engine(200_000, true);
+    env.advance_until("a", "killed", Duration::from_millis(500), |v| {
+        v.phase == FolderPhase::Stopped
+    });
+    assert_eq!(env.kills(), 1);
+    drop(env);
+
+    let env = force_stop_behind_a_busy_engine(30_000, false);
+    let started = Instant::now();
+    let mut waited = Duration::ZERO;
+    while env.kills() == 0 {
+        assert!(
+            started.elapsed() < WAIT,
+            "never killed: {:?}",
+            env.log.all()
+        );
+        env.advance(Duration::from_secs(1));
+        waited += Duration::from_secs(1);
+        thread::sleep(Duration::from_millis(60));
+    }
+    assert!(
+        waited >= FORCE_STOP_ENGINE_PATIENCE,
+        "killed after {waited:?} of a busy engine"
+    );
+    assert!(
+        waited <= FORCE_STOP_ENGINE_PATIENCE + Duration::from_secs(5),
+        "{waited:?}"
+    );
 }
 
 #[test]

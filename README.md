@@ -642,6 +642,8 @@ its last phase is named.
 because files are open in the mount or unsaved data is pending. Close them
 (the daemon retries every 2 s), or `tkfs manage force-stop STATE`: unsaved
 files go to the folder's pending saves and are committed on its next start.
+While the worker is busy saving a large file, the force stop waits for it
+(up to 2 minutes) rather than kill a worker that still holds unsaved files.
 
 ### Unsaved file that cannot be restored
 
