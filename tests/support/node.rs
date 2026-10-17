@@ -441,18 +441,30 @@ pub struct Control {
 }
 impl Control {
     pub fn call(&self, action: &Value) -> Result<Value> {
-        let bytes = fs::read(self.data_dir.join("orchestrator.json"))
-            .context("ORCHESTRATOR_NOT_RUNNING")?;
-        let discovery: Value = serde_json::from_slice(&bytes)?;
-        let control = discovery["control"]
-            .as_str()
-            .context("INVALID_ORCHESTRATOR_DISCOVERY")?;
+        let read = || -> Result<String> {
+            let bytes = fs::read(self.data_dir.join("orchestrator.json"))
+                .context("ORCHESTRATOR_NOT_RUNNING")?;
+            let discovery: Value = serde_json::from_slice(&bytes)?;
+            Ok(discovery["control"]
+                .as_str()
+                .context("INVALID_ORCHESTRATOR_DISCOVERY")?
+                .to_owned())
+        };
+        let control = read()?;
         let token = self.data_dir.join("orchestrator.token");
         if token.is_file() {
+            let token = fs::read_to_string(token)?;
+            // As `ControlClient` (WP4.INT re-review): the token goes only to
+            // the endpoint the discovery named before and after it was read
+            // (a starting daemon removes a stale discovery before it writes
+            // its token).
+            if read().ok().as_deref() != Some(control.as_str()) {
+                bail!("ORCHESTRATOR_NOT_RUNNING: the discovery changed while the token was read");
+            }
             // WP4.1 local tokens: the same JSON wire with an X-Tkfs-Token upgrade header.
-            return token_call(control, fs::read_to_string(token)?.trim(), action);
+            return token_call(&control, token.trim(), action);
         }
-        let mut socket = ws::connect(control)?;
+        let mut socket = ws::connect(&control)?;
         ws::call(&mut socket, action)
     }
 }

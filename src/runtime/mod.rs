@@ -106,18 +106,28 @@ pub fn worker_token(info: &Discovery) -> Option<String> {
     published_token(info).or_else(|| crate::ws::tokens::lookup_endpoint(&info.address))
 }
 
-/// `STATE/runtime.token` when `STATE/runtime.json` publishes `info.address`.
+/// `STATE/runtime.token` when `STATE/runtime.json` publishes `info.address`
+/// both before and after the token is read (WP4.INT re-review). A new worker
+/// instance removes a stale `runtime.json` before it writes its token
+/// (`server::start_rpc_server`) and publishes its own after, so a read that
+/// finds the new token is followed by a read that finds no discovery or the
+/// new instance's: the token is never handed out for the address of the
+/// instance before it (a freed port another local process may hold).
 fn published_token(info: &Discovery) -> Option<String> {
     if info.state.is_empty() {
         return None;
     }
     let state = std::path::Path::new(&info.state);
-    let published: Value =
-        serde_json::from_slice(&std::fs::read(state.join("runtime.json")).ok()?).ok()?;
-    if published.get("address").and_then(Value::as_str) != Some(info.address.as_str()) {
-        return None;
-    }
-    crate::worker::record::read_token(&crate::worker::record::token_path(state))
+    let publishes = || -> Option<()> {
+        let published: Value =
+            serde_json::from_slice(&std::fs::read(state.join("runtime.json")).ok()?).ok()?;
+        (published.get("address").and_then(Value::as_str) == Some(info.address.as_str()))
+            .then_some(())
+    };
+    publishes()?;
+    let token = crate::worker::record::read_token(&crate::worker::record::token_path(state))?;
+    publishes()?;
+    Some(token)
 }
 
 /// A JSON RPC connection to the worker `info` describes, presenting its token

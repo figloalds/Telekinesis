@@ -15,7 +15,9 @@
 //!    any worker is started or adopted), and the control endpoint's local
 //!    token (`api::install_control_token`, CCR-WP4.1-3: written before
 //!    `orchestrator.json` names the endpoint, required by the control server
-//!    on every upgrade);
+//!    on every upgrade; the previous daemon's `orchestrator.json`, stale
+//!    under the lock just taken, is removed first, so no client pairs the
+//!    new token with the dead daemon's endpoint: WP4.INT re-review);
 //! 3. `FolderRegistry::start` with the real launcher and the limits derived
 //!    from `Config` (the worker version is `worker::version()`,
 //!    CCR-WP1.2-2): every desired folder adopts or starts its worker;
