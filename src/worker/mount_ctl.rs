@@ -641,6 +641,20 @@ pub mod adapter {
     };
 
     static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+    /// A detach or checkout fenced the mount: reads waiting for content end
+    /// (`runtime::content::ContentWait::cancelled`), so the drain is not
+    /// held up by downloads (WP5.2).
+    static FENCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Whether a detach or checkout fenced the mount (lock-free).
+    pub fn fenced() -> bool {
+        FENCED.load(Ordering::SeqCst)
+    }
+
+    /// Sets or lifts the fence seen by [`fenced`] (the adapters' checkout).
+    pub fn set_fenced(fenced: bool) {
+        FENCED.store(fenced, Ordering::SeqCst);
+    }
     static DRAIN: Mutex<()> = Mutex::new(());
     static DRAINED: Condvar = Condvar::new();
     static MOUNT_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -725,6 +739,7 @@ pub mod adapter {
                 let dirty = e.sessions.values().filter(|s| s.dirty).count();
                 if force || (open == 0 && dirty == 0) {
                     e.switching = true;
+                    set_fenced(true);
                     return Ok(());
                 }
                 ensure!(
@@ -739,6 +754,7 @@ pub mod adapter {
     /// Lifts the fence after a refused or failed detach.
     pub fn unfence(engine: &Shared) {
         lock_engine(engine).switching = false;
+        set_fenced(false);
     }
 
     /// Step 3 of a force detach: every dirty session into `pending_saves`.
@@ -779,6 +795,7 @@ pub mod adapter {
         e.notifications.clear();
         e.mounted = false;
         e.switching = false;
+        set_fenced(false);
         e.publish_observation();
     }
 
@@ -798,6 +815,7 @@ pub mod adapter {
         let mut e = lock_engine(engine);
         e.mounted = true;
         e.switching = false;
+        set_fenced(false);
         // A fresh native instance has no cached names to invalidate.
         e.notifications.clear();
         e.publish_observation();

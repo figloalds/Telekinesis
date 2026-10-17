@@ -231,6 +231,8 @@ pub fn bind(engine: &Shared) -> Result<()> {
         );
     }
     *slot = Some(engine.clone());
+    drop(slot);
+    crate::runtime::Engine::adopt_shared(engine);
     Ok(())
 }
 /// `MOUNT_PATH_MUST_NOT_EXIST` unless nothing is at `path`, including a live
@@ -501,6 +503,8 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
             }
         }
         e.switching = true;
+        // Content waits end now (they would hold the drain below).
+        adapter::set_fenced(true);
     }
     adapter::drain(DETACH_DRAIN);
     // Unmounted outside the worker: the checkout still runs, then the mount is
@@ -582,7 +586,10 @@ fn errno(error: &anyhow::Error) -> i32 {
     if text.contains("UNSUPPORTED_FUSE_OPCODE") {
         libc::ENOSYS // Let the kernel fall back (e.g. STATX to GETATTR).
     } else if text.contains("CONTENT_UNAVAILABLE") {
-        libc::EAGAIN
+        // Not EAGAIN (CCR-WP4.INT-2): a blocking read that answers "try
+        // again" is retried in a loop or misreported; the content could not
+        // arrive in time, an I/O error.
+        libc::EIO
     } else if text.contains("FILE_NOT_FOUND") {
         libc::ENOENT
     } else if text.contains("NAME_COLLISION") {
@@ -1178,18 +1185,21 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
         let callback = adapter::callback();
         let unique = u64_at(p, 8)?;
         let inode = u64_at(p, 16)?;
-        // Content waits must not stop the single /dev/fuse reader from serving
-        // unrelated lookups and metadata requests. Bound outstanding requests.
-        if [15, 16].contains(&op) {
+        // Content waits and saves must not stop the single /dev/fuse reader
+        // from serving unrelated lookups and metadata requests: reads,
+        // writes, flushes, fsyncs and size changes run on their own threads
+        // (WP5.2 added the last three: their saves hash and copy without the
+        // engine lock, but they still take time). Bound outstanding requests.
+        let size_change = op == 4 && u32_at(p, 40).is_ok_and(|valid| valid & (1 << 3) != 0);
+        if [15, 16, 20, 25].contains(&op) || size_change {
             let body = p[40..].to_vec();
-            let handle = u64_at(&body, 0)?;
-            if content.fetch_add(1, Ordering::Relaxed) >= 16 {
+            if content.fetch_add(1, Ordering::Relaxed) >= MAX_THREADED {
                 content.fetch_sub(1, Ordering::Relaxed);
                 write_reply(
                     &writer,
                     unique,
                     Err(anyhow::anyhow!(
-                        "CONTENT_UNAVAILABLE: download capacity busy"
+                        "CONTENT_UNAVAILABLE: {MAX_THREADED} file operations are already waiting"
                     )),
                 )?;
                 continue;
@@ -1201,15 +1211,7 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
             std::thread::spawn(move || {
                 let _callback = callback;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::runtime::prepare_content(
-                        &engine,
-                        handle,
-                        std::time::Duration::from_secs(15),
-                    )?;
-                    let mut e = lock_engine(&engine);
-                    let result = lock(&fs).dispatch(&mut e, op, inode, &body);
-                    e.publish_observation();
-                    result
+                    threaded(&engine, &fs, op, inode, &body)
                 }))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("FUSE_CALLBACK_PANIC")));
                 if let Err(error) = &result {
@@ -1221,6 +1223,15 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if [18, 29].contains(&op) {
+                // A release saves without the engine lock first (WP5.2); a
+                // failed save retained the session, and the handle goes.
+                let handle = u64_at(&p[40..], 0)?;
+                if let Err(error) = crate::runtime::engine::save_handle(&engine, handle) {
+                    lock_engine(&engine).release_handle(handle);
+                    return Err(error);
+                }
+            }
             let mut e = lock_engine(&engine);
             let result = lock(&fs).dispatch(&mut e, op, inode, &p[40..]);
             e.publish_observation();
@@ -1233,6 +1244,116 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
         write_reply(&writer, unique, result)?;
         drop(callback);
     }
+}
+/// Requests handled on a thread of their own at most at once.
+const MAX_THREADED: usize = 64;
+/// How long a read waits for content that is downloading (the WinFsp
+/// adapter's bounds: FUSE has no request timeout of its own).
+const CONTENT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+const CONTENT_BOUND: std::time::Duration = std::time::Duration::from_secs(240);
+/// Reads waiting for downloads at once (half of [`MAX_THREADED`]).
+static CONTENT_WAITERS: crate::runtime::content::WaitSlots =
+    crate::runtime::content::WaitSlots::new(MAX_THREADED / 2);
+fn content_wait() -> crate::runtime::content::ContentWait {
+    crate::runtime::content::ContentWait {
+        stall: CONTENT_STALL,
+        bound: CONTENT_BOUND,
+        slots: Some(&CONTENT_WAITERS),
+        cancelled: adapter::fenced,
+    }
+}
+/// `body` with its `setattr` valid mask replaced by `valid`.
+fn with_valid(body: &[u8], valid: u32) -> Vec<u8> {
+    let mut body = body.to_vec();
+    if body.len() >= 4 {
+        body[..4].copy_from_slice(&valid.to_ne_bytes());
+    }
+    body
+}
+/// One request on a thread of its own (`serve`): the work that needs no
+/// engine lock first (waiting for content, the writable copy of a large
+/// file, a save's hashing and copying), then the request under the lock.
+fn threaded(
+    engine: &Shared,
+    fs: &Mutex<Filesystem>,
+    op: u32,
+    inode: u64,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    use crate::runtime::{content, engine::save_handle};
+    match op {
+        15 | 16 => {
+            let handle = u64_at(body, 0)?;
+            content::prepare_content_waiting(engine, handle, content_wait())?;
+            if op == 16 {
+                content::prepare_writable(engine, handle, None)?;
+            }
+            let mut e = if op == 16 {
+                crate::runtime::engine::lock_for_write(engine, handle)
+            } else {
+                lock_engine(engine)
+            };
+            let result = lock(fs).dispatch(&mut e, op, inode, body);
+            e.publish_observation();
+            result
+        }
+        20 | 25 => {
+            save_handle(engine, u64_at(body, 0)?)?;
+            let mut e = lock_engine(engine);
+            let result = lock(fs).dispatch(&mut e, op, inode, body);
+            e.publish_observation();
+            result
+        }
+        4 => setattr_size(engine, fs, inode, body),
+        _ => bail!("UNSUPPORTED_FUSE_OPCODE: {op}"),
+    }
+}
+/// A `setattr` that changes the size, in the order `dispatch` applies one:
+/// the mode, then the size (truncated under the lock, saved without it),
+/// then the times; the reply is the attributes after all of them.
+fn setattr_size(
+    engine: &Shared,
+    fs: &Mutex<Filesystem>,
+    inode: u64,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let valid = u32_at(body, 0)?;
+    let size = u64_at(body, 16)?;
+    if valid & 1 != 0 {
+        let mut e = lock_engine(engine);
+        lock(fs).dispatch(&mut e, 4, inode, &with_valid(body, 1))?;
+    }
+    // The handle to truncate through: the request's, else a temporary one.
+    let (handle, temporary) = if valid & (1 << 6) != 0 {
+        (u64_at(body, 8)?, false)
+    } else {
+        let mut e = lock_engine(engine);
+        ensure!(!e.switching, "BUSY_VIEW");
+        let fs = lock(fs);
+        let entry = fs.entry(&e, inode)?;
+        let path = fs.path(&e, &entry)?;
+        (e.open(&path, None, true)?.0, true)
+    };
+    let truncated = (|| {
+        if size != 0 {
+            crate::runtime::content::prepare_content_waiting(engine, handle, content_wait())?;
+        }
+        crate::runtime::content::prepare_writable(engine, handle, Some((size, false)))?;
+        crate::runtime::engine::lock_for_write(engine, handle).truncate(handle, size, false)?;
+        crate::runtime::engine::save_handle(engine, handle)
+    })();
+    if temporary {
+        let mut e = lock_engine(engine);
+        match &truncated {
+            Ok(()) => e.close(handle)?,
+            Err(_) => e.release_handle(handle),
+        }
+    }
+    truncated?;
+    let mut e = lock_engine(engine);
+    let result = lock(fs).dispatch(&mut e, 4, inode, &with_valid(body, valid & !(1 | (1 << 3))));
+    e.publish_observation();
+    result
 }
 fn write_reply(
     writer: &std::sync::Mutex<File>,
