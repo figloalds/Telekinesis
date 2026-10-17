@@ -67,10 +67,11 @@ declare -A owner_wave=(
   [qual_wp1_8_objects]=1 [qual_wp1_9_session]=1 [qual_wp1_12_legacy]=1
   [qual_wp2_1_lifecycle]=2 [qual_wp2_3_worker]=2 [qual_wp2_4_offlock]=2 [qual_wp2_5_feed]=2
   [qual_wp3_1_transport]=3 [qual_wp3_2_objects]=3 [qual_wp3_int_e2e]=3 [qual_scale]=4
+  [qual_wp4_4_seal]=4
 )
 order="qual_wp1_4_worker qual_wp1_5_mount qual_wp1_6_activation qual_wp1_7_derive qual_wp1_8_objects
 qual_wp1_9_session qual_wp1_12_legacy qual_wp2_1_lifecycle qual_wp2_3_worker qual_wp2_4_offlock
-qual_wp2_5_feed qual_wp3_1_transport qual_wp3_2_objects qual_wp3_int_e2e qual_scale"
+qual_wp2_5_feed qual_wp3_1_transport qual_wp3_2_objects qual_wp3_int_e2e qual_scale qual_wp4_4_seal"
 selected=()
 for f in $order; do
   [ "${owner_wave[$f]}" -le "$wave" ] || continue
@@ -171,6 +172,10 @@ for entry in statuses:
         result = lines[-1] if lines else None
     # Cross-check: a pass needs exit 0 and an `ok.` result line (as qualify.ps1).
     if st == "pass" and not (result or "").startswith("test result: ok."): st = "fail"
+    # Under TKFS_QUAL_ENFORCE=0 a scenario with failed checks does not panic,
+    # so cargo exits 0: a file with a failed scenario still fails, as with
+    # qualify.ps1 (WP4.INT, the WP4.2 review's minor; exit_code stays as run).
+    if st == "pass" and any(s["status"] == "fail" for s in scenarios): st = "fail"
     files.append({"file": name, "status": st, "exit_code": int(code), "duration_s": int(secs),
                   "result": result,
                   "log": log, "scenarios": scenarios})
@@ -189,7 +194,7 @@ if os.environ.get("TKFS_QUALIFY_MERGE") == "1" and os.path.exists(evidence):
     order = ["qual_wp1_4_worker", "qual_wp1_5_mount", "qual_wp1_6_activation", "qual_wp1_7_derive",
              "qual_wp1_8_objects", "qual_wp1_9_session", "qual_wp1_12_legacy", "qual_wp2_1_lifecycle",
              "qual_wp2_3_worker", "qual_wp2_4_offlock", "qual_wp2_5_feed", "qual_wp3_1_transport",
-             "qual_wp3_2_objects", "qual_wp3_int_e2e", "qual_scale"]
+             "qual_wp3_2_objects", "qual_wp3_int_e2e", "qual_scale", "qual_wp4_4_seal"]
     files = sorted(kept + files, key=lambda f: order.index(f["file"]) if f["file"] in order else 99)
 selected = {f["file"] for f in files}
 ops = {"<": lambda v, l: v < l, "<=": lambda v, l: v <= l, ">": lambda v, l: v > l,

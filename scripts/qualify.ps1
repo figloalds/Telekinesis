@@ -165,6 +165,8 @@ $qualFiles = [ordered]@{
     "qual_wp3_2_objects"    = 3
     "qual_wp3_int_e2e"      = 3
     "qual_scale"            = 4
+    # CCR-WP4.4-4 (applied by WP4.INT): WP4.4's seal-path scenarios.
+    "qual_wp4_4_seal"       = 4
 }
 
 if ($All -or $Baseline) { $Wave = 4 }
