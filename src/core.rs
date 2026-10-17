@@ -992,6 +992,26 @@ impl Store {
             preserve_times,
         )
     }
+    /// [`Store::write_with_base_and_times`] of bytes already stored
+    /// ([`Store::put_object`], [`Store::put_stream`]): the commit alone, so a
+    /// caller can store the bytes before it takes SQLite's writer slot
+    /// (WP4.INT re-review: a retained save held it for the whole copy).
+    pub fn write_object_with_base_and_times(
+        &mut self,
+        entity: &str,
+        content_base: Option<String>,
+        alive_base: Option<String>,
+        object: String,
+        preserve_times: u8,
+    ) -> Result<String> {
+        self.write_object_with_parents(
+            entity,
+            content_base,
+            alive_base.into_iter().collect(),
+            object,
+            preserve_times,
+        )
+    }
     fn write_object_with_parents(
         &mut self,
         entity: &str,
