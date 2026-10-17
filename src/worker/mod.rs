@@ -18,8 +18,10 @@
 //!    24); then the heartbeat thread (§4.1 step 10, moved here so that
 //!    nothing fallible remains after Ready). The listener's per-instance
 //!    token (WP4.1) is in `STATE/runtime.token` (owner-only) before it
-//!    accepts anything; every JSON RPC and loopback session upgrade must
-//!    carry it;
+//!    accepts anything, written only once a previous instance's
+//!    `runtime.json` is removed (WP4.INT re-review: the token is never next
+//!    to a dead listener's address); every JSON RPC and loopback session
+//!    upgrade must carry it;
 //! 7. write `runtime.json` and `worker.json` with the token
 //!    (`runtime.json.mount` is the
 //!    absolute, normalized legacy `--mount` once prepared, or the path of a

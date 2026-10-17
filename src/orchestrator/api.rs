@@ -4,12 +4,15 @@
 //! **Control token (WP4.1, §14).** The daemon's control endpoint requires a
 //! local token as the `X-Tkfs-Token` of its WebSocket upgrade: a fresh one
 //! per daemon start, in `DATA/orchestrator.token` (owner-only, written
-//! before `orchestrator.json` names the endpoint; [`install_control_token`]).
+//! before `orchestrator.json` names the endpoint, and only once the previous
+//! daemon's `orchestrator.json` is gone; [`install_control_token`]).
 //! An upgrade without it is refused (HTTP 403) before any action is read.
 //! [`client`] and [`ControlClient`] read the file next to the
 //! `orchestrator.json` they follow, again on every connect (a restarted
-//! daemon has a new token); a client of a known endpoint presents the token
-//! its own process knows for it, if any (`ws::tokens`).
+//! daemon has a new token), and present it only to the endpoint that file
+//! named before and after the token was read (WP4.INT re-review: never to a
+//! stale endpoint); a client of a known endpoint presents the token its own
+//! process knows for it, if any (`ws::tokens`).
 use super::config::Config;
 use super::hub_rules::{format_bytes, format_duration, format_elapsed};
 use crate::{
@@ -155,6 +158,15 @@ pub fn read_control_token(data_directory: &Path) -> Option<String> {
     crate::worker::record::read_token(&control_token_path(data_directory))
 }
 
+/// `DATA/orchestrator.json`: where the running daemon's control endpoint is
+/// published (`run::serve_with`).
+pub const DISCOVERY_FILE: &str = "orchestrator.json";
+
+/// `DATA/orchestrator.json`.
+pub fn discovery_path(data_directory: &Path) -> PathBuf {
+    data_directory.join(DISCOVERY_FILE)
+}
+
 /// The daemon's control token (WP4.1): the value its control server
 /// requires on every upgrade, and the registration that lets clients of this
 /// process (in-process daemons of the tests) find it.
@@ -195,9 +207,43 @@ impl std::fmt::Debug for ControlToken {
 /// clients of this process present it. A token file that cannot be written
 /// is logged and the endpoint is still protected (fail closed: clients then
 /// cannot connect).
+///
+/// **The predecessor's discovery goes first** (WP4.INT re-review): an
+/// `orchestrator.json` that is still there names the control endpoint of a
+/// daemon that did not exit cleanly (this one holds `orchestrator.lock`, so
+/// no live daemon owns it), and a local process may listen on that freed
+/// port. It is removed before the fresh token is written, so no client pairs
+/// the new token with the dead daemon's endpoint: until `run::serve_with`
+/// publishes this daemon's endpoint a client finds no discovery
+/// (`ORCHESTRATOR_NOT_RUNNING`), and [`ControlClient`] reads the discovery
+/// again after the token and refuses a token read between two different
+/// endpoints. A stale file that cannot be removed is logged and no token
+/// file is written (fail closed: management clients cannot connect to this
+/// daemon; the endpoint stays protected).
 pub fn install_control_token(catalog: &super::catalog::Catalog, control: &str) -> ControlToken {
     let token = ws::tokens::generate();
+    let hold = |token: &str| {
+        ws::tokens::addresses(control)
+            .first()
+            .and_then(|address| ws::tokens::protect(*address, token, None))
+    };
+    let discovery = discovery_path(catalog.data_directory());
     let path = control_token_path(catalog.data_directory());
+    if let Err(error) = fs::remove_file(&discovery)
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        crate::util::log::event!(error, PERMISSION_DENIED, {
+            "detail": "cannot remove the previous daemon's orchestrator.json; no control token is written and management clients cannot connect",
+            "path": discovery.display().to_string(),
+            "error": error.to_string(),
+        });
+        let _ = fs::remove_file(&path);
+        let hold = hold(&token);
+        return ControlToken {
+            token: token.into(),
+            hold,
+        };
+    }
     if let Err(error) = crate::worker::record::write_private(&path, token.as_bytes()) {
         crate::util::log::event!(error, PERMISSION_DENIED, {
             "detail": "cannot write the control token; management clients cannot connect",
@@ -205,9 +251,7 @@ pub fn install_control_token(catalog: &super::catalog::Catalog, control: &str) -
             "error": format!("{error:#}"),
         });
     }
-    let hold = ws::tokens::addresses(control)
-        .first()
-        .and_then(|address| ws::tokens::protect(*address, &token, None));
+    let hold = hold(&token);
     ControlToken {
         token: token.into(),
         hold,
@@ -347,9 +391,7 @@ impl ControlClient {
     /// Connects to the daemon of `config` (its `orchestrator.json`).
     /// Fails with `ORCHESTRATOR_NOT_RUNNING` when there is none.
     pub fn connect(config: &Config) -> Result<Self> {
-        Self::open_with(Target::Discovery(
-            config.data_directory.join("orchestrator.json"),
-        ))
+        Self::open_with(Target::Discovery(discovery_path(&config.data_directory)))
     }
 
     /// Connects to a known control endpoint (`ws://127.0.0.1:PORT`).
@@ -414,18 +456,7 @@ impl ControlClient {
     fn open(&mut self) -> Result<()> {
         let (endpoint, token) = match &self.target {
             Target::Endpoint(endpoint) => (endpoint.clone(), None),
-            Target::Discovery(path) => {
-                let discovery: Value =
-                    serde_json::from_slice(&fs::read(path).context("ORCHESTRATOR_NOT_RUNNING")?)
-                        .context("INVALID_ORCHESTRATOR_DISCOVERY")?;
-                let endpoint = discovery["control"]
-                    .as_str()
-                    .context("INVALID_ORCHESTRATOR_DISCOVERY")?
-                    .to_owned();
-                // WP4.1: the daemon's token, next to its discovery.
-                let token = path.parent().and_then(read_control_token);
-                (endpoint, token)
-            }
+            Target::Discovery(path) => discovered_endpoint(path)?,
         };
         let socket = ws::connect_authorized(&endpoint, token.as_deref())?;
         self.socket = Some(socket);
@@ -512,6 +543,48 @@ fn tcp_of(socket: &ws::Socket) -> Option<&TcpStream> {
         MaybeTlsStream::NativeTls(tls) => Some(tls.get_ref()),
         _ => None,
     }
+}
+
+/// How often [`discovered_endpoint`] reads a discovery that changed while
+/// the token was read (a daemon starting) before it gives up.
+const DISCOVERY_ATTEMPTS: u32 = 5;
+
+/// The control endpoint `path` (`DATA/orchestrator.json`) publishes and the
+/// daemon's token next to it (WP4.1), read so that the token is never paired
+/// with an endpoint its daemon did not publish (WP4.INT re-review): the
+/// discovery, then the token, then the discovery again, whose two reads must
+/// name the same endpoint. A starting daemon removes a stale discovery before
+/// it writes its token ([`install_control_token`]) and publishes its own
+/// after, so any read that finds the new token is followed by a read that
+/// finds no discovery or the new one: the endpoint of the daemon before it
+/// (a port another local process may now hold) never passes with the new
+/// token. A discovery that changed meanwhile is read again (the daemon is
+/// starting: 20, 40, 80, 160 ms), then `ORCHESTRATOR_NOT_RUNNING`.
+fn discovered_endpoint(path: &Path) -> Result<(String, Option<String>)> {
+    let read = || -> Result<String> {
+        let discovery: Value =
+            serde_json::from_slice(&fs::read(path).context("ORCHESTRATOR_NOT_RUNNING")?)
+                .context("INVALID_ORCHESTRATOR_DISCOVERY")?;
+        Ok(discovery["control"]
+            .as_str()
+            .context("INVALID_ORCHESTRATOR_DISCOVERY")?
+            .to_owned())
+    };
+    for attempt in 0..DISCOVERY_ATTEMPTS {
+        let endpoint = read()?;
+        // WP4.1: the daemon's token, next to its discovery.
+        let token = path.parent().and_then(read_control_token);
+        if read().is_ok_and(|again| again == endpoint) {
+            return Ok((endpoint, token));
+        }
+        if attempt + 1 < DISCOVERY_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(20 << attempt));
+        }
+    }
+    anyhow::bail!(
+        "ORCHESTRATOR_NOT_RUNNING: {} changed while the daemon's token was read (the daemon is starting); try again",
+        path.display()
+    )
 }
 
 /// Whether the daemon closed (or wrote unrequested bytes on) an idle

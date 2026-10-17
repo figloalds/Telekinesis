@@ -237,7 +237,15 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         repo: ctx.repo.clone(),
         device: ctx.device.clone(),
     };
-    // The instance's local token, on disk before anything can connect.
+    // The instance's local token, on disk before anything can connect. The
+    // previous instance's `runtime.json` goes first (WP4.INT re-review): one
+    // that is still there names the listener of a worker that did not exit
+    // cleanly (the caller holds `owner.lock`, so no live worker owns it), and
+    // a local process may listen on that freed port; `runtime::worker_token`
+    // pairs `runtime.token` only with the address `runtime.json` names, so
+    // the new token must never sit next to the old address. `publish` writes
+    // this instance's discovery after.
+    remove_stale_discovery(&ctx.state)?;
     let token = crate::ws::tokens::generate();
     crate::worker::record::write_private(
         &crate::worker::record::token_path(&ctx.state),
@@ -269,6 +277,20 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         .name("rpc-accept".into())
         .spawn(move || accept.accept_loop(listener))?;
     Ok(RpcServer { core })
+}
+
+/// Removes `STATE/runtime.json` before a new instance writes its token
+/// ([`start_rpc_server`]); a missing file is not an error, and one that
+/// cannot be removed fails the start (fail closed: its address would be
+/// paired with the new token).
+fn remove_stale_discovery(state: &Path) -> Result<()> {
+    match std::fs::remove_file(state.join("runtime.json")) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(anyhow::Error::new(
+            error,
+        )
+        .context("cannot remove the previous worker's runtime.json before writing the new token")),
+        _ => Ok(()),
+    }
 }
 
 /// Sets the engine's discovery bytes (the mount's `.tkfs-runtime.json`) and

@@ -123,7 +123,7 @@ pub fn serve_with(daemon: Daemon, signals: bool) -> Result<()> {
         "started_at_ms": ctx.started_at_ms,
     });
     let file = DiscoveryFile::write(
-        &ctx.config.data_directory.join("orchestrator.json"),
+        &super::api::discovery_path(&ctx.config.data_directory),
         &discovery,
     )?;
     // A closed stdout (a launcher that went away) must not end the daemon.

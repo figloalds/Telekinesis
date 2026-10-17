@@ -1877,3 +1877,258 @@ fn debug_text_of_token_bearing_records_redacts_the_token() {
     // The wire keeps it.
     assert_eq!(serde_json::to_value(&endpoint).unwrap()["token"], token);
 }
+
+// ---------------------------------------------------------------------------
+// Stale discoveries (WP4.INT re-review)
+
+/// A local process listening where a stale discovery points (the freed port
+/// of a daemon or worker that did not exit cleanly): it records the
+/// `X-Tkfs-Token` of every upgrade it receives and closes the connection.
+struct Squatter {
+    endpoint: String,
+    tokens: Arc<std::sync::Mutex<Vec<String>>>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Squatter {
+    fn start() -> Self {
+        Self::on(std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+    }
+
+    fn on(listener: std::net::TcpListener) -> Self {
+        use std::{
+            io::Read,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        listener.set_nonblocking(true).unwrap();
+        {
+            let (tokens, connections, stop) = (tokens.clone(), connections.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut stream = match listener.accept() {
+                        Ok((stream, _)) => stream,
+                        Err(_) => {
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                    };
+                    connections.fetch_add(1, Ordering::Relaxed);
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut head = Vec::new();
+                    let mut buffer = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") && head.len() < 16 * 1024 {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => head.extend_from_slice(&buffer[..count]),
+                        }
+                    }
+                    for line in String::from_utf8_lossy(&head).split("\r\n") {
+                        if let Some((name, value)) = line.split_once(':')
+                            && name.trim().eq_ignore_ascii_case("x-tkfs-token")
+                        {
+                            tokens.lock().unwrap().push(value.trim().to_owned());
+                        }
+                    }
+                }
+            });
+        }
+        Self {
+            endpoint,
+            tokens,
+            connections,
+            stop,
+        }
+    }
+
+    fn captured(&self) -> Vec<String> {
+        self.tokens.lock().unwrap().clone()
+    }
+
+    fn connections(&self) -> usize {
+        self.connections.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Squatter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// WP4.INT re-review (the WP4.1 review's major): a daemon writes its fresh
+/// control token while it builds, and publishes its endpoint in
+/// `orchestrator.json` only later; after an unclean exit the old
+/// `orchestrator.json` still names the dead daemon's port, which another
+/// local process may hold. The stale discovery is removed before the token is
+/// written, so in that window a client finds no daemon instead of sending the
+/// live token to the old port (it reached the squatter before the fix).
+#[test]
+fn a_fresh_control_token_is_never_sent_to_a_stale_endpoint() {
+    let root = tempfile::tempdir().unwrap();
+    let config = Config {
+        format_version: 2,
+        data_directory: root.path().join("data"),
+        default_mount_directory: root.path().join("mounts"),
+        maximum_running: 8,
+        network: Network {
+            listen: None,
+            connections: 2,
+            sync_interval_ms: 200,
+        },
+    };
+    fs::create_dir_all(&config.data_directory).unwrap();
+    let squatter = Squatter::start();
+    let discovery = config.data_directory.join("orchestrator.json");
+    fs::write(
+        &discovery,
+        json!({"format": 3, "pid": 1, "control": squatter.endpoint, "network": null}).to_string(),
+    )
+    .unwrap();
+    // Built, not served: the token is on disk, its endpoint not published.
+    let daemon = orchestrator::ctx::build(config.clone()).unwrap();
+    let token = fs::read_to_string(config.data_directory.join("orchestrator.token"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(!discovery.exists(), "the stale discovery is still there");
+    let error = orchestrator::client(&config, &Action::List).unwrap_err();
+    assert_eq!(code_of(&error), "ORCHESTRATOR_NOT_RUNNING", "{error:#}");
+    let served_config = config.clone();
+    let server = thread::spawn(move || orchestrator::serve_with(daemon, false));
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            orchestrator::client(&served_config, &Action::List).is_ok()
+        }),
+        "the served daemon never answered"
+    );
+    assert!(
+        !squatter.captured().contains(&token),
+        "the live control token was sent to the stale endpoint"
+    );
+    assert_eq!(
+        squatter.connections(),
+        0,
+        "a client dialed the stale endpoint"
+    );
+    orchestrator::client(&config, &Action::Shutdown).unwrap();
+    server.join().unwrap().unwrap();
+}
+
+/// The same with real processes (the review's second reproduction): a killed
+/// daemon leaves `orchestrator.json`, a local process takes its control port,
+/// and the daemon starts again while a client keeps calling `list`. No live
+/// token reaches the old port (14 tokens, one of them live, did before the
+/// fix).
+#[test]
+fn a_restarted_daemon_never_sends_its_token_to_the_old_port() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let mut node = Node::new();
+    let old = node.discovery().unwrap()["control"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    node.kill();
+    assert!(
+        node.discovery().is_ok(),
+        "a killed daemon leaves its discovery"
+    );
+    let address = old.strip_prefix("ws://").unwrap().to_owned();
+    let mut listener = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            listener = std::net::TcpListener::bind(&address).ok();
+            listener.is_some()
+        }),
+        "the old control port {address} stayed taken"
+    );
+    let squatter = Squatter::on(listener.unwrap());
+    let config = Config::load(&node.config_path()).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicU64::new(0));
+    let poller = {
+        let (stop, polls) = (stop.clone(), polls.clone());
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = orchestrator::client(&config, &Action::List);
+                polls.fetch_add(1, Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    node.spawn();
+    thread::sleep(Duration::from_millis(500));
+    stop.store(true, Ordering::Relaxed);
+    poller.join().unwrap();
+    let live = fs::read_to_string(node.data_dir().join("orchestrator.token"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let captured = squatter.captured();
+    assert!(
+        !captured.contains(&live),
+        "the live token reached the old port ({} tokens captured, {} polls)",
+        captured.len(),
+        polls.load(Ordering::Relaxed)
+    );
+    assert!(polls.load(Ordering::Relaxed) > 0);
+    node.list();
+}
+
+/// The worker's side of it (the review's third reproduction): a new worker
+/// instance writes `runtime.token` at step 6 and publishes `runtime.json` at
+/// step 7; a crashed predecessor's `runtime.json` names its freed listener.
+/// The stale file is removed before the token is written, so
+/// `runtime::worker_token` never hands the new token out for the old address
+/// and `runtime::rpc` never sends it there (it did before the fix, and the
+/// token opened the new instance's JSON RPC).
+#[test]
+fn a_new_worker_instance_never_pairs_its_token_with_a_stale_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path();
+    let store = tkfs::core::Store::open(state, Some("stale-discovery")).unwrap();
+    let engine = Arc::new(std::sync::Mutex::new(tkfs::runtime::Engine::new(store)));
+    let squatter = Squatter::start();
+    let stale = json!({
+        "format": 2, "address": squatter.endpoint, "state": state.to_string_lossy(),
+        "mount": null, "repo": "r", "device": "d",
+    });
+    fs::write(state.join("runtime.json"), stale.to_string()).unwrap();
+    // A client that read the stale discovery (parsing notes where its token is).
+    let stale: tkfs::runtime::Discovery = serde_json::from_value(stale).unwrap();
+    let ctx = tkfs::worker::build_ctx(engine, state, false, None);
+    let server = tkfs::runtime::server::start_rpc_server(ctx).unwrap();
+    // Step 6 is done: the token is on disk, this instance's discovery is not.
+    let token = fs::read_to_string(state.join("runtime.token"))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(token.len(), 64);
+    assert!(
+        !state.join("runtime.json").exists(),
+        "the stale runtime.json is still there"
+    );
+    assert_eq!(tkfs::runtime::worker_token(&stale), None);
+    assert!(tkfs::runtime::rpc(&stale, "stale", json!({"op": "status"})).is_err());
+    assert!(
+        wait_until(Duration::from_secs(5), || squatter.connections() > 0),
+        "the call never reached the stale address"
+    );
+    assert!(
+        !squatter.captured().contains(&token),
+        "the new instance's token was sent to the stale address"
+    );
+    // Once published, the token goes to the instance's own address.
+    let own = server.publish(None).unwrap();
+    assert_eq!(
+        tkfs::runtime::worker_token(&own).as_deref(),
+        Some(token.as_str())
+    );
+    let status = tkfs::runtime::rpc(&own, "own", json!({"op": "status"})).unwrap();
+    assert_eq!(status["repo"], "stale-discovery", "{status}");
+}
