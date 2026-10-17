@@ -725,7 +725,7 @@ resumes by itself when it serves again.
   per event; [validation](docs/VALIDATION.md#soak)). An open conflict slows
   only what touches it: creating, renaming, moving or deleting other files
   stays on the fast path, local or from a peer; changing the name or place
-  of a conflicted entry (or of its folder) is a full replay, about 0.3 s at
+  of a conflicted entry (or of its folder) is a full replay, about 0.3–0.5 s at
   10,000 events and 1 s at 30,000. A rename to a new name and a first
   delete also count the folder's concurrent history (CCR-WP1.6-5): about
   0.1 s at 10,000 events, with or without conflicts.

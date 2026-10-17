@@ -11,9 +11,10 @@
 //! included (inline under the engine lock, O(history) each: about one
 //! namespace operation per second on a 30K-event folder). With fast paths on,
 //! the successors now refuse only when a conflict of the current projection
-//! touches what the event changes ([`conflicts_touch`]): an entity the event
-//! changes, the parent directory it leaves or enters, the slot it leaves or
-//! takes, by name in the conflict or in its alternatives' locations. Why
+//! touches what the event changes ([`conflicts_touch`]): the conflict names
+//! an entity the event changes or a parent directory it leaves or enters, or
+//! one of its alternatives is located inside a changed entity or in a slot
+//! the event leaves or takes. Why
 //! that is exact: full replay of `N = O ∪ {E}` stores its projection's
 //! records and those of every antichain cut; with `dependencies == frontier`
 //! the old antichains keep their cuts (their records are already stored) and
