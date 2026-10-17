@@ -236,9 +236,49 @@ command-line soak tool.
 
 ## Two-machine lab
 
-The final integration (WP4.INT) adds the results of the two-machine lab run
-(a desktop and a server over WSS behind a TLS proxy) under
-`test-evidence/lab/` and summarises them here.
+`test-evidence/lab/` holds the two-machine lab run of 2026-10-16: the
+previous release (`6298d0b`) against the Wave 4 base of this one
+(`e8c2979`, before the Wave 4 packages merged), on two Windows machines (a
+laptop as the source and listener, the 16-core desktop as the dialer and
+receiver) whose peer traffic crossed an `ssh -L` tunnel over Wi-Fi (about
+7 MB/s each way, 2-3 ms). The harness (`lab_e2e.py` 1.4, `mounted_check.py`
+1.1) is not part of this repository; each `results-*.json` records its
+parameters, the binaries' hashes, the link probes and the machines' load,
+and `results-comparison.md` puts the runs side by side. Every cell is one
+run (n = 1), the desktop was shared with other builds, and the link varied
+between runs: compare the builds with each other, not with the probe.
+
+| Scenario | previous, 200 files | this, 200 files | previous, 2,000 files | this, 2,000 files |
+|---|---|---|---|---|
+| S1 receive: every path and hash visible | 161.6 s | 2.0 s | not reached in 30 min | 6.8 s |
+| S1 receive: all content (543-603 MB) | 188.5 s (2.9 MB/s) | 75.3 s (7.2 MB/s, the tunnel's ceiling) | 478 of 2,001 files at 30 min | 84.2 s (7.2 MB/s) |
+| S2 two-way edits (200 each way) converged | 1031.6 s | 52.5 s | 0 of 200 and 7 of 200 at 30 min | 120.8 s |
+| S3 45 s outage during a 512 MiB transfer: restore to complete | 215.3 s | 152.0 s | transfer never started (backlog) | 156.4 s |
+| S3 restore to transfer resumed | 28.0 s | 85.8 s | — | 88.5 s |
+| Worker `status` calls answered busy or stale (S1) | 63 of 95 | 0 of 38 | 454 of 892 | 0 of 45 |
+
+Every completed transfer resumed from its durable offset and verified. Two
+results are worse in the measured build: after the outage the lanes
+reconnected in 36-37 s against 28 s (the dial backoff grows during the 45 s
+outage, 1 s doubling up to 60 s) and the transfer resumed about 50 s after
+that. The second wait is consistent with the base's lease rules: the pull's lease
+from before the outage lapsed (60 s without progress) and the lapse backed
+the object off for its only source for another 60 s. WP4.5, merged after
+this run, releases the leases of a round whose session was lost (no lapse,
+no stall backoff); the lab was not run again on the final build, so that
+gain is not measured here. The laptop's ingest of 2,000 files into its
+WinFsp mount took 163.6 s against 102.6 s, measured once on a laptop shared
+with Windows servicing.
+
+The mounted check (this build only) received the 201 files into a WinFsp
+mount: the gate opened when the metadata was complete and the mount
+attached 2.1 s after `receive`, while the 512 MiB file was still
+downloading. All 201 files were listed with the right sizes and 200 hashed
+correctly through the mount; reading the large file failed with "invalid
+argument" (`STATUS_FILE_IS_OFFLINE`: a read waits up to 15 s for content
+that is still downloading, then fails; README, *Initial-sync gate*). A file
+written through the mount reached the laptop and hashed correctly there,
+and the folder stopped cleanly with its mount point removed.
 
 ## Earlier validation records
 
