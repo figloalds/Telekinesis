@@ -1241,6 +1241,9 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
                     crate::util::fault::fail("fs.close")?;
                     return Ok(vec![]);
                 }
+                // An unlink, rmdir or rename: the entry it removes or
+                // replaces is final first (`settle_entity`).
+                10 | 11 | 12 | 45 => settle_target(&engine, &fs, op, inode, &p[40..])?,
                 _ => {}
             }
             // Background saves let this request take the engine first.
@@ -1268,9 +1271,10 @@ const CONTENT_BOUND: std::time::Duration = std::time::Duration::from_secs(240);
 static CONTENT_WAITERS: crate::runtime::content::WaitSlots =
     crate::runtime::content::WaitSlots::new(MAX_THREADED / 2);
 fn content_wait() -> crate::runtime::content::ContentWait {
+    let (stall, bound) = crate::runtime::content::wait_bounds(CONTENT_STALL, CONTENT_BOUND);
     crate::runtime::content::ContentWait {
-        stall: CONTENT_STALL,
-        bound: CONTENT_BOUND,
+        stall,
+        bound,
         slots: Some(&CONTENT_WAITERS),
         cancelled: adapter::fenced,
     }
@@ -1320,6 +1324,36 @@ fn threaded(
         }
         4 => setattr_size(engine, fs, inode, body),
         _ => bail!("UNSUPPORTED_FUSE_OPCODE: {op}"),
+    }
+}
+/// Settles the entry an unlink or rmdir (`10`, `11`) removes, or a rename
+/// (`12`, `45`) may replace ([`crate::runtime::engine::settle_entity`]).
+fn settle_target(
+    engine: &Shared,
+    fs: &Mutex<Filesystem>,
+    op: u32,
+    inode: u64,
+    body: &[u8],
+) -> Result<()> {
+    let target = {
+        let e = lock_engine(engine);
+        let fs = lock(fs);
+        match op {
+            10 | 11 => fs.child(&e, inode, name(body)?),
+            _ => {
+                let names = body
+                    .get(if op == 45 { 16 } else { 8 }..)
+                    .context("INVALID_PARAMETER")?;
+                let old = name(names)?;
+                let new = name(names.get(old.len() + 1..).context("INVALID_PARAMETER")?)?;
+                fs.child(&e, u64_at(body, 0)?, new)
+            }
+        }
+    };
+    match target {
+        Ok(path) => crate::runtime::engine::settle_path(engine, &path),
+        // The request itself reports a bad name or parent.
+        Err(_) => Ok(()),
     }
 }
 /// A `setattr` that changes the size, in the order `dispatch` applies one:

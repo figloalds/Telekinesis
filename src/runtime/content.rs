@@ -60,6 +60,23 @@ fn never() -> bool {
     false
 }
 
+/// An adapter's `(stall, bound)`: its defaults, or shorter ones from
+/// `TKFS_CONTENT_STALL_MS` and `TKFS_CONTENT_BOUND_MS` (qualification and
+/// tests; never longer than the defaults, which fit the adapter's request
+/// timeout).
+pub fn wait_bounds(stall: Duration, bound: Duration) -> (Duration, Duration) {
+    let shorter = |name: &str, default: Duration| {
+        std::env::var(name)
+            .ok()
+            .and_then(|ms| ms.trim().parse::<u64>().ok())
+            .map_or(default, |ms| Duration::from_millis(ms).min(default))
+    };
+    (
+        shorter("TKFS_CONTENT_STALL_MS", stall),
+        shorter("TKFS_CONTENT_BOUND_MS", bound),
+    )
+}
+
 /// A bound on concurrent content waits ([`ContentWait::slots`]).
 pub struct WaitSlots {
     used: AtomicUsize,

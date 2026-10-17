@@ -1328,6 +1328,8 @@ impl Engine {
         // (committed here, rolled back below), never inside it.
         match result {
             Ok(revision) => {
+                // Qualification: a crash right after the commit.
+                crate::util::fault::exit("engine.save.committed");
                 if pending {
                     count_pending_saves(&self.store, &self.vitals);
                 }
@@ -2508,28 +2510,99 @@ fn orphan_dirty(e: &Engine, now: Instant) -> Option<String> {
         .cloned()
 }
 
-/// Closes handle `h` (WinFsp close, FUSE release): when its session is
-/// dirty and no save of it runs, saves it first (without the engine lock)
-/// if a background slot is free, then removes the handle. A save that runs
-/// is not waited for (it ends the session once committed); with no slot
-/// free, a background save that ends, or the pending-save retry, saves it.
-/// A failed save retained the session; the handle goes either way, and the
-/// failure is returned.
+/// Makes `entity`'s content final before a namespace operation removes or
+/// replaces the entity (a delete, a rename over it): waits until no save of
+/// it runs, and saves what a closed file of it still holds unsaved (no
+/// handle writes it any more). A background save then never commits after
+/// the delete, which would bring the file back or make a conflict of it; the
+/// last bytes are committed first, as when a close saved before it returned.
+/// A session that an open handle still writes is left alone (as before).
+pub fn settle_entity(engine: &Shared, entity: &str) -> Result<()> {
+    loop {
+        let (seen, signal, orphan) = {
+            let e = super::lock_engine(engine);
+            let Some(session) = e.sessions.get(entity) else {
+                return Ok(());
+            };
+            if !session.saving {
+                let writing = e
+                    .handles
+                    .values()
+                    .any(|handle| handle.entity == entity && !handle.cleaned);
+                if !session.dirty || writing {
+                    return Ok(());
+                }
+            }
+            (
+                e.saves.generation(),
+                e.save_signal(),
+                !e.sessions[entity].saving,
+            )
+        };
+        if orphan {
+            save_entity(engine, entity)?;
+        } else {
+            signal.wait_past(seen, SAVE_WAIT_SLICE);
+        }
+    }
+}
+
+/// [`settle_entity`] for the entity at `path`, if one is there.
+pub fn settle_path(engine: &Shared, path: &str) -> Result<()> {
+    let entity = super::lock_engine(engine)
+        .store
+        .lookup(path)
+        .ok()
+        .map(|entry| entry.id);
+    match entity {
+        Some(entity) => settle_entity(engine, &entity),
+        None => Ok(()),
+    }
+}
+
+/// [`settle_entity`] for the session of handle `h`.
+pub fn settle_handle(engine: &Shared, h: u64) -> Result<()> {
+    let entity = super::lock_engine(engine)
+        .handles
+        .get(&h)
+        .map(|handle| handle.entity.clone());
+    match entity {
+        Some(entity) => settle_entity(engine, &entity),
+        None => Ok(()),
+    }
+}
+
+/// Closes handle `h` (WinFsp close, FUSE release): removes the handle and,
+/// when its session is dirty, no save of it runs and its pending-save
+/// backoff is due, starts its save in the background (with a free slot;
+/// otherwise a background save that ends picks it up). The close itself
+/// never saves: a WinFsp close holds the application's `CloseHandle` until
+/// it answers (measured: a save in it cost the application the whole save).
 pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
     let unsaved = {
-        let e = super::lock_engine(engine);
-        e.handles
+        let mut e = super::lock_engine(engine);
+        let now = Instant::now();
+        let unsaved = e
+            .handles
             .get(&h)
             .and_then(|handle| e.sessions.get(&handle.entity).map(|s| (handle, s)))
-            .filter(|(_, s)| s.dirty && !s.saving)
-            .map(|(handle, _)| handle.entity.clone())
+            .filter(|(handle, s)| {
+                s.dirty
+                    && !s.saving
+                    && e.retry_state
+                        .get(&handle.entity)
+                        .is_none_or(|state| state.next_at <= now)
+            })
+            .map(|(handle, _)| handle.entity.clone());
+        e.release_handle(h)?;
+        unsaved
     };
-    let saved = match unsaved.zip(BackgroundSlot::take()) {
-        Some((entity, _slot)) => save_entity_as(engine, &entity, true),
-        None => Ok(()),
-    };
-    let released = super::lock_engine(engine).release_handle(h);
-    saved.and(released)
+    if let Some(entity) = unsaved
+        && let Some(slot) = BackgroundSlot::take()
+    {
+        spawn_background(engine, entity, slot);
+    }
+    Ok(())
 }
 
 /// Opens the transaction that commits a retained save (`SAVEPOINT staged_save`)
