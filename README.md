@@ -695,7 +695,11 @@ resumes by itself when it serves again.
   checkpoints never leave the computer; only shared branches sync.
 - Concurrent edits become conflicts that are kept and shown (`journal … N
   unresolved conflicts`); nothing is merged automatically. Resolve them in the
-  desktop (Conflicts) or with `tkfs resolve` / `tkfs recover`.
+  desktop (Conflicts) or with `tkfs resolve` / `tkfs recover`. Leave few
+  unresolved: an event from a peer that conflicts with the local history is
+  activated by a full replay, whose cost grows with the history and its
+  conflicts (at about 9,000 events and 9,000 unresolved conflicts, minutes
+  per event; [validation](docs/VALIDATION.md#soak)).
 - Metadata and content travel separately: a file can be listed, renamed or
   moved before its bytes arrive. Opening a file whose bytes have not arrived
   moves it to the front of the download queue and waits for it for up to 15
