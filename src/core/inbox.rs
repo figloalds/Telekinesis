@@ -602,9 +602,13 @@ impl Store {
         } else {
             None
         };
-        let outer = begin_write(&self.db, "inbox_stage")?;
-        let result = self.stage_inner(events, allowed, strict);
-        let result = finish_write(&self.db, "inbox_stage", outer, result);
+        // Restored on every path, a failed `BEGIN IMMEDIATE` included
+        // (WP4.INT, WP4.4 review minor: a busy writer left the pooled
+        // connection with the raised cache).
+        let result = begin_write(&self.db, "inbox_stage").and_then(|outer| {
+            let result = self.stage_inner(events, allowed, strict);
+            finish_write(&self.db, "inbox_stage", outer, result)
+        });
         if let Some(previous) = cache {
             // Best effort: only a page cache size.
             let _ = self

@@ -1764,3 +1764,53 @@ fn fastpath_off_replay_child() {
     )
     .unwrap();
 }
+
+/// WP4.INT (WP4.4 review minor): a large staging call raises its
+/// connection's page cache for the call (CCR-WP2.5-6) and restores it on
+/// every path, also when its `BEGIN IMMEDIATE` fails because another
+/// connection holds SQLite's writer: a pooled staging connection keeps no
+/// extra memory.
+#[test]
+fn a_busy_writer_leaves_the_staging_cache_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let mut a = store(&dir.path().join("a"), &repo);
+    let b = store(&dir.path().join("b"), &repo);
+    let allowed = devices([&a, &b]);
+    for i in 0..80 {
+        a.create(&format!("f{i:03}.txt"), "file").unwrap();
+    }
+    let events: Vec<StagedEvent> = missing(&a, &b)
+        .events
+        .into_iter()
+        .map(|event| StagedEvent {
+            event,
+            source: None,
+        })
+        .collect();
+    assert!(events.len() >= 64, "a page that raises the cache");
+    let secondary = Store::open_secondary(&b.root, &b.repo, &b.device).unwrap();
+    secondary
+        .db
+        .busy_timeout(Duration::from_millis(50))
+        .unwrap();
+    let cache_size = |s: &Store| -> i64 {
+        s.db.query_row("PRAGMA cache_size", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = cache_size(&secondary);
+    let holder = Connection::open(b.root.join("metadata.sqlite")).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let error = secondary
+        .stage_incoming(events.clone(), &allowed)
+        .expect_err("the writer is held");
+    assert!(
+        format!("{error:#}").contains("locked") || format!("{error:#}").contains("busy"),
+        "{error:#}"
+    );
+    assert_eq!(cache_size(&secondary), before, "the raised cache stayed");
+    holder.execute_batch("ROLLBACK").unwrap();
+    let outcome = secondary.stage_incoming(events, &allowed).unwrap();
+    assert!(!outcome.staged.is_empty());
+    assert_eq!(cache_size(&secondary), before);
+}

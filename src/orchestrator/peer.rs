@@ -2288,6 +2288,17 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
     let mut backoff = supervisor.options.lane_backoff();
     let mut announced: Option<u64> = None;
     loop {
+        // WP4.INT (the WP4.1 review's minor): while the peer is being
+        // unpaired its lanes do not dial. The acceptor was just told to
+        // revoke us and sends our sessions away; a re-dial (with the code,
+        // once the credential is refused) would be served again until
+        // `RemovePeer` and the reconcile stop this supervisor. A failed
+        // `RemovePeer` clears the mark and the lanes go on.
+        while supervisor.unpairing.load(Ordering::Acquire) {
+            if supervisor.cancel.sleep(UNPAIRING_PARK) {
+                return;
+            }
+        }
         if !supervisor.admit(lane, &mut announced) {
             return;
         }
@@ -2347,6 +2358,9 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
         }
     }
 }
+
+/// How often a lane parked by an unpair in progress rechecks (`run_lane`).
+const UNPAIRING_PARK: Duration = Duration::from_millis(20);
 
 /// `<prefix>-<installation>[-<lane>]`, without control characters (a thread
 /// name may not hold a NUL) and with the installation cut to 64 characters.
