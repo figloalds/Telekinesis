@@ -4201,9 +4201,12 @@ fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
     let e_lease = objects::push_lease(&e.ctx.installation, LANE);
     // A1 is offered Y and pushes none of it (its worker cannot read Y's
     // size), so B backs Y off for A1 and gives A1's lease up; then A1 goes
-    // away.
+    // away. (30 s, was 10 s: since CCR-WP4.2-5 an upload round whose wants
+    // reply is empty, Y being in B's backoff for A1, waits
+    // `OBJECTS_IDLE_INTERVAL` (5 s) for the next one, so the fourth want
+    // can come just after 10 s; WP4.INT, seen in 1 of 5 WSL runs.)
     assert!(
-        wait_until(Duration::from_secs(10), || b
+        wait_until(Duration::from_secs(30), || b
             .worker
             .want_calls
             .load(Ordering::Relaxed)
