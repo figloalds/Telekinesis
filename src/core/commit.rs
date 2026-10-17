@@ -224,12 +224,12 @@ pub mod verified {
     }
 }
 
-/// The view slots (`(parent, name key)` → entity) of the alive entries of
-/// `projection`; `None` if a name cannot be keyed, which a committed
-/// projection never has.
 /// A view's slots: (parent, name key) to its visible entry.
 type ViewSlots = BTreeMap<(String, String), String>;
 
+/// The view slots (`(parent, name key)` → entity) of the alive entries of
+/// `projection`; `None` if a name cannot be keyed, which a committed
+/// projection never has.
 fn view_slots(projection: &Projection) -> Option<ViewSlots> {
     projection
         .entries
@@ -1050,11 +1050,11 @@ impl Store {
                     }
                     None => None,
                 };
-                let (projection, delta, carried) = match appended {
+                let (projection, delta, fresh) = match appended {
                     Some(appended) => (
                         appended.projection,
                         Some((appended.changed, appended.lists, appended.placements)),
-                        Some(appended.carried),
+                        Some(appended.fresh),
                     ),
                     None => (
                         project(branch, events)?,
@@ -1082,7 +1082,7 @@ impl Store {
                         events,
                         new_event: Some(&event.id),
                         reviewed: &reviewed,
-                        stored: carried.as_ref(),
+                        fresh: fresh.as_ref(),
                         index,
                     })?;
                 Ok::<_, anyhow::Error>(Some((projection, derived, delta)))

@@ -5,8 +5,9 @@ Package: WP5.1 (REVAMP_PLAN §14.5b). Inputs: CCR-WP4.INT-3 and CCR-WP4.INT-4
 WP4.INT soak workers (`prepare_slow → derive_conflicts → ConeGraph::cone →
 project_refs`, dominated by `String` clones into `BTreeSet`s).
 
-This note is written before the implementation; *Measurements after* is
-filled in at the end (the final numbers are in `wp5-1.md`).
+Sections 1 and 2 were written before the implementation; section 3
+describes what was built (revised after it: the first choice, C, was not
+needed, see §3.7). The numbers before and after are in `wp5-1.md`.
 
 ## 1. Where the time goes today
 
@@ -104,7 +105,7 @@ touches, and run full mode's DELETE only on the rows they can make stale.
   that contains its entities, which can be the whole subtree. A correct
   scoped DELETE needs a global view of which cone derives which record.
 
-### C. A memoized model of full mode's namespace history (chosen, on A)
+### C. A memoized model of full mode's namespace history (first choice, on A; not built)
 
 Full mode's namespace history is a union over cones: `D_ns(N) =
 ∪_C ∪_{A ∈ antichains(rel(C))} records(cut(A), C)`. Keep, per branch, an
@@ -133,155 +134,196 @@ off the model, no precondition, no fallback.
 
 Rejected: a scope cut (§12) and new derived state.
 
-## 3. The chosen design (C on A)
+## 3. The design as built
 
-### 3.1 Interned index
+The note's first version chose C on A. What was built is A, plus three
+incremental pieces that turned out to remove the O(history) work of a slow
+commit without a model of full mode: an appended projection, a per-branch
+derivation index kept beside the event cache, and a write that skips what is
+stored already. C was not built (§3.7 says why); fallbacks still derive in
+full, now on A's engine.
 
-`Ix` (per derivation, from `DeriveInput::events`): event positions as now
-(the slice order), `HashMap<&str, u32>` for ids, causal parents as `u32`,
-entities numbered in sorted order (`ROOT` excluded), per entity its
-touching events and alive versions, per register its versions with
-version parents as positions, location rows with interned parent entity
-and slot key (`slot_key` memo, unchanged). Closures (`anc`, `desc`) are
-bitsets, computed lazily per event or in one sweep for a cone, within
-`CLOSURE_MEMO_BYTES`.
+### 3.1 Interned engine (A)
 
-### 3.2 Exactness of the primitives (against the reference)
+`derive.rs`: entities are numbers in their ids' sort order, events are
+positions, registers are pre-indexed per entity and field with their version
+parents resolved, causal relations among a cone's events come from one
+topological sweep (`Relations`), antichains are enumerated over concurrent
+sets in the historical order, cuts are projected from the cone's registers
+(`namespace_records`, each record built once per derivation), and `project`
+borrows instead of cloning. Exactness of each primitive:
 
 - **Entity order.** Entity numbers follow the ids' byte order, so every
   `BTreeSet<&str>` / `BTreeMap<&str, _>` iteration of the reference is the
   same order on numbers; pair records name `a,b` in id order as before.
-- **Antichain enumeration order.** The reference builds the antichain
-  list `L` by, for each relevant event `i` in order, appending
-  `A ∪ {i}` for every earlier antichain `A` compatible with `i`. The
-  antichains compatible with `i` are exactly those inside
-  `conc_<(i)` (relevant events before `i` that are neither ancestors nor
-  descendants of `i`), and in `L` they appear in the order `L(S)` defined
-  by `L(S) = [∅] ++ concat_{m ∈ S ascending} [A ∪ {m} : A ∈ L(S ∩ conc_<(m))]`
-  (induction on `i`). Enumerating `L(conc_<(i))` recursively gives the
-  same list in the same order, visiting only antichains, never the whole
-  list per event. The refusal (`competing_cuts > MAX_NAMESPACE_CUTS`) is
-  raised at the same antichain.
-- **Restricted records in full mode.** `NsContext::namespace_records`
-  (append mode's restricted projection) is exact whenever
-  `projection_cannot_fail` holds (the existing argument; unit test
-  `restricted_projection_matches_project`). Full mode now uses it under the
-  same condition, and keeps the whole `project` of each cut otherwise.
-- **Location pairs.** `concurrent_placement`'s ancestry test reads the
-  event closures instead of `event_ancestors`' string sets; pairs are
-  evaluated in the reference order, so a bad name fails at the same pair.
-- **`project`.** Same registers, heads, winners, `modified_ms`, conflicts
-  (pairs of heads with distinct values, bases from the common ancestors),
-  slot and chain passes, built from references: only heads and records are
-  cloned.
+- **Antichain enumeration order.** The reference builds the antichain list
+  `L` by, for each relevant event `i` in order, appending `A ∪ {i}` for
+  every earlier antichain `A` compatible with `i`. Those are exactly the
+  antichains inside `conc_<(i)` (relevant events before `i` that are neither
+  ancestors nor descendants of `i`), and in `L` they appear in the order
+  `L(S) = [∅] ++ concat_{m ∈ S ascending} [A ∪ {m} : A ∈ L(S ∩ conc_<(m))]`
+  (induction on `i`). Enumerating `L(conc_<(i))` recursively gives the same
+  list in the same order, visiting only antichains. The refusal
+  (`competing_cuts > MAX_NAMESPACE_CUTS`) is raised at the same antichain.
+- **Restricted records in full mode.** `namespace_records` is exact whenever
+  `projection_cannot_fail` holds (append mode's existing argument; unit test
+  `restricted_projection_matches_project`). Full mode uses it under the same
+  condition and projects each cut in full otherwise.
+- **Location pairs** read the memoized closures and are evaluated in the
+  reference order, so a bad name fails at the same pair.
+- **`project`**: same registers, heads, winners, conflicts and namespace
+  passes, built from references.
+- **Competing-cut counts** (CCR-WP4.INT-4) are memoized process-wide by a
+  SHA-256 digest of the branch, the relevant events' ids and the ancestry
+  among them (`cut_counts`): the count is a function of exactly those.
 
-Every one is compared with `tests::legacy` (Wave 0) on random histories in
-every event order, and on storm-shaped histories (new generator: two
-devices, a shared name pool, renames and deletes, tombstones and
-resurrections).
+Checked against the Wave 0 reference (`tests::legacy`) and against a
+verbatim copy of the Wave 4 derivation (`tests::wave4`,
+`interned_derivation_matches_wave4`: projections, full namespace history,
+append plans, successor counts, on four generators including two-device
+storms).
 
-### 3.3 The model and why it equals full mode (invariant 11)
+### 3.2 The appended projection
 
-Notation as in `derive.rs`'s module docs: `O` the branch's committed events,
-`N = O ∪ {E}`, `S` the stored rows, (H) `S = rebuild(O)` (the strict
-oracle).
+`project_append(base, events, new)`: `project(events)` from the stored
+projection of the events without `E` (the handle's view), instead of
+projecting the branch. The argument is in its doc comment; in short: with
+no pending event and no event naming `E`, `E` is the only addition to the
+active set; a register `E` does not change keeps its heads, winner and
+records; one it changes has `E`'s parents removed from its heads and `E`
+added, and its records recomputed from its whole version list; only `E`'s
+entities' entries are rebuilt; the namespace passes are re-evaluated where
+they can differ (`namespace_delta`): the slots `E`'s entities leave or take,
+and the chains through an entity whose slot verdict, kind or parent changed
+(and their descendants). It also returns what changed (entities, whether the
+lists did, the records carried unchanged, the changed entities' old visible
+placements), so the stored-projection delta, the view slots and the derived
+rows need no comparison of whole projections. Refusals: `E`'s own
+`INVALID_CAUSAL_PARENT` is checked as `project` checks it; anything else it
+does not handle declines (`None`) and `project` runs. Under the commit
+checks every appended projection is compared with `project`, and the
+patched view slots with `view_slots`.
 
-Full mode stores `S \ stale ∪ D_full(N)`, with `D_full(N) = p_N.conflicts ∪
-reviewed(E) ∪ LP(N) ∪ RC(N) ∪ D_ns(N) ∪ RP(E)` (location pairs, reviewed
-cuts, namespace history, register pairs of `E`) and `stale = S_ns \
-D_full(N)`. By (H), `S_ns = D_full_ns(O)`, so `stale = D_full_ns(O) \
-D_full_ns(N)`: a set difference of two model states.
+### 3.3 The branch index
 
-The model of `O` holds `D_ns(O)` as cone data and reference counts, `LP(O)`
-and `RC(O)` (namespace records only; non-namespace rows are never
-deleted). Applying `E`:
+Everything append mode used to compute from every event on every commit is
+a function of the branch's events alone: event positions and causal
+parents/children, entity numbers, the per-entity alive, touching and
+namespace-register versions (`NsBase`), the cone graph with per-edge
+contributions and the location changes per slot (`GraphBase`), and the
+precondition's facts (comma ids, malformed locations, ids named but absent,
+events with several relocations, names without a key, ill-typed values,
+entities with an unplaced presence version: `Facts`). `BranchIndex` keeps
+them per branch beside the event cache (`commit.rs`'s `EventCache`), built
+by the first slow commit that needs them and **extended** when events join
+the cache (`extend`: a monotone move of every stored position, then the new
+events' contributions inserted in order; an added event that an indexed
+event names, or a repeated id, drops the index instead, and the next commit
+rebuilds it). Entities have stable numbers (first appearance) and a rank
+table gives the id order, so a new entity changes two small tables, not
+every list.
 
-1. `LP(N) = LP(O) ∪ pairs(E)`: a pair of two older placements has the same
-   ancestry in `N` (fact 1, `E` is a sink), so `LP(O) ⊆ LP(N)` and only
-   pairs with `E` are new.
-2. `RC(N) = RC(O) ∪ cut(E)'s records` when `E` is a review: an older
-   review's cut excludes `E`.
-3. `D_ns(N)`: a cone of `N` that is the cone of an entity that does not
-   reach an entity `E` touches is a cone of `O` with the same members and
-   the same relevant set (the argument of `append_plan`: its members' kind,
-   location and alive registers are unchanged, and their TRUE-presence
-   signatures read only events of `O`, whose ancestry is unchanged), so its
-   antichains, cuts and records are the model's. Every other cone of `N` is
-   the cone of an entity in `reaching(touched)` (computed on `N`); the model
-   recomputes exactly those: members, relevant set (with the compression,
-   on `N`), antichains in the reference order, and per antichain its
-   records; an antichain whose event set and cone members equal an old
-   antichain of the same cone reuses that antichain's records (same cut:
-   `E` is in no cut of older events; same filter). Cones of `O` that are no
-   longer cones of `N` (an entity's cone grew) leave the union: their
-   records' reference counts drop. A record is in `D_ns(N)` iff its count is
-   positive.
-4. Counting: every recomputed cone is counted in full (its antichains are
-   enumerated), every other cone keeps its count, which (H) bounds. The
-   first cone over `MAX_NAMESPACE_CUTS` refuses with full mode's error, so a
-   refusal happens in both or neither.
+A slow commit **pushes** its event onto the index (it is the last event, so
+everything it adds goes to the end of a row and is logged), derives, and
+**pops** it (`undo`), also when the derivation panics (`Pushed`'s drop).
+`derive_append_indexed` is the scan derivation (`derive_append_scan`, the
+WP1.7 code on the engine of §3.1) with these reads replaced: the guard's
+scans (no event names `E` and no id has a comma, read from the facts; the
+relocation conditions over the indexed events with several relocations),
+the context (`NsContext` borrows the index's `NsBase`), the cone graph, the
+location pairs (the rows of `E`'s slot), the register versions of `E`'s
+registers, and `projection_cannot_fail` (the facts plus `E`'s entities
+rechecked). `project_append` and the successor counts read it too. A
+history the index does not cover takes the scan: the crafted ones the guard
+and `Locations::first_error` exist for.
 
-So the model's `D_full(N)` is full mode's, row for row, and the write
-(upsert of `D_full(N)`'s rows that `S` lacks or holds differently, the
-receipts, the DELETE of `stale`) leaves full mode's table. The model is a
-pure function of the event set: it is found by a fingerprint of the
-branch's event ids (count and a 128-bit hash), per store root, so a commit
-that rolled back or went stale never corrupts it (the previous version is
-kept), and a mismatch builds a fresh model with one full derivation.
-Restricted records are a precondition: when `projection_cannot_fail` does
-not hold for `N`, the commit derives in full (the reference) instead.
+Why it is exact: every part of the index is defined as a function of an
+event list, and `BranchIndex::same_as` compares two indexes as such
+functions (up to the stable numbering). Under the commit checks (every fuzz
+seed, and verify mode) each extension is compared with a fresh build, each
+indexed derivation and successor count with the scan's, and the index after
+`undo` with the index before; the unit tests
+`branch_index_extends_and_pushes_like_a_fresh_build` (random batches at
+their id positions, as the cache merges them) and
+`indexed_append_equals_the_scan_on_every_prefix` check the same on 3,000
+seeds in release.
 
-**When it falls back to full mode:** the structural guards of
-`append_guard` (pending events, `E` a parent of a committed event, a comma
-in an entity id, several relocations in one event, two events relocating
-the same entities: the ambiguity guards of fact 3, under which a record id
-determines its payload), a branch on which a projection can fail
-(`projection_cannot_fail`), and `TKFS_CONFLICT_MODE=full`. `verify` runs the
-model and full mode and compares (`CONFLICT_MODE_MISMATCH`), as today; the
-fuzz checks every commit against a derivation from no rows.
+### 3.4 The write
 
-### 3.4 Per-commit write
+- Rows the derivation knows are stored with the same payload (the base
+  projection's records that `project_append` carried) are not written again
+  (`projection_sources`): the upsert would leave the same table. The
+  survival check still sees their ids.
+- A seal trusts the handle's own last anchor (`snapshot::AnchorCache`: the
+  bytes it wrote, compared by value with the stored row) instead of reading
+  and hashing it, and reuses its header when the lists did not change.
+- The view's slots are patched for the changed entities instead of
+  recomputed (`commit::patched_slots`).
 
-Rows already in `S` with the same payload are not written again (an upsert
-whose `WHERE payload<>excluded.payload` would skip them anyway, after
-serializing and looking each up): the derivation knows them (the old
-projection's records, the model's old set). The `current_meta` header and
-the rows anchor's header hold the projection's conflict list; with
-thousands of open conflicts each slow commit rewrote megabytes. (Kept in
-the format if the measurements show it is small after the rest; otherwise
-moved to per-row form; see `wp5-1.md`.)
+### 3.5 When it falls back to full mode
 
-### 3.5 Activator
+Unchanged from WP1.7: the structural guards (pending events, `E` named by a
+committed event, a comma in an entity id, several relocations in `E`, one
+event placing two entities in one slot, two events relocating the same
+entities, more than 16 multi-relocation events), an irregular history
+(repeated ids or registers), and the cone checks of `append_plan` (a touched
+cone lost a relevant event: a TRUE presence witness displaced by `E`'s rank;
+a cone shrank; a grown cone not covered), and a current namespace record not
+derived from history. `TKFS_CONFLICT_MODE=full` always derives in full;
+`verify` runs both and compares.
 
-- One preparation per batch: the read handle keeps its event cache and the
-  model across tickets, so consecutive slow events cost their own cones.
-- A prepared commit whose branch moved only by commits of other entities is
-  committed instead of discarded: under the lock, when every event
-  committed since the preparation's base touches no entity of the
-  prepared event's cones (and is not touched by them), the prepared result
-  is rebased (see `wp5-1.md` for what is re-checked); otherwise `Stale` as
-  today.
+### 3.6 What a fallback and a rebuild cost now
 
-### 3.6 Other tasks
+Full mode runs on §3.1's engine: the 53 s fallback of §1 (4.5K events, 3K
+conflicts) takes about 0.3 s; a full rebuild of a store with 9K open
+conflicts is in `wp5-1.md` (scenario (d)).
 
-- `check_commit`: an in-memory verified set (hash → size, mtime, process
-  instant) records objects this process verified; a local commit skips the
-  re-hash when the file still has the recorded size and mtime (invariant 1:
-  the bytes were hashed by this process and are unchanged by `stat`, as the
-  startup marker rule trusts).
-- `backfill_journal_branch`: the cursor is upserted, so the progress row
-  exists from the first chunk.
+### 3.7 Why not the model (C)
+
+With §3.2–3.4, a slow commit that keeps the precondition costs its touched
+cones plus a few O(history) integer passes (the index's position move, the
+event cache merge), and the fallbacks are rare (§1: 1.4 % of append commits,
+all witness displacements) and now cost a fraction of a second. The model
+would make those fallbacks incremental too, at the price of a second
+derivation of full mode's namespace history to keep exact (reference counts
+per record across overlapping cones, a scoped DELETE) and its memory. The
+measurements did not need it; it stays the way forward if displacement
+fallbacks ever dominate (they are counted per reason,
+`thread_fallback_reasons`).
+
+### 3.8 Activator (CCR-WP4.INT-3, the other items)
+
+A slow ticket is still prepared on a pooled read store and committed under
+the lock, and a ticket whose branch moved is still `Stale` and re-queued.
+What changed is the price: the read store keeps its event cache, view and
+branch index across tickets (they are extended, not reloaded), so a
+preparation costs the event's cones, and a stale one is re-prepared for
+milliseconds, not minutes. Batching several tickets into one preparation, or
+rebasing a prepared result over unrelated commits, would save that
+re-preparation only; neither was built (the scenarios' stale counts and
+backlogs are in `wp5-1.md`).
+
+### 3.9 Other tasks
+
+- `check_commit`: a process-wide verified set (`commit::verified`, keyed by
+  store root and hash, holding size and mtime) records objects this process
+  hashed; a local commit skips the re-hash of a new object recorded within
+  five minutes with the same size and mtime, or with a fresh trusted
+  availability row (invariant 1: the bytes were hashed by this process and
+  `stat` shows them unchanged, the rule the startup marker already trusts).
+- `backfill_journal_branch`: the cursor row is upserted, so a backfill that
+  crashed before its first chunk resumes instead of matching no row.
 
 ## 4. Risks and checks
 
-- The 1,000-seed `derive_oracle` fuzz (every commit checked against a
-  derivation from no rows; verify mode every third seed), the stress seeds,
-  the unit comparisons with `tests::legacy`, `TKFS_CONFLICT_MODE=full` and
-  `verify` suites.
-- The model's memory is bounded (records per cut are memoized ids; an LRU of
-  model versions per branch; a cap past which the model is dropped and the
-  commit derives in full).
+- The 1,000-seed release `derive_oracle` fuzz (every commit checked against
+  a derivation from no rows, verify mode every third seed) and the stress
+  seeds, which now also run every extension, indexed derivation and
+  successor count against the scan; the Wave 0 and Wave 4 differential unit
+  tests; `TKFS_CONFLICT_MODE=full` and `verify` spot checks.
+- Memory: one index per cached branch (`EVENT_CACHE_BRANCHES`), dropped with
+  its cache entry; it is about the size of the parsed events.
 
-## 5. Baseline numbers of the scenarios (before)
+## 5. Numbers
 
-Filled in by the runs (see `wp5-1.md`).
+Before and after, for every scenario, are in `wp5-1.md`.
