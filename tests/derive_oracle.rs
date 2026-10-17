@@ -957,6 +957,116 @@ fn history_limit_refused_at_the_same_event_in_every_mode() {
     moves.clear();
 }
 
+/// CCR-WP4.4-5 (WP4.INT): a content successor (a save committed on the fast
+/// path: content plus `alive = true`, one head per register, not the whole
+/// frontier) that is concurrent with a cone's relevant events and saves an
+/// entity with a tombstone adds a TRUE-presence witness to that cone. Here
+/// `f.txt`'s cone holds the historical slot `anchor/collision` of its parent,
+/// into which twelve other directories move concurrently: 4,083 competing
+/// cuts, within `MAX_NAMESPACE_CUTS`. A save of `f.txt` concurrent with all
+/// twelve would make 8,178. Full replay refuses it, so the fast path must
+/// too, before its ACK: before the fix it was accepted and the next rebuild
+/// of the branch failed (`NAMESPACE_HISTORY_LIMIT`), as the release stress
+/// fuzz found.
+#[test]
+fn a_content_successor_that_tips_a_cone_over_the_cut_limit_is_refused() {
+    let mut source = Replica::new();
+    let s = source.store();
+    let anchor = s.create("anchor", "directory").unwrap();
+    let home = s.create("anchor/collision", "directory").unwrap();
+    let file = s.create("anchor/collision/f.txt", "file").unwrap();
+    s.rename(&home.id, "anchor/home", false).unwrap();
+    let dirs: Vec<Entry> = (0..12)
+        .map(|i| {
+            s.create(&format!("anchor/dir-{i:02}"), "directory")
+                .unwrap()
+        })
+        .collect();
+    s.delete(&file.id).unwrap();
+    let branch = s.branch(&s.active).unwrap();
+    let history: Vec<Event> = s.events().unwrap();
+    // The undelete: alive TRUE parented by the tombstone (a primary change).
+    let mut undelete = s.event(
+        &branch,
+        vec![s.current_change(&file.id, "alive", json!(true)).unwrap()],
+    );
+    undelete.id = "undelete".into();
+    let moves: Vec<Event> = dirs
+        .iter()
+        .enumerate()
+        .map(|(i, dir)| {
+            let mut event = s.event(
+                &branch,
+                vec![
+                    s.current_change(
+                        &dir.id,
+                        "location",
+                        json!({"parent": anchor.id, "name": "collision"}),
+                    )
+                    .unwrap(),
+                ],
+            );
+            event.id = format!("concurrent-{i:02}");
+            event.dependencies = vec![undelete.id.clone()];
+            event
+        })
+        .collect();
+    // The save: concurrent with every move, one head per register.
+    let mut save = s.event(
+        &branch,
+        vec![
+            s.current_change(&file.id, "content", json!(hash(b"saved")))
+                .unwrap(),
+            Change {
+                entity: file.id.clone(),
+                field: "alive".into(),
+                parents: vec![undelete.id.clone()],
+                value: json!(true),
+            },
+        ],
+    );
+    save.id = "late-save".into();
+    save.dependencies = vec![undelete.id.clone()];
+    let allowed = BTreeSet::from([s.device.clone()]);
+    for mode in [ConflictMode::Append, ConflictMode::Full] {
+        let _mode = ModeGuard::new(mode);
+        let mut receiver = Replica::new();
+        let r = receiver.store();
+        r.receive(bundle(history.clone()), &allowed).unwrap();
+        r.receive(bundle(vec![undelete.clone()]), &allowed).unwrap();
+        for event in &moves {
+            let acked = r.receive(bundle(vec![event.clone()]), &allowed).unwrap();
+            assert_eq!(
+                acked,
+                vec![event.id.clone()],
+                "{mode:?}: {:?}",
+                quarantined(r)
+            );
+        }
+        // The save meets the content successor's conditions.
+        let entry = r.lookup("anchor/home/f.txt").unwrap();
+        assert!(entry.alive && entry.revisions["alive"] == undelete.id);
+        let acked = r.receive(bundle(vec![save.clone()]), &allowed).unwrap();
+        assert!(acked.is_empty(), "{mode:?}: the save was acknowledged");
+        let refused = quarantined(r);
+        assert!(
+            refused
+                .iter()
+                .any(|(id, error)| id == "late-save" && error.contains("NAMESPACE_HISTORY_LIMIT")),
+            "{mode:?}: {refused:?}"
+        );
+        let diff = oracle(r).unwrap();
+        assert!(
+            diff.is_empty(),
+            "{mode:?}: the history no longer rebuilds: {diff:#?}"
+        );
+        assert!(
+            full_mode_refuses(r, "late-save"),
+            "{mode:?}: refusal parity"
+        );
+    }
+}
+
 /// The workloads append mode exists for take the append path, never the
 /// fallback: a two-way backlog (A's creates while B has one unseen edit),
 /// directory creation plus moves into it, deletes, renames in place and
