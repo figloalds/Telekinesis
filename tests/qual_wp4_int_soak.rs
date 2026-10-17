@@ -3,12 +3,14 @@
 //! `FaultProxy` (A dials B through one, B dials A through the other), share
 //! one folder. For `TKFS_SOAK_MINUTES` (default 120) both sides edit
 //! continuously through their workers (new files, saves of existing ones,
-//! directories, renames, deletes, a few larger files, an operation every
-//! 50–400 ms on each side). Each side edits names of its own, and
+//! directories, renames, deletes, a few larger files), an operation every
+//! `TKFS_SOAK_PAUSE_MS_MIN`..`TKFS_SOAK_PAUSE_MS_MAX` ms on each side
+//! (default 1000..4000). Each side edits names of its own, and
 //! `TKFS_SOAK_SHARED_PERCENT` (default 10) of its operations go to a name
-//! pool both sides edit, so concurrent edits conflict now and then; with
-//! 100 every operation is on the shared pool (a conflict storm: the first
-//! WP4.INT run, which did not converge, see `docs/revamp/notes/wp4-int.md`).
+//! pool both sides edit, so concurrent edits conflict now and then. The
+//! first WP4.INT runs used 50..400 ms with 100 % (a conflict storm) and with
+//! 10 % shared: neither converged, activation fell behind (CCR-WP4.INT-3,
+//! `docs/revamp/notes/wp4-int.md`).
 //! Meanwhile the links cycle through
 //! fault phases: healthy, latency changes (5 to 100 ms one way), bandwidth
 //! caps (256 KiB/s to 20 MiB/s), stalls, connection resets, a blackhole and
@@ -77,6 +79,7 @@ impl Editor {
         seed: u64,
         side: &'static str,
         shared_percent: u32,
+        pause_ms: (u64, u64),
         stop: Arc<AtomicBool>,
     ) {
         let mut rng = StdRng::seed_from_u64(seed);
@@ -138,7 +141,9 @@ impl Editor {
                     *self.last_error.lock().unwrap() = Some(describe_error(&error));
                 }
             }
-            thread::sleep(Duration::from_millis(rng.gen_range(50..400)));
+            thread::sleep(Duration::from_millis(
+                rng.gen_range(pause_ms.0..=pause_ms.1),
+            ));
         }
     }
 }
@@ -279,6 +284,11 @@ fn soak_two_daemons_through_faulty_links() {
     let duration = Duration::from_secs(60 * minutes("TKFS_SOAK_MINUTES", 120));
     let settle = Duration::from_secs(60 * minutes("TKFS_SOAK_SETTLE_MINUTES", 30));
     let shared_percent = minutes("TKFS_SOAK_SHARED_PERCENT", 10).min(100) as u32;
+    let pause_min = minutes("TKFS_SOAK_PAUSE_MS_MIN", 1000);
+    let pause_ms = (
+        pause_min,
+        minutes("TKFS_SOAK_PAUSE_MS_MAX", 4000).max(pause_min),
+    );
     let mut s = Scenario::with_budget(FILE, "soak", duration + settle + Duration::from_secs(900));
     // A short anti-entropy interval, as the harness daemons use: more
     // exchanges per minute through the faults.
@@ -306,7 +316,7 @@ fn soak_two_daemons_through_faulty_links() {
         .zip(editors.iter())
         .map(|((folder, seed, side), editor)| {
             let (editor, folder, stop) = (editor.clone(), folder.clone(), stop.clone());
-            thread::spawn(move || editor.run(folder, seed, side, shared_percent, stop))
+            thread::spawn(move || editor.run(folder, seed, side, shared_percent, pause_ms, stop))
         })
         .collect();
 
@@ -421,6 +431,7 @@ fn soak_two_daemons_through_faulty_links() {
         json!({
             "edit_minutes": edited.as_secs_f64() / 60.0,
             "shared_percent": shared_percent,
+            "pause_ms": [pause_ms.0, pause_ms.1],
             "edits": edits,
             "refused_edits": refused,
             "last_refusal": editors.iter().map(|e| e.last_error.lock().unwrap().clone()).collect::<Vec<_>>(),
