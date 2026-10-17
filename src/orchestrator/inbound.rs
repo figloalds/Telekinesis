@@ -59,7 +59,7 @@
 //! | `ping` | `{alive:true}` (the session's I/O thread answers it first) |
 //! | `catalog.list` | `PublishedCatalogApi::list()`, O(1), never a worker; `unchanged:true` when `since` is the generation |
 //! | `meta.exchange` | route `{peer: authenticated installation, repo, local_replica: folder device, remote_replica: request.sender}` → worker `feed-exchange` |
-//! | `objects.*` | [`super::inbound_objects::handle`] (lane check, interim `objects.exchange`) |
+//! | `objects.*` | [`super::inbound_objects::handle`] (lane check; `objects.exchange`, the Wave 2 interim op, is refused `UNSUPPORTED_OPERATION`, WP4.5) |
 //! | `peer.enroll`, `peer.revoke` | WP4.1, above |
 //! | anything else | `UNKNOWN_PEER_OPERATION` |
 //!
@@ -69,9 +69,11 @@
 //! `REPOSITORY_NOT_MANAGED`; none of them reaches a worker.
 //!
 //! **Exchanges never hold a handler.** `meta.exchange` and `objects.*` run on
-//! a thread of their own, at most as many per session as its role has handler
-//! threads and at most [`InboundOptions::max_exchanges`] server-wide (beyond
-//! either: `BUSY`, Contention). An exchange keeps its slots until its worker
+//! a thread of their own, at most [`exchange_slots`] per session (a control
+//! or probe session: its role's handler threads, 4; a bulk session:
+//! [`BULK_EXCHANGE_SLOTS`], 4, CCR-WP4.5-2) and at most
+//! [`InboundOptions::max_exchanges`] server-wide (beyond either: `BUSY`,
+//! Contention). An exchange keeps its slots until its worker
 //! call returns, also after its session is gone, so redialing cannot pile up
 //! worker calls. The handler pool therefore only ever runs the O(1) checks
 //! and `catalog.list`, which answer at once even while every exchange of the
@@ -178,7 +180,7 @@ pub struct InboundOptions {
     /// (128).
     pub max_sessions: usize,
     /// Worker-bound exchanges running at once, server-wide (128). Each
-    /// session also runs at most as many as its role has handler threads.
+    /// session also runs at most [`exchange_slots`] of its role.
     /// An exchange keeps its slot until its worker call returns, also after
     /// its session went away, so session churn cannot grow the threads.
     pub max_exchanges: usize,
@@ -590,6 +592,11 @@ impl Inner {
         self.ctx.status.record(event);
     }
 
+    /// The exchange slots of a session of `role` ([`exchange_slots`]).
+    fn exchange_slots(&self, role: LaneRole) -> usize {
+        exchange_slots(role)
+    }
+
     fn session_options(&self, role: LaneRole) -> ConnOptions {
         let mut options = self.options.conn;
         options.handlers = match role {
@@ -801,7 +808,7 @@ impl Inner {
             peer: peer.clone(),
             revocation_epoch,
             exchanges: Arc::new(AtomicUsize::new(0)),
-            exchange_slots: self.session_options(peer.role).handlers,
+            exchange_slots: self.exchange_slots(peer.role),
         }));
         let reason = loop {
             if let Some(reason) = conn.wait_closed(Duration::from_secs(3600)) {
@@ -1339,6 +1346,25 @@ pub(crate) fn accept_error_is_per_connection(error: &io::Error) -> bool {
 // ---------------------------------------------------------------------------
 // Request routing
 
+/// Exchanges a bulk session runs at once (CCR-WP4.5-2, applied by WP4.INT):
+/// a lane that pulls and pushes at once keeps its pull pipeline full with
+/// four (`objects::PEER_CALLS`, the dialer's side of the same number);
+/// measured by WP4.5 at 50 ms RTT and 20 MiB/s, download while uploading
+/// went from 0.80 to 0.97 of the link, loopback unchanged. Its handler pool
+/// stays `limits::BULK_HANDLERS` threads: exchanges run on threads of their
+/// own.
+pub const BULK_EXCHANGE_SLOTS: usize = 4;
+
+/// The exchange slots of a session of `role`: [`BULK_EXCHANGE_SLOTS`] for a
+/// bulk session, the role's handler threads for control and probe sessions
+/// (`limits::CONTROL_HANDLERS`).
+pub fn exchange_slots(role: LaneRole) -> usize {
+    match role {
+        LaneRole::Bulk => BULK_EXCHANGE_SLOTS,
+        LaneRole::Control | LaneRole::Probe => limits::CONTROL_HANDLERS,
+    }
+}
+
 /// Serves one session's requests (runs on its handler pool).
 struct SessionHandler {
     inner: Arc<Inner>,
@@ -1348,7 +1374,7 @@ struct SessionHandler {
     revocation_epoch: u64,
     /// Exchanges of this session running now.
     exchanges: Arc<AtomicUsize>,
-    /// At most this many at once (the role's handler count).
+    /// At most this many at once ([`exchange_slots`]).
     exchange_slots: usize,
 }
 

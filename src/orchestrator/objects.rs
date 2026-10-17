@@ -20,12 +20,13 @@
 //! rounds on the lane at once, both directions of one counting once
 //! ([`LaneOptions::repos`]; waiting repositories enter in order). Both
 //! directions run on the lane's one bulk session; the peer runs at most
-//! `PEER_CALLS` (2, its per-session exchange slots, `limits::BULK_HANDLERS`)
+//! `PEER_CALLS` (4, its per-session exchange slots, `inbound::BULK_EXCHANGE_SLOTS`)
 //! of our `objects.*` calls at once, so the lane admits at most that many
 //! ([`LaneOptions::peer_calls`]): pulls, pushes and reports wait their turn
 //! in order, and pushes (with their `objects.wants`) hold at most
-//! `peer_calls - 1` slots at once, so a push the peer stalls never keeps a
-//! pull or a report waiting (CCR-WP3.3-1; WP3.INT re-review). That limit is
+//! `min(peer_calls, repos) - 1` slots at once (1 with the defaults), so a
+//! push the peer stalls never keeps a pull or a report waiting, nor takes
+//! every repository turn (CCR-WP3.3-1; WP3.INT re-review). That limit is
 //! the *push gate*: an upload round takes it before its repository's turn
 //! and holds it for the round, so an upload round never waits for it while
 //! holding a turn, and a stalled push holds one turn at most, whatever the
@@ -170,7 +171,7 @@ use super::{
 use crate::{
     model::{
         errors::{ErrorClass, ErrorWire, Scope},
-        orchestrator::{CallError, Ctx, PeerContext, limits},
+        orchestrator::{CallError, Ctx, PeerContext},
         protocol::{
             LaneRole, LaneSpec, deadlines,
             frame::ChunkHeader,
@@ -208,9 +209,10 @@ pub const WINDOW_BYTES: u64 = PULL_BUDGET_BYTES;
 /// Object bytes one push carries at most.
 pub const PUSH_BUDGET_BYTES: u64 = PULL_BUDGET_BYTES;
 /// `objects.*` calls a lane runs on the peer at once: the acceptor's
-/// exchange slots per bulk session (`limits::BULK_HANDLERS`; a third call
-/// would be refused `BUSY`). See CCR-WP3.3-1.
-pub const PEER_CALLS: usize = limits::BULK_HANDLERS;
+/// exchange slots per bulk session (`inbound::BULK_EXCHANGE_SLOTS`, 4; a
+/// fifth call would be refused `BUSY`). CCR-WP3.3-1 measured by WP4.5 and
+/// applied with CCR-WP4.5-2 by WP4.INT (it was 2, `limits::BULK_HANDLERS`).
+pub const PEER_CALLS: usize = super::inbound::BULK_EXCHANGE_SLOTS;
 /// A key's round ends after this, so the lane's other repositories get a
 /// turn (it runs again after [`CONTENT_YIELD`] when it moved data).
 pub const ROUND_CAP: Duration = Duration::from_secs(10);
@@ -1986,8 +1988,12 @@ pub fn run_lane_with(
         slots: Slots::new(options.peer_calls, Some(stats.clone())),
         // Pushes leave at least one peer slot to pulls and reports (WP3.INT
         // re-review): a push held by the peer's stalled worker keeps its slot
-        // until the peer's write deadline.
-        pushes: Slots::new(options.peer_calls.saturating_sub(1).max(1), None),
+        // until the peer's write deadline. And at least one repository turn
+        // (WP3.INT re-review 2): each upload round holds a turn, so with
+        // more gate slots than `repos - 1` stalled pushes of other
+        // repositories could take every turn and park a third repository's
+        // downloads (WP4.INT, with `PEER_CALLS` = 4).
+        pushes: Slots::new(push_gate(&options), None),
         repos: RepoGate::new(options.repos, Some(stats.clone())),
         stats,
         cancel: token.clone(),
@@ -2026,6 +2032,16 @@ pub fn run_lane_with(
     if let Ok(handle) = uploads {
         let _ = handle.join();
     }
+}
+
+/// Upload rounds a lane runs at once (the push gate): one fewer than its
+/// peer calls and one fewer than its repository turns, at least one.
+fn push_gate(options: &LaneOptions) -> usize {
+    options
+        .peer_calls
+        .saturating_sub(1)
+        .min(options.repos.saturating_sub(1))
+        .max(1)
 }
 
 fn lane_check(peer: &PeerContext, conn: &session::Conn, lane: LaneSpec) -> Result<(), ErrorWire> {
