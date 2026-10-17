@@ -1394,6 +1394,14 @@ mod stdio {
                 CloseHandle(write);
                 return Err(error);
             }
+            // The replaced handle (an inherited log file) stays open until
+            // the switch settles: a child spawned meanwhile must not inherit
+            // it as a leaked handle (Rust's `Command` passes every
+            // inheritable handle; the streams it gives a child are
+            // duplicated for it anyway). WP4.INT, the WP4.2 review's minor.
+            if previous != 0 && previous != usize::MAX {
+                SetHandleInformation(previous as Handle, HANDLE_FLAG_INHERIT, 0);
+            }
             Ok((File::from_raw_handle(read as _), previous))
         }
     }
