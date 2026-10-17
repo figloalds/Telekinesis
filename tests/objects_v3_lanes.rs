@@ -61,12 +61,14 @@ use tkfs::{
     orchestrator::{
         Config, Network,
         inbound::{self, InboundOptions, InboundServer},
+        inbound_objects,
         objects::{self, LaneOptions, LaneStats},
         scheduler::{Readiness, SchedulerView},
         worker_client::{self, SessionWorkerClient},
     },
     paired_sync::SyncRoute,
     pairing_code::Verifier,
+    runtime::objects_rpc::{DemandHeader, DemandItem, DemandReply},
     session::{self, AcceptPolicy, CodeAuth, Conn, ConnOptions, Handler, Incoming, Priority},
     util::{cancel::Cancel, snapshot::Snapshot, time::SystemClock},
 };
@@ -204,6 +206,8 @@ struct WorkerState {
     private: HashSet<String>,
     completed: Vec<String>,
     reports: Vec<(String, String)>,
+    /// Objects a reader waits for, newest first (WP5.3, `objects.demand`).
+    demanded: Vec<String>,
 }
 
 struct FakeWorker {
@@ -217,6 +221,7 @@ struct FakeWorker {
     bytes_written: AtomicU64,
     write_calls: AtomicU64,
     want_calls: AtomicU64,
+    demand_calls: AtomicU64,
     /// Every read: (hash, offset, len).
     read_log: Mutex<Vec<(String, u64, u64)>>,
     /// Every write item: (session, hash, offset, len).
@@ -249,6 +254,7 @@ impl FakeWorker {
             bytes_written: AtomicU64::new(0),
             write_calls: AtomicU64::new(0),
             want_calls: AtomicU64::new(0),
+            demand_calls: AtomicU64::new(0),
             read_log: Mutex::new(Vec::new()),
             write_log: Mutex::new(Vec::new()),
             want_log: Mutex::new(Vec::new()),
@@ -378,6 +384,14 @@ impl FakeWorker {
         spool.lock().unwrap().size_unknown = true;
     }
 
+    /// A reader waits for `hash` now (the newest demand; WP5.3): its want
+    /// items lead the lists, as `Demand`, and `objects.demand` lists it.
+    fn demand(&self, hash: &str) {
+        let mut state = self.state.lock().unwrap();
+        state.demanded.retain(|demanded| demanded != hash);
+        state.demanded.insert(0, hash.to_owned());
+    }
+
     /// Stops wanting `hash` (its event was quarantined): writes of it are
     /// `Unsolicited` from now on.
     fn unwant(&self, hash: &str) {
@@ -492,11 +506,19 @@ impl FakeWorker {
                 .map(|(hash, spool)| (hash.clone(), spool.clone()))
                 .collect()
         };
-        let mut candidates: Vec<(u64, String, u64)> = wanted
+        // Demand first (newest first), then smaller first (WP5.3).
+        let demanded = self.state.lock().unwrap().demanded.clone();
+        let rank = |hash: &str| {
+            demanded
+                .iter()
+                .position(|demanded| demanded == hash)
+                .unwrap_or(usize::MAX)
+        };
+        let mut candidates: Vec<(usize, u64, String, u64)> = wanted
             .into_iter()
             .map(|(hash, spool)| {
                 let spool = spool.lock().unwrap();
-                (spool.size, hash, spool.durable)
+                (rank(&hash), spool.size, hash, spool.durable)
             })
             .collect();
         candidates.sort();
@@ -509,7 +531,7 @@ impl FakeWorker {
         let mut state = self.state.lock().unwrap();
         let mut items = Vec::new();
         let mut bytes = 0u64;
-        for (size, hash, durable) in candidates {
+        for (rank, size, hash, durable) in candidates {
             let durable = if stale { 0 } else { durable };
             let remaining = size - durable;
             if items.len() >= header.max_items as usize
@@ -526,7 +548,11 @@ impl FakeWorker {
                 hash,
                 size,
                 offset: durable,
-                priority: WantPriority::History,
+                priority: if rank == usize::MAX {
+                    WantPriority::History
+                } else {
+                    WantPriority::Demand
+                },
             });
         }
         drop(state);
@@ -539,6 +565,29 @@ impl FakeWorker {
         });
         Ok((
             serde_json::to_value(WantReply { items }).unwrap(),
+            Vec::new(),
+        ))
+    }
+
+    /// `objects.demand` (WP5.3): the demanded objects of the lane not held
+    /// yet, newest first; read-only.
+    fn op_demand(&self, header: Value) -> Result<(Value, Vec<u8>), ErrorWire> {
+        let header: DemandHeader = parse(header)?;
+        self.route_check(&header.route)?;
+        self.demand_calls.fetch_add(1, Ordering::Relaxed);
+        let state = self.state.lock().unwrap();
+        let items = state
+            .demanded
+            .iter()
+            .filter(|hash| !state.held.contains_key(*hash))
+            .filter(|hash| header.lane.is_none_or(|lane| lane.owns(hash)))
+            .map(|hash| DemandItem {
+                hash: hash.clone(),
+                requested_ms: 1,
+            })
+            .collect();
+        Ok((
+            serde_json::to_value(DemandReply { items }).unwrap(),
             Vec::new(),
         ))
     }
@@ -860,6 +909,7 @@ impl Handler for WorkerHandler {
             "objects.write" => worker.op_write(header, body),
             "objects.report" => worker.op_report(header),
             "objects.release" => worker.op_release(header),
+            "objects.demand" => worker.op_demand(header),
             other => Err(ErrorWire::coded("UNSUPPORTED_OPERATION", other)),
         };
         match result {
@@ -965,6 +1015,24 @@ impl World {
             let mut views = views.clone();
             let mut view = (*views[state]).clone();
             view.record.sync_enabled = false;
+            view.generation += 1;
+            views.insert(state.into(), Arc::new(view));
+            views
+        });
+    }
+
+    /// The folder's demand queue grows (`content.requested` of its heartbeat:
+    /// a reader waits for an object; WP5.3).
+    fn bump_demand(&self, state: &str) {
+        self.views.update(|views| {
+            let mut views = views.clone();
+            let mut view = (*views[state]).clone();
+            let mut heartbeat = (**view.heartbeat.as_ref().unwrap()).clone();
+            heartbeat.seq += 1;
+            let mut content = heartbeat.content.unwrap_or_default();
+            content.requested += 1;
+            heartbeat.content = Some(content);
+            view.heartbeat = Some(Arc::new(heartbeat));
             view.generation += 1;
             views.insert(state.into(), Arc::new(view));
             views
@@ -4898,6 +4966,254 @@ fn socket_buffers_are_tuned_on_loopback_only() {
         );
     }
     assert_eq!(socket_tuning(None), SocketTuning::System);
+}
+
+// ---------------------------------------------------------------------------
+// WP5.3: demand and leases of a dead session (REVAMP_PLAN §14.5b)
+
+/// An object a reader waits for gets the next pull of a lane busy with a
+/// large object (through a slow link the large one streams for about 6 s):
+/// the round asks its worker which objects are demanded every half second
+/// and leases the small one with a small want, at the front of its plan,
+/// instead of after the large object's plan or the round cap (10 s).
+#[test]
+fn a_demanded_object_gets_the_next_pull_of_a_busy_lane() {
+    let (a, b) = pair(1000);
+    let big_size = 48 * MIB;
+    let big = b.worker.hold(content(5300, big_size as usize));
+    let small_size = 256 * 1024;
+    let small = b.worker.hold(content(5301, small_size as usize));
+    a.worker.want(&big, big_size);
+    let proxy = FaultProxy::start(&b.endpoint);
+    proxy.set_bandwidth(8 * MIB);
+    let conn = a.dial(&proxy.endpoint(), &b.code, LANE);
+    let (options, stats) = a.options();
+    let lane = a.run(conn, options);
+    assert!(
+        wait_until(Duration::from_secs(20), || a
+            .worker
+            .durable(&big)
+            .is_some_and(|durable| durable >= 2 * MIB)),
+        "the large object never started"
+    );
+    // A reader opens the small file now.
+    a.worker.want(&small, small_size);
+    a.worker.demand(&small);
+    let asked = Instant::now();
+    assert!(
+        wait_until(Duration::from_secs(20), || a.worker.has(&small)),
+        "the demanded object never arrived"
+    );
+    let took = asked.elapsed();
+    assert!(
+        !a.worker.has(&big),
+        "the large object finished first (the link is too fast for the test)"
+    );
+    assert!(
+        took <= Duration::from_secs(3),
+        "the demanded object waited {took:?} behind the large one"
+    );
+    assert!(LaneStats::get(&stats.demand_promoted) >= 1);
+    assert!(a.worker.demand_calls.load(Ordering::Relaxed) >= 1);
+    drop(lane);
+}
+
+/// A grown demand queue (the heartbeat's `content.requested`) starts a
+/// round of an idle lane at once, whatever the absorb window: a reader is
+/// waiting, which is never an echo of our own exchanges (the interval here
+/// is 60 s).
+#[test]
+fn a_grown_demand_queue_starts_an_idle_lanes_round() {
+    let (a, b) = pair(60_000);
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let (options, _) = a.options();
+    let lane = a.run(conn, options);
+    // The first rounds find nothing to do.
+    assert!(wait_until(Duration::from_secs(5), || a
+        .worker
+        .want_calls
+        .load(Ordering::Relaxed)
+        > 0));
+    sleep_ms(300);
+    let hash = b.worker.hold(content(5310, 256 * 1024));
+    a.worker.want(&hash, 256 * 1024);
+    a.worker.demand(&hash);
+    let asked = Instant::now();
+    a.world.bump_demand(STATE_A);
+    assert!(
+        wait_until(Duration::from_secs(5), || a.worker.has(&hash)),
+        "a demanded object waited for anti-entropy"
+    );
+    assert!(asked.elapsed() < Duration::from_secs(5));
+    drop(lane);
+}
+
+/// A lane whose session ends gives up every lease its rounds hold at our
+/// worker, also those a round kept for the next one while its repository
+/// waited for a turn (three repositories, two turns: one always waits), so
+/// no object stays hidden from other sources until its lease lapses.
+#[test]
+fn a_lost_session_gives_up_every_lease_its_rounds_kept() {
+    let (code, verifier) = Verifier::generate();
+    let b_world = World::new(&format!("b-{}", uuid()), Some(verifier));
+    let a_world = World::new(&format!("a-{}", uuid()), None);
+    let mut workers = Vec::new();
+    let mut entries = Vec::new();
+    let mut wanted = Vec::new();
+    for index in 0..3u64 {
+        let repo = format!("repo-{index}");
+        let (replica_a, replica_b) = (format!("replica-a-{index}"), format!("replica-b-{index}"));
+        let worker_a = FakeWorker::start(&replica_a);
+        let worker_b = FakeWorker::start(&replica_b);
+        a_world.folder_of(&format!("state-a-{index}"), &repo, &replica_a, &worker_a);
+        b_world.folder_of(&format!("state-b-{index}"), &repo, &replica_b, &worker_b);
+        let size = 6 * MIB;
+        let hash = worker_b.hold(content(5320 + index, size as usize));
+        worker_a.want(&hash, size);
+        wanted.push((worker_a.clone(), hash));
+        entries.push(entry_of(&repo, &replica_b));
+        workers.push((worker_a, worker_b));
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = inbound::start_with(ctx(&b_world, 1000), listener, InboundOptions::default());
+    let proxy = FaultProxy::start(&endpoint);
+    proxy.set_bandwidth(2 * MIB);
+    let a_ctx = ctx(&a_world, 100);
+    let peer = Arc::new(PeerContext {
+        installation: b_world.installation.clone(),
+        endpoint: proxy.endpoint(),
+        local_installation: a_ctx.installation.clone(),
+        pool: 2,
+        catalog: Snapshot::new(RemoteCatalog {
+            generation: 1,
+            at_ms: 0,
+            entries,
+        }),
+    });
+    let dialer = Dialer {
+        world: a_world.clone(),
+        worker: workers[0].0.clone(),
+        ctx: a_ctx,
+        peer,
+    };
+    let conn = dialer.dial(&proxy.endpoint(), &code, LANE);
+    let (mut options, stats) = dialer.options();
+    // Short rounds of small pulls: each round leaves its object unfinished
+    // and keeps its lease for the next one.
+    options.round = Duration::from_millis(300);
+    options.window_bytes = MIB;
+    let mut lane = dialer.run(conn, options);
+    let holder = objects::pull_holder(&b_world.installation, LANE);
+    assert!(
+        wait_until(Duration::from_secs(20), || wanted.iter().all(
+            |(worker, hash)| worker.durable(hash).is_some_and(|durable| durable > 0)
+        )),
+        "every repository moved some bytes"
+    );
+    sleep_ms(1500);
+    proxy.refuse(true);
+    proxy.reset_all();
+    assert!(
+        wait_until(Duration::from_secs(20), || lane.finished()),
+        "the lane did not end with its session"
+    );
+    lane.stop();
+    assert!(
+        wait_until(Duration::from_secs(3), || wanted.iter().all(
+            |(worker, hash)| worker
+                .lease_of(hash)
+                .is_none_or(|lease| !lease.starts_with(&holder))
+        )),
+        "leases left behind: {:?}",
+        wanted
+            .iter()
+            .map(|(worker, hash)| worker.lease_of(hash))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        wanted.iter().all(|(worker, hash)| !worker.has(hash)),
+        "a repository finished: the test needs a slower link"
+    );
+    assert!(
+        LaneStats::get(&stats.kept_released) >= 1,
+        "no kept lease was given up at the lane's end"
+    );
+    server.shutdown(Duration::from_secs(5));
+    for (a, b) in workers {
+        a.shutdown();
+        b.shutdown();
+    }
+}
+
+/// The acceptor's offer of a dialer whose session went away between its
+/// `objects.wants` and its push (an outage cut it) gives its leases up once
+/// the session stayed silent for `OFFER_GRACE`, instead of hiding the
+/// objects from every other source until the lease lapses (60 s).
+#[test]
+fn an_offer_whose_session_went_away_gives_up_its_leases() {
+    let b = Acceptor::start(FakeWorker::start(REPLICA_B));
+    let a = Dialer::start(
+        FakeWorker::start(REPLICA_A),
+        &b.installation(),
+        &b.endpoint,
+        100,
+    );
+    let hash = sha(&content(5330, 1024));
+    b.worker.want(&hash, 1024);
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let request = json!({
+        "repo": REPO,
+        "sender": REPLICA_A,
+        "receiver": REPLICA_B,
+        "lane": LANE,
+        "max_items": 8,
+        "max_bytes": MIB,
+    });
+    let reply = conn
+        .call(
+            "objects.wants",
+            request,
+            Vec::new(),
+            Priority::Control,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let offered: ObjectsWantsReply = if reply.body.is_empty() {
+        serde_json::from_value(reply.header).unwrap()
+    } else {
+        serde_json::from_slice(&reply.body).unwrap()
+    };
+    assert_eq!(
+        offered
+            .items
+            .iter()
+            .map(|item| item.hash.clone())
+            .collect::<Vec<_>>(),
+        vec![hash.clone()]
+    );
+    let lease = objects::push_lease(&a.ctx.installation, LANE);
+    assert_eq!(b.worker.lease_of(&hash), Some(lease.clone()));
+    // The session goes away before any push.
+    let gone = Instant::now();
+    conn.close();
+    assert!(
+        wait_until(
+            inbound_objects::OFFER_GRACE + Duration::from_secs(5),
+            || b.worker.lease_of(&hash).is_none()
+        ),
+        "the lease of the dead session's offer is still held: {:?}",
+        b.worker.lease_of(&hash)
+    );
+    assert!(gone.elapsed() >= inbound_objects::OFFER_GRACE);
+    assert!(
+        b.worker
+            .release_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(session, released)| *session == lease && released.contains(&hash))
+    );
 }
 
 // ---------------------------------------------------------------------------

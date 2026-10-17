@@ -85,6 +85,26 @@
 //! ended early, its session went away), is given up the same way (without a
 //! backoff when the object did not fail).
 //!
+//! **An offer whose session went away** (WP5.3: leases of a dead session
+//! end at once). A dialer pushes right after its `objects.wants`, on the
+//! same peer slot, so an offer that no push followed is either settled by
+//! the dialer's next request on that session (above), or its session ended
+//! in between (an outage cut it: the leases would hide those objects from
+//! every other source, our own pull lanes to that peer included, until they
+//! lapsed, 60 s, plus the stall backoff the lapse imposes on the peer's
+//! replica, 60 s more). The acceptor has no word of a session's end
+//! (CCR-WP5.3-2 asks for one), so it watches for it: once an offer and its
+//! session have both been silent for [`OFFER_GRACE`] (5 s: no push, no
+//! `objects.*` request of that session), its leases are given up at our
+//! worker, without a backoff (nothing says the dialer could not serve
+//! them). The offer itself stays: a dialer still there settles it at its
+//! next request as before (its next `objects.wants` backs off what it did
+//! not send; a late push is matched against it), and a push of it still
+//! writes (a free lease is taken by the write) unless another session took
+//! it meanwhile (then `IN_FLIGHT_ELSEWHERE`: never two owners, invariant
+//! 19). A dialer that comes back on a new session is offered them again at
+//! once.
+//!
 //! **Report.** A report makes our worker re-read a whole object, so it is
 //! taken only for an object of the session's lane (`OBJECT_ON_WRONG_LANE`)
 //! that a pull of ours sent this peer through its end in the last hour
@@ -161,6 +181,7 @@ pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incomi
         req.responder.error(error);
         return;
     }
+    seen_session(&peer.session);
     match req.op.as_str() {
         ops::OBJECTS_PULL => pull(ctx, peer, req),
         ops::OBJECTS_WANTS => wants(ctx, peer, req),
@@ -508,6 +529,12 @@ struct Offer {
     session: String,
     at: Instant,
     items: Vec<Offered>,
+    /// How to give its leases up when its session goes away (WP5.3), and
+    /// whether that was done.
+    client: Arc<SessionWorkerClient>,
+    route: SyncRoute,
+    lease: String,
+    released: bool,
 }
 
 #[derive(Clone)]
@@ -538,14 +565,104 @@ fn take_offer(key: &str) -> Option<Offer> {
 }
 
 fn put_offer(key: String, offer: Offer) {
-    let mut map = lock(offers());
-    if map.len() >= MAX_OFFERS {
-        map.retain(|_, offer| offer.at.elapsed() < OFFER_AGE);
+    {
+        let mut map = lock(offers());
         if map.len() >= MAX_OFFERS {
-            return;
+            map.retain(|_, offer| offer.at.elapsed() < OFFER_AGE);
+            if map.len() >= MAX_OFFERS {
+                return;
+            }
+        }
+        map.insert(key, offer);
+    }
+    start_reaper();
+}
+
+/// An offer whose session sent no `objects.*` request since the offer for
+/// this long lost its session (module docs, "An offer whose session went
+/// away").
+pub const OFFER_GRACE: Duration = Duration::from_secs(5);
+/// How often the reaper looks.
+const REAP_EVERY: Duration = Duration::from_millis(500);
+/// Sessions whose last request is remembered at most (the oldest go first).
+const MAX_SESSIONS_SEEN: usize = 4096;
+
+/// When each bulk session last sent an `objects.*` request.
+fn sessions_seen() -> &'static Mutex<HashMap<String, Instant>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `session` sent a request now.
+fn seen_session(session: &str) {
+    let now = Instant::now();
+    let mut seen = lock(sessions_seen());
+    if seen.len() >= MAX_SESSIONS_SEEN && !seen.contains_key(session) {
+        seen.retain(|_, at| now.saturating_duration_since(*at) < OFFER_AGE);
+        if seen.len() >= MAX_SESSIONS_SEEN
+            && let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(session, _)| session.clone())
+        {
+            seen.remove(&oldest);
         }
     }
-    map.insert(key, offer);
+    seen.insert(session.to_owned(), now);
+}
+
+/// The process's offer reaper, started with the first offer.
+fn start_reaper() {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        thread::Builder::new()
+            .name("offer-reaper".into())
+            .spawn(|| {
+                loop {
+                    thread::sleep(REAP_EVERY);
+                    reap_offers(Instant::now());
+                }
+            })
+            .is_ok()
+    });
+}
+
+/// Gives up the leases of every offer whose session went away (module
+/// docs): the offer and its session both silent for [`OFFER_GRACE`]. The
+/// offer stays (marked), for a dialer that is still there. Returns how many
+/// offers it gave up (tests).
+pub fn reap_offers(now: Instant) -> usize {
+    let silent = |at: Instant| now.saturating_duration_since(at) >= OFFER_GRACE;
+    let gone: Vec<(Arc<SessionWorkerClient>, SyncRoute, String, Vec<String>)> = {
+        let seen = lock(sessions_seen());
+        let mut offers = lock(offers());
+        offers
+            .values_mut()
+            .filter(|offer| {
+                !offer.released
+                    && silent(offer.at)
+                    && seen.get(&offer.session).is_none_or(|last| silent(*last))
+            })
+            .map(|offer| {
+                offer.released = true;
+                (
+                    offer.client.clone(),
+                    offer.route.clone(),
+                    offer.lease.clone(),
+                    offer
+                        .items
+                        .iter()
+                        .map(|offered| offered.item.hash.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    };
+    let count = gone.len();
+    for (client, route, lease, hashes) in gone {
+        release_leases(&client, &route, &lease, hashes);
+    }
+    count
 }
 
 /// Where one dialer's lane stands in our worker's leases: its lease session
@@ -726,6 +843,10 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                 item: item.clone(),
             })
             .collect(),
+        client: bound.client.clone(),
+        route: bound.route.clone(),
+        lease: source.lease.clone(),
+        released: false,
     };
     if !offer.items.is_empty() {
         put_offer(key, offer);
