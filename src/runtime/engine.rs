@@ -2562,19 +2562,24 @@ fn saver_loop() {
                 }
             }
         };
-        let mut next = Some(entity);
-        while let Some(entity) = next {
-            if let Err(error) = save_entity_as(&engine, &entity, true) {
-                let wire = crate::model::errors::ErrorWire::from_error(&error);
-                crate::util::log::event!(warn, (wire.code.as_str()), {
-                    "site": "engine.background_save",
-                    "entity": entity,
-                    "message": wire.message,
-                });
-                super::lock_engine(&engine).retry_failed(&entity, Instant::now(), &error);
+        // A panic (a poisoned engine under the test policy) ends this job,
+        // never the saver or its counts.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut next = Some(entity);
+            while let Some(entity) = next {
+                if let Err(error) = save_entity_as(&engine, &entity, true) {
+                    let wire = crate::model::errors::ErrorWire::from_error(&error);
+                    crate::util::log::event!(warn, (wire.code.as_str()), {
+                        "site": "engine.background_save",
+                        "entity": entity,
+                        "message": wire.message,
+                    });
+                    super::lock_engine(&engine).retry_failed(&entity, Instant::now(), &error);
+                }
+                next = orphan_dirty(&super::lock_engine(&engine), Instant::now());
             }
-            next = orphan_dirty(&super::lock_engine(&engine), Instant::now());
-        }
+        }));
+        drop(engine);
         crate::util::lock::lock(&savers.state).running -= 1;
     }
 }
