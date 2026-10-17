@@ -2310,6 +2310,10 @@ fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()>
             yield_to_foreground();
         }
         let mut e = super::lock_engine(engine);
+        if !e.sessions.contains_key(entity) {
+            // Saved and closed meanwhile (a background save ended it).
+            return Ok(());
+        }
         let job = match e.begin_save(entity)? {
             SaveStart::Clean => return Ok(()),
             SaveStart::Busy(_) if background => return Ok(()),
