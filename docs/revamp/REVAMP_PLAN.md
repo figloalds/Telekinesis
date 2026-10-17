@@ -2903,6 +2903,122 @@ WP4.5's CCRs against WP4.1-owned files; copy the two-machine lab results
 `test-evidence/lab/` and summarise them in `docs/VALIDATION.md`.
 
 
+### 14.5b Wave 5 addendum: field fixes (coordinator, after WP4.INT)
+
+Wave 5 closes the issues that real-hardware testing found after Wave 4. They come from three sources:
+
+- **The two-machine lab.** A desktop and a laptop synced over Wi-Fi. The results are in `C:/tkfs-build/lab/results-comparison.md`, which WP4.INT copies to `test-evidence/lab/`.
+- **The WP4.INT soak** (CCR-WP4.INT-3).
+- **A CPU profile of the soak workers.** Each worker's activator thread ran at 100 % of a core for two hours. The time was spent in `prepare_slow → derive_conflicts → ConeGraph::cone → project_refs`, and most of it went to cloning `String`s into `BTreeSet`s.
+
+Packages run in parallel. **Merge order: 5.4, 5.3, 5.2, 5.1.**
+
+The lab numbers that motivate this wave compare the revamp (e8c2979) with the baseline (6298d0b), one run each (n = 1), over Wi-Fi:
+
+| Measurement | Revamp | Baseline |
+|---|---|---|
+| Restore → transfer resumed after a 45 s outage | 86–88 s | 28 s |
+| Copying 2,001 files into the laptop's mount | 163.6 s | 102.6 s |
+
+Also, reading a 512 MiB file through the WinFsp mount while it was still downloading failed. The adapter returned `STATUS_FILE_IS_OFFLINE`, which programs show as "invalid argument".
+
+#### WP5.1 Concurrent-edit activation
+
+- **Goal:** sustained two-way editing with conflicts converges. Activation cost follows the cones an event touches, not the length of history or the total number of open conflicts.
+- **Owned:**
+  - `src/core/commit.rs`, `src/core/derive.rs`, `src/core/inbox.rs`, `src/core/snapshot.rs`, `src/core/verify.rs`, `src/worker/activator.rs`;
+  - `tests/{derive_oracle,offlock_commit,activation_inbox,seal_path,scoped_conflict_gate,qual_wp1_6_activation,qual_wp1_7_derive,qual_wp4_int_soak}.rs`;
+  - new: `tests/qual_wp5_1_concurrent.rs`.
+- **Tasks:**
+  1. **CCR-WP4.INT-3.** Four changes:
+     - When the append-mode precondition fails only for cones the event does not touch, derive only the touched cones.
+     - Remote namespace changes that touch no conflicted entity keep the fast path while unrelated conflicts are open.
+     - Prepare one replay for several queued slow events.
+     - Do not discard a prepared replay when the branch moved only by commits of unrelated entities.
+  2. **CCR-WP4.INT-4.** Keep competing-cut counts per cone, so a successor recounts only the cones it joins.
+  3. **Allocation.** Inside `derive` (`project_refs`, `ConeGraph`, `NsContext`), intern entity and event ids as integers instead of cloning `String`s into ordered sets.
+  4. **Full rebuild cost.** A full rebuild must be bounded the same way when the store has thousands of unresolved conflicts. This covers startup after a damaged snapshot, a downgrade, and the oracle.
+  5. **`check_commit`.** Skip re-verifying an object that this process installed and verified moments ago. Track these in an in-memory verified set keyed by hash and size/mtime. Invariant 1 must still hold.
+  6. **`backfill_journal_branch` resume bug.** The chunk-progress `UPDATE` matches no row when the cursor key does not exist yet. This was a WP4.INT review minor.
+- **Invariants:** 4, 5, 6, 9, 10, and **11 (determinism; the oracle decides)**.
+- **Acceptance:**
+  - The 1,000-seed release `derive_oracle` fuzz passes, and so do the stress seeds.
+  - `qual_wp5_1_concurrent` passes all four scenarios:
+    - **(a) Conflict storm.** Both sides edit one shared name pool for 2 hours, at one operation per side every 50–400 ms. The replicas converge within a 30-minute settle, and the oracle reports no differences.
+    - **(b) Fast two-way editing.** Both sides edit for 2 hours at the same rate, with 10 % of names shared. The activation backlog stays bounded, with no upward trend over the last hour, and the replicas converge.
+    - **(c) Event cost.** CPU per concurrent namespace event, at 5K events and 1K open conflicts, is at least 10× lower than WP4.INT.
+    - **(d) Rebuild time.** A full rebuild of a store with 9K open conflicts takes under 5 minutes.
+  - Record before and after numbers for each scenario.
+
+#### WP5.2 Local filesystem path
+
+- **Goal:** writes through the mount are fast and never wait on hashing or copying under the engine lock. A read of content that is still downloading waits and then succeeds.
+- **Owned:**
+  - `src/runtime/engine.rs`, `src/runtime/content.rs`, `src/runtime/notify.rs`, `src/staging.rs`, `src/mount.rs`, `src/fuse_linux.rs`, `native/mount.c`, `src/worker/mount_ctl.rs`;
+  - `tests/{mount_lifecycle,pending_saves,partial_content,worker_concurrency}.rs`;
+  - new: `tests/local_fs_throughput.rs`, `tests/qual_wp5_2_local.rs`.
+- **Tasks:**
+  1. **CCR-WP4.INT-5** (the engine and staging part):
+     - Snapshot a session's staged bytes under the lock.
+     - Hash and store them without holding it.
+     - Commit with a base check.
+     - The first write to a large file no longer copies it under the lock.
+     - Durability (invariant 8) and crash safety must hold at every step.
+  2. **WinFsp write path.** Profile it for many small files (create, write, close, rename). Remove avoidable per-operation costs: lock holds, notifications, fsyncs and status work.
+  3. **CCR-WP4.INT-2.** A read of content that is still downloading registers demand and waits while the download progresses. The wait is based on progress and bounded by the adapter's request timeout. It then serves verified bytes. If the content cannot arrive, fail with a status that programs report meaningfully, never one they show as "invalid argument". Do the same on FUSE.
+- **Acceptance:**
+  - `qual_wp5_2_local`: copying 2,000 files (1–64 KiB, in 100 directories) into a WinFsp mount is at least 2× faster than the 6298d0b baseline binary on the same machine. Measure the baseline, WP4.INT and WP5.2.
+  - Filesystem p99 stays under 50 ms while a sync catch-up runs.
+  - Crash tests cover the off-lock save.
+  - A mounted read of a 512 MiB object, started while the object is still downloading, returns the correct bytes.
+
+#### WP5.3 Network recovery and demand
+
+- **Goal:** after an outage, transfers resume within seconds, and on-demand reads move to the front of the queue.
+- **Owned:**
+  - `src/orchestrator/objects.rs`, `src/orchestrator/inbound_objects.rs`, `src/orchestrator/peer.rs`, `src/orchestrator/scheduler.rs`, `src/runtime/objects_rpc.rs`, `src/runtime/ctx.rs`, `src/core/objects.rs`, `src/core/demand.rs`, `src/core/transfer.rs`;
+  - `tests/{objects_v3_worker,objects_v3_lanes,peer_supervisor}.rs`;
+  - new: `tests/qual_wp5_3_recovery.rs`.
+- **Tasks:**
+  1. **Leases.** Release the object leases of a dead session immediately, without breaking invariant 19. Either session loss notifies the worker, or leases are bound to a live session.
+  2. **Lane reconnect.**
+     - Lower the backoff cap for transient network loss.
+     - When one lane of a peer reconnects, its sibling lanes retry immediately.
+     - Reset the backoff once the lane is healthy.
+  3. **Demand.** Demand objects (those with waiting reads) get the next slot on the owning lane.
+- **Acceptance:**
+  - `qual_wp5_3_recovery` runs through FaultProxy with a 45 s outage in the middle of a 512 MiB transfer. After the network is restored:
+    - lanes are Ready within 5 s;
+    - bytes are flowing again within 10 s;
+    - the transfer resumes from the durable offset.
+  - Under mutual pairing, no object is transferred twice.
+  - The existing objects and e2e floors still hold.
+
+#### WP5.4 Leftovers
+
+- **Owned:** `tests/meta_scheduler.rs`, `src/worker/status_cell.rs`, `src/orchestrator/ctx.rs`, `src/orchestrator/catalog.rs`, `src/model/orchestrator.rs`, `tests/catalog_actor.rs`.
+- **Tasks:**
+  1. **Flaky test.** Fix `meta_scheduler::a_request_id_is_never_sent_twice`. It checks the key's failure counter right after it sees the finished event; it should wait for the counter instead.
+  2. **CCR-WP4.INT-1.** Derive the worker status fields `caught_up` and `metadata_caught_up` from the v3 feed observations, with a freshness rule.
+  3. **`ctx.rs`.** `plain_path` must strip the real `\\?\` verbatim prefix.
+  4. **CCR-WP4.1-1.** Add the per-peer credential commands and view to the `model::orchestrator` catalog contract, and remove the adapter.
+  5. **Other WP4.INT review minors.** Fix the ones still open in files that no other Wave 5 package owns.
+
+#### WP5.INT
+
+- **Owns:**
+  - the docs for this wave: README *Known limitations*, ARCHITECTURE, VALIDATION and CONFIGURATION;
+  - `tests/qualification-floors.json`. Add a floor for every WP5 acceptance number.
+- **Runs:**
+  - the full suite, on Windows plus the WSL subset;
+  - the 1,000-seed oracle and the feed fuzz;
+  - `qualify.ps1 -All`;
+  - the default 2-hour soak **and** both heavy WP5.1 workloads.
+- **Writes:** `test-evidence/qualification-wave-5.json`.
+
+The coordinator re-runs the two-machine lab afterwards.
+
+
 ### 14.6 Qualification scenario catalog (created by WP0.5; owner un-ignores)
 
 | File | Scenarios (floors in §15) |
