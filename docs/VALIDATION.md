@@ -111,6 +111,7 @@ holds the §15 before/after table with the Linux numbers too.
 |---|---|---|---|---|
 | Remote linear create, per event, 2K / 10K | `qual_wp1_6_activation` | 15.9 s @2K | ≤ 5 ms | 0.63 / 0.90 ms |
 | Local create after a resolved conflict (p90) | `qual_wp1_6_activation` | 4.2 s | ≤ 10 ms | 1.2 ms |
+| Local create beside an unresolved conflict, 10K events (p90; WP4.INT re-review) | `qual_wp1_6_activation` | 262–436 ms (before the scoped conflict gate) | ≤ 10 ms | 3.2 / 3.6 ms (two runs, measured apart from `-All`; renames 95–99 ms and deletes 94 ms, reported: their cut count is O(history) with or without conflicts) |
 | Two-way backlog, per event, 2K / 6.4K | `qual_wp1_7_derive` | 15.9 s / 218 s | ≤ 100 / 300 ms | 35 / 132 ms |
 | 50 concurrent namespace ops on 5K history (max) | `qual_wp1_7_derive` | seconds to minutes | ≤ 500 ms | 229 ms |
 | Restart to Ready at 20K objects | `qual_wp1_8_objects` | full re-hash | ≤ 3 s | 0.95 s |
@@ -293,10 +294,13 @@ folders every minute and the final state.
 | storm, 2 h | the same | **did not converge**: 8,973 and 7,905 events, 9,399 and 5,861 unresolved conflicts; 1,549 and 2,617 events still waiting after the 30 min settle, each conflicting event a full replay of minutes; the final oracle check of the two stopped stores had not finished after 3 h (stopped) |
 | fast editing, 91 min of 2 h (stopped) | 10 % on the shared pool, one operation every 50–400 ms | **falling behind**: 21.5K events and 100–107 unresolved conflicts on each side, the activation backlog growing (140 events after 30 min, 1.5K after 91 min) |
 
-The last two show this release's limit: while a branch has unresolved
-conflicts, remote creations and namespace changes take the slow path, and a
-slow event whose append-mode precondition fails is a full replay, whose
-cost grows with the history and, steeply, with the unresolved conflicts;
+The last two show this release's limit (measured before the WP4.INT
+re-review's scoped conflict gate, under which creations and namespace
+changes that touch no conflicted entry, parent or slot keep the fast path
+while other conflicts are open): an event that conflicts, or that touches a
+conflicted entry, is a slow event, and a slow event whose append-mode
+precondition fails is a full replay, whose cost grows with the history and,
+steeply, with the unresolved conflicts;
 under continuous local writes the prepared replays also go stale and are
 redone (2,420 stale outcomes in the stopped run). Activation then falls
 behind a peer that keeps writing. Resolving conflicts keeps it fast
