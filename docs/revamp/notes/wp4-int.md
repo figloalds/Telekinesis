@@ -163,6 +163,24 @@ path, large-projection crash coverage, `59a224e`), WP4.5 (Summary 8).
   or wait as long as the download progresses. Adapter: README *Initial-sync
   gate* documents it.
 
+- **CCR-WP4.INT-3** (`src/core/commit.rs`, `src/core/derive.rs`,
+  `src/worker/activator.rs`; performance): in a history with thousands of
+  unresolved conflicts, each conflict-producing remote event falls back to a
+  full replay (off-lock prepare, then commit), whose cost grows with the
+  history and the conflicts: in the first soak run (*Qualification*, every
+  edit of both sides on one shared name pool for two hours: 8,973 events and
+  9,399 unresolved conflicts on one side) one event's prepare took minutes
+  and went stale four times in 15 min before it was committed inline, a
+  full rebuild of that store (a copy) had not finished after 20 min, and
+  activation fell behind for good (1,549 and 2,617 events waiting after the
+  30 min settle). Requested: keep the slow path's cost proportional to the
+  touched cones when the append precondition fails for cones the event does
+  not touch, or prepare one replay for several queued slow events, and do
+  not throw a prepared replay away when the branch moved only by fast
+  commits of unrelated entities (1,171 stale outcomes in that run). Adapter:
+  none; the soak's default workload keeps conflicts occasional (deviation 2)
+  and README / VALIDATION describe the limit.
+
 ## Deviations from the spec, and why
 
 1. **The feed fuzz is a file of its own** (`tests/feed_fuzz.rs`), not part
