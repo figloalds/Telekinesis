@@ -238,8 +238,7 @@ fn recovery(fault: Fault, mutual: bool) {
     let mut s = Scenario::with_budget(FILE, &name, budget_or(600));
     let size = scaled(512) as u64 * MIB;
     let config = NodeConfig::default().connections(CONNECTIONS);
-    let a = Node::start(config.clone());
-    let a = Arc::new(a);
+    let a = Arc::new(Node::start(config.clone()));
     let b = Arc::new(Node::start(config));
     let pa = a.create("Recovery", true);
     let hash = a

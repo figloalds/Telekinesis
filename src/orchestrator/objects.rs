@@ -3384,6 +3384,9 @@ fn want_more(
         state.excluded |= !exclude.is_empty();
         let items = match want_excluding(client, &header, exclude, worker_client::deadlines::WANT) {
             Ok(items) => items,
+            // A busy round's demand want is a hint: its failure is not the
+            // round's (the round's own wants report the worker's state).
+            Err(_) if demand => return,
             Err(error) => {
                 state.local_error.get_or_insert(error);
                 return;
