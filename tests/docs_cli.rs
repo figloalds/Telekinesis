@@ -214,8 +214,10 @@ enum Takes {
     /// One value per occurrence (`--mount <MOUNT>`).
     One,
     /// Every following word up to the next option (`--conflict <ID>...`,
-    /// clap's `num_args = 1..`).
+    /// clap's `num_args = 1..`): at least one.
     Many,
+    /// One value or none (`--color [<WHEN>]`, clap's `num_args = 0..=1`).
+    Maybe,
 }
 
 /// One entry of the `Options:` section of a clap help text.
@@ -261,6 +263,8 @@ fn options_of(help: &str) -> Vec<OptionSpec> {
             if token.starts_with('<') || token.starts_with('[') {
                 takes = if token.ends_with("...") {
                     Takes::Many
+                } else if token.starts_with('[') {
+                    Takes::Maybe
                 } else {
                     Takes::One
                 };
@@ -367,12 +371,23 @@ fn resolve(helper: &mut Helper, doc: &Documented) -> Result<Resolved, String> {
                     None => Takes::Nothing,
                 }
             };
-            match takes {
-                Takes::Nothing => {}
-                Takes::One => {
-                    words.next();
-                }
-                Takes::Many => while words.next_if(|next| !is_option(next)).is_some() {},
+            // A value is a word that is not an option: `--mount` at the end
+            // of a line, or followed by `--headless`, is refused as clap
+            // refuses it (WP4.INT, the WP4.3 review's minor).
+            let mut values = 0usize;
+            let most = match takes {
+                Takes::Nothing => 0,
+                Takes::One | Takes::Maybe => 1,
+                Takes::Many => usize::MAX,
+            };
+            while values < most && words.next_if(|next| !is_option(next)).is_some() {
+                values += 1;
+            }
+            if values == 0 && matches!(takes, Takes::One | Takes::Many) {
+                return Err(format!(
+                    "`{name}` needs a value in `tkfs {}`",
+                    path.join(" ")
+                ));
             }
             options.push(name);
             continue;
@@ -711,6 +726,25 @@ fn the_checker_refuses_unknown_commands_options_and_incomplete_lines() {
             "needs 2 positional",
         ),
         ("tkfs daemon --mount PATH", "requires --state"),
+        // An option without its value: at the end of the line, before
+        // another option, or a multi-value option with none.
+        (
+            "tkfs manage configure-mount STATE --mount",
+            "`--mount` needs a value",
+        ),
+        (
+            "tkfs manage create X --mount --headless",
+            "`--mount` needs a value",
+        ),
+        ("tkfs -C MOUNT checkpoint -m", "`-m` needs a value"),
+        (
+            "tkfs -C MOUNT recover ENTITY TARGET --conflict",
+            "`--conflict` needs a value",
+        ),
+        (
+            "tkfs -C MOUNT resolve --conflict --revision R",
+            "`--conflict` needs a value",
+        ),
         ("tkfs -C MOUNT checkpoint", "requires --message"),
         (
             "tkfs -C MOUNT publish NAME",
