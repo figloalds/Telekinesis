@@ -290,6 +290,14 @@ thread_local! {
     static LAST_FALLBACK: Cell<Option<&'static str>> = const { Cell::new(None) };
     static FALLBACK_REASONS: RefCell<BTreeMap<&'static str, u64>> = const { RefCell::new(BTreeMap::new()) };
     static COMMIT_CHECKS: Cell<bool> = const { Cell::new(false) };
+    static INDEXED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How many append derivations on the calling thread read a branch index
+/// (`derive_append_indexed`; tests and telemetry).
+#[doc(hidden)]
+pub fn thread_indexed_appends() -> u64 {
+    INDEXED.with(Cell::get)
 }
 
 /// Check every commit on the calling thread (any mode) against the
@@ -505,6 +513,7 @@ pub(super) fn persist_projection(
         new_event,
         reviewed: &reviewed,
         stored: None,
+        index: None,
     })?;
     write_projection(tx, branch, &out)
 }
@@ -534,6 +543,10 @@ pub struct DeriveInput<'a> {
     /// stored one keeps them): append mode does not write them again. `None`:
     /// unknown, every record is written.
     pub stored: Option<&'a BTreeSet<String>>,
+    /// WP5.1: the branch's index of every event but the new one (the last of
+    /// `events`), kept with the event cache (`BranchIndex`); `None`: append
+    /// mode scans the events.
+    pub(crate) index: Option<&'a IndexCell>,
 }
 
 /// A derived record set ready to write: rows deduplicated by id (the last
@@ -646,6 +659,7 @@ pub fn derive_conflicts(input: &DeriveInput) -> Result<DeriveOutput> {
             new_event: None,
             reviewed: &[],
             stored: None,
+            index: None,
             ..*input
         },
         None,
@@ -740,7 +754,7 @@ fn derive_in_mode(input: &DeriveInput, new_id: &str) -> Result<Derived> {
                 Ok(Derived::Rows(finish(
                     input,
                     Some(new_id),
-                    without_stored(input, conflicts),
+                    conflicts,
                     false,
                 )?))
             }
@@ -751,33 +765,6 @@ fn derive_in_mode(input: &DeriveInput, new_id: &str) -> Result<Derived> {
         },
         ConflictMode::Verify => derive_verified(input, new_id),
     }
-}
-
-/// Append mode's records without the projection's records that are stored
-/// already (`DeriveInput::stored`): the leading `projection.conflicts` part
-/// of the list (append mode's first source), for ids no later source derives
-/// again (the last record of an id is the one written). Writing them again
-/// would upsert an identical row; skipping them leaves the same table.
-fn without_stored(input: &DeriveInput, conflicts: Vec<Conflict>) -> Vec<Conflict> {
-    let Some(stored) = input.stored else {
-        return conflicts;
-    };
-    let projected = input.projection.conflicts.len().min(conflicts.len());
-    let last: HashMap<&str, usize> = conflicts
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.id.as_str(), i))
-        .collect();
-    let keep: Vec<bool> = conflicts
-        .iter()
-        .enumerate()
-        .map(|(i, c)| !(i < projected && last[c.id.as_str()] < projected && stored.contains(&c.id)))
-        .collect();
-    conflicts
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(c, keep)| keep.then_some(c))
-        .collect()
 }
 
 /// Full derivation: every source over the whole branch history, written
@@ -848,6 +835,7 @@ fn derive_full(
             new_event,
             reviewed: &reviewed,
             stored: None,
+            index: None,
         },
         new_event,
     )
@@ -867,7 +855,8 @@ fn derive_full_with(input: &DeriveInput, new_event: Option<&str>) -> Result<Vec<
     if new_event.is_some() {
         conflicts.extend(input.reviewed.iter().cloned());
     }
-    let ns = NsContext::new(branch, events);
+    let base = timed("f.base", || NsBase::build(events));
+    let ns = NsContext::new(branch, events, &base);
     let pending: HashSet<&str> = p.pending.iter().map(String::as_str).collect();
     let activated: Vec<bool> = events
         .iter()
@@ -1065,49 +1054,68 @@ fn register_pairs(
         if new_event.is_some() && candidate.is_none() {
             continue;
         }
-        // The overwhelmingly common single-parent chain has no historical
-        // concurrency. Detect it in O(revisions), without enumerating pairs.
-        if linear_versions(versions) {
-            continue;
-        }
-        let reach = VersionReach::new(events, versions);
-        // Appending a validated event cannot change old/old register ancestry.
-        // Keep their durable records and derive only new/old pairs on append.
-        // Startup/repair still derives the entire historical set from the DAG.
-        let pairs: Box<dyn Iterator<Item = (usize, usize)>> = if let Some(i) = candidate {
-            Box::new(
-                (0..versions.len())
-                    .filter(move |&j| j != i)
-                    .map(move |j| (i, j)),
-            )
-        } else {
-            Box::new(
-                (0..versions.len()).flat_map(|i| ((i + 1)..versions.len()).map(move |j| (i, j))),
-            )
-        };
-        for (i, j) in pairs {
-            crate::startup::progress("rebuilding register conflicts");
-            let (a, b) = (versions[i], versions[j]);
-            if a.1.value != b.1.value && !reach.has(i, j) && !reach.has(j, i) {
-                let mut bases: Vec<Version> = versions
-                    .iter()
-                    .enumerate()
-                    .filter(|(k, _)| reach.has(i, *k) && reach.has(j, *k))
-                    .map(|(_, &v)| version_of(events, v))
-                    .collect();
-                bases.sort_by(|a, b| a.revision.cmp(&b.revision));
-                conflicts.push(make_conflict(
-                    branch,
-                    entity,
-                    field,
-                    "concurrent revisions",
-                    vec![version_of(events, a), version_of(events, b)],
-                    bases,
-                ));
-            }
-        }
+        register_records(
+            branch,
+            events,
+            (entity, field),
+            versions,
+            candidate,
+            &mut conflicts,
+        );
     }
     conflicts
+}
+
+/// The concurrent-revision records of register `(entity, field)` from its
+/// `versions` (in event order): of the version `candidate` (an append's new
+/// one) against every other, or of every pair (`None`).
+fn register_records(
+    branch: &str,
+    events: &[Event],
+    (entity, field): (&str, &str),
+    versions: &[VersionRef],
+    candidate: Option<usize>,
+    conflicts: &mut Vec<Conflict>,
+) {
+    // The overwhelmingly common single-parent chain has no historical
+    // concurrency. Detect it in O(revisions), without enumerating pairs.
+    if linear_versions(versions) {
+        return;
+    }
+    let reach = VersionReach::new(events, versions);
+    // Appending a validated event cannot change old/old register ancestry.
+    // Keep their durable records and derive only new/old pairs on append.
+    // Startup/repair still derives the entire historical set from the DAG.
+    let pairs: Box<dyn Iterator<Item = (usize, usize)>> = if let Some(i) = candidate {
+        Box::new(
+            (0..versions.len())
+                .filter(move |&j| j != i)
+                .map(move |j| (i, j)),
+        )
+    } else {
+        Box::new((0..versions.len()).flat_map(|i| ((i + 1)..versions.len()).map(move |j| (i, j))))
+    };
+    for (i, j) in pairs {
+        crate::startup::progress("rebuilding register conflicts");
+        let (a, b) = (versions[i], versions[j]);
+        if a.1.value != b.1.value && !reach.has(i, j) && !reach.has(j, i) {
+            let mut bases: Vec<Version> = versions
+                .iter()
+                .enumerate()
+                .filter(|(k, _)| reach.has(i, *k) && reach.has(j, *k))
+                .map(|(_, &v)| version_of(events, v))
+                .collect();
+            bases.sort_by(|a, b| a.revision.cmp(&b.revision));
+            conflicts.push(make_conflict(
+                branch,
+                entity,
+                field,
+                "concurrent revisions",
+                vec![version_of(events, a), version_of(events, b)],
+                bases,
+            ));
+        }
+    }
 }
 
 /// Writes `rows`: full mode's DELETE of the namespace rows they lack (when
@@ -1202,6 +1210,7 @@ fn review_receipts(
 }
 
 /// The outcome of the append-mode precondition.
+#[derive(Debug, PartialEq)]
 enum Plan {
     /// The records append mode derives (written without the namespace DELETE).
     Derived(Vec<Conflict>),
@@ -1309,7 +1318,6 @@ fn slot_key(name: &str) -> Result<Arc<str>> {
 struct Location<'a> {
     event: usize,
     change: &'a Change,
-    parent: &'a str,
     key: std::result::Result<Arc<str>, String>,
 }
 
@@ -1323,10 +1331,11 @@ impl<'a> Locations<'a> {
         let mut rows = vec![];
         for (event, e) in events.iter().enumerate() {
             for change in e.changes.iter().filter(|c| c.field == "location") {
+                // A parent that is not a string panics here, as it always did.
+                let _: &str = change.value["parent"].as_str().unwrap();
                 rows.push(Location {
                     event,
                     change,
-                    parent: change.value["parent"].as_str().unwrap(),
                     key: slot_key(change.value["name"].as_str().unwrap())
                         .map_err(|error| format!("{error:#}")),
                 });
@@ -1373,47 +1382,9 @@ fn projection_cannot_fail(ns: &NsContext, locations: &Locations) -> bool {
             return false;
         }
     }
-    for (entity, versions) in ns.alive.iter().enumerate() {
-        if versions.is_empty() {
-            continue;
-        }
-        let entity = ns.names[entity];
-        let index: HashMap<&str, usize> = versions
-            .iter()
-            .enumerate()
-            .map(|(k, (i, _))| (events[*i].id.as_str(), k))
-            .collect();
-        // placed[k]: version k's event places the entity, or a presence
-        // parent of it is placed (resolved in topological order).
-        let parents: Vec<Vec<usize>> = versions
-            .iter()
-            .map(|(_, c)| {
-                c.parents
-                    .iter()
-                    .filter_map(|p| index.get(p.as_str()).copied())
-                    .collect()
-            })
-            .collect();
-        let children = children_of(&parents);
-        let mut degree: Vec<usize> = parents.iter().map(Vec::len).collect();
-        let mut ready: Vec<usize> = (0..versions.len()).filter(|&k| degree[k] == 0).collect();
-        let mut placed = vec![false; versions.len()];
-        let mut seen = 0;
-        while let Some(k) = ready.pop() {
-            seen += 1;
-            placed[k] = events[versions[k].0]
-                .changes
-                .iter()
-                .any(|c| c.entity == entity && c.field == "location")
-                || parents[k].iter().any(|&p| placed[p]);
-            for &child in &children[k] {
-                degree[child] -= 1;
-                if degree[child] == 0 {
-                    ready.push(child);
-                }
-            }
-        }
-        if seen < versions.len() || placed.contains(&false) {
+    let base = ns.base;
+    for (x, versions) in base.alive.iter().enumerate() {
+        if !versions.is_empty() && !presence_placed(events, &base.names[x], versions) {
             return false;
         }
     }
@@ -1422,7 +1393,7 @@ fn projection_cannot_fail(ns: &NsContext, locations: &Locations) -> bool {
 
 /// Per edge of the namespace dependency graph: how many location changes of
 /// the branch contribute it, and whether the new event is one of them.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Contributions {
     all: usize,
     new: usize,
@@ -1431,6 +1402,11 @@ impl Contributions {
     fn add(&mut self, new: bool) {
         self.all += 1;
         self.new += usize::from(new);
+    }
+    /// Undoes an `add` (`BranchIndex::undo`).
+    fn remove(&mut self, new: bool) {
+        self.all -= 1;
+        self.new -= usize::from(new);
     }
     /// Present before the new event (`before`) or with it.
     fn present(self, before: bool) -> bool {
@@ -1442,20 +1418,14 @@ impl Contributions {
     }
 }
 
-/// `NamespaceCones` of the whole branch, built once, with per-edge
-/// contributions so the cones without the new event come from the same
-/// graph (the new event adds at most one placement). WP5.1: entities as
-/// numbers (`NsContext::names`), slots as numbers.
-struct ConeGraph {
-    nodes: Vec<Contributions>,
-    /// Per entity: its parent directories and their contributions.
-    parents: Vec<Vec<(u32, Contributions)>>,
-    /// Per entity: the entities placed under it (distinct).
-    children: Vec<Vec<u32>>,
-    /// Per entity: its slots (distinct).
-    entity_slots: Vec<Vec<u32>>,
-    /// Per slot: its occupants and their contributions.
-    slots: Vec<Vec<(u32, Contributions)>>,
+/// `NamespaceCones` of the whole branch with per-edge contributions, so the
+/// cones without the new event come from the same graph (the new event adds
+/// at most one placement). WP5.1: the graph is a `GraphBase` (kept in the
+/// branch index, or built for one derivation), by stable entity numbers;
+/// entities in and out are numbers in id order (`NsContext`).
+struct ConeGraph<'g> {
+    graph: &'g GraphBase,
+    ns: &'g NsBase,
 }
 
 /// Cones computed for one `before` setting: entities that share a slot
@@ -1466,85 +1436,42 @@ struct ConeMemo {
     cones: HashMap<usize, Rc<[u32]>>,
 }
 
-impl ConeGraph {
-    fn new(ns: &NsContext, locations: &Locations, new: usize) -> Self {
-        let n = ns.names.len();
-        let mut graph = Self {
-            nodes: vec![Contributions::default(); n],
-            parents: vec![vec![]; n],
-            children: vec![vec![]; n],
-            entity_slots: vec![vec![]; n],
-            slots: vec![],
-        };
-        for (i, e) in ns.events.iter().enumerate() {
-            for c in &e.changes {
-                graph.nodes[ns.entities[c.entity.as_str()] as usize].add(i == new);
-            }
+impl<'g> ConeGraph<'g> {
+    fn new(index: &'g BranchIndex) -> Self {
+        Self {
+            graph: &index.graph,
+            ns: &index.ns,
         }
-        let mut slot_ids: HashMap<(&str, &str), u32> = HashMap::default();
-        for row in &locations.rows {
-            let is_new = row.event == new;
-            let entity = ns.entities[row.change.entity.as_str()];
-            if row.parent != ROOT {
-                let parent = ns.entities[row.parent];
-                let list = &mut graph.parents[entity as usize];
-                match list.iter_mut().find(|(p, _)| *p == parent) {
-                    Some((_, c)) => c.add(is_new),
-                    None => {
-                        let mut c = Contributions::default();
-                        c.add(is_new);
-                        list.push((parent, c));
-                    }
-                }
-                if !graph.children[parent as usize].contains(&entity) {
-                    graph.children[parent as usize].push(entity);
-                }
-                graph.nodes[parent as usize].add(is_new);
-            }
-            // Callers check `Locations::first_error` first.
-            let key: &str = row.key.as_deref().unwrap_or_default();
-            let next = slot_ids.len() as u32;
-            let slot = *slot_ids.entry((row.parent, key)).or_insert(next);
-            if slot as usize == graph.slots.len() {
-                graph.slots.push(vec![]);
-            }
-            if !graph.entity_slots[entity as usize].contains(&slot) {
-                graph.entity_slots[entity as usize].push(slot);
-            }
-            let occupants = &mut graph.slots[slot as usize];
-            match occupants.iter_mut().find(|(m, _)| *m == entity) {
-                Some((_, c)) => c.add(is_new),
-                None => {
-                    let mut c = Contributions::default();
-                    c.add(is_new);
-                    occupants.push((entity, c));
-                }
-            }
-        }
-        graph
+    }
+    /// Stable numbers to numbers in id order, sorted.
+    fn ranked(&self, stable: impl Iterator<Item = usize>) -> Vec<u32> {
+        let mut out: Vec<u32> = stable.map(|x| self.ns.rank[x]).collect();
+        out.sort_unstable();
+        out
     }
     /// Whether `entity` is a node of the history without the new event.
     fn existed(&self, entity: u32) -> bool {
-        self.nodes[entity as usize].present(true)
+        self.graph.nodes[self.ns.by_rank[entity as usize] as usize].present(true)
     }
     /// The cone of `entity` (`NamespaceCones::cone`), with or without the new
     /// event's contributions. Sorted.
     fn cone(&self, entity: u32, before: bool) -> Vec<u32> {
         crate::startup::progress("analyzing namespace dependencies");
-        let mut members = Bits::new(self.nodes.len());
-        let mut visited_slots = Bits::new(self.slots.len());
-        let mut pending = vec![entity];
+        let g = self.graph;
+        let mut members = Bits::new(g.nodes.len());
+        let mut visited_slots = Bits::new(g.slots.len());
+        let mut pending = vec![self.ns.by_rank[entity as usize]];
         while let Some(next) = pending.pop() {
             if !members.insert(next as usize) {
                 continue;
             }
-            for &(parent, c) in &self.parents[next as usize] {
+            for &(parent, c) in &g.parents[next as usize] {
                 if c.present(before) {
                     pending.push(parent);
                 }
             }
-            for &slot in &self.entity_slots[next as usize] {
-                let occupants = &self.slots[slot as usize];
+            for &slot in &g.entity_slots[next as usize] {
+                let occupants = &g.slots[slot as usize];
                 let here = occupants
                     .iter()
                     .find(|(m, _)| *m == next)
@@ -1559,15 +1486,16 @@ impl ConeGraph {
                 }
             }
         }
-        members.iter().map(|m| m as u32).collect()
+        self.ranked(members.iter())
     }
     /// `cone`, computed once per group of entities that share a slot
     /// (transitively, over the edges present with `before`): they have the
     /// same cone (each one's cone holds the others and so their cones).
     fn cone_memo(&self, memo: &mut ConeMemo, entity: u32, before: bool) -> Rc<[u32]> {
+        let g = self.graph;
         let group = memo.group.get_or_insert_with(|| {
-            let mut group: Vec<usize> = (0..self.nodes.len()).collect();
-            for occupants in &self.slots {
+            let mut group: Vec<usize> = (0..g.nodes.len()).collect();
+            for occupants in &g.slots {
                 let present: Vec<u32> = occupants
                     .iter()
                     .filter(|(_, c)| c.present(before))
@@ -1583,7 +1511,7 @@ impl ConeGraph {
             }
             group
         });
-        let root = union_find(group, entity as usize);
+        let root = union_find(group, self.ns.by_rank[entity as usize] as usize);
         memo.cones
             .entry(root)
             .or_insert_with(|| self.cone(entity, before).into())
@@ -1592,22 +1520,23 @@ impl ConeGraph {
     /// The entities whose cone (with the new event) contains one of
     /// `targets`: reverse reachability over parent and slot edges. Sorted.
     fn reaching(&self, targets: &[u32]) -> Vec<u32> {
-        let mut found = Bits::new(self.nodes.len());
+        let g = self.graph;
+        let mut found = Bits::new(g.nodes.len());
         let mut pending: Vec<u32> = targets
             .iter()
-            .copied()
-            .filter(|&t| self.nodes[t as usize].present(false))
+            .map(|&t| self.ns.by_rank[t as usize])
+            .filter(|&t| g.nodes[t as usize].present(false))
             .collect();
         while let Some(next) = pending.pop() {
             if !found.insert(next as usize) {
                 continue;
             }
-            pending.extend(&self.children[next as usize]);
-            for &slot in &self.entity_slots[next as usize] {
-                pending.extend(self.slots[slot as usize].iter().map(|&(m, _)| m));
+            pending.extend(&g.children[next as usize]);
+            for &slot in &g.entity_slots[next as usize] {
+                pending.extend(g.slots[slot as usize].iter().map(|&(m, _)| m));
             }
         }
-        found.iter().map(|m| m as u32).collect()
+        self.ranked(found.iter())
     }
 }
 
@@ -1639,6 +1568,7 @@ fn derive_append(
             new_event: Some(new_id),
             reviewed: &reviewed,
             stored: None,
+            index: None,
         },
         new_id,
     )
@@ -1647,13 +1577,14 @@ fn derive_append(
 /// Append mode (§5.2): the records the new event adds, or a fallback reason.
 /// Errors are refusals, raised exactly where full mode raises them (module
 /// docs): nothing here fails on history that a rebuild accepts.
+///
+/// WP5.1: with the branch's index (`DeriveInput::index`), the parts of the
+/// precondition and of the derivation that read every event read the index
+/// instead (`derive_append_indexed`); without it, or for a history the index
+/// does not cover, they scan the events (`derive_append_scan`). Under the
+/// commit checks both run and must agree.
 fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
-    let DeriveInput {
-        branch,
-        projection: p,
-        events,
-        ..
-    } = *input;
+    let events = input.events;
     let mut positions = events
         .iter()
         .enumerate()
@@ -1662,18 +1593,49 @@ fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
     let (Some(new), None) = (positions.next(), positions.next()) else {
         return Ok(Plan::Fallback("new event not exactly once in the branch"));
     };
+    if let Some(cell) = input.index
+        && let Some(result) = derive_append_indexed(input, new, cell)
+    {
+        if checks_projections() {
+            let reference = derive_append_scan(input, new);
+            let same = match (&result, &reference) {
+                (Ok(a), Ok(b)) => a == b,
+                (Err(a), Err(b)) => format!("{a:#}") == format!("{b:#}"),
+                _ => false,
+            };
+            ensure!(
+                same,
+                "CONFLICT_MODE_MISMATCH: the indexed append derivation of {new_id} differs from the scan: {:?} / {:?}",
+                result.as_ref().map_err(|e| format!("{e:#}")),
+                reference.as_ref().map_err(|e| format!("{e:#}"))
+            );
+        }
+        return result;
+    }
+    derive_append_scan(input, new)
+}
+
+/// Append mode reading every event (the historical computation).
+fn derive_append_scan(input: &DeriveInput, new: usize) -> Result<Plan> {
+    let DeriveInput {
+        branch,
+        projection: p,
+        events,
+        ..
+    } = *input;
     if let Some(reason) = timed("a.guard", || append_guard(p, events, new)) {
         return Ok(Plan::Fallback(reason));
     }
     let e = &events[new];
-    let ns = timed("a.nscontext", || NsContext::new(branch, events));
+    let index = timed("a.index", || BranchIndex::build_marked(events, Some(new)));
+    let ns = NsContext::new(branch, events, &index.ns);
     if ns.irregular {
-        // Only crafted journals (see `NsContext::new`): the reference decides.
+        // Only crafted journals (see `NsBase::irregular`): the reference decides.
         return Ok(Plan::Fallback("an irregular history"));
     }
     let locations = timed("a.locations", || Locations::new(events));
     // Same source order as full mode, so a refusal surfaces with the same error.
-    let mut conflicts = timed("a.pconflicts", || p.conflicts.clone());
+    let (mut conflicts, skipped) = projection_sources(input);
     conflicts.extend(input.reviewed.iter().cloned());
     conflicts.extend(timed("a.location_pairs", || {
         location_pairs_with(&ns, &locations, new)
@@ -1683,7 +1645,8 @@ fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
     }
     // Full mode's cone analysis reads every name next.
     locations.first_error()?;
-    let plan = match timed("a.plan", || ns.append_plan(new, &locations))? {
+    let graph = ConeGraph::new(&index);
+    let plan = match timed("a.plan", || ns.append_plan(new, &graph))? {
         Ok(plan) => plan,
         Err(reason) => return Ok(Plan::Fallback(reason)),
     };
@@ -1696,20 +1659,219 @@ fn derive_append_with(input: &DeriveInput, new_id: &str) -> Result<Plan> {
         ns.derive_planned(&plan, restricted)
     })?);
     conflicts.extend(timed("a.register_pairs", || {
-        register_pairs(branch, p, events, Some(new_id))
+        register_pairs(branch, p, events, Some(&e.id))
     }));
-    // Nothing above can fail on accepted history; a failure here is left to
-    // full mode, which raises or derives whatever the reference does.
-    match timed("a.survive", || {
-        ns.current_records_survive(new, &plan, &conflicts)
-    }) {
-        Ok(true) => Ok(Plan::Derived(conflicts)),
-        Ok(false) => Ok(Plan::Fallback(
-            "a current namespace record is not derived from history",
-        )),
-        Err(_) => Ok(Plan::Fallback(
-            "the current namespace records failed to project",
-        )),
+    Ok(survive(&ns, new, &plan, conflicts, &skipped))
+}
+
+/// Append mode through the branch's index (`BranchIndex`, which must index
+/// every event but the new one, the last): `None` when the index does not
+/// cover the history (a crafted one: an entity id with a comma, a location
+/// value that is not a pair of strings, a name without a key, an event that
+/// names the new one), and the scan derives.
+///
+/// The same derivation as `derive_append_scan`, with these read from the
+/// index (the new event pushed onto it, and popped after): the guard's facts
+/// (no event names the new one and no entity id has a comma, so the guard
+/// only refuses pending events and several relocations), the positions,
+/// entities and registers (`NsBase`), the cone graph (`GraphBase`), the
+/// location pairs of the new event's slot, the register versions of the new
+/// event's registers, and whether a cut can fail to project (`Facts`).
+fn derive_append_indexed(
+    input: &DeriveInput,
+    new: usize,
+    cell: &IndexCell,
+) -> Option<Result<Plan>> {
+    let DeriveInput {
+        projection: p,
+        events,
+        ..
+    } = *input;
+    let e = &events[new];
+    {
+        let index = cell.try_borrow().ok()?;
+        let index = index.as_ref()?;
+        let f = &index.facts;
+        if new + 1 != events.len()
+            || index.len() != new
+            || f.comma > 0
+            || f.malformed > 0
+            || f.key_errors > 0
+            || f.dangling.contains_key(e.id.as_str())
+        {
+            return None;
+        }
+    }
+    for c in &e.changes {
+        if c.entity.contains(',') {
+            return None;
+        }
+        if c.field == "location" {
+            let (Some(_), Some(name)) = (c.value["parent"].as_str(), c.value["name"].as_str())
+            else {
+                return None;
+            };
+            if slot_key(name).is_err() {
+                return None;
+            }
+        }
+    }
+    // `append_guard`, from the facts.
+    if !p.pending.is_empty() {
+        return Some(Ok(Plan::Fallback("the branch has pending events")));
+    }
+    if e.changes.iter().filter(|c| c.field == "location").count() > 1 {
+        return Some(Ok(Plan::Fallback(
+            "the new event relocates several entities",
+        )));
+    }
+    let multi: Vec<Vec<&Change>> = cell
+        .borrow()
+        .as_ref()?
+        .facts
+        .multi
+        .iter()
+        .map(|&i| {
+            events[i]
+                .changes
+                .iter()
+                .filter(|c| c.field == "location")
+                .collect()
+        })
+        .collect();
+    if let Some(reason) = relocation_guard(&multi) {
+        return Some(Ok(Plan::Fallback(reason)));
+    }
+    let checks = checks_projections();
+    let before = if checks { cell.borrow().clone() } else { None };
+    let undo = timed("a.push", || cell.borrow_mut().as_mut()?.push(events))?;
+    let pushed = Pushed {
+        cell,
+        events,
+        undo: Some(undo),
+    };
+    let result = {
+        let index = cell.borrow();
+        let index = index.as_ref().expect("the pushed index");
+        if checks && !index.same_as(&BranchIndex::build_marked(events, Some(new))) {
+            Err(anyhow::anyhow!(
+                "CONFLICT_MODE_MISMATCH: the branch index with {} differs from a fresh build",
+                e.id
+            ))
+        } else {
+            derive_append_core(input, new, index)
+        }
+    };
+    drop(pushed);
+    INDEXED.with(|cell| cell.set(cell.get() + 1));
+    if let Some(before) = before {
+        let after = cell.borrow();
+        if !after.as_ref().is_some_and(|after| after.same_as(&before)) {
+            return Some(Err(anyhow::anyhow!(
+                "CONFLICT_MODE_MISMATCH: the branch index after {} is not the index before it",
+                e.id
+            )));
+        }
+    }
+    Some(result)
+}
+
+/// The new event pushed onto a branch index (`BranchIndex::push`): popped
+/// again when dropped, also when the derivation panics.
+struct Pushed<'c> {
+    cell: &'c IndexCell,
+    events: &'c [Event],
+    undo: Option<Undo>,
+}
+impl Drop for Pushed<'_> {
+    fn drop(&mut self) {
+        let Some(undo) = self.undo.take() else {
+            return;
+        };
+        // The derivation's reader is gone by now (it is declared later).
+        if let Ok(mut slot) = self.cell.try_borrow_mut()
+            && let Some(index) = slot.as_mut()
+        {
+            index.undo(self.events, undo);
+        }
+    }
+}
+
+/// `derive_append_scan` past the guard, through `index` (with the new event).
+fn derive_append_core(input: &DeriveInput, new: usize, index: &BranchIndex) -> Result<Plan> {
+    let DeriveInput { branch, events, .. } = *input;
+    let e = &events[new];
+    let ns = NsContext::new(branch, events, &index.ns);
+    if ns.irregular {
+        return Ok(Plan::Fallback("an irregular history"));
+    }
+    let (mut conflicts, skipped) = projection_sources(input);
+    conflicts.extend(input.reviewed.iter().cloned());
+    conflicts.extend(timed("a.location_pairs", || {
+        location_pairs_indexed(&ns, index, new)
+    }));
+    if !e.reviewed.is_empty() {
+        conflicts.extend(timed("a.reviewed_cut", || ns.reviewed_cut(new))?);
+    }
+    let graph = ConeGraph::new(index);
+    let plan = match timed("a.plan", || ns.append_plan(new, &graph))? {
+        Ok(plan) => plan,
+        Err(reason) => return Ok(Plan::Fallback(reason)),
+    };
+    let restricted = !plan.cones.is_empty() && index.cannot_fail();
+    if restricted {
+        count(Count::Restricted);
+    }
+    conflicts.extend(timed("a.derive_planned", || {
+        ns.derive_planned(&plan, restricted)
+    })?);
+    conflicts.extend(timed("a.register_pairs", || {
+        register_pairs_indexed(branch, &ns, new)
+    }));
+    Ok(survive(&ns, new, &plan, conflicts, &skipped))
+}
+
+/// Append mode's first source, the current projection's records, without
+/// those stored with that payload already (`DeriveInput::stored`): writing
+/// them again would upsert an identical row (a later source that derives
+/// the same id is written after it anyway, the last record of an id being
+/// the one kept). Also the ids it skips, which the survival check reads.
+fn projection_sources<'i>(input: &DeriveInput<'i>) -> (Vec<Conflict>, Vec<&'i str>) {
+    let mut kept = vec![];
+    let mut skipped = vec![];
+    for c in &input.projection.conflicts {
+        if input.stored.is_some_and(|stored| stored.contains(&c.id)) {
+            skipped.push(c.id.as_str());
+        } else {
+            kept.push(c.clone());
+        }
+    }
+    (kept, skipped)
+}
+
+/// The last step of append mode (`current_records_survive`): the records,
+/// or the fallback when a current namespace record does not survive.
+/// `skipped`: the ids of the projection's records left out of `conflicts`.
+fn survive(
+    ns: &NsContext,
+    new: usize,
+    plan: &AppendPlan,
+    conflicts: Vec<Conflict>,
+    skipped: &[&str],
+) -> Plan {
+    let survives = {
+        let mut derived: HashSet<&str> = conflicts.iter().map(|c| c.id.as_str()).collect();
+        derived.extend(skipped.iter().copied());
+        // Nothing above can fail on accepted history; a failure here is left
+        // to full mode, which raises or derives whatever the reference does.
+        timed("a.survive", || {
+            ns.current_records_survive(new, plan, &derived)
+        })
+    };
+    match survives {
+        Ok(true) => Plan::Derived(conflicts),
+        Ok(false) => Plan::Fallback("a current namespace record is not derived from history"),
+        Err(_) => Plan::Fallback("the current namespace records failed to project"),
     }
 }
 
@@ -1738,10 +1900,15 @@ fn append_guard(p: &Projection, events: &[Event], new: usize) -> Option<&'static
             multi.push(locations);
         }
     }
-    // Several location changes in one event are a fork or restore root (or
-    // crafted). They keep ids unambiguous unless one event places two entities
-    // in one slot, or two events both relocate the same two entities.
-    for locations in &multi {
+    relocation_guard(&multi)
+}
+
+/// `append_guard`'s condition on the events with several location changes
+/// (`multi`, in event order): a fork or restore root (or crafted) keeps ids
+/// unambiguous unless one event places two entities in one slot, or two
+/// events both relocate the same two entities.
+fn relocation_guard(multi: &[Vec<&Change>]) -> Option<&'static str> {
+    for locations in multi {
         let mut slots = BTreeSet::new();
         for c in locations {
             let (Some(parent), Some(name)) = (c.value["parent"].as_str(), c.value["name"].as_str())
@@ -1778,6 +1945,82 @@ fn append_guard(p: &Projection, events: &[Event], new: usize) -> Option<&'static
         }
     }
     None
+}
+
+/// `location_pairs_with` through the index: the new event's location change
+/// against the earlier location changes of its slot (same parent, same key,
+/// in event order), as the scan pairs them.
+fn location_pairs_indexed(ns: &NsContext, index: &BranchIndex, new: usize) -> Vec<Conflict> {
+    let events = ns.events;
+    let mut conflicts = vec![];
+    for (q, c) in events[new].changes.iter().enumerate() {
+        if c.field != "location" {
+            continue;
+        }
+        let (Some(parent), Ok(key)) = (
+            c.value["parent"].as_str(),
+            slot_key(c.value["name"].as_str().unwrap_or_default()),
+        ) else {
+            continue;
+        };
+        let Some(&slot) = index.graph.slot_ids.get(&(Box::<str>::from(parent), key)) else {
+            continue;
+        };
+        for &(i, k) in &index.graph.rows[slot as usize] {
+            if (i, k) == (new, q) {
+                continue;
+            }
+            crate::startup::progress("rebuilding namespace conflicts");
+            let other = &events[i].changes[k];
+            if other.entity != c.entity && !ns.related(i, new) {
+                conflicts.push(placement_record(ns.branch, events, (i, other), (new, c)));
+            }
+        }
+    }
+    conflicts
+}
+
+/// `register_pairs` of an append through the index: the new event's
+/// registers (in key order), each with its versions from the entity's
+/// changes (`NsBase::changes`, in event order).
+fn register_pairs_indexed(branch: &str, ns: &NsContext, new: usize) -> Vec<Conflict> {
+    let events = ns.events;
+    let mut keys: Vec<(String, (&str, &str))> = events[new]
+        .changes
+        .iter()
+        .map(|c| {
+            (
+                register(&c.entity, &c.field),
+                (c.entity.as_str(), c.field.as_str()),
+            )
+        })
+        .collect();
+    keys.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    keys.dedup_by(|a, b| a.0 == b.0);
+    let mut conflicts = vec![];
+    for (_, (entity, field)) in keys {
+        crate::startup::progress("rebuilding register conflicts");
+        let Some(&x) = ns.base.entities.get(entity) else {
+            continue;
+        };
+        let versions: Vec<VersionRef> = ns.base.changes[x as usize]
+            .iter()
+            .map(|&version| (version.0, ns.change(version)))
+            .filter(|(_, c)| c.field == field)
+            .collect();
+        let Some(candidate) = versions.iter().position(|(i, _)| *i == new) else {
+            continue;
+        };
+        register_records(
+            branch,
+            events,
+            (entity, field),
+            &versions,
+            Some(candidate),
+            &mut conflicts,
+        );
+    }
+    conflicts
 }
 
 /// CCR-WP1.6-5: whether committing `events[new]` through the namespace
@@ -2033,8 +2276,9 @@ pub(super) fn check_successor_cuts(branch: &str, events: &[Event], new: usize) -
     }
     let locations = Locations::new(events);
     locations.first_error()?;
-    let ns = NsContext::new(branch, events);
-    let graph = ConeGraph::new(&ns, &locations, new);
+    let index = BranchIndex::build_marked(events, Some(new));
+    let ns = NsContext::new(branch, events, &index.ns);
+    let graph = ConeGraph::new(&index);
     let touched = touched_entities(&ns, new);
     let mut memo = ConeMemo::default();
     let cones: BTreeSet<Rc<[u32]>> = graph
@@ -2092,9 +2336,7 @@ fn derive_verified(input: &DeriveInput, new_id: &str) -> Result<Derived> {
             fallback(reason);
             return Ok(Derived::Rows(full_rows(input, Some(new_id))?));
         }
-        Ok(Plan::Derived(conflicts)) => {
-            finish(input, Some(new_id), without_stored(input, conflicts), false)
-        }
+        Ok(Plan::Derived(conflicts)) => finish(input, Some(new_id), conflicts, false),
         Err(error) => Err(error),
     };
     let full = full_rows(input, Some(new_id));
@@ -2576,6 +2818,9 @@ type Record = Rc<Conflict>;
 /// the location head versions it lists, as (member, event position).
 type RecordKey = (u32, Option<u32>, Vec<(u32, usize)>);
 
+/// Relevant sets by member set and excluded event (`NsContext::relevant`).
+type RelevantMemo = HashMap<(Vec<u32>, Option<usize>), Rc<Vec<usize>>>;
+
 #[derive(Default)]
 struct Memo<'a> {
     ancestors: Vec<Option<Rc<Bits>>>,
@@ -2591,7 +2836,7 @@ struct Memo<'a> {
     /// Relations over the touching events of a member set.
     relations: HashMap<Vec<u32>, Rc<Relations>>,
     /// Relevant sets by member set and excluded event.
-    relevant: HashMap<(Vec<u32>, Option<usize>), Rc<Vec<usize>>>,
+    relevant: RelevantMemo,
     records: HashMap<RecordKey, Record>,
     /// Full mode projects every cut in full (tests of the cut memo).
     unrestricted: bool,
@@ -2611,12 +2856,886 @@ fn ns_field(field: &str) -> Option<usize> {
     }
 }
 
-/// One namespace register version (`NsContext::regs`): its event, the
-/// change, and its parents among the register's versions.
-struct RegVersion<'a> {
+// ---------------------------------------------------------------------------
+// WP5.1: the branch index.
+
+/// One namespace register version (`NsBase::regs`): its event position, the
+/// change's index in that event, and its parents among the register's
+/// versions (by revision, in the change's parent order).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RegVersion {
     event: usize,
-    change: &'a Change,
+    change: usize,
     parents: Vec<usize>,
+}
+
+/// What `NsContext` reads of a branch's events, as positions and entity
+/// numbers: built for one derivation (`NsBase::build`), or kept with the
+/// event cache and extended as events join the branch (`BranchIndex`).
+///
+/// Entities have a *stable* number, in order of first appearance, that does
+/// not change while the base grows; `NsContext` numbers them in id order
+/// (`rank`), as the historical `BTreeSet<&str>` iterated them.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NsBase {
+    /// The number of events described.
+    len: usize,
+    /// The causal DAG: dependencies and change parents present in the events
+    /// (sorted, distinct positions).
+    parents: Vec<Vec<usize>>,
+    children: Vec<Vec<usize>>,
+    /// Event id to position (the last one, for a repeated id).
+    index: HashMap<Box<str>, usize>,
+    /// Entity ids (change entities and location parents other than `ROOT`)
+    /// by stable number.
+    names: Vec<Box<str>>,
+    entities: HashMap<Box<str>, u32>,
+    /// Per stable number, the entity's number in id order; per number in id
+    /// order, the stable number.
+    rank: Vec<u32>,
+    by_rank: Vec<u32>,
+    /// Per stable number: alive versions (event, change), in event order.
+    alive: Vec<Vec<(usize, usize)>>,
+    /// Per stable number: events with a kind, location or alive change.
+    touching: Vec<Vec<usize>>,
+    /// Per stable number: kind, location and alive versions, in event order.
+    regs: Vec<[Vec<RegVersion>; 3]>,
+    /// Per stable number: every change of the entity (event, change), in
+    /// event order.
+    changes: Vec<Vec<(usize, usize)>>,
+    /// Repeated event ids or a register changed twice by one event: no cut
+    /// is projected from registers alone.
+    irregular: bool,
+}
+
+impl NsBase {
+    /// The base of `events` (for one derivation).
+    fn build(events: &[Event]) -> Self {
+        let mut index = BranchIndex::empty(events.len());
+        let added: Vec<usize> = (0..events.len()).collect();
+        index.add(events, &added, None, false, None);
+        index.ns
+    }
+}
+
+/// `NamespaceCones` of a branch with per-edge contributions (`ConeGraph`),
+/// by stable entity number: what `ConeGraph::new` historically built from
+/// every location change on every append. Lists are unordered (the cones
+/// are sets).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct GraphBase {
+    nodes: Vec<Contributions>,
+    /// Per entity: its parent directories and their contributions.
+    parents: Vec<Vec<(u32, Contributions)>>,
+    /// Per entity: the entities placed under it (distinct).
+    children: Vec<Vec<u32>>,
+    /// Per entity: its slots (distinct).
+    entity_slots: Vec<Vec<u32>>,
+    /// Per slot: its occupants and their contributions.
+    slots: Vec<Vec<(u32, Contributions)>>,
+    /// (parent, name key) to slot; a name without a key has the empty key,
+    /// as `ConeGraph` had it.
+    slot_ids: HashMap<(Box<str>, Arc<str>), u32>,
+    /// Per slot: its location changes (event, change), in event order.
+    rows: Vec<Vec<(usize, usize)>>,
+}
+
+/// Facts over every event that the append-mode preconditions read
+/// (`append_guard`, `Locations::first_error`, `projection_cannot_fail`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Facts {
+    /// Changes whose entity id has a comma.
+    comma: usize,
+    /// Location changes without a string parent and a string name.
+    malformed: usize,
+    /// Ids that events name (dependencies, change parents) and that are not
+    /// events, with the number of times they are named.
+    dangling: HashMap<Box<str>, usize>,
+    /// Events with several location changes (positions, sorted).
+    multi: Vec<usize>,
+    /// Location changes whose name has no key.
+    key_errors: usize,
+    /// Kind, alive and basic changes whose value has the wrong type.
+    invalid_values: usize,
+    /// Entities (stable numbers) with a presence version that has no
+    /// placement in its event or causally before it (`presence_placed`).
+    unplaced: HashSet<u32>,
+}
+
+/// A branch's derivation index (WP5.1): what a slow commit's append-mode
+/// derivation used to compute from every event of the branch on every
+/// commit (`NsContext::new`, `ConeGraph::new`, `Locations::new`, the scans
+/// of `append_guard` and `projection_cannot_fail`), kept beside the event
+/// cache (`commit.rs`) and extended as events join it. A derivation pushes
+/// its new event onto it, derives, and pops it again (`push`, `undo`).
+/// Every part is a function of the events alone: `same_as` compares two
+/// indexes as the functions of the same events they must be, and the commit
+/// checks compare a kept index with a fresh build on every extension.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct BranchIndex {
+    ns: NsBase,
+    graph: GraphBase,
+    facts: Facts,
+}
+
+/// A branch index beside the event cache: `None` until a slow commit first
+/// needs it (then built from the cached events), and dropped when it cannot
+/// follow the cache.
+pub(crate) type IndexCell = RefCell<Option<BranchIndex>>;
+
+/// What `BranchIndex::push` changed, for `BranchIndex::undo`. The pushed
+/// event is the last one, so everything it added sits at the end of its row.
+struct Undo {
+    ops: Vec<Undone>,
+    entities: usize,
+    irregular: bool,
+    comma: usize,
+    malformed: usize,
+    key_errors: usize,
+    invalid_values: usize,
+}
+
+/// One change of `BranchIndex::push`, undone in reverse order.
+enum Undone {
+    Children(usize),
+    Dangling(Box<str>),
+    Alive(u32),
+    Touching(u32),
+    Reg(u32, usize),
+    Changes(u32),
+    Node(u32),
+    EdgeAdded(u32, usize),
+    EdgePushed(u32),
+    GraphChild(u32),
+    EntitySlot(u32),
+    Slot((Box<str>, Arc<str>)),
+    OccupantAdded(u32, usize),
+    OccupantPushed(u32),
+    Row(u32),
+    Multi,
+    Unplaced(u32, bool),
+}
+
+/// Inserts `value` into the sorted `row` unless present; whether it did.
+fn insert_sorted<T: Ord>(row: &mut Vec<T>, value: T) -> bool {
+    match row.binary_search(&value) {
+        Ok(_) => false,
+        Err(at) => {
+            row.insert(at, value);
+            true
+        }
+    }
+}
+
+/// Whether every presence version of `entity` (`versions`: its alive
+/// changes, in event order) has a placement of it in its own event or in a
+/// presence parent that has one (resolved in topological order), with no
+/// cycle among them: `projection_cannot_fail`'s per-entity condition.
+fn presence_placed(events: &[Event], entity: &str, versions: &[(usize, usize)]) -> bool {
+    let index: HashMap<&str, usize> = versions
+        .iter()
+        .enumerate()
+        .map(|(k, (i, _))| (events[*i].id.as_str(), k))
+        .collect();
+    let parents: Vec<Vec<usize>> = versions
+        .iter()
+        .map(|&(i, c)| {
+            events[i].changes[c]
+                .parents
+                .iter()
+                .filter_map(|p| index.get(p.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let children = children_of(&parents);
+    let mut degree: Vec<usize> = parents.iter().map(Vec::len).collect();
+    let mut ready: Vec<usize> = (0..versions.len()).filter(|&k| degree[k] == 0).collect();
+    let mut placed = vec![false; versions.len()];
+    let mut seen = 0;
+    while let Some(k) = ready.pop() {
+        seen += 1;
+        placed[k] = events[versions[k].0]
+            .changes
+            .iter()
+            .any(|c| c.entity == entity && c.field == "location")
+            || parents[k].iter().any(|&p| placed[p]);
+        for &child in &children[k] {
+            degree[child] -= 1;
+            if degree[child] == 0 {
+                ready.push(child);
+            }
+        }
+    }
+    seen == versions.len() && !placed.contains(&false)
+}
+
+impl BranchIndex {
+    /// An index of `len` events with no contribution yet (`add` fills it).
+    fn empty(len: usize) -> Self {
+        let mut index = Self::default();
+        index.ns.len = len;
+        index.ns.parents = vec![vec![]; len];
+        index.ns.children = vec![vec![]; len];
+        index
+    }
+
+    /// The index of `events`.
+    pub(crate) fn build(events: &[Event]) -> Self {
+        Self::build_marked(events, None)
+    }
+
+    /// The index of `events`, with the cone-graph contributions of event
+    /// `new` marked new (`Contributions`).
+    fn build_marked(events: &[Event], new: Option<usize>) -> Self {
+        let mut index = Self::empty(events.len());
+        let added: Vec<usize> = (0..events.len()).collect();
+        index.add(events, &added, new, true, None);
+        index
+    }
+
+    /// The number of events indexed.
+    pub(crate) fn len(&self) -> usize {
+        self.ns.len
+    }
+
+    /// Whether no cut of the branch can fail to project
+    /// (`projection_cannot_fail` over the indexed events).
+    fn cannot_fail(&self) -> bool {
+        let f = &self.facts;
+        f.malformed == 0 && f.key_errors == 0 && f.invalid_values == 0 && f.unplaced.is_empty()
+    }
+
+    /// Extends the index of the events without `added` (sorted positions in
+    /// `events`; the others are the indexed events, in order) to `events`.
+    /// `Ok(false)`: it cannot follow (an added id is indexed already, is
+    /// named by an indexed event, or repeats), so the caller drops it. Under
+    /// the commit checks the result is compared with a fresh build.
+    pub(crate) fn extend(&mut self, events: &[Event], added: &[usize]) -> Result<bool> {
+        let old = self.ns.len;
+        if events.len() != old + added.len()
+            || added.windows(2).any(|w| w[0] >= w[1])
+            || added.last().is_some_and(|&last| last >= events.len())
+        {
+            return Ok(false);
+        }
+        let mut ids: HashSet<&str> = HashSet::default();
+        for &i in added {
+            let id = events[i].id.as_str();
+            if !ids.insert(id)
+                || self.ns.index.contains_key(id)
+                || self.facts.dangling.contains_key(id)
+            {
+                return Ok(false);
+            }
+        }
+        if added.is_empty() {
+            return Ok(true);
+        }
+        if added[0] < old {
+            self.remap(added, events.len());
+        } else {
+            self.ns.parents.resize(events.len(), vec![]);
+            self.ns.children.resize(events.len(), vec![]);
+        }
+        self.ns.len = events.len();
+        self.add(events, added, None, true, None);
+        if checks_projections() {
+            ensure!(
+                self.same_as(&Self::build(events)),
+                "CONFLICT_MODE_MISMATCH: the extended branch index differs from a fresh build"
+            );
+        }
+        Ok(true)
+    }
+
+    /// Moves every indexed position to its place among `len` events, the
+    /// positions `added` (sorted, the first below the old end) left free.
+    fn remap(&mut self, added: &[usize], len: usize) {
+        let old = self.ns.len;
+        let mut map: Vec<usize> = Vec::with_capacity(old);
+        let mut free = added.iter().peekable();
+        for p in 0..len {
+            if free.peek() == Some(&&p) {
+                free.next();
+            } else {
+                map.push(p);
+            }
+        }
+        let first = added[0];
+        let to = |p: usize| if p >= first { map[p] } else { p };
+        let ns = &mut self.ns;
+        // Rows are sorted by position: only those reaching `first` move.
+        for row in ns
+            .parents
+            .iter_mut()
+            .chain(ns.children.iter_mut())
+            .chain(ns.touching.iter_mut())
+        {
+            if row.last().is_some_and(|&last| last >= first) {
+                row.iter_mut().for_each(|p| *p = to(*p));
+            }
+        }
+        for row in ns
+            .alive
+            .iter_mut()
+            .chain(ns.changes.iter_mut())
+            .chain(self.graph.rows.iter_mut())
+        {
+            if row.last().is_some_and(|&(last, _)| last >= first) {
+                row.iter_mut().for_each(|(p, _)| *p = to(*p));
+            }
+        }
+        for fields in &mut ns.regs {
+            for versions in fields.iter_mut() {
+                if versions.last().is_some_and(|v| v.event >= first) {
+                    versions.iter_mut().for_each(|v| v.event = to(v.event));
+                }
+            }
+        }
+        for p in ns.index.values_mut() {
+            *p = to(*p);
+        }
+        for p in &mut self.facts.multi {
+            *p = to(*p);
+        }
+        let mut parents = vec![vec![]; len];
+        let mut children = vec![vec![]; len];
+        for (k, (ps, cs)) in std::mem::take(&mut ns.parents)
+            .into_iter()
+            .zip(std::mem::take(&mut ns.children))
+            .enumerate()
+        {
+            parents[map[k]] = ps;
+            children[map[k]] = cs;
+        }
+        ns.parents = parents;
+        ns.children = children;
+    }
+
+    /// Pushes `events`' last event (the indexed events are the others, in
+    /// order), its cone-graph contributions marked new; `None` (nothing
+    /// changed) when its id is indexed or named by an indexed event.
+    fn push(&mut self, events: &[Event]) -> Option<Undo> {
+        let i = self.ns.len;
+        let id = events.get(i)?.id.as_str();
+        if events.len() != i + 1
+            || self.ns.index.contains_key(id)
+            || self.facts.dangling.contains_key(id)
+        {
+            return None;
+        }
+        let mut undo = Undo {
+            ops: vec![],
+            entities: self.ns.names.len(),
+            irregular: self.ns.irregular,
+            comma: self.facts.comma,
+            malformed: self.facts.malformed,
+            key_errors: self.facts.key_errors,
+            invalid_values: self.facts.invalid_values,
+        };
+        self.ns.parents.push(vec![]);
+        self.ns.children.push(vec![]);
+        self.ns.len += 1;
+        self.add(events, &[i], Some(i), true, Some(&mut undo));
+        Some(undo)
+    }
+
+    /// Takes the last pushed event out again (`push`).
+    fn undo(&mut self, events: &[Event], undo: Undo) {
+        let Self { ns, graph, facts } = self;
+        for op in undo.ops.into_iter().rev() {
+            match op {
+                Undone::Children(p) => {
+                    ns.children[p].pop();
+                }
+                Undone::Dangling(id) => {
+                    if let Some(count) = facts.dangling.get_mut(&id) {
+                        *count -= 1;
+                        if *count == 0 {
+                            facts.dangling.remove(&id);
+                        }
+                    }
+                }
+                Undone::Alive(x) => {
+                    ns.alive[x as usize].pop();
+                }
+                Undone::Touching(x) => {
+                    ns.touching[x as usize].pop();
+                }
+                Undone::Reg(x, field) => {
+                    ns.regs[x as usize][field].pop();
+                }
+                Undone::Changes(x) => {
+                    ns.changes[x as usize].pop();
+                }
+                Undone::Node(x) => graph.nodes[x as usize].remove(true),
+                Undone::EdgeAdded(x, k) => graph.parents[x as usize][k].1.remove(true),
+                Undone::EdgePushed(x) => {
+                    graph.parents[x as usize].pop();
+                }
+                Undone::GraphChild(x) => {
+                    graph.children[x as usize].pop();
+                }
+                Undone::EntitySlot(x) => {
+                    graph.entity_slots[x as usize].pop();
+                }
+                Undone::Slot(key) => {
+                    graph.slots.pop();
+                    graph.rows.pop();
+                    graph.slot_ids.remove(&key);
+                }
+                Undone::OccupantAdded(slot, k) => graph.slots[slot as usize][k].1.remove(true),
+                Undone::OccupantPushed(slot) => {
+                    graph.slots[slot as usize].pop();
+                }
+                Undone::Row(slot) => {
+                    graph.rows[slot as usize].pop();
+                }
+                Undone::Multi => {
+                    facts.multi.pop();
+                }
+                Undone::Unplaced(x, was) => {
+                    if was {
+                        facts.unplaced.insert(x);
+                    } else {
+                        facts.unplaced.remove(&x);
+                    }
+                }
+            }
+        }
+        let i = ns.len - 1;
+        ns.parents.pop();
+        ns.children.pop();
+        ns.index.remove(events[i].id.as_str());
+        ns.len = i;
+        if ns.names.len() > undo.entities {
+            for name in ns.names.drain(undo.entities..) {
+                ns.entities.remove(&name);
+            }
+            ns.alive.truncate(undo.entities);
+            ns.touching.truncate(undo.entities);
+            ns.regs.truncate(undo.entities);
+            ns.changes.truncate(undo.entities);
+            graph.nodes.truncate(undo.entities);
+            graph.parents.truncate(undo.entities);
+            graph.children.truncate(undo.entities);
+            graph.entity_slots.truncate(undo.entities);
+            ns.by_rank.retain(|&x| (x as usize) < undo.entities);
+            ns.rank.truncate(undo.entities);
+            for (r, &x) in ns.by_rank.iter().enumerate() {
+                ns.rank[x as usize] = r as u32;
+            }
+        }
+        ns.irregular = undo.irregular;
+        facts.comma = undo.comma;
+        facts.malformed = undo.malformed;
+        facts.key_errors = undo.key_errors;
+        facts.invalid_values = undo.invalid_values;
+    }
+
+    /// The stable number of entity `id`, created if new.
+    fn entity_number(ns: &mut NsBase, graph: &mut GraphBase, id: &str) -> u32 {
+        if let Some(&x) = ns.entities.get(id) {
+            return x;
+        }
+        let x = ns.names.len() as u32;
+        ns.names.push(id.into());
+        ns.entities.insert(id.into(), x);
+        ns.alive.push(vec![]);
+        ns.touching.push(vec![]);
+        ns.regs.push(Default::default());
+        ns.changes.push(vec![]);
+        graph.nodes.push(Contributions::default());
+        graph.parents.push(vec![]);
+        graph.children.push(vec![]);
+        graph.entity_slots.push(vec![]);
+        x
+    }
+
+    /// Adds the events at positions `added` (sorted; their rows are empty
+    /// and every other position is indexed): `new` marks one's cone-graph
+    /// contributions; `full` also keeps the cone graph and the facts (else
+    /// only `ns`, for one derivation); `log` records what a `push` changed.
+    fn add(
+        &mut self,
+        events: &[Event],
+        added: &[usize],
+        new: Option<usize>,
+        full: bool,
+        mut log: Option<&mut Undo>,
+    ) {
+        let entities = self.ns.names.len();
+        for &i in added {
+            if self
+                .ns
+                .index
+                .insert(events[i].id.as_str().into(), i)
+                .is_some()
+            {
+                self.ns.irregular = true;
+            }
+        }
+        let mut versions: Vec<(u32, usize)> = vec![];
+        let mut presence: Vec<u32> = vec![];
+        for &i in added {
+            self.add_event(
+                events,
+                i,
+                new == Some(i),
+                full,
+                &mut versions,
+                &mut presence,
+                log.as_deref_mut(),
+            );
+        }
+        // The new versions' parents, among their register's versions.
+        versions.sort_unstable();
+        versions.dedup();
+        let ns = &mut self.ns;
+        for (x, field) in versions {
+            let register = &mut ns.regs[x as usize][field];
+            for k in 0..register.len() {
+                let v = &register[k];
+                if added.binary_search(&v.event).is_err() {
+                    continue;
+                }
+                let change = &events[v.event].changes[v.change];
+                if change.parents.is_empty() {
+                    continue;
+                }
+                let parents: Vec<usize> = change
+                    .parents
+                    .iter()
+                    .filter_map(|p| ns.index.get(p.as_str()))
+                    .filter_map(|&event| register.binary_search_by_key(&event, |v| v.event).ok())
+                    .collect();
+                register[k].parents = parents;
+            }
+        }
+        if ns.names.len() > entities {
+            if entities == 0 || ns.names.len() - entities > 32 {
+                let mut order: Vec<u32> = (0..ns.names.len() as u32).collect();
+                order.sort_unstable_by(|&a, &b| ns.names[a as usize].cmp(&ns.names[b as usize]));
+                ns.by_rank = order;
+            } else {
+                for x in entities..ns.names.len() {
+                    let name = &ns.names[x];
+                    let at = ns
+                        .by_rank
+                        .partition_point(|&y| ns.names[y as usize] < *name);
+                    ns.by_rank.insert(at, x as u32);
+                }
+            }
+            ns.rank = vec![0; ns.names.len()];
+            for (r, &x) in ns.by_rank.iter().enumerate() {
+                ns.rank[x as usize] = r as u32;
+            }
+        }
+        if full {
+            presence.sort_unstable();
+            presence.dedup();
+            for x in presence {
+                let placed = presence_placed(events, &ns.names[x as usize], &ns.alive[x as usize]);
+                let was = self.facts.unplaced.contains(&x);
+                if placed == was {
+                    if placed {
+                        self.facts.unplaced.remove(&x);
+                    } else {
+                        self.facts.unplaced.insert(x);
+                    }
+                    if let Some(log) = log.as_deref_mut() {
+                        log.ops.push(Undone::Unplaced(x, was));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `add` for one event (`NsContext::new`'s, `ConeGraph::new`'s and the
+    /// facts' share of it).
+    #[allow(clippy::too_many_arguments)]
+    fn add_event(
+        &mut self,
+        events: &[Event],
+        i: usize,
+        new: bool,
+        full: bool,
+        versions: &mut Vec<(u32, usize)>,
+        presence: &mut Vec<u32>,
+        mut log: Option<&mut Undo>,
+    ) {
+        let Self { ns, graph, facts } = self;
+        let mut note = |op: Undone| {
+            if let Some(log) = log.as_deref_mut() {
+                log.ops.push(op);
+            }
+        };
+        let e = &events[i];
+        if e.changes.len() > 1 {
+            let mut registers: Vec<(&str, &str)> = e
+                .changes
+                .iter()
+                .map(|c| (c.entity.as_str(), c.field.as_str()))
+                .collect();
+            registers.sort_unstable();
+            ns.irregular |= registers.windows(2).any(|w| w[0] == w[1]);
+        }
+        let named = || {
+            e.dependencies
+                .iter()
+                .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
+        };
+        let mut parents: Vec<usize> = named()
+            .filter_map(|p| ns.index.get(p.as_str()).copied())
+            .collect();
+        parents.sort_unstable();
+        parents.dedup();
+        for &p in &parents {
+            if insert_sorted(&mut ns.children[p], i) {
+                note(Undone::Children(p));
+            }
+        }
+        ns.parents[i] = parents;
+        if full {
+            for id in named() {
+                if !ns.index.contains_key(id.as_str()) {
+                    *facts.dangling.entry(id.as_str().into()).or_insert(0) += 1;
+                    note(Undone::Dangling(id.as_str().into()));
+                }
+            }
+        }
+        let mut locations = 0;
+        for (k, c) in e.changes.iter().enumerate() {
+            let x = Self::entity_number(ns, graph, &c.entity);
+            let parent = (c.field == "location")
+                .then(|| c.value["parent"].as_str())
+                .flatten();
+            let parent_number = parent
+                .filter(|&parent| parent != ROOT)
+                .map(|parent| Self::entity_number(ns, graph, parent));
+            if c.field == "alive" {
+                insert_sorted(&mut ns.alive[x as usize], (i, k));
+                note(Undone::Alive(x));
+                presence.push(x);
+            }
+            if let Some(field) = ns_field(&c.field) {
+                if insert_sorted(&mut ns.touching[x as usize], i) {
+                    note(Undone::Touching(x));
+                }
+                let register = &mut ns.regs[x as usize][field];
+                let at = register.partition_point(|v| v.event <= i);
+                if at < register.len() {
+                    for v in register.iter_mut() {
+                        for p in &mut v.parents {
+                            if *p >= at {
+                                *p += 1;
+                            }
+                        }
+                    }
+                }
+                register.insert(
+                    at,
+                    RegVersion {
+                        event: i,
+                        change: k,
+                        parents: vec![],
+                    },
+                );
+                versions.push((x, field));
+                note(Undone::Reg(x, field));
+            }
+            insert_sorted(&mut ns.changes[x as usize], (i, k));
+            note(Undone::Changes(x));
+            if !full {
+                continue;
+            }
+            if c.entity.contains(',') {
+                facts.comma += 1;
+            }
+            let valid = match c.field.as_str() {
+                "kind" => c.value.is_string(),
+                "alive" => c.value.is_boolean(),
+                "basic" => BasicInfo::deserialize(&c.value).is_ok(),
+                _ => true,
+            };
+            if !valid {
+                facts.invalid_values += 1;
+            }
+            graph.nodes[x as usize].add(new);
+            note(Undone::Node(x));
+            if c.field != "location" {
+                continue;
+            }
+            locations += 1;
+            let (Some(parent), Some(name)) = (parent, c.value["name"].as_str()) else {
+                facts.malformed += 1;
+                continue;
+            };
+            if let Some(p) = parent_number {
+                let edges = &mut graph.parents[x as usize];
+                match edges.iter().position(|(q, _)| *q == p) {
+                    Some(at) => {
+                        edges[at].1.add(new);
+                        note(Undone::EdgeAdded(x, at));
+                    }
+                    None => {
+                        let mut contributions = Contributions::default();
+                        contributions.add(new);
+                        edges.push((p, contributions));
+                        note(Undone::EdgePushed(x));
+                    }
+                }
+                if !graph.children[p as usize].contains(&x) {
+                    graph.children[p as usize].push(x);
+                    note(Undone::GraphChild(p));
+                }
+                graph.nodes[p as usize].add(new);
+                note(Undone::Node(p));
+            }
+            let key: Arc<str> = match slot_key(name) {
+                Ok(key) => key,
+                Err(_) => {
+                    facts.key_errors += 1;
+                    Arc::from("")
+                }
+            };
+            let slot_key_pair: (Box<str>, Arc<str>) = (parent.into(), key);
+            let slot = match graph.slot_ids.get(&slot_key_pair) {
+                Some(&slot) => slot,
+                None => {
+                    let slot = graph.slots.len() as u32;
+                    graph.slots.push(vec![]);
+                    graph.rows.push(vec![]);
+                    graph.slot_ids.insert(slot_key_pair.clone(), slot);
+                    note(Undone::Slot(slot_key_pair));
+                    slot
+                }
+            };
+            if !graph.entity_slots[x as usize].contains(&slot) {
+                graph.entity_slots[x as usize].push(slot);
+                note(Undone::EntitySlot(x));
+            }
+            let occupants = &mut graph.slots[slot as usize];
+            match occupants.iter().position(|(m, _)| *m == x) {
+                Some(at) => {
+                    occupants[at].1.add(new);
+                    note(Undone::OccupantAdded(slot, at));
+                }
+                None => {
+                    let mut contributions = Contributions::default();
+                    contributions.add(new);
+                    occupants.push((x, contributions));
+                    note(Undone::OccupantPushed(slot));
+                }
+            }
+            insert_sorted(&mut graph.rows[slot as usize], (i, k));
+            note(Undone::Row(slot));
+        }
+        if full && locations > 1 {
+            insert_sorted(&mut facts.multi, i);
+            note(Undone::Multi);
+        }
+    }
+
+    /// Whether `self` and `other` index the same events alike: equal up to
+    /// the stable numbering of entities and slots (each index numbers them in
+    /// the order it met them).
+    fn same_as(&self, other: &Self) -> bool {
+        self.canonical() == other.canonical()
+    }
+
+    /// Everything, with entities by id and slots by (parent, key).
+    fn canonical(&self) -> impl PartialEq + use<> {
+        let ns = &self.ns;
+        let g = &self.graph;
+        let name = |x: u32| ns.names[x as usize].to_string();
+        let slot_names: Vec<(String, String)> = {
+            let mut by_slot = vec![(String::new(), String::new()); g.slots.len()];
+            for ((parent, key), &slot) in &g.slot_ids {
+                by_slot[slot as usize] = (parent.to_string(), key.to_string());
+            }
+            by_slot
+        };
+        let entities: BTreeMap<String, _> = (0..ns.names.len() as u32)
+            .map(|x| {
+                let s = x as usize;
+                let mut parents: Vec<(String, usize, usize)> = g.parents[s]
+                    .iter()
+                    .map(|(p, c)| (name(*p), c.all, c.new))
+                    .collect();
+                parents.sort();
+                let mut children: Vec<String> = g.children[s].iter().map(|&c| name(c)).collect();
+                children.sort();
+                let mut slots: Vec<(String, String)> = g.entity_slots[s]
+                    .iter()
+                    .map(|&slot| slot_names[slot as usize].clone())
+                    .collect();
+                slots.sort();
+                (
+                    name(x),
+                    (
+                        ns.alive[s].clone(),
+                        ns.touching[s].clone(),
+                        ns.regs[s].clone(),
+                        ns.changes[s].clone(),
+                        (g.nodes[s].all, g.nodes[s].new),
+                        parents,
+                        children,
+                        slots,
+                    ),
+                )
+            })
+            .collect();
+        let ranked: Vec<String> = ns.by_rank.iter().map(|&x| name(x)).collect();
+        let rank_ok = ns.rank.len() == ns.names.len()
+            && ns.by_rank.len() == ns.names.len()
+            && ns
+                .by_rank
+                .iter()
+                .enumerate()
+                .all(|(r, &x)| ns.rank.get(x as usize) == Some(&(r as u32)));
+        let slots: BTreeMap<(String, String), _> = (0..g.slots.len())
+            .map(|slot| {
+                let mut occupants: Vec<(String, usize, usize)> = g.slots[slot]
+                    .iter()
+                    .map(|(m, c)| (name(*m), c.all, c.new))
+                    .collect();
+                occupants.sort();
+                (slot_names[slot].clone(), (occupants, g.rows[slot].clone()))
+            })
+            .collect();
+        let index: BTreeMap<String, usize> = ns
+            .index
+            .iter()
+            .map(|(id, &p)| (id.to_string(), p))
+            .collect();
+        let dangling: BTreeMap<String, usize> = self
+            .facts
+            .dangling
+            .iter()
+            .map(|(id, &n)| (id.to_string(), n))
+            .collect();
+        let unplaced: BTreeSet<String> = self.facts.unplaced.iter().map(|&x| name(x)).collect();
+        (
+            (
+                ns.len,
+                ns.parents.clone(),
+                ns.children.clone(),
+                index,
+                ns.irregular,
+            ),
+            (entities, ranked, rank_ok, slots),
+            (
+                self.facts.comma,
+                self.facts.malformed,
+                dangling,
+                self.facts.multi.clone(),
+                self.facts.key_errors,
+                self.facts.invalid_values,
+                unplaced,
+            ),
+        )
+    }
 }
 
 /// Namespace-history derivation over one branch's events (both modes), with
@@ -2631,22 +3750,10 @@ struct RegVersion<'a> {
 struct NsContext<'a> {
     branch: &'a str,
     events: &'a [Event],
-    /// The causal DAG: dependencies and change parents present in `events`.
-    parents: Vec<Vec<usize>>,
-    children: Vec<Vec<usize>>,
-    index: HashMap<&'a str, usize>,
-    /// Entity ids (change entities and location parents other than `ROOT`),
-    /// sorted; an entity's number is its position.
-    names: Vec<&'a str>,
-    entities: HashMap<&'a str, u32>,
-    /// Alive versions per entity, in event order.
-    alive: Vec<Vec<(usize, &'a Change)>>,
-    /// Events with a kind, location or alive change, per entity.
-    touching: Vec<Vec<usize>>,
-    /// Kind, location and alive versions per entity, in event order.
-    regs: Vec<[Vec<RegVersion<'a>>; 3]>,
+    /// The events' positions, entities and registers (`NsBase`).
+    base: &'a NsBase,
     /// Repeated event ids or a register changed twice by one event: no cut
-    /// is projected from registers alone (see `new`).
+    /// is projected from registers alone (`NsBase::irregular`).
     irregular: bool,
     memo: RefCell<Memo<'a>>,
 }
@@ -2680,110 +3787,9 @@ struct AppendPlan {
 type RegisterMemo<'a> = BTreeMap<(&'a str, Option<usize>), Option<Rc<RegisterFacts<'a>>>>;
 
 impl<'a> NsContext<'a> {
-    fn new(branch: &'a str, events: &'a [Event]) -> Self {
-        let mut index: HashMap<&'a str, usize> =
-            HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
-        // Repeated event ids, or an event changing one register twice (only
-        // crafted journals have them; commits refuse both): such a history is
-        // derived with whole-cut projections (`irregular`).
-        let mut irregular = false;
-        for (i, e) in events.iter().enumerate() {
-            irregular |= index.insert(e.id.as_str(), i).is_some();
-            if e.changes.len() > 1 {
-                let mut registers: Vec<(&str, &str)> = e
-                    .changes
-                    .iter()
-                    .map(|c| (c.entity.as_str(), c.field.as_str()))
-                    .collect();
-                registers.sort_unstable();
-                irregular |= registers.windows(2).any(|w| w[0] == w[1]);
-            }
-        }
-        let t0 = std::time::Instant::now();
-        let mut parents: Vec<Vec<usize>> = Vec::with_capacity(events.len());
-        for e in events {
-            let mut ps: Vec<usize> = e
-                .dependencies
-                .iter()
-                .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
-                .filter_map(|p| index.get(p.as_str()).copied())
-                .collect();
-            ps.sort_unstable();
-            ps.dedup();
-            parents.push(ps);
-        }
-        let children = children_of(&parents);
-        record_phase("n.parents", t0.elapsed().as_micros() as u64);
-        let t0 = std::time::Instant::now();
-        let mut unique: HashSet<&'a str> = HashSet::default();
-        for e in events {
-            for c in &e.changes {
-                unique.insert(c.entity.as_str());
-                if c.field == "location"
-                    && let Some(parent) = c.value["parent"].as_str()
-                    && parent != ROOT
-                {
-                    unique.insert(parent);
-                }
-            }
-        }
-        let mut names: Vec<&'a str> = unique.into_iter().collect();
-        names.sort_unstable();
-        let entities: HashMap<&'a str, u32> = names
-            .iter()
-            .enumerate()
-            .map(|(k, &name)| (name, k as u32))
-            .collect();
-        let n = names.len();
-        record_phase("n.names", t0.elapsed().as_micros() as u64);
-        let t0 = std::time::Instant::now();
-        let mut alive: Vec<Vec<(usize, &Change)>> = vec![vec![]; n];
-        let mut touching: Vec<Vec<usize>> = vec![vec![]; n];
-        let mut regs: Vec<[Vec<RegVersion>; 3]> = (0..n).map(|_| Default::default()).collect();
-        for (i, e) in events.iter().enumerate() {
-            for c in &e.changes {
-                let entity = entities[c.entity.as_str()] as usize;
-                if c.field == "alive" {
-                    alive[entity].push((i, c));
-                }
-                if let Some(field) = ns_field(&c.field) {
-                    let list = &mut touching[entity];
-                    if list.last() != Some(&i) {
-                        list.push(i);
-                    }
-                    regs[entity][field].push(RegVersion {
-                        event: i,
-                        change: c,
-                        parents: vec![],
-                    });
-                }
-            }
-        }
-        record_phase("n.regs", t0.elapsed().as_micros() as u64);
-        let t0 = std::time::Instant::now();
-        // Version parents within each register (by revision): a parent's
-        // event position, then its version in the register (the versions
-        // are in event order, one per event).
-        for fields in &mut regs {
-            for versions in fields.iter_mut() {
-                for k in 0..versions.len() {
-                    if versions[k].change.parents.is_empty() {
-                        continue;
-                    }
-                    let ps: Vec<usize> = versions[k]
-                        .change
-                        .parents
-                        .iter()
-                        .filter_map(|p| index.get(p.as_str()))
-                        .filter_map(|&event| {
-                            versions.binary_search_by_key(&event, |v| v.event).ok()
-                        })
-                        .collect();
-                    versions[k].parents = ps;
-                }
-            }
-        }
-        record_phase("n.vparents", t0.elapsed().as_micros() as u64);
+    /// The derivation context of `events`, whose base is `base`.
+    fn new(branch: &'a str, events: &'a [Event], base: &'a NsBase) -> Self {
+        debug_assert_eq!(base.len, events.len());
         let memo = Memo {
             ancestors: vec![None; events.len()],
             descendants: vec![None; events.len()],
@@ -2793,27 +3799,60 @@ impl<'a> NsContext<'a> {
         Self {
             branch,
             events,
-            parents,
-            children,
-            index,
-            names,
-            entities,
-            alive,
-            touching,
-            regs,
-            irregular,
+            base,
+            irregular: base.irregular,
             memo: RefCell::new(memo),
         }
     }
 
-    /// The number of `entity`, if it is one of the branch's.
+    /// The number (in id order) of `entity`, if it is one of the branch's.
     fn entity(&self, entity: &str) -> Option<u32> {
-        self.entities.get(entity).copied()
+        let base = self.base;
+        base.entities.get(entity).map(|&x| base.rank[x as usize])
+    }
+
+    /// The id of entity number `k`.
+    fn name(&self, k: u32) -> &'a str {
+        let base: &'a NsBase = self.base;
+        &base.names[base.by_rank[k as usize] as usize]
+    }
+
+    /// The stable number of entity number `k`.
+    fn stable(&self, k: u32) -> usize {
+        self.base.by_rank[k as usize] as usize
+    }
+
+    /// Entity `k`'s alive versions (event, change), in event order.
+    fn alive_of(&self, k: u32) -> &'a [(usize, usize)] {
+        let base: &'a NsBase = self.base;
+        &base.alive[self.stable(k)]
+    }
+
+    /// The events with a kind, location or alive change of entity `k`.
+    fn touching_of(&self, k: u32) -> &'a [usize] {
+        let base: &'a NsBase = self.base;
+        &base.touching[self.stable(k)]
+    }
+
+    /// Entity `k`'s versions of namespace register `field`, in event order.
+    fn regs_of(&self, k: u32, field: usize) -> &'a [RegVersion] {
+        let base: &'a NsBase = self.base;
+        &base.regs[self.stable(k)][field]
+    }
+
+    /// The change of a version (event, change).
+    fn change(&self, (i, c): (usize, usize)) -> &'a Change {
+        &self.events[i].changes[c]
+    }
+
+    /// The position of event `id`.
+    fn position(&self, id: &str) -> Option<usize> {
+        self.base.index.get(id).copied()
     }
 
     /// The members as sorted entity ids.
     fn member_set(&self, members: &[u32]) -> BTreeSet<&'a str> {
-        members.iter().map(|&m| self.names[m as usize]).collect()
+        members.iter().map(|&m| self.name(m)).collect()
     }
 
     /// Ancestors (`forward == false`) or descendants of event `i`.
@@ -2830,9 +3869,9 @@ impl<'a> NsContext<'a> {
             }
         }
         let edges = if forward {
-            &self.children
+            &self.base.children
         } else {
-            &self.parents
+            &self.base.parents
         };
         let found = Rc::new(reach(edges, i));
         let mut memo = self.memo.borrow_mut();
@@ -2860,12 +3899,12 @@ impl<'a> NsContext<'a> {
             return found.clone();
         }
         let n = self.events.len();
-        let mut degree: Vec<usize> = self.parents.iter().map(Vec::len).collect();
+        let mut degree: Vec<usize> = self.base.parents.iter().map(Vec::len).collect();
         let mut ready: Vec<usize> = (0..n).filter(|&i| degree[i] == 0).collect();
         let mut order = Vec::with_capacity(n);
         while let Some(i) = ready.pop() {
             order.push(i);
-            for &child in &self.children[i] {
+            for &child in &self.base.children[i] {
                 degree[child] -= 1;
                 if degree[child] == 0 {
                     ready.push(child);
@@ -2952,8 +3991,8 @@ impl<'a> NsContext<'a> {
             }
             out
         };
-        let up = pass(&mut order.iter().copied(), &self.parents);
-        let down = pass(&mut order.iter().rev().copied(), &self.children);
+        let up = pass(&mut order.iter().copied(), &self.base.parents);
+        let down = pass(&mut order.iter().rev().copied(), &self.base.children);
         Relations {
             universe,
             at,
@@ -2965,10 +4004,10 @@ impl<'a> NsContext<'a> {
     /// How many events read event `i`'s set in a sweep along `edges`
     /// (`parents`: its children; `children`: its parents).
     fn edge_users(&self, edges: &[Vec<usize>], i: usize) -> usize {
-        if std::ptr::eq(edges, self.parents.as_slice()) {
-            self.children[i].len()
+        if std::ptr::eq(edges, self.base.parents.as_slice()) {
+            self.base.children[i].len()
         } else {
-            self.parents[i].len()
+            self.base.parents[i].len()
         }
     }
 
@@ -2980,7 +4019,7 @@ impl<'a> NsContext<'a> {
         }
         let mut universe: Vec<usize> = members
             .iter()
-            .flat_map(|&m| self.touching[m as usize].iter().copied())
+            .flat_map(|&m| self.touching_of(m).iter().copied())
             .collect();
         universe.sort_unstable();
         universe.dedup();
@@ -3000,7 +4039,7 @@ impl<'a> NsContext<'a> {
             || (c.field == "alive"
                 && (c.value == false
                     || c.parents.iter().any(|parent| {
-                        self.index.get(parent.as_str()).is_some_and(|&j| {
+                        self.position(parent).is_some_and(|j| {
                             self.events[j].changes.iter().any(|p| {
                                 p.entity == c.entity && p.field == "alive" && p.value == false
                             })
@@ -3031,8 +4070,8 @@ impl<'a> NsContext<'a> {
     fn compute_relevant(&self, members: &[u32], exclude: Option<usize>) -> Vec<usize> {
         let mut relevant: Vec<usize> = vec![];
         for &member in members {
-            let name = self.names[member as usize];
-            for &i in &self.touching[member as usize] {
+            let name = self.name(member);
+            for &i in self.touching_of(member) {
                 if Some(i) != exclude
                     && self.events[i]
                         .changes
@@ -3051,9 +4090,9 @@ impl<'a> NsContext<'a> {
         // This preserves possible boolean winners without counting every save.
         let compressed: Vec<(u32, Rc<RegisterFacts<'a>>)> = members
             .iter()
-            .filter(|&&m| !self.alive[m as usize].is_empty())
+            .filter(|&&m| !self.alive_of(m).is_empty())
             .filter_map(|&m| {
-                self.register_facts(self.names[m as usize], m, exclude)
+                self.register_facts(self.name(m), m, exclude)
                     .map(|facts| (m, facts))
             })
             .collect();
@@ -3146,10 +4185,11 @@ impl<'a> NsContext<'a> {
     /// nodes are the register's versions in event order (the other events are
     /// isolated nodes there and never change closures, ranks or segments).
     fn analyse_register(&self, entity: u32, exclude: Option<usize>) -> Option<RegisterFacts<'a>> {
-        let versions: Vec<(usize, &'a Change)> = self.alive[entity as usize]
+        let versions: Vec<(usize, &'a Change)> = self
+            .alive_of(entity)
             .iter()
-            .copied()
             .filter(|(i, _)| Some(*i) != exclude)
+            .map(|&version| (version.0, self.change(version)))
             .collect();
         let tombstones: Vec<usize> = versions
             .iter()
@@ -3470,9 +4510,8 @@ impl<'a> NsContext<'a> {
     fn append_plan(
         &self,
         new: usize,
-        locations: &Locations<'a>,
+        graph: &ConeGraph,
     ) -> Result<std::result::Result<AppendPlan, &'static str>> {
-        let graph = timed("p.graph", || ConeGraph::new(self, locations, new));
         let touched: Vec<u32> = touched_entities(self, new);
         let reaching = timed("p.reaching", || graph.reaching(&touched));
         let (after, before) = timed("p.cones", || {
@@ -3588,7 +4627,7 @@ impl<'a> NsContext<'a> {
         &self,
         new: usize,
         plan: &AppendPlan,
-        derived: &[Conflict],
+        derived: &HashSet<&str>,
     ) -> Result<bool> {
         if plan.members.is_empty() {
             return Ok(true);
@@ -3600,7 +4639,6 @@ impl<'a> NsContext<'a> {
                 old.insert(k);
             }
         }
-        let derived: HashSet<&str> = derived.iter().map(|c| c.id.as_str()).collect();
         let mut maximal: HashMap<Rc<[u32]>, HashSet<String>> = HashMap::default();
         for record in self.namespace_records(&plan.members, &relations, &old)? {
             if derived.contains(record.id.as_str()) {
@@ -3678,7 +4716,7 @@ impl<'a> NsContext<'a> {
         for &member in members {
             let mut entry: Option<Placement> = None;
             for field in [KIND, LOCATION, ALIVE] {
-                let versions = &self.regs[member as usize][field];
+                let versions = self.regs_of(member, field);
                 let present: Vec<usize> = (0..versions.len())
                     .filter(|&k| in_cut(versions[k].event))
                     .collect();
@@ -3700,7 +4738,10 @@ impl<'a> NsContext<'a> {
                     );
                     (&ea.device, &ea.id).cmp(&(&eb.device, &eb.id))
                 });
-                let winner = versions[*heads.last().unwrap()].change;
+                let winner = {
+                    let v = &versions[*heads.last().unwrap()];
+                    self.change((v.event, v.change))
+                };
                 let placement = entry.get_or_insert(Placement {
                     kind: None,
                     parent: "",
@@ -3760,7 +4801,7 @@ impl<'a> NsContext<'a> {
         }
         for k in 0..entries.len() {
             // `project`'s walk starts at the entity and stops at `ROOT`.
-            if entries[k].is_none() || self.names[members[k] as usize] == ROOT {
+            if entries[k].is_none() || self.name(members[k]) == ROOT {
                 continue;
             }
             let mut cursor = k;
@@ -3818,7 +4859,7 @@ impl<'a> NsContext<'a> {
         let record = Rc::new(match b {
             Some(b) => make_conflict(
                 self.branch,
-                &format!("{},{}", self.names[a as usize], self.names[b as usize]),
+                &format!("{},{}", self.name(a), self.name(b)),
                 "namespace",
                 "same name / file-directory collision",
                 alternatives,
@@ -3826,7 +4867,7 @@ impl<'a> NsContext<'a> {
             ),
             None => make_conflict(
                 self.branch,
-                self.names[a as usize],
+                self.name(a),
                 "namespace",
                 "deleted/missing parent or directory cycle",
                 alternatives,
@@ -3842,10 +4883,11 @@ impl<'a> NsContext<'a> {
 
     /// The location version of `member` that event `event` writes.
     fn location_version(&self, member: u32, event: usize) -> Version {
-        let change = self.regs[member as usize][LOCATION]
+        let change = self
+            .regs_of(member, LOCATION)
             .iter()
             .find(|v| v.event == event)
-            .map(|v| v.change)
+            .map(|v| self.change((v.event, v.change)))
             .expect("a location head is a location version of its member");
         version_of(self.events, (event, change))
     }
@@ -3951,7 +4993,7 @@ struct NamespaceCones {
 }
 impl NamespaceCones {
     fn new(ns: &NsContext) -> Result<Self> {
-        let n = ns.names.len();
+        let n = ns.base.names.len();
         let mut result = Self {
             parents: vec![vec![]; n],
             entity_slots: vec![vec![]; n],
@@ -3963,10 +5005,10 @@ impl NamespaceCones {
                 if c.field != "location" {
                     continue;
                 }
-                let entity = ns.entities[c.entity.as_str()];
+                let entity = ns.entity(&c.entity).unwrap();
                 let parent = c.value["parent"].as_str().unwrap();
                 if parent != ROOT {
-                    result.parents[entity as usize].push(ns.entities[parent]);
+                    result.parents[entity as usize].push(ns.entity(parent).unwrap());
                 }
                 // As the historical code: the first invalid name refuses.
                 let key = match slot_key(c.value["name"].as_str().unwrap()) {
@@ -5789,6 +6831,7 @@ mod tests {
                     new_event: Some(new_id),
                     reviewed: &reviewed,
                     stored: None,
+                    index: None,
                 },
                 new_id,
             )
@@ -8996,7 +10039,7 @@ mod tests {
             );
             assert!(
                 same(
-                    &NsContext::new(BRANCH, order).full(),
+                    &NsContext::new(BRANCH, order, &NsBase::build(order)).full(),
                     &wave4::NsContext::new(BRANCH, order).full()
                 ),
                 "{name}: namespace history differs"
@@ -9012,6 +10055,7 @@ mod tests {
                         new_event,
                         reviewed: &reviewed,
                         stored: None,
+                        index: None,
                     };
                     let current = derive_full_with(&input, new_event);
                     let reference = wave4::derive_full_with(&input, new_event);
@@ -9039,6 +10083,7 @@ mod tests {
                 new_event: Some(id),
                 reviewed: &[],
                 stored: None,
+                index: None,
             };
             let current = plan_text(&derive_append_with(&input, id));
             let reference = wave4_plan_text(&wave4::derive_append_with(&input, id));
@@ -9100,6 +10145,196 @@ mod tests {
         assert!(
             appended > 200 && fallbacks > 0,
             "{appended} appended, {fallbacks} fallbacks"
+        );
+    }
+
+    /// A random history from one of the generators (`kind` modulo 4).
+    fn any_history(rng: &mut StdRng, kind: u64) -> Vec<Event> {
+        match kind % 4 {
+            0 => {
+                let len = rng.gen_range(4..=16);
+                history(rng, len)
+            }
+            1 => {
+                let len = rng.gen_range(8..=24);
+                device_history(rng, len)
+            }
+            2 => {
+                let len = rng.gen_range(8..=20);
+                device_history_with(rng, len, true)
+            }
+            _ => {
+                let len = rng.gen_range(20..=48);
+                storm_history(rng, len, 4, 2, 0.3)
+            }
+        }
+    }
+
+    /// WP5.1: a branch index extended with a branch's events in random
+    /// batches, each merged at its id position (as the event cache merges
+    /// them), equals a fresh build of the merged events, or declines (an
+    /// event arrived after one naming it); pushing the next event onto it
+    /// equals a build with that event's contributions marked new, and the
+    /// undo restores it exactly. `TKFS_DERIVE_INDEX_SEEDS` (default 160).
+    #[test]
+    fn branch_index_extends_and_pushes_like_a_fresh_build() {
+        let seeds: u64 = std::env::var("TKFS_DERIVE_INDEX_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160);
+        let (mut extended, mut declined, mut pushed, mut moved) = (0, 0, 0, 0);
+        for seed in 0..seeds {
+            let mut rng = StdRng::seed_from_u64(77_000 + seed);
+            let mut sorted = any_history(&mut rng, seed);
+            sorted.sort_by(|a, b| a.id.cmp(&b.id));
+            let mut arrival: Vec<usize> = (0..sorted.len()).collect();
+            arrival.shuffle(&mut rng);
+            if seed % 3 == 0 {
+                // Mostly causal arrivals too.
+                arrival
+                    .sort_by_cached_key(|&k| events_order_hint(&sorted, k) + rng.gen_range(0..3));
+            }
+            let mut present: Vec<usize> = vec![];
+            let mut index = BranchIndex::build(&[]);
+            let mut at = 0;
+            while at < arrival.len() {
+                let batch = rng.gen_range(1..=3).min(arrival.len() - at);
+                let mut next = present.clone();
+                next.extend(&arrival[at..at + batch]);
+                next.sort_unstable();
+                let merged: Vec<Event> = next.iter().map(|&k| sorted[k].clone()).collect();
+                let added: Vec<usize> = (0..next.len())
+                    .filter(|p| arrival[at..at + batch].contains(&next[*p]))
+                    .collect();
+                let inside = added.first().is_some_and(|&first| first < present.len());
+                let fresh = BranchIndex::build(&merged);
+                if index.extend(&merged, &added).unwrap() {
+                    assert!(index.same_as(&fresh), "seed {seed}: extended at {at}");
+                    extended += 1;
+                    moved += usize::from(inside);
+                } else {
+                    declined += 1;
+                    index = fresh;
+                }
+                if let Some(&k) = arrival.get(at + batch) {
+                    let mut with = merged.clone();
+                    with.push(sorted[k].clone());
+                    let before = index.clone();
+                    if let Some(undo) = index.push(&with) {
+                        assert!(
+                            index.same_as(&BranchIndex::build_marked(&with, Some(merged.len()))),
+                            "seed {seed}: pushed at {at}"
+                        );
+                        index.undo(&with, undo);
+                        assert!(index.same_as(&before), "seed {seed}: undone at {at}");
+                        assert_eq!(index, before, "seed {seed}: undone at {at}, exactly");
+                        pushed += 1;
+                    }
+                }
+                present = next;
+                at += batch;
+            }
+        }
+        println!("{extended} extended ({moved} moved), {declined} declined, {pushed} pushed");
+        assert!(
+            extended > 500 && moved > 200 && declined > 0 && pushed > 500,
+            "{extended} extended ({moved} moved), {declined} declined, {pushed} pushed"
+        );
+    }
+
+    /// A rough causal rank of `events[k]`: how many of the events name it
+    /// transitively is not needed; the number of its dependencies present
+    /// is enough to put roots first.
+    fn events_order_hint(events: &[Event], k: usize) -> usize {
+        let ids: BTreeSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
+        let mut depth = 0;
+        let mut frontier: Vec<&str> = events[k]
+            .dependencies
+            .iter()
+            .map(String::as_str)
+            .filter(|d| ids.contains(d))
+            .collect();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        while let Some(id) = frontier.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            depth += 1;
+            if let Some(e) = events.iter().find(|e| e.id == id) {
+                frontier.extend(
+                    e.dependencies
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|d| ids.contains(d)),
+                );
+            }
+        }
+        depth
+    }
+
+    /// WP5.1: append mode through a branch index (`derive_append_indexed`)
+    /// derives exactly what the scan derives (`derive_append_scan`), records,
+    /// fallback reason or refusal, on every prefix of random histories, with
+    /// and without stored projection records, and leaves the index as it
+    /// found it. `TKFS_DERIVE_INDEX_SEEDS` (default 160).
+    #[test]
+    fn indexed_append_equals_the_scan_on_every_prefix() {
+        let seeds: u64 = std::env::var("TKFS_DERIVE_INDEX_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(160);
+        let (mut indexed, mut scanned, mut derived) = (0, 0, 0);
+        for seed in 0..seeds {
+            let mut rng = StdRng::seed_from_u64(88_000 + seed);
+            let events = any_history(&mut rng, seed);
+            for k in 1..events.len() {
+                let (old, new) = (&events[..k], &events[..=k]);
+                let Ok(p) = project(BRANCH, new) else {
+                    continue;
+                };
+                let stored: BTreeSet<String> = p.conflicts.iter().map(|c| c.id.clone()).collect();
+                let cell: IndexCell = RefCell::new(Some(BranchIndex::build(old)));
+                let input = DeriveInput {
+                    branch: BRANCH,
+                    projection: &p,
+                    events: new,
+                    new_event: Some(&new[k].id),
+                    reviewed: &[],
+                    stored: (k % 2 == 0).then_some(&stored),
+                    index: Some(&cell),
+                };
+                let scan = derive_append_scan(&input, k);
+                match derive_append_indexed(&input, k, &cell) {
+                    None => scanned += 1,
+                    Some(through) => {
+                        indexed += 1;
+                        match (&through, &scan) {
+                            (Ok(a), Ok(b)) => {
+                                assert_eq!(a, b, "seed {seed} k {k}");
+                                derived += usize::from(matches!(a, Plan::Derived(_)));
+                            }
+                            (Err(a), Err(b)) => {
+                                assert_eq!(format!("{a:#}"), format!("{b:#}"), "seed {seed} k {k}")
+                            }
+                            _ => panic!(
+                                "seed {seed} k {k}: indexed {:?}, scan {:?}",
+                                through.as_ref().map_err(|e| format!("{e:#}")),
+                                scan.as_ref().map_err(|e| format!("{e:#}"))
+                            ),
+                        }
+                    }
+                }
+                let after = cell.into_inner().unwrap();
+                assert!(
+                    after.same_as(&BranchIndex::build(old)),
+                    "seed {seed} k {k}: index"
+                );
+            }
+        }
+        println!("{indexed} indexed ({derived} derived), {scanned} scanned");
+        assert!(
+            indexed > 2000 && derived > 1000,
+            "{indexed} indexed ({derived} derived), {scanned} scanned"
         );
     }
 
@@ -9349,7 +10584,7 @@ mod tests {
             reversed.reverse();
             for order in [&events, &shuffled, &reversed] {
                 let legacy = legacy::namespace_history(BRANCH, order);
-                let current = NsContext::new(BRANCH, order).full();
+                let current = NsContext::new(BRANCH, order, &NsBase::build(order)).full();
                 assert!(
                     same(&legacy, &current),
                     "seed {seed}: namespace history differs\nlegacy {legacy:#?}\ncurrent {current:#?}"
@@ -9437,21 +10672,22 @@ current {current:#?}"
             for k in 1..events.len() {
                 let old = &events[..k];
                 let new = &events[..=k];
-                let Ok(before) = NsContext::new(BRANCH, old).full() else {
+                let Ok(before) = NsContext::new(BRANCH, old, &NsBase::build(old)).full() else {
                     continue;
                 };
                 if let Some(reason) = append_guard(&Projection::default(), new, k) {
                     *fallbacks.entry(reason).or_insert(0) += 1;
                     continue;
                 }
-                let after = NsContext::new(BRANCH, new).full();
+                let after = NsContext::new(BRANCH, new, &NsBase::build(new)).full();
                 let locations = Locations::new(new);
                 if let Err(error) = locations.first_error() {
                     assert!(after.is_err(), "seed {seed} k {k}: {error:#}");
                     continue;
                 }
-                let ctx = NsContext::new(BRANCH, new);
-                let plan = match ctx.append_plan(k, &locations) {
+                let index = BranchIndex::build_marked(new, Some(k));
+                let ctx = NsContext::new(BRANCH, new, &index.ns);
+                let plan = match ctx.append_plan(k, &ConeGraph::new(&index)) {
                     Ok(Ok(plan)) => plan,
                     Ok(Err(reason)) => {
                         *fallbacks.entry(reason).or_insert(0) += 1;
@@ -9521,7 +10757,8 @@ current {current:#?}"
             let len = rng.gen_range(4..=16);
             let events = history(&mut rng, len);
             let locations = Locations::new(&events);
-            let ctx = NsContext::new(BRANCH, &events);
+            let base = NsBase::build(&events);
+            let ctx = NsContext::new(BRANCH, &events, &base);
             if project(BRANCH, &events).is_err() || !projection_cannot_fail(&ctx, &locations) {
                 unsafe_histories += 1;
                 continue;
@@ -9694,9 +10931,9 @@ current {current:#?}"
         // The cone precondition holds (every old antichain survives); only
         // the current-records check sees that append mode, which never
         // deletes, would keep the row.
-        let locations = Locations::new(new);
-        let ctx = NsContext::new(BRANCH, new);
-        let plan = match ctx.append_plan(new.len() - 1, &locations) {
+        let index = BranchIndex::build_marked(new, Some(new.len() - 1));
+        let ctx = NsContext::new(BRANCH, new, &index.ns);
+        let plan = match ctx.append_plan(new.len() - 1, &ConeGraph::new(&index)) {
             Ok(Ok(plan)) => plan,
             _ => panic!("the cone precondition holds"),
         };
@@ -9766,15 +11003,16 @@ current {current:#?}"
         let reference = by_id(&legacy::namespace_history(BRANCH, &events).unwrap());
         // Restricted records (the default when no cut can fail) use no cut
         // memo; the memo serves the whole-cut projections.
-        let restricted = NsContext::new(BRANCH, &events);
+        let base = NsBase::build(&events);
+        let restricted = NsContext::new(BRANCH, &events, &base);
         assert_eq!(by_id(&restricted.full().unwrap()), reference);
         assert!(restricted.memo.borrow().cuts.is_empty());
-        let unbounded = NsContext::new(BRANCH, &events);
+        let unbounded = NsContext::new(BRANCH, &events, &base);
         unbounded.memo.borrow_mut().cut_budget = usize::MAX;
         unbounded.memo.borrow_mut().unrestricted = true;
         assert_eq!(by_id(&unbounded.full().unwrap()), reference);
         let budget = 256 * 1024;
-        let bounded = NsContext::new(BRANCH, &events);
+        let bounded = NsContext::new(BRANCH, &events, &base);
         bounded.memo.borrow_mut().cut_budget = budget;
         bounded.memo.borrow_mut().unrestricted = true;
         assert_eq!(by_id(&bounded.full().unwrap()), reference);
@@ -9821,7 +11059,8 @@ current {current:#?}"
             println!("legacy: {records} records in {:?}", started.elapsed());
             return;
         }
-        let ctx = NsContext::new(BRANCH, &events);
+        let base = NsBase::build(&events);
+        let ctx = NsContext::new(BRANCH, &events, &base);
         ctx.memo.borrow_mut().unrestricted =
             std::env::var("TKFS_DERIVE_PROBE_UNRESTRICTED").is_ok_and(|v| v == "1");
         let records = ctx.full().unwrap().len();
@@ -9926,14 +11165,17 @@ current {current:#?}"
         ];
         // w1 and w2 extend the witnesses; w3 displaces w2 (the rank maximum).
         for k in 2..=3 {
-            let locations = Locations::new(&events[..=k]);
-            let ctx = NsContext::new(BRANCH, &events[..=k]);
-            assert!(matches!(ctx.append_plan(k, &locations), Ok(Ok(_))), "{k}");
+            let index = BranchIndex::build_marked(&events[..=k], Some(k));
+            let ctx = NsContext::new(BRANCH, &events[..=k], &index.ns);
+            assert!(
+                matches!(ctx.append_plan(k, &ConeGraph::new(&index)), Ok(Ok(_))),
+                "{k}"
+            );
         }
-        let locations = Locations::new(&events);
-        let ctx = NsContext::new(BRANCH, &events);
+        let index = BranchIndex::build_marked(&events, Some(4));
+        let ctx = NsContext::new(BRANCH, &events, &index.ns);
         assert!(matches!(
-            ctx.append_plan(4, &locations),
+            ctx.append_plan(4, &ConeGraph::new(&index)),
             Ok(Err("a touched cone lost a relevant event"))
         ));
     }
@@ -10024,12 +11266,15 @@ current {current:#?}"
             };
             for k in 1..events.len() {
                 let old = &events[..k];
-                if NsContext::new(BRANCH, old).full().is_err() {
+                if NsContext::new(BRANCH, old, &NsBase::build(old))
+                    .full()
+                    .is_err()
+                {
                     continue;
                 }
                 let mut new = old.to_vec();
                 new.push(successor_shaped(old, &events[k]));
-                let full = NsContext::new(BRANCH, &new).full();
+                let full = NsContext::new(BRANCH, &new, &NsBase::build(&new)).full();
                 let check = check_successor_cuts(BRANCH, &new, k);
                 if successor_cones_are_small(&new, k) {
                     small += 1;
@@ -10070,8 +11315,13 @@ current {current:#?}"
                     .iter()
                     .flat_map(|e| e.changes.iter().map(|c| c.entity.as_str()))
                     .collect();
-                let (ns_new, ns_old) = (NsContext::new(BRANCH, &new), NsContext::new(BRANCH, old));
-                let graph = ConeGraph::new(&ns_new, &locations, k);
+                let (index, base_old) =
+                    (BranchIndex::build_marked(&new, Some(k)), NsBase::build(old));
+                let (ns_new, ns_old) = (
+                    NsContext::new(BRANCH, &new, &index.ns),
+                    NsContext::new(BRANCH, old, &base_old),
+                );
+                let graph = ConeGraph::new(&index);
                 let touched = touched_entities(&ns_new, k);
                 for entity in graph.reaching(&touched) {
                     let numbers = graph.cone(entity, false);
@@ -10146,7 +11396,8 @@ current {current:#?}"
             .chain([3usize, 12, 13].into_iter().map(same_slot));
         for events in histories {
             let n = events.len();
-            let ns = NsContext::new(BRANCH, &events);
+            let base = NsBase::build(&events);
+            let ns = NsContext::new(BRANCH, &events, &base);
             let cones = NamespaceCones::new(&ns).unwrap();
             for members in cones.members() {
                 let relevant = ns.relevant(&members, None);
