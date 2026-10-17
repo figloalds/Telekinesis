@@ -20,7 +20,8 @@
 //! WP5.2: reads, writes, fsyncs and size changes run on threads of their own
 //! and do the work that needs no engine lock first (content waits, the
 //! writable copy of a large file, a save's hashing and copying); a flush
-//! queues the save of the closed file for a background saver; a release, an
+//! saves the closed file, or queues the save for a background saver during
+//! a burst of closes; a release, an
 //! unlink, an rmdir and a rename settle the entry first
 //! (`runtime::engine::settle_entity`). A read of content that cannot arrive
 //! answers `EIO` (it answered `EAGAIN`, CCR-WP4.INT-2).
@@ -1235,13 +1236,16 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
                 fenced(&engine)?;
             }
             match op {
-                // A close(2): the save goes on in the background
-                // (`save_handle_in_background`; an fsync waits for it).
+                // A close(2): during a burst of closes the save goes on in
+                // the background (`write_behind`; an fsync waits for it); a
+                // lone close saves before it is answered.
                 20 => {
-                    crate::runtime::engine::save_handle_in_background(
-                        &engine,
-                        u64_at(&p[40..], 0)?,
-                    )?;
+                    let handle = u64_at(&p[40..], 0)?;
+                    if crate::runtime::engine::write_behind() {
+                        crate::runtime::engine::save_handle_in_background(&engine, handle)?;
+                    } else {
+                        crate::runtime::engine::save_handle(&engine, handle)?;
+                    }
                     return Ok(vec![]);
                 }
                 // The last close: saves without the engine lock what no save

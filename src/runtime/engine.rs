@@ -73,14 +73,15 @@
 //! dirty session until its commit, so `quiet()` refuses it, a force detach
 //! or a poison exit retains it, and its commit then removes the record.
 //!
-//! The adapters save this way ([`save_handle`] for flushes, renames and
-//! deletes on close), and a closed file is saved in the background
-//! ([`save_handle_in_background`], WinFsp cleanup and FUSE flush): a bounded
-//! pool of saver threads commits it shortly after the close, giving the
-//! engine to filesystem callbacks first ([`foreground`]); a delete or a
-//! rename over a closed file waits for its save ([`settle_entity`]). The
-//! availability rows of saved objects are written on a connection of their
-//! own, in batches ([`AvailabilityNotes`]).
+//! The adapters save this way ([`save_handle`] for flushes, renames, deletes
+//! on close and a lone close), and during a burst of closes ([`write_behind`])
+//! a closed file is saved in the background ([`save_handle_in_background`],
+//! WinFsp cleanup and FUSE flush): a bounded pool of saver threads commits it
+//! shortly after the close, giving the engine to filesystem callbacks first
+//! ([`foreground`]); a delete or a rename over a closed file waits for its
+//! save ([`settle_entity`]), and `quiet()` counts it as unsaved until it is
+//! committed. The availability rows of saved objects are written on a
+//! connection of their own, in batches ([`AvailabilityNotes`]).
 use super::{
     Shared,
     notify::{NotifyQueue, delta_notifications},
@@ -1265,6 +1266,7 @@ impl Engine {
     pub fn finish_save(&mut self, job: SaveJob, stored: Result<StoredObject>) -> Result<()> {
         let result = self.finish_save_inner(&job, stored);
         let entity = job.entity.as_str();
+        note_save_end();
         if let Some(session) = self.sessions.get_mut(entity) {
             session.saving = false;
             session.queued = false;
@@ -1562,8 +1564,8 @@ impl Engine {
     /// unsaved bytes were lost. A restored record is a dirty session, which
     /// `quiet()` refuses already; records of other branches do not block.
     pub fn checkout_allowed(&self) -> Result<()> {
-        // Files closed through the mount and still being saved pass `quiet`
-        // (WP5.2); a checkout waits for them.
+        // Files closed through the mount and still being saved: a checkout
+        // waits for them (WP5.2; `quiet` refuses them first).
         let unsaved = self.sessions.values().filter(|s| s.dirty).count();
         ensure!(
             unsaved == 0,
@@ -1933,20 +1935,16 @@ impl Engine {
     /// A `pending_saves` record that could not be restored does not count
     /// (module docs): its row stays and is retried; only a checkout waits for
     /// it ([`Engine::checkout_allowed`]).
-    ///
-    /// While mounted, files closed through the mount whose saves the
-    /// background savers run or have queued ([`Engine::settling`]) do not
-    /// count either (WP5.2): a graceful stop or detach waits for them in the
-    /// adapter's fence (`worker::mount_ctl::adapter::fence`), a force stop or
-    /// a poison exit retains them, and a checkout refuses them
-    /// ([`Engine::checkout_allowed`]). Without this a stop right after a
-    /// copy into the mount was refused as blocked by open files.
+    /// Files closed through the mount and still being saved in the
+    /// background ([`Engine::settling`]) are unsaved files too: the stop, the
+    /// checkout and the control requests that need a quiet engine are refused
+    /// (`BUSY_VIEW`, retried) until they are committed, and a fork or a delete
+    /// never runs ahead of them. Saves are made in the background only during
+    /// a burst of closes ([`write_behind`]), so a lone close is committed
+    /// when it returns, as before.
     pub fn quiet(&self) -> Result<()> {
         let open = self.handles.len();
-        let mut dirty = self.sessions.values().filter(|s| s.dirty).count();
-        if self.mounted {
-            dirty -= self.settling();
-        }
+        let dirty = self.sessions.values().filter(|s| s.dirty).count();
         if open == 0 && dirty == 0 {
             if let Some(health) = &self.health {
                 bail!("BUSY_VIEW: {health}");
@@ -2505,6 +2503,40 @@ fn savers() -> &'static Savers {
         state: Mutex::new(SaversState::default()),
         wake: std::sync::Condvar::new(),
     })
+}
+
+/// How long after a save ended the next close still counts as part of a
+/// burst of closes ([`write_behind`]).
+pub const BURST_WINDOW: Duration = Duration::from_millis(100);
+
+/// Milliseconds after this process's first save at which the latest save
+/// ended (0: none yet).
+static LAST_SAVE_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn process_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+fn note_save_end() {
+    LAST_SAVE_END.store(process_ms(), Ordering::Relaxed);
+}
+
+/// Whether a close should leave its save to the background savers (WP5.2):
+/// during a burst of closes, that is while background saves run or wait, or
+/// within [`BURST_WINDOW`] of the end of a save. A lone close is saved before
+/// it returns, as before, so a command that follows it (a stop, a fork, a
+/// delete) never waits for it; in a burst (a copy, a build) the saves overlap
+/// the application's next files, and what follows the burst may find files
+/// still being saved for a few milliseconds (refused `BUSY_VIEW`, retried).
+pub fn write_behind() -> bool {
+    if background_saves() > 0 {
+        return true;
+    }
+    let last = LAST_SAVE_END.load(Ordering::Relaxed);
+    last != 0 && process_ms().saturating_sub(last) < BURST_WINDOW.as_millis() as u64
 }
 
 /// Background saver threads alive now.
