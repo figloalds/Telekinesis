@@ -160,6 +160,24 @@ fn namespace_operations_that_touch_a_conflict_take_the_slow_path() {
     for replica in [&mut a, &mut b] {
         assert_exact(&mut replica.store, "the name collision");
     }
+    // Beside the open name collision (in the same directory), creating and
+    // renaming other entries keeps the fast path.
+    let before = a.store.commit_path_counters();
+    a.store.create("beside-collision.txt", "file").unwrap();
+    assert_exact(&mut a.store, "create beside the collision");
+    let file = a.store.lookup("file-04.txt").unwrap();
+    a.store
+        .rename(&file.id, "file-04-renamed.txt", false)
+        .unwrap();
+    assert_exact(&mut a.store, "rename beside the collision");
+    let after = a.store.commit_path_counters();
+    assert_eq!((after.fast - before.fast, after.slow - before.slow), (2, 0));
+    // Taking the colliding name (another entry into that slot) touches it.
+    let before = a.store.commit_path_counters();
+    let file = a.store.lookup("file-05.txt").unwrap();
+    assert!(a.store.rename(&file.id, "same.txt", false).is_err());
+    let after = a.store.commit_path_counters();
+    assert_eq!(after.fast, before.fast);
     let shown = a.store.lookup("same.txt").unwrap();
     // Renaming the visible winner of the collision touches it: slow.
     let before = a.store.commit_path_counters();
