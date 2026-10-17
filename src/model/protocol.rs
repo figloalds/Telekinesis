@@ -912,6 +912,13 @@ pub mod objects {
         pub route: SyncRoute,
         pub session: String,
         pub hashes: Vec<String>,
+        /// Additive (WP4.INT): also hide these objects from this route's
+        /// source (`route.remote_replica`) for this long, as a lapsed lease's
+        /// stall backoff does: the dialer gives up objects in their backoff
+        /// for that source, and its `exclude` list holds at most
+        /// [`MAX_RELEASE_ITEMS`] of them. Never shortens a longer backoff.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hold_ms: Option<u64>,
     }
 
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

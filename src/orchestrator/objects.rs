@@ -662,6 +662,15 @@ pub(crate) fn object_blocked(key: &ObjectKey) -> bool {
         .is_some_and(|held| Instant::now() < held.until)
 }
 
+/// How long `key` stays in its backoff (`None` when it is not in one).
+pub(crate) fn object_blocked_for(key: &ObjectKey) -> Option<Duration> {
+    let now = Instant::now();
+    lock(held())
+        .get(key)
+        .filter(|held| now < held.until)
+        .map(|held| held.until - now)
+}
+
 /// Records a failure of `key`; returns the delay before it is tried again.
 /// An empty `code` is a backoff without an error in the hub (a source that
 /// did not serve an object, see "Leases given up"); it keeps the code of an
@@ -832,11 +841,28 @@ pub(crate) fn release_leases(
     session: &str,
     hashes: Vec<String>,
 ) {
+    release_leases_holding(client, route, session, hashes, None);
+}
+
+/// [`release_leases`], asking the worker to also hide them from this route's
+/// source for `hold` (`ReleaseHeader::hold_ms`): objects in their backoff for
+/// this source that its want returned anyway (beyond the exclusion list's
+/// [`MAX_RELEASE_ITEMS`]) stay out of its next wants until then, instead of
+/// coming back in every want (WP4.INT, the WP4.5 review's minor).
+pub(crate) fn release_leases_holding(
+    client: &SessionWorkerClient,
+    route: &SyncRoute,
+    session: &str,
+    hashes: Vec<String>,
+    hold: Option<Duration>,
+) {
+    let hold_ms = hold.map(|hold| u64::try_from(hold.as_millis()).unwrap_or(u64::MAX));
     for chunk in hashes.chunks(MAX_RELEASE_ITEMS) {
         let header = ReleaseHeader {
             route: route.clone(),
             session: session.to_owned(),
             hashes: chunk.to_vec(),
+            hold_ms,
         };
         let Ok(header) = serde_json::to_value(&header) else {
             return;
@@ -848,6 +874,21 @@ pub(crate) fn release_leases(
             Priority::Control,
             RELEASE_DEADLINE,
         ) {
+            if error.code() == "UNSUPPORTED_OPERATION" {
+                // A worker of an older build (adopted across the upgrade)
+                // has no objects.release and ignores `exclude`: until it is
+                // restarted, a source that cannot serve an object hands it on
+                // only after its lease lapses (60 s). Said once (WP4.INT, the
+                // WP4.5 review's minor).
+                static SAID: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    event!(warn, UNSUPPORTED_OPERATION, {
+                        "repo": route.repo,
+                        "detail": "the folder's worker predates objects.release: objects a source cannot serve are handed on only after their lease lapses, until the worker restarts on this build",
+                    });
+                }
+            }
             event!(debug, (error.code().as_str()), {
                 "repo": route.repo,
                 "session": session,
@@ -3078,7 +3119,15 @@ fn want_more(
             });
         }
         if !refused.is_empty() {
-            release_leases(client, route, &lease, refused);
+            // Hidden from this source for the shortest of their remaining
+            // backoffs (at least a second): beyond the exclusion list's 256
+            // they would otherwise come back in every want.
+            let hold = refused
+                .iter()
+                .filter_map(|hash| object_blocked_for(&lane.key(&target.repo, false, hash)))
+                .min()
+                .map(|left| left.max(Duration::from_secs(1)));
+            release_leases_holding(client, route, &lease, refused, hold);
         }
     }
     if fresh == 0 {

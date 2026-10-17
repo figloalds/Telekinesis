@@ -677,9 +677,18 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         max_bytes,
         session: source.lease.clone(),
     };
-    let items = match want_excluding(&bound.client, &want, exclude, wait) {
+    let items = match want_excluding(&bound.client, &want, exclude.clone(), wait) {
         Ok(items) => items,
-        Err(error) => return responder.error(worker_failure(&error)),
+        Err(error) => {
+            // The unpushed objects of the last offer are no longer this
+            // dialer's: give their leases up anyway, best effort, so another
+            // dialer can be offered them before the lapse (WP4.INT, the WP4.5
+            // review's minor).
+            if !exclude.is_empty() {
+                release_leases(&bound.client, &bound.route, &source.lease, exclude);
+            }
+            return responder.error(worker_failure(&error));
+        }
     };
     // One in its backoff for this dialer although the want excluded what it
     // could (the list is bounded) is given up at once.

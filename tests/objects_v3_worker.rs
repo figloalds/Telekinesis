@@ -2514,3 +2514,38 @@ fn a_verified_read_quarantines_corrupt_bytes_through_the_store() {
     assert!(engine.store.object_available_checked(&hash));
     assert_eq!(availability(&engine.store, &hash), Some(AVAILABLE));
 }
+
+/// WP4.INT (the WP4.5 review's minor): a release with `hold_ms` also hides
+/// the objects from that route's source for that long (the dialer's own
+/// backoff, which its exclusion list can carry for only 256 objects), while
+/// another source is offered them at once; a release without it hides
+/// nothing.
+#[test]
+fn a_release_with_a_hold_hides_the_objects_from_their_source() {
+    let (x, y) = (vec![16u8; 20_000], vec![17u8; 25_000]);
+    let w = worker(|a| {
+        file(a, "x.bin", &x);
+        file(a, "y.bin", &y);
+    });
+    let (hx, hy) = (tkfs::core::hash(&x), tkfs::core::hash(&y));
+    let source_a = w.route_b["remote_replica"].as_str().unwrap().to_owned();
+    let route_c = route_c(&w);
+    let first = want_op(&w, &w.route_b, "s1");
+    assert!(offered(&first, &hx).is_some() && offered(&first, &hy).is_some());
+    let released = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route": w.route_b, "session": "s1", "hashes": [hx], "hold_ms": 60_000}),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(released.0["released"], 1, "{released:?}");
+    assert_eq!(release_op(&w, &w.route_b, "s1", &[&hy]), 1);
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hx).is_some());
+    assert!(objects_rpc::source_retry_at(&w.ctx, &source_a, &hy).is_none());
+    // The source is not offered X again; it is offered Y; C gets X at once.
+    let again = want_op(&w, &w.route_b, "s2");
+    assert!(offered(&again, &hx).is_none(), "{again:?}");
+    assert!(offered(&again, &hy).is_some(), "{again:?}");
+    assert!(offered(&want_op(&w, &route_c, "c1"), &hx).is_some());
+}

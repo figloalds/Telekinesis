@@ -1179,8 +1179,11 @@ fn busy_fault_child() {
     std::fs::write(Path::new(&marker).join("busy.done"), b"ok").unwrap();
 }
 
-/// The slice budget starts after the window load: with a 1.5 s load and a
-/// 1 s budget a slice of cheap events still activates `min(N, 32)`.
+/// The slice budget starts after the window load: with a 4 s load and a
+/// 3 s budget a slice of cheap events still activates `min(N, 32)`. (A 1.5 s
+/// load and a 1 s budget until CCR-WP4.1-13, applied by WP4.INT: 32 cheap
+/// activations did not always fit 1 s on a loaded machine; the load still
+/// outlasts the budget, so a budget that included it would activate none.)
 #[test]
 fn slice_budget_excludes_the_window_load() {
     let marker = tempfile::tempdir().unwrap();
@@ -1190,7 +1193,7 @@ fn slice_budget_excludes_the_window_load() {
             (CHILD_WINDOW, marker.path().display().to_string()),
             ("TKFS_FAULT_POINT", "core.inbox.window".into()),
             ("TKFS_FAULT_ACTION", "hang".into()),
-            ("TKFS_FAULT_MS", "1500".into()),
+            ("TKFS_FAULT_MS", "4000".into()),
         ],
     );
     assert!(
@@ -1233,13 +1236,13 @@ fn window_load_child() {
     .unwrap();
     let budget = SliceBudget {
         max_events: 32,
-        max_ms: 1000,
+        max_ms: 3000,
         inline_slow: true,
     };
     let started = Instant::now();
     let first = b.activate_slice(budget).unwrap();
     assert!(
-        started.elapsed() >= Duration::from_millis(1500),
+        started.elapsed() >= Duration::from_millis(4000),
         "the load hung"
     );
     assert_eq!(first.activated.len(), 32, "N=40: min(N, 32)");
