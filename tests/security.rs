@@ -2132,3 +2132,137 @@ fn a_new_worker_instance_never_pairs_its_token_with_a_stale_address() {
     let status = tkfs::runtime::rpc(&own, "own", json!({"op": "status"})).unwrap();
     assert_eq!(status["repo"], "stale-discovery", "{status}");
 }
+
+// ---------------------------------------------------------------------------
+// Pre-auth bounds of the local endpoints (WP4.INT re-review)
+
+/// Whether the other end closed `stream` (end of stream or a reset); bytes it
+/// sent are read and skipped.
+fn closed_by_server(stream: &std::net::TcpStream) -> bool {
+    use std::io::Read;
+    let _ = stream.set_nonblocking(true);
+    let mut buffer = [0u8; 1024];
+    let mut reader = stream;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return true,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// The security review's first major: the control endpoint counted a
+/// connection toward its 64 slots from its accept, before the token was
+/// checked, and bounded its upgrade only by a 15 s per-read timeout, so 64
+/// local connections trickling one header line every few seconds locked the
+/// management client out for as long as they trickled. Now unauthenticated
+/// connections count apart (at most `MAX_CONTROL_PREAUTH`, the oldest closed
+/// for a new one) and each upgrade is bounded by `CONTROL_UPGRADE`: with 80
+/// of them open the client keeps working, and the daemon closes every one.
+#[test]
+fn unauthenticated_control_connections_never_lock_the_client_out() {
+    use std::{
+        io::Write,
+        net::TcpStream,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    // `orchestrator::run::CONTROL_UPGRADE`.
+    use tkfs::model::protocol::frame::HANDSHAKE_TIMEOUT as CONTROL_UPGRADE;
+    let daemon = Daemon::start();
+    let control = daemon.ctx.endpoints.load().control.clone();
+    let address = control.strip_prefix("ws://").unwrap().to_owned();
+    let attackers: Vec<TcpStream> = (0..80)
+        .map(|_| {
+            let mut stream = TcpStream::connect(&address).unwrap();
+            let _ = stream.write_all(b"GET / HTTP/1.1\r\n");
+            stream
+        })
+        .collect();
+    let stop = Arc::new(AtomicBool::new(false));
+    let trickler = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut attackers = attackers;
+            while !stop.load(Ordering::Relaxed) {
+                for stream in &mut attackers {
+                    let _ = stream.write_all(b"X-Slow: 1\r\n");
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+            attackers
+        })
+    };
+    let started = Instant::now();
+    let mut failures = Vec::new();
+    let mut calls = 0;
+    while started.elapsed() < CONTROL_UPGRADE + Duration::from_secs(3) {
+        calls += 1;
+        if let Err(error) = orchestrator::client(&daemon.config, &Action::List) {
+            failures.push(format!("{:?}: {error:#}", started.elapsed()));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let attackers = trickler.join().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} of {calls} management calls failed: {failures:?}",
+        failures.len()
+    );
+    let open = attackers
+        .iter()
+        .filter(|stream| !closed_by_server(stream))
+        .count();
+    assert_eq!(
+        open, 0,
+        "unauthenticated connections still open after the upgrade budget"
+    );
+}
+
+/// The security review's second major: a worker's listener spawned a thread
+/// for every connection and held it through a 5 s peek and a 15 s upgrade
+/// read before the token was checked (400 bare connections, 400 threads).
+/// Now at most `MAX_PREAUTH_CONNECTIONS` wait for their upgrade (the oldest
+/// are closed at once for newer ones), the rest are closed within
+/// `UPGRADE_BUDGET`, and an authorized client is served meanwhile.
+#[test]
+fn unauthenticated_worker_connections_are_bounded_and_closed() {
+    use std::net::TcpStream;
+    use tkfs::runtime::server::{MAX_PREAUTH_CONNECTIONS, UPGRADE_BUDGET};
+    let dir = tempfile::tempdir().unwrap();
+    let store = tkfs::core::Store::open(dir.path(), Some("preauth")).unwrap();
+    let engine = Arc::new(std::sync::Mutex::new(tkfs::runtime::Engine::new(store)));
+    let discovery = tkfs::runtime::start_rpc(engine, dir.path(), None).unwrap();
+    let address = discovery.address.strip_prefix("ws://").unwrap().to_owned();
+    let total = 200;
+    let bare: Vec<TcpStream> = (0..total)
+        .map(|_| TcpStream::connect(&address).unwrap())
+        .collect();
+    let started = Instant::now();
+    let mut closed = 0;
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            closed = bare
+                .iter()
+                .filter(|stream| closed_by_server(stream))
+                .count();
+            closed >= total - MAX_PREAUTH_CONNECTIONS
+        }),
+        "only {closed} of {total} unauthenticated connections were closed at once"
+    );
+    let status = tkfs::runtime::rpc(&discovery, "preauth", json!({"op": "status"})).unwrap();
+    assert_eq!(status["repo"], "preauth", "{status}");
+    assert!(
+        wait_until(UPGRADE_BUDGET + Duration::from_secs(3), || {
+            closed = bare
+                .iter()
+                .filter(|stream| closed_by_server(stream))
+                .count();
+            closed == total
+        }),
+        "{closed} of {total} unauthenticated connections closed after {:?}",
+        started.elapsed()
+    );
+}

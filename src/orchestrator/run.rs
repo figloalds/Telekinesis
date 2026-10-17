@@ -6,10 +6,15 @@
 //! * `control-accept` blocks in `accept` on the loopback control listener and
 //!   gives each connection its own thread, whose upgrade must carry the
 //!   daemon's control token (`X-Tkfs-Token`, WP4.1; CCR-WP4.1-3: required
-//!   here until the control server stops, refused with HTTP 403 otherwise) (at most
-//!   `limits::MAX_CONTROL_CONNECTIONS` outside a request, and as many more
-//!   parked inside one, so requests waiting on a slow catalog never lock
-//!   List, Inspect and Status out): a persistent `receive → manage →
+//!   here until the control server stops, refused with HTTP 403 otherwise),
+//!   the whole upgrade within [`CONTROL_UPGRADE`] (WP4.INT re-review: a
+//!   watchdog, as on the peer and loopback handshakes). At most
+//!   [`MAX_CONTROL_PREAUTH`] connections are upgrading (the oldest is closed
+//!   for a new one), and they count apart from the authenticated ones (at
+//!   most `limits::MAX_CONTROL_CONNECTIONS` outside a request, and as many
+//!   more parked inside one, so requests waiting on a slow catalog never lock
+//!   List, Inspect and Status out, and connections without the token never
+//!   lock the management client out): a persistent `receive → manage →
 //!   reply` loop. A complete frame that is not JSON, or JSON that is not a
 //!   valid action, is answered (`INVALID_REQUEST`) and the connection stays
 //!   usable; a transport failure (including a binary envelope the codec
@@ -73,10 +78,24 @@ use std::{
 pub const DISCOVERY_FORMAT: u32 = 3;
 /// A persistent control connection idle this long is closed.
 pub const CONTROL_IDLE: Duration = Duration::from_secs(300);
-/// Control connection threads at most: `limits::MAX_CONTROL_CONNECTIONS`
-/// connections outside a request, plus as many parked inside one
-/// (`Connections::admits`).
+/// Authenticated control connection threads at most:
+/// `limits::MAX_CONTROL_CONNECTIONS` connections outside a request, plus as
+/// many parked inside one (`Connections::admit`); [`MAX_CONTROL_PREAUTH`]
+/// more may be upgrading.
 pub const MAX_CONTROL_THREADS: usize = 2 * limits::MAX_CONTROL_CONNECTIONS;
+/// Control connections whose upgrade has not yet carried the token, at most
+/// (WP4.INT re-review). They never count toward
+/// `limits::MAX_CONTROL_CONNECTIONS`, so half-open connections cannot take
+/// the management client's place; each is bounded by [`CONTROL_UPGRADE`], and
+/// when every slot is taken the oldest is closed to admit the new one (a
+/// slow or silent connection cannot hold a slot against a client that
+/// upgrades at once).
+pub const MAX_CONTROL_PREAUTH: usize = limits::MAX_PREAUTH;
+/// The whole control upgrade (request read, token check, response) of one
+/// connection, enforced by a watchdog that shuts the socket down: a client
+/// trickling its request one header line at a time cannot extend it (the
+/// per-read socket timeouts alone are renewed by every byte).
+pub const CONTROL_UPGRADE: Duration = crate::model::protocol::frame::HANDSHAKE_TIMEOUT;
 
 /// Runs the daemon until a `Shutdown` action or a signal (§3.6).
 pub fn run(config: Config) -> Result<()> {
@@ -249,11 +268,16 @@ fn stop_accept(name: &str, stop: &AtomicBool, address: SocketAddr, accept: threa
 /// persistent error cannot spin.
 const ACCEPT_ERROR_PAUSE: Duration = Duration::from_millis(50);
 
-/// One control connection: its socket (to close it at shutdown) and whether
-/// it is handling a request.
+/// One control connection: its socket (to close it at shutdown, or when a
+/// newer unauthenticated connection needs its slot), whether its upgrade
+/// carried the token and whether it is handling a request.
 struct Connection {
     killer: Option<TcpStream>,
     busy: Arc<AtomicBool>,
+    authenticated: Arc<AtomicBool>,
+    /// Closed to make room for a newer unauthenticated connection; its
+    /// thread is ending.
+    evicted: bool,
 }
 
 /// The control listener and its connections.
@@ -283,20 +307,52 @@ impl Connections {
         self.live.lock().len()
     }
 
-    /// Whether one more connection may be served: at most
-    /// `limits::MAX_CONTROL_CONNECTIONS` connections that are not inside a
-    /// request (idle, or reading one), and at most [`MAX_CONTROL_THREADS`] in
-    /// all. A connection parked in a request (a management write behind a
-    /// slow catalog, a long Subscribe or Stop wait) thus never takes the
-    /// place of a new List, Inspect or Status (§2.3: a catalog fault may stop
-    /// writes, never status; post-integration re-review, WP2.INT).
-    fn admits(&self) -> bool {
-        let live = self.live.lock();
-        let busy = live
-            .values()
-            .filter(|connection| connection.busy.load(Ordering::Acquire))
-            .count();
-        live.len() < MAX_CONTROL_THREADS && live.len() - busy < limits::MAX_CONTROL_CONNECTIONS
+    /// Whether one more connection may be served; if so it is registered as
+    /// `id`, not yet authenticated. Authenticated connections: at most
+    /// `limits::MAX_CONTROL_CONNECTIONS` that are not inside a request (idle,
+    /// or reading one), and at most [`MAX_CONTROL_THREADS`] in all. A
+    /// connection parked in a request (a management write behind a slow
+    /// catalog, a long Subscribe or Stop wait) thus never takes the place of
+    /// a new List, Inspect or Status (§2.3: a catalog fault may stop writes,
+    /// never status; post-integration re-review, WP2.INT). Connections not
+    /// yet authenticated count apart (WP4.INT re-review): at most
+    /// [`MAX_CONTROL_PREAUTH`], the oldest closed to admit a new one, so
+    /// local connections that never present the token cannot lock the
+    /// management client out.
+    fn admit(&self, id: u64, connection: Connection) -> bool {
+        let mut live = self.live.lock();
+        let mut authenticated = 0;
+        let mut busy = 0;
+        let mut preauth = Vec::new();
+        for (id, connection) in live.iter() {
+            if connection.evicted {
+                continue;
+            }
+            if !connection.authenticated.load(Ordering::Acquire) {
+                preauth.push(*id);
+            } else {
+                authenticated += 1;
+                if connection.busy.load(Ordering::Acquire) {
+                    busy += 1;
+                }
+            }
+        }
+        if authenticated >= MAX_CONTROL_THREADS
+            || authenticated - busy >= limits::MAX_CONTROL_CONNECTIONS
+        {
+            return false;
+        }
+        if preauth.len() >= MAX_CONTROL_PREAUTH {
+            // Ids grow with each accept: the first is the oldest.
+            if let Some(oldest) = preauth.first().and_then(|id| live.get_mut(id)) {
+                oldest.evicted = true;
+                if let Some(killer) = &oldest.killer {
+                    let _ = killer.shutdown(Shutdown::Both);
+                }
+            }
+        }
+        live.insert(id, connection);
+        true
     }
 
     fn remove(&self, id: u64) {
@@ -393,7 +449,19 @@ fn accept_control(
                 continue;
             }
         };
-        if !connections.admits() {
+        let id = connections.next.fetch_add(1, Ordering::Relaxed);
+        let busy = Arc::new(AtomicBool::new(false));
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let admitted = connections.admit(
+            id,
+            Connection {
+                killer: stream.try_clone().ok(),
+                busy: busy.clone(),
+                authenticated: authenticated.clone(),
+                evicted: false,
+            },
+        );
+        if !admitted {
             event!(warn, BUSY, {
                 "detail": "control connection refused: too many open connections",
                 "limit": limits::MAX_CONTROL_CONNECTIONS,
@@ -401,21 +469,12 @@ fn accept_control(
             });
             continue;
         }
-        let id = connections.next.fetch_add(1, Ordering::Relaxed);
-        let busy = Arc::new(AtomicBool::new(false));
-        connections.live.lock().insert(
-            id,
-            Connection {
-                killer: stream.try_clone().ok(),
-                busy: busy.clone(),
-            },
-        );
         let spawned = {
             let (ctx, connections, token) = (ctx.clone(), connections.clone(), token.clone());
             thread::Builder::new()
                 .name(format!("control-conn-{id}"))
                 .spawn(move || {
-                    serve_control(&ctx, stream, &token, &busy);
+                    serve_control(&ctx, stream, &token, &busy, &authenticated);
                     connections.remove(id);
                 })
         };
@@ -432,11 +491,31 @@ fn accept_control(
 /// A persistent control connection: requests are answered in order until
 /// the client goes away, the connection idles for [`CONTROL_IDLE`], or it
 /// asked for Shutdown (answered, then the daemon's shutdown is signalled).
-/// The upgrade must carry `token` (refused before any request is read).
-fn serve_control(ctx: &Arc<Ctx>, stream: TcpStream, token: &str, busy: &AtomicBool) {
-    let Ok(mut socket) = ws::accept_authorized(stream, Some(token)) else {
+/// The upgrade must carry `token` (refused before any request is read), all
+/// of it within [`CONTROL_UPGRADE`] (a watchdog; no watchdog, no
+/// connection); then the connection counts as authenticated.
+fn serve_control(
+    ctx: &Arc<Ctx>,
+    stream: TcpStream,
+    token: &str,
+    busy: &AtomicBool,
+    authenticated: &AtomicBool,
+) {
+    let Ok(watchdog) = ws::watchdog::Watchdog::start(&stream) else {
         return;
     };
+    watchdog.arm(CONTROL_UPGRADE);
+    let upgraded = ws::accept_authorized(stream, Some(token));
+    watchdog.disarm();
+    if watchdog.fired() {
+        // The socket was shut down: even a completed upgrade is unusable.
+        return;
+    }
+    drop(watchdog);
+    let Ok(mut socket) = upgraded else {
+        return;
+    };
+    authenticated.store(true, Ordering::Release);
     if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_mut() {
         let _ = tcp.set_read_timeout(Some(CONTROL_IDLE));
     }

@@ -48,7 +48,12 @@
 //! requires it as `X-Tkfs-Token` on every JSON RPC upgrade
 //! (`ws::accept_authorized`) and loopback session upgrade
 //! (`session::accept_loopback`): a connection without it is refused at the
-//! upgrade (HTTP 403, `ACCESS_DENIED`). `worker::run` also puts it in
+//! upgrade (HTTP 403, `ACCESS_DENIED`). Before its upgrade is authorized a
+//! connection is bounded (WP4.INT re-review): its whole pre-auth phase (the
+//! peek and the upgrade) within [`UPGRADE_BUDGET`] (a watchdog), and at most
+//! [`MAX_PREAUTH_CONNECTIONS`] of them at once (the oldest is closed for a
+//! new one), so connections that never present the token cannot exhaust the
+//! worker's threads (a crash-restart loop through the accept-error exit). `worker::run` also puts it in
 //! `worker.json` and the Ready line ([`RpcServer::token`]). Clients of this
 //! process find it through `ws::tokens` (the server remembers its own
 //! address there); `runtime::rpc` and `runtime::connect_worker` read the file.
@@ -107,6 +112,19 @@ const UPGRADE_PEEK_MAX: usize = 16 * 1024;
 /// Largest JSON result a loopback session returns as its reply header (the
 /// session header bound is 64 KiB); larger ones travel as the body.
 pub const INLINE_REPLY: usize = 60 * 1024;
+/// Connections whose upgrade has not yet carried the instance's token, at
+/// most (WP4.INT re-review; the peer server's `limits::MAX_PREAUTH`): every
+/// accepted connection takes one of these slots until its upgrade is
+/// authorized, and when all are taken the oldest is closed to admit the new
+/// one. So local connections that never present the token hold at most this
+/// many threads (and a watchdog thread each), and cannot keep a client that
+/// upgrades at once out.
+pub const MAX_PREAUTH_CONNECTIONS: usize = crate::model::orchestrator::limits::MAX_PREAUTH;
+/// The whole pre-auth phase of one connection: the upgrade peek, the token
+/// check and the upgrade, enforced by a watchdog that shuts the socket down
+/// (a client trickling its request cannot extend it; the per-read socket
+/// timeouts alone are renewed by every byte).
+pub const UPGRADE_BUDGET: Duration = crate::model::protocol::frame::HANDSHAKE_TIMEOUT;
 /// Handler threads and queued requests of one loopback session: the
 /// orchestrator keeps up to 4 reads and 4 writes in flight per transfer, and
 /// one session (`worker_client::session_for`) serves every lane.
@@ -269,6 +287,7 @@ pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
         reply: Mutex::new(StopReplyState::default()),
         reply_flushed: Condvar::new(),
         connections: AtomicU64::new(0),
+        preauth: Mutex::new(std::collections::BTreeMap::new()),
         token,
         _remembered: remembered,
     });
@@ -396,10 +415,32 @@ struct Core {
     reply: Mutex<StopReplyState>,
     reply_flushed: Condvar,
     connections: AtomicU64,
+    /// Connections not yet authorized, by connection id (ids grow with each
+    /// accept): their sockets, to close the oldest ([`MAX_PREAUTH_CONNECTIONS`]).
+    preauth: Mutex<std::collections::BTreeMap<u64, Preauth>>,
     /// The instance's local token (module docs).
     token: String,
     /// Lets clients of this process find the token (`ws::tokens`).
     _remembered: Option<Arc<crate::ws::tokens::Hold>>,
+}
+
+/// A connection in its pre-auth phase.
+struct Preauth {
+    killer: Option<TcpStream>,
+    /// Closed for a newer connection; its thread is ending.
+    evicted: bool,
+}
+
+/// Ends a connection's pre-auth phase when dropped (its slot is free).
+struct PreauthSlot<'a> {
+    core: &'a Core,
+    id: u64,
+}
+
+impl Drop for PreauthSlot<'_> {
+    fn drop(&mut self) {
+        lock(&self.core.preauth).remove(&self.id);
+    }
 }
 
 /// One handled request: its result, and whether it accepted a stop (the
@@ -431,16 +472,20 @@ impl Core {
             let error = match accepted {
                 Ok(stream) => {
                     let id = self.connections.fetch_add(1, Ordering::Relaxed) + 1;
+                    self.admit_preauth(id, &stream);
                     let core = self.clone();
                     match thread::Builder::new()
                         .name(format!("rpc-conn-{id}"))
-                        .spawn(move || core.serve(stream))
+                        .spawn(move || core.serve(id, stream))
                     {
                         Ok(_) => {
                             consecutive = 0;
                             continue;
                         }
-                        Err(error) => anyhow::Error::from(error),
+                        Err(error) => {
+                            lock(&self.preauth).remove(&id);
+                            anyhow::Error::from(error)
+                        }
                     }
                 }
                 Err(error) => error,
@@ -509,12 +554,71 @@ impl Core {
     /// One connection: a v3 loopback session ([`Core::serve_session`]), or
     /// the JSON RPC's persistent request loop. Notifications are delivered by
     /// the notifier thread, never on the reply path.
-    fn serve(self: Arc<Self>, stream: TcpStream) {
+    /// Registers connection `id` in its pre-auth phase; when
+    /// [`MAX_PREAUTH_CONNECTIONS`] are already there, the oldest is closed
+    /// (its thread sees its socket shut down and ends).
+    fn admit_preauth(&self, id: u64, stream: &TcpStream) {
+        let mut preauth = lock(&self.preauth);
+        let waiting: Vec<u64> = preauth
+            .iter()
+            .filter(|(_, slot)| !slot.evicted)
+            .map(|(id, _)| *id)
+            .collect();
+        if waiting.len() >= MAX_PREAUTH_CONNECTIONS
+            && let Some(oldest) = waiting.first().and_then(|id| preauth.get_mut(id))
+        {
+            oldest.evicted = true;
+            if let Some(killer) = &oldest.killer {
+                let _ = killer.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        preauth.insert(
+            id,
+            Preauth {
+                killer: stream.try_clone().ok(),
+                evicted: false,
+            },
+        );
+    }
+
+    /// One connection: its pre-auth phase (the upgrade peek, then the JSON
+    /// RPC or loopback session upgrade with the token) within
+    /// [`UPGRADE_BUDGET`] (a watchdog; no watchdog, no connection), then its
+    /// requests.
+    fn serve(self: Arc<Self>, id: u64, stream: TcpStream) {
+        let slot = PreauthSlot { core: &self, id };
+        let Ok(watchdog) = crate::ws::watchdog::Watchdog::start(&stream) else {
+            return;
+        };
+        watchdog.arm(UPGRADE_BUDGET);
         if peek_upgrade(&stream) == UpgradeKind::Loopback {
-            self.serve_session(stream);
+            let accepted = session::accept_loopback(stream, Some(&self.token), loopback_options());
+            watchdog.disarm();
+            let fired = watchdog.fired();
+            drop(watchdog);
+            drop(slot);
+            match accepted {
+                // The socket was shut down: even a completed upgrade is
+                // unusable.
+                Ok(conn) if fired => conn.close(),
+                Ok(conn) => self.serve_session(conn),
+                Err(error) => {
+                    crate::util::log::event!(info, (error.code.as_str()), {
+                        "site": "worker.loopback.accept",
+                        "message": error.message,
+                    });
+                }
+            }
             return;
         }
-        let Ok(mut socket) = crate::ws::accept_authorized(stream, Some(&self.token)) else {
+        let upgraded = crate::ws::accept_authorized(stream, Some(&self.token));
+        watchdog.disarm();
+        if watchdog.fired() {
+            return;
+        }
+        drop(watchdog);
+        drop(slot);
+        let Ok(mut socket) = upgraded else {
             return;
         };
         loop {
@@ -547,20 +651,10 @@ impl Core {
         }
     }
 
-    /// One loopback session: accepted (`session::accept_loopback`, with the
-    /// instance's token), served by its handler pool, closed when the worker
+    /// One loopback session, accepted (`session::accept_loopback`, with the
+    /// instance's token): served by its handler pool, closed when the worker
     /// stops.
-    fn serve_session(self: Arc<Self>, stream: TcpStream) {
-        let conn = match session::accept_loopback(stream, Some(&self.token), loopback_options()) {
-            Ok(conn) => conn,
-            Err(error) => {
-                crate::util::log::event!(info, (error.code.as_str()), {
-                    "site": "worker.loopback.accept",
-                    "message": error.message,
-                });
-                return;
-            }
-        };
+    fn serve_session(self: Arc<Self>, conn: session::Conn) {
         conn.serve(Arc::new(LoopbackHandler { core: self.clone() }));
         loop {
             if conn.wait_closed(Duration::from_millis(500)).is_some() {
