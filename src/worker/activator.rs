@@ -832,6 +832,8 @@ impl Activator {
             }
             let mut sealed = false;
             if let Ok(slice) = &slice {
+                // Rows the slice moved to `retry` (CCR-WP4.2-2).
+                self.counters.retried += u64::from(slice.retried);
                 // Exact, whichever branch sealed (the WAL checkpoint below).
                 sealed = slice.fast + slice.slow > 0
                     && forecast.is_some_and(|forecast| sealed_past(&engine.store, forecast.tip));

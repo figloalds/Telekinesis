@@ -1176,6 +1176,28 @@ fn busy_fault_child() {
     assert!(b.lookup("busy.txt").is_ok());
     assert_eq!(b.inbox_counts().unwrap().total(), 0);
     assert_oracle_empty(&mut b, "after the retry");
+    // CCR-WP4.2-2 (WP4.INT): the slice reports the row it moved to `retry`
+    // (the activator's `activation.retried`).
+    a.create("busy-again.txt", "file").unwrap();
+    let again = missing(&a, &b);
+    let mut fault = FaultConfig::new("core.commit.busy", FaultAction::Fail);
+    fault.count = Some(1);
+    tkfs::util::fault::configure(Some(fault));
+    b.stage_incoming(
+        again
+            .events
+            .into_iter()
+            .map(|event| StagedEvent {
+                event,
+                source: None,
+            })
+            .collect(),
+        &allowed,
+    )
+    .unwrap();
+    let slice = b.activate_slice(SliceBudget::UNBOUNDED).unwrap();
+    assert_eq!(slice.retried, 1, "{slice:?}");
+    assert!(slice.activated.is_empty());
     std::fs::write(Path::new(&marker).join("busy.done"), b"ok").unwrap();
 }
 

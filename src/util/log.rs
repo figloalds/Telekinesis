@@ -768,10 +768,20 @@ impl RotatingFile {
     }
 
     fn reopen(&mut self) -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let open = |path: &Path| OpenOptions::new().create(true).append(true).open(path);
+        let mut file = match open(&self.path) {
+            Ok(file) => file,
+            // The directory went away (a user cleared `DATA/logs` while the
+            // daemon runs): made again, once, so the log does not stop for
+            // the rest of the process (WP4.INT, the WP4.2 review's minor).
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                open(&self.path)?
+            }
+            Err(error) => return Err(error),
+        };
         self.size = file.metadata().map(|m| m.len()).unwrap_or(0);
         // Output written before (a partial line of a process that wrote the
         // file directly) must not swallow the first line written now.
