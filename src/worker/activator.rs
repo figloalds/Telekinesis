@@ -926,7 +926,7 @@ impl Activator {
             })
             .filter(|(_, c, _)| *c > 0)
             .collect();
-        diff.sort_by(|a, b| b.2.cmp(&a.2));
+        diff.sort_by_key(|d| std::cmp::Reverse(d.2));
         eprintln!(
             "DERIVE_PHASES {} {} {}",
             now_ms(),

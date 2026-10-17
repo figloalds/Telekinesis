@@ -395,6 +395,10 @@ struct EventCache {
     /// The rows the cache covers that are not known committed (`None`: all
     /// are).
     tentative: Option<Tentative>,
+    /// WP5.1: the derivation index of `events` (`derive::BranchIndex`),
+    /// built by the first slow commit that needs it and extended with the
+    /// events that join the cache; dropped with the entry.
+    index: derive::IndexCell,
 }
 
 /// Journal rows an event cache entry covers that may still roll back.
@@ -1028,9 +1032,16 @@ impl Store {
         };
         let computed = derive::timed("s.compute", || {
             let t0 = std::time::Instant::now();
-            self.with_branch_events(branch, Some(event), committed_view, |events| {
+            self.with_branch_index(branch, Some(event), committed_view, |events, index| {
                 derive::record_phase("s.events", t0.elapsed().as_micros() as u64);
                 let new = events.len() - 1;
+                // The index of the cached events, built once per cache entry.
+                if let Some(cell) = index
+                    && cell.borrow().is_none()
+                {
+                    let built = derive::timed("s.index", || derive::BranchIndex::build(&events[..new]));
+                    *cell.borrow_mut() = Some(built);
+                }
                 let appended = match base {
                     Some(base) => derive::timed("s.append", || {
                         derive::project_append(branch, base, events, new)
@@ -1071,6 +1082,7 @@ impl Store {
                         new_event: Some(&event.id),
                         reviewed: &reviewed,
                         stored: carried.as_ref(),
+                        index,
                     })
                 })?;
                 Ok::<_, anyhow::Error>(Some((projection, derived, delta)))
@@ -1489,6 +1501,17 @@ impl Store {
         committed_view: bool,
         f: impl FnOnce(&[Event]) -> T,
     ) -> Result<T> {
+        self.with_branch_index(branch, extra, committed_view, |events, _| f(events))
+    }
+    /// `with_branch_events`, with the cache entry's derivation index (WP5.1)
+    /// when the entry is kept: it indexes the cached events, `extra` aside.
+    pub(super) fn with_branch_index<T>(
+        &self,
+        branch: &str,
+        extra: Option<&Event>,
+        committed_view: bool,
+        f: impl FnOnce(&[Event], Option<&derive::IndexCell>) -> T,
+    ) -> Result<T> {
         let committed = committed_view || self.db.is_autocommit();
         let (tip, total): (i64, i64) = self
             .db
@@ -1517,7 +1540,7 @@ impl Store {
         if let Some(extra) = extra {
             cache.events.push(extra.clone());
         }
-        let result = f(&cache.events);
+        let result = f(&cache.events, keep.then_some(&cache.index));
         if extra.is_some() {
             cache.events.pop();
         }
@@ -1561,6 +1584,7 @@ impl Store {
             upto: tip,
             total,
             tentative: None,
+            index: Default::default(),
         };
         if committed {
             return Ok((cache, true));
@@ -1648,20 +1672,31 @@ impl Store {
             added.sort_by(|a, b| a.id.cmp(&b.id));
             let old = std::mem::take(&mut cache.events);
             let mut merged = Vec::with_capacity(old.len() + added.len());
+            let mut positions = Vec::with_capacity(added.len());
             let mut old = old.into_iter().peekable();
             let mut added = added.into_iter().peekable();
             loop {
                 let next = match (old.peek(), added.peek()) {
                     (Some(a), Some(b)) if a.id == b.id => return Ok(None),
                     (Some(a), Some(b)) if a.id < b.id => old.next(),
-                    (Some(_), Some(_)) => added.next(),
+                    (Some(_), Some(_)) | (None, Some(_)) => {
+                        positions.push(merged.len());
+                        added.next()
+                    }
                     (Some(_), None) => old.next(),
-                    (None, Some(_)) => added.next(),
                     (None, None) => break,
                 };
                 merged.extend(next);
             }
             cache.events = merged;
+            // The index follows the cache, or is dropped (rebuilt on demand).
+            let follows = match cache.index.get_mut() {
+                Some(index) => index.extend(&cache.events, &positions)?,
+                None => true,
+            };
+            if !follows {
+                *cache.index.get_mut() = None;
+            }
         }
         cache.upto = tip;
         cache.total = total;

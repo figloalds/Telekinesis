@@ -32,7 +32,9 @@ use std::{
 use support::*;
 use tkfs::core::{
     Store,
-    derive::{DeriveCounters, thread_derive_counters, thread_fallback_reasons},
+    derive::{
+        DeriveCounters, thread_derive_counters, thread_fallback_reasons, thread_indexed_appends,
+    },
 };
 
 const FILE: &str = "qual_wp5_1_concurrent";
@@ -267,6 +269,7 @@ fn measure_deliveries(
     shape: serde_json::Value,
 ) {
     let start = thread_derive_counters();
+    let indexed_before = thread_indexed_appends();
     let slow_before = b.commit_path_counters().slow;
     let phases_before = tkfs::core::derive::thread_phase_micros();
     let loads_before = b.view_loads();
@@ -307,6 +310,7 @@ fn measure_deliveries(
     extra["wall"] = summarize(&wall).json();
     extra["derivations"] = since(start);
     extra["fallback_reasons"] = json!(thread_fallback_reasons());
+    extra["indexed"] = json!(thread_indexed_appends() - indexed_before);
     extra["view_loads"] = json!(b.view_loads() - loads_before);
     s.metric_with(
         "cpu_ms_per_event",
@@ -332,7 +336,7 @@ fn measure_deliveries(
             })
             .filter(|p| p.1 > 0)
             .collect();
-        phases.sort_by(|a, b| b.2.cmp(&a.2));
+        phases.sort_by_key(|p| std::cmp::Reverse(p.2));
         eprintln!("PHASES {phases:?}");
     }
     let (diff, oracle_ms) = time_ms(|| b.verify_derived_state().unwrap());
