@@ -1792,15 +1792,13 @@ fn no_pairing_code_secret_or_token_in_status_or_logs() {
             found.push("worker token in status JSON".into());
         }
         for log in &logs {
-            let text = fs::read_to_string(log).unwrap_or_default();
-            // CCR-WP4.1-4: the launcher copies the worker's Ready line (which
-            // carries the token for its supervisor, §14 WP4.1) verbatim into
-            // `worker.log`; every other line must not carry it.
-            let leaked = text
-                .lines()
-                .filter(|line| !line.starts_with(r#"{"ready":true"#))
-                .any(|line| line.contains(token.as_str()));
-            if leaked {
+            // CCR-WP4.1-4 (applied by WP4.INT): the launcher's copy of the
+            // Ready line in `worker.log` has its token redacted, so no line
+            // of any log may carry it (the Ready-line exemption is gone).
+            if fs::read_to_string(log)
+                .unwrap_or_default()
+                .contains(token.as_str())
+            {
                 found.push(format!("worker token in {}", log.display()));
             }
         }

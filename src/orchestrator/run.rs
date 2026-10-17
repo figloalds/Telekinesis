@@ -82,7 +82,13 @@ pub const MAX_CONTROL_THREADS: usize = 2 * limits::MAX_CONTROL_CONNECTIONS;
 pub fn run(config: Config) -> Result<()> {
     #[cfg(windows)]
     keep_inherited_handles_private();
-    serve(ctx::build(config)?)
+    serve(ctx::build_with(
+        config,
+        ctx::BuildOptions {
+            install_log: true,
+            ..ctx::BuildOptions::default()
+        },
+    )?)
 }
 
 /// Serves a built daemon until it shuts down (the body of [`run`]), with

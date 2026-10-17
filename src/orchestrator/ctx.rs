@@ -6,7 +6,10 @@
 //! [`build`] wires the actors, in this order:
 //!
 //! 1. `Catalog::open` (takes `orchestrator.lock`: a second daemon on the same
-//!    data directory fails here, before anything else starts) →
+//!    data directory fails here, before anything else starts); with
+//!    [`BuildOptions::install_log`] (`run`), `DATA/logs/orchestrator.log`
+//!    becomes the process log right after (CCR-WP4.2-1, so a daemon that
+//!    fails to start never touches the running one's log) →
 //!    `StatusHub::new` with its 1 Hz `hub-tick` thread → `PublishedCatalog`;
 //! 2. the control and network listeners (a busy port fails the start before
 //!    any worker is started or adopted), and the control endpoint's local
@@ -136,6 +139,12 @@ pub struct BuildOptions {
     pub executable: Option<PathBuf>,
     /// The launcher (default: [`DaemonLauncher`] over `RealLauncher`).
     pub launcher: Option<Arc<dyn WorkerLauncher>>,
+    /// Installs `DATA/logs/orchestrator.log` as this process's rotating log
+    /// once the catalog holds `orchestrator.lock`, and publishes it as
+    /// `log_path` (CCR-WP4.2-1, applied by WP4.INT). `run` sets it;
+    /// in-process daemons of the tests leave it off (the first install of a
+    /// process wins, and their events go to the harness's stderr).
+    pub install_log: bool,
     /// Lifecycle timing (default: `LifecycleLimits` defaults); the executable,
     /// `maximum_running` and the worker version are always set from the
     /// options and the configuration.
@@ -150,6 +159,9 @@ pub fn build(config: Config) -> Result<Daemon> {
 /// Builds the daemon context (see the module docs for the order).
 pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
     let catalog = Catalog::open(&config)?;
+    if options.install_log {
+        install_log(&config.data_directory);
+    }
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let shutdown = Cancel::new();
     let hub = StatusHub::new(
@@ -169,7 +181,7 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
         .map(TcpListener::bind)
         .transpose()
         .context("binding the network listener")?;
-    let endpoints = DaemonEndpoints {
+    let mut endpoints = DaemonEndpoints {
         control: format!("ws://{}", control.local_addr()?),
         network: network
             .as_ref()
@@ -195,6 +207,9 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
             catalog: catalog_api.clone(),
         })
     });
+    // The process log: the one installed above, or the desktop's adopted by
+    // `RealLauncher::new` (WP4.2), or none.
+    endpoints.log_path = crate::util::log::file_log().map(|log| log.path.display().to_string());
     let registry = FolderRegistry::start(RegistryDeps {
         catalog: catalog_api.clone(),
         published: published.clone(),
@@ -251,6 +266,41 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
         catalog,
         registry,
     })
+}
+
+/// CCR-WP4.2-1: `DATA/logs/orchestrator.log` becomes this process's log. A
+/// daemon the desktop started (its standard streams appended to that file)
+/// adopts it first, as `RealLauncher::new` did before (WP4.2); any other
+/// daemon installs it, and keeps teeing its events to a terminal, pipe or
+/// other file on stderr. The path is the one the user knows (no `\?\`
+/// verbatim prefix: `Config::load` canonicalizes the data directory). A log
+/// that cannot be installed is logged; events then go to stderr only.
+fn install_log(data_directory: &std::path::Path) {
+    use crate::util::log;
+    if log::adopt_desktop_log().is_some() {
+        return;
+    }
+    let path = log::daemon_log_path(&plain_path(data_directory));
+    if let Err(error) = log::install_file(&path, log::Rotation::from_env()) {
+        event!(warn, UNKNOWN_ERROR, {
+            "detail": "cannot install the daemon log; events go to standard error only",
+            "path": path.display().to_string(),
+            "error": error.to_string(),
+        });
+    }
+}
+
+/// `path` without the Windows verbatim prefix (`\?\C:\…` becomes `C:\…`,
+/// `\?\UNC\host\share` becomes `\host\share`).
+fn plain_path(path: &std::path::Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\?\UNC\") {
+        PathBuf::from(format!(r"\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_owned()
+    }
 }
 
 // Cancels a token when dropped (unless disarmed).

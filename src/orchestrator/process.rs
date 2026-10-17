@@ -44,8 +44,9 @@
 //! and that file becomes its rotating JSON-line log. The launcher is built
 //! once per daemon, after `orchestrator.lock` is held (`ctx::build_with`), so
 //! a second daemon that fails to start never rotates the running one's log.
-//! (The explicit call for every daemon, with `DaemonStatus.log_path`, is
-//! CCR-WP4.2-1.)
+//! Every daemon `run` starts installs that log itself, and publishes it as
+//! `DaemonStatus.log_path` (`ctx::BuildOptions::install_log`, CCR-WP4.2-1,
+//! applied by WP4.INT); the adoption here then finds it installed.
 use super::worker_client::JsonWorkerClient;
 use crate::{
     model::{
@@ -186,11 +187,8 @@ impl RealLauncher {
             fs::create_dir_all(parent).map_err(|e| start_error(&program, "create log dir", &e))?;
         }
         rotate_worker_log(log, &self.policy, label);
-        let log_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-            .map_err(|e| start_error(&program, "open worker.log", &e))?;
+        let log_file =
+            open_worker_log(log).map_err(|e| start_error(&program, "open worker.log", &e))?;
         let stderr = log_file
             .try_clone()
             .map_err(|e| start_error(&program, "open worker.log", &e))?;
@@ -278,6 +276,32 @@ impl WorkerLauncher for RealLauncher {
 
     fn client(&self, endpoint: &WorkerEndpoint) -> Arc<dyn WorkerClient> {
         JsonWorkerClient::new(endpoint.clone())
+    }
+}
+
+/// Opens `worker.log` for appending, owner-only (CCR-WP4.1-4, applied by
+/// WP4.INT): created 0600 on Unix, and an older file made 0600 too (its
+/// rotated copies are renames of it, so they keep the mode). Its lines are
+/// redacted, but stray output of a worker could still name a secret.
+/// Windows: the file inherits the state directory's ACL (the user's
+/// profile), like every other file of the state (§11.15).
+fn open_worker_log(log: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        options.mode(0o600);
+        let file = options.open(log)?;
+        let metadata = file.metadata()?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(log)
     }
 }
 
