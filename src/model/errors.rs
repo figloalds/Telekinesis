@@ -543,13 +543,38 @@ impl From<&anyhow::Error> for ErrorWire {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Scope {
     Daemon,
-    Folder { state: String },
-    Peer { installation: String },
-    Lane { installation: String, lane: u32 },
-    FolderPeer { state: String, installation: String },
-    Object { state: String, hash: String },
-    Event { state: String, id: String },
-    Mount { state: String },
+    Folder {
+        state: String,
+    },
+    Peer {
+        installation: String,
+    },
+    Lane {
+        installation: String,
+        lane: u32,
+    },
+    FolderPeer {
+        state: String,
+        installation: String,
+    },
+    Object {
+        state: String,
+        hash: String,
+    },
+    Event {
+        state: String,
+        id: String,
+    },
+    Mount {
+        state: String,
+    },
+    /// An endpoint that is not a paired peer (CCR-WP3.1-3, applied by
+    /// WP4.INT): a pairing the endpoint refused, before any installation is
+    /// known (it was `Peer{installation: <endpoint>}`). Additive: older
+    /// readers of the status JSON never see it from older daemons.
+    Endpoint {
+        endpoint: String,
+    },
 }
 
 /// The history of one error code in one scope.

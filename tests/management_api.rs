@@ -2006,3 +2006,46 @@ fn cli_watch_follows_changes() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// CCR-WP4.3-1 and CCR-WP3.1-3 (applied by WP4.INT): an error scoped to a
+/// peer the snapshot does not list names it once (`peer <id>`, it printed
+/// `peer peer <id>`), and a refused pairing is scoped to its endpoint.
+#[test]
+fn error_scopes_of_unlisted_peers_and_endpoints_read_once() {
+    let snapshot = StatusSnapshot {
+        schema: STATUS_SCHEMA,
+        generation: 1,
+        at_ms: T,
+        daemon: DaemonStatus {
+            control: "ws://127.0.0.1:50123".into(),
+            errors: vec![
+                error(
+                    "PEER_NEEDS_UPGRADE",
+                    "the peer speaks tkfs-peer/2",
+                    Scope::Endpoint {
+                        endpoint: "ws://10.0.0.9:43180".into(),
+                    },
+                    60_000,
+                    60_000,
+                    1,
+                ),
+                error(
+                    "WS_CONNECT_FAILED",
+                    "refused",
+                    Scope::Peer {
+                        installation: "1f2e3d4c-aaaa-bbbb-cccc-def012345678".into(),
+                    },
+                    60_000,
+                    60_000,
+                    1,
+                ),
+            ],
+            ..DaemonStatus::default()
+        },
+        ..StatusSnapshot::default()
+    };
+    let text = format_status(&snapshot);
+    assert!(text.contains("endpoint ws://10.0.0.9:43180"), "{text}");
+    assert!(text.contains("peer 1f2e3d4c"), "{text}");
+    assert!(!text.contains("peer peer"), "{text}");
+}

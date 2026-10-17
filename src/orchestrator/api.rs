@@ -625,6 +625,25 @@ struct Names<'a> {
 }
 
 impl Names<'_> {
+    /// `peer <name>` for an error's scope: a peer the snapshot does not list
+    /// is named once, by its id (CCR-WP4.3-1, applied by WP4.INT: it printed
+    /// `peer peer <id>`), in full when it is not an installation id (an
+    /// endpoint scoped by an older daemon).
+    fn peer_scope(&self, installation: &str) -> String {
+        match self.peers.iter().find(|p| p.installation == installation) {
+            Some(peer) => format!(
+                "peer {}",
+                peer_name(
+                    peer.label.as_deref(),
+                    peer.endpoint.as_deref(),
+                    installation
+                )
+            ),
+            None if installation.contains("://") => format!("peer {installation}"),
+            None => format!("peer {}", short(installation)),
+        }
+    }
+
     fn peer(&self, installation: &str) -> String {
         match self.peers.iter().find(|p| p.installation == installation) {
             Some(peer) => peer_name(
@@ -1529,11 +1548,12 @@ fn scope_text(scope: &Scope, names: &Names) -> Option<String> {
         Scope::Object { hash, .. } => Some(format!("object {}", short_hash(hash))),
         Scope::Event { id, .. } => Some(format!("event {}", short(id))),
         Scope::FolderPeer { installation, .. } | Scope::Peer { installation } => {
-            Some(format!("peer {}", names.peer(installation)))
+            Some(names.peer_scope(installation))
         }
         Scope::Lane { installation, lane } => {
-            Some(format!("peer {} lane {lane}", names.peer(installation)))
+            Some(format!("{} lane {lane}", names.peer_scope(installation)))
         }
+        Scope::Endpoint { endpoint } => Some(format!("endpoint {endpoint}")),
     }
 }
 

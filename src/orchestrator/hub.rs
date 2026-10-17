@@ -1179,7 +1179,7 @@ fn scope_folder(scope: &Scope) -> Option<&str> {
         | Scope::Object { state, .. }
         | Scope::Event { state, .. }
         | Scope::Mount { state } => Some(state),
-        Scope::Daemon | Scope::Peer { .. } | Scope::Lane { .. } => None,
+        Scope::Daemon | Scope::Peer { .. } | Scope::Lane { .. } | Scope::Endpoint { .. } => None,
     }
 }
 
@@ -2642,7 +2642,7 @@ impl HubState {
 
     fn on_error(&mut self, scope: Scope, error: ErrorWire, now: Now) {
         match &scope {
-            Scope::Daemon => {
+            Scope::Daemon | Scope::Endpoint { .. } => {
                 self.daemon_errors
                     .observe((scope, String::new()), error, now, &mut self.ring);
             }
@@ -2681,7 +2681,7 @@ impl HubState {
             slot_scope == scope && (code.is_empty() || open.record.error.code == code)
         };
         match scope {
-            Scope::Daemon | Scope::Peer { .. } | Scope::Lane { .. } => {
+            Scope::Daemon | Scope::Peer { .. } | Scope::Lane { .. } | Scope::Endpoint { .. } => {
                 self.daemon_errors.resolve(matches, now, &mut self.ring);
                 if let Some(installation) = scope_peer(scope) {
                     let installation = installation.to_owned();
