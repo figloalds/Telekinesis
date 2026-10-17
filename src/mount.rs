@@ -236,6 +236,9 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
             ensure!(g == e.store.generation, "STALE_VIEW");
         }
         e.quiet()?;
+        // Refused before the mount stops, not after (`Engine::control` checks
+        // it again).
+        e.checkout_allowed()?;
         let branch = e
             .store
             .branch(payload["name"].as_str().context("MISSING_ARGUMENT")?)?;
