@@ -5375,44 +5375,72 @@ pub(super) fn project_append(
     mut p: Projection,
     events: &[Event],
     new: usize,
+    index: Option<&BranchIndex>,
 ) -> Result<Option<Appended>> {
     if !p.pending.is_empty() {
         return Ok(None);
     }
     let e = &events[new];
-    let mut ids: HashMap<&str, usize> =
-        HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
-    for (i, event) in events.iter().enumerate() {
-        if ids.insert(event.id.as_str(), i).is_some() {
-            return Ok(None);
+    // The events' positions by id: the branch index's (WP5.1), when it
+    // indexes every event but `E` (the last) and no id repeats; else a scan.
+    let indexed = index.filter(|index| {
+        index.len() == new && new + 1 == events.len() && index.ns.index.len() == new
+    });
+    let ids: Option<HashMap<&str, usize>> = match indexed {
+        Some(index) => {
+            // `E`'s id repeats an indexed one, or an indexed event names it.
+            if index.ns.index.contains_key(e.id.as_str())
+                || index.facts.dangling.contains_key(e.id.as_str())
+            {
+                return Ok(None);
+            }
+            None
         }
-    }
-    let names_new = |event: &Event| {
-        event.dependencies.iter().any(|d| d == &e.id)
-            || event
-                .changes
+        None => {
+            let mut ids: HashMap<&str, usize> =
+                HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
+            for (i, event) in events.iter().enumerate() {
+                if ids.insert(event.id.as_str(), i).is_some() {
+                    return Ok(None);
+                }
+            }
+            let names_new = |event: &Event| {
+                event.dependencies.iter().any(|d| d == &e.id)
+                    || event
+                        .changes
+                        .iter()
+                        .any(|c| c.parents.iter().any(|p| p == &e.id))
+            };
+            if events
                 .iter()
-                .any(|c| c.parents.iter().any(|p| p == &e.id))
+                .enumerate()
+                .any(|(i, event)| i != new && names_new(event))
+            {
+                return Ok(None);
+            }
+            Some(ids)
+        }
     };
-    if events
-        .iter()
-        .enumerate()
-        .any(|(i, event)| i != new && names_new(event))
-    {
-        return Ok(None);
-    }
+    // The position of an event other than `E`.
+    let position = |id: &str| -> Option<usize> {
+        match (&ids, indexed) {
+            (Some(ids), _) => ids.get(id).copied(),
+            (None, Some(index)) => index.ns.index.get(id).copied(),
+            (None, None) => None,
+        }
+    };
     let parents = e
         .dependencies
         .iter()
         .chain(e.changes.iter().flat_map(|c| c.parents.iter()));
     for parent in parents {
-        if parent == &e.id || !ids.contains_key(parent.as_str()) {
+        if parent == &e.id || position(parent).is_none() {
             return Ok(None);
         }
     }
     for c in &e.changes {
         for parent in &c.parents {
-            let p = &events[ids[parent.as_str()]];
+            let p = &events[position(parent).expect("checked above")];
             ensure!(
                 p.changes
                     .iter()
@@ -5471,18 +5499,32 @@ pub(super) fn project_append(
                 .len()
                 > 1
         {
-            // `project`'s records of the register, from its whole history.
-            let versions: Vec<VersionRef> = events
-                .iter()
-                .enumerate()
-                .flat_map(|(i, event)| {
-                    event
-                        .changes
-                        .iter()
-                        .filter(|pc| pc.entity == c.entity && pc.field == c.field)
-                        .map(move |pc| (i, pc))
-                })
-                .collect();
+            // `project`'s records of the register, from its whole history (in
+            // event order: through the index, the entity's indexed changes,
+            // then `E`'s).
+            let versions: Vec<VersionRef> = match indexed {
+                Some(index) => index
+                    .ns
+                    .entities
+                    .get(c.entity.as_str())
+                    .into_iter()
+                    .flat_map(|&x| index.ns.changes[x as usize].iter())
+                    .map(|&(i, k)| (i, &events[i].changes[k]))
+                    .chain(e.changes.iter().map(|pc| (new, pc)))
+                    .filter(|(_, pc)| pc.entity == c.entity && pc.field == c.field)
+                    .collect(),
+                None => events
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, event)| {
+                        event
+                            .changes
+                            .iter()
+                            .filter(|pc| pc.entity == c.entity && pc.field == c.field)
+                            .map(move |pc| (i, pc))
+                    })
+                    .collect(),
+            };
             let mut order: Vec<usize> = (0..versions.len()).collect();
             order.sort_by(|&a, &b| events[versions[a].0].id.cmp(&events[versions[b].0].id));
             let at: HashMap<&str, usize> = versions
@@ -10377,7 +10419,32 @@ mod tests {
                     continue;
                 };
                 let full = project(BRANCH, new);
-                match project_append(BRANCH, base.clone(), new, k) {
+                let through =
+                    project_append(BRANCH, base.clone(), new, k, Some(&BranchIndex::build(old)));
+                let scanned = project_append(BRANCH, base.clone(), new, k, None);
+                match (&through, &scanned) {
+                    (Ok(a), Ok(b)) => assert!(
+                        a.as_ref().map(|a| (
+                            &a.projection,
+                            &a.changed,
+                            a.lists,
+                            &a.carried,
+                            &a.placements
+                        )) == b.as_ref().map(|b| (
+                            &b.projection,
+                            &b.changed,
+                            b.lists,
+                            &b.carried,
+                            &b.placements
+                        )),
+                        "seed {seed} k {k}: indexed and scanned appends differ"
+                    ),
+                    (Err(a), Err(b)) => {
+                        assert_eq!(format!("{a:#}"), format!("{b:#}"), "seed {seed} k {k}")
+                    }
+                    _ => panic!("seed {seed} k {k}: one append refused"),
+                }
+                match scanned {
                     Ok(None) => declined += 1,
                     Ok(Some(appended_projection)) => {
                         let full = full.unwrap_or_else(|e| {
