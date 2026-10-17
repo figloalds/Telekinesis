@@ -2019,7 +2019,7 @@ impl SaveSignal {
 /// tables alone keeps the view (`Store::adopt_foreign_commits`).
 ///
 /// The rows are written in batches, one transaction every
-/// [`NOTES_INTERVAL`] at most, by a thread that runs only while rows wait:
+/// [`NOTES_INTERVAL`], by a thread that runs only while rows wait:
 /// one row per transaction made the saves of a burst of small files wait on
 /// each other's commits (SQLite's busy handler sleeps). Best effort, like
 /// the index itself: until its row is written an object counts as present by
@@ -2038,8 +2038,12 @@ struct NotesState {
     /// A flushing thread runs.
     flusher: bool,
 }
-/// How long noted rows wait before the flushing thread writes them.
-pub const NOTES_INTERVAL: Duration = Duration::from_millis(200);
+/// How long noted rows wait before the flushing thread writes them. Every
+/// batch is a commit of another connection: an engine commit that overlaps
+/// one cannot patch its projection view and drops it (the next operation
+/// reloads the whole projection, about 25 ms at 2K files), so batches are
+/// rare.
+pub const NOTES_INTERVAL: Duration = Duration::from_secs(1);
 impl AvailabilityNotes {
     fn new(store: &Store) -> Self {
         Self {
