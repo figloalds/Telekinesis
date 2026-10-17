@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use support::*;
 use tkfs::{core::id, ws};
@@ -308,7 +308,30 @@ fn inbound_status() {
         has_file(&pa, "b.txt", b"b")
     });
     let b_installation = b.installation();
-    let status = status(&a);
+    // CCR-WP4.2-6 (applied by WP4.INT): the hub publishes the inbound peer
+    // within about 0.25 s of its sessions; on fast storage (a WSL tmpfs) the
+    // sync above takes less than that, so wait (≤ 5 s) for the listing and
+    // its lanes before checking what it says.
+    let listed = |status: &Value| {
+        let peer = peer_of(status, &b_installation);
+        !peer.is_null()
+            && peer["lanes"].as_array().is_some_and(|lanes| {
+                ["control", "bulk"].iter().all(|role| {
+                    lanes.iter().any(|lane| {
+                        lane["direction"] == "inbound"
+                            && lane["role"] == *role
+                            && lane["state"] == "ready"
+                    })
+                })
+            })
+    };
+    let mut snapshot = status(&a);
+    let waited = Instant::now();
+    while !listed(&snapshot) && waited.elapsed() < Duration::from_secs(5) {
+        thread::sleep(Duration::from_millis(50));
+        snapshot = status(&a);
+    }
+    let status = snapshot;
     let peer = peer_of(&status, &b_installation);
     s.check(!peer.is_null(), "inbound peer listed on the acceptor");
     s.check(

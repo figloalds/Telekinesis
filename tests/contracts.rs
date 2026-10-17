@@ -2438,10 +2438,7 @@ fn model_helpers_follow_the_spec() {
     assert_eq!(protocol::max_body(protocol::ops::META_EXCHANGE), 16 << 20);
     // CCR-WP4.5-1 (WP4.INT): the interim bulk page is gone (CCR-WP3.3-2), so
     // its 16 MiB bound (CCR-WP2.7-1 / CCR-WP2.8-1) and 60 s deadline go too.
-    assert_eq!(
-        protocol::max_body(protocol::ops::OBJECTS_EXCHANGE),
-        1 << 20
-    );
+    assert_eq!(protocol::max_body(protocol::ops::OBJECTS_EXCHANGE), 1 << 20);
     assert_eq!(protocol::op_deadline(protocol::ops::OBJECTS_EXCHANGE), None);
     assert_eq!(protocol::max_body(protocol::ops::OBJECTS_PULL), 1 << 20);
     assert_eq!(protocol::max_body(protocol::ops::PING), 1 << 20);
