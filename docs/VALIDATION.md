@@ -239,24 +239,70 @@ two hosts (or two data directories on one machine).
 
 ## Soak
 
-The final integration runs a two-hour soak: two daemons connected through a
-fault-injecting proxy (`tests/support/proxy.rs`, `FaultProxy`: latency,
-bandwidth limits, stalls, connection resets) whose faults change
-periodically, with continuous edits on both sides. It passes when, after the
-edits stop and the link is healthy:
+`tests/qual_wp4_int_soak.rs` (release, ignored in the suite):
 
-- both folders read `Up to date` (no `stalled`, `blocked` or `needs attention`
-  state, no open errors other than resolved ones);
-- both replicas hold the same shared events (`metadata caught up` both ways,
-  and `accepted_metadata_equal` from `scripts/inspect_metadata.py --compare`
-  of the two states);
-- every object is available on both sides (`content complete`) and every event
-  is acknowledged (`journal.outgoing_unacknowledged` = 0);
-- the derived-state oracle (`Store::verify_derived_state`) finds no difference
-  on either store, checked on the stopped folders.
+```powershell
+cargo test --release --test qual_wp4_int_soak -- --ignored --nocapture
+```
 
-The proxy and the oracle are test-support and library APIs; there is no
-command-line soak tool.
+Two real daemons are paired both ways, each through its own
+`FaultProxy` (`tests/support/proxy.rs`), and share one folder. For two hours
+(`TKFS_SOAK_MINUTES`) both sides edit continuously through their workers:
+new files, saves, directories, renames, deletes and a few files of 1–4 MiB,
+one operation every 1–4 s on each side (`TKFS_SOAK_PAUSE_MS_MIN` / `_MAX`),
+mostly on names of their own and 10 % on a pool both sides edit
+(`TKFS_SOAK_SHARED_PERCENT`), so concurrent edits conflict now and then.
+Meanwhile both links cycle every 20–60 s through healthy, latency (5–100 ms
+one way), bandwidth caps (256 KiB/s–20 MiB/s), stalls, resets, resets
+after some bytes, a blackhole, refused connections, and stalls after some
+bytes with jittery latency. Then the edits stop,
+the links heal, and it passes when, within 30 min
+(`TKFS_SOAK_SETTLE_MINUTES`):
+
+- both folders read `up_to_date` (none ends stalled, blocked, needing
+  attention or backing off), every lane of both peers is ready, nothing is
+  staged and every outbox row is acknowledged;
+- both replicas hold the same shared journal (equal feeds) and the same
+  projection, and all content (`content.complete`);
+- the derived-state oracle (`Store::verify_derived_state`) is empty on both
+  stores, checked with the folders stopped.
+
+Its `QUAL` records keep the edits, the fault phases, a status sample of both
+folders every minute and the final state.
+
+**Results** (release, the final code; the details are in
+`test-evidence/qualification-final.json` and the WP4.INT notes):
+
+- **The two-hour soak passes** (default workload, at `9dc5720`, 7,257 s):
+  4,889 edits (2,415 and 2,474; 768 more refused, e.g. a rename onto an
+  occupied name), 396 MB written, 180 fault phases (40 resets, 40 stalls,
+  20 blackholes, 20 refused-connection phases, …), 178 proxy resets, 662
+  connections and 495 MB through the proxies. Of the 240 per-minute folder
+  samples 159 read `up_to_date`, the others the fault in progress
+  (`backoff` 42, `offline` 13, transfers 25). When the edits stopped both
+  folders were up to date already (settled in 0.01 s): 5,630 shared events
+  on each side, equal journals and projections, all content, nothing
+  staged, every event acknowledged, both oracles empty.
+- Faster or conflict-heavy workloads (`TKFS_SOAK_PAUSE_MS_*`,
+  `TKFS_SOAK_SHARED_PERCENT`):
+
+| Run | Workload | Outcome |
+|---|---|---|
+| storm, 8 min | every operation of both sides on the shared pool, one every 50–400 ms | **pass**: 3,408 events, 236 unresolved conflicts, settled in 1.6 s, oracle empty |
+| storm, 20 min | the same | **pass**: 7,082 events, 1,300 unresolved conflicts, settled in 1.6 s, oracle empty |
+| storm, 2 h | the same | **did not converge**: 8,973 and 7,905 events, 9,399 and 5,861 unresolved conflicts; 1,549 and 2,617 events still waiting after the 30 min settle, each conflicting event a full replay of minutes; the final oracle check of the two stopped stores had not finished after 3 h (stopped) |
+| fast editing, 91 min of 2 h (stopped) | 10 % on the shared pool, one operation every 50–400 ms | **falling behind**: 21.5K events and 100–107 unresolved conflicts on each side, the activation backlog growing (140 events after 30 min, 1.5K after 91 min) |
+
+The last two show this release's limit: while a branch has unresolved
+conflicts, remote creations and namespace changes take the slow path, and a
+slow event whose append-mode precondition fails is a full replay, whose
+cost grows with the history and, steeply, with the unresolved conflicts;
+under continuous local writes the prepared replays also go stale and are
+redone (2,420 stale outcomes in the stopped run). Activation then falls
+behind a peer that keeps writing. Resolving conflicts keeps it fast
+(README, *Filesystem behaviour*); the plan's scope cut keeps conflict
+derivation to append mode plus the off-lock replay, and WP4.INT files the
+rest as CCR-WP4.INT-3.
 
 ## Two-machine lab
 

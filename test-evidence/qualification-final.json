@@ -1,0 +1,2022 @@
+{
+  "schema": 1,
+  "kind": "final",
+  "package": "WP4.INT",
+  "commit": "9dc5720",
+  "branch": "revamp/wp4-int",
+  "section_15_1": [
+    {
+      "metric": "Remote linear create, per event",
+      "baseline_6298d0b": "6.2 s @1K, 15.9 s @2K, 218 s @6.4K",
+      "floor": "<= 5 ms @10K",
+      "enforced_from": "W1",
+      "after": {
+        "remote_linear_create_2k": {
+          "windows": {
+            "scenario": "qual_wp1_6_activation::remote_linear_create_2k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 0.6283271999999999,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_6_activation::remote_linear_create_2k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 0.5205386545,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "remote_linear_create_10k": {
+          "windows": {
+            "scenario": "qual_wp1_6_activation::remote_linear_create_10k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 0.8945440499999999,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_6_activation::remote_linear_create_10k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 0.6151589355999999,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "scale_remote_linear_2k": {
+          "windows": {
+            "scenario": "qual_scale::remote_linear_activation_2k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 0.85949305,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::remote_linear_activation_2k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 1.1881066745,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "scale_remote_linear_6400": {
+          "windows": {
+            "scenario": "qual_scale::remote_linear_activation_6400",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 1.0382715,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::remote_linear_activation_6400",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 5,
+            "unit": "ms",
+            "measured": 1.13941506640625,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Two-way backlog (one unseen local edit), per event",
+      "baseline_6298d0b": "15.9 s @2K, 218 s @6.4K (slow path)",
+      "floor": "<= 100 ms @2K, <= 300 ms @6.4K",
+      "enforced_from": "W1",
+      "after": {
+        "two_way_backlog_2k": {
+          "windows": {
+            "scenario": "qual_wp1_7_derive::two_way_backlog_2k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 34.96108274999999,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_7_derive::two_way_backlog_2k",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 28.928326561000002,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "two_way_backlog_6400": {
+          "windows": {
+            "scenario": "qual_wp1_7_derive::two_way_backlog_6400",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 300,
+            "unit": "ms",
+            "measured": 131.68474209375006,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_7_derive::two_way_backlog_6400",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 300,
+            "unit": "ms",
+            "measured": 108.24099328718785,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "scale_two_way_backlog": {
+          "windows": {
+            "scenario": "qual_scale::two_way_backlog",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 1.8540579,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::two_way_backlog",
+            "metric": "per_event_ms",
+            "op": "<=",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 1.7576581065,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "50 concurrent namespace ops on 5K history",
+      "baseline_6298d0b": "O(N^2) seconds to minutes",
+      "floor": "<= 500 ms each",
+      "enforced_from": "W1",
+      "after": {
+        "concurrent_namespace_ops_5k": {
+          "windows": {
+            "scenario": "qual_wp1_7_derive::concurrent_namespace_ops_5k",
+            "metric": "max_op_ms",
+            "op": "<=",
+            "floor": 500,
+            "unit": "ms",
+            "measured": 228.9499,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_7_derive::concurrent_namespace_ops_5k",
+            "metric": "max_op_ms",
+            "op": "<=",
+            "floor": 500,
+            "unit": "ms",
+            "measured": 190.958105,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Local create after a resolved conflict",
+      "baseline_6298d0b": "4.2 s",
+      "floor": "<= 10 ms",
+      "enforced_from": "W1",
+      "after": {
+        "local_create_after_resolved_conflict": {
+          "windows": {
+            "scenario": "qual_wp1_6_activation::local_create_after_resolved_conflict",
+            "metric": "p90_ms",
+            "op": "<=",
+            "floor": 10,
+            "unit": "ms",
+            "measured": 1.1938,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_6_activation::local_create_after_resolved_conflict",
+            "metric": "p90_ms",
+            "op": "<=",
+            "floor": 10,
+            "unit": "ms",
+            "measured": 3.7456460000000003,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Restart to Ready at 20K objects",
+      "baseline_6298d0b": "full re-hash",
+      "floor": "<= 3 s",
+      "enforced_from": "W1",
+      "after": {
+        "restart_ready_20k_objects": {
+          "windows": {
+            "scenario": "qual_wp1_8_objects::restart_without_rehash_20k",
+            "metric": "ready_ms",
+            "op": "<=",
+            "floor": 3000,
+            "unit": "ms",
+            "measured": 953.2801,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_8_objects::restart_without_rehash_20k",
+            "metric": "ready_ms",
+            "op": "<=",
+            "floor": 3000,
+            "unit": "ms",
+            "measured": 714.487674,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "content_status at 50K objects",
+      "baseline_6298d0b": "about 6.5 s (0.13 ms/object)",
+      "floor": "< 50 ms",
+      "enforced_from": "W1",
+      "after": {
+        "content_status_50k": {
+          "windows": {
+            "scenario": "qual_wp1_8_objects::content_status_50k",
+            "metric": "content_status_ms",
+            "op": "<",
+            "floor": 50,
+            "unit": "ms",
+            "measured": 0.061900000000000004,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_8_objects::content_status_50k",
+            "metric": "content_status_ms",
+            "op": "<",
+            "floor": 50,
+            "unit": "ms",
+            "measured": 0.010183000000000001,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Hung remote repo vs a healthy repo on the same peer",
+      "baseline_6298d0b": "lane-wide resets, 30 s backoff",
+      "floor": "healthy repo progresses within 45 s (W1, legacy); < 2 s extra delay (W3, v3)",
+      "enforced_from": "W1 / W3",
+      "after": {
+        "legacy_hung_repo_healthy_progress": {
+          "windows": {
+            "scenario": "qual_wp1_12_legacy::hung_remote_repo_charged",
+            "metric": "healthy_delay_ms",
+            "op": "<=",
+            "floor": 45000,
+            "unit": "ms",
+            "measured": 686.8059,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_12_legacy::hung_remote_repo_charged",
+            "metric": "healthy_delay_ms",
+            "op": "<=",
+            "floor": 45000,
+            "unit": "ms",
+            "measured": 759.281599,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "v3_hung_repo_extra_delay": {
+          "windows": {
+            "scenario": "qual_wp3_1_transport::hung_remote_repo_extra_delay",
+            "metric": "extra_delay_ms",
+            "op": "<",
+            "floor": 2000,
+            "unit": "ms",
+            "measured": 0.9819000000000031,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_1_transport::hung_remote_repo_extra_delay",
+            "metric": "extra_delay_ms",
+            "op": "<",
+            "floor": 2000,
+            "unit": "ms",
+            "measured": 1.568456999999995,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "sync_interval_ms = 20000 reconnects over 60 s",
+      "baseline_6298d0b": "every idle cycle",
+      "floor": "0",
+      "enforced_from": "W1",
+      "after": {
+        "legacy_interval_20s_reconnects": {
+          "windows": {
+            "scenario": "qual_wp1_12_legacy::interval_20s_no_reconnects",
+            "metric": "reconnects",
+            "op": "<=",
+            "floor": 0,
+            "unit": "count",
+            "measured": 0.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_12_legacy::interval_20s_no_reconnects",
+            "metric": "reconnects",
+            "op": "<=",
+            "floor": 0,
+            "unit": "count",
+            "measured": 0.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "v3_interval_20s_reconnects": {
+          "windows": {
+            "scenario": "qual_wp3_1_transport::interval_20s_no_reconnects",
+            "metric": "reconnects",
+            "op": "<=",
+            "floor": 0,
+            "unit": "count",
+            "measured": 0.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_1_transport::interval_20s_no_reconnects",
+            "metric": "reconnects",
+            "op": "<=",
+            "floor": 0,
+            "unit": "count",
+            "measured": 0.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Management API p99 during lifecycle churn",
+      "baseline_6298d0b": "locks held 23-41 s",
+      "floor": "< 100 ms",
+      "enforced_from": "W2",
+      "after": {
+        "api_p99_under_churn": {
+          "windows": {
+            "scenario": "qual_wp2_1_lifecycle::api_latency_under_churn",
+            "metric": "list_p99_ms",
+            "op": "<",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 1.3292,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_1_lifecycle::api_latency_under_churn",
+            "metric": "list_p99_ms",
+            "op": "<",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 0.855705,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "scale_api_p99_under_churn": {
+          "windows": {
+            "scenario": "qual_scale::management_api_p99_under_churn",
+            "metric": "list_p99_ms",
+            "op": "<",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 2.0309999999999997,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::management_api_p99_under_churn",
+            "metric": "list_p99_ms",
+            "op": "<",
+            "floor": 100,
+            "unit": "ms",
+            "measured": 1.209629,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "FS-op p99 during 2K-event catch-up",
+      "baseline_6298d0b": "engine held for seconds",
+      "floor": "< 50 ms",
+      "enforced_from": "W2",
+      "after": {
+        "fs_p99_during_catchup": {
+          "windows": {
+            "scenario": "qual_wp2_3_worker::fs_p99_during_catchup",
+            "metric": "fs_p99_ms",
+            "op": "<",
+            "floor": 50,
+            "unit": "ms",
+            "measured": 12.344000000000001,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_3_worker::fs_p99_during_catchup",
+            "metric": "fs_p99_ms",
+            "op": "<",
+            "floor": 50,
+            "unit": "ms",
+            "measured": 15.023385000000001,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Status RPC latency during activation",
+      "baseline_6298d0b": "blanked (busy/stale)",
+      "floor": "< 20 ms with full counts",
+      "enforced_from": "W2",
+      "after": {
+        "status_latency_during_activation": {
+          "windows": {
+            "scenario": "qual_wp2_3_worker::status_latency_during_activation",
+            "metric": "status_p99_ms",
+            "op": "<",
+            "floor": 20,
+            "unit": "ms",
+            "measured": 7.5346,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_3_worker::status_latency_during_activation",
+            "metric": "status_p99_ms",
+            "op": "<",
+            "floor": 20,
+            "unit": "ms",
+            "measured": 4.213425,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Engine-lock hold for a slow event at 2K",
+      "baseline_6298d0b": "full O(N^2) derivation",
+      "floor": "< 50 ms",
+      "enforced_from": "W2",
+      "after": {
+        "lock_hold_slow_event_2k": {
+          "windows": {
+            "scenario": "qual_wp2_4_offlock::lock_hold_slow_event_2k",
+            "metric": "max_blocked_ms",
+            "op": "<",
+            "floor": 50,
+            "unit": "ms",
+            "measured": 1.7159,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_4_offlock::lock_hold_slow_event_2k",
+            "metric": "max_blocked_ms",
+            "op": "<",
+            "floor": 50,
+            "unit": "ms",
+            "measured": 4.9582690000000005,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Idle metadata exchange at 50K events",
+      "baseline_6298d0b": "1.13 s and 251 KB @6.4K",
+      "floor": "<= 10 ms CPU per side, <= 4 KiB",
+      "enforced_from": "W2 (in-process) / W3 (daemon)",
+      "after": {
+        "idle_exchange_50k_cpu": {
+          "windows": {
+            "scenario": "qual_wp2_5_feed::idle_exchange_50k",
+            "metric": "cpu_ms_per_side",
+            "op": "<=",
+            "floor": 10,
+            "unit": "ms",
+            "measured": 0.78125,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_5_feed::idle_exchange_50k",
+            "metric": "cpu_ms_per_side",
+            "op": "<=",
+            "floor": 10,
+            "unit": "ms",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "idle_exchange_50k_bytes": {
+          "windows": {
+            "scenario": "qual_wp2_5_feed::idle_exchange_50k",
+            "metric": "bytes",
+            "op": "<=",
+            "floor": 4096,
+            "unit": "bytes",
+            "measured": 1621.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_5_feed::idle_exchange_50k",
+            "metric": "bytes",
+            "op": "<=",
+            "floor": 4096,
+            "unit": "bytes",
+            "measured": 1621.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "e2e_idle_exchange_bytes": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::idle_exchange_daemons",
+            "metric": "bytes_per_exchange",
+            "op": "<=",
+            "floor": 4096,
+            "unit": "bytes",
+            "measured": 1912.9439834024897,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::idle_exchange_daemons",
+            "metric": "bytes_per_exchange",
+            "op": "<=",
+            "floor": 4096,
+            "unit": "bytes",
+            "measured": 1911.4049429657794,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "150K-event inventory",
+      "baseline_6298d0b": "INVENTORY_TOO_LARGE",
+      "floor": "syncs",
+      "enforced_from": "W2 / W3",
+      "after": {
+        "feed_150k_events": {
+          "windows": {
+            "scenario": "qual_wp2_5_feed::feed_150k_events",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_5_feed::feed_150k_events",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "e2e_feed_150k": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::feed_150k_daemons",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::feed_150k_daemons",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "scale_feed_150k": {
+          "windows": {
+            "scenario": "qual_scale::feed_150k",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::feed_150k",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Event >= 349,525 B",
+      "baseline_6298d0b": "permanent stall",
+      "floor": "up to 8 MiB syncs",
+      "enforced_from": "W2 / W3",
+      "after": {
+        "large_event_8mib": {
+          "windows": {
+            "scenario": "qual_wp2_5_feed::large_event_8mib",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_5_feed::large_event_8mib",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "e2e_large_event_8mib": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::large_event_8mib_daemons",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::large_event_8mib_daemons",
+            "metric": "completed",
+            "op": "==",
+            "floor": 1,
+            "unit": "bool",
+            "measured": 1.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Single large object on loopback (daemons)",
+      "baseline_6298d0b": "2.0 MiB/s",
+      "floor": ">= 40 MiB/s",
+      "enforced_from": "W3",
+      "after": {
+        "e2e_object_256mib_loopback": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::object_256mib_loopback",
+            "metric": "mib_per_s",
+            "op": ">=",
+            "floor": 40,
+            "unit": "MiB/s",
+            "measured": 107.62685064579894,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::object_256mib_loopback",
+            "metric": "mib_per_s",
+            "op": ">=",
+            "floor": 40,
+            "unit": "MiB/s",
+            "measured": 93.02994599220618,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "scale_one_gib_object": {
+          "windows": {
+            "scenario": "qual_scale::one_gib_object",
+            "metric": "mib_per_s",
+            "op": ">=",
+            "floor": 40,
+            "unit": "MiB/s",
+            "measured": 115.17920022015424,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::one_gib_object",
+            "metric": "mib_per_s",
+            "op": ">=",
+            "floor": 40,
+            "unit": "MiB/s",
+            "measured": 107.50695509316817,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "100 Mbit / 50 ms RTT link",
+      "baseline_6298d0b": "not measured",
+      "floor": ">= 80 % of link",
+      "enforced_from": "W3",
+      "after": {
+        "e2e_link_utilization": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::one_gib_through_proxy",
+            "metric": "link_utilization",
+            "op": ">=",
+            "floor": 0.8,
+            "unit": "ratio",
+            "measured": 0.9794791502991299,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::one_gib_through_proxy",
+            "metric": "link_utilization",
+            "op": ">=",
+            "floor": 0.8,
+            "unit": "ratio",
+            "measured": 0.9789599498007424,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "10K x 4 KiB files",
+      "baseline_6298d0b": "page cliff above 10,031 parts",
+      "floor": ">= 300 files/s",
+      "enforced_from": "W3",
+      "after": {
+        "objects_worker_tiny_10k": {
+          "windows": {
+            "scenario": "qual_wp3_2_objects::tiny_objects_10k",
+            "metric": "objects_per_s",
+            "op": ">=",
+            "floor": 300,
+            "unit": "objects/s",
+            "measured": 906.7159711268489,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_2_objects::tiny_objects_10k",
+            "metric": "objects_per_s",
+            "op": ">=",
+            "floor": 300,
+            "unit": "objects/s",
+            "measured": 348.42906095482846,
+            "verdict": "pass",
+            "enforced": false
+          }
+        },
+        "e2e_tiny_files_10k": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::tiny_files_10k",
+            "metric": "files_per_s",
+            "op": ">=",
+            "floor": 300,
+            "unit": "files/s",
+            "measured": 771.0691404460305,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::tiny_files_10k",
+            "metric": "files_per_s",
+            "op": ">=",
+            "floor": 300,
+            "unit": "files/s",
+            "measured": 219.22608042706054,
+            "verdict": "fail",
+            "enforced": false
+          }
+        },
+        "scale_tiny_files_10k": {
+          "windows": {
+            "scenario": "qual_scale::tiny_files_10k",
+            "metric": "files_per_s",
+            "op": ">=",
+            "floor": 300,
+            "unit": "files/s",
+            "measured": 769.501583029644,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::tiny_files_10k",
+            "metric": "files_per_s",
+            "op": ">=",
+            "floor": 300,
+            "unit": "files/s",
+            "measured": 195.933994581332,
+            "verdict": "fail",
+            "enforced": false
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "10K-event catch-up between daemons",
+      "baseline_6298d0b": "hours",
+      "floor": "<= 60 s",
+      "enforced_from": "W3",
+      "after": {
+        "e2e_catch_up_10k": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::catch_up_10k_events",
+            "metric": "seconds",
+            "op": "<=",
+            "floor": 60,
+            "unit": "s",
+            "measured": 10.8379858,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::catch_up_10k_events",
+            "metric": "seconds",
+            "op": "<=",
+            "floor": 60,
+            "unit": "s",
+            "measured": 12.877756385,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Objects before activation",
+      "baseline_6298d0b": "0-byte bulk rounds",
+      "floor": "objects flow while the activator is paused",
+      "enforced_from": "W3",
+      "after": {
+        "e2e_objects_before_activation": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::objects_before_activation",
+            "metric": "objects_ahead",
+            "op": ">=",
+            "floor": 1,
+            "unit": "objects",
+            "measured": 54.0,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::objects_before_activation",
+            "metric": "objects_ahead",
+            "op": ">=",
+            "floor": 1,
+            "unit": "objects",
+            "measured": 11.0,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Mutual pairing duplicate bytes",
+      "baseline_6298d0b": "up to 2x",
+      "floor": "<= 1.1x",
+      "enforced_from": "W3",
+      "after": {
+        "e2e_mutual_pairing_bytes": {
+          "windows": {
+            "scenario": "qual_wp3_int_e2e::mutual_pairing_duplicate_bytes",
+            "metric": "wire_ratio",
+            "op": "<=",
+            "floor": 1.1,
+            "unit": "ratio",
+            "measured": 1.001947283744812,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp3_int_e2e::mutual_pairing_duplicate_bytes",
+            "metric": "wire_ratio",
+            "op": "<=",
+            "floor": 1.1,
+            "unit": "ratio",
+            "measured": 1.00205796957016,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Startup to Ready at 50K objects",
+      "baseline_6298d0b": "minutes",
+      "floor": "< 10 s",
+      "enforced_from": "W4",
+      "after": {
+        "scale_startup_50k_objects": {
+          "windows": {
+            "scenario": "qual_scale::startup_ready_50k_objects",
+            "metric": "ready_ms",
+            "op": "<",
+            "floor": 10000,
+            "unit": "ms",
+            "measured": 2630.2269,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::startup_ready_50k_objects",
+            "metric": "ready_ms",
+            "op": "<",
+            "floor": 10000,
+            "unit": "ms",
+            "measured": 2202.8307489999997,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Idle worker CPU (5K events / 10K objects)",
+      "baseline_6298d0b": "4 sweeps + 2 parses per 500 ms per lane x repo",
+      "floor": "<= 1 %",
+      "enforced_from": "W4",
+      "after": {
+        "scale_idle_worker_cpu": {
+          "windows": {
+            "scenario": "qual_scale::idle_worker_cpu",
+            "metric": "cpu_percent",
+            "op": "<=",
+            "floor": 1,
+            "unit": "%",
+            "measured": 0.5208333333333333,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_scale::idle_worker_cpu",
+            "metric": "cpu_percent",
+            "op": "<=",
+            "floor": 1,
+            "unit": "%",
+            "measured": 0.36666666666666664,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    },
+    {
+      "metric": "Subscribe/watch latency",
+      "baseline_6298d0b": "5 s poll",
+      "floor": "<= 1 s",
+      "enforced_from": "W2",
+      "after": {
+        "subscribe_latency": {
+          "windows": {
+            "scenario": "qual_wp2_1_lifecycle::subscribe_latency",
+            "metric": "subscribe_ms",
+            "op": "<=",
+            "floor": 1000,
+            "unit": "ms",
+            "measured": 26.2076,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp2_1_lifecycle::subscribe_latency",
+            "metric": "subscribe_ms",
+            "op": "<=",
+            "floor": 1000,
+            "unit": "ms",
+            "measured": 129.519455,
+            "verdict": "pass",
+            "enforced": true
+          }
+        },
+        "watch_latency": {
+          "windows": {
+            "scenario": "qual_wp1_4_worker::watch_latency",
+            "metric": "watch_ms",
+            "op": "<=",
+            "floor": 1500,
+            "unit": "ms",
+            "measured": 1014.0045,
+            "verdict": "pass",
+            "enforced": true
+          },
+          "linux": {
+            "scenario": "qual_wp1_4_worker::watch_latency",
+            "metric": "watch_ms",
+            "op": "<=",
+            "floor": 1500,
+            "unit": "ms",
+            "measured": 1034.276299,
+            "verdict": "pass",
+            "enforced": true
+          }
+        }
+      },
+      "holds_on_windows": true
+    }
+  ],
+  "package_floors": {
+    "e2e_two_way_backlog": {
+      "windows": {
+        "scenario": "qual_wp3_int_e2e::two_way_backlog_e2e",
+        "metric": "seconds",
+        "op": "<=",
+        "floor": 180,
+        "unit": "s",
+        "measured": 3.705806,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp3_int_e2e::two_way_backlog_e2e",
+        "metric": "seconds",
+        "op": "<=",
+        "floor": 180,
+        "unit": "s",
+        "measured": 3.650324084,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "legacy_crash_backoff": {
+      "windows": {
+        "scenario": "qual_wp1_12_legacy::crash_backoff",
+        "metric": "restarts_20s",
+        "op": "<=",
+        "floor": 5,
+        "unit": "count",
+        "measured": 5.0,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp1_12_legacy::crash_backoff",
+        "metric": "restarts_20s",
+        "op": "<=",
+        "floor": 5,
+        "unit": "count",
+        "measured": 5.0,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "objects_worker_256mib": {
+      "windows": {
+        "scenario": "qual_wp3_2_objects::object_256mib_worker_to_worker",
+        "metric": "mib_per_s",
+        "op": ">=",
+        "floor": 100,
+        "unit": "MiB/s",
+        "measured": 120.04741122447048,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp3_2_objects::object_256mib_worker_to_worker",
+        "metric": "mib_per_s",
+        "op": ">=",
+        "floor": 100,
+        "unit": "MiB/s",
+        "measured": 132.79949533950779,
+        "verdict": "pass",
+        "enforced": false
+      }
+    },
+    "restart_rows_vs_inline_50k": {
+      "windows": {
+        "scenario": "qual_wp4_4_seal::restart_50k_rows_vs_inline",
+        "metric": "restart_rows_vs_inline",
+        "op": "<=",
+        "floor": 1.15,
+        "unit": "ratio",
+        "measured": 1.0055773613579853,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp4_4_seal::restart_50k_rows_vs_inline",
+        "metric": "restart_rows_vs_inline",
+        "op": "<=",
+        "floor": 1.15,
+        "unit": "ratio",
+        "measured": 0.99259420467229,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "seal_after_other_branch_gap": {
+      "windows": {
+        "scenario": "qual_wp4_4_seal::seal_after_other_branch_gap",
+        "metric": "seal_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 0.296,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp4_4_seal::seal_after_other_branch_gap",
+        "metric": "seal_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 0.204,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "seal_bytes_reduction_150k": {
+      "windows": {
+        "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+        "metric": "seal_bytes_reduction",
+        "op": ">=",
+        "floor": 10,
+        "unit": "x",
+        "measured": 72.28942711824193,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+        "metric": "seal_bytes_reduction",
+        "op": ">=",
+        "floor": 10,
+        "unit": "x",
+        "measured": 72.28942711824193,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "seal_max_ms_150k": {
+      "windows": {
+        "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+        "metric": "max_seal_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 8.631,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp4_4_seal::catch_up_150k_seals",
+        "metric": "max_seal_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 16.92,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "session_control_under_queued_data": {
+      "windows": {
+        "scenario": "qual_wp1_9_session::slow_does_not_block_fast",
+        "metric": "control_queued_30mib_p99_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 2.1834,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp1_9_session::slow_does_not_block_fast",
+        "metric": "control_queued_30mib_p99_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 1.342784,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "session_loopback_throughput": {
+      "windows": {
+        "scenario": "qual_wp1_9_session::loopback_throughput",
+        "metric": "mib_per_s",
+        "op": ">=",
+        "floor": 300,
+        "unit": "MiB/s",
+        "measured": 2731.6639061033216,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp1_9_session::loopback_throughput",
+        "metric": "mib_per_s",
+        "op": ">=",
+        "floor": 300,
+        "unit": "MiB/s",
+        "measured": 4371.824492832497,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "session_slow_does_not_block_fast": {
+      "windows": {
+        "scenario": "qual_wp1_9_session::slow_does_not_block_fast",
+        "metric": "fast_p99_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 0.2018,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp1_9_session::slow_does_not_block_fast",
+        "metric": "fast_p99_ms",
+        "op": "<",
+        "floor": 50,
+        "unit": "ms",
+        "measured": 0.287898,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "shutdown_busy_folder": {
+      "windows": {
+        "scenario": "qual_wp2_1_lifecycle::shutdown_with_busy_folder",
+        "metric": "shutdown_ms",
+        "op": "<=",
+        "floor": 30000,
+        "unit": "ms",
+        "measured": 392.8968,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp2_1_lifecycle::shutdown_with_busy_folder",
+        "metric": "shutdown_ms",
+        "op": "<=",
+        "floor": 30000,
+        "unit": "ms",
+        "measured": 473.34749700000003,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "startup_with_5k_staged": {
+      "windows": {
+        "scenario": "qual_wp2_3_worker::startup_with_5k_staged",
+        "metric": "ready_ms",
+        "op": "<",
+        "floor": 3000,
+        "unit": "ms",
+        "measured": 175.16119999999998,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp2_3_worker::startup_with_5k_staged",
+        "metric": "ready_ms",
+        "op": "<",
+        "floor": 3000,
+        "unit": "ms",
+        "measured": 198.53583999999998,
+        "verdict": "pass",
+        "enforced": true
+      }
+    },
+    "tiny_pending_objects_12k": {
+      "windows": {
+        "scenario": "qual_wp1_8_objects::tiny_pending_objects_12k",
+        "metric": "completed",
+        "op": "==",
+        "floor": 1,
+        "unit": "bool",
+        "measured": 1.0,
+        "verdict": "pass",
+        "enforced": true
+      },
+      "linux": {
+        "scenario": "qual_wp1_8_objects::tiny_pending_objects_12k",
+        "metric": "completed",
+        "op": "==",
+        "floor": 1,
+        "unit": "bool",
+        "measured": 1.0,
+        "verdict": "pass",
+        "enforced": true
+      }
+    }
+  },
+  "qualification": {
+    "windows": {
+      "generated_at": "2026-10-17T05:26:59.6187514-03:00",
+      "git": {
+        "commit": "27802c345618097a0ca2ea3eddaf33d127978860",
+        "branch": "revamp/wp4-int",
+        "dirty": false,
+        "dirty_paths": []
+      },
+      "duration_s": 4190.3,
+      "summary": {
+        "ok": true,
+        "scenarios": 91,
+        "by_status": {
+          "pass": 90,
+          "skipped": 1
+        },
+        "floors_evaluated": 54,
+        "floors_passed": 54,
+        "floors_failed": 0,
+        "floors_missing": 0,
+        "floors_not_run": 0,
+        "floors_incomplete": 0,
+        "enforced_failures": []
+      },
+      "settings": {
+        "budget_s": 2400,
+        "file_timeout_min": 150,
+        "priority": "Normal",
+        "filter": "",
+        "profile": "release",
+        "temp_dir": "F:\\tkfs-qual-tmp\\wp4-int\\",
+        "target_dir": "C:/tkfs-target/wp4-int",
+        "baseline_bin": "C:/tkfs-build/lab/target-baseline/release/tkfs.exe"
+      },
+      "hardware": {
+        "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor          ",
+        "cores": 16,
+        "threads": 32,
+        "memory_gb": 127.7,
+        "os": "Microsoft Windows 11 Pro 10.0.26300",
+        "machine": "FIGLOALDS",
+        "disks": [
+          {
+            "role": "temp",
+            "path": "F:\\tkfs-qual-tmp\\wp4-int\\",
+            "drive": "F:",
+            "free_gb": 117.2,
+            "size_gb": 1788.5,
+            "file_system": "NTFS",
+            "model": "KINGSTON SEDC600M1920G",
+            "media": "SSD",
+            "bus": "SATA"
+          },
+          {
+            "role": "target",
+            "path": "C:/tkfs-target/wp4-int",
+            "drive": "C:",
+            "free_gb": 109.8,
+            "size_gb": 1862.3,
+            "file_system": "NTFS",
+            "model": "Samsung SSD 9100 PRO with Heatsink 2TB",
+            "media": "SSD",
+            "bus": "NVMe"
+          }
+        ]
+      },
+      "load_at_start": {
+        "cpu_load_percent": 0,
+        "build_processes": 1,
+        "tkfs_processes": 2,
+        "qual_processes": 1
+      }
+    },
+    "linux": {
+      "generated_at": "2026-10-17T06:28:27-0300",
+      "git": {
+        "commit": "2e62858ce1bfffb057f4edf160d1021d4f89e978",
+        "branch": "revamp/wp4-int",
+        "dirty": true,
+        "dirty_paths": [
+          "M docs/VALIDATION.md",
+          " M test-evidence/qualification-all-linux.json"
+        ]
+      },
+      "duration_s": 81,
+      "summary": {
+        "ok": true,
+        "scenarios": 92,
+        "by_status": {
+          "pass": 91,
+          "skipped": 1
+        },
+        "floors_evaluated": 54,
+        "floors_passed": 52,
+        "floors_failed": 2,
+        "floors_missing": 0,
+        "floors_not_run": 0,
+        "floors_incomplete": 0,
+        "enforced_failures": []
+      },
+      "settings": {
+        "budget_s": 2400,
+        "file_timeout_min": 150,
+        "filter": "",
+        "profile": "release"
+      },
+      "hardware": {
+        "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor",
+        "threads": 32,
+        "memory_gb": 62.6,
+        "os": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+        "fuse": true,
+        "wsl": true,
+        "disks": [
+          {
+            "role": "temp",
+            "path": "/home/figloalds/tkfs-qual-tmp/wp4-int",
+            "free_gb": 836.7,
+            "size_gb": 1006.9,
+            "device": "/dev/sdd",
+            "file_system": "ext4"
+          },
+          {
+            "role": "target",
+            "path": "/home/figloalds/tkfs-target/wp4-int",
+            "free_gb": 836.7,
+            "size_gb": 1006.9,
+            "device": "/dev/sdd",
+            "file_system": "ext4"
+          }
+        ]
+      },
+      "load_at_start": {
+        "loadavg": "0.18 0.59 1.38 1/476 415",
+        "build_processes": "0"
+      }
+    }
+  },
+  "release_oracles": {
+    "derive_oracle::fuzz_300_seeds_release": {
+      "seeds": "1000-1999 (1,000)",
+      "result": "ok",
+      "counters": {
+        "append": 76214,
+        "verified": 39280,
+        "fallbacks": 44,
+        "checked": 115556,
+        "full": 9,
+        "restricted": 97835
+      },
+      "refusals": 0
+    },
+    "derive_oracle::fuzz_stress_release": {
+      "seeds": "5000-5039 (40)",
+      "result": "ok",
+      "counters": {
+        "append": 7681,
+        "verified": 4220,
+        "fallbacks": 3,
+        "checked": 12586,
+        "full": 310
+      },
+      "refusals": 62,
+      "note": "every refusal also a full-mode refusal; seed 5026 (CCR-WP4.4-5) passes"
+    },
+    "feed_fuzz::feed_fuzz_release": {
+      "seeds": "10000-10999 (1,000)",
+      "result": "ok",
+      "stats": {
+        "backup": 2097,
+        "create": 16225,
+        "create in a directory": 1154,
+        "delete": 3202,
+        "events": 41769,
+        "exchange": 63207,
+        "local refused": 167,
+        "mkdir": 3011,
+        "private": 1201,
+        "rename": 4002,
+        "replicas": 3018,
+        "reply lost": 6026,
+        "request lost": 4722,
+        "restart": 4510,
+        "restore": 2097,
+        "save": 11155,
+        "stale save": 3020
+      },
+      "note": "the first run failed seeds 10023 (evidence from feed_needs, fixed in src/core/sharing.rs) and 10631 (the harness's convergence loop)"
+    },
+    "seal_path::random_workloads_and_crashes_release": {
+      "workloads": "seeds 0-19, both layouts (40)",
+      "result": "ok"
+    },
+    "seal_path::large_projections_resume_exactly_after_crashes": {
+      "result": "ok"
+    },
+    "offlock_commit::prepared_commits_300_seeds_release": {
+      "seeds": 300,
+      "result": "ok"
+    },
+    "meta_scheduler::anti_entropy_at_30_s_keeps_one_session_for_90_s": {
+      "result": "ok"
+    },
+    "built_at": "4f64579 (no src/ change after it)"
+  },
+  "soak": [
+    {
+      "run": "default: own names, 10 % shared, one operation every 1-4 s per side, 120 min",
+      "commit": "9dc5720",
+      "result": "pass",
+      "settle": {
+        "at_ms": 1792238459690,
+        "edit_bytes": [
+          193309675,
+          203559900
+        ],
+        "edit_minutes": 120.05710036666666,
+        "edits": [
+          2415,
+          2474
+        ],
+        "entries": 1626,
+        "final": {
+          "a": {
+            "complete": true,
+            "conflicts": 0,
+            "errors": [],
+            "events": 5630,
+            "inbox": {
+              "blocked": 0,
+              "quarantined": 0,
+              "ready": 0,
+              "retry": 0,
+              "unclassified": 0,
+              "waiting": 0
+            },
+            "missing_bytes": 0,
+            "summary": "Up to date · 1 of 1 peer",
+            "sync": "up_to_date",
+            "unacknowledged": 0
+          },
+          "b": {
+            "complete": true,
+            "conflicts": 0,
+            "errors": [],
+            "events": 5630,
+            "inbox": {
+              "blocked": 0,
+              "quarantined": 0,
+              "ready": 0,
+              "retry": 0,
+              "unclassified": 0,
+              "waiting": 0
+            },
+            "missing_bytes": 0,
+            "summary": "Up to date · 1 of 1 peer",
+            "sync": "up_to_date",
+            "unacknowledged": 0
+          }
+        },
+        "metric": "settle_s",
+        "pause_ms": [
+          1000,
+          4000
+        ],
+        "phases": 180,
+        "proxy_bytes": 494949499,
+        "proxy_connections": 662,
+        "proxy_resets": 178,
+        "refused_edits": [
+          393,
+          375
+        ],
+        "scenario": "qual_wp4_int_soak::soak",
+        "shared_events": 5630,
+        "shared_percent": 10,
+        "unit": "s",
+        "unresolved_conflicts": 0,
+        "value": 0.0128277
+      },
+      "end": {
+        "elapsed_ms": 7255074,
+        "failures": [],
+        "status": "pass"
+      }
+    },
+    {
+      "run": "storm: every operation on the shared pool, one every 50-400 ms per side, 8 min",
+      "commit": "9dc5720",
+      "result": "pass",
+      "settle": {
+        "at_ms": 1792231747300,
+        "edit_bytes": [
+          134667098,
+          141612388
+        ],
+        "edit_minutes": 8.00706228,
+        "edits": [
+          1633,
+          1613
+        ],
+        "entries": 760,
+        "final": {
+          "a": {
+            "complete": true,
+            "conflicts": 236,
+            "errors": [],
+            "events": 3408,
+            "inbox": {
+              "blocked": 0,
+              "quarantined": 0,
+              "ready": 0,
+              "retry": 0,
+              "unclassified": 0,
+              "waiting": 0
+            },
+            "missing_bytes": 0,
+            "summary": "Up to date · 1 of 1 peer",
+            "sync": "up_to_date",
+            "unacknowledged": 0
+          },
+          "b": {
+            "complete": true,
+            "conflicts": 236,
+            "errors": [],
+            "events": 3408,
+            "inbox": {
+              "blocked": 0,
+              "quarantined": 0,
+              "ready": 0,
+              "retry": 0,
+              "unclassified": 0,
+              "waiting": 0
+            },
+            "missing_bytes": 0,
+            "summary": "Up to date · 1 of 1 peer",
+            "sync": "up_to_date",
+            "unacknowledged": 0
+          }
+        },
+        "metric": "settle_s",
+        "pause_ms": [
+          50,
+          400
+        ],
+        "phases": 12,
+        "proxy_bytes": 292725614,
+        "proxy_connections": 51,
+        "proxy_resets": 12,
+        "refused_edits": [
+          213,
+          257
+        ],
+        "scenario": "qual_wp4_int_soak::soak",
+        "shared_events": 3408,
+        "shared_percent": 100,
+        "unit": "s",
+        "unresolved_conflicts": 236,
+        "value": 1.5652840000000001
+      },
+      "end": {
+        "elapsed_ms": 500104,
+        "failures": [],
+        "status": "pass"
+      }
+    },
+    {
+      "run": "storm: the same, 20 min",
+      "commit": "9dc5720",
+      "result": "pass",
+      "settle": {
+        "at_ms": 1792233087830,
+        "edit_bytes": [
+          292959434,
+          280330830
+        ],
+        "edit_minutes": 20.012991866666667,
+        "edits": [
+          3662,
+          3637
+        ],
+        "entries": 1088,
+        "final": {
+          "a": {
+            "complete": true,
+            "conflicts": 1300,
+            "errors": [],
+            "events": 7082,
+            "inbox": {
+              "blocked": 0,
+              "quarantined": 0,
+              "ready": 0,
+              "retry": 0,
+              "unclassified": 0,
+              "waiting": 0
+            },
+            "missing_bytes": 0,
+            "summary": "Up to date · 1 of 1 peer",
+            "sync": "up_to_date",
+            "unacknowledged": 0
+          },
+          "b": {
+            "complete": true,
+            "conflicts": 1300,
+            "errors": [],
+            "events": 7082,
+            "inbox": {
+              "blocked": 0,
+              "quarantined": 0,
+              "ready": 0,
+              "retry": 0,
+              "unclassified": 0,
+              "waiting": 0
+            },
+            "missing_bytes": 0,
+            "summary": "Up to date · 1 of 1 peer",
+            "sync": "up_to_date",
+            "unacknowledged": 0
+          }
+        },
+        "metric": "settle_s",
+        "pause_ms": [
+          50,
+          400
+        ],
+        "phases": 31,
+        "proxy_bytes": 616033533,
+        "proxy_connections": 129,
+        "proxy_resets": 36,
+        "refused_edits": [
+          463,
+          502
+        ],
+        "scenario": "qual_wp4_int_soak::soak",
+        "shared_events": 7082,
+        "shared_percent": 100,
+        "unit": "s",
+        "unresolved_conflicts": 1300,
+        "value": 1.5747252
+      },
+      "end": {
+        "elapsed_ms": 1287654,
+        "failures": [],
+        "status": "pass"
+      }
+    },
+    {
+      "run": "storm: every operation on the shared pool, one every 50-400 ms per side, 120 min",
+      "commit": "4f64579",
+      "outcome": "did not converge within the 30 min settle",
+      "final": {
+        "a": {
+          "events": 8973,
+          "unresolved_conflicts": 9399,
+          "waiting": 1549,
+          "unacknowledged": 2618
+        },
+        "b": {
+          "events": 7905,
+          "unresolved_conflicts": 5861,
+          "waiting": 2617,
+          "unacknowledged": 1550
+        }
+      },
+      "notes": "one event's off-lock prepare went stale four times in 15 min and was then committed inline; the oracle check of the stopped stores had not finished after 3 h and the run was stopped (CCR-WP4.INT-3)"
+    },
+    {
+      "run": "fast editing: own names, 10 % shared, one operation every 50-400 ms per side, 120 min planned",
+      "commit": "2a7d96b",
+      "outcome": "stopped after 91 min, activation falling behind",
+      "samples": [
+        {
+          "minute": 30,
+          "events": [
+            10329,
+            10372
+          ],
+          "waiting": [
+            146,
+            125
+          ],
+          "unresolved_conflicts": [
+            15,
+            16
+          ]
+        },
+        {
+          "minute": 60,
+          "events": [
+            16634,
+            16506
+          ],
+          "waiting": [
+            484,
+            614
+          ],
+          "unresolved_conflicts": [
+            46,
+            46
+          ]
+        },
+        {
+          "minute": 80,
+          "events": [
+            20005,
+            19847
+          ],
+          "waiting": [
+            902,
+            1068
+          ],
+          "unresolved_conflicts": [
+            85,
+            74
+          ]
+        },
+        {
+          "minute": 91,
+          "events": [
+            21552,
+            21452
+          ],
+          "waiting": [
+            1501,
+            1600
+          ],
+          "unresolved_conflicts": [
+            100,
+            107
+          ],
+          "stale": [
+            2420,
+            2504
+          ]
+        }
+      ]
+    }
+  ],
+  "full_suite": {
+    "windows": {
+      "command": "suite-lock.ps1 cargo test --all-targets --no-fail-fast",
+      "commit": "9dc5720",
+      "binaries": 72,
+      "passed": 1062,
+      "failed": 0,
+      "ignored": 123,
+      "exit": 0
+    },
+    "wsl_subset": {
+      "commit": "9dc5720",
+      "binaries": 19,
+      "passed": 534,
+      "failed": 1,
+      "ignored": 23,
+      "failed_tests": [
+        "objects_v3_lanes::a_saturating_push_does_not_delay_pulls_on_a_slow_uplink (12.8 s against 12 s under load; passes alone 3/3; known since WP3.INT)"
+      ]
+    },
+    "wsl_check": "cargo check --all-targets: ok"
+  },
+  "upgrade_from_6298d0b": {
+    "qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync": "pass",
+    "qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides": "pass (TKFS_BASELINE_BIN = the lab's 6298d0b release build)",
+    "qual_wp3_1_transport::v2_peer_fails_closed": "pass",
+    "qual_wp3_int_e2e::v2_peer_fails_closed": "pass",
+    "suite": "catalog_actor (6298d0b catalog upgrade and downgrade) and harness_selftest (legacy fixtures): pass"
+  },
+  "two_machine_lab": {
+    "files": "test-evidence/lab/",
+    "builds": "6298d0b against e8c2979 (the Wave 4 base)",
+    "headline": {
+      "S1 all paths and hashes visible (s after receive)": {
+        "baseline_small": 161.6,
+        "revamp_small": 2.0,
+        "baseline_full": "not reached in 30 min",
+        "revamp_full": 6.8
+      },
+      "S1 all content (s after receive)": {
+        "baseline_small": 188.5,
+        "revamp_small": 75.3,
+        "baseline_full": "478 of 2,001 files at 30 min",
+        "revamp_full": 84.2
+      },
+      "S2 two-way convergence (s)": {
+        "baseline_small": 1031.6,
+        "revamp_small": 52.5,
+        "baseline_full": "not reached",
+        "revamp_full": 120.8
+      },
+      "S3 restore to complete (s)": {
+        "baseline_small": 215.3,
+        "revamp_small": 152.0,
+        "baseline_full": "transfer never started",
+        "revamp_full": 156.4
+      }
+    },
+    "findings": [
+      "after a 45 s outage the transfer resumed about 50 s after the lanes reconnected (lease lapse plus stall backoff in the base; WP4.5 releases a lost round's leases; not re-measured)",
+      "a mounted read of a 512 MiB file still downloading failed after 15 s (CCR-WP4.INT-2)"
+    ]
+  },
+  "preliminary_windows_run": {
+    "commit": "d73d0ae (later files on 4f64579's library)",
+    "conditions": "25 release fuzz and crash processes running beside it",
+    "summary": "49 of 54 floors; missed fs_p99_during_catchup 74.3 ms, objects_worker_256mib 23.0 MiB/s, objects_worker_tiny_10k 28.1/s, e2e_tiny_files_10k 263.5/s, e2e_catch_up_10k 71.6 s; not the evidence"
+  }
+}

@@ -92,7 +92,30 @@ does that after review (§13 rule 6, rule 8 item 7).
    is 4: `objects_v3_lanes::two_stalled_pushes_leave_a_third_repository_its_turn`
    caught two stalled pushes holding both repository turns (`d3eae4c`).
 
-TBD-RESULTS
+9. **Test races found while qualifying** (the property each test checks is
+   unchanged): `qual_wp1_9_session::dead_peer_detection` let the server's
+   own dead timer close the link at the moment the client's fired, so the
+   client read the reset as `CONNECTION_LOST` (the server now declares the
+   link dead three times later; `2e62858`);
+   `objects_v3_lanes::an_object_of_unknown_size_pushed_in_part_is_handed_on`
+   waited 10 s for four want calls, which the 5 s idle recheck can exceed
+   (30 s; `860c6f7`).
+
+10. **The soak's limit** (CCR-WP4.INT-3): the default two-hour soak passes,
+    and so do conflict storms of 8 and 20 minutes (up to 1,300 unresolved
+    conflicts); a two-hour storm (9,399 unresolved conflicts) and fast
+    two-way editing (an operation every 50–400 ms per side) did not keep up,
+    because a conflicting remote event's full replay grows with the history
+    and the open conflicts.
+
+**Results.** Full suite: 72 binaries, 1,062 passed, 0 failed, 123 ignored.
+`qualify.ps1 -All`: 91 scenarios (90 passed, 1 skipped), **54 of 54
+floors**. `qualify.sh --all`: 92 scenarios (91 passed, 1 skipped), every
+enforced floor (52 of 54; the two misses are Windows-only floors). Release
+oracles: `derive_oracle` 1,000 seeds and 40 stress seeds, the feed fuzz
+1,000 seeds, 40 seal-path crash workloads: all pass. Soak: pass (default
+workload). Upgrade from 6298d0b: pass. `qualification-final.json`: every
+§15.1 row holds on Windows.
 
 ## CCRs
 
@@ -164,22 +187,34 @@ path, large-projection crash coverage, `59a224e`), WP4.5 (Summary 8).
   gate* documents it.
 
 - **CCR-WP4.INT-3** (`src/core/commit.rs`, `src/core/derive.rs`,
-  `src/worker/activator.rs`; performance): in a history with thousands of
-  unresolved conflicts, each conflict-producing remote event falls back to a
-  full replay (off-lock prepare, then commit), whose cost grows with the
-  history and the conflicts: in the first soak run (*Qualification*, every
-  edit of both sides on one shared name pool for two hours: 8,973 events and
-  9,399 unresolved conflicts on one side) one event's prepare took minutes
-  and went stale four times in 15 min before it was committed inline, a
-  full rebuild of that store (a copy) had not finished after 20 min, and
-  activation fell behind for good (1,549 and 2,617 events waiting after the
-  30 min settle). Requested: keep the slow path's cost proportional to the
-  touched cones when the append precondition fails for cones the event does
-  not touch, or prepare one replay for several queued slow events, and do
-  not throw a prepared replay away when the branch moved only by fast
-  commits of unrelated entities (1,171 stale outcomes in that run). Adapter:
-  none; the soak's default workload keeps conflicts occasional (deviation 2)
-  and README / VALIDATION describe the limit.
+  `src/worker/activator.rs`; performance, the release's main open limit):
+  while a branch has unresolved conflicts, remote creations and namespace
+  changes take the slow path, and a slow event whose append-mode
+  precondition fails is a full replay (off-lock prepare, then commit), whose
+  cost grows with the history and steeply with the unresolved conflicts. The
+  soak measured it (*Qualification*, *Soak*): with every edit of both sides
+  on one shared name pool, the stores were exact and converged at 3,408
+  events / 236 conflicts (8 min) and 7,082 / 1,300 (20 min, oracle check
+  about a minute), but after two hours (8,973 events, 9,399 conflicts) one
+  event's prepare took minutes and went stale four times in 15 min, 1,549
+  and 2,617 events were still waiting after the 30 min settle, and the
+  oracle check of the stopped stores had not finished after 3 h. With 10 %
+  of the edits shared but one every 50–400 ms per side, activation fell
+  behind too (21.5K events and about 100 conflicts per side after 91 min,
+  the backlog growing from 140 to 1.5K events), while continuous local
+  writes made most prepared replays go stale (2,420 stale outcomes).
+  Requested: keep the slow path's cost proportional to the touched cones
+  when the append precondition fails for cones the event does not touch (or
+  let remote namespace changes that touch no conflicted entity keep the fast
+  path while unrelated conflicts are open), prepare one replay for several
+  queued slow events, and do not discard a prepared replay when the branch
+  moved only by commits of unrelated entities. A full rebuild (startup after
+  a damaged snapshot, a downgrade, the oracle) has the same cost: a store
+  with thousands of unresolved conflicts can take hours to open that way.
+  Adapter: none; README (*Filesystem behaviour*) asks to keep unresolved
+  conflicts few, VALIDATION (*Soak*) records the limit, and the soak's
+  default workload edits one operation every 1–4 s per side with 10 %
+  shared (deviation 2).
 
 ## Deviations from the spec, and why
 
@@ -196,9 +231,16 @@ path, large-projection crash coverage, `59a224e`), WP4.5 (Summary 8).
 2. **The soak is a release test** (`tests/qual_wp4_int_soak.rs`, ignored),
    run on its own and not by `qualify.ps1 -All`: its 2-hour edit phase plus
    up to 30 min of settling exceeds `-All`'s per-file budget and would double
-   the run. It writes the same `QUAL` records (its evidence is in
-   `qualification-final.json`). `TKFS_SOAK_MINUTES` (default 120) and
-   `TKFS_SOAK_SETTLE_MINUTES` (default 30) shorten it for dry runs.
+   the run. Its workload was changed twice after runs that did not converge
+   (*Qualification*, *Soak*): the first edited only a shared name pool (a
+   conflict storm), the second edited one operation every 50–400 ms per
+   side; the default is now names of each side's own with 10 % shared, one
+   operation every 1–4 s per side (`TKFS_SOAK_SHARED_PERCENT`,
+   `TKFS_SOAK_PAUSE_MS_MIN` / `_MAX`; `TKFS_SOAK_MINUTES` and
+   `TKFS_SOAK_SETTLE_MINUTES` shorten it). The plan's criteria ("equal feeds,
+   empty oracle on both, no stalled or blocked state") are unchanged; what
+   the faster workloads showed is CCR-WP4.INT-3, not hidden: it is in the
+   README, VALIDATION and *Known limitations*.
 3. **The upgrade checks** are the existing scenarios
    (`qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync` from the 6298d0b
    data directory, `qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides`
@@ -233,6 +275,8 @@ path, large-projection crash coverage, `59a224e`), WP4.5 (Summary 8).
 | `logging::diagnostics_bundles_have_every_part_and_no_secret` | requires the installed log | CCR-WP4.2-1 (every daemon has one now) |
 | `folder_controller` (2 tests) | the fake worker's summary probe moved from its `label` to its one branch; a running entry's label is the record's | CCR-WP4.3-2: the controller publishes the catalog label, so the label no longer names the summary the entry came from |
 | `docs_cli` help-parser self-test | gains an optional-value option | the checker's new `Maybe` kind |
+| `objects_v3_lanes::an_object_of_unknown_size_pushed_in_part_is_handed_on` | the wait for four want calls 10 s → 30 s | since CCR-WP4.2-5 an upload round whose wants reply is empty waits `OBJECTS_IDLE_INTERVAL` (5 s); the four calls still have to happen (Summary 9) |
+| `qual_wp1_9_session::dead_peer_detection` | the server's `dead_after` is three times the client's (its assertions unchanged) | the server's own timer closed the link as the client's fired, so the client read `CONNECTION_LOST` (Summary 9) |
 
 ## Tests added
 
@@ -269,11 +313,138 @@ path, large-projection crash coverage, `59a224e`), WP4.5 (Summary 8).
 
 ## VERIFY
 
-TBD-VERIFY
+Run in `C:/Users/felyp/Desktop/Projetos/Telekinesis-wt/wp4-int`,
+`CARGO_TARGET_DIR=C:/tkfs-target/wp4-int` (Windows 11), on the final code.
+
+| Command | Result |
+|---|---|
+| `cargo fmt --check` | clean (exit 0) |
+| `cargo build --all-targets` | ok (exit 0) |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `powershell -NoProfile -File C:/tkfs-build/suite-lock.ps1 cargo test --all-targets --no-fail-fast` (at `9dc5720`; later commits change docs, notes and evidence only) | **ok, exit 0: 72 test binaries, 1,062 passed, 0 failed, 123 ignored** (WP4.3's base: 972 passed, 104 ignored). An earlier run at `860c6f7`: the same counts, exit 0 |
+| WSL: `cargo check --all-targets` (`CARGO_TARGET_DIR=$HOME/tkfs-target/wp4-int`) | ok (exit 0) |
+| WSL: `cargo test --no-fail-fast` for `orchestrator`, `session_core`, `session_handshake`, `worker_lifecycle`, `mount_lifecycle`, `security`, `logging`, `feed_v7`, `feed_fuzz`, `seal_path`, `objects_v3_worker`, `objects_v3_lanes`, `derive_oracle`, `activation_inbox`, `status_hub`, `availability_index`, `docs_cli`, `inbound_v3`, `peer_supervisor` (at `9dc5720`) | 19 binaries: **534 passed, 1 failed, 23 ignored**; the failure is `objects_v3_lanes::a_saturating_push_does_not_delay_pulls_on_a_slow_uplink` (12.8 s against its 12 s bound with the whole binary running on a loaded host; 3 of 3 alone pass; *Known limitations*). The first subset run (at `4f64579`) failed `objects_v3_lanes::an_object_of_unknown_size_pushed_in_part_is_handed_on` once, a wait that the 5 s idle recheck could exceed: fixed (`860c6f7`), then 6 of 6 alone and the binary (48 passed) |
+
+Per binary (Windows): `security` 21, `logging` 20, `feed_v7` 45,
+`feed_fuzz` 2 + 1 ignored, `derive_oracle` 12 + 2 ignored, `seal_path` 18 + 2
+ignored, `activation_inbox` 22, `availability_index` 22, `status_hub` 97,
+`gui_model` 45, `management_api` 28, `folder_controller` 57, `docs_cli` 5,
+`contracts` 40, `objects_v3_worker` 41, `objects_v3_lanes` 48 + 18 ignored,
+`w3_integration` 10, `peer_supervisor` 25, `orchestrator` 18,
+`qual_wp4_int_soak` 0 + 1 ignored.
 
 ## Qualification
 
-TBD-QUAL
+All on the final code (no `src/` change after `4f64579`; later commits
+change tests' timing, the soak's workload, docs and evidence).
+
+### `qualify.ps1 -All` (Windows): `test-evidence/qualification-all.json`
+
+`TMP`/`TEMP` on `F:` (SATA SSD, as WP4.2's run), `-Priority Normal`,
+`TKFS_BASELINE_BIN` = the lab's 6298d0b release build, at `27802c3` with a
+clean tree, 4,190 s. **`summary.ok`: true: 91 scenarios, 90 passed, 1
+skipped (`sigterm_matches_shutdown`: no SIGTERM on Windows); 54 of 54
+floors held**, every Wave 1–4 floor and the four `qual_wp4_4_seal` floors
+included. The measurements are in `docs/VALIDATION.md` (*Floors*) and, as
+the §15 before/after table, in `qualification-final.json`. Highlights
+against WP4.2's `-All` (which missed the idle-CPU floor at 18.85 %): idle
+worker CPU 0.52 %; tiny files 771 / 770 files/s and tiny objects 907/s
+(floor 300); the 10K catch-up 10.8 s; the 150K catch-up's seals 72× smaller
+than WP3.INT's with the longest seal 8.6 ms.
+
+A preliminary `-All` run at `d73d0ae` (before the feed fix; its later files
+ran on `4f64579`'s library, rebuilt in the same target meanwhile), made
+while 25 release fuzz and crash processes ran beside it, missed five
+fsync- and latency-bound floors (`fs_p99_during_catchup` 74 ms,
+`objects_worker_256mib` 23 MiB/s, `objects_worker_tiny_10k` 28/s,
+`e2e_tiny_files_10k` 264/s, `e2e_catch_up_10k` 72 s) and passed the other
+49, the idle-CPU floor included (0.47 %); it is not the evidence.
+
+### `qualify.sh --all` (WSL): `test-evidence/qualification-all-linux.json`
+
+`TMPDIR` and the target on the WSL image's ext4 (disk-backed, 837 GB free),
+at `2a7d96b` with a clean tree, 3,223 s; `qual_wp1_9_session` re-run at
+`2e62858` with `--merge` after its race fix (the first run failed
+`dead_peer_detection` once: the server's own dead timer closed the link at
+the same moment, so the client read the reset as `CONNECTION_LOST`; 1 run in
+4 alone). **`summary.ok`: true: 92 scenarios, 91 passed, 1 skipped (the
+6298d0b upgrade: no Linux baseline binary); 52 of 54 floors held, every
+enforced one**; the two misses are the Windows-only tiny-file floors (219
+and 196 files/s on ext4), recorded and not enforced. WP4.2's Linux run
+had failed the idle-CPU floor (18.3 %) and `inbound_status`; here 0.37 % and
+pass.
+
+### Release oracles and crash workloads (`CARGO_TARGET_DIR=C:/tkfs-target/wp4-int/rel2`, `4f64579`)
+
+| Run | Seeds / workloads | Result |
+|---|---|---|
+| `derive_oracle::fuzz_300_seeds_release`, `TKFS_DERIVE_SEEDS=100` × 10 shards from 1000 | **1,000 seeds** (1000–1999), 100–180 steps | **ok**, every shard (37–52 min each, run in parallel): 76,214 append-mode commits, 39,280 verified (append and full compared), 44 fallbacks, 115,556 slow-path commits checked, 0 refusals |
+| `derive_oracle::fuzz_stress_release`, 4 shards × 10 from 5000 | **40 seeds** (5000–5039), four rarely syncing replicas, 200–320 steps | **ok** (167–2,149 s per seed), 62 namespace-budget refusals, each one a full-mode refusal too; seed 5026, which failed WP4.4's run (CCR-WP4.4-5), passes |
+| `feed_fuzz::feed_fuzz_release`, 4 shards × 250 from 10000 | **1,000 seeds** (10000–10999), 100–200 steps, 2–4 replicas | **ok** after the fixes (the first run failed seed 10023, the evidence defect of Summary 5, and seed 10631, the harness's convergence loop stopping after a round that only re-synchronized cursors): 41,769 events, 63,207 exchanges, 6,026 lost replies, 4,722 lost requests, 4,510 restarts, 2,097 restores, 1,201 private branches; convergence, acks and per-id evidence on every route |
+| `seal_path::random_workloads_and_crashes_release`, 4 shards × 5 seeds | **40 workloads** (seeds 0–19 in both layouts) | **ok** |
+| `seal_path::large_projections_resume_exactly_after_crashes` | 14 crashes above `FOLD_MAX_ENTRIES` | **ok** |
+| `offlock_commit::prepared_commits_300_seeds_release` | 300 seeds | **ok** |
+| `meta_scheduler::anti_entropy_at_30_s_keeps_one_session_for_90_s` | — | **ok** |
+
+### Objects v3 lane scenarios (`objects_v3_lanes -- --ignored`, release, `9dc5720`)
+
+WP3.3's and WP4.5's measurement scenarios with `PEER_CALLS` = 4 and 4
+exchange slots per bulk session (CCR-WP4.5-2): **18 passed** (the two that
+need a remote server skip themselves). Both directions at once through
+50 ms / 20 MiB/s: download 0.967 and upload 0.773 of the link (WP4.5
+measured 0.97 / 0.775 with its scratch copy of the change); a control-lane
+ping p99 under a saturated bulk lane 52.6 ms (< 100 ms; idle 51.4 ms), the
+saturated session's own p99 140 ms (< 200 ms); 1 GiB through 50 ms /
+20 MiB/s at 0.974 of the link, through 50 ms / 100 Mbit/s at 0.986; tiny
+files on loopback 605/s (disk spools), session throughput 2.8 GiB/s down,
+2.6 GiB/s up.
+
+### Soak (`tests/qual_wp4_int_soak.rs`)
+
+Five runs, all on the final code (release; `rel2` / `rel3` targets of this
+worktree). The criteria are the plan's: equal feeds (journals) and
+projections, all content, nothing staged, every event acknowledged, both
+oracles empty, neither folder stalled, blocked or needing attention.
+
+| Run | Workload | Result |
+|---|---|---|
+| **default, 2 h** (`9dc5720`, the evidence) | own names, 10 % on the shared pool, an operation every 1–4 s per side | **pass** (7,257 s): 4,889 edits, 180 fault phases, 178 proxy resets, 662 connections; 159 of 240 per-minute samples `up_to_date`, the rest the fault in progress; settled in 0.01 s after the edits; 5,630 shared events on each side, equal journals and projections, oracles empty |
+| storm, 8 min (`9dc5720`) | every operation on the shared pool, one every 50–400 ms per side, settle 1 min | **pass**: 3,408 events, 236 unresolved conflicts, settled in 1.6 s |
+| storm, 20 min (`9dc5720`) | the same, settle 5 min | **pass**: 7,082 events, 1,300 unresolved conflicts, settled in 1.6 s, the oracle check about a minute |
+| storm, 2 h (`4f64579`, the first run) | the same | **fail**: did not converge in the 30 min settle (1,549 and 2,617 events waiting; 8,973 / 7,905 events, 9,399 / 5,861 unresolved conflicts); the final oracle check had not finished after 3 h and the run was stopped |
+| fast editing (`2a7d96b`, the second run) | own names, 10 % shared, an operation every 50–400 ms per side | stopped after 91 min: activation falling behind (21.5K events and 100–107 unresolved conflicts per side; 140 events waiting at 30 min, 485–615 at 60, 900–1,070 at 80, 1,500–1,600 at 91; 2,420 / 2,504 stale prepared replays) |
+
+The two failures are CCR-WP4.INT-3 (a throughput limit of conflict
+derivation, not a correctness one: every oracle that finished was empty,
+and the stores of the passing storm runs converged exactly). The default
+workload is the deviation-2 change; VALIDATION (*Soak*) and the README
+state the limit.
+
+### Upgrade from 6298d0b
+
+In the `-All` run: `qual_wp3_int_e2e::legacy_fixture_upgrade_then_sync`
+(the 6298d0b data directory fixture opens in place, its folder syncs to a
+new host and back) **pass**;
+`qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides`
+(two 6298d0b daemons paired both ways, one upgraded in place: both sides
+fail closed with `PEER_NEEDS_UPGRADE`) **pass**; `v2_peer_fails_closed`
+(both files) **pass**. In the suite: `catalog_actor`'s 6298d0b catalog
+upgrade and downgrade tests and `harness_selftest`'s legacy fixture tests
+**pass**.
+
+### Two-machine lab
+
+`test-evidence/lab/` (11 files), summarized in `docs/VALIDATION.md`
+(*Two-machine lab*): the coordinator's run of 6298d0b against the Wave 4
+base (`e8c2979`). Against the previous release: all paths and hashes
+visible 2.0 s / 6.8 s after `receive` (161.6 s / not reached in 30 min),
+all content at the tunnel's ceiling, two-way edits converged in 52.5 s /
+120.8 s (1,031.6 s / not reached), no worker `status` call answered busy or
+stale (63 of 95 / 454 of 892). Two findings: the resume after a 45 s
+outage waited about 50 s after the lanes reconnected (the base's lease
+lapse plus stall backoff; WP4.5's release of a lost round's leases removes
+it, not re-measured), and the mounted read of a 512 MiB file still
+downloading failed after 15 s (CCR-WP4.INT-2).
 
 ## Docs
 
@@ -311,7 +482,7 @@ code (`586296a`, `d73d0ae`, `c26ac0d`, `4f64579` and this commit):
 | WP4.2 operations | approved | `4a2f264` | — | `-All` / `qualify.sh` green: now met (*Qualification*); `qualify.sh` pass-on-failed-scenario, `RotatingFile::reopen`, the inherited handle: fixed; the notes' settle statement: corrected here (deviation 4) |
 | WP4.3 docs | approved | `ca8a887` | — | `docs_cli` value checks, README state order and `revoked` row, `catalog.list` on probe sessions: fixed; CCR-WP4.3-2: applied |
 | WP4.4 seal path | approved | `e362eee` | — | `journal_branch` setup atomicity, staging cache on a failed `BEGIN`, large-projection crash coverage: fixed; CCR-WP4.4-5: fixed; CCR-WP4.4-1: open (performance) |
-| WP4.5 objects cleanup | approved | `d8c392f` | — | more than 256 objects in backoff (`hold_ms`), the saturated-session latency check, the loopback send-buffer test, mixed-version adoption (warned once), the acceptor's leases on a failed want: fixed; the Wave 3 tiny-files floors: TBD-TINY |
+| WP4.5 objects cleanup | approved | `d8c392f` | — | more than 256 objects in backoff (`hold_ms`), the saturated-session latency check, the loopback send-buffer test, mixed-version adoption (warned once), the acceptor's leases on a failed want: fixed; the Wave 3 tiny-files floors: **hold** in the final `-All` (771 / 770 files/s, 907 objects/s, scenario data on `F:`) |
 
 ## Known limitations
 
@@ -344,8 +515,59 @@ code (`586296a`, `d73d0ae`, `c26ac0d`, `4f64579` and this commit):
 - **Timing floors on a shared machine**: the evidence records the load at
   the start of each run; the fsync-bound floors depend on the disk of the
   temporary directory (recorded too).
-TBD-LIMITS2
+- **Concurrent two-way editing with unresolved conflicts** (CCR-WP4.INT-3):
+  activation falls behind a peer that keeps writing fast (an operation
+  every 50–400 ms per side) or once thousands of conflicts are unresolved;
+  the soak passes at one operation every 1–4 s per side with 10 % shared
+  names, and its storm runs pass up to about 1,300 unresolved conflicts. A
+  full rebuild of a store with thousands of unresolved conflicts takes hours.
+- **`objects_v3_lanes::a_saturating_push_does_not_delay_pulls_on_a_slow_uplink`
+  in WSL** goes over its 12 s bound when its binary runs all its tests at
+  once on a loaded host (12.8 s in the final subset run; 3 of 3 alone pass),
+  as WP4.5 and WP3.INT recorded; it passes on Windows. The Linux socket path
+  is unchanged in Wave 4.
+- **The fsync-bound floors depend on the disk**: the final `-All` kept
+  scenario data on the SATA SSD (`F:`), as WP4.2's did; on the NVMe system
+  disk they measured 310–315/s at Wave 3 and below 300/s in WP4.5's runs
+  while that disk was full.
 
 ## Commits
 
-TBD-COMMITS
+On `revamp/wp4-int` (first parent; every message starts `WP4.INT: `):
+
+| Commit | Subject |
+|---|---|
+| `4a2f264` | merge WP4.2 (operations: logs, diagnostics, qualification floors) |
+| `783314f` | merge WP4.1 (security: per-peer credentials, revocation, local tokens) |
+| `e362eee` | merge WP4.4 (seal path and inbox staging cost) |
+| `d8c392f` | merge WP4.5 (objects v3 cleanup and tuning) |
+| `ca8a887` | merge WP4.3 (documentation) |
+| `e52c3f7` | WP4.1 blocker - peer.enroll checks the verifier generation in the catalog transaction |
+| `5992236` | CCR-WP4.1-3 - the control server requires the daemon's token itself |
+| `e905cdf` | CCR-WP4.2-1 every daemon installs its log; CCR-WP4.1-4 owner-only worker.log |
+| `b9debf9` | CCR-WP4.4-5 - a concurrent content successor on a tombstoned entity counts its cuts |
+| `59a224e` | WP4.4 review minors and WP4.1 unpair minor |
+| `d3eae4c` | CCR-WP4.5-2 - four exchange slots per bulk session, PEER_CALLS 4 |
+| `bd509fa` | CCR-WP4.5-1 - interim objects.exchange docs and bounds removed |
+| `56f631f` | qualification wiring - CCR-WP4.4-4, CCR-WP4.2-6, qualify.sh file status |
+| `19805ca` | CCR-WP4.2-5 - an idle worker does no O(objects) work per sync interval |
+| `93be9fc` | CCR-WP3.1-3 Scope::Endpoint, CCR-WP4.3-1, feed fuzz and soak scenarios |
+| `fd921b8` | CCR-WP4.1-2, -5, -8 - peer ops registered, worker_call token, redacted Debug |
+| `9f22963` | CCR-WP3.4-1 - the hub keeps the controller's mount over older heartbeats |
+| `c80b998` | WP4.5 review minors; CCR-WP4.1-10 and -13 test margins |
+| `92c93ce` | CCR-WP4.2-2 activation.retried counts slice retries; a cleared log directory is made again |
+| `e1d06aa` | docs_cli refuses an option without its value (the WP4.3 review's minor) |
+| `9c6ad45` | docs_cli help parser self-test reads an optional value |
+| `d73d0ae` | CCR-WP4.3-2 - a running folder is published with its catalog label |
+| `586296a` | docs and plan reconciled with the merged wave 4 |
+| `7f0b33d` | a replaced standard handle is not inherited while its switch settles |
+| `c26ac0d` | two-machine lab results in test-evidence/lab, summarized in VALIDATION |
+| `4f64579` | an entry listed while we lacked its event becomes evidence once we hold it |
+| `860c6f7` | objects_v3_lanes hand-on test waits for the idle recheck |
+| `f9c22d8` | the soak's editors mostly edit names of their own |
+| `27802c3` | notes (draft; results follow with the final runs) |
+| `2a7d96b` | final Windows qualification (qualify.ps1 -All): 54 of 54 floors |
+| `2e62858` | dead_peer_detection - the server declares the link dead later than the client |
+| `5dabe00` | Linux qualification (qualify.sh --all, WSL): every enforced floor |
+| `9dc5720` | the soak's edit rate is configurable, one operation every 1-4 s by default |
+| (this commit) | notes, `qualification-final.json`, VALIDATION's soak results |
