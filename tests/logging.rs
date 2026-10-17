@@ -887,7 +887,8 @@ fn events_in(path: &Path) -> Vec<Value> {
 /// streams into the log once the capture settles. Before WP4.2 fix round 2
 /// they kept the replaced log-file handle, which the capture closed 2 s
 /// later: C output then failed, or went into whichever file reused the handle
-/// value. The descriptors' new handles are not inheritable.
+/// value. The descriptors' new handles are not inheritable, and neither are
+/// the replaced ones while they wait for the settle (WP4.INT).
 #[cfg(windows)]
 #[test]
 fn c_runtime_writes_follow_the_captured_streams() {
@@ -958,6 +959,18 @@ fn crt_child() {
     )
     .unwrap();
     assert!(installed.captured_stdout && installed.captured_stderr);
+    // Before the switch settles the descriptors still hold the replaced log
+    // handles, which a child spawned now must not inherit (WP4.INT).
+    assert_eq!(
+        crt::inheritable(1),
+        Some(false),
+        "the replaced stdout handle"
+    );
+    assert_eq!(
+        crt::inheritable(2),
+        Some(false),
+        "the replaced stderr handle"
+    );
     let captured = |code: &str, prefix: &str| {
         events_in(&path)
             .iter()
