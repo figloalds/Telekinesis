@@ -17,6 +17,14 @@
 //! to the controller, and callback failures go to the mount-scoped error
 //! counter and log.
 //!
+//! WP5.2: reads, writes, fsyncs and size changes run on threads of their own
+//! and do the work that needs no engine lock first (content waits, the
+//! writable copy of a large file, a save's hashing and copying); a flush
+//! queues the save of the closed file for a background saver; a release, an
+//! unlink, an rmdir and a rename settle the entry first
+//! (`runtime::engine::settle_entity`). A read of content that cannot arrive
+//! answers `EIO` (it answered `EAGAIN`, CCR-WP4.INT-2).
+//!
 //! `MOUNT` is the transition lock: [`bind`], [`attach`], [`detach`] and
 //! [`checkout`] hold it across their mount I/O (so they wait for each other);
 //! a callback, [`attached`], [`serves`] and [`inflight`] never take it, so

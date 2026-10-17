@@ -12,6 +12,16 @@
 //! [`checkout`] hold it across their mount I/O (so they wait for each other);
 //! a callback, [`attached`], [`serves`] and [`inflight`] never take it, and
 //! [`notify`] only tries it, so readers never wait for a transition.
+//!
+//! WP5.2: a callback does the work that needs no engine lock first (waiting
+//! for content that is downloading, the writable copy of a large file, the
+//! hashing and copying of a save; `runtime::engine`, *Saves off the engine
+//! lock*), and takes the engine only for its own short phases. A cleanup
+//! queues the save of a closed file for a background saver and returns; a
+//! flush, a rename and a delete-on-close wait for the save. A read of content
+//! that cannot arrive answers `STATUS_DEVICE_NOT_READY` (programs report "the
+//! device is not ready"); `STATUS_FILE_IS_OFFLINE` read as "invalid argument"
+//! (CCR-WP4.INT-2). At most half of the dispatcher threads wait for content.
 use crate::{
     core::*,
     model::ipc::timing::DETACH_DRAIN,

@@ -47,6 +47,40 @@
 //!   (`ACCESS_DENIED`) until that branch is checked out, which restores the
 //!   record, or the record is discarded. It is not retried while its branch
 //!   is not active; a checkout makes every unrestored record due at once.
+//!
+//! **Saves off the engine lock (WP5.2, CCR-WP4.INT-5).** A save has three
+//! phases:
+//! 1. [`Engine::begin_save`], under the lock: snapshots the session's bytes
+//!    (a copy of in-memory bytes, at most 256 KiB, or a second handle to its
+//!    staging file) and marks it `saving`;
+//! 2. [`store_snapshot`], without the lock: hashes the bytes, writes them to
+//!    `objects/<id>.part`, `fsync`s it and installs it under its hash with a
+//!    write-through rename (invariant 1), or verifies the copy already there;
+//! 3. [`Engine::finish_save`], under the lock: commits the object as the
+//!    session's content with the bases of the snapshot (the base check: the
+//!    branch, the generation and the session's bases are those of the
+//!    snapshot; saves of one entity never overlap), together with the
+//!    removal (or the rebase) of a `pending_saves` record of it.
+//!
+//! While a save reads a staging file nothing writes it: writers wait for the
+//! save without the lock ([`lock_for_write`]), and an unsynchronized
+//! [`Engine::write`] is refused (`BUSY_VIEW`). In-memory bytes may change
+//! during the save; the session then stays dirty and saves again. Every
+//! failure of any phase retains the session (`pending_saves`), as a failed
+//! save always did, and a crash at any step leaves the last committed bytes
+//! (an orphaned `.part` is removed at the next startup). Dirty sessions keep
+//! surviving detach, stop and restart (invariant 8): a save in progress is a
+//! dirty session until its commit, so `quiet()` refuses it, a force detach
+//! or a poison exit retains it, and its commit then removes the record.
+//!
+//! The adapters save this way ([`save_handle`] for flushes, renames and
+//! deletes on close), and a closed file is saved in the background
+//! ([`save_handle_in_background`], WinFsp cleanup and FUSE flush): a bounded
+//! pool of saver threads commits it shortly after the close, giving the
+//! engine to filesystem callbacks first ([`foreground`]); a delete or a
+//! rename over a closed file waits for its save ([`settle_entity`]). The
+//! availability rows of saved objects are written on a connection of their
+//! own, in batches ([`AvailabilityNotes`]).
 use super::{
     Shared,
     notify::{NotifyQueue, delta_notifications},
