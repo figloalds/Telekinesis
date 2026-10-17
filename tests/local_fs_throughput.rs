@@ -1000,8 +1000,7 @@ fn a_graceful_detach_right_after_writes_waits_for_their_saves() {
         fs::write(m.mount.join(&relative), &data).unwrap();
         written.insert(relative, data);
     }
-    // At once: files closed through the mount and being saved do not make
-    // the engine busy for a stop, but a checkout waits for them.
+    // At once: a checkout waits for the files still being saved.
     {
         let e = lock(&m.engine);
         if e.settling() > 0 {
@@ -1017,10 +1016,6 @@ fn a_graceful_detach_right_after_writes_waits_for_their_saves() {
             .is_empty()),
         "the kernel closed every handle"
     );
-    assert!(
-        lock(&m.engine).quiet().is_ok(),
-        "settling saves keep it quiet"
-    );
     // The graceful detach waits for the saves instead of refusing.
     let status = m.controller.detach(false).unwrap();
     assert_eq!(status.state, MountState::Detached);
@@ -1034,5 +1029,84 @@ fn a_graceful_detach_right_after_writes_waits_for_their_saves() {
     }
     assert!(pending_rows(&e).is_empty());
     assert!(e.checkout_allowed().is_ok());
+    no_conflicts(&e);
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn many_concurrent_writers_never_stall_the_mount() {
+    let _serial = serial();
+    let Some(m) = mounted::Mounted::new() else {
+        return;
+    };
+    // A build: eight writers at once, small files, each read back and some
+    // renamed, while another thread keeps listing and stating.
+    let mount = m.mount.clone();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let prober = {
+        let (mount, stop) = (mount.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let started = Instant::now();
+                let _ = fs::read_dir(&mount).map(|d| d.count());
+                let _ = fs::metadata(mount.join("w0"));
+                worst = worst.max(started.elapsed());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            worst
+        })
+    };
+    let writers: Vec<_> = (0..8u64)
+        .map(|w| {
+            let mount = mount.clone();
+            std::thread::spawn(move || {
+                let dir = mount.join(format!("w{w}"));
+                fs::create_dir(&dir).unwrap();
+                let mut worst = Duration::ZERO;
+                let mut written = BTreeMap::new();
+                for i in 0..150u64 {
+                    let data = bytes(w * 1000 + i, 512 + (i as usize * 1531) % 40_000);
+                    let started = Instant::now();
+                    let path = dir.join(format!("f{i:03}.obj"));
+                    fs::write(&path, &data).unwrap();
+                    assert_eq!(fs::read(&path).unwrap(), data);
+                    let name = if i % 5 == 0 {
+                        let renamed = format!("w{w}/r{i:03}.obj");
+                        fs::rename(&path, mount.join(&renamed)).unwrap();
+                        renamed
+                    } else {
+                        format!("w{w}/f{i:03}.obj")
+                    };
+                    worst = worst.max(started.elapsed());
+                    written.insert(name, data);
+                }
+                (worst, written)
+            })
+        })
+        .collect();
+    let mut written = BTreeMap::new();
+    let mut worst = Duration::ZERO;
+    for writer in writers {
+        let (slowest, files) = writer.join().unwrap();
+        worst = worst.max(slowest);
+        written.extend(files);
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let probe_worst = prober.join().unwrap();
+    assert!(
+        worst < Duration::from_secs(5),
+        "a write, read back and rename took {worst:?}"
+    );
+    assert!(
+        probe_worst < Duration::from_secs(5),
+        "a listing or stat took {probe_worst:?}"
+    );
+    assert!(m.quiet(Duration::from_secs(60)), "every file is committed");
+    let e = lock(&m.engine);
+    for (relative, data) in &written {
+        assert_eq!(&content(&e, relative), data, "{relative}");
+    }
+    assert!(pending_rows(&e).is_empty());
     no_conflicts(&e);
 }

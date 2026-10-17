@@ -16,9 +16,10 @@
 //! WP5.2: a callback does the work that needs no engine lock first (waiting
 //! for content that is downloading, the writable copy of a large file, the
 //! hashing and copying of a save; `runtime::engine`, *Saves off the engine
-//! lock*), and takes the engine only for its own short phases. A cleanup
-//! queues the save of a closed file for a background saver and returns; a
-//! flush, a rename and a delete-on-close wait for the save. A read of content
+//! lock*), and takes the engine only for its own short phases. During a
+//! burst of closes a cleanup queues the save of the closed file for a
+//! background saver and returns (`runtime::engine::write_behind`); a lone
+//! cleanup, a flush, a rename and a delete-on-close wait for the save. A read of content
 //! that cannot arrive answers `STATUS_DEVICE_NOT_READY` (programs report "the
 //! device is not ready"); `STATUS_FILE_IS_OFFLINE` read as "invalid argument"
 //! (CCR-WP4.INT-2). At most half of the dispatcher threads wait for content.
@@ -380,13 +381,15 @@ pub unsafe extern "C" fn tk_call(
                 crate::runtime::engine::save_handle(engine, h)?;
                 crate::runtime::engine::settle_handle(engine, h)?;
             }
-            9 => {
-                // The application's close: the save goes on in the background
-                // (`save_handle_in_background`, durable before a stop).
+            // The application's close: during a burst of closes the save goes
+            // on in the background (`write_behind`, `save_handle_in_background`);
+            // a lone close saves before it returns.
+            9 if crate::runtime::engine::write_behind() => {
                 lock_engine(engine).cleanup_unsaved(h)?;
                 crate::runtime::engine::save_handle_in_background(engine, h)?;
                 return Ok(0);
             }
+            9 => crate::runtime::engine::save_handle(engine, h)?,
             10 => {
                 crate::runtime::engine::close_handle(engine, h)?;
                 // Qualification hook: a close-path failure after the handle closed.
