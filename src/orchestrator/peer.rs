@@ -1257,6 +1257,9 @@ struct NetLoss {
     next: Instant,
     /// Redial slots handed out since the loss began.
     dials: u64,
+    /// The code of the session loss that began it (the reconnect is logged
+    /// under it).
+    cause: String,
 }
 
 /// What a lane waits on during one attempt (a dial, or the wait before the
@@ -1445,6 +1448,7 @@ impl Supervisor {
                     since: None,
                     next: Instant::now(),
                     dials: 0,
+                    cause: String::new(),
                 },
             ),
             wakers: Tracked::new("peer.wakers", BTreeMap::new()),
@@ -2041,12 +2045,15 @@ impl Supervisor {
         self.connects.fetch_add(1, Ordering::AcqRel);
         let ended = {
             let mut net = self.net.lock();
-            net.since.take().map(|since| (since.elapsed(), net.dials))
+            net.since
+                .take()
+                .map(|since| (since.elapsed(), net.dials, std::mem::take(&mut net.cause)))
         };
-        if let Some((down, dials)) = ended {
-            event!(info, PEER_RECONNECTED, {
+        if let Some((down, dials, cause)) = ended {
+            event!(info, (cause.as_str()), {
                 "peer": self.installation(),
                 "lane": lane,
+                "detail": "the peer is reachable again: its network loss ended",
                 "down_ms": u64::try_from(down.as_millis()).unwrap_or(u64::MAX),
                 "redials": dials,
             });
@@ -2086,6 +2093,7 @@ impl Supervisor {
                 net.since = Some(now);
                 net.next = now + self.options.jittered(self.options.lane_backoff_base);
                 net.dials = 0;
+                net.cause = reason.code.clone();
                 true
             }
         };
