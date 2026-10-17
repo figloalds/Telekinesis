@@ -547,7 +547,8 @@ fn incremental_schema(db: &Connection) -> Result<()> {
         [],
         |r| r.get(0),
     )?;
-    db.execute_batch("SAVEPOINT snapshot_rows_schema;
+    in_savepoint(db, || {
+        db.execute_batch("
         CREATE TABLE IF NOT EXISTS journal_branch(seq INTEGER PRIMARY KEY,branch TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS journal_branch_order ON journal_branch(branch,seq);
         CREATE TRIGGER IF NOT EXISTS journal_branch_insert AFTER INSERT ON journal_sequence BEGIN
@@ -593,19 +594,24 @@ fn incremental_schema(db: &Connection) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS projection_version_meta_delete AFTER DELETE ON current_meta BEGIN
             UPDATE projection_version SET version=version+1 WHERE id=1;
         END;
-        RELEASE snapshot_rows_schema;")?;
-    if !indexed {
-        // A new (or dropped) index: build it from the whole journal.
-        db.execute("DELETE FROM config WHERE key=?1", [JOURNAL_BRANCH_MARKER])?;
+        ")?;
+        if !indexed {
+            // A new (or dropped) index: build it from the whole journal. In
+            // the same savepoint as the table (WP4.INT, WP4.4 review minor):
+            // a crash after creating the table never leaves it without its
+            // backfill keys (an index missing every older row).
+            db.execute("DELETE FROM config WHERE key=?1", [JOURNAL_BRANCH_MARKER])?;
+            db.execute(
+                "INSERT INTO config(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
+                [JOURNAL_BRANCH_CURSOR],
+            )?;
+        }
         db.execute(
-            "INSERT INTO config(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
-            [JOURNAL_BRANCH_CURSOR],
+            "INSERT INTO config(key,value) VALUES('schema:snapshot',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
+            [SCHEMA_VERSION],
         )?;
-    }
-    db.execute(
-        "INSERT INTO config(key,value) VALUES('schema:snapshot',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
-        [SCHEMA_VERSION],
-    )?;
+        Ok(())
+    })?;
     backfill_journal_branch(db)
 }
 
@@ -622,8 +628,13 @@ fn backfill_journal_branch(db: &Connection) -> Result<()> {
     if value(JOURNAL_BRANCH_MARKER)?.is_some() {
         return Ok(());
     }
-    if let Some(cursor) = value(JOURNAL_BRANCH_CURSOR)? {
-        let mut cursor: i64 = cursor.parse().unwrap_or(0);
+    // No marker: the build is due, from the cursor or, with no cursor either
+    // (a crash of an earlier build between creating the table and writing
+    // its keys), from the start (WP4.INT; the inserts are idempotent).
+    {
+        let mut cursor: i64 = value(JOURNAL_BRANCH_CURSOR)?
+            .and_then(|cursor| cursor.parse().ok())
+            .unwrap_or(0);
         loop {
             let upper: Option<i64> = db.query_row(
                 "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",

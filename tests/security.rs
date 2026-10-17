@@ -27,6 +27,7 @@ mod support;
 
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -1555,6 +1556,24 @@ fn unpair_revokes_inbound_access_within_one_second() {
         "B serves A's lanes"
     );
     let endpoint = b.endpoint();
+    let sessions_of_a = || -> BTreeSet<String> {
+        b.net.inbound().map_or(BTreeSet::new(), |server| {
+            server
+                .sessions()
+                .into_iter()
+                .filter(|session| session.installation == a.installation())
+                .map(|session| session.session)
+                .collect()
+        })
+    };
+    let before_unpair = sessions_of_a();
+    let new_sessions = || -> BTreeSet<String> {
+        sessions_of_a()
+            .difference(&before_unpair)
+            .cloned()
+            .collect()
+    };
+    let mut served_during = BTreeSet::new();
     let started = Instant::now();
     let unpair = {
         let network = a.ctx.network().unwrap().clone();
@@ -1565,6 +1584,7 @@ fn unpair_revokes_inbound_access_within_one_second() {
     while started.elapsed() < Duration::from_secs(3)
         && (revoked_at.is_none() || closed_at.is_none())
     {
+        served_during.extend(new_sessions());
         if revoked_at.is_none() && b.revoked(&a.installation(), CredentialSide::Inbound) {
             revoked_at = Some(started.elapsed());
         }
@@ -1573,6 +1593,18 @@ fn unpair_revokes_inbound_access_within_one_second() {
         }
         thread::sleep(Duration::from_millis(5));
     }
+    // WP4.INT (the WP4.1 review's minor): no new session of A is served
+    // while the unpair finishes (its lanes do not re-dial, with the code once
+    // the credential is refused, until the supervisor stops).
+    while !unpair.is_finished() {
+        served_during.extend(new_sessions());
+        thread::sleep(Duration::from_millis(5));
+    }
+    served_during.extend(new_sessions());
+    assert!(
+        served_during.is_empty(),
+        "B served new sessions of A during the unpair: {served_during:?}"
+    );
     unpair.join().unwrap().unwrap();
     let revoked_at = revoked_at.expect("B never revoked A's credential");
     let closed_at = closed_at.expect("A's sessions at B never closed");

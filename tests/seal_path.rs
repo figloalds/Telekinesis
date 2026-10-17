@@ -778,6 +778,61 @@ fn crash_scenario(dir: &Path, step: &str) -> PathBuf {
             .unwrap();
             root
         }
+        // Above `FOLD_MAX_ENTRIES` (WP4.INT, WP4.4 review minor): a startup
+        // restores the header plus diffed `current_parts` rows
+        // (`restore_parts`), and a slow commit keeps its parts as a delta.
+        "large-open" | "large-slow" => {
+            let mut a = Store::open(&dir.join("a"), Some(REPO)).unwrap();
+            linear_history(&mut a, FOLD_MAX_ENTRIES + 50).unwrap();
+            a.create("file", "file").unwrap();
+            if step == "large-open" {
+                let root = a.root.clone();
+                // A conflict row, and a tail of saves after the seal.
+                let entry = a.lookup("file").unwrap();
+                let (content, existence) = (
+                    entry.revisions.get("content").cloned(),
+                    entry.revisions.get("alive").cloned(),
+                );
+                a.write_with_base(&entry.id, content.clone(), existence.clone(), b"one")
+                    .unwrap();
+                a.write_with_base(&entry.id, content, existence, b"two")
+                    .unwrap();
+                assert!(!a.conflicts().unwrap().is_empty());
+                drop(a);
+                let mut s = open(&root);
+                let names: Vec<String> = alive(&s)
+                    .into_iter()
+                    .map(|(path, _)| path)
+                    .filter(|path| path != "file")
+                    .take(20)
+                    .collect();
+                for name in &names {
+                    save(&mut s, name, b"tail");
+                }
+                return root;
+            }
+            let (mut a, mut b) = clone_replica(a, &dir.join("b")).unwrap();
+            let allowed = devices([&a, &b]);
+            save(&mut a, "file", b"from a");
+            save(&mut b, "file", b"from b");
+            let root = b.root.clone();
+            drop(b);
+            let b = open(&root);
+            let events = missing(&a, &b);
+            assert_eq!(events.len(), 1);
+            b.stage_incoming(
+                events
+                    .into_iter()
+                    .map(|event| StagedEvent {
+                        event,
+                        source: None,
+                    })
+                    .collect(),
+                &allowed,
+            )
+            .unwrap();
+            root
+        }
         step => panic!("unknown step {step}"),
     }
 }
@@ -919,6 +974,65 @@ fn crashes_at_every_seal_step_resume_with_exact_state() {
         runs += 1;
     }
     assert!(runs >= 30, "{runs}");
+}
+
+/// WP4.INT (WP4.4 review minor): the paths that only apply above
+/// `FOLD_MAX_ENTRIES` under crashes. A startup of a large rows snapshot
+/// with a conflict and a 20-save tail (`restore_parts` writes only the rows
+/// that differ, then the tail is replayed and resealed), and a slow commit
+/// that keeps a large projection's parts as a delta: a crash at every step of
+/// each resumes with exact state. Release only: the strict oracle on a
+/// 1,000-entry projection after each of the 14 crashes takes minutes in a
+/// debug build.
+#[test]
+#[ignore = "release: cargo test --release --test seal_path -- --ignored"]
+fn large_projections_resume_exactly_after_crashes() {
+    let _layout = Layout::rows();
+    let seal = [
+        "before_startup_snapshot",
+        "startup_snapshot_written",
+        "seal_entries_written",
+        "seal_conflicts_written",
+        "seal_marks_cleared",
+    ];
+    let mut startup = vec!["startup_snapshot_restored", "startup_suffix_applied"];
+    startup.extend(seal);
+    let mut commit = vec!["before_sql", "sql_committed"];
+    commit.extend(seal);
+    let mut runs = 0;
+    for (scenario, child, points) in [
+        ("large-open", "open", startup),
+        ("large-slow", "slow-inline", commit),
+    ] {
+        let template = tempfile::tempdir().unwrap();
+        let source = crash_scenario(template.path(), scenario);
+        {
+            // Checked on a copy: an open replays the tail and reseals.
+            let probe = template.path().join("probe");
+            copy_dir(&source, &probe).unwrap();
+            let s = open(&probe);
+            assert!(
+                s.projection(&s.active).unwrap().entries.len() > FOLD_MAX_ENTRIES,
+                "{scenario}: a large projection"
+            );
+            assert!(s.check_startup_snapshot(&s.active).unwrap().rows);
+        }
+        for point in points {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("b");
+            copy_dir(&source, &root).unwrap();
+            let before = anchors(&root);
+            crash(&root, child, point, Some(0));
+            let left = if point == "sql_committed" {
+                Left::Committed
+            } else {
+                Left::Unchanged
+            };
+            after_crash(&root, &before, &format!("{scenario} {point}"), left);
+            runs += 1;
+        }
+    }
+    assert_eq!(runs, 14);
 }
 
 // ---------------------------------------------------------------------------
@@ -1696,6 +1810,46 @@ fn the_journal_index_is_built_for_an_older_store() {
     .unwrap();
     db.execute("DELETE FROM events WHERE id=?", [last]).unwrap();
     assert_eq!(indexed_branches(&db), journal_branches(&db));
+}
+
+/// WP4.INT (WP4.4 review minor): the table and its backfill keys are created
+/// in one savepoint, and a store left by an earlier build with the table but
+/// neither key (a crash between the two) is still indexed in full at its
+/// next open, instead of keeping an index that lacks every older row.
+#[test]
+fn a_journal_index_without_its_keys_is_rebuilt() {
+    let _layout = Layout::rows();
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = open(dir.path());
+    for i in 0..30 {
+        s.create(&format!("f{i:03}"), "file").unwrap();
+    }
+    assert_eq!(indexed_branches(&s.db), journal_branches(&s.db));
+    drop(s);
+    let db = Connection::open(dir.path().join("metadata.sqlite")).unwrap();
+    db.execute_batch(
+        "DELETE FROM journal_branch;
+        DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+    )
+    .unwrap();
+    drop(db);
+    let mut s = open(dir.path());
+    assert_eq!(
+        indexed_branches(&s.db),
+        journal_branches(&s.db),
+        "rebuilt from the journal"
+    );
+    let marker: Option<String> =
+        s.db.query_row(
+            "SELECT value FROM config WHERE key='snapshot_journal_branch_v1'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(marker.as_deref(), Some("1"));
+    assert_snapshots(&s, "after the rebuild");
+    assert_oracle(&mut s, "after the rebuild");
 }
 
 /// A restart at the tip of a large rows snapshot writes no projection row
