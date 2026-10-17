@@ -1405,12 +1405,11 @@ impl Engine {
         let mut committed = 0;
         for entity in due {
             // Saved without the engine lock when the shared engine is known
-            // and a background slot is free: a thread saves it and reports a
-            // failure back (`retry_failed`).
+            // and the background queue has room: a saver saves it and
+            // reports a failure back (`retry_failed`).
             if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade)
-                && let Some(slot) = BackgroundSlot::take()
+                && schedule(&shared, entity.clone())
             {
-                spawn_background(&shared, entity, slot);
                 continue;
             }
             match self.flush_entity(&entity) {
@@ -2295,9 +2294,12 @@ pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
     save_entity_as(engine, entity, false)
 }
 
-/// [`save_entity`]; `background`: before each phase that takes the engine
-/// lock, give it to the filesystem callbacks in progress first
-/// ([`foreground`], at most [`YIELD_MAX`] each time).
+/// [`save_entity`]; `background` (the background savers): before each
+/// phase that takes the engine lock, give it to the filesystem callbacks in
+/// progress first ([`foreground`], at most [`YIELD_MAX`] each time); commit
+/// [`SETTLE`] after the bytes are stored; and leave an entity a save of
+/// which runs to that save (edits made since stay dirty for the savers'
+/// sweep, [`orphan_dirty`]).
 fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()> {
     loop {
         if background {
@@ -2306,6 +2308,7 @@ fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()>
         let mut e = super::lock_engine(engine);
         let job = match e.begin_save(entity)? {
             SaveStart::Clean => return Ok(()),
+            SaveStart::Busy(_) if background => return Ok(()),
             SaveStart::Busy(seen) => {
                 let signal = e.save_signal();
                 drop(e);
@@ -2319,6 +2322,7 @@ fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()>
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store_snapshot(&job)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("UNKNOWN_ERROR: storing a save panicked")));
         if background {
+            std::thread::sleep(SETTLE);
             yield_to_foreground();
         }
         return super::lock_engine(engine).finish_save(job, stored);
@@ -2373,35 +2377,121 @@ pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
 /// The longest single wait for a save's end before the waiter looks again.
 const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 
-/// Saves running in the background ([`save_handle_in_background`], a close,
-/// the pending-save retry) at most at once, in this process. It bounds the
-/// adapter threads saves occupy, and what a hard crash (power loss, a killed
-/// process) can lose of files that were closed but not committed yet: past
-/// it, a closed file waits for a slot (the background saves pick up the
-/// closed files left unsaved, [`orphan_dirty`]).
+/// Background saver threads at most, in this process
+/// ([`save_handle_in_background`], a close, the pending-save retry).
 pub const MAX_BACKGROUND_SAVES: usize = 8;
-static BACKGROUND_SAVES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Closed files waiting for a background saver at most. Past it a close
+/// leaves its file to the savers' sweep ([`orphan_dirty`]). With the savers
+/// it bounds what a hard crash (power loss, a killed process) can lose of
+/// files that were closed but not committed yet.
+pub const MAX_QUEUED_SAVES: usize = 64;
+/// A background save commits at least this long after it stored the bytes:
+/// an on-access scanner scans the object file just written, and the
+/// commit's verification of newly authored bytes (`check_commit`) waited
+/// for that scan under the engine lock (measured on the reference machine:
+/// about 3 ms of a 32 KiB file's 5.5 ms commit). Waiting before taking the
+/// lock costs only latency.
+pub const SETTLE: Duration = Duration::from_millis(10);
+/// How long an idle background saver thread waits for work before it ends.
+const SAVER_IDLE: Duration = Duration::from_secs(1);
 
-/// Saves running in the background now.
+/// The background savers: a queue of `(engine, entity)` and up to
+/// [`MAX_BACKGROUND_SAVES`] threads that serve it (started as work comes,
+/// ending after [`SAVER_IDLE`]).
+struct Savers {
+    state: Mutex<SaversState>,
+    wake: std::sync::Condvar,
+}
+#[derive(Default)]
+struct SaversState {
+    jobs: std::collections::VecDeque<(Shared, String)>,
+    threads: usize,
+    idle: usize,
+    running: usize,
+}
+fn savers() -> &'static Savers {
+    static SAVERS: std::sync::OnceLock<Savers> = std::sync::OnceLock::new();
+    SAVERS.get_or_init(|| Savers {
+        state: Mutex::new(SaversState::default()),
+        wake: std::sync::Condvar::new(),
+    })
+}
+
+/// Saves running or waiting in the background now.
 pub fn background_saves() -> usize {
-    BACKGROUND_SAVES.load(Ordering::SeqCst)
+    let state = crate::util::lock::lock(&savers().state);
+    state.jobs.len() + state.running
 }
 
-/// One background save slot, given back on drop.
-struct BackgroundSlot;
-impl BackgroundSlot {
-    fn take() -> Option<Self> {
-        BACKGROUND_SAVES
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |running| {
-                (running < MAX_BACKGROUND_SAVES).then_some(running + 1)
-            })
-            .ok()
-            .map(|_| Self)
+/// Queues the save of `entity` for a background saver; `false` when the
+/// queue is full (the savers' sweep picks the file up later).
+fn schedule(engine: &Shared, entity: String) -> bool {
+    let savers = savers();
+    let mut state = crate::util::lock::lock(&savers.state);
+    if state
+        .jobs
+        .iter()
+        .any(|(queued, name)| Arc::ptr_eq(queued, engine) && *name == entity)
+    {
+        return true;
     }
+    if state.jobs.len() >= MAX_QUEUED_SAVES {
+        return false;
+    }
+    state.jobs.push_back((engine.clone(), entity));
+    if state.idle == 0
+        && state.threads < MAX_BACKGROUND_SAVES
+        && std::thread::Builder::new()
+            .name("save".into())
+            .spawn(saver_loop)
+            .is_ok()
+    {
+        state.threads += 1;
+    }
+    drop(state);
+    savers.wake.notify_one();
+    true
 }
-impl Drop for BackgroundSlot {
-    fn drop(&mut self) {
-        BACKGROUND_SAVES.fetch_sub(1, Ordering::SeqCst);
+
+/// One background saver: serves the queue, then sweeps the closed files of
+/// that engine left unsaved, until it is idle for [`SAVER_IDLE`].
+fn saver_loop() {
+    let savers = savers();
+    loop {
+        let (engine, entity) = {
+            let mut state = crate::util::lock::lock(&savers.state);
+            loop {
+                if let Some(job) = state.jobs.pop_front() {
+                    state.running += 1;
+                    break job;
+                }
+                state.idle += 1;
+                let (next, waited) = savers
+                    .wake
+                    .wait_timeout(state, SAVER_IDLE)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                state.idle -= 1;
+                if waited.timed_out() && state.jobs.is_empty() {
+                    state.threads -= 1;
+                    return;
+                }
+            }
+        };
+        let mut next = Some(entity);
+        while let Some(entity) = next {
+            if let Err(error) = save_entity_as(&engine, &entity, true) {
+                let wire = crate::model::errors::ErrorWire::from_error(&error);
+                crate::util::log::event!(warn, (wire.code.as_str()), {
+                    "site": "engine.background_save",
+                    "entity": entity,
+                    "message": wire.message,
+                });
+                super::lock_engine(&engine).retry_failed(&entity, Instant::now(), &error);
+            }
+            next = orphan_dirty(&super::lock_engine(&engine), Instant::now());
+        }
+        crate::util::lock::lock(&savers.state).running -= 1;
     }
 }
 
@@ -2436,16 +2526,16 @@ fn yield_to_foreground() {
 }
 
 /// The save of a closed file (WinFsp cleanup, FUSE flush): when the session
-/// of handle `h` is dirty and no save of it runs, it is saved on a thread of
-/// its own and this returns at once, so the application's close does not
-/// wait for the hashing, copying and commits (module docs, *Saves off the
-/// engine lock*). With every background slot taken, the close of the handle
-/// or a background save that ends picks it up. Until it is committed the
-/// session is a dirty session like any other: reads see its bytes, a
-/// graceful stop or detach waits for it (`quiet`), a forced one or a poison
-/// exit retains it (invariant 8), and a flush (`FlushFileBuffers`, `fsync`)
-/// waits for it ([`save_handle`]). A failed background save is retained
-/// (`pending_saves`) and retried with the pending-save backoff.
+/// of handle `h` is dirty and no save of it runs, it is queued for a
+/// background saver and this returns at once, so the application's close
+/// does not wait for the hashing, copying and commits (module docs, *Saves
+/// off the engine lock*). With the queue full, a saver's sweep picks it up.
+/// Until it is committed the session is a dirty session like any other:
+/// reads see its bytes, a graceful stop or detach waits for it (`quiet`), a
+/// forced one or a poison exit retains it (invariant 8), and a flush
+/// (`FlushFileBuffers`, `fsync`) waits for it ([`save_handle`]). A failed
+/// background save is retained (`pending_saves`) and retried with the
+/// pending-save backoff.
 pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
     let entity = {
         let e = super::lock_engine(engine);
@@ -2460,36 +2550,8 @@ pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
             _ => return Ok(()),
         }
     };
-    if let Some(slot) = BackgroundSlot::take() {
-        spawn_background(engine, entity, slot);
-    }
+    schedule(engine, entity);
     Ok(())
-}
-
-/// Starts a thread that saves `entity` and then every other closed file left
-/// unsaved ([`orphan_dirty`]), holding `slot`. A thread that cannot start
-/// leaves them to a close or the pending-save retry.
-fn spawn_background(engine: &Shared, entity: String, slot: BackgroundSlot) {
-    let shared = engine.clone();
-    let _ = std::thread::Builder::new()
-        .name("save".into())
-        .spawn(move || {
-            let _slot = slot;
-            let mut next = Some(entity);
-            while let Some(entity) = next {
-                if let Err(error) = save_entity_as(&shared, &entity, true) {
-                    let wire = crate::model::errors::ErrorWire::from_error(&error);
-                    crate::util::log::event!(warn, (wire.code.as_str()), {
-                        "site": "engine.background_save",
-                        "entity": entity,
-                        "message": wire.message,
-                    });
-                    super::lock_engine(&shared).retry_failed(&entity, Instant::now(), &error);
-                }
-                yield_to_foreground();
-                next = orphan_dirty(&super::lock_engine(&shared), Instant::now());
-            }
-        });
 }
 
 /// A dirty session no save covers and the application no longer writes:
@@ -2574,8 +2636,8 @@ pub fn settle_handle(engine: &Shared, h: u64) -> Result<()> {
 
 /// Closes handle `h` (WinFsp close, FUSE release): removes the handle and,
 /// when its session is dirty, no save of it runs and its pending-save
-/// backoff is due, starts its save in the background (with a free slot;
-/// otherwise a background save that ends picks it up). The close itself
+/// backoff is due, queues its save for a background saver (with the queue
+/// full, a saver's sweep picks it up). The close itself
 /// never saves: a WinFsp close holds the application's `CloseHandle` until
 /// it answers (measured: a save in it cost the application the whole save).
 pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
@@ -2597,10 +2659,8 @@ pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
         e.release_handle(h)?;
         unsaved
     };
-    if let Some(entity) = unsaved
-        && let Some(slot) = BackgroundSlot::take()
-    {
-        spawn_background(engine, entity, slot);
+    if let Some(entity) = unsaved {
+        schedule(engine, entity);
     }
     Ok(())
 }
