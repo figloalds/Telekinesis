@@ -227,7 +227,10 @@ pub mod verified {
 /// The view slots (`(parent, name key)` → entity) of the alive entries of
 /// `projection`; `None` if a name cannot be keyed, which a committed
 /// projection never has.
-fn view_slots(projection: &Projection) -> Option<BTreeMap<(String, String), String>> {
+/// A view's slots: (parent, name key) to its visible entry.
+type ViewSlots = BTreeMap<(String, String), String>;
+
+fn view_slots(projection: &Projection) -> Option<ViewSlots> {
     projection
         .entries
         .values()
@@ -235,6 +238,33 @@ fn view_slots(projection: &Projection) -> Option<BTreeMap<(String, String), Stri
         .map(|e| Ok(((e.parent.clone(), name_key(&e.name)?), e.id.clone())))
         .collect::<Result<_>>()
         .ok()
+}
+
+/// `view_slots` of a projection `derive::project_append` made from a view
+/// whose slots are `slots` (WP5.1): only the entities that changed can move,
+/// and each slot has at most one visible entry. `placements`: the changed
+/// entities with their visible placement in the base (`Appended`).
+fn patched_slots(
+    mut slots: BTreeMap<(String, String), String>,
+    placements: &[(String, Option<(String, String)>)],
+    projection: &Projection,
+) -> Option<BTreeMap<(String, String), String>> {
+    for (id, before) in placements {
+        if let Some((parent, name)) = before {
+            let key = (parent.clone(), name_key(name).ok()?);
+            if slots.get(&key) == Some(id) {
+                slots.remove(&key);
+            }
+        }
+    }
+    for (id, _) in placements {
+        if let Some(e) = projection.entries.get(id)
+            && e.alive
+        {
+            slots.insert((e.parent.clone(), name_key(&e.name).ok()?), id.clone());
+        }
+    }
+    Some(slots)
 }
 
 /// The view of `branch` after a slow commit stored `projection` (`None` if a
@@ -927,8 +957,9 @@ impl Store {
         }
     }
     /// The branch's projection as this handle's fresh view (loaded if
-    /// needed), taken out of the view cache; `None` when it cannot be read.
-    fn take_view(&self, branch: &str) -> Option<Projection> {
+    /// needed) and its slots, taken out of the view cache; `None` when it
+    /// cannot be read.
+    fn take_view(&self, branch: &str) -> Option<(Projection, ViewSlots)> {
         self.drop_rolled_back_view();
         if self.view(branch).is_err() {
             return None;
@@ -938,7 +969,7 @@ impl Store {
             .ok()?
             .take()
             .filter(|view| view.branch == branch)
-            .map(|view| view.projection)
+            .map(|view| (view.projection, view.slots))
     }
     /// `projection_delta` for a projection `derive::project_append` made from
     /// the stored one: it knows the entities that changed and whether the
@@ -991,7 +1022,10 @@ impl Store {
         // The stored projection of the branch, as this handle's view: the
         // base of `derive::project_append` (WP5.1). It is consumed; a
         // committing slow commit leaves its own projection as the view.
-        let base = derive::timed("s.view", || self.take_view(branch));
+        let (base, base_slots) = match derive::timed("s.view", || self.take_view(branch)) {
+            Some((base, slots)) => (Some(base), Some(slots)),
+            None => (None, None),
+        };
         let computed = derive::timed("s.compute", || {
             let t0 = std::time::Instant::now();
             self.with_branch_events(branch, Some(event), committed_view, |events| {
@@ -1006,7 +1040,7 @@ impl Store {
                 let (projection, delta, carried) = match appended {
                     Some(appended) => (
                         appended.projection,
-                        Some((appended.changed, appended.lists)),
+                        Some((appended.changed, appended.lists, appended.placements)),
                         Some(appended.carried),
                     ),
                     None => (
@@ -1045,17 +1079,29 @@ impl Store {
         let Some((projection, derived, delta)) = computed else {
             return Ok(None);
         };
-        let stored = derive::timed("s.delta", || match delta {
-            Some((changed, lists)) => self.appended_delta(branch, &projection, changed, lists),
-            None => self.projection_delta(branch, &projection),
-        });
+        let (stored, patched) = match delta {
+            Some((changed, lists, placements)) => {
+                let patched =
+                    base_slots.and_then(|slots| patched_slots(slots, &placements, &projection));
+                if patched.is_some() && derive::checks_projections() {
+                    ensure!(
+                        patched == view_slots(&projection),
+                        "CONFLICT_MODE_MISMATCH: the patched view slots of {} differ",
+                        event.id
+                    );
+                }
+                let stored = self.appended_delta(branch, &projection, changed, lists);
+                (stored, patched)
+            }
+            None => (self.projection_delta(branch, &projection), None),
+        };
         let (json, slots) = if precompute {
             let json = (!stored.is_delta() || !snapshot::sealed_as_rows(&self.db, branch))
                 .then(|| serde_json::to_string(&projection))
                 .transpose()?;
-            (json, view_slots(&projection))
+            (json, patched.or_else(|| view_slots(&projection)))
         } else {
-            (None, None)
+            (None, patched)
         };
         Ok(Some(Box::new(SlowPlan {
             projection,

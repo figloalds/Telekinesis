@@ -4293,6 +4293,10 @@ pub(super) struct Appended {
     /// The ids of the base's records the projection keeps unchanged (stored,
     /// with that payload, by the induction hypothesis of the module docs).
     pub(super) carried: BTreeSet<String>,
+    /// Per entity of `changed`, its visible placement (parent, name) in the
+    /// base, `None` when it was not visible: with `projection`'s entries, the
+    /// view slots move only there (`commit::patched_slots`).
+    pub(super) placements: Vec<(String, Option<(String, String)>)>,
 }
 
 /// `project(events)` from `base`, the projection of `events` without
@@ -4513,7 +4517,8 @@ pub(super) fn project_append(
         }
         p.entries.insert(entity.into(), entry);
     }
-    let (changed, mut removed_ns, mut added) = namespace_delta(branch, &mut p, &old)?;
+    let (changed, mut removed_ns, mut added) =
+        timed("pa.delta", || namespace_delta(branch, &mut p, &old))?;
     removed.append(&mut removed_ns);
     added.extend(added_registers);
     p.conflicts.sort_by(|a, b| a.id.cmp(&b.id));
@@ -4527,11 +4532,29 @@ pub(super) fn project_append(
         .filter(|c| !fresh.contains(c.id.as_str()))
         .map(|c| c.id.clone())
         .collect();
+    // An entity outside `E`'s that changed changed presence only (the chain
+    // pass flipped it, `namespace_delta`): it was visible exactly when it is
+    // not now, at the same placement.
+    let placements = changed
+        .iter()
+        .map(|id| {
+            let before = match old.get(id.as_str()) {
+                Some(Some(b)) => b.alive.then(|| (b.parent.clone(), b.name.clone())),
+                Some(None) => None,
+                None => {
+                    let e = &p.entries[id];
+                    (!e.alive).then(|| (e.parent.clone(), e.name.clone()))
+                }
+            };
+            (id.clone(), before)
+        })
+        .collect();
     Ok(Some(Appended {
         projection: p,
         changed,
         lists,
         carried,
+        placements,
     }))
 }
 
@@ -4600,39 +4623,58 @@ fn namespace_delta(
             slots.insert((entry.parent.clone(), key_of(&entry.name)?));
         }
     }
-    // Their members before and after (sorted ids), and the slot verdicts.
+    // Their members before and after (sorted ids), and the slot verdicts:
+    // one pass over the entries. `(parent, name, present)` is in slot `s`
+    // when present under that parent with that key; an ASCII name's key is
+    // its ASCII lower case, so it is compared without computing the key (it
+    // cannot fail there: every present name was keyed by the base's passes,
+    // and `E`'s own above), and presence is read only for a name in the slot.
+    let slots: Vec<(String, Arc<str>)> = slots.into_iter().collect();
+    let in_slot = |parent: &str, name: &str, present: &dyn Fn() -> bool| -> Result<Option<usize>> {
+        for (s, (slot_parent, key)) in slots.iter().enumerate() {
+            if parent != slot_parent {
+                continue;
+            }
+            let same = if name.is_ascii() {
+                name.eq_ignore_ascii_case(key) && present()
+            } else {
+                present() && key_of(name)? == *key
+            };
+            if same {
+                return Ok(Some(s));
+            }
+        }
+        Ok(None)
+    };
+    let mut members_after: Vec<Vec<String>> = vec![vec![]; slots.len()];
+    let mut members_before: Vec<Vec<String>> = vec![vec![]; slots.len()];
+    for (id, entry) in &p.entries {
+        let present = || register_presence(p, id);
+        let now = in_slot(&entry.parent, &entry.name, &present)?;
+        if let Some(s) = now {
+            members_after[s].push(id.clone());
+        }
+        let was = match old.get(id.as_str()) {
+            Some(Some(b)) if b.raw_alive => in_slot(&b.parent, &b.name, &|| true)?,
+            Some(_) => None,
+            None => now,
+        };
+        if let Some(s) = was {
+            members_before[s].push(id.clone());
+        }
+    }
     let mut verdict_after: HashMap<String, bool> = HashMap::default();
     let mut verdict_before: HashMap<String, bool> = HashMap::default();
     let mut pairs_before: HashSet<(String, String)> = HashSet::default();
     let mut added: Vec<Conflict> = vec![];
-    for (parent, key) in &slots {
-        let mut after: Vec<String> = vec![];
-        let mut before: Vec<String> = vec![];
-        for (id, entry) in &p.entries {
-            let moved = old.get(id.as_str());
-            if entry.parent == *parent && register_presence(p, id) && key_of(&entry.name)? == *key {
-                after.push(id.clone());
-            }
-            let was = match moved {
-                Some(Some(b)) => b.raw_alive && b.parent == *parent && key_of(&b.name)? == *key,
-                Some(None) => false,
-                None => {
-                    entry.parent == *parent
-                        && register_presence(p, id)
-                        && key_of(&entry.name)? == *key
-                }
-            };
-            if was {
-                before.push(id.clone());
-            }
-        }
+    for (after, before) in members_after.iter().zip(&members_before) {
         if let Some(winner) = after.last() {
-            for id in &after {
+            for id in after {
                 verdict_after.insert(id.clone(), id == winner);
             }
         }
         if let Some(winner) = before.last() {
-            for id in &before {
+            for id in before {
                 verdict_before.insert(id.clone(), id == winner);
             }
         }
@@ -4686,14 +4728,31 @@ fn namespace_delta(
     });
     let mut affected: BTreeSet<String> = origins.iter().cloned().collect();
     if directories {
-        let mut children: HashMap<&str, Vec<&str>> = HashMap::default();
-        for (id, entry) in &p.entries {
-            children
-                .entry(entry.parent.as_str())
-                .or_default()
-                .push(id.as_str());
+        // Level by level (a scan of the entries per level, no index), then,
+        // past a few levels, through a map of every directory's children.
+        let mut level: HashSet<String> = origins.iter().cloned().collect();
+        for _ in 0..4 {
+            if level.is_empty() {
+                break;
+            }
+            let mut next: HashSet<String> = HashSet::default();
+            for (id, entry) in &p.entries {
+                if level.contains(entry.parent.as_str()) && affected.insert(id.clone()) {
+                    next.insert(id.clone());
+                }
+            }
+            level = next;
         }
-        let mut todo: Vec<String> = origins.clone();
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::default();
+        if !level.is_empty() {
+            for (id, entry) in &p.entries {
+                children
+                    .entry(entry.parent.as_str())
+                    .or_default()
+                    .push(id.as_str());
+            }
+        }
+        let mut todo: Vec<String> = level.into_iter().collect();
         while let Some(next) = todo.pop() {
             for &child in children.get(next.as_str()).into_iter().flatten() {
                 if affected.insert(child.to_owned()) {
@@ -9094,7 +9153,22 @@ mod tests {
                             changed,
                             lists,
                             carried,
+                            placements,
                         } = appended_projection;
+                        // The changed entities' visible placements in the base.
+                        assert_eq!(
+                            placements.iter().map(|(id, _)| id).collect::<Vec<_>>(),
+                            changed.iter().collect::<Vec<_>>(),
+                            "seed {seed} k {k}: placements"
+                        );
+                        for (id, before) in &placements {
+                            let visible = base
+                                .entries
+                                .get(id)
+                                .filter(|e| e.alive)
+                                .map(|e| (e.parent.clone(), e.name.clone()));
+                            assert_eq!(before, &visible, "seed {seed} k {k}: placement of {id}");
+                        }
                         for id in &carried {
                             assert!(
                                 base.conflicts
