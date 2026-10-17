@@ -76,7 +76,10 @@
 //! * **No objects v3.** A worker that does not echo the loopback upgrade
 //!   header (a Wave 2 worker) gives `Unavailable(UNSUPPORTED_OPERATION: …)`;
 //!   [`session_for`] remembers that for the instance (a worker instance never
-//!   changes its build), and the bulk lanes fall back to the interim path.
+//!   changes its build), and the bulk lanes fail that repository's key
+//!   (`UNSUPPORTED_OPERATION`, Transient: backed off by class) until the
+//!   worker is restarted on this build; there is no interim path any more
+//!   (WP4.5, CCR-WP4.5-1).
 use crate::{
     model::{
         errors::{ErrorWire, UNKNOWN_CODE, code_in},

@@ -90,7 +90,10 @@ pub mod ops {
     pub const PING: &str = "ping";
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const META_EXCHANGE: &str = "meta.exchange";
-    /// Interim bulk path (W2–W3, §6.5): legacy `bulk_sync::Page` JSON.
+    /// Reserved: the Wave 2–3 interim bulk op (§6.5), removed in Wave 4
+    /// (CCR-WP3.3-2, WP4.5). An acceptor answers it
+    /// `UNSUPPORTED_OPERATION` before any worker call; its body bound and
+    /// deadline are the defaults (CCR-WP4.5-1, applied by WP4.INT).
     pub const OBJECTS_EXCHANGE: &str = "objects.exchange";
     pub const OBJECTS_PULL: &str = "objects.pull";
     pub const OBJECTS_WANTS: &str = "objects.wants";
@@ -104,7 +107,6 @@ pub mod deadlines {
     pub const PING: Duration = Duration::from_secs(5);
     pub const CATALOG_LIST: Duration = Duration::from_secs(10);
     pub const META_EXCHANGE: Duration = Duration::from_secs(30);
-    pub const OBJECTS_EXCHANGE: Duration = Duration::from_secs(60);
     /// Idle deadline of `objects.pull` and `objects.push` (PROGRESS resets it).
     pub const OBJECTS_IDLE: Duration = Duration::from_secs(30);
     pub const OBJECTS_WANTS: Duration = Duration::from_secs(10);
@@ -118,7 +120,6 @@ pub fn op_deadline(op: &str) -> Option<Duration> {
         ops::PING => Some(deadlines::PING),
         ops::CATALOG_LIST => Some(deadlines::CATALOG_LIST),
         ops::META_EXCHANGE => Some(deadlines::META_EXCHANGE),
-        ops::OBJECTS_EXCHANGE => Some(deadlines::OBJECTS_EXCHANGE),
         ops::OBJECTS_WANTS => Some(deadlines::OBJECTS_WANTS),
         ops::OBJECTS_REPORT => Some(deadlines::OBJECTS_REPORT),
         _ => None,
@@ -151,12 +152,12 @@ pub fn op_allowed(op: &str, role: LaneRole) -> bool {
     }
 }
 
-/// Reassembled body limit per op: 16 MiB for `meta.exchange` and the interim
-/// `objects.exchange` (its legacy `bulk_sync::Page` carries up to 4 MiB of hex
-/// parts plus inventories; CCR-WP2.7-1 / CCR-WP2.8-1, applied by WP2.INT),
-/// 1 MiB otherwise.
+/// Reassembled body limit per op: 16 MiB for `meta.exchange` (CCR-WP2.7-1 /
+/// CCR-WP2.8-1, applied by WP2.INT), 1 MiB otherwise. The interim
+/// `objects.exchange` had 16 MiB too until its removal (CCR-WP4.5-1: an
+/// acceptor reassembled up to 16 MiB of a request it then refused).
 pub fn max_body(op: &str) -> usize {
-    if op == ops::META_EXCHANGE || op == ops::OBJECTS_EXCHANGE {
+    if op == ops::META_EXCHANGE {
         frame::MAX_BODY_META
     } else {
         frame::MAX_CHUNK
