@@ -82,6 +82,24 @@
 //! save ([`settle_entity`]), and `quiet()` counts it as unsaved until it is
 //! committed. The availability rows of saved objects are written on a
 //! connection of their own, in batches ([`AvailabilityNotes`]).
+//!
+//! **Deferred creates (WP5.2).** A file created through the WinFsp mount
+//! ([`Engine::create_deferred`]) is not committed when it is created: its
+//! first save commits one event that creates it with its content (it used to
+//! be two commits, each `fsync`ing the journal under the engine lock, the
+//! first on the application's create). Until then it is a dirty session the
+//! mount shows like any file ([`Engine::lookup_visible`],
+//! [`Engine::children_visible`]; a second create of the name is refused,
+//! basic information set on it stays in the session), and every rule of
+//! dirty sessions holds: `quiet()` refuses it, a force detach or a poison
+//! exit retains it (its record holds its location, and a restart shows it
+//! again), and a crash before its first commit loses the new file only, as
+//! it loses any unsaved bytes. Anything that would change or replace its
+//! name commits it first ([`settle_entity`]: a rename of it saves it, a
+//! rename over it or a delete of it settles it). A directory, a FUSE create
+//! and every create outside the mount commit at once; `TKFS_DEFERRED_CREATE=0`
+//! turns deferred creates off. A remote create of the same name in the
+//! meantime makes a conflict, as two concurrent creates do.
 use super::{
     Shared,
     notify::{NotifyQueue, delta_notifications},
@@ -175,6 +193,9 @@ pub struct Engine {
     notes: Arc<AvailabilityNotes>,
     /// What `observation` was last built from ([`Engine::publish_observation`]).
     observed: Mutex<Option<Observed>>,
+    /// Files created through the mount whose creation is not committed yet
+    /// (module docs, *Deferred creates*): `(parent, name key)` → entity.
+    pending_creates: BTreeMap<(String, String), String>,
     /// The shared engine this engine is (set by the mount adapters'
     /// `bind`): the pending-save retry hands staging-file saves to a thread
     /// that stores them without the engine lock.
@@ -537,6 +558,7 @@ impl Engine {
             notes: Arc::new(AvailabilityNotes::new(&store)),
             shared: None,
             observed: Mutex::new(None),
+            pending_creates: BTreeMap::new(),
             store,
         };
         if let Err(error) = engine.load_pending() {
@@ -872,6 +894,16 @@ impl Engine {
                     pending.stage
                 )
             })?;
+        if self.store.entry(&pending.entry.id).is_err() {
+            // A deferred create retained before its first commit (module
+            // docs, *Deferred creates*): visible again, committed by its save.
+            if let Ok(key) = name_key(&pending.entry.name) {
+                self.pending_creates.insert(
+                    (pending.entry.parent.clone(), key),
+                    pending.entry.id.clone(),
+                );
+            }
+        }
         self.sessions.insert(
             pending.entry.id.clone(),
             Session {
@@ -1335,15 +1367,20 @@ impl Engine {
             None
         };
         let preserve_times = self.sessions[entity].preserve_times;
+        let deferred = self.store.entry(entity).is_err();
         let result = (|| {
             crate::util::fault::trigger("engine.save.commit")?;
-            let revision = self.store.write_object_with_base_and_times(
-                entity,
-                job.content_base.clone(),
-                job.alive_base.clone(),
-                stored.object.clone(),
-                preserve_times,
-            )?;
+            let revision = if deferred {
+                self.commit_deferred_create(entity, &stored.object, preserve_times)?
+            } else {
+                self.store.write_object_with_base_and_times(
+                    entity,
+                    job.content_base.clone(),
+                    job.alive_base.clone(),
+                    stored.object.clone(),
+                    preserve_times,
+                )?
+            };
             if let Some(outer) = outer {
                 match row.as_deref().filter(|_| !unedited) {
                     None => {
@@ -1377,6 +1414,9 @@ impl Engine {
                 if pending {
                     count_pending_saves(&self.store, &self.vitals);
                 }
+                if deferred {
+                    self.pending_creates.retain(|_, pending| pending != entity);
+                }
                 let entry = self.store.entry(entity);
                 let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
                 session.content_base = Some(revision.clone());
@@ -1405,6 +1445,209 @@ impl Engine {
                 Err(error)
             }
         }
+    }
+    /// Commits a deferred create (module docs, *Deferred creates*) with its
+    /// first content, `object`: one event that creates the file at its
+    /// session's location, with that content and its basic information (the
+    /// write and change times of a save, unless preserved, as
+    /// `Store::write_object_with_base_and_times` sets them). Another entry
+    /// that took the name meanwhile (a remote create) makes a conflict, as
+    /// concurrent creates do.
+    fn commit_deferred_create(
+        &mut self,
+        entity: &str,
+        object: &str,
+        preserve_times: u8,
+    ) -> Result<String> {
+        let entry = self.sessions[entity].entry.clone();
+        let branch = self.store.branch(&self.store.active)?;
+        let change = |field: &str, value: Value| Change {
+            entity: entity.to_owned(),
+            field: field.into(),
+            parents: vec![],
+            value,
+        };
+        let changes = vec![
+            change("kind", json!(entry.kind)),
+            change(
+                "location",
+                json!({"parent": entry.parent, "name": entry.name}),
+            ),
+            change("alive", json!(true)),
+            change("content", json!(object)),
+        ];
+        let mut event = self.store.event(&branch, changes);
+        if entry.basic.is_some() || preserve_times != 0 {
+            let now = filetime(event.created_ms);
+            let mut basic = entry.basic_info();
+            if preserve_times & 2 == 0 {
+                basic.write_time = now;
+            }
+            if preserve_times & 4 == 0 {
+                basic.change_time = now;
+            }
+            basic.attributes = BasicInfo::attributes(&entry.kind, basic.attributes | 0x20)?;
+            event.changes.push(change("basic", json!(basic)));
+        }
+        let revision = event.id.clone();
+        self.store.commit(event, true)?;
+        Ok(revision)
+    }
+    /// Creates the file `path` through the mount without committing its
+    /// creation (module docs, *Deferred creates*): the file is visible at
+    /// once ([`Engine::lookup_visible`], directory listings), and its first
+    /// save commits it together with its content. `TKFS_DEFERRED_CREATE=0`
+    /// turns it off (the create commits at once, as before).
+    pub fn create_deferred(
+        &mut self,
+        path: &str,
+        writable: bool,
+        attributes: Option<u32>,
+    ) -> Result<(u64, Entry)> {
+        if !deferred_creates() {
+            return self.open_with_attributes(path, Some("file"), writable, attributes);
+        }
+        ensure!(!self.switching, "BUSY_VIEW");
+        let normalized = path.replace('\\', "/");
+        ensure!(
+            !normalized
+                .trim_matches('/')
+                .eq_ignore_ascii_case(".tkfs-runtime.json"),
+            "PERMISSION_DENIED"
+        );
+        let (parent, name) = split_path(path)?;
+        let key = name_key(&name)?;
+        let dir = self.store.lookup(&parent)?;
+        ensure!(dir.kind == "directory", "NOT_DIRECTORY");
+        ensure!(self.lookup_visible(path).is_err(), "NAME_COLLISION");
+        let now = time();
+        let basic = attributes
+            .map(|attributes| -> Result<BasicInfo> {
+                let stamp = filetime(now);
+                Ok(BasicInfo {
+                    posix_mode: None,
+                    attributes: BasicInfo::attributes("file", attributes)?,
+                    creation_time: stamp,
+                    access_time: stamp,
+                    write_time: stamp,
+                    change_time: stamp,
+                })
+            })
+            .transpose()?;
+        let entry = Entry {
+            id: id(),
+            kind: "file".into(),
+            parent: dir.id.clone(),
+            name,
+            content: Some(hash(b"")),
+            alive: true,
+            revisions: BTreeMap::new(),
+            modified_ms: now,
+            created_ms: now,
+            basic,
+        };
+        self.pending_creates.insert((dir.id, key), entry.id.clone());
+        self.sessions.insert(
+            entry.id.clone(),
+            Session {
+                entry: entry.clone(),
+                bytes: crate::staging::Staged::memory(vec![]),
+                content_base: None,
+                alive_base: None,
+                dirty: true,
+                references: 1,
+                preserve_times: 0,
+                edits: 0,
+                saving: false,
+                queued: false,
+            },
+        );
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.handles.insert(
+            h,
+            Handle {
+                entity: entry.id.clone(),
+                generation: self.store.generation,
+                cleaned: false,
+                writable,
+                time_update_disabled: 0,
+                directory: None,
+            },
+        );
+        Ok((h, entry))
+    }
+    /// Commits, inline, the deferred create that holds `path` (a rename's
+    /// target, module docs, *Deferred creates*), so the rename sees it. One a
+    /// background save is committing right now refuses the rename
+    /// (`ACCESS_DENIED`, as a rename over an open file does).
+    pub fn commit_created_at(&mut self, path: &str) -> Result<()> {
+        let Ok(entry) = self.lookup_visible(path) else {
+            return Ok(());
+        };
+        if !self.is_deferred(&entry.id) {
+            return Ok(());
+        }
+        self.flush_entity(&entry.id)?;
+        ensure!(
+            !self.is_deferred(&entry.id),
+            "ACCESS_DENIED: the file at the target is being saved"
+        );
+        Ok(())
+    }
+    /// Whether `entity` is a deferred create not committed yet.
+    pub fn is_deferred(&self, entity: &str) -> bool {
+        self.pending_creates
+            .values()
+            .any(|pending| pending == entity)
+    }
+    /// [`Store::lookup`], and the deferred creates (module docs, *Deferred
+    /// creates*): the entry the mount shows at `path`.
+    pub fn lookup_visible(&self, path: &str) -> Result<Entry> {
+        let found = self.store.lookup(path);
+        if found.is_ok() || self.pending_creates.is_empty() {
+            return found;
+        }
+        let Ok((parent, name)) = split_path(path) else {
+            return found;
+        };
+        let (Ok(dir), Ok(key)) = (self.store.lookup(&parent), name_key(&name)) else {
+            return found;
+        };
+        match self
+            .pending_creates
+            .get(&(dir.id, key))
+            .and_then(|entity| self.sessions.get(entity))
+        {
+            Some(session) => Ok(session.entry.clone()),
+            None => found,
+        }
+    }
+    /// The entries the mount shows in `directory`: [`Store::children`] and
+    /// the deferred creates in it.
+    pub fn children_visible(&self, directory: &str) -> Result<Vec<Entry>> {
+        let mut children = self.store.children(directory)?;
+        children.extend(
+            self.pending_creates
+                .range((directory.to_owned(), String::new())..)
+                .take_while(|((parent, _), _)| parent == directory)
+                .filter_map(|(_, entity)| self.sessions.get(entity))
+                .map(|session| session.entry.clone()),
+        );
+        Ok(children)
+    }
+    /// The size the mount shows for `entry`: an open session's bytes, else
+    /// its object's size.
+    pub fn visible_size(&self, entry: &Entry) -> Result<usize> {
+        if let Some(session) = self.sessions.get(&entry.id) {
+            return Ok(session.bytes.len());
+        }
+        Ok(entry
+            .content
+            .as_ref()
+            .map(|object| self.store.object_size(object))
+            .transpose()?
+            .map_or(0, |size| size as usize))
     }
     /// Whether a write or truncate through handle `h` must wait: a save of
     /// its session runs and reads the staging file (module docs, *Saves off
@@ -1634,9 +1877,10 @@ impl Engine {
                 ..Default::default()
             }
         } else if let Some(kind) = create {
+            ensure!(self.lookup_visible(path).is_err(), "NAME_COLLISION");
             self.store.create_with_attributes(path, kind, attributes)?
         } else {
-            self.store.lookup(path)?
+            self.lookup_visible(path)?
         };
         ensure!(
             create.is_some()
@@ -1739,7 +1983,7 @@ impl Engine {
         let directory = self.session(h)?.entry.clone();
         ensure!(directory.kind == "directory", "NOT_DIRECTORY");
         if restart || self.handles[&h].directory.is_none() {
-            let mut children = self.store.children(&directory.id)?;
+            let mut children = self.children_visible(&directory.id)?;
             children.sort_by_key(|entry| entry.name.to_lowercase());
             let mut parent = self
                 .store
@@ -1752,12 +1996,16 @@ impl Engine {
             cut.push((directory, 0));
             cut.push((parent, 0));
             for entry in children {
-                let size = entry
-                    .content
-                    .as_ref()
-                    .map(|object| self.store.object_size(object))
-                    .transpose()?
-                    .unwrap_or(0);
+                let size = if self.is_deferred(&entry.id) {
+                    self.sessions[&entry.id].bytes.len() as u64
+                } else {
+                    entry
+                        .content
+                        .as_ref()
+                        .map(|object| self.store.object_size(object))
+                        .transpose()?
+                        .unwrap_or(0)
+                };
                 cut.push((entry, usize::try_from(size)?));
             }
             self.handles.get_mut(&h).unwrap().directory = Some(cut);
@@ -1863,7 +2111,14 @@ impl Engine {
         let entry = self.session(h)?.entry.clone();
         ensure!(entry.id != "control", "PERMISSION_DENIED");
         ensure!(entry.id != ROOT, "UNSUPPORTED_FS_OPERATION: root metadata");
-        let current = self.store.entry(&entry.id)?;
+        // A deferred create keeps its basic information in its session until
+        // its first save commits it (module docs, *Deferred creates*).
+        let deferred = self.is_deferred(&entry.id);
+        let current = if deferred {
+            entry.clone()
+        } else {
+            self.store.entry(&entry.id)?
+        };
         let mut basic = current.basic_info();
         if attributes != u32::MAX {
             basic.attributes = BasicInfo::attributes(&entry.kind, attributes)?;
@@ -1884,7 +2139,16 @@ impl Engine {
                 _ => bail!("INVALID_TIMESTAMP"),
             }
         }
-        self.store.set_basic(&entry.id, basic)?;
+        if deferred {
+            // `Store::set_basic`'s checks, without its commit.
+            basic.validate()?;
+            ensure!(
+                basic.attributes == BasicInfo::attributes(&entry.kind, basic.attributes)?,
+                "INVALID_ATTRIBUTES"
+            );
+        } else {
+            self.store.set_basic(&entry.id, basic)?;
+        }
         self.handles.get_mut(&h).unwrap().time_update_disabled = disabled;
         let s = self.sessions.get_mut(&entry.id).unwrap();
         s.entry.basic = Some(basic);
@@ -2462,6 +2726,28 @@ pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
     }
 }
 
+/// Waits (without the engine lock) until no save of handle `h`'s file runs
+/// while that file is a deferred create (module docs, *Deferred creates*),
+/// then returns the engine locked: the caller's inline save
+/// ([`Engine::flush`]) commits the creation before a rename or a delete of
+/// the file. Bounded only by the saves themselves.
+pub fn lock_created(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
+    loop {
+        let e = super::lock_engine(engine);
+        let Some(seen) = e
+            .session(h)
+            .ok()
+            .filter(|s| s.saving && e.is_deferred(&s.entry.id))
+            .map(|_| e.saves.generation())
+        else {
+            return e;
+        };
+        let signal = e.save_signal();
+        drop(e);
+        signal.wait_past(seen, SAVE_WAIT_SLICE);
+    }
+}
+
 /// The longest single wait for a save's end before the waiter looks again.
 const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 
@@ -2503,6 +2789,13 @@ fn savers() -> &'static Savers {
         state: Mutex::new(SaversState::default()),
         wake: std::sync::Condvar::new(),
     })
+}
+
+/// Whether the mount defers the commit of a file's creation to its first save
+/// (module docs, *Deferred creates*); `TKFS_DEFERRED_CREATE=0` turns it off.
+pub fn deferred_creates() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TKFS_DEFERRED_CREATE").as_deref() != Ok("0"))
 }
 
 /// How long after a save ended the next close still counts as part of a
@@ -2726,6 +3019,13 @@ pub fn settle_entity(engine: &Shared, entity: &str) -> Result<()> {
             let Some(session) = e.sessions.get(entity) else {
                 return Ok(());
             };
+            if !session.saving && e.is_deferred(entity) {
+                // Its name must be in the store before anything replaces
+                // or removes it: saved even while a handle writes it.
+                drop(e);
+                save_entity(engine, entity)?;
+                continue;
+            }
             if !session.saving {
                 let writing = e
                     .handles
@@ -2749,11 +3049,11 @@ pub fn settle_entity(engine: &Shared, entity: &str) -> Result<()> {
     }
 }
 
-/// [`settle_entity`] for the entity at `path`, if one is there.
+/// [`settle_entity`] for the entity at `path`, if one is there (a deferred
+/// create too).
 pub fn settle_path(engine: &Shared, path: &str) -> Result<()> {
     let entity = super::lock_engine(engine)
-        .store
-        .lookup(path)
+        .lookup_visible(path)
         .ok()
         .map(|entry| entry.id);
     match entity {

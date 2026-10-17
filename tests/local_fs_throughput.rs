@@ -12,6 +12,10 @@
 //! * Reads of content still downloading wait while it progresses
 //!   (CCR-WP4.INT-2), end on a stall, a fence or the wait bound, and are
 //!   bounded in number.
+//! * A file created through the mount commits with its first save, in one
+//!   event (deferred creates): visible meanwhile, retained and restored like
+//!   any unsaved file, committed before a rename or a delete of it, and a
+//!   crash at every step of its first save leaves a consistent store.
 //!
 //! The mounted scenarios need WinFsp or FUSE and pass without checking when
 //! the machine has neither. The mount adapter is one per process and fault
@@ -682,9 +686,14 @@ fn save_crash_worker() {
         .unwrap()
         .parse()
         .unwrap();
+    let deferred = std::env::var("TKFS_TEST_SAVE_DEFERRED").is_ok();
     let h = {
         let mut e = lock(&engine);
-        let (h, _) = e.open("f.bin", None, true).unwrap();
+        let (h, _) = if deferred {
+            e.create_deferred("new.bin", true, None).unwrap()
+        } else {
+            e.open("f.bin", None, true).unwrap()
+        };
         e.write(h, 0, &bytes(5, size), false, false).unwrap();
         if retained {
             e.retain_all_dirty().unwrap();
@@ -765,6 +774,293 @@ fn a_crash_at_every_step_of_a_save_keeps_the_last_committed_bytes() {
             }
         }
     }
+}
+
+/// Events in the journal.
+fn events(e: &Engine) -> i64 {
+    e.store
+        .db
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_file_created_through_the_mount_commits_with_its_first_save() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    let creation = 133_500_000_000_000_000u64;
+    let write = 133_600_000_000_000_000u64;
+    let (h, entity, before) = {
+        let mut e = lock(&engine);
+        e.store.create("d", "directory").unwrap();
+        let before = events(&e);
+        let (h, entry) = e.create_deferred("d/New.txt", true, None).unwrap();
+        assert_eq!(events(&e), before, "nothing is committed at the create");
+        assert!(e.store.lookup("d/New.txt").is_err());
+        assert!(e.is_deferred(&entry.id));
+        // The mount shows it, under any case of its name.
+        assert_eq!(e.lookup_visible("d/new.TXT").unwrap().id, entry.id);
+        let d = e.store.lookup("d").unwrap().id;
+        let names: Vec<_> = e
+            .children_visible(&d)
+            .unwrap()
+            .into_iter()
+            .map(|child| child.name)
+            .collect();
+        assert_eq!(names, ["New.txt"]);
+        // A second create of the name, a file's or a directory's, collides.
+        let again = e.create_deferred("d/NEW.txt", true, None).map(|_| ());
+        let directory = e.open("d/new.txt", Some("directory"), false).map(|_| ());
+        for create in [again, directory] {
+            assert!(
+                format!("{:#}", create.unwrap_err()).contains("NAME_COLLISION"),
+                "a second create collides"
+            );
+        }
+        // A second open shares the session.
+        let (second, same) = e.open("d/new.txt", None, false).unwrap();
+        assert_eq!(same.id, entry.id);
+        e.release_handle(second).unwrap();
+        e.write(h, 0, b"hello", false, false).unwrap();
+        // Times set before the first save stay in the session.
+        e.set_basic(h, u32::MAX, [creation, 0, write, 0]).unwrap();
+        assert_eq!(events(&e), before, "still nothing committed");
+        assert!(e.quiet().is_err(), "an uncommitted create is unsaved");
+        (h, entry.id, before)
+    };
+    engine::save_handle(&engine, h).unwrap();
+    let mut e = lock(&engine);
+    assert_eq!(
+        events(&e),
+        before + 1,
+        "one event creates the file with its content"
+    );
+    assert!(!e.is_deferred(&entity));
+    let committed = e.store.lookup("d/New.txt").unwrap();
+    assert_eq!(committed.id, entity);
+    assert_eq!(content(&e, "d/New.txt"), b"hello");
+    let basic = committed.basic_info();
+    assert_eq!(basic.creation_time, creation);
+    assert_eq!(basic.write_time, write, "a time set explicitly is kept");
+    assert_ne!(basic.attributes & 0x20, 0, "saved: archive");
+    e.close(h).unwrap();
+    assert_eq!(events(&e), before + 1, "a clean close commits nothing");
+    assert!(e.quiet().is_ok());
+    let d = e.store.lookup("d").unwrap().id;
+    assert_eq!(e.children_visible(&d).unwrap().len(), 1, "listed once");
+    assert!(pending_rows(&e).is_empty());
+    no_conflicts(&e);
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
+#[test]
+fn a_deferred_create_is_committed_before_anything_replaces_or_removes_its_name() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    // A rename's target held by a writer: settled (committed) at once.
+    let (held, held_entity) = {
+        let mut e = lock(&engine);
+        let (h, entry) = e.create_deferred("target.txt", true, None).unwrap();
+        e.write(h, 0, b"held", false, false).unwrap();
+        (h, entry.id)
+    };
+    engine::settle_path(&engine, "target.txt").unwrap();
+    {
+        let mut e = lock(&engine);
+        assert!(!e.is_deferred(&held_entity));
+        assert_eq!(e.store.lookup("target.txt").unwrap().id, held_entity);
+        assert_eq!(content(&e, "target.txt"), b"held");
+        // The writer goes on; its later bytes are saved as usual.
+        e.write(held, 4, b" on", false, false).unwrap();
+        e.close(held).unwrap();
+        assert_eq!(content(&e, "target.txt"), b"held on");
+        // In line, under the lock (the mount's rename, after a race).
+        let (h, entry) = e.create_deferred("other.txt", true, None).unwrap();
+        e.write(h, 0, b"other", false, false).unwrap();
+        e.commit_created_at("other.txt").unwrap();
+        assert!(!e.is_deferred(&entry.id));
+        assert_eq!(content(&e, "other.txt"), b"other");
+        e.close(h).unwrap();
+        // A committed file renamed over one replaces it, without conflict.
+        let source = committed_file(&mut e, "source.txt", b"replacement");
+        let (h, replaced) = e.create_deferred("replaced.txt", true, None).unwrap();
+        e.write(h, 0, b"replaced", false, false).unwrap();
+        e.release_handle(h).unwrap();
+        drop(e);
+        engine::settle_path(&engine, "replaced.txt").unwrap();
+        let mut e = lock(&engine);
+        e.store.rename(&source, "replaced.txt", true).unwrap();
+        assert_eq!(content(&e, "replaced.txt"), b"replacement");
+        assert!(!e.store.entry(&replaced.id).unwrap().alive);
+        // A delete: the creation commits, then the delete.
+        let (h, doomed) = e.create_deferred("doomed.txt", true, None).unwrap();
+        e.write(h, 0, b"short lived", false, false).unwrap();
+        e.cleanup(h, true).unwrap();
+        e.close(h).unwrap();
+        assert!(e.store.lookup("doomed.txt").is_err());
+        assert!(e.lookup_visible("doomed.txt").is_err());
+        assert!(!e.store.entry(&doomed.id).unwrap().alive);
+    }
+    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
+        .quiet()
+        .is_ok()));
+    let mut e = lock(&engine);
+    assert!(e.sessions.is_empty());
+    assert!(pending_rows(&e).is_empty());
+    no_conflicts(&e);
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
+#[test]
+fn a_retained_deferred_create_is_shown_again_after_a_restart_and_committed_once() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let data = bytes(9, 100_000);
+    let entity = {
+        let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+        let (h, entry) = e.create_deferred("kept.bin", true, None).unwrap();
+        e.write(h, 0, &data, false, false).unwrap();
+        // A force detach: the file is retained, the engine goes unsaved.
+        assert_eq!(e.retain_all_dirty().unwrap(), 1);
+        entry.id
+    };
+    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    assert!(e.store.lookup("kept.bin").is_err());
+    assert!(e.is_deferred(&entity), "restored as a deferred create");
+    assert_eq!(e.lookup_visible("kept.bin").unwrap().id, entity);
+    assert!(e.quiet().is_err(), "unsaved until committed");
+    let before = events(&e);
+    e.retry_pending().unwrap();
+    assert_eq!(events(&e), before + 1, "committed once, in one event");
+    assert!(!e.is_deferred(&entity));
+    assert_eq!(content(&e, "kept.bin"), data);
+    assert!(pending_rows(&e).is_empty());
+    no_conflicts(&e);
+    drop(e);
+    // A restart after the commit shows it once.
+    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    assert!(!e.is_deferred(&entity));
+    let listed = e.children_visible(ROOT).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .filter(|child| child.name == "kept.bin")
+            .count(),
+        1
+    );
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
+#[test]
+fn a_crash_at_every_step_of_the_first_save_of_a_deferred_create_leaves_a_consistent_store() {
+    let _serial = serial();
+    let points = [
+        ("engine.save.snapshot", false),
+        ("engine.save.store", false),
+        ("engine.save.flushed", false),
+        ("engine.save.installed", false),
+        ("engine.save.commit", false),
+        ("engine.save.committed", true),
+        ("object_flushed", false),
+        ("object_installed", false),
+    ];
+    for retained in [false, true] {
+        for (point, committed) in points {
+            let size = 4096usize;
+            let dir = tempfile::tempdir().unwrap();
+            drop(Engine::new(
+                Store::open(dir.path(), Some("local-fs")).unwrap(),
+            ));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "save_crash_worker", "--nocapture"])
+                .env("TKFS_TEST_SAVE_WORKER", dir.path())
+                .env("TKFS_TEST_SAVE_SIZE", size.to_string())
+                .env("TKFS_TEST_SAVE_DEFERRED", "1");
+            if point.starts_with("object_") {
+                child.env("TKFS_FAULT", point);
+            } else {
+                child
+                    .env("TKFS_FAULT_POINT", point)
+                    .env("TKFS_FAULT_ACTION", "exit");
+            }
+            if retained {
+                child.env("TKFS_TEST_SAVE_RETAINED", "1");
+            }
+            let output = child.output().unwrap();
+            let what = format!("{point}, retained {retained}");
+            assert_eq!(
+                output.status.code(),
+                Some(86),
+                "{what}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+            e.remove_orphaned_spools().unwrap();
+            assert!(part_files(dir.path()).is_empty(), "{what}");
+            let latest = bytes(if retained { 6 } else { 5 }, size);
+            if committed {
+                assert_eq!(content(&e, "new.bin"), latest, "{what}");
+            } else if retained {
+                // Restored, shown, and committed by its save.
+                assert!(e.store.lookup("new.bin").is_err(), "{what}");
+                assert!(e.lookup_visible("new.bin").is_ok(), "{what}");
+                e.retry_pending().unwrap();
+                assert_eq!(content(&e, "new.bin"), latest, "{what}");
+            } else {
+                // Never committed, never retained: only the new file is lost.
+                assert!(e.lookup_visible("new.bin").is_err(), "{what}");
+                assert!(e.sessions.is_empty(), "{what}");
+            }
+            assert!(pending_rows(&e).is_empty(), "{what}");
+            no_conflicts(&e);
+            let diff = e.store.verify_derived_state().unwrap();
+            assert!(diff.is_empty(), "{what}: {diff:?}");
+        }
+    }
+}
+
+#[test]
+fn deferred_create_switch_worker() {
+    let Ok(root) = std::env::var("TKFS_TEST_DEFERRED_SWITCH") else {
+        return;
+    };
+    assert!(!engine::deferred_creates());
+    let mut e = Engine::new(Store::open(Path::new(&root), Some("local-fs")).unwrap());
+    let (h, entry) = e.create_deferred("at-once.txt", true, None).unwrap();
+    assert!(!e.is_deferred(&entry.id));
+    assert_eq!(e.store.lookup("at-once.txt").unwrap().id, entry.id);
+    e.write(h, 0, b"switched off", false, false).unwrap();
+    e.close(h).unwrap();
+    std::process::exit(0);
+}
+
+#[test]
+fn deferred_creates_can_be_switched_off() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    drop(Engine::new(
+        Store::open(dir.path(), Some("local-fs")).unwrap(),
+    ));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "deferred_create_switch_worker", "--nocapture"])
+        .env("TKFS_TEST_DEFERRED_SWITCH", dir.path())
+        .env("TKFS_DEFERRED_CREATE", "0")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    assert_eq!(content(&e, "at-once.txt"), b"switched off");
+    no_conflicts(&e);
 }
 
 // ---------------------------------------------------------------------------
@@ -1107,6 +1403,61 @@ fn many_concurrent_writers_never_stall_the_mount() {
     for (relative, data) in &written {
         assert_eq!(&content(&e, relative), data, "{relative}");
     }
+    assert!(pending_rows(&e).is_empty());
+    no_conflicts(&e);
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn a_file_held_open_after_its_create_is_listed_renamed_and_deleted_through_the_mount() {
+    use std::io::Write;
+    let _serial = serial();
+    let Some(m) = mounted::Mounted::new() else {
+        return;
+    };
+    let held_path = m.mount.join("held.txt");
+    let mut held = fs::File::create(&held_path).unwrap();
+    held.write_all(b"first part").unwrap();
+    // Shown at once. A WinFsp create commits at its first save; any close of
+    // the file saves it, the stat's own (or a scanner's) too, so whether it
+    // is committed yet is not checked here.
+    assert!(fs::metadata(&held_path).unwrap().is_file());
+    let listed: BTreeSet<_> = fs::read_dir(&m.mount)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(listed.contains(std::ffi::OsStr::new("held.txt")));
+    // A second exclusive create of the name fails.
+    let again = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(m.mount.join("held.txt"));
+    assert_eq!(again.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    // A rename of the held file commits its creation first.
+    fs::rename(&held_path, m.mount.join("renamed.txt")).unwrap();
+    {
+        let e = lock(&m.engine);
+        assert!(e.store.lookup("renamed.txt").is_ok());
+        assert!(e.lookup_visible("held.txt").is_err());
+    }
+    held.write_all(b", second part").unwrap();
+    drop(held);
+    // A file created and deleted while it is held open (the FUSE adapter
+    // refuses to unlink an open file: deleted after its close there).
+    let gone_path = m.mount.join("gone.txt");
+    let mut gone = fs::File::create(&gone_path).unwrap();
+    gone.write_all(b"short lived").unwrap();
+    #[cfg(windows)]
+    fs::remove_file(&gone_path).unwrap();
+    drop(gone);
+    #[cfg(not(windows))]
+    fs::remove_file(&gone_path).unwrap();
+    assert!(m.quiet(Duration::from_secs(30)), "everything is committed");
+    assert!(!gone_path.exists());
+    let e = lock(&m.engine);
+    assert_eq!(content(&e, "renamed.txt"), b"first part, second part");
+    assert!(e.lookup_visible("gone.txt").is_err());
+    assert!(e.lookup_visible("held.txt").is_err());
     assert!(pending_rows(&e).is_empty());
     no_conflicts(&e);
 }
