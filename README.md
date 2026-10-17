@@ -353,9 +353,10 @@ the folder are ignored.
 
 | State | CLI | Desktop chip | Meaning |
 |---|---|---|---|
-| Stopped | `stopped` | `Stopped [Start]`, or `Not syncing — <lifecycle>` | The folder is stopped, or its worker is not running yet (starting, restarting, stopping). |
+| Stopped | `stopped` | `Stopped [Start]` | The folder is stopped (and not asked to run). |
 | Needs attention | `needs attention` | `Needs attention: <reason> [action]` | The worker failed (crash loop, start failure), the initial-sync gate is blocked, the mount failed with an error you must fix, or a folder error needs action. |
-| Paused | `paused` | `Paused [Resume]` | Sync is paused for this folder (`manage resume`). |
+| Paused | `paused` | `Paused [Resume]` | Sync is paused for this folder (`manage resume`), also while its worker starts or stops. |
+| Stopped | `stopped` | `Not syncing — <lifecycle>` | Its worker is not running yet (starting, restarting, stopping). |
 | Not shared | `not shared` | `Not shared with any peer` | No paired peer has this repository. |
 | Stalled | `stalled` | `Stalled N min — CODE …` | A peer that shares the folder is connected and has work left, but nothing progressed for the stall threshold. |
 | Initial sync | `initial sync` | `Initial sync from <peer> · N of M events` | A received folder waits for its initial sync before mounting. |
@@ -403,7 +404,7 @@ up`, `last exchange`.
 | `offline for …` | `Offline N min` | No lane and no inbound session. |
 | `needs upgrade (incompatible protocol)` | `Peer needs upgrade` | The peer runs the previous release or an incompatible protocol; rechecked every 10 min. |
 | `unauthorized: pair again with the current code` | `Unauthorized — re-pair` | The peer refused our pairing code or our per-peer credential (code rotated or wrong, credential revoked); rechecked every 60 s. |
-| `revoked` | `Revoked` | The per-peer credential between the two hosts was revoked (`PEER_REVOKED`), by an unpair or by a rotation of the accepting host's code. Pair again with that host's current code. |
+| `revoked` | `Revoked` | Reserved; this release does not show it. A refused per-peer credential (`PEER_REVOKED`: an unpair or a rotation of the accepting host's code revoked it) is dropped and the dialer retries with its pairing code: it reconnects (and enrolls a new credential) when that code is still accepted, and reads `unauthorized` when it is not. |
 
 Direction: `outbound` (we dial it), `inbound` (it dials us; we have no
 pairing record for it), `both ways`. Lanes: lane 0 is the control lane
@@ -453,6 +454,15 @@ peer (the *source*):
 If the source is unpaired, the gate switches to another peer that shares the
 folder.
 
+The gate is about metadata: once it opens, the mount lists every file with
+its size, while file content may still be downloading. Opening such a file
+moves its download to the front; a read waits for the whole object for up to
+15 s and then fails as offline (Windows: `STATUS_FILE_IS_OFFLINE`, which
+many programs report as "invalid argument"; Linux: `EAGAIN`). Reading it
+again after the download (the folder's `downloading` row) succeeds. The
+two-machine lab hit this with a 512 MiB file opened 3 s after the mount
+attached ([validation](docs/VALIDATION.md#two-machine-lab)).
+
 ### Three separate claims
 
 - **Metadata caught up** (per peer): we have read the peer's whole feed and
@@ -473,7 +483,8 @@ culprit (the last error's code and object or event) is named.
 ## Error classes and what to do
 
 Every error has a code (`SCREAMING_CASE`), a class and a scope (daemon,
-folder, mount, peer, lane, folder-peer pair, object, event). Errors clear on
+folder, mount, peer, lane, folder-peer pair, object, event, or an endpoint
+that is not a paired peer, e.g. a refused pairing). Errors clear on
 the next success in the same scope; the status keeps the last 50 with when
 they were resolved.
 

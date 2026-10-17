@@ -203,11 +203,13 @@ closed at once) and 128 sessions (`GOAWAY{TOO_MANY_SESSIONS}`); pre-auth
 messages ≤ 16 KiB and ≤ 5 s per step. Each session gets a handler pool (4
 threads for control, 2 for bulk, queue 16; full → `BUSY`). Requests are
 checked in order: daemon not stopping, the session's verifier generation still
-current, the op allowed on the session's role (`meta.exchange` and
-`catalog.list` only on control, `objects.*` only on bulk), the folder running
+current, the op allowed on the session's role (`meta.exchange` only on
+control, `catalog.list` on control and probe sessions, `objects.*` only on
+bulk), the folder running
 (`REMOTE_WORKER_STARTING`) and not paused (`FOLDER_SYNC_PAUSED`). Exchanges run
-on their own threads, bounded per session and server-wide, so a hung worker
-never holds a handler. A rotation of this host's pairing code revokes every
+on their own threads, bounded per session (4 on a bulk session, the
+dialer's 4 peer calls per lane) and server-wide, so a hung worker never holds
+a handler. A rotation of this host's pairing code revokes every
 per-peer credential and sends `GOAWAY{PAIRING_CODE_CHANGED}` to older
 sessions within a second. `peer.enroll` stores a dialer's per-peer
 credential; `peer.revoke` (a dialer's unpair) revokes it and closes that
@@ -336,14 +338,46 @@ while the activator is idle, objects not verified for 7 days).
 
 ### Startup snapshots
 
-Each branch has a disposable startup snapshot: the projection, conflicts,
-frontier and the acceptance cursor, checksummed and bound to the journal
-prefix. A start resumes it and replays at most 1,024 events after it;
-anything else (missing, damaged, incompatible, edits outside the incremental
-rules) falls back to a full rebuild. Seals happen with full-replay commits and
-periodically every `sealed payload / 4 KiB` events (between 128 and 1,024).
-Triggers on `events` keep `journal_sequence` and invalidate snapshots even when
-an older binary writes the journal.
+Each branch has a disposable startup snapshot (format 2): an anchor row in
+`startup_snapshots` (identity, the acceptance cursor, the frontier and the
+journal binding, checksummed) plus, for a large projection, sealed rows. A
+start resumes it and replays at most 1,024 events after it; anything else
+(missing, damaged, incompatible, edits outside the incremental rules, a row
+that does not match the anchor's digest) falls back to a full rebuild.
+
+- **Layouts.** While the anchor stays within 1 MiB it holds the whole
+  projection and every conflict row (**inline**, as format 1 did). A larger
+  projection is sealed as **rows**: the anchor keeps only the projection's
+  header and an order-independent digest of the rows, and
+  `snapshot_entries` / `snapshot_conflicts` hold one row per entity and per
+  conflict.
+- **Incremental seals.** Triggers on `current_parts` and `conflicts` mark
+  every changed entity and conflict row in `snapshot_dirty`, in the writing
+  transaction; a seal rewrites the anchor and only the marked rows, then
+  clears the marks in the same transaction, so a seal costs O(change)
+  whatever the projection's size. A rebuild (whose change is unknown) seals
+  in full, and so does a seal that finds anything unreadable in the snapshot
+  tables.
+- **Journal binding.** The anchor stores the journal hash and its resumable
+  state, so a seal hashes only its own branch's journal rows since the
+  previous seal, through the trigger-maintained per-branch index
+  `journal_branch(seq, branch)`; a start recomputes the hash from the
+  journal and checks it.
+- **Cadence.** Seals happen with full-replay commits and periodically every
+  `sealed payload / 4 KiB` events (between 128 and 1,024; a rows anchor is
+  small, so a large projection seals every 128 events). A restore writes
+  only the projection rows that differ from the sealed ones, so an open at
+  the tip writes nothing.
+- **Stored projection header.** `current_meta` holds the projection's
+  conflict and pending lists when they differ from `current_state`'s, so a
+  conflict-producing commit writes a delta instead of the whole projection.
+- **Downgrade.** An older binary finds a format-2 anchor incompatible and
+  reconstructs every branch at its first open (rewriting `current_state`),
+  then seals format 1; it never reads the side tables, which this binary's
+  next full seal replaces.
+
+Triggers on `events` keep `journal_sequence` (and `journal_branch`) and
+invalidate snapshots even when an older binary writes the journal.
 
 ## Protocol v3
 
@@ -400,10 +434,12 @@ received for 20 s is dead. Each call has its own deadline (and an idle
 deadline for streams, reset by PROGRESS); an expired call is cancelled with
 CANCEL and fails as `Timeout`. A remote error leaves the session usable; a
 lost session makes its calls uncertain, and they are never replayed. GOAWAY
-stops new requests; calls in flight finish. On Windows the receive buffer is
-4 MiB and the send buffer follows the drain rate (64 KiB to 4 MiB); on Linux
-unsent bytes are bounded at 256 KiB, so control frames never queue behind
-megabytes of data.
+stops new requests; calls in flight finish. On Windows, a session to this
+machine's loopback gets a 4 MiB receive buffer and a send buffer sized for
+two 10 ms horizons at its drain rate (64 KiB to 4 MiB); any other socket
+keeps the system's autotuning (a fixed window would cap a long link). On
+Linux unsent bytes are bounded at 256 KiB on every socket, so control frames
+never queue behind megabytes of data.
 
 | Op | Lane | Deadline |
 |---|---|---|
@@ -412,6 +448,8 @@ megabytes of data.
 | `meta.exchange` | control | idle 30 s (every reply frame restarts it), 30 min cap |
 | `objects.pull`, `objects.push` | bulk | idle 30 s |
 | `objects.wants`, `objects.report` | bulk | 10 s |
+| `peer.enroll` | any (the dialer sends it on lane 0) | 10 s |
+| `peer.revoke` | any (lane 0, or a probe session) | 2 s |
 
 ### Metadata feed (format 7)
 
@@ -467,10 +505,18 @@ Content moves on the bulk lanes, driven by the dialer in both directions:
 
 Objects are sharded across a session's bulk lanes by hash, and worker leases
 (60 s, renewed only by progress) keep two sessions or peers from moving the
-same object. A lane runs at most 2 repositories at once; a pull reserves at
-most its repository's share of the lane's 16 MiB window; pushes leave a peer
-slot free for pulls. An object its source cannot serve is handed to another
-source of the daemon under the same lease.
+same object. A lane runs at most 2 repositories at once and makes at most 4
+`objects.*` calls on the peer at once (the acceptor's exchange slots per bulk
+session); a pull reserves at most its repository's share of the lane's
+16 MiB window; one upload round runs at a time, so pushes leave peer calls
+for pulls. A source that cannot serve an object gives its lease up: the
+dialer's `objects.want` excludes the objects in their backoff for that
+source (`exclude`, at most 256) and `objects.release` ends the leases of a
+failed or abandoned round, so another session or peer takes the object in
+its next round instead of waiting for the lease to lapse. A key whose round
+found nothing to do (nothing wanted, offered, excluded or pushed) is
+rechecked after 5 s (the sync interval when that is longer); its triggers
+(feed tips, content generations, staging) still run it at once.
 
 **Durability.** A spool's durable offset (`spool_state`) advances only after
 fsync; a write must start exactly there, and overlaps are compared byte for
