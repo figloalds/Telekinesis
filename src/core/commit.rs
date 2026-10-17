@@ -561,11 +561,10 @@ impl Store {
         }
     }
     pub(super) fn commit_ready(&mut self, event: Event, local: bool) -> Result<()> {
-        let Check::Ready(checked) = derive::timed("c.check", || self.check_commit(&event, local))?
-        else {
+        let Check::Ready(checked) = self.check_commit(&event, local)? else {
             return Ok(());
         };
-        let fast = derive::timed("c.fast_successor", || self.fast_successor(&event, local))?;
+        let fast = self.fast_successor(&event, local)?;
         self.commit_checked(event, local, checked, fast)
     }
     /// Every validation of the commit path that needs no projection.
@@ -737,14 +736,17 @@ impl Store {
     /// replay would refuse it with `NAMESPACE_HISTORY_LIMIT` (module docs).
     fn check_namespace_successor(&self, event: &Event, committed_view: bool) -> Result<()> {
         let branch = event.branch.id.as_str();
-        self.with_branch_events(branch, Some(event), committed_view, |events| {
+        self.with_branch_index(branch, Some(event), committed_view, |events, index| {
             let new = events.len() - 1;
             if !derive::successor_may_add_cuts(events, new) {
                 return Ok(());
             }
             let counted = &self.caches.commit.successor_checks;
             counted.set(counted.get().saturating_add(1));
-            derive::check_successor_cuts(branch, events, new)
+            if let Some(cell) = index {
+                derive::ensure_index(cell, &events[..new]);
+            }
+            derive::check_successor_cuts(branch, events, new, index)
         })?
     }
     /// CCR-WP4.4-5: refuse a content successor commit exactly when full
@@ -765,14 +767,17 @@ impl Store {
             return Ok(());
         }
         let branch = event.branch.id.as_str();
-        self.with_branch_events(branch, Some(event), committed_view, |events| {
+        self.with_branch_index(branch, Some(event), committed_view, |events, index| {
             let new = events.len() - 1;
             if !derive::content_successor_may_add_cuts(events, new) {
                 return Ok(());
             }
             let counted = &self.caches.commit.successor_checks;
             counted.set(counted.get().saturating_add(1));
-            derive::check_successor_cuts(branch, events, new)
+            if let Some(cell) = index {
+                derive::ensure_index(cell, &events[..new]);
+            }
+            derive::check_successor_cuts(branch, events, new, index)
         })?
     }
     /// How many namespace successor commits had their competing cuts counted
@@ -911,7 +916,7 @@ impl Store {
     /// happens only if the branch is still in that state (`commit_prepared`).
     fn projection_delta(&self, branch: &str, p: &Projection) -> Stored {
         self.drop_rolled_back_view();
-        let Ok(view) = derive::timed("s.view", || self.view(branch)) else {
+        let Ok(view) = self.view(branch) else {
             return Stored::Rewrite;
         };
         let stored = &view.projection;
@@ -1026,28 +1031,23 @@ impl Store {
         // The stored projection of the branch, as this handle's view: the
         // base of `derive::project_append` (WP5.1). It is consumed; a
         // committing slow commit leaves its own projection as the view.
-        let (base, base_slots) = match derive::timed("s.view", || self.take_view(branch)) {
+        let (base, base_slots) = match self.take_view(branch) {
             Some((base, slots)) => (Some(base), Some(slots)),
             None => (None, None),
         };
-        let computed = derive::timed("s.compute", || {
-            let t0 = std::time::Instant::now();
+        let computed =
             self.with_branch_index(branch, Some(event), committed_view, |events, index| {
-                derive::record_phase("s.events", t0.elapsed().as_micros() as u64);
                 let new = events.len() - 1;
                 // The index of the cached events, built once per cache entry.
-                if let Some(cell) = index
-                    && cell.borrow().is_none()
-                {
-                    let built = derive::timed("s.index", || derive::BranchIndex::build(&events[..new]));
-                    *cell.borrow_mut() = Some(built);
+                if let Some(cell) = index {
+                    derive::ensure_index(cell, &events[..new]);
                 }
                 let appended = match base {
-                    Some(base) => derive::timed("s.append", || {
+                    Some(base) => {
                         let index = index.map(|cell| cell.borrow());
                         let index = index.as_deref().and_then(Option::as_ref);
-                        derive::project_append(branch, base, events, new, index)
-                    })?,
+                        derive::project_append(branch, base, events, new, index)?
+                    }
                     None => None,
                 };
                 let (projection, delta, carried) = match appended {
@@ -1057,7 +1057,7 @@ impl Store {
                         Some(appended.carried),
                     ),
                     None => (
-                        derive::timed("s.project", || project(branch, events))?,
+                        project(branch, events)?,
                         None,
                         None,
                     ),
@@ -1076,8 +1076,7 @@ impl Store {
                     return Ok(None);
                 }
                 let reviewed = derive::read_reviewed(&self.db, branch, event)?;
-                let derived = derive::timed("s.derive", || {
-                    derive_conflicts(&DeriveInput {
+                let derived = derive_conflicts(&DeriveInput {
                         branch,
                         projection: &projection,
                         events,
@@ -1085,11 +1084,9 @@ impl Store {
                         reviewed: &reviewed,
                         stored: carried.as_ref(),
                         index,
-                    })
-                })?;
+                    })?;
                 Ok::<_, anyhow::Error>(Some((projection, derived, delta)))
-            })
-        })??;
+            })??;
         let Some((projection, derived, delta)) = computed else {
             return Ok(None);
         };
@@ -1165,10 +1162,7 @@ impl Store {
         if crate::util::fault::hit(BUSY_FAULT).is_some() {
             return Err(injected_busy().into());
         }
-        let slow = matches!(plan, Plan::Slow(_));
-        let result = derive::timed(if slow { "w.slow" } else { "w.fast" }, || {
-            self.write_commit_inner(event, local, checked, plan, view_base)
-        });
+        let result = self.write_commit_inner(event, local, checked, plan, view_base);
         if result.is_err() {
             // The view may have been patched for the seal.
             self.view_cache.borrow_mut().take();
@@ -1274,9 +1268,7 @@ impl Store {
                     tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload", params![branch, state])?;
                     snapshot::clear_header(&tx, &branch)?;
                 }
-                derive::timed("w.write_projection", || {
-                    derive::write_projection(&tx, &branch, &slow.derived)
-                })?;
+                derive::write_projection(&tx, &branch, &slow.derived)?;
             }
         }
         for parent in event
@@ -1351,20 +1343,18 @@ impl Store {
                     Stored::Rewrite => snapshot::Changed::All,
                 };
                 let lists_unchanged = matches!(slow.stored, Stored::Delta { header: false, .. });
-                let report = derive::timed("w.seal_slow", || {
-                    snapshot::seal(
-                        &tx,
-                        &branch,
-                        snapshot::Seal {
-                            cursor: Some(seq),
-                            projection: Some(&slow.projection),
-                            json: slow.json.as_deref(),
-                            changed,
-                            anchors: Some(&self.caches.commit.anchors),
-                            lists_unchanged,
-                        },
-                    )
-                })?;
+                let report = snapshot::seal(
+                    &tx,
+                    &branch,
+                    snapshot::Seal {
+                        cursor: Some(seq),
+                        projection: Some(&slow.projection),
+                        json: slow.json.as_deref(),
+                        changed,
+                        anchors: Some(&self.caches.commit.anchors),
+                        lists_unchanged,
+                    },
+                )?;
                 record_seal(&self.caches.commit, &report);
                 if report.used_json {
                     let seals = &self.caches.commit.prepared_seals;
@@ -1635,7 +1625,6 @@ impl Store {
         if tip == cache.upto {
             return Ok((total == cache.total).then_some(cache));
         }
-        let t0 = std::time::Instant::now();
         let mut statement = self.db.prepare_cached(
             "SELECT s.seq,e.id,e.branch=?1,CASE WHEN e.branch=?1 THEN e.payload END FROM journal_sequence s CROSS JOIN events e ON e.id=s.event WHERE s.seq>?2 ORDER BY s.seq",
         )?;
@@ -1671,7 +1660,6 @@ impl Store {
                 .rows
                 .extend(read);
         }
-        derive::record_phase("s.ev.read", t0.elapsed().as_micros() as u64);
         if !added.is_empty() {
             added.sort_by(|a, b| a.id.cmp(&b.id));
             let old = std::mem::take(&mut cache.events);
@@ -1695,9 +1683,7 @@ impl Store {
             cache.events = merged;
             // The index follows the cache, or is dropped (rebuilt on demand).
             let follows = match cache.index.get_mut() {
-                Some(index) => {
-                    derive::timed("s.ev.index", || index.extend(&cache.events, &positions))?
-                }
+                Some(index) => index.extend(&cache.events, &positions)?,
                 None => true,
             };
             if !follows {
