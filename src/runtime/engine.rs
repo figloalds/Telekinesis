@@ -47,12 +47,16 @@
 //!   (`ACCESS_DENIED`) until that branch is checked out, which restores the
 //!   record, or the record is discarded. It is not retried while its branch
 //!   is not active; a checkout makes every unrestored record due at once.
-use super::notify::{NotifyQueue, delta_notifications};
+use super::{
+    Shared,
+    notify::{NotifyQueue, delta_notifications},
+};
 use crate::core::{inbox::SliceBudget, *};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Write;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -70,6 +74,13 @@ pub struct Session {
     pub dirty: bool,
     pub references: usize,
     pub preserve_times: u8,
+    /// Bumped by every change of `bytes` (write, truncate): a save commits
+    /// the snapshot it took, and leaves the session dirty when it moved since.
+    pub edits: u64,
+    /// A save of this session runs ([`Engine::begin_save`] to
+    /// [`Engine::finish_save`]): no second save starts, and while the bytes
+    /// are a staging file nothing writes them ([`Engine::write_blocked`]).
+    pub saving: bool,
 }
 pub struct Handle {
     pub entity: String,
@@ -119,6 +130,16 @@ pub struct Engine {
     /// `pending_saves` records not restored into a session, by entity (module
     /// docs); retried by [`Engine::retry_pending_due`].
     unrecovered: BTreeMap<String, Unrecovered>,
+    /// Moves whenever a save ends (module docs, *Saves off the engine lock*).
+    saves: Arc<SaveSignal>,
+    /// The availability rows of objects saved off the engine lock.
+    notes: Arc<AvailabilityNotes>,
+    /// What `observation` was last built from ([`Engine::publish_observation`]).
+    observed: Mutex<Option<Observed>>,
+    /// The shared engine this engine is (set by the mount adapters'
+    /// `bind`): the pending-save retry hands staging-file saves to a thread
+    /// that stores them without the engine lock.
+    shared: Option<std::sync::Weak<Mutex<Engine>>>,
 }
 
 /// What one activation committed, for [`Engine::after_activation`].
@@ -167,6 +188,15 @@ fn record_branch(record: &str) -> Option<String> {
     serde_json::from_str::<PendingSave>(record)
         .ok()
         .map(|pending| pending.branch)
+}
+
+/// What [`Engine::publish_observation`] last built the observation from.
+struct Observed {
+    /// `(generation, mounted, open handles, unflushed files)`.
+    key: (u64, bool, usize, usize),
+    health: Option<String>,
+    active: String,
+    branch: Value,
 }
 
 /// The delay before retry number `failures + 1` (1 s → 60 s).
@@ -443,7 +473,6 @@ fn count_pending_saves(store: &Store, vitals: &EngineVitals) {
 impl Engine {
     pub fn new(store: Store) -> Self {
         let mut engine = Self {
-            store,
             sessions: BTreeMap::new(),
             handles: BTreeMap::new(),
             next_handle: 1,
@@ -465,6 +494,11 @@ impl Engine {
             notify_queue: Arc::new(NotifyQueue::default()),
             retry_state: BTreeMap::new(),
             unrecovered: BTreeMap::new(),
+            saves: Arc::new(SaveSignal::default()),
+            notes: Arc::new(AvailabilityNotes::new(&store)),
+            shared: None,
+            observed: Mutex::new(None),
+            store,
         };
         if let Err(error) = engine.load_pending() {
             engine.health = Some(format!("RECOVERY_REQUIRED: {error:#}"));
@@ -472,13 +506,47 @@ impl Engine {
         engine.publish_observation();
         engine
     }
+    /// Refreshes the vitals and the observation. Every filesystem callback
+    /// calls it (WP5.2: it was a fifth of a cheap callback's cost): the
+    /// observation is rebuilt only when what it shows changed, and the
+    /// active branch's descriptor is read again only after a checkout.
     pub fn publish_observation(&self) {
         self.refresh_vitals();
-        let branch = self.store.branch(&self.store.active).ok();
+        let unflushed = self.sessions.values().filter(|s| s.dirty).count();
+        let health = self.reported_health();
+        let mut observed = crate::util::lock::lock(&self.observed);
+        let key = (
+            self.store.generation,
+            self.mounted,
+            self.handles.len(),
+            unflushed,
+        );
+        if let Some(known) = observed.as_ref()
+            && known.key == key
+            && known.health == health
+            && known.active == self.store.active
+        {
+            return;
+        }
+        let branch = match observed.take() {
+            Some(known)
+                if known.active == self.store.active && known.key.0 == self.store.generation =>
+            {
+                known.branch
+            }
+            _ => serde_json::to_value(self.store.branch(&self.store.active).ok())
+                .unwrap_or(Value::Null),
+        };
         *crate::util::lock::lock(&self.observation) = json!({"repo":self.store.repo,"device":self.store.device,
             "branch":branch,"generation":self.store.generation,"mounted":self.mounted,
-            "open_handles":self.handles.len(),"unflushed_files":self.sessions.values().filter(|s|s.dirty).count(),
-            "health":self.reported_health(),"sampled_at_ms":time(),"caught_up":false});
+            "open_handles":self.handles.len(),"unflushed_files":unflushed,
+            "health":health,"sampled_at_ms":time(),"caught_up":false});
+        *observed = Some(Observed {
+            key,
+            health,
+            active: self.store.active.clone(),
+            branch,
+        });
     }
     /// Copies the cheap counters into [`EngineVitals`] (no SQL: the store
     /// revision compares the connection's `total_changes`, the sync
@@ -775,6 +843,8 @@ impl Engine {
                 preserve_times: pending.preserve_times,
                 dirty: true,
                 references: 0,
+                edits: 0,
+                saving: false,
             },
         );
         Ok(())
@@ -1089,10 +1159,104 @@ impl Engine {
             .map_err(|(_, error)| error)
             .context("cannot close the connection")
     }
+    /// Saves `entity`'s dirty session under the caller's engine lock: the
+    /// three phases of an off-lock save ([`save_entity`]) run back to back.
+    /// While another save of the entity runs (off the lock), this one does
+    /// nothing: that save commits what it took, and edits made since leave
+    /// the session dirty for the next save.
     fn flush_entity(&mut self, entity: &str) -> Result<()> {
-        if !self.sessions.get(entity).context("INVALID_HANDLE")?.dirty {
-            return Ok(());
+        match self.begin_save(entity)? {
+            SaveStart::Clean | SaveStart::Busy(_) => Ok(()),
+            SaveStart::Started(job) => {
+                let stored = store_snapshot(&job);
+                self.finish_save(job, stored)
+            }
         }
+    }
+    /// Phase 1 of a save (CCR-WP4.INT-5), under the engine lock: snapshots the
+    /// dirty session's bytes ([`crate::staging::Staged::snapshot`]) and marks
+    /// it `saving`. `Clean`: nothing to save; `Busy`: a save of the entity
+    /// runs, wait for [`SaveSignal`] to move past the returned generation.
+    /// A snapshot that fails retains the session (`pending_saves`).
+    pub fn begin_save(&mut self, entity: &str) -> Result<SaveStart> {
+        let generation = self.saves.generation();
+        let session = self.sessions.get(entity).context("INVALID_HANDLE")?;
+        if !session.dirty {
+            return Ok(SaveStart::Clean);
+        }
+        if session.saving {
+            return Ok(SaveStart::Busy(generation));
+        }
+        let snapshot = crate::util::fault::trigger("engine.save.snapshot")
+            .and_then(|()| session.bytes.snapshot());
+        let bytes = match snapshot {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.retain_pending(entity, &error)
+                    .context("PENDING_SAVE_PERSIST_FAILED")?;
+                return Err(error);
+            }
+        };
+        let job = SaveJob {
+            entity: entity.to_owned(),
+            edits: session.edits,
+            content_base: session.content_base.clone(),
+            alive_base: session.alive_base.clone(),
+            branch: self.store.active.clone(),
+            generation: self.store.generation,
+            bytes,
+            root: self.store.root.clone(),
+            notes: self.notes.clone(),
+        };
+        self.sessions.get_mut(entity).unwrap().saving = true;
+        Ok(SaveStart::Started(job))
+    }
+    /// Phase 3 of a save, under the engine lock: commits the object phase 2
+    /// stored ([`store_snapshot`]) as the session's new content, with the
+    /// bases the snapshot was taken at, and ends the save (writers and other
+    /// saves of the entity may go on; [`SaveSignal`] moves). A retained
+    /// save's `pending_saves` row goes in the same transaction: removed when
+    /// the session was not edited since the snapshot (its bytes are the ones
+    /// committed), else rebased onto the new revision (it holds later bytes).
+    /// The session stays dirty when it was edited since the snapshot. Any
+    /// failure, also one of phase 2, retains the session, as a failed save
+    /// always did.
+    pub fn finish_save(&mut self, job: SaveJob, stored: Result<StoredObject>) -> Result<()> {
+        let result = self.finish_save_inner(&job, stored);
+        let entity = job.entity.as_str();
+        if let Some(session) = self.sessions.get_mut(entity) {
+            session.saving = false;
+            if !session.dirty && session.references == 0 {
+                // Closed while it was saved: nothing keeps it now.
+                self.sessions.remove(entity);
+            }
+        }
+        self.saves.bump();
+        result
+    }
+    fn finish_save_inner(&mut self, job: &SaveJob, stored: Result<StoredObject>) -> Result<()> {
+        let entity = job.entity.as_str();
+        ensure!(self.sessions.contains_key(entity), "INVALID_HANDLE");
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(error) => {
+                self.retain_pending(entity, &error)
+                    .context("PENDING_SAVE_PERSIST_FAILED")?;
+                return Err(error);
+            }
+        };
+        // The base check. A checkout or a branch switch needs a quiet engine,
+        // and saves of one entity never overlap, so neither can move under a
+        // running save; refuse rather than commit onto another view. The
+        // session stays dirty (and is retained by a stop as usual).
+        let session = &self.sessions[entity];
+        ensure!(
+            job.branch == self.store.active
+                && job.generation == self.store.generation
+                && job.content_base == session.content_base
+                && job.alive_base == session.alive_base,
+            "STALE_VIEW: the file's view changed while it was saved; it stays unsaved and is saved again"
+        );
         let row: Option<String> = self
             .store
             .db
@@ -1110,76 +1274,52 @@ impl Engine {
         let pending = row
             .as_deref()
             .is_some_and(|record| !self.of_other_branch(record));
-        let replaced = row.filter(|_| pending && self.unrecovered.contains_key(entity));
-        let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
-        // A retained save commits its write and the removal of its row
-        // together. From autocommit that transaction begins IMMEDIATE, taking
-        // SQLite's writer slot before the write reads the projection (as
-        // `Engine::control` does): a deferred read-then-write transaction fails
-        // at once with SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT when another connection
-        // (the bulk transfer view, a pooled secondary store) writes meanwhile.
-        // The bytes of a retained save are stored (hashed, copied, synced,
-        // installed) before the writer slot is taken below, so the slot is
-        // held for the commit, not for the copy (WP4.INT re-review: another
-        // connection's writer failed after its 5 s busy timeout behind a
-        // multi-GiB pending save). A failure is retained as below.
-        let stored: Result<Option<String>> = if pending {
-            match &mut session.bytes {
-                crate::staging::Staged::Memory(bytes) => self.store.put_object(bytes),
-                staged => staged
-                    .reader()
-                    .and_then(|mut source| self.store.put_stream(&mut source)),
-            }
-            .map(Some)
-        } else {
-            Ok(None)
-        };
-        let stored = match stored {
-            Ok(stored) => stored,
-            Err(error) => {
-                self.retain_pending(entity, &error)
-                    .context("PENDING_SAVE_PERSIST_FAILED")?;
-                return Err(error);
-            }
-        };
+        let replaced = row
+            .clone()
+            .filter(|_| pending && self.unrecovered.contains_key(entity));
+        let unedited = self.sessions[entity].edits == job.edits;
+        // A retained save commits its write and its row together. From
+        // autocommit that transaction begins IMMEDIATE, taking SQLite's writer
+        // slot before the write reads the projection (as `Engine::control`
+        // does): a deferred read-then-write transaction fails at once with
+        // SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT when another connection writes
+        // meanwhile. The bytes are already stored (phase 2), so the slot is
+        // held for the commit only.
         let outer = if pending {
             Some(begin_staged_save(&self.store.db)?)
         } else {
             None
         };
+        let preserve_times = self.sessions[entity].preserve_times;
         let result = (|| {
-            let revision = match (stored, &mut session.bytes) {
-                (Some(object), _) => self.store.write_object_with_base_and_times(
-                    entity,
-                    session.content_base.clone(),
-                    session.alive_base.clone(),
-                    object,
-                    session.preserve_times,
-                )?,
-                (None, crate::staging::Staged::Memory(bytes)) => {
-                    self.store.write_with_base_and_times(
-                        entity,
-                        session.content_base.clone(),
-                        session.alive_base.clone(),
-                        bytes,
-                        session.preserve_times,
-                    )?
-                }
-                (None, staged) => {
-                    let mut source = staged.reader()?;
-                    self.store.write_stream_with_base_and_times(
-                        entity,
-                        session.content_base.clone(),
-                        session.alive_base.clone(),
-                        &mut source,
-                        session.preserve_times,
-                    )?
-                }
-            };
+            crate::util::fault::trigger("engine.save.commit")?;
+            let revision = self.store.write_object_with_base_and_times(
+                entity,
+                job.content_base.clone(),
+                job.alive_base.clone(),
+                stored.object.clone(),
+                preserve_times,
+            )?;
             if let Some(outer) = outer {
-                self.store
-                    .db
-                    .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
+                match row.as_deref().filter(|_| !unedited) {
+                    None => {
+                        self.store
+                            .db
+                            .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
+                    }
+                    Some(record) => {
+                        // A retain after the snapshot recorded later bytes:
+                        // they stay retained, on top of this commit.
+                        let mut pending: PendingSave = serde_json::from_str(record)
+                            .context("RECOVERY_REQUIRED: the pending-save record cannot be read")?;
+                        pending.content_base = Some(revision.clone());
+                        pending.alive_base = Some(revision.clone());
+                        self.store.db.execute(
+                            "UPDATE pending_saves SET payload=? WHERE entity=?",
+                            rusqlite::params![serde_json::to_string(&pending)?, entity],
+                        )?;
+                    }
+                }
                 commit_staged_save(&self.store.db, outer)?;
             }
             Ok(revision)
@@ -1191,11 +1331,15 @@ impl Engine {
                 if pending {
                     count_pending_saves(&self.store, &self.vitals);
                 }
+                let entry = self.store.entry(entity);
+                let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
                 session.content_base = Some(revision.clone());
                 session.alive_base = Some(revision);
-                session.dirty = false;
-                session.bytes.release();
-                session.entry = self.store.entry(entity)?;
+                if unedited {
+                    session.dirty = false;
+                    session.bytes.release();
+                }
+                session.entry = entry?;
                 if pending {
                     self.forget_unrecovered(entity, replaced.as_deref(), None);
                 }
@@ -1216,11 +1360,23 @@ impl Engine {
             }
         }
     }
+    /// Whether a write or truncate through handle `h` must wait: a save of
+    /// its session runs and reads the staging file (module docs, *Saves off
+    /// the engine lock*). `Some(generation)`: wait for [`SaveSignal`] to move
+    /// past it, without the engine lock, then try again.
+    pub fn write_blocked(&self, h: u64) -> Option<u64> {
+        let session = self.session(h).ok()?;
+        (session.saving && session.bytes.is_file()).then(|| self.saves.generation())
+    }
+    /// The signal saves move when they end ([`Engine::finish_save`]).
+    pub fn save_signal(&self) -> Arc<SaveSignal> {
+        self.saves.clone()
+    }
     pub fn retry_pending(&mut self) -> Result<()> {
         let entities: Vec<_> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.dirty && s.references == 0)
+            .filter(|(_, s)| s.dirty && s.references == 0 && !s.saving)
             .map(|(id, _)| id.clone())
             .collect();
         for entity in entities {
@@ -1240,40 +1396,73 @@ impl Engine {
         let due: Vec<_> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.dirty && s.references == 0)
+            .filter(|(_, s)| s.dirty && s.references == 0 && !s.saving)
             .map(|(id, _)| id.clone())
             .filter(|id| self.retry_state.get(id).is_none_or(|s| s.next_at <= now))
             .collect();
         let mut committed = 0;
         for entity in due {
+            // A staging file (a large file) is hashed and copied without the
+            // engine lock when the shared engine is known: a thread saves it
+            // (`save_entity`) and reports a failure back here.
+            if self.sessions[&entity].bytes.is_file()
+                && let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade)
+            {
+                let name = entity.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("save".into())
+                    .spawn(move || {
+                        if let Err(error) = save_entity(&shared, &name) {
+                            super::lock_engine(&shared).retry_failed(&name, Instant::now(), &error);
+                        }
+                    });
+                if spawned.is_ok() {
+                    // Not due again before the backoff, should it fail.
+                    self.retry_state
+                        .entry(entity)
+                        .or_insert(RetryState {
+                            failures: 0,
+                            next_at: now,
+                        })
+                        .next_at = now + RETRY_BASE;
+                    continue;
+                }
+            }
             match self.flush_entity(&entity) {
                 Ok(()) => {
                     self.sessions.remove(&entity);
                     self.retry_state.remove(&entity);
                     committed += 1;
                 }
-                Err(error) => {
-                    let state = self
-                        .retry_state
-                        .entry(entity.clone())
-                        .or_insert(RetryState {
-                            failures: 0,
-                            next_at: now,
-                        });
-                    state.failures = state.failures.saturating_add(1);
-                    let delay = retry_delay(state.failures);
-                    state.next_at = now + delay;
-                    crate::util::log::event!(warn, PENDING_SAVE, {
-                        "site": "engine.retry_pending",
-                        "entity": entity,
-                        "failures": state.failures,
-                        "retry_in_ms": delay.as_millis() as u64,
-                        "message": format!("{error:#}"),
-                    });
-                }
+                Err(error) => self.retry_failed(&entity, now, &error),
             }
         }
         committed
+    }
+    /// Records a failed pending-save retry of `entity` (its backoff grows).
+    fn retry_failed(&mut self, entity: &str, now: Instant, error: &anyhow::Error) {
+        let state = self
+            .retry_state
+            .entry(entity.to_owned())
+            .or_insert(RetryState {
+                failures: 0,
+                next_at: now,
+            });
+        state.failures = state.failures.saturating_add(1);
+        let delay = retry_delay(state.failures);
+        state.next_at = now + delay;
+        crate::util::log::event!(warn, PENDING_SAVE, {
+            "site": "engine.retry_pending",
+            "entity": entity,
+            "failures": state.failures,
+            "retry_in_ms": delay.as_millis() as u64,
+            "message": format!("{error:#}"),
+        });
+    }
+    /// Makes `engine` known to itself (the mount adapters' `bind`): the
+    /// pending-save retry then saves staging files without the engine lock.
+    pub fn adopt_shared(engine: &Shared) {
+        super::lock_engine(engine).shared = Some(Arc::downgrade(engine));
     }
     /// Tries again to restore the due records that could not be restored
     /// (module docs): a staging file a scanner held at startup, a record of
@@ -1445,6 +1634,8 @@ impl Engine {
                     dirty: false,
                     references: 0,
                     preserve_times: 0,
+                    edits: 0,
+                    saving: false,
                 },
             );
         }
@@ -1469,6 +1660,27 @@ impl Engine {
         let handle = self.handles.get(&h).context("INVALID_HANDLE")?;
         ensure!(handle.generation == self.store.generation, "STALE_VIEW");
         self.sessions.get(&handle.entity).context("INVALID_HANDLE")
+    }
+    /// [`Engine::session`], mutable.
+    pub fn session_mut(&mut self, h: u64) -> Result<&mut Session> {
+        let handle = self.handles.get(&h).context("INVALID_HANDLE")?;
+        ensure!(handle.generation == self.store.generation, "STALE_VIEW");
+        let entity = handle.entity.clone();
+        self.sessions.get_mut(&entity).context("INVALID_HANDLE")
+    }
+    /// Removes handle `h` after an off-lock save ([`save_handle`]) without
+    /// saving again (it would hold the lock for a save that failed a moment
+    /// ago); the session goes when nothing keeps it. A dirty session stays
+    /// (its failed save retained it; the pending-save retry commits it).
+    pub fn release_handle(&mut self, h: u64) {
+        if let Some(handle) = self.handles.remove(&h)
+            && let Some(s) = self.sessions.get_mut(&handle.entity)
+        {
+            s.references = s.references.saturating_sub(1);
+            if s.references == 0 && !s.dirty && !s.saving {
+                self.sessions.remove(&handle.entity);
+            }
+        }
     }
     /// One directory cut per enumeration, retained through marker continuations.
     /// A rewind sees later mutations; close releases the cursor. Generation
@@ -1530,6 +1742,13 @@ impl Engine {
             session.entry.kind == "file" && session.entry.id != "control",
             "IS_DIRECTORY"
         );
+        // A save reads this staging file without the lock: the adapters wait
+        // for it first (`lock_for_write`), so only a caller that did not gets
+        // here, and is refused instead of tearing the save's snapshot.
+        ensure!(
+            !(session.saving && session.bytes.is_file()),
+            "BUSY_VIEW: the file is being saved"
+        );
         let start = if append {
             session.bytes.len()
         } else {
@@ -1547,6 +1766,7 @@ impl Engine {
         if end > session.bytes.len() {
             session.bytes.resize(&self.store.root, end)?;
         }
+        session.edits += 1;
         session
             .bytes
             .write_at(&self.store.root, start, &bytes[..count])?;
@@ -1561,6 +1781,12 @@ impl Engine {
         ensure!(session.entry.kind == "file", "IS_DIRECTORY");
         ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
         if !allocation || size < (session.bytes.len() as u64) {
+            // As in `write`: the adapters wait for a save of a staging file.
+            ensure!(
+                !(session.saving && session.bytes.is_file()),
+                "BUSY_VIEW: the file is being saved"
+            );
+            session.edits += 1;
             session.bytes.resize(&self.store.root, size as usize)?;
             session.preserve_times = handle.time_update_disabled;
             session.dirty = true;
@@ -1709,6 +1935,370 @@ impl Engine {
         Ok(accepted)
     }
 }
+
+/// How [`Engine::begin_save`] answered.
+pub enum SaveStart {
+    /// The session is clean: nothing to save.
+    Clean,
+    /// A save of the entity runs: wait until [`SaveSignal`] moves past this
+    /// generation (without the engine lock), then begin again.
+    Busy(u64),
+    /// Phase 1 is done: store the snapshot ([`store_snapshot`], without the
+    /// engine lock), then [`Engine::finish_save`].
+    Started(SaveJob),
+}
+
+/// A save between its snapshot (phase 1) and its commit (phase 3); see the
+/// module docs, *Saves off the engine lock*.
+pub struct SaveJob {
+    entity: String,
+    edits: u64,
+    content_base: Option<String>,
+    alive_base: Option<String>,
+    branch: String,
+    generation: u64,
+    bytes: crate::staging::StageSnapshot,
+    root: std::path::PathBuf,
+    notes: Arc<AvailabilityNotes>,
+}
+impl SaveJob {
+    /// The entity being saved.
+    pub fn entity(&self) -> &str {
+        &self.entity
+    }
+    /// The size of the snapshot being saved.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// The object phase 2 of a save stored ([`store_snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub object: String,
+    pub size: u64,
+}
+
+/// Moves whenever a save ends ([`Engine::finish_save`]), always under the
+/// engine lock; a writer or a save that must wait for a running save reads
+/// the generation under the engine lock, releases it, and waits for the
+/// generation to move ([`SaveSignal::wait_past`]).
+#[derive(Debug, Default)]
+pub struct SaveSignal {
+    generation: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+impl SaveSignal {
+    pub fn generation(&self) -> u64 {
+        *crate::util::lock::lock(&self.generation)
+    }
+    fn bump(&self) {
+        *crate::util::lock::lock(&self.generation) += 1;
+        self.changed.notify_all();
+    }
+    /// Waits until the generation moved past `seen`, at most `timeout`;
+    /// whether it moved.
+    pub fn wait_past(&self, seen: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut generation = crate::util::lock::lock(&self.generation);
+        while *generation == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            generation = self
+                .changed
+                .wait_timeout(generation, deadline - now)
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|poison| poison.into_inner().0);
+        }
+        true
+    }
+}
+
+/// The availability-index rows of objects saved off the engine lock,
+/// written on a connection of their own (module docs): a write through the
+/// engine's connection outside a commit would make the engine's projection
+/// view stale, and its next operation would reload the whole projection
+/// (about 10 ms per save at 2K files; it was most of a small file's save
+/// before WP5.2). Another connection's commit that leaves the projection
+/// tables alone keeps the view (`Store::adopt_foreign_commits`). Best
+/// effort, like the index itself: an object without its row is checked with
+/// a `stat`, and verified again at the next startup.
+pub struct AvailabilityNotes {
+    root: std::path::PathBuf,
+    repo: String,
+    device: String,
+    store: Mutex<Option<Store>>,
+}
+impl AvailabilityNotes {
+    fn new(store: &Store) -> Self {
+        Self {
+            root: store.root.clone(),
+            repo: store.repo.clone(),
+            device: store.device.clone(),
+            store: Mutex::new(None),
+        }
+    }
+    /// Records `object` (`size` bytes, mtime `mtime_ns`) as available and
+    /// verified now.
+    fn note(&self, object: &str, size: u64, mtime_ns: i64) {
+        let mut slot = crate::util::lock::lock(&self.store);
+        if slot.is_none() {
+            match Store::open_secondary(&self.root, &self.repo, &self.device) {
+                Ok(store) => *slot = Some(store),
+                Err(error) => {
+                    crate::util::log::event!(debug, OBJECT_IO_ERROR, {
+                        "site": "engine.save.note",
+                        "message": format!("{error:#}"),
+                    });
+                    return;
+                }
+            }
+        }
+        if let Some(store) = slot.as_ref() {
+            store.note_available(object, size, mtime_ns, time());
+        }
+    }
+}
+
+/// Phase 2 of a save, without the engine lock: hashes the snapshot, writes it
+/// to a temporary file in `objects/`, makes it durable and installs it under
+/// its hash (invariant 1: whole-object SHA-256, `fsync`, write-through
+/// rename), or verifies the installed copy when the object exists already.
+/// Then records its availability ([`AvailabilityNotes`]). A crash at any
+/// step leaves at most an unreferenced object or a `.part` file (removed at
+/// the next startup, `Engine::remove_orphaned_spools`); the session and the
+/// store are as before the save until its commit (phase 3).
+pub fn store_snapshot(job: &SaveJob) -> Result<StoredObject> {
+    use crate::staging::StageSnapshot;
+    crate::util::fault::trigger("engine.save.store")?;
+    let objects = job.root.join("objects");
+    let (stored, mtime) = match &job.bytes {
+        StageSnapshot::Object { object, size } => {
+            return Ok(StoredObject {
+                object: object.clone(),
+                size: *size as u64,
+            });
+        }
+        StageSnapshot::Bytes(bytes) => {
+            let object = hash(bytes);
+            let size = bytes.len() as u64;
+            match verified_existing(&objects, &object, size)? {
+                Some(mtime) => (StoredObject { object, size }, mtime),
+                None => {
+                    let mtime = install_new(&objects, &object, |file| {
+                        file.write_all(bytes)?;
+                        Ok(())
+                    })?;
+                    (StoredObject { object, size }, mtime)
+                }
+            }
+        }
+        StageSnapshot::File { file, size } => store_file(&objects, file, *size)?,
+    };
+    job.notes.note(&stored.object, stored.size, mtime);
+    Ok(stored)
+}
+
+/// The mtime (read before hashing) of the installed copy of `object` when it
+/// exists and hashes to it; `None` when there is none; `CORRUPT_OBJECT` when
+/// the installed bytes do not hash to it (as `Store::put_object` refuses).
+fn verified_existing(objects: &std::path::Path, object: &str, size: u64) -> Result<Option<i64>> {
+    let path = objects.join(object);
+    let Ok(before) = std::fs::metadata(&path) else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
+    ensure!(
+        before.len() == size && crate::core::stream_hash(&mut file)? == object,
+        "CORRUPT_OBJECT: {object}"
+    );
+    Ok(Some(crate::core::objects::mtime_ns(&before)))
+}
+
+/// Writes a temporary file in `objects/` with `write`, makes it durable and
+/// installs it as `object`; returns its mtime. When the object appears
+/// meanwhile (another save of the same bytes), the installed copy is
+/// verified and the temporary file removed.
+fn install_new(
+    objects: &std::path::Path,
+    object: &str,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<i64> {
+    let temp = objects.join(format!("{}.part", id()));
+    let dest = objects.join(object);
+    let result = (|| -> Result<i64> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        let mtime = crate::core::objects::stamp(&file)?;
+        drop(file);
+        // The legacy crash points of `Store::put_object` (`TKFS_FAULT`).
+        crate::core::fault("object_flushed");
+        crate::util::fault::trigger("engine.save.flushed")?;
+        match crate::core::objects::install_object(&temp, &dest) {
+            Ok(()) => {}
+            Err(error) => {
+                let size = std::fs::metadata(&temp)?.len();
+                match verified_existing(objects, object, size)? {
+                    Some(mtime) => {
+                        std::fs::remove_file(&temp)?;
+                        return Ok(mtime);
+                    }
+                    None => return Err(error),
+                }
+            }
+        }
+        crate::core::fault("object_installed");
+        crate::util::fault::trigger("engine.save.installed")?;
+        Ok(mtime)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Phase 2 for a staging file: streams it (positional reads, the session's
+/// handle keeps its own position) into a new object, hashing it on the way.
+fn store_file(
+    objects: &std::path::Path,
+    source: &std::fs::File,
+    size: usize,
+) -> Result<(StoredObject, i64)> {
+    ensure!(size as u64 <= MAX_CONTENT, "FILE_TOO_LARGE");
+    let temp_name = format!("{}.part", id());
+    let temp = objects.join(&temp_name);
+    let result = (|| -> Result<(StoredObject, i64)> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let mut digest = <sha2::Sha256 as sha2::Digest>::new();
+        let mut buffer = vec![0; IO_CHUNK.min(size.max(1))];
+        let mut offset = 0usize;
+        while offset < size {
+            let n = buffer.len().min(size - offset);
+            crate::staging::read_file_at(source, offset as u64, &mut buffer[..n])?;
+            sha2::Digest::update(&mut digest, &buffer[..n]);
+            file.write_all(&buffer[..n])?;
+            offset += n;
+        }
+        let object = hex::encode(sha2::Digest::finalize(digest));
+        let stored = StoredObject {
+            object: object.clone(),
+            size: size as u64,
+        };
+        if let Some(mtime) = verified_existing(objects, &object, size as u64)? {
+            drop(file);
+            std::fs::remove_file(&temp)?;
+            return Ok((stored, mtime));
+        }
+        file.sync_all()?;
+        let mtime = crate::core::objects::stamp(&file)?;
+        drop(file);
+        crate::core::fault("object_flushed");
+        crate::util::fault::trigger("engine.save.flushed")?;
+        let dest = objects.join(&object);
+        if let Err(error) = crate::core::objects::install_object(&temp, &dest) {
+            match verified_existing(objects, &object, size as u64)? {
+                Some(mtime) => {
+                    std::fs::remove_file(&temp)?;
+                    return Ok((stored, mtime));
+                }
+                None => return Err(error),
+            }
+        }
+        crate::core::fault("object_installed");
+        crate::util::fault::trigger("engine.save.installed")?;
+        Ok((stored, mtime))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Saves `entity`'s dirty session without holding the engine lock while its
+/// bytes are hashed and stored (CCR-WP4.INT-5; module docs): phase 1 under
+/// the lock, phase 2 without it, phase 3 under it. Waits (without the lock)
+/// for a save of the same entity that runs. A panic in phase 2 still ends
+/// the save (the session is retained).
+pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
+    loop {
+        let mut e = super::lock_engine(engine);
+        let job = match e.begin_save(entity)? {
+            SaveStart::Clean => return Ok(()),
+            SaveStart::Busy(seen) => {
+                let signal = e.save_signal();
+                drop(e);
+                signal.wait_past(seen, SAVE_WAIT_SLICE);
+                continue;
+            }
+            SaveStart::Started(job) => job,
+        };
+        drop(e);
+        let stored =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store_snapshot(&job)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("UNKNOWN_ERROR: storing a save panicked")));
+        return super::lock_engine(engine).finish_save(job, stored);
+    }
+}
+
+/// [`save_entity`] for the session of handle `h`; `h == 0`: every dirty
+/// session (a volume flush). An unknown handle is left to the caller.
+pub fn save_handle(engine: &Shared, h: u64) -> Result<()> {
+    let entities: Vec<String> = {
+        let e = super::lock_engine(engine);
+        if h == 0 {
+            e.sessions
+                .iter()
+                .filter(|(_, s)| s.dirty)
+                .map(|(entity, _)| entity.clone())
+                .collect()
+        } else {
+            match e.handles.get(&h) {
+                Some(handle) if e.sessions.get(&handle.entity).is_some_and(|s| s.dirty) => {
+                    vec![handle.entity.clone()]
+                }
+                _ => vec![],
+            }
+        }
+    };
+    let mut first = Ok(());
+    for entity in entities {
+        let saved = save_entity(engine, &entity);
+        if first.is_ok() {
+            first = saved;
+        }
+    }
+    first
+}
+
+/// Waits (without the engine lock) until a write through handle `h` no
+/// longer waits for a save ([`Engine::write_blocked`]), then returns the
+/// engine locked. Bounded only by the saves themselves.
+pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
+    loop {
+        let e = super::lock_engine(engine);
+        let Some(seen) = e.write_blocked(h) else {
+            return e;
+        };
+        let signal = e.save_signal();
+        drop(e);
+        signal.wait_past(seen, SAVE_WAIT_SLICE);
+    }
+}
+
+/// The longest single wait for a save's end before the waiter looks again.
+const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// Opens the transaction that commits a retained save (`SAVEPOINT staged_save`)
 /// and reports whether it is the outermost one: from autocommit it begins with
