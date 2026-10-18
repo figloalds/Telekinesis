@@ -477,6 +477,49 @@ fn a_save_that_finds_a_corrupt_copy_of_its_object_records_it() {
     assert!(e.sessions.values().any(|s| s.dirty));
 }
 
+/// WP5.INT (CCR-WP5.2-1): phase 2 records the bytes it hashed in the
+/// verified set, so the commit's check of newly authored bytes
+/// (`check_commit`) does not hash them again under the engine lock: in
+/// memory, from a staging file, and a copy already installed that phase 2
+/// verified. Before, every one was hashed again (its availability row lands
+/// later, in a batch), which also waited for an on-access scanner.
+#[test]
+fn a_saves_commit_does_not_hash_its_bytes_again() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    let small = bytes(41, 4096);
+    let large = bytes(42, 300 * 1024);
+    let mut e = lock(&engine);
+    // Created first: a create deduplicates the empty object, which
+    // `Store::put_object` verifies (not a save).
+    for path in ["small.bin", "large.bin", "again.bin"] {
+        e.store.create(path, "file").unwrap();
+    }
+    let hashes = e.store.object_hashes();
+    let skipped = commit::verified::skipped();
+    let save = |e: &mut Engine, path: &str, content: &[u8]| {
+        let (h, _) = e.open(path, None, true).unwrap();
+        e.write(h, 0, content, false, false).unwrap();
+        e.close(h).unwrap();
+    };
+    save(&mut e, "small.bin", &small);
+    save(&mut e, "large.bin", &large);
+    // The same bytes again: phase 2 verifies the installed copy (and the
+    // object is referenced already, so the commit checks nothing).
+    save(&mut e, "again.bin", &small);
+    assert_eq!(
+        e.store.object_hashes(),
+        hashes,
+        "a commit hashed bytes its save had just stored"
+    );
+    assert!(commit::verified::skipped() >= skipped + 2);
+    assert_eq!(content(&e, "small.bin"), small);
+    assert_eq!(content(&e, "large.bin"), large);
+    assert_eq!(content(&e, "again.bin"), small);
+    no_conflicts(&e);
+}
+
 #[test]
 fn closed_files_are_saved_in_the_background_and_a_stop_waits_for_them() {
     let _serial = serial();

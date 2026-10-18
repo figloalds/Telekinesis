@@ -60,7 +60,12 @@
 //!    session's content with the bases of the snapshot (the base check: the
 //!    branch, the generation and the session's bases are those of the
 //!    snapshot; saves of one entity never overlap), together with the
-//!    removal (or the rebase) of a `pending_saves` record of it.
+//!    removal (or the rebase) of a `pending_saves` record of it. Phase 2
+//!    records the bytes it hashed in `core::commit::verified`, so the
+//!    commit's check of newly authored bytes (`check_commit`) does not hash
+//!    them again under the lock (CCR-WP5.2-1, applied by WP5.INT: it used
+//!    to, and to wait for an on-access scanner's scan of the new object,
+//!    which the savers' 10 ms settle before each commit worked around).
 //!
 //! While a save reads a staging file nothing writes it: writers wait for the
 //! save without the lock ([`lock_for_write`]), and an unsynchronized
@@ -1345,13 +1350,13 @@ impl Engine {
             Err(error) => {
                 if let Some(corrupt) = error.downcast_ref::<CorruptCopy>() {
                     // Recorded as `Store::put_object`'s dedupe records it: the
-                    // store's own verification marks the object `CORRUPT` and
-                    // stops serving it (its `note_corrupt`), so the inventory
-                    // no longer advertises the bad copy. That verification
-                    // hashes the copy again, under the engine lock (only when
-                    // a copy is corrupt; CCR-WP5.2-7 asks for a hook that
-                    // records it without the hash).
-                    let _ = self.store.verify_object(&corrupt.object);
+                    // object is marked `CORRUPT` and no longer served, so the
+                    // inventory no longer advertises the bad copy. Without
+                    // hashing it again under the engine lock (CCR-WP5.2-7,
+                    // applied by WP5.INT): phase 2 hashed it, and it is
+                    // recorded only while the file is still that copy.
+                    self.store
+                        .note_corrupt_copy(&corrupt.object, corrupt.len, corrupt.mtime_ns);
                 }
                 self.retain_pending(entity, &error)
                     .context("PENDING_SAVE_PERSIST_FAILED")?;
@@ -2550,8 +2555,11 @@ impl Drop for AvailabilityNotes {
 /// the next startup, `Engine::remove_orphaned_spools`); the session and the
 /// store are as before the save until its commit (phase 3).
 pub fn store_snapshot(job: &SaveJob) -> Result<StoredObject> {
+    use crate::core::commit::verified;
     use crate::staging::StageSnapshot;
     crate::util::fault::trigger("engine.save.store")?;
+    // No later than any `stat` below (`verified::note`).
+    let observed = verified::now_ns();
     let objects = job.root.join("objects");
     let (stored, mtime) = match &job.bytes {
         StageSnapshot::Object { object, size } => {
@@ -2576,6 +2584,11 @@ pub fn store_snapshot(job: &SaveJob) -> Result<StoredObject> {
         }
         StageSnapshot::File { file, size } => store_file(&objects, file, *size)?,
     };
+    // CCR-WP5.2-1 (applied by WP5.INT): the commit's `check_commit` finds
+    // the bytes this save hashed (installed, or the installed copy it
+    // verified) in the verified set and does not hash them again under the
+    // engine lock. An installed object's stamped mtime is never racy.
+    verified::note(&job.root, &stored.object, stored.size, mtime, observed);
     job.notes.note(&stored.object, stored.size, mtime);
     Ok(stored)
 }
@@ -2593,6 +2606,8 @@ fn verified_existing(objects: &std::path::Path, object: &str, size: u64) -> Resu
     if before.len() != size || crate::core::stream_hash(&mut file)? != object {
         return Err(CorruptCopy {
             object: object.to_owned(),
+            len: before.len(),
+            mtime_ns: crate::core::objects::mtime_ns(&before),
         }
         .into());
     }
@@ -2605,6 +2620,10 @@ fn verified_existing(objects: &std::path::Path, object: &str, size: u64) -> Resu
 #[derive(Debug)]
 pub struct CorruptCopy {
     pub object: String,
+    /// The copy's length and mtime when it was hashed: phase 3 records it
+    /// only while the file is still that copy (CCR-WP5.2-7).
+    pub len: u64,
+    pub mtime_ns: i64,
 }
 impl std::fmt::Display for CorruptCopy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -2730,10 +2749,9 @@ pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
 
 /// [`save_entity`]; `background` (the background savers): before each
 /// phase that takes the engine lock, give it to the filesystem callbacks in
-/// progress first ([`foreground`], at most [`YIELD_MAX`] each time); commit
-/// [`SETTLE`] after the bytes are stored; and leave an entity a save of
-/// which runs to that save (edits made since stay dirty for the savers'
-/// sweep, [`orphan_dirty`]).
+/// progress first ([`foreground`], at most [`YIELD_MAX`] each time); and
+/// leave an entity a save of which runs to that save (edits made since stay
+/// dirty for the savers' sweep, [`orphan_dirty`]).
 fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()> {
     loop {
         if background {
@@ -2760,7 +2778,6 @@ fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()>
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store_snapshot(&job)))
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("UNKNOWN_ERROR: storing a save panicked")));
         if background {
-            std::thread::sleep(SETTLE);
             yield_to_foreground();
         }
         return super::lock_engine(engine).finish_save(job, stored);
@@ -2863,13 +2880,6 @@ pub const MAX_BACKGROUND_SAVES: usize = 8;
 /// (power loss, a killed process) can lose of closed files (a failed save is
 /// retained in `pending_saves`, which a crash does not lose).
 pub const MAX_QUEUED_SAVES: usize = 64;
-/// A background save commits at least this long after it stored the bytes:
-/// an on-access scanner scans the object file just written, and the
-/// commit's verification of newly authored bytes (`check_commit`) waited
-/// for that scan under the engine lock (measured on the reference machine:
-/// about 3 ms of a 32 KiB file's 5.5 ms commit). Waiting before taking the
-/// lock costs only latency.
-pub const SETTLE: Duration = Duration::from_millis(10);
 /// How long an idle background saver thread waits for work before it ends.
 const SAVER_IDLE: Duration = Duration::from_secs(1);
 

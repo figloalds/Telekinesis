@@ -5417,9 +5417,12 @@ pub(super) struct Appended {
 
 /// `project(events)` from `base`, the projection of `events` without
 /// `events[new]` (WP5.1: a slow commit no longer projects the whole branch).
-/// `None` when the shortcut does not apply (the base has pending events, the
-/// new event is a parent of another or has a parent outside `events`, an id
-/// repeats, an entity id has a comma): the caller projects in full.
+/// `Err(base)`, the base handed back unchanged, when the shortcut does not
+/// apply (the base has pending events, the new event is a parent of another
+/// or has a parent outside `events`, an id repeats, an entity id has a
+/// comma): the caller projects in full, and can keep the base as its view
+/// instead of loading the stored projection again (WP5.INT, the WP5.1
+/// review's minor). Every decline happens before the base is changed.
 ///
 /// The comma. A collision record's entity is its pair joined by a comma
 /// (`a,b`), and `namespace_delta` revises the records of a recomputed slot
@@ -5452,20 +5455,20 @@ pub(super) struct Appended {
 /// conflict list is sorted as `project` sorts it. The commit checks
 /// (`set_thread_commit_checks`) compare the result with `project` itself on
 /// every commit.
-pub(super) fn project_append(
+pub(super) fn project_append_or_base(
     branch: &str,
     mut p: Projection,
     events: &[Event],
     new: usize,
     index: Option<&BranchIndex>,
-) -> Result<Option<Appended>> {
+) -> Result<std::result::Result<Appended, Projection>> {
     if !p.pending.is_empty() {
-        return Ok(None);
+        return Ok(Err(p));
     }
     let e = &events[new];
     let comma = |event: &Event| event.changes.iter().any(|c| c.entity.contains(','));
     if comma(e) {
-        return Ok(None);
+        return Ok(Err(p));
     }
     // The events' positions by id: the branch index's (WP5.1), when it
     // indexes every event but `E` (the last) and no id repeats; else a scan.
@@ -5480,7 +5483,7 @@ pub(super) fn project_append(
                 || index.facts.dangling.contains_key(e.id.as_str())
                 || index.facts.comma > 0
             {
-                return Ok(None);
+                return Ok(Err(p));
             }
             None
         }
@@ -5489,7 +5492,7 @@ pub(super) fn project_append(
                 HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
             for (i, event) in events.iter().enumerate() {
                 if ids.insert(event.id.as_str(), i).is_some() || comma(event) {
-                    return Ok(None);
+                    return Ok(Err(p));
                 }
             }
             let names_new = |event: &Event| {
@@ -5504,7 +5507,7 @@ pub(super) fn project_append(
                 .enumerate()
                 .any(|(i, event)| i != new && names_new(event))
             {
-                return Ok(None);
+                return Ok(Err(p));
             }
             Some(ids)
         }
@@ -5523,7 +5526,7 @@ pub(super) fn project_append(
         .chain(e.changes.iter().flat_map(|c| c.parents.iter()));
     for parent in parents {
         if parent == &e.id || position(parent).is_none() {
-            return Ok(None);
+            return Ok(Err(p));
         }
     }
     for c in &e.changes {
@@ -5714,13 +5717,25 @@ pub(super) fn project_append(
             (id.clone(), before)
         })
         .collect();
-    Ok(Some(Appended {
+    Ok(Ok(Appended {
         projection: p,
         changed,
         lists,
         fresh,
         placements,
     }))
+}
+
+/// [`project_append_or_base`] as an `Option` (`None`: declined).
+#[cfg(test)]
+pub(super) fn project_append(
+    branch: &str,
+    p: Projection,
+    events: &[Event],
+    new: usize,
+    index: Option<&BranchIndex>,
+) -> Result<Option<Appended>> {
+    Ok(project_append_or_base(branch, p, events, new, index)?.ok())
 }
 
 /// An entity of the new event as the base projection had it.
