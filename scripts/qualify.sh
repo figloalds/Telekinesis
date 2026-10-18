@@ -64,6 +64,8 @@ if [ "$kind" = "all" ]; then
   [ -n "$budget" ] || budget=2400
   [ -n "$file_timeout" ] || file_timeout=150
 fi
+# --heavy runs two-hour workloads: 200 minutes per file unless given (WP5.INT).
+if [ "$heavy" = 1 ]; then [ -n "$file_timeout" ] || file_timeout=200; fi
 [ -n "$budget" ] || budget=120
 [ -n "$file_timeout" ] || file_timeout=90
 [ -n "$kind" ] || kind="wave-$wave"

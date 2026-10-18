@@ -17,7 +17,8 @@
   -Heavy     also run the heavy scenarios (WP5.INT): the two-hour WP5.1
              daemon workloads (qual_wp5_1_concurrent::conflict_storm and
              ::fast_two_way_editing, about 2.5 h each), which a run skips
-             otherwise. A floor marked `heavy` in
+             otherwise (each file then gets -FileTimeoutMin 200 unless
+             given). A floor marked `heavy` in
              tests/qualification-floors.json is enforced only when its
              scenario ran (a run without -Heavy records it as not_run). They
              are usually run on their own, beside the soak:
@@ -90,6 +91,9 @@ Set-Location $root
 # unless the caller chose one (WP4.2).
 if ($All -and -not $PSBoundParameters.ContainsKey("BudgetS")) { $BudgetS = 2400 }
 if ($All -and -not $PSBoundParameters.ContainsKey("FileTimeoutMin")) { $FileTimeoutMin = 150 }
+# -Heavy runs two-hour workloads (2 h of edits, up to 30 min to settle, the
+# oracles): a file gets 200 minutes unless the caller chose (WP5.INT).
+if ($Heavy -and -not $PSBoundParameters.ContainsKey("FileTimeoutMin")) { $FileTimeoutMin = 200 }
 
 # File status from the exit code and the last `test result:` line. A pass
 # needs both: exit code 0 and `test result: ok.`. An unknown ($null) exit code
