@@ -5158,9 +5158,13 @@ fn a_lost_session_gives_up_every_lease_its_rounds_kept() {
 }
 
 /// The acceptor's offer of a dialer whose session went away between its
-/// `objects.wants` and its push (an outage cut it) gives its leases up once
-/// the session stayed silent for `OFFER_GRACE`, instead of hiding the
-/// objects from every other source until the lease lapses (60 s).
+/// `objects.wants` and its push (an outage cut it) gives its leases up,
+/// instead of hiding the objects from every other source until the lease
+/// lapses (60 s): at once when the session's close is seen (CCR-WP5.3-2,
+/// applied by WP5.INT: the inbound server reports a bulk session's end;
+/// WP5.3 had only the reaper, so this asserted at least `OFFER_GRACE`), and
+/// once a session that stays open stays silent for `OFFER_GRACE` (a link
+/// that went silent before the session's liveness deadline).
 #[test]
 fn an_offer_whose_session_went_away_gives_up_its_leases() {
     let b = Acceptor::start(FakeWorker::start(REPLICA_B));
@@ -5216,7 +5220,11 @@ fn an_offer_whose_session_went_away_gives_up_its_leases() {
         "the lease of the dead session's offer is still held: {:?}",
         b.worker.lease_of(&hash)
     );
-    assert!(gone.elapsed() >= inbound_objects::OFFER_GRACE);
+    assert!(
+        gone.elapsed() < inbound_objects::OFFER_GRACE,
+        "released {:?} after the close: the close was not reported",
+        gone.elapsed()
+    );
     assert!(
         b.worker
             .release_log
@@ -5225,6 +5233,21 @@ fn an_offer_whose_session_went_away_gives_up_its_leases() {
             .iter()
             .any(|(session, released)| *session == lease && released.contains(&hash))
     );
+    // A session that stays open and silent after its wants: the reaper.
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    assert_eq!(offered_on(&conn), vec![hash.clone()]);
+    assert_eq!(b.worker.lease_of(&hash), Some(lease.clone()));
+    let silent = Instant::now();
+    assert!(
+        wait_until(
+            inbound_objects::OFFER_GRACE + Duration::from_secs(5),
+            || b.worker.lease_of(&hash).is_none()
+        ),
+        "the lease of the silent session's offer is still held: {:?}",
+        b.worker.lease_of(&hash)
+    );
+    assert!(silent.elapsed() >= inbound_objects::OFFER_GRACE);
+    conn.close();
 }
 
 /// `objects.wants` on `conn` for lane [`LANE`]: the hashes offered.

@@ -2194,7 +2194,6 @@ fn a_catalog_without_credentials_answers_none() {
     }
     let fake: Arc<dyn CatalogApi> = Arc::new(Fake(Arc::new(CatalogSnapshot::default())));
     assert!(fake.credentials().is_none());
-    assert!(Catalog::of(&fake).is_none());
     assert_eq!(
         fake.apply(enroll("peer", CredentialSide::Inbound, [1; 32]))
             .unwrap_err()

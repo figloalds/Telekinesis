@@ -90,7 +90,7 @@ use crate::{
     paired_sync::SyncRoute,
     util::{backoff::Backoff, lock::lock, time::now_ms},
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -109,36 +109,12 @@ pub const STALL_BACKOFF: Duration = LEASE_TTL;
 /// Lease holders kept (see [`ObjectsState::holders`]).
 const MAX_LEASE_HOLDERS: usize = 64 * 1024;
 
-/// `objects.demand` (module docs, "Demand"; WP5.3, CCR-WP5.3-3).
-pub const DEMAND: &str = "objects.demand";
-/// Demanded objects one `objects.demand` lists at most.
-pub const MAX_DEMAND_ITEMS: u32 = MAX_WANT_ITEMS as u32;
-
-/// `objects.demand` request header.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DemandHeader {
-    pub route: SyncRoute,
-    /// Only the objects this lane owns (`LaneSpec::owns`).
-    #[serde(default)]
-    pub lane: Option<crate::model::protocol::LaneSpec>,
-    /// At most this many (default and cap [`MAX_DEMAND_ITEMS`]).
-    #[serde(default)]
-    pub max_items: Option<u32>,
-}
-
-/// One object a reader waits for.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DemandItem {
-    pub hash: String,
-    /// When the demand was (last) registered, Unix ms.
-    pub requested_ms: i64,
-}
-
-/// `objects.demand` reply: newest demand first.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DemandReply {
-    pub items: Vec<DemandItem>,
-}
+/// `objects.demand` (module docs, "Demand"; WP5.3). Its name and types are
+/// the model's since CCR-WP5.3-3 (applied by WP5.INT), re-exported here for
+/// the callers that named them here.
+pub use crate::model::protocol::objects::{
+    DemandHeader, DemandItem, DemandReply, MAX_DEMAND_ITEMS, ops::DEMAND,
+};
 
 pub fn dispatch(
     ctx: &WorkerCtx,
