@@ -1380,6 +1380,131 @@ fn a_retained_deferred_create_is_shown_again_after_a_restart_and_committed_once(
     assert!(diff.is_empty(), "{diff:?}");
 }
 
+/// WP5.INT (the WP5.2 review's major): a new file retained before its first
+/// commit whose staging file cannot be opened at startup (a scanner holding
+/// it) is not restored then; the application creates the same name again
+/// (B, held open). When the staging file is back, the late restore of the
+/// first file (A) never takes B's name: B stays a new file, its close
+/// commits it, and A is restored and committed after that, beside it (a name
+/// conflict, as concurrent creates are). Before, A's restore replaced B in
+/// the name index, B's saves failed `FILE_NOT_FOUND` for good, the engine
+/// stayed dirty and the name showed A.
+#[test]
+fn a_late_restore_of_a_new_file_never_takes_the_name_of_a_newer_one() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let a = {
+        let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+        let (h, entry) = e.create_deferred("x.txt", true, None).unwrap();
+        e.write(h, 0, b"version A", false, false).unwrap();
+        assert_eq!(e.retain_all_dirty().unwrap(), 1);
+        entry.id
+    };
+    let stage = {
+        let s = Store::open(dir.path(), Some("local-fs")).unwrap();
+        let record: String =
+            s.db.query_row("SELECT payload FROM pending_saves", [], |r| r.get(0))
+                .unwrap();
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        dir.path()
+            .join("staging")
+            .join(record["stage"].as_str().unwrap())
+    };
+    let aside = dir.path().join("aside.stage");
+    fs::rename(&stage, &aside).unwrap();
+    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    assert!(!e.is_deferred(&a), "A could not be restored");
+    assert!(e.lookup_visible("x.txt").is_err());
+    let (hb, b) = e.create_deferred("x.txt", true, None).unwrap();
+    e.write(hb, 0, b"version B", false, false).unwrap();
+    fs::rename(&aside, &stage).unwrap();
+    let later = || Instant::now() + Duration::from_secs(3600);
+    e.retry_pending_due(later());
+    assert!(e.is_deferred(&b.id), "B is still a new file");
+    assert!(!e.is_deferred(&a), "A waits for the name");
+    assert_eq!(e.lookup_visible("x.txt").unwrap().id, b.id);
+    assert_eq!(
+        e.children_visible(ROOT)
+            .unwrap()
+            .iter()
+            .filter(|child| child.name == "x.txt")
+            .count(),
+        1
+    );
+    // B's close commits B.
+    e.close(hb).unwrap();
+    assert!(!e.is_deferred(&b.id));
+    assert_eq!(content(&e, "x.txt"), b"version B");
+    // Then A is restored and committed beside it.
+    for _ in 0..3 {
+        e.retry_pending_due(later());
+    }
+    assert!(pending_rows(&e).is_empty(), "{:?}", pending_rows(&e));
+    assert!(e.quiet().is_ok(), "{:?}", e.quiet());
+    let object = |entity: &str| {
+        let entry = e.store.entry(entity).unwrap();
+        e.store
+            .read_object(entry.content.as_ref().unwrap())
+            .unwrap()
+    };
+    assert_eq!(object(&a), b"version A");
+    assert_eq!(object(&b.id), b"version B");
+    let open: Vec<_> = e
+        .store
+        .conflicts()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.resolved_by.is_none())
+        .collect();
+    assert!(
+        open.len() == 1
+            && open[0].reason.contains("same name")
+            && open[0].entity.contains(&a)
+            && open[0].entity.contains(&b.id),
+        "a name conflict of the two files: {open:#?}"
+    );
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
+/// WP5.INT (the WP5.2 review's minor): while a committed entry holds the
+/// name of a new file not committed yet (here a create that lands before
+/// its first save, as a remote one does), a listing shows the name once, as
+/// lookups do (the committed entry), until the new file's commit makes the
+/// name conflict. Before, the listing named both.
+#[test]
+fn a_listing_never_shows_a_name_twice_for_a_new_file() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    let (h, new) = e.create_deferred("y.txt", true, None).unwrap();
+    e.write(h, 0, b"the new file", false, false).unwrap();
+    let committed = e.store.create("y.txt", "file").unwrap();
+    let named = |e: &Engine| {
+        e.children_visible(ROOT)
+            .unwrap()
+            .into_iter()
+            .filter(|child| child.name == "y.txt")
+            .map(|child| child.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(named(&e), vec![committed.id.clone()]);
+    assert_eq!(e.lookup_visible("y.txt").unwrap().id, committed.id);
+    e.close(h).unwrap();
+    assert!(!e.is_deferred(&new.id));
+    let open: Vec<_> = e
+        .store
+        .conflicts()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.resolved_by.is_none())
+        .collect();
+    assert_eq!(open.len(), 1, "{open:#?}");
+    assert_eq!(named(&e).len(), 1);
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
 #[test]
 fn a_crash_at_every_step_of_the_first_save_of_a_deferred_create_leaves_a_consistent_store() {
     let _serial = serial();

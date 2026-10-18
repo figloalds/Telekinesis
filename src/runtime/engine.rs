@@ -109,7 +109,12 @@
 //! rename over it or a delete of it settles it). A directory, a FUSE create
 //! and every create outside the mount commit at once; `TKFS_DEFERRED_CREATE=0`
 //! turns deferred creates off. A remote create of the same name in the
-//! meantime makes a conflict, as two concurrent creates do.
+//! meantime makes a conflict, as two concurrent creates do (a listing shows
+//! the committed entry until then, as lookups do). A retained new file that
+//! is restored late (its staging file could not be opened at startup) is
+//! never restored under a name another new file holds by then: it stays
+//! unrecovered until that file commits, then is restored and its commit
+//! makes the name conflict (WP5.INT, the WP5.2 review's major).
 use super::{
     Shared,
     notify::{NotifyQueue, delta_notifications},
@@ -257,7 +262,29 @@ struct Unrecovered {
     next_at: Instant,
     /// The branch the record belongs to (`None`: the record does not parse).
     branch: Option<String>,
+    /// A new file whose name a newer unsaved file holds ([`NameHeld`]): due
+    /// again as soon as a deferred create commits.
+    name_held: bool,
 }
+
+/// A deferred create's record that `restore_pending` refused because a newer
+/// unsaved new file holds its name (WP5.INT, the WP5.2 review's major): it is
+/// restored once that file is committed.
+#[derive(Debug)]
+struct NameHeld {
+    name: String,
+    holder: String,
+}
+impl std::fmt::Display for NameHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RECOVERY_REQUIRED: the unsaved new file {} has the name of a newer unsaved file ({}); it is restored once that file is saved",
+            self.name, self.holder
+        )
+    }
+}
+impl std::error::Error for NameHeld {}
 
 /// The branch of a `pending_saves` record (`None`: it does not parse).
 fn record_branch(record: &str) -> Option<String> {
@@ -905,6 +932,32 @@ impl Engine {
             "RECOVERY_BRANCH_MISMATCH: the unsaved file belongs to branch {}, not the active branch",
             pending.branch
         );
+        // A deferred create (not committed yet) is restored under its name
+        // only while no other new file holds that name (WP5.INT, the WP5.2
+        // review's major): one restored late, after the application created
+        // the name again (a record that could not be restored at startup),
+        // would otherwise replace that file in the name index, which then
+        // could never commit (`FILE_NOT_FOUND` on every save) while the name
+        // showed the older file. It stays unrecovered and is retried; once
+        // the other file is committed it is restored, and its commit makes a
+        // name conflict, as concurrent creates do.
+        let deferred_key = if self.is_committed(&pending.entry.id)? {
+            None
+        } else {
+            let key = name_key(&pending.entry.name)
+                .context("RECOVERY_REQUIRED: the unsaved new file's name is not valid")?;
+            let slot = (pending.entry.parent.clone(), key);
+            if let Some(other) = self.pending_creates.get(&slot)
+                && other != &pending.entry.id
+            {
+                return Err(NameHeld {
+                    name: pending.entry.name.clone(),
+                    holder: other.clone(),
+                }
+                .into());
+            }
+            Some(slot)
+        };
         let bytes = crate::staging::Staged::recover(&self.store.root, &pending.stage)
             .with_context(|| {
                 format!(
@@ -912,15 +965,10 @@ impl Engine {
                     pending.stage
                 )
             })?;
-        if !self.is_committed(&pending.entry.id)? {
+        if let Some(slot) = deferred_key {
             // A deferred create retained before its first commit (module
             // docs, *Deferred creates*): visible again, committed by its save.
-            let key = name_key(&pending.entry.name)
-                .context("RECOVERY_REQUIRED: the unsaved new file's name is not valid")?;
-            self.pending_creates.insert(
-                (pending.entry.parent.clone(), key),
-                pending.entry.id.clone(),
-            );
+            self.pending_creates.insert(slot, pending.entry.id.clone());
         }
         self.sessions.insert(
             pending.entry.id.clone(),
@@ -987,6 +1035,7 @@ impl Engine {
                 failures,
                 next_at: now + retry_delay(failures),
                 branch: record_branch(record),
+                name_held: error.downcast_ref::<NameHeld>().is_some(),
             },
         );
     }
@@ -1460,6 +1509,11 @@ impl Engine {
                 }
                 if deferred {
                     self.pending_creates.retain(|_, pending| pending != entity);
+                    // A late-restored new file may wait for this name.
+                    let now = Instant::now();
+                    for unrecovered in self.unrecovered.values_mut().filter(|u| u.name_held) {
+                        unrecovered.next_at = now;
+                    }
                 }
                 if self.retry_handed.remove(entity) {
                     // A pending save the retry handed to a saver: reported by
@@ -1673,16 +1727,31 @@ impl Engine {
         }
     }
     /// The entries the mount shows in `directory`: [`Store::children`] and
-    /// the deferred creates in it.
+    /// the deferred creates in it. A deferred create whose name a committed
+    /// entry holds (one restored late, or a remote create of the same name
+    /// before its first save) is left out, as [`Engine::lookup_visible`]
+    /// shows the committed one, until its commit makes the name conflict
+    /// (WP5.INT, the WP5.2 review's minor: the listing named both).
     pub fn children_visible(&self, directory: &str) -> Result<Vec<Entry>> {
         let mut children = self.store.children(directory)?;
-        children.extend(
-            self.pending_creates
-                .range((directory.to_owned(), String::new())..)
-                .take_while(|((parent, _), _)| parent == directory)
-                .filter_map(|(_, entity)| self.sessions.get(entity))
-                .map(|session| session.entry.clone()),
-        );
+        let mut deferred = self
+            .pending_creates
+            .range((directory.to_owned(), String::new())..)
+            .take_while(|((parent, _), _)| parent == directory)
+            .peekable();
+        if deferred.peek().is_none() {
+            return Ok(children);
+        }
+        let taken: BTreeSet<String> = children
+            .iter()
+            .filter_map(|child| name_key(&child.name).ok())
+            .collect();
+        let shown: Vec<Entry> = deferred
+            .filter(|((_, key), _)| !taken.contains(key))
+            .filter_map(|(_, entity)| self.sessions.get(entity))
+            .map(|session| session.entry.clone())
+            .collect();
+        children.extend(shown);
         Ok(children)
     }
     /// Whether a deferred create not committed yet is in `directory`.
