@@ -160,7 +160,10 @@ use std::{
 /// the file's size and mtime when it was verified, and when. Process-wide,
 /// bounded; `check_commit` skips the re-hash of an object recorded here
 /// within [`FRESH_MS`](verified::FRESH_MS) whose file still has that size
-/// and mtime.
+/// and mtime. A verification is recorded only when it is not racy: observed
+/// at least [`RACY_NS`](verified::RACY_NS) after the file's mtime, so that a
+/// same-size rewrite within one timestamp tick cannot hide (the rule of the
+/// availability rows' `trusted`).
 pub mod verified {
     use std::{
         collections::HashMap,
@@ -169,12 +172,16 @@ pub mod verified {
             Mutex, OnceLock, PoisonError,
             atomic::{AtomicU64, Ordering},
         },
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     /// How long a verification counts as "moments ago".
     pub const FRESH_MS: u64 = 300_000;
     const FRESH: Duration = Duration::from_millis(FRESH_MS);
+    /// A verification observed within this long of the file's mtime is racy
+    /// and not recorded: the availability rows' `objects::RACY_NS` (larger
+    /// than any common mtime granularity; FAT: 2 s).
+    pub const RACY_NS: i64 = 3_000_000_000;
     /// Entries kept (the oldest are dropped past it).
     const CAPACITY: usize = 4096;
 
@@ -187,9 +194,45 @@ pub mod verified {
 
     static SKIPPED: AtomicU64 = AtomicU64::new(0);
 
+    /// The wall clock, in ns since the epoch (`observed_ns` of [`note`]).
+    pub fn now_ns() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+    }
+
+    /// When this process started trusting availability rows, in ms since the
+    /// epoch: fixed by the first call, which `Store::open` makes (through
+    /// `snapshot::initialize`) before the process installs anything.
+    pub fn epoch_ms() -> u64 {
+        static EPOCH: OnceLock<u64> = OnceLock::new();
+        *EPOCH.get_or_init(super::time)
+    }
+
+    /// Whether an observation at `observed_ns` of a file with mtime
+    /// `mtime_ns` is not racy.
+    pub fn settled(mtime_ns: i64, observed_ns: i64) -> bool {
+        i128::from(observed_ns) - i128::from(mtime_ns) >= i128::from(RACY_NS)
+    }
+
+    /// Whether an availability row verified at `verified_ms` stands for a
+    /// verification by this process moments ago (at `now_ms`): not before
+    /// [`epoch_ms`] (a previous process's row, until CCR-WP5.1-1 lets the
+    /// installers record their verifications here) and within
+    /// [`FRESH_MS`].
+    pub fn fresh_row(verified_ms: i64, now_ms: u64) -> bool {
+        u64::try_from(verified_ms)
+            .is_ok_and(|at| at >= epoch_ms() && now_ms.saturating_sub(at) <= FRESH_MS)
+    }
+
     /// Record that this process verified `hash` under `root` while its file
-    /// had `len` bytes and mtime `mtime_ns`.
-    pub fn note(root: &Path, hash: &str, len: u64, mtime_ns: i64) {
+    /// had `len` bytes and mtime `mtime_ns`, as `stat` read them no earlier
+    /// than `observed_ns` (wall clock, ns since the epoch). Nothing is
+    /// recorded when that observation is racy ([`settled`]).
+    pub fn note(root: &Path, hash: &str, len: u64, mtime_ns: i64, observed_ns: i64) {
+        if !settled(mtime_ns, observed_ns) {
+            return;
+        }
         let mut entries = entries().lock().unwrap_or_else(PoisonError::into_inner);
         if entries.len() >= CAPACITY {
             entries.retain(|_, (_, _, at)| at.elapsed() < FRESH);
@@ -662,14 +705,19 @@ impl Store {
     /// `check_commit`'s verification of newly authored bytes (WP5.1 task 5,
     /// CCR-WP4.INT-5's re-hash): skipped when this process verified the
     /// object moments ago and the file still has the size and mtime it had
-    /// then ([`verified`]), else a full `verify_object`, recorded on success.
-    /// The bytes were hashed by this process (or installed from bytes it
-    /// hashed: the availability marker `put_object` / `put_stream` leave,
-    /// read within [`verified::FRESH_MS`]) and `stat` shows them unchanged:
-    /// the rule startup trusts markers by (`VerifyMode::Changed`), narrowed
-    /// to moments ago, so invariant 1 (a verified, durable install) holds.
+    /// then ([`verified`]), else a full `verify_object`, recorded on success
+    /// unless racy. The bytes were hashed by this process (or installed from
+    /// bytes it hashed: the trusted availability marker `put_object` /
+    /// `put_stream` leave, written since this process started and read within
+    /// [`verified::FRESH_MS`]) and `stat` shows them unchanged, with an mtime
+    /// at least [`verified::RACY_NS`] older than the verification: the rule
+    /// startup trusts markers by (`VerifyMode::Changed`), narrowed to this
+    /// process and to moments ago, so invariant 1 (a verified, durable
+    /// install) holds.
     fn verify_new_object(&self, object: &str) -> Result<()> {
         let path = self.root.join("objects").join(object);
+        // No later than the `stat` below (`verified::note`).
+        let observed = verified::now_ns();
         let before = fs::metadata(&path).ok();
         if let Some(metadata) = &before {
             let (len, mtime) = (metadata.len(), objects::mtime_ns(metadata));
@@ -678,13 +726,13 @@ impl Store {
                 return Ok(());
             }
             // The install marker this process's `put_object` / `put_stream`
-            // left (the adapter of CCR-WP5.1-1).
-            let fresh = self.availability_row(object)?.is_some_and(|row| {
-                row.trusted(len, mtime)
-                    && time().saturating_sub(row.verified_ms.max(0) as u64) <= verified::FRESH_MS
+            // left (the adapter of CCR-WP5.1-1); `trusted` is not racy.
+            let row = self.availability_row(object)?.filter(|row| {
+                row.trusted(len, mtime) && verified::fresh_row(row.verified_ms, time())
             });
-            if fresh {
-                verified::note(&self.root, object, len, mtime);
+            if let Some(row) = row {
+                let verified_ns = row.verified_ms.saturating_mul(1_000_000);
+                verified::note(&self.root, object, len, mtime, verified_ns);
                 verified::count_skip();
                 return Ok(());
             }
@@ -696,6 +744,7 @@ impl Store {
                 object,
                 metadata.len(),
                 objects::mtime_ns(&metadata),
+                observed,
             );
         }
         Ok(())
@@ -2375,6 +2424,86 @@ mod tests {
             "corrupt bytes accepted"
         );
         assert_eq!(s.object_hashes(), hashes + 1);
+    }
+
+    /// WP5.1 review (round 1): a verification observed within `RACY_NS` of
+    /// the file's mtime is not recorded, so a same-size rewrite in that tick
+    /// is hashed again and refused; a verification well after the mtime is
+    /// recorded and skips the next re-hash. Availability rows count only when
+    /// written since this process started, and within `FRESH_MS`.
+    #[test]
+    fn a_racy_or_earlier_verification_is_not_trusted() {
+        // The set's rule.
+        let root = Path::new("racy-root");
+        let mtime = 1_000_000_000_000_000_000;
+        verified::note(root, "h1", 5, mtime, mtime + verified::RACY_NS - 1);
+        assert!(!verified::recent(root, "h1", 5, mtime));
+        verified::note(root, "h2", 5, mtime, mtime + verified::RACY_NS);
+        assert!(verified::recent(root, "h2", 5, mtime));
+        assert!(!verified::recent(root, "h2", 6, mtime));
+        assert!(!verified::recent(root, "h2", 5, mtime + 1));
+        // Availability rows.
+        let now = time();
+        let epoch = verified::epoch_ms();
+        assert!(epoch <= now);
+        assert!(verified::fresh_row(now as i64, now));
+        assert!(!verified::fresh_row(epoch as i64 - 1, now));
+        assert!(!verified::fresh_row(0, now));
+        assert!(!verified::fresh_row(
+            now as i64,
+            now + verified::FRESH_MS + 1
+        ));
+        // Bytes installed behind the store's back with a racy mtime: hashed,
+        // not recorded; rewritten (same size) and given that mtime again,
+        // they are hashed again and refused.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), None).unwrap();
+        let bytes = b"racy bytes";
+        let object = hash(bytes);
+        let path = s.root.join("objects").join(&object);
+        fs::write(&path, bytes).unwrap();
+        // In the future: racy however long the machine stalls before the
+        // verification reads it (a minute).
+        let stamp = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        let hashes = s.object_hashes();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes + 1);
+        fs::write(&path, b"Racy bytes").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        let refused = s.verify_new_object(&object).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("CORRUPT_OBJECT"),
+            "{refused:#}"
+        );
+        assert_eq!(s.object_hashes(), hashes + 2);
+        // Bytes whose mtime is well before the verification: recorded.
+        let bytes = b"settled bytes";
+        let object = hash(bytes);
+        let path = s.root.join("objects").join(&object);
+        fs::write(&path, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes + 3);
+        let skipped = verified::skipped();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes + 3);
+        assert!(verified::skipped() > skipped);
     }
 
     /// WP4.4 (CCR-WP2.4-2): every seal is written by `snapshot::seal`, so a
