@@ -274,7 +274,7 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
 /// daemon the desktop started (its standard streams appended to that file)
 /// adopts it first, as `RealLauncher::new` did before (WP4.2); any other
 /// daemon installs it, and keeps teeing its events to a terminal, pipe or
-/// other file on stderr. The path is the one the user knows (no `\?\`
+/// other file on stderr. The path is the one the user knows (no `\\?\`
 /// verbatim prefix: `Config::load` canonicalizes the data directory). A log
 /// that cannot be installed is logged; events then go to stderr only.
 fn install_log(data_directory: &std::path::Path) {

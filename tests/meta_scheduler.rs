@@ -1257,8 +1257,8 @@ fn a_request_id_is_never_sent_twice() {
     // The slot thread records `ExchangeFinished` before it hands the result
     // to the lane's loop, which counts the failure and publishes its view
     // afterwards: wait for the counter instead of reading it at once (WP5.4:
-    // read right after the event, it was still 0 about once in 40 runs
-    // under load).
+    // read right after the event, it was still 0 in 12 of 1,000 runs under
+    // load).
     assert!(
         wait_until(Duration::from_secs(5), || lane
             .view()
