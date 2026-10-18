@@ -49,7 +49,7 @@ A fault stays in its domain:
 | Object | that object | other objects, the other direction, the lane | per-object backoff; `CORRUPT_AT_SOURCE` makes the sender re-verify and quarantine its copy |
 | Inbox event | that event and its causal descendants (`blocked`) | unrelated events, other branches | transient: retry 1 s → 5 min; validation: quarantine, `revalidate` |
 | Exchange (peer, repo, op) | that key | other repositories on the same connection | per-key backoff by error class; contention is not counted |
-| Connection | its requests in flight (never replayed) | other lanes and peers | redial 1 s → 60 s with jitter, reset after 30 s healthy |
+| Connection | its requests in flight (never replayed) | other lanes and peers | redial 1 s → 60 s with jitter, reset after 5 s healthy; after a network loss the peer's lanes redial on one shared cadence (1 s, growing with the outage to 60 s) and a lane that connects wakes its siblings |
 | Peer | that peer | other peers, inbound sessions, folders | backoff, `Incompatible` (10 min), `Unauthorized` (60 s) |
 | Mount | file access for that folder | sync, status, graceful stop, other folders | attach retry 2 s → 120 s, or wait for the user |
 | Worker process | that folder | the management API, other folders | restart 1 s → 300 s, breaker after 5 failures in 10 min |
@@ -182,9 +182,28 @@ the catalog (a changed record restarts it; a removed one stops it within 5 s).
 A peer's pool is `max(connections, 2)` sessions: lane 0 is the control lane,
 lanes 1…N−1 bulk lanes. Each lane is a state machine: `Dialing` (every
 resolved address, 3 s each) → `Handshaking` → `Ready`, or `Backoff` (1 s →
-60 s, ±20 %, reset after 30 s Ready), `Incompatible` (rechecked after 10 min
+60 s, ±20 %, reset after 5 s Ready), `Incompatible` (rechecked after 10 min
 or when the record changes), `Unauthorized` (60 s or a new code). An
 incompatible or unauthorized peer is probed by one lane at a time.
+
+- **Network loss** (WP5.3). A lane that was healthy (`Ready` for 5 s) and
+  loses its session by the transport (`CONNECTION_LOST`, `TRANSPORT_DEAD`,
+  `WS_CLOSED`; not a `GOAWAY`, not a close of this side's own) starts the
+  peer's network loss. Until a lane connects again, every lane whose dial
+  reaches nothing or whose session the transport loses redials on **one
+  cadence shared by the peer's lanes**: the first redial 1 s after the loss,
+  then one per spacing, the outage's age / 30 between 1 s and 60 s (1 s for
+  the first 30 s, 1.5 s at 45 s, 4 s at 2 min, 60 s from 30 min on), ±20 %,
+  without escalating the lane's own backoff. When a lane connects, the loss
+  ends, every sibling whose wait is wakeable (its dial failed, or the cadence
+  paces it) dials at once, and a sibling dial still in its handshake that
+  began before the successful one is interrupted and redialed. A lane
+  backing off after a session the peer closed before it was healthy (a
+  flapping acceptor) keeps its own escalating delay. Every redial is a fresh
+  session (invariant 16). A 45 s outage in the middle of a 512 MiB transfer
+  has every lane `Ready` within about 0.3–1.1 s of the restore and bytes
+  flowing again within about 0.2–1.1 s, from the durable offset
+  ([validation](VALIDATION.md#floors-and-the-latest-measurements)).
 
 - **Remote catalog.** Lane 0 asks for the peer's published catalog when it
   connects and every 2 s with the generation it has (`catalog.list{since}`,
@@ -200,7 +219,10 @@ incompatible or unauthorized peer is probed by one lane at a time.
   Failures back off by class: contention 50 ms → 1 s (not counted), transient
   1 s → 60 s, needs-user-action 60 s, incompatible and fatal 10 min. A lost
   session charges no key; the next attempt is a fresh request.
-- **Bulk lanes** run objects v3 (below), one scheduler per direction.
+- **Bulk lanes** run objects v3 (below), one scheduler per direction. When a
+  lane ends (its session lost, or told to stop; not while the daemon stops),
+  it gives up the leases its rounds kept for its next round, holding each
+  repository's key meanwhile, so no round overlaps the release.
 
 ### Inbound server
 
@@ -272,7 +294,8 @@ dirty file, logs, and exits 70; the daemon restarts the worker.
 
 | Holder | Engine lock? |
 |---|---|
-| filesystem callbacks | yes; content hydration (a read of bytes still downloading) waits outside it, but saving a file hashes and copies it into the object store under it, and the first write to a file larger than 256 KiB copies it to a staging file under it, so those holds grow with the file (about 2 s per 256 MiB); a pending save's commit takes SQLite's writer slot only after its bytes are stored |
+| filesystem callbacks | short holds only (WP5.2). A save snapshots the file's bytes under the lock, hashes and stores them without it, and commits under it with a base check; the commit does not hash the new object again (the verified set, below). The first write to a file larger than 256 KiB copies it to a staging file without the lock. A read of bytes still downloading waits outside it. Work before the lock honours the mount's fence |
+| background savers (WP5.2) | the save's two short phases, after the filesystem callbacks waiting for the engine (at most 20 ms each time) |
 | activator | slices of ≤ 64 events or 25 ms; yields while filesystem callbacks wait |
 | feed RPCs, `objects.*`, `status`, `hello`, `watch` | no: pooled secondary SQLite connections; status from the status cell |
 | control ops (mkdir, resolve, checkout, …) | yes |
@@ -293,6 +316,41 @@ A graceful detach needs quiet (no open handles, no dirty files), else
 orphaned handles. Mount errors never touch the store's health. WinFsp binds
 the engine once and creates a fresh file system per attach, so a folder can
 attach, detach and attach again in the same process.
+
+**The filesystem path** (WP5.2; `runtime::engine` module docs):
+
+- **Saves off the engine lock.** Three phases: snapshot the session's bytes
+  under the lock (a copy of at most 256 KiB in memory, or a second handle to
+  its staging file, which writers then wait for without the lock); hash,
+  write, `fsync` and install the object without it (invariant 1), recording
+  in the verified set what it hashed; commit under it with the snapshot's
+  bases. A session edited meanwhile stays dirty and saves again. Every
+  failure of any phase keeps the file as a pending save; a crash at any step
+  leaves the last committed bytes.
+- **Write-behind during a burst of closes.** A lone close saves before it
+  returns. During a burst (saves running, or one ended less than 100 ms ago)
+  a close queues its save for a pool of at most 8 saver threads (64 queued);
+  with the queue full a close saves before it returns, so at most 72 closed
+  files are uncommitted at any time. `FlushFileBuffers` and fsync(2), a
+  rename and a delete wait for the file's save; a graceful stop, a detach,
+  a checkout and every control request that needs a quiet engine wait for
+  closed files' saves (at most 5 s) instead of answering `BUSY_VIEW`.
+- **Deferred creates.** A file created through the WinFsp mount is a dirty
+  session until its first save, which commits one event that creates it with
+  its content. It is shown by lookups and listings meanwhile (a committed
+  entry of the same name wins until the new file's commit makes the name
+  conflict), retained, restored and committed like any unsaved file, and
+  committed first by anything that would change its name.
+  `TKFS_DEFERRED_CREATE=0` turns this off; FUSE creates commit at once.
+- **Reads of content still downloading** register demand and wait while the
+  object's spool grows; they serve only the verified whole object, and fail
+  `CONTENT_UNAVAILABLE` after 60 s without progress, after 240 s in all, or
+  at once when a detach or checkout fences the mount (WinFsp:
+  `STATUS_DEVICE_NOT_READY`; FUSE: `EIO`). At most half the WinFsp
+  dispatcher threads (FUSE: 32 requests) wait at once.
+- **FUSE threads.** Reads, writes, fsyncs, flushes and size changes run on
+  threads of their own, at most 64 at once; the others wait in line, none is
+  refused.
 
 ### Inbox and activation
 
@@ -338,6 +396,35 @@ children released from `waiting` in the same slice. Three commit paths:
   validation that depends on the database. If the branch moved meanwhile the
   ticket is stale and re-queued (250 ms → 30 s); after 4 stale outcomes the
   event is committed inline, alone (`starved_since_ms` reports the wait).
+
+**The slow path as built** (WP5.1; `core::derive` and `core::commit`
+module docs). A slow commit no longer derives or projects the branch from
+scratch:
+
+- **Appended projection.** It projects from the handle's view
+  (`project_append`: the new event's registers, then incremental namespace
+  passes over the slots and chains the event can change), declining (to a
+  full `project`, the base kept as the view) for a base with pending
+  events, an entity id with a comma, or an event another event names.
+- **Branch index.** A per-branch derivation index kept beside the event
+  cache (positions, register versions, cones, competing-cut counts
+  memoized per cone) lets append mode read what it used to recompute from
+  every event; a successor recounts only the cones it joins.
+- **Interned derivation.** Full mode (fallbacks, rebuilds, the oracle)
+  works on integers instead of `String` sets, sweeps each cone once and
+  enumerates antichains over concurrent sets: a full rebuild of a store with
+  9,000 open conflicts takes seconds, not minutes.
+- **Writes that follow the change.** Stored rows with the same payload are
+  skipped, the view's slots are patched, and the seal trusts the handle's
+  own last anchor and reuses its header.
+- **The verified set.** `check_commit` hashes a local event's new object
+  again only when this process did not verify it moments ago (an in-memory
+  set keyed by store and hash, holding the file's size and mtime, filled by
+  every installer and by the engine's saves, never trusting a racy mtime or
+  an object the index marks corrupt or missing).
+
+`TKFS_CONFLICT_MODE=full` stays the reference: it projects and derives in
+full on every slow commit.
 
 A commit that crosses the startup-snapshot interval is committed alone, and
 the WAL is checkpointed outside the lock between slices. `Store::
@@ -392,6 +479,10 @@ that does not match the anchor's digest) falls back to a full rebuild.
 - **Stored projection header.** `current_meta` holds the projection's
   conflict and pending lists when they differ from `current_state`'s, so a
   conflict-producing commit writes a delta instead of the whole projection.
+  Both it and the rows anchor's header still hold the whole conflict list,
+  so a commit that changes it writes O(open conflicts) bytes twice (about
+  50 + 90 ms at 13,000 open conflicts; a format 3 that keys them by id is
+  CCR-WP5.1-2).
 - **Downgrade.** An older binary finds a format-2 anchor incompatible and
   reconstructs every branch at its first open (rewriting `current_state`),
   then seals format 1; it never reads the side tables, which this binary's
@@ -539,6 +630,17 @@ found nothing to do (nothing wanted, offered, excluded or pushed) is
 rechecked after 5 s (the sync interval when that is longer); its triggers
 (feed tips, content generations, staging) still run it at once.
 
+**Leases of a dead session** (WP5.3) end at once: a failed round releases
+its unfinished objects, a lane that ends gives up what its rounds kept, and
+the acceptor gives up the leases it offered on a bulk session when that
+session ends (the inbound server reports it) or once the offer and its
+session have been silent for 5 s (a link that drops every byte). Lease ids
+are per lane, so a release is serialized with the next session's exchanges
+of that lane. **Demand first**: a busy download round asks its worker every
+500 ms which objects readers wait for (`objects.demand`, read-only) and
+moves them to the front of its plan, leasing one it had not planned with a
+small want; an idle lane runs a round as soon as the demand grows.
+
 **Durability.** A spool's durable offset (`spool_state`) advances only after
 fsync; a write must start exactly there, and overlaps are compared byte for
 byte. A completed object is hashed again in full, installed (write-through
@@ -609,14 +711,14 @@ the redacted catalog, the ends of the logs and the versions into
 
 | # | Invariant | Mechanism | Guard |
 |---|---|---|---|
-| 1 | Verified, durable install before an object is shared | full re-hash before install, write-through install, availability after install | `objects_v3_worker::corrupt_spool_never_installed`, `availability_index` |
+| 1 | Verified, durable install before an object is shared | full re-hash before install, write-through install, availability after install; a local commit skips the re-hash only of bytes this process verified moments ago, unchanged since (the verified set) | `objects_v3_worker::corrupt_spool_never_installed`, `availability_index`, `core::commit::tests::a_later_corrupt_verdict_wins_over_the_verified_set` |
 | 2 | Overlaps verified, no gaps, offsets advertised only after fsync | `spool_state.durable` after fsync; appends start exactly there | `objects_v3_worker::crash_mid_object_resumes_from_durable` |
 | 3 | Register only after install; a crash between them recovers | re-transfer of a non-shareable object | `crash_between_install_and_register_retransfers` |
 | 4 | `synchronous=FULL`, atomic commits | side rows and triggers inside the commit's savepoint | every store suite |
 | 5 | Snapshots are disposable | checksummed, journal-bound, rebuild fallback | `startup_snapshots`, `w3_integration` |
 | 6 | Events are immutable | derived tables only; digests computed, never stored | `EVENT_ID_REUSED` tests |
 | 7 | Object sizes are immutable | `OBJECT_SIZE_CHANGED` at staging, commit and write | `offlock_commit::size_change_between_prepare_and_commit_rejected` |
-| 8 | Dirty files survive | force detach saves, poison saves, shutdown leaves busy workers | `worker_lifecycle::force_stop_persists_dirty`, `poison_exit_persists_dirty` |
+| 8 | Dirty files survive | force detach saves, poison saves, shutdown leaves busy workers; a save in progress (off the lock, or queued by write-behind) is a dirty session until its commit | `worker_lifecycle::force_stop_persists_dirty`, `poison_exit_persists_dirty`, `local_fs_throughput::a_crash_at_every_step_of_a_save_keeps_the_last_committed_bytes` |
 | 9 | Causal activation | `incoming_waits`; activation only with every parent committed | `activation_inbox` |
 | 10 | Acks only for committed events, bound to their request | per-id evidence from the peer's committed feed | `feed_v7::staged_never_acks`, `rejected_never_acks`, `third_peer_staged_not_acked` |
 | 11 | Deterministic conflicts | fast paths and append mode are restrictions of full mode; `verify` mode; oracle fuzz | `derive_oracle`, `activation_inbox` |
@@ -627,7 +729,7 @@ the redacted catalog, the ends of the logs and the versions into
 | 16 | Uncertain requests are never replayed | fresh requests after a loss; `ControlClient` never resends a mutation | `session_core::lost_request_not_replayed` |
 | 17 | A remote error keeps the session | `ok:false` responses leave it usable | `session_core::remote_error_keeps_conn` |
 | 18 | Control carries no object bytes; bulk never activates or acknowledges | op/role table | `inbound_v3::role_violations_and_route_violations_keep_their_codes`, `objects_v3_lanes::control_carries_no_object_bytes` |
-| 19 | One owner per object per session | lane sharding, worker leases, object locks | `objects_v3_worker::duplicate_sessions_transfer_once` |
+| 19 | One owner per object per session | lane sharding, worker leases, object locks; a release ends only the releasing lane's own leases and is serialized with that lane's next session | `objects_v3_worker::duplicate_sessions_transfer_once`, `objects_v3_lanes::a_reap_never_ends_the_lease_of_the_lanes_next_session` |
 | 20 | Fail closed against old peers | `X-Tkfs-Sync` both ways | `session_handshake::legacy_both_directions`, `qual_wp3_1_transport` |
 | 21 | Salted verifier; per-peer credentials; rotation invalidates sessions and credentials; no code, secret or token in status, logs or diagnostics | HMAC over the verifier digest or `K_peer`; generation → GOAWAY; rotation and unpair revoke `peer_credentials`; redaction of logs and bundles | `session_handshake`, `status_hub`, `security`, `logging` |
 | 22 | Bounded input | frame, header, page, need and body limits; pre-auth limits | `session_core::bounds`, `inbound_v3::preauth_flood_keeps_memory_flat` |
