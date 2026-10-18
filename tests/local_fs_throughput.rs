@@ -617,6 +617,60 @@ fn a_delete_or_a_rename_over_a_closed_file_waits_for_its_save() {
     }
 }
 
+/// WP5.INT (CCR-WP5.2-4): a graceful stop or a control request right after
+/// a burst of closes waits for the closed files' saves (bounded) instead of
+/// being refused `BUSY_VIEW`, and does not wait when something else keeps
+/// the engine from being quiet (a file still open).
+#[test]
+fn a_quiet_engine_is_awaited_while_only_closed_files_are_being_saved() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    fault::configure(Some(FaultConfig {
+        ms: Some(300),
+        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
+    }));
+    let disarm = Disarm;
+    for i in 0..4u64 {
+        let h = {
+            let mut e = lock(&engine);
+            let (h, _) = e.create_deferred(&format!("b{i}.bin"), true, None).unwrap();
+            e.write(h, 0, &bytes(8100 + i, 2048), false, false).unwrap();
+            e.cleanup_unsaved(h).unwrap();
+            h
+        };
+        engine::save_handle_in_background(&engine, h).unwrap();
+        engine::close_handle(&engine, h).unwrap();
+    }
+    assert!(
+        lock(&engine).quiet().is_err(),
+        "the saves are still running"
+    );
+    let started = Instant::now();
+    let e = engine::lock_after_saves(&engine, Duration::from_secs(30));
+    assert!(e.quiet().is_ok(), "{:?}", e.quiet());
+    assert!(started.elapsed() < Duration::from_secs(30));
+    drop(e);
+    // An open file: no wait at all.
+    let (h, _) = lock(&engine)
+        .create_deferred("open.bin", true, None)
+        .unwrap();
+    let started = Instant::now();
+    let e = engine::lock_after_saves(&engine, Duration::from_secs(30));
+    assert!(e.quiet().is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(e);
+    drop(disarm);
+    lock(&engine).close(h).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
+        .quiet()
+        .is_ok()));
+}
+
 #[test]
 fn closes_past_a_full_save_queue_save_before_they_return() {
     let _serial = serial();

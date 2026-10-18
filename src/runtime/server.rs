@@ -779,9 +779,32 @@ impl Core {
                 crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
                 result
             }
+            // CCR-WP5.4-4 (applied by WP5.INT): the embedded status claims
+            // (`caught_up`, `metadata_caught_up`, `upload_state`) are the
+            // worker `status` reply's, which counts the feed peers; the
+            // engine's own `status` knows only the legacy lanes. Read with no
+            // engine lock held (the control reply's guard ends with it).
+            "folder-details" => {
+                let mut details = self.engine()?.control(request, payload)?;
+                let status = self.status()?;
+                for member in ["caught_up", "metadata_caught_up", "upload_state"] {
+                    details["status"][member] = status[member].clone();
+                }
+                Ok(details)
+            }
             op => {
-                let result = self.engine()?.control(request, payload);
-                if !READ_ONLY_CONTROL_OPS.contains(&op) {
+                let read_only = READ_ONLY_CONTROL_OPS.contains(&op);
+                let mut engine = if read_only {
+                    self.engine()?
+                } else {
+                    // A mutation needs a quiet engine: give the saves of
+                    // files closed just before it their few milliseconds
+                    // instead of refusing it (CCR-WP5.2-4).
+                    self.engine_after_saves()?
+                };
+                let result = engine.control(request, payload);
+                drop(engine);
+                if !read_only {
                     // Journaled mutations, demand (`request-object`) and
                     // anything unknown: refreshed before the reply.
                     crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
@@ -796,6 +819,16 @@ impl Core {
     /// it), `hang` holds it, `fail` fails the request.
     fn engine(&self) -> Result<EngineGuard<'_>> {
         let guard = lock_engine_tracked(&self.ctx.engine);
+        fault::trigger("engine.poison")?;
+        Ok(guard)
+    }
+
+    /// [`Self::engine`] once the saves of closed files have ended, if they
+    /// are all that keeps the engine from being quiet (at most
+    /// `engine::QUIET_SAVES_WAIT`; CCR-WP5.2-4).
+    fn engine_after_saves(&self) -> Result<EngineGuard<'_>> {
+        let guard =
+            super::engine::lock_after_saves(&self.ctx.engine, super::engine::QUIET_SAVES_WAIT);
         fault::trigger("engine.poison")?;
         Ok(guard)
     }
@@ -874,7 +907,18 @@ impl Core {
         let attached = self.ctx.mount.status().state.is_attached();
         let reply = match mode {
             StopMode::Graceful => {
-                engine()?.quiet()?;
+                if reply_follows {
+                    // The saves of files closed just before the stop end
+                    // first, instead of a `BUSY_VIEW` refusal the controller
+                    // retries 2 s later (CCR-WP5.2-4).
+                    super::engine::lock_after_saves(
+                        &self.ctx.engine,
+                        super::engine::QUIET_SAVES_WAIT,
+                    )
+                    .quiet()?;
+                } else {
+                    engine()?.quiet()?;
+                }
                 let detached = self.ctx.mount.detach(false);
                 self.beat();
                 detached.map_err(ErrorWire::into_anyhow)?;
