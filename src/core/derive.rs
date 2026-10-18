@@ -8,7 +8,8 @@
 //!
 //! - `full`: the reference. Every historical location pair, every reviewed
 //!   cut and every antichain of every namespace cone is re-derived; namespace
-//!   rows that are no longer derived are deleted.
+//!   rows that are no longer derived are deleted. A slow commit also projects
+//!   the branch in full (`project`, not `project_append`).
 //! - `append` (default): derives only what `E` can add, under an exactness
 //!   precondition checked on every commit, and runs `full` whenever the
 //!   precondition does not hold.
@@ -278,7 +279,8 @@ pub enum ConflictMode {
     /// otherwise derive in full.
     #[default]
     Append,
-    /// Re-derive the whole branch history (the reference).
+    /// Re-derive the whole branch history (the reference). A slow commit
+    /// also projects the branch in full (no `project_append`).
     Full,
     /// Run both and fail the commit with `CONFLICT_MODE_MISMATCH` on any
     /// difference; the full result is kept.
@@ -4540,12 +4542,18 @@ impl<'a> NsContext<'a> {
     /// `namespace_history`). WP5.1: a cut's records come from the cone's own
     /// registers (`namespace_records`) whenever no cut of the branch can fail
     /// to project (`projection_cannot_fail`, the condition append mode
-    /// already projects under), else from the whole cut, as before.
+    /// already projects under) and no entity id has a comma, else from the
+    /// whole cut, as before. The comma: the historical path keeps a cut's
+    /// records whose entity, split at its commas, names a member, so with a
+    /// comma in an id it keeps fewer than `namespace_records` (the record of
+    /// `d,0` and `f,0` names neither); append mode never runs there
+    /// (`append_guard`), so the historical path stays the reference.
     fn full(&self) -> Result<Vec<Conflict>> {
         let cones = NamespaceCones::new(self)?;
         let locations = Locations::new(self.events);
         let restricted = !self.memo.borrow().unrestricted
             && !self.irregular
+            && !self.base.names.iter().any(|name| name.contains(','))
             && locations.first_error().is_ok()
             && projection_cannot_fail(self, &locations);
         let mut conflicts = BTreeMap::new();
@@ -5411,7 +5419,15 @@ pub(super) struct Appended {
 /// `events[new]` (WP5.1: a slow commit no longer projects the whole branch).
 /// `None` when the shortcut does not apply (the base has pending events, the
 /// new event is a parent of another or has a parent outside `events`, an id
-/// repeats): the caller projects in full.
+/// repeats, an entity id has a comma): the caller projects in full.
+///
+/// The comma. A collision record's entity is its pair joined by a comma
+/// (`a,b`), and `namespace_delta` revises the records of a recomputed slot
+/// by reading that pair back. With a comma in an entity id the joined text
+/// is ambiguous (`a,b` with `c`, and `a` with `b,c`, are both `a,b,c`), so a
+/// history with one (crafted: `check_commit` accepts the id) is projected
+/// in full, as append mode derives it in full (`append_guard`). Without one,
+/// a pair's text names exactly its two members.
 ///
 /// Why it equals `project`. Every event of `O = events \ {E}` is active in
 /// the base (no pending event) and none names `E` as a parent, so `E` is the
@@ -5447,6 +5463,10 @@ pub(super) fn project_append(
         return Ok(None);
     }
     let e = &events[new];
+    let comma = |event: &Event| event.changes.iter().any(|c| c.entity.contains(','));
+    if comma(e) {
+        return Ok(None);
+    }
     // The events' positions by id: the branch index's (WP5.1), when it
     // indexes every event but `E` (the last) and no id repeats; else a scan.
     let indexed = index.filter(|index| {
@@ -5454,9 +5474,11 @@ pub(super) fn project_append(
     });
     let ids: Option<HashMap<&str, usize>> = match indexed {
         Some(index) => {
-            // `E`'s id repeats an indexed one, or an indexed event names it.
+            // `E`'s id repeats an indexed one, an indexed event names it, or
+            // an indexed entity id has a comma.
             if index.ns.index.contains_key(e.id.as_str())
                 || index.facts.dangling.contains_key(e.id.as_str())
+                || index.facts.comma > 0
             {
                 return Ok(None);
             }
@@ -5466,7 +5488,7 @@ pub(super) fn project_append(
             let mut ids: HashMap<&str, usize> =
                 HashMap::with_capacity_and_hasher(events.len(), FastHash::default());
             for (i, event) in events.iter().enumerate() {
-                if ids.insert(event.id.as_str(), i).is_some() {
+                if ids.insert(event.id.as_str(), i).is_some() || comma(event) {
                     return Ok(None);
                 }
             }
@@ -5739,6 +5761,9 @@ fn register_presence(p: &Projection, entity: &str) -> bool {
 /// one of those (they and their descendants) are decided again. A slot
 /// verdict outside the recomputed slots is the base's: alive after the
 /// passes, or suppressed by the chain pass (it has that pass's record).
+///
+/// Precondition: no entity id has a comma (`project_append` declines such
+/// a history), so a collision record's `a,b` names exactly its pair.
 fn namespace_delta(
     branch: &str,
     p: &mut Projection,
@@ -10236,6 +10261,19 @@ mod tests {
             appended > 200 && fallbacks > 0,
             "{appended} appended, {fallbacks} fallbacks"
         );
+        // WP5.1 review (round 1): entity ids with commas (`with_comma_ids`),
+        // where full mode keeps the historical whole-cut records (`full`)
+        // and append mode falls back.
+        let mut commas = 0;
+        for seed in 0..seeds.div_ceil(3) {
+            let mut rng = StdRng::seed_from_u64(32_000 + seed);
+            let events = any_history(&mut rng, seed);
+            let events = with_comma_ids(&mut rng, events);
+            let (_, f) = compare_with_wave4(&format!("comma seed {seed}"), &events, &mut rng);
+            commas += f;
+        }
+        println!("{commas} comma fallbacks");
+        assert!(commas > 100, "{commas} comma fallbacks");
     }
 
     /// A random history from one of the generators (`kind` modulo 4).
@@ -10437,13 +10475,16 @@ mod tests {
     /// WP5.1: `project_append` from the projection of every prefix equals
     /// `project` of the prefix plus the next event (or declines), and its
     /// `changed` set and `lists` flag cover every difference from the base,
-    /// on the four history generators.
+    /// on the four history generators. Seeds 240 and up give about half of
+    /// the entity ids a comma (`with_comma_ids`): from the first prefix that
+    /// has one, the append declines (indexed and scanned), and before it the
+    /// same checks hold.
     #[test]
     fn project_append_equals_project_on_every_prefix() {
-        let (mut appended, mut declined) = (0, 0);
-        for seed in 0..240u64 {
+        let (mut appended, mut declined, mut commas) = (0, 0, 0);
+        for seed in 0..300u64 {
             let mut rng = StdRng::seed_from_u64(41_000 + seed);
-            let events = match seed % 5 {
+            let mut events = match seed % 5 {
                 4 => {
                     // Long storms over few names: many collisions, moved
                     // and deleted directories, chains through them.
@@ -10467,6 +10508,9 @@ mod tests {
                     storm_history(&mut rng, len, 4, 2, 0.3)
                 }
             };
+            if seed >= 240 {
+                events = with_comma_ids(&mut rng, events);
+            }
             for k in 1..events.len() {
                 let (old, new) = (&events[..k], &events[..=k]);
                 let Ok(base) = project(BRANCH, old) else {
@@ -10476,6 +10520,17 @@ mod tests {
                 let through =
                     project_append(BRANCH, base.clone(), new, k, Some(&BranchIndex::build(old)));
                 let scanned = project_append(BRANCH, base.clone(), new, k, None);
+                if new
+                    .iter()
+                    .any(|e| e.changes.iter().any(|c| c.entity.contains(',')))
+                {
+                    assert!(
+                        matches!((&through, &scanned), (Ok(None), Ok(None))),
+                        "seed {seed} k {k}: an entity id with a comma, appended"
+                    );
+                    commas += 1;
+                    continue;
+                }
                 match (&through, &scanned) {
                     (Ok(a), Ok(b)) => assert!(
                         a.as_ref().map(|a| (
@@ -10564,8 +10619,129 @@ mod tests {
                 }
             }
         }
-        println!("{appended} appended, {declined} declined");
-        assert!(appended > 4000, "{appended} appended, {declined} declined");
+        println!("{appended} appended, {declined} declined, {commas} with a comma");
+        assert!(
+            appended > 4000 && commas > 500,
+            "{appended} appended, {declined} declined, {commas} with a comma"
+        );
+    }
+
+    /// `events` with about half of their entity ids given a comma after
+    /// their first character (`f1` becomes `f,1`), in the changes and in
+    /// the location parents. Crafted ids: `check_commit` accepts them.
+    fn with_comma_ids(rng: &mut StdRng, mut events: Vec<Event>) -> Vec<Event> {
+        let entities: BTreeSet<String> = events
+            .iter()
+            .flat_map(|e| e.changes.iter().map(|c| c.entity.clone()))
+            .collect();
+        let renamed: BTreeMap<String, String> = entities
+            .into_iter()
+            .filter(|_| rng.gen_bool(0.5))
+            .map(|id| {
+                let (head, tail) = id.split_at(1);
+                let comma = format!("{head},{tail}");
+                (id, comma)
+            })
+            .collect();
+        for e in &mut events {
+            for c in &mut e.changes {
+                if let Some(to) = renamed.get(&c.entity) {
+                    c.entity = to.clone();
+                }
+                let parent = c.value["parent"].as_str().map(str::to_owned);
+                if c.field == "location"
+                    && let Some(to) = parent.and_then(|parent| renamed.get(&parent))
+                {
+                    c.value["parent"] = json!(to);
+                }
+            }
+        }
+        events
+    }
+
+    /// WP5.1 review (round 1): `a,b` and `c` collide in `x` (`a2`), and `c`
+    /// moves out (`a3`). The pair's record is `a,b,c`, which also names `a`
+    /// with `b,c`: `project_append` declines (it kept the record), and
+    /// `project` drops it.
+    #[test]
+    fn project_append_declines_an_entity_id_with_a_comma() {
+        let event = |id: &str, deps: &[&str], changes: Vec<Change>| Event {
+            id: id.into(),
+            repo: "repo".into(),
+            branch: Branch {
+                id: BRANCH.into(),
+                name: "main".into(),
+                shared: true,
+            },
+            device: "dev-a".into(),
+            created_ms: 1,
+            changes,
+            dependencies: deps.iter().map(|d| d.to_string()).collect(),
+            reviewed: vec![],
+            object_sizes: BTreeMap::new(),
+        };
+        let change = |entity: &str, field: &str, parents: &[&str], value| Change {
+            entity: entity.into(),
+            field: field.into(),
+            parents: parents.iter().map(|p| p.to_string()).collect(),
+            value,
+        };
+        let create = |entity: &str| {
+            vec![
+                change(entity, "kind", &[], json!("file")),
+                change(
+                    entity,
+                    "location",
+                    &[],
+                    json!({"parent": ROOT, "name": "x"}),
+                ),
+                change(entity, "alive", &[], json!(true)),
+            ]
+        };
+        let events = [
+            event("a1", &[], create("a,b")),
+            event("a2", &["a1"], create("c")),
+            event(
+                "a3",
+                &["a2"],
+                vec![change(
+                    "c",
+                    "location",
+                    &["a2"],
+                    json!({"parent": ROOT, "name": "y"}),
+                )],
+            ),
+        ];
+        let collided = |p: &Projection| p.conflicts.iter().any(|c| c.entity == "a,b,c");
+        for k in 1..events.len() {
+            let (old, new) = (&events[..k], &events[..=k]);
+            let base = project(BRANCH, old).unwrap();
+            let index = BranchIndex::build(old);
+            assert!(matches!(
+                project_append(BRANCH, base.clone(), new, k, Some(&index)),
+                Ok(None)
+            ));
+            assert!(matches!(
+                project_append(BRANCH, base, new, k, None),
+                Ok(None)
+            ));
+            assert_eq!(collided(&project(BRANCH, new).unwrap()), k == 1, "k {k}");
+        }
+        // The new event's own comma, on a history without one.
+        let fresh = [
+            event("b1", &[], create("c")),
+            event("b2", &["b1"], create("a,b")),
+        ];
+        let base = project(BRANCH, &fresh[..1]).unwrap();
+        let index = BranchIndex::build(&fresh[..1]);
+        assert!(matches!(
+            project_append(BRANCH, base.clone(), &fresh, 1, Some(&index)),
+            Ok(None)
+        ));
+        assert!(matches!(
+            project_append(BRANCH, base, &fresh, 1, None),
+            Ok(None)
+        ));
     }
 
     /// The rows a commit leaves: `stored` upserted with `derived` (the last

@@ -1412,6 +1412,286 @@ fn fallback_when_a_current_record_is_not_derived_from_history() {
     assert!(rows.windows(2).all(|w| w[0] == w[1]));
 }
 
+/// WP5.1 review (round 1): a collision record's entity is its pair joined by
+/// a comma, so an entity id with a comma makes it ambiguous (`a,b` with `c`,
+/// and `a` with `b,c`, are both `a,b,c`). `check_commit` accepts such ids,
+/// so a crafted history can have them. Here `a,b` and `c` collide in `x`
+/// (`a2`), `c` moves out (`a3`: the current record must go), back in
+/// (`a4`), and `a,b` is deleted (`a5`). Every delivery commits in every mode,
+/// with and without the commit checks; after each the oracle is empty, the
+/// stored projection is `project`'s, and every configuration stores the
+/// same rows.
+#[test]
+fn entity_ids_with_a_comma_commit_as_the_reference() {
+    let branch = hash(format!("tkfs-v1/{REPO}/main").as_bytes());
+    let crafted = |id: &str, deps: &[&str], changes: Vec<Change>| Event {
+        id: id.into(),
+        repo: REPO.into(),
+        branch: Branch {
+            id: branch.clone(),
+            name: "main".into(),
+            shared: true,
+        },
+        device: format!("dev-{}", &id[..1]),
+        created_ms: 1,
+        changes,
+        dependencies: deps.iter().map(|d| d.to_string()).collect(),
+        reviewed: vec![],
+        object_sizes: BTreeMap::new(),
+    };
+    let change = |entity: &str, field: &str, parents: &[&str], value| Change {
+        entity: entity.into(),
+        field: field.into(),
+        parents: parents.iter().map(|p| p.to_string()).collect(),
+        value,
+    };
+    let place = |name: &str| json!({"parent": ROOT, "name": name});
+    let events = vec![
+        crafted(
+            "a1",
+            &[],
+            vec![
+                change("a,b", "kind", &[], json!("file")),
+                change("a,b", "location", &[], place("x")),
+                change("a,b", "alive", &[], json!(true)),
+            ],
+        ),
+        crafted(
+            "a2",
+            &["a1"],
+            vec![
+                change("c", "kind", &[], json!("file")),
+                change("c", "location", &[], place("x")),
+                change("c", "alive", &[], json!(true)),
+            ],
+        ),
+        crafted(
+            "a3",
+            &["a2"],
+            vec![change("c", "location", &["a2"], place("y"))],
+        ),
+        crafted(
+            "a4",
+            &["a3"],
+            vec![change("c", "location", &["a3"], place("x"))],
+        ),
+        crafted(
+            "a5",
+            &["a4"],
+            vec![change("a,b", "alive", &["a1"], json!(false))],
+        ),
+    ];
+    let allowed: BTreeSet<String> = ["dev-a".to_string()].into();
+    // Whether the current projection records the collision of `a,b` and `c`.
+    let collided = |p: &Projection| {
+        p.conflicts
+            .iter()
+            .any(|c| c.field == "namespace" && c.entity == "a,b,c")
+    };
+    let mut rows = vec![];
+    for (mode, checks) in [
+        (ConflictMode::Append, true),
+        (ConflictMode::Append, false),
+        (ConflictMode::Verify, true),
+        (ConflictMode::Full, true),
+        (ConflictMode::Full, false),
+    ] {
+        let _mode = ModeGuard::new(mode);
+        let previous = set_thread_commit_checks(checks);
+        let mut receiver = Replica::new();
+        let r = receiver.store();
+        for event in &events {
+            let acked = r.receive(bundle(vec![event.clone()]), &allowed).unwrap();
+            assert_eq!(
+                acked,
+                vec![event.id.clone()],
+                "{mode:?} checks {checks}: {:?}",
+                quarantined(r)
+            );
+            let diff = oracle(r).unwrap();
+            assert!(
+                diff.is_empty(),
+                "{mode:?} checks {checks} after {}: {diff:#?}",
+                event.id
+            );
+            let stored = r.projection(&branch).unwrap();
+            assert_eq!(
+                stored,
+                project(&branch, &r.events().unwrap()).unwrap(),
+                "{mode:?} checks {checks} after {}",
+                event.id
+            );
+            let expected = matches!(event.id.as_str(), "a2" | "a4");
+            assert_eq!(
+                collided(&stored),
+                expected,
+                "{mode:?} checks {checks} after {}: {:?}",
+                event.id,
+                stored.conflicts
+            );
+        }
+        set_thread_commit_checks(previous);
+        rows.push(conflict_rows(r));
+    }
+    assert!(rows.windows(2).all(|w| w[0] == w[1]));
+}
+
+/// A crafted history for `crafted_histories_with_comma_ids_commit_as_the_reference`:
+/// `len` events over directories `d1`..`d3`, `d,0` and files `f1`..`f4`,
+/// `f,0`, each changing one to three entities (so several relocations per
+/// event, directory moves and cycles), with concurrent and stale parents.
+fn comma_history(rng: &mut StdRng, len: usize) -> Vec<Event> {
+    const ENTITIES: &[&str] = &["d1", "d2", "d3", "d,0", "f1", "f2", "f3", "f4", "f,0"];
+    const PARENTS: &[&str] = &["d1", "d2", "d3", "d,0"];
+    let branch = Branch {
+        id: hash(format!("tkfs-v1/{REPO}/main").as_bytes()),
+        name: "main".into(),
+        shared: true,
+    };
+    let mut versions: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut created: BTreeSet<&str> = BTreeSet::new();
+    let mut events: Vec<Event> = vec![];
+    for n in 0..len {
+        let id = format!("{:04x}-{n:03}", rng.gen_range(0..0x10000));
+        let mut chosen = ENTITIES.to_vec();
+        chosen.shuffle(rng);
+        chosen.truncate(rng.gen_range(1..=3));
+        let mut changes = vec![];
+        for entity in chosen {
+            let kind = if entity.starts_with('d') {
+                "directory"
+            } else {
+                "file"
+            };
+            let place = |rng: &mut StdRng| {
+                let parent = if rng.gen_bool(0.4) {
+                    ROOT
+                } else {
+                    PARENTS[rng.gen_range(0..PARENTS.len())]
+                };
+                let name = ["a", "A", "b"][rng.gen_range(0..3)];
+                json!({"parent": parent, "name": name})
+            };
+            let mut fields: Vec<(&str, serde_json::Value)> = vec![];
+            if created.insert(entity) {
+                fields.push(("kind", json!(kind)));
+                fields.push(("location", place(rng)));
+                fields.push(("alive", json!(true)));
+            } else {
+                match rng.gen_range(0..3) {
+                    0 => fields.push(("location", place(rng))),
+                    1 => fields.push(("alive", json!(rng.gen_bool(0.6)))),
+                    _ => {
+                        fields.push(("location", place(rng)));
+                        fields.push(("alive", json!(rng.gen_bool(0.7))));
+                    }
+                }
+            }
+            for (field, value) in fields {
+                let key = (entity.to_string(), field.to_string());
+                let known = versions.get(&key).cloned().unwrap_or_default();
+                // The latest version, sometimes an older one, or none
+                // (concurrent).
+                let parents = if known.is_empty() || rng.gen_bool(0.12) {
+                    vec![]
+                } else if rng.gen_bool(0.7) {
+                    vec![known.last().unwrap().clone()]
+                } else {
+                    vec![known[rng.gen_range(0..known.len())].clone()]
+                };
+                changes.push(Change {
+                    entity: entity.into(),
+                    field: field.into(),
+                    parents,
+                    value,
+                });
+                versions.entry(key).or_default().push(id.clone());
+            }
+        }
+        let mut dependencies = vec![];
+        if !events.is_empty() && rng.gen_bool(0.5) {
+            let back = rng.gen_range(1..=events.len().min(4));
+            dependencies.push(events[events.len() - back].id.clone());
+        }
+        events.push(Event {
+            id,
+            repo: REPO.into(),
+            branch: branch.clone(),
+            device: format!("dev-{}", n % 3),
+            created_ms: 1000 + rng.gen_range(0..50),
+            changes,
+            dependencies,
+            reviewed: vec![],
+            object_sizes: BTreeMap::new(),
+        });
+    }
+    events
+}
+
+/// WP5.1 review (round 1): random crafted histories whose entity ids include
+/// commas (`comma_history`), received one event at a time:
+///
+/// - under the commit checks, no commit differs from the reference (no
+///   `CONFLICT_MODE_MISMATCH` in the inbox);
+/// - without them, the oracle is empty after every delivery (the stored
+///   projection is `project`'s and every row a rebuild's);
+/// - a full-mode receiver quarantines the same events and stores the same
+///   rows.
+///
+/// `TKFS_DERIVE_COMMA_SEEDS` (default 8).
+#[test]
+fn crafted_histories_with_comma_ids_commit_as_the_reference() {
+    let seeds: u64 = std::env::var("TKFS_DERIVE_COMMA_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let allowed: BTreeSet<String> = (0..3).map(|d| format!("dev-{d}")).collect();
+    let mut acked = 0;
+    for seed in 0..seeds {
+        let mut rng = StdRng::seed_from_u64(51_000 + seed);
+        let events = comma_history(&mut rng, 16);
+        let mut outcomes = vec![];
+        for (mode, checks) in [
+            (ConflictMode::Append, true),
+            (ConflictMode::Append, false),
+            (ConflictMode::Full, false),
+        ] {
+            let _mode = ModeGuard::new(mode);
+            let previous = set_thread_commit_checks(checks);
+            let mut receiver = Replica::new();
+            let r = receiver.store();
+            for event in &events {
+                if let Ok(ids) = r.receive(bundle(vec![event.clone()]), &allowed) {
+                    acked += ids.len();
+                }
+                if !checks {
+                    let diff = oracle(r).unwrap();
+                    assert!(
+                        diff.is_empty(),
+                        "seed {seed} {mode:?} after {}: {diff:#?}",
+                        event.id
+                    );
+                }
+            }
+            let refused = quarantined(r);
+            for (id, error) in &refused {
+                assert!(
+                    !error.contains("CONFLICT_MODE_MISMATCH"),
+                    "seed {seed} {mode:?} checks {checks}: {id}: {error}"
+                );
+            }
+            set_thread_commit_checks(previous);
+            outcomes.push((refused, conflict_rows(r)));
+        }
+        assert!(
+            outcomes.windows(2).all(|w| w[0] == w[1]),
+            "seed {seed}: the receivers differ"
+        );
+    }
+    println!("{acked} events committed");
+    assert!(acked > 0);
+}
+
 /// The oracle adapter (`verify_derived_state_strict`, CCR-WP1.7-1) starts
 /// its rebuild from no conflict rows, so excess derived state is reported: a
 /// fabricated register record, an inflated or invented `resolved_by`, a
