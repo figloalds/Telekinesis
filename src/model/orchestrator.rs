@@ -162,6 +162,150 @@ pub trait CatalogApi: Send + Sync {
     fn apply(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire>;
     /// Blocks until the generation exceeds `generation` or `timeout` elapses.
     fn wait_newer(&self, generation: u64, timeout: Duration) -> Arc<CatalogSnapshot>;
+    /// The per-peer credentials (WP4.1, `peer_credentials`; CCR-WP4.1-1,
+    /// applied by WP5.4): an O(1) load of what the catalog last published.
+    ///
+    /// They are published beside the snapshot, not in it: a command that
+    /// changes only credentials (the `*Credential` commands of
+    /// [`CatalogCmd`]) moves no `generation` and wakes no `wait_newer`
+    /// caller. A rotation (`SetVerifier`) and an unpair (`RemovePeer`)
+    /// change both, in one transaction.
+    ///
+    /// `None` (the default): this catalog keeps no per-peer credentials (a
+    /// test's fake). Its peers authenticate with the pairing code alone: a
+    /// caller that finds `None` neither presents nor accepts a per-peer
+    /// credential and sends no credential command.
+    fn credentials(&self) -> Option<Arc<Credentials>> {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-peer credentials (WP4.1, §9; in this contract since CCR-WP4.1-1)
+
+/// Which way a per-peer credential works.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CredentialSide {
+    /// A dialer enrolled this credential with us; the inbound server
+    /// verifies its `peer-hmac-v1` sessions with it.
+    Inbound,
+    /// We enrolled this credential with an acceptor; our lanes present it.
+    Outbound,
+}
+
+impl CredentialSide {
+    /// The stored spelling (`peer_credentials.side`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CredentialSide::Inbound => "inbound",
+            CredentialSide::Outbound => "outbound",
+        }
+    }
+
+    /// The side a stored spelling names, if any.
+    pub fn parse(text: &str) -> Option<CredentialSide> {
+        match text {
+            "inbound" => Some(CredentialSide::Inbound),
+            "outbound" => Some(CredentialSide::Outbound),
+            _ => None,
+        }
+    }
+}
+
+/// One per-peer credential: `K_peer` (`session::auth::peer_key`) of a peer
+/// installation on one side. `Debug` never shows the key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PeerCredential {
+    pub installation: String,
+    pub side: CredentialSide,
+    key: [u8; 32],
+    pub created_ms: u64,
+    pub revoked_ms: Option<u64>,
+}
+
+impl PeerCredential {
+    pub fn new(
+        installation: impl Into<String>,
+        side: CredentialSide,
+        key: [u8; 32],
+        created_ms: u64,
+        revoked_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            installation: installation.into(),
+            side,
+            key,
+            created_ms,
+            revoked_ms,
+        }
+    }
+
+    /// `K_peer`, unless the credential is revoked.
+    pub fn active_key(&self) -> Option<[u8; 32]> {
+        self.revoked_ms.is_none().then_some(self.key)
+    }
+}
+
+impl fmt::Debug for PeerCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerCredential")
+            .field("installation", &self.installation)
+            .field("side", &self.side)
+            .field("key", &"<redacted>")
+            .field("created_ms", &self.created_ms)
+            .field("revoked_ms", &self.revoked_ms)
+            .finish()
+    }
+}
+
+/// Every per-peer credential of a catalog, keyed by installation and side
+/// (both sides of a mutual pairing are separate credentials).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Credentials {
+    entries: BTreeMap<(String, CredentialSide), PeerCredential>,
+}
+
+impl Credentials {
+    pub fn get(&self, installation: &str, side: CredentialSide) -> Option<&PeerCredential> {
+        self.entries.get(&(installation.to_owned(), side))
+    }
+
+    /// The active `K_peer` of `installation` on `side`.
+    pub fn active(&self, installation: &str, side: CredentialSide) -> Option<[u8; 32]> {
+        self.get(installation, side)
+            .and_then(PeerCredential::active_key)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PeerCredential> {
+        self.entries.values()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Adds `credential`, replacing the one of the same installation and
+    /// side.
+    pub fn insert(&mut self, credential: PeerCredential) {
+        self.entries.insert(
+            (credential.installation.clone(), credential.side),
+            credential,
+        );
+    }
+}
+
+impl FromIterator<PeerCredential> for Credentials {
+    fn from_iter<I: IntoIterator<Item = PeerCredential>>(credentials: I) -> Self {
+        let mut all = Credentials::default();
+        for credential in credentials {
+            all.insert(credential);
+        }
+        all
+    }
 }
 
 /// An immutable catalog view. Debug output never shows the verifier or codes.
@@ -329,6 +473,35 @@ pub enum CatalogCmd {
         display_name: Option<String>,
         incompatible: Option<String>,
     },
+    /// Stores `key` (`K_peer`) as the active credential of `installation`
+    /// on `side`, replacing (and un-revoking) an earlier one (WP4.1). Refused
+    /// `CANNOT_PAIR_WITH_SELF` for this installation. Checked in the same
+    /// transaction, so a racing unpair or rotation is serialized with it:
+    /// with `paired_only`, refused `PEER_NOT_PAIRED` unless a peer record
+    /// names the installation (a lane 0 enrollment racing an unpair leaves
+    /// nothing behind); with `generation`, refused `PAIRING_CODE_CHANGED`
+    /// unless the verifier is still at that generation (an acceptor's
+    /// `peer.enroll` authenticated by a code a rotation replaced meanwhile
+    /// stores nothing, invariant 21). Changes only the credentials
+    /// ([`CatalogApi::credentials`]).
+    EnrollCredential {
+        installation: String,
+        side: CredentialSide,
+        key: [u8; 32],
+        paired_only: bool,
+        generation: Option<u64>,
+    },
+    /// Revokes the credential of `installation` on `side` (kept, marked
+    /// `revoked_ms`); a missing one stays missing.
+    RevokeCredential {
+        installation: String,
+        side: CredentialSide,
+    },
+    /// Deletes the credential of `installation` on `side`.
+    ForgetCredential {
+        installation: String,
+        side: CredentialSide,
+    },
 }
 
 impl CatalogCmd {
@@ -346,6 +519,9 @@ impl CatalogCmd {
             CatalogCmd::RemovePeer { .. } => "remove_peer",
             CatalogCmd::SetVerifier { .. } => "set_verifier",
             CatalogCmd::RecordPeerSeen { .. } => "record_peer_seen",
+            CatalogCmd::EnrollCredential { .. } => "enroll_credential",
+            CatalogCmd::RevokeCredential { .. } => "revoke_credential",
+            CatalogCmd::ForgetCredential { .. } => "forget_credential",
         }
     }
 }
@@ -418,6 +594,30 @@ impl fmt::Debug for CatalogCmd {
                 .field("at_ms", at_ms)
                 .field("display_name", display_name)
                 .field("incompatible", incompatible)
+                .finish(),
+            CatalogCmd::EnrollCredential {
+                installation,
+                side,
+                paired_only,
+                generation,
+                ..
+            } => f
+                .debug_struct("EnrollCredential")
+                .field("installation", installation)
+                .field("side", side)
+                .field("key", &"<redacted>")
+                .field("paired_only", paired_only)
+                .field("generation", generation)
+                .finish(),
+            CatalogCmd::RevokeCredential { installation, side } => f
+                .debug_struct("RevokeCredential")
+                .field("installation", installation)
+                .field("side", side)
+                .finish(),
+            CatalogCmd::ForgetCredential { installation, side } => f
+                .debug_struct("ForgetCredential")
+                .field("installation", installation)
+                .field("side", side)
                 .finish(),
         }
     }
