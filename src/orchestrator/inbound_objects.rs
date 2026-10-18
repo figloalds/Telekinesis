@@ -92,12 +92,15 @@
 //! in between (an outage cut it: the leases would hide those objects from
 //! every other source, our own pull lanes to that peer included, until they
 //! lapsed, 60 s, plus the stall backoff the lapse imposes on the peer's
-//! replica, 60 s more). The acceptor has no word of a session's end
-//! (CCR-WP5.3-2 asks for one), so it watches for it: once an offer and its
-//! session have both been silent for [`OFFER_GRACE`] (5 s: no push, no
-//! `objects.*` request of that session), its leases are given up at our
-//! worker, without a backoff (nothing says the dialer could not serve
-//! them). The offer itself stays: a dialer still there settles it at its
+//! replica, 60 s more). The inbound server reports a bulk session's end
+//! ([`session_closed`], CCR-WP5.3-2, applied by WP5.INT): the leases of its
+//! offers are given up at our worker then, without a backoff (nothing says
+//! the dialer could not serve them). A session that stays open but goes
+//! silent (a link that drops every byte, until the session's liveness
+//! deadline ends it) is watched for: once an offer and its session have
+//! both been silent for [`OFFER_GRACE`] (5 s: no push, no `objects.*`
+//! request of that session), its leases are given up the same way. The
+//! offer itself stays: a dialer still there settles it at its
 //! next request as before (its next `objects.wants` backs off what it did
 //! not send; a late push is matched against it), and a push of it still
 //! writes (a free lease is taken by the write) unless another session took
@@ -681,12 +684,48 @@ fn start_reaper() {
 /// waits for it). Returns how many offers it gave up (tests).
 pub fn reap_offers(now: Instant) -> usize {
     let silent = |at: Instant| now.saturating_duration_since(at) >= OFFER_GRACE;
-    let keys: Vec<String> = lock(&offers().map)
+    reap_where(|offer, seen| {
+        silent(offer.at) && seen.get(&offer.session).is_none_or(|last| silent(*last))
+    })
+}
+
+/// A bulk session ended (CCR-WP5.3-2, applied by WP5.INT: the inbound
+/// server calls this from the session's close path): the leases of the
+/// offers made on it are given up now, instead of after [`OFFER_GRACE`] of
+/// silence, by the reaper's rules (each offer judged and marked under the
+/// offers' lock, an exchange of the lane's next session waiting for the
+/// release). On a thread of its own: the close path never waits for a
+/// worker. Without one (it could not start) the periodic reaper still
+/// gives them up, the session no longer counting as seen.
+pub fn session_closed(peer: &session::AcceptedPeer) {
+    if peer.role != protocol::LaneRole::Bulk {
+        return;
+    }
+    let session = peer.session.clone();
+    lock(sessions_seen()).remove(&session);
+    let offered = lock(&offers().map)
         .offers
-        .iter()
-        .filter(|(_, offer)| !offer.released && silent(offer.at))
-        .map(|(key, _)| key.clone())
-        .collect();
+        .values()
+        .any(|offer| !offer.released && offer.session == session);
+    if offered {
+        let _ = thread::Builder::new()
+            .name("offer-release".into())
+            .spawn(move || reap_where(|offer, _| offer.session == session));
+    }
+}
+
+/// Gives up the leases of every unreleased offer `gone` picks (with when
+/// each session was last seen), as [`reap_offers`] describes.
+fn reap_where(gone: impl Fn(&Offer, &HashMap<String, Instant>) -> bool) -> usize {
+    let keys: Vec<String> = {
+        let seen = lock(sessions_seen());
+        lock(&offers().map)
+            .offers
+            .iter()
+            .filter(|(_, offer)| !offer.released && gone(offer, &seen))
+            .map(|(key, _)| key.clone())
+            .collect()
+    };
     let mut count = 0;
     for key in keys {
         // Judged again now: an exchange of a new session may have taken or
@@ -696,11 +735,7 @@ pub fn reap_offers(now: Instant) -> usize {
             let mut map = lock(&offers().map);
             let OfferMap { offers, reaping } = &mut *map;
             match offers.get_mut(&key) {
-                Some(offer)
-                    if !offer.released
-                        && silent(offer.at)
-                        && seen.get(&offer.session).is_none_or(|last| silent(*last)) =>
-                {
+                Some(offer) if !offer.released && gone(offer, &seen) => {
                     offer.released = true;
                     reaping.insert(key.clone());
                     Some((

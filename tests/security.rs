@@ -1058,8 +1058,9 @@ fn a_lost_acceptor_credential_is_replaced_over_the_code() {
 /// installation and side; a rotation revokes every inbound credential and
 /// leaves ours alone; an unpair forgets our outbound credential once no
 /// record names the installation; everything survives a reopen;
-/// `folders.sqlite` is owner-only (Unix); `Catalog::of` finds the catalog
-/// behind its `dyn CatalogApi`.
+/// `folders.sqlite` is owner-only (Unix); the catalog's `dyn CatalogApi`
+/// publishes the same credentials (`CatalogApi::credentials`; WP4.1's
+/// `Catalog::of` adapter is gone since CCR-WP5.4-1).
 #[test]
 fn the_catalog_keeps_credentials_per_installation_and_side() {
     use tkfs::model::orchestrator::{CatalogApi, CatalogCmd, PeerRecord};
@@ -1073,7 +1074,7 @@ fn the_catalog_keeps_credentials_per_installation_and_side() {
     };
     let catalog = Catalog::open(&config).unwrap();
     let api: Arc<dyn CatalogApi> = catalog.clone();
-    assert!(Arc::ptr_eq(&Catalog::of(&api).unwrap(), &catalog));
+    assert!(api.credentials().is_some());
     let (inbound, outbound) = ([1u8; 32], [2u8; 32]);
     catalog
         .enroll("peer", CredentialSide::Inbound, inbound)

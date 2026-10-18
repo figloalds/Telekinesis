@@ -2153,6 +2153,22 @@ fn release_kept(lane: &LaneRun) {
             &repo,
             KEPT_CLAIM_WAIT,
         ) else {
+            // A round still holds the key (one of this runner that outlived
+            // its exit wait): the leases go back to the lane, merged with
+            // what that round kept since, so its settle (`take_kept`) gives
+            // them up with its own instead of leaving them to lapse
+            // (WP5.INT, the WP5.3 review's minor).
+            let mut lane_kept = lock(&lane.kept);
+            match lane_kept.get_mut(&repo) {
+                Some(newer) => {
+                    for (hash, entry) in kept.hashes {
+                        newer.hashes.entry(hash).or_insert(entry);
+                    }
+                }
+                None => {
+                    lane_kept.insert(repo, kept);
+                }
+            }
             continue;
         };
         let mut by_slot: BTreeMap<usize, Vec<String>> = BTreeMap::new();

@@ -88,9 +88,9 @@
 //! A component that holds only `Arc<dyn CatalogApi>` reads and changes the
 //! credentials through the trait; a catalog that keeps none (a test's fake)
 //! answers `credentials()` with `None`, and its peers use the pairing code
-//! alone. [`Catalog::of`], WP4.1's way to the concrete catalog while the
-//! contract had no credential calls, stays until its last callers move to
-//! the trait (CCR-WP5.4-1). `folders.sqlite` holds these keys and the
+//! alone. Every caller does so since CCR-WP5.4-1 (applied by WP5.INT), which
+//! removed WP4.1's adapter to the concrete catalog (`Catalog::of`) with its
+//! registry of open catalogs. `folders.sqlite` holds these keys and the
 //! dialers' codes: on Unix it is made owner-only (0600) at open; on Windows
 //! it inherits the profile ACL.
 use super::{Config, lock};
@@ -115,7 +115,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, PoisonError, Weak,
+        Arc, Condvar, Mutex, PoisonError,
         atomic::{AtomicU8, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
@@ -288,15 +288,6 @@ mod sql {
 /// (applied by WP5.4); re-exported here for the paths callers use.
 pub use crate::model::orchestrator::{CredentialSide, Credentials, PeerCredential};
 
-/// The open catalogs of this process, by the address of their handle, so a
-/// `dyn CatalogApi` can be told to be one ([`Catalog::of`], the WP4.1
-/// adapter that CCR-WP5.4-1 removes once its last callers use the trait).
-static CATALOGS: Mutex<Vec<(usize, Weak<Catalog>)>> = Mutex::new(Vec::new());
-
-fn catalog_key<T: ?Sized>(handle: *const T) -> usize {
-    handle.cast::<()>() as usize
-}
-
 // ---------------------------------------------------------------------------
 // The public handle
 
@@ -387,9 +378,6 @@ impl Catalog {
                     busy_since_ms,
                     credentials,
                 });
-                let mut catalogs = crate::util::lock::lock(&CATALOGS);
-                catalogs.retain(|(_, handle)| handle.strong_count() > 0);
-                catalogs.push((catalog_key(Arc::as_ptr(&catalog)), Arc::downgrade(&catalog)));
                 Ok(catalog)
             }
             failed => {
@@ -405,26 +393,6 @@ impl Catalog {
     /// The data directory whose `folders.sqlite` this catalog owns.
     pub fn data_directory(&self) -> &Path {
         &self.data_directory
-    }
-
-    /// The concrete catalog behind `api`, if it is one (`None` for another
-    /// [`CatalogApi`], such as a test's fake).
-    ///
-    /// The WP4.1 adapter: the per-peer credentials were reached through it
-    /// while the catalog contract had no credential calls. Since
-    /// CCR-WP4.1-1 (applied by WP5.4) they are part of the contract
-    /// ([`CatalogApi::credentials`] and the `*Credential` commands of
-    /// [`CatalogCmd`]), which every catalog answers, a fake included
-    /// (`None`: code only). This stays only for the callers outside WP5.4's
-    /// files (`inbound.rs`, `peer.rs`, `tests/security.rs`); CCR-WP5.4-1
-    /// moves them to the trait and removes it with its registry of open
-    /// catalogs.
-    pub fn of(api: &Arc<dyn CatalogApi>) -> Option<Arc<Catalog>> {
-        let key = catalog_key(Arc::as_ptr(api));
-        crate::util::lock::lock(&CATALOGS)
-            .iter()
-            .find(|(handle, _)| *handle == key)
-            .and_then(|(_, handle)| handle.upgrade())
     }
 
     /// The per-peer credentials (WP4.1): an O(1) load of what the actor last

@@ -123,7 +123,8 @@
 //! close their new session as soon as the dial returns.
 //!
 //! **Per-peer credentials (WP4.1).** A dial presents our outbound credential
-//! for the peer (`peer_credentials`, side `outbound`, `Catalog::of`) with
+//! for the peer (`peer_credentials`, side `outbound`, read through the
+//! catalog contract, `CatalogApi::credentials`, since CCR-WP5.4-1) with
 //! the scheme `peer-hmac-v1`, the stored pairing code as the fallback for an
 //! acceptor that does not offer the scheme. Credentials are enrolled:
 //!
@@ -147,7 +148,8 @@
 //! replaces it. [`NetworkApi::unpair`] of a peer's last record first stops
 //! its supervisor from enrolling (an enrollment racing the revoke would
 //! leave an active credential at the peer; one already running stores
-//! nothing once the record is gone, `Catalog::enroll_paired`), then, when
+//! nothing once the record is gone: `CatalogCmd::EnrollCredential` with
+//! `paired_only`), then, when
 //! we hold a credential, sends a best-effort `peer.revoke` (on lane 0 if it
 //! is up, else on a probe session, at most about [`REVOKE_BUDGET`]), then
 //! removes the record, which deletes our outbound credential with it.
@@ -166,16 +168,13 @@ use crate::{
     model::{
         errors::{ErrorClass, ErrorWire},
         orchestrator::{
-            CatalogApi, CatalogCmd, CatalogSnapshot, Ctx, NetworkApi, PairResult, PeerContext,
-            PeerRecord, PublishedEntry, RemoteCatalog, limits,
+            CatalogApi, CatalogCmd, CatalogSnapshot, CredentialSide, Credentials, Ctx, NetworkApi,
+            PairResult, PeerContext, PeerRecord, PublishedEntry, RemoteCatalog, limits,
         },
         protocol::{CatalogListReply, CatalogListRequest, LaneRole, LaneSpec, deadlines, ops},
         status::{Direction, LaneState, StatusEvent},
     },
-    orchestrator::{
-        catalog::{Catalog, CredentialSide},
-        objects, scheduler,
-    },
+    orchestrator::{objects, scheduler},
     pairing_code::Verifier,
     session::{
         self, ClientAuth, CodeAuth, Conn, ConnOptions, DialError, Priority, Reply,
@@ -225,14 +224,14 @@ const CREDENTIAL_QUEUE: usize = 64;
 /// lane is healthy"): a later loss starts over from the base delay, and a
 /// loss by the transport begins a network loss of the peer (module docs).
 /// A session the peer closes sooner (a flapping acceptor) keeps escalating.
-/// §3.7 said 30 s (`limits::LANE_RESET_AFTER`, frozen; CCR-WP5.3-1).
-pub const LANE_HEALTHY_AFTER: Duration = Duration::from_secs(5);
+/// `limits::LANE_RESET_AFTER` (5 s since CCR-WP5.3-1; §3.7 said 30 s).
+pub const LANE_HEALTHY_AFTER: Duration = limits::LANE_RESET_AFTER;
 /// While a peer's network is down its lanes redial on one shared cadence
 /// whose spacing is the outage's age divided by this (WP5.3; module docs,
 /// "Network loss"), between the lane backoff's base and its cap: 1 s for
 /// the first 30 s of an outage, 1.5 s at 45 s, 4 s at 2 min, 60 s from
-/// 30 min on.
-pub const NETWORK_SPACING_RATIO: u32 = 30;
+/// 30 min on. `limits::NETWORK_SPACING_RATIO` (CCR-WP5.3-1).
+pub const NETWORK_SPACING_RATIO: u32 = limits::NETWORK_SPACING_RATIO;
 /// A sibling's dial is stale (and is interrupted when a lane connects)
 /// once it has run this much longer than the dial that just succeeded,
 /// without an answer from the peer.
@@ -403,9 +402,10 @@ pub struct PeerManager {
     watcher_done: Arc<Notify>,
     /// `peer_meta` writes, off the lane threads.
     meta: Arc<MetaWriter>,
-    /// The concrete catalog (per-peer credentials, WP4.1); `None` under a
-    /// test's fake catalog, which keeps the code-only behaviour.
-    catalog: Option<Arc<Catalog>>,
+    /// The per-peer credentials (WP4.1) through the catalog contract;
+    /// `None` when the catalog keeps none (a test's fake), which keeps the
+    /// code-only behaviour.
+    catalog: Option<Arc<CredentialCatalog>>,
     /// Enrollments and forgotten credentials, off the lane threads.
     credentials: Arc<CredentialWriter>,
 }
@@ -456,7 +456,7 @@ impl PeerManager {
     pub fn start_with(ctx: Arc<Ctx>, options: PeerOptions) -> Arc<PeerManager> {
         let cancel = ctx.shutdown.child();
         let ctx_catalog = ctx.catalog.clone();
-        let catalog = Catalog::of(&ctx.catalog);
+        let catalog = CredentialCatalog::of(&ctx.catalog);
         let credentials = CredentialWriter::start(ctx.installation.clone(), catalog.clone());
         let manager = Arc::new(PeerManager {
             ctx,
@@ -2502,8 +2502,81 @@ impl ClientAuth for AnnounceHandshake<'_> {
 /// What a supervisor needs for per-peer credentials (WP4.1).
 #[derive(Clone)]
 struct Credentialing {
-    catalog: Option<Arc<Catalog>>,
+    catalog: Option<Arc<CredentialCatalog>>,
     writer: Arc<CredentialWriter>,
+}
+
+/// The per-peer credentials of a catalog that keeps them, through the
+/// catalog contract (CCR-WP4.1-1, applied by WP5.4; its last callers moved
+/// here by CCR-WP5.4-1, WP5.INT, which removed `Catalog::of`): the
+/// published [`Credentials`] and the `*Credential` commands of
+/// [`CatalogCmd`], with the semantics the catalog actor gives them.
+struct CredentialCatalog(Arc<dyn CatalogApi>);
+
+impl CredentialCatalog {
+    /// `None` when `catalog` keeps no per-peer credentials.
+    fn of(catalog: &Arc<dyn CatalogApi>) -> Option<Arc<CredentialCatalog>> {
+        catalog
+            .credentials()
+            .is_some()
+            .then(|| Arc::new(CredentialCatalog(catalog.clone())))
+    }
+
+    fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.0.snapshot()
+    }
+
+    fn credentials(&self) -> Arc<Credentials> {
+        self.0.credentials().unwrap_or_default()
+    }
+
+    /// Stores `key` as the active credential of `installation` on `side`;
+    /// with `paired_only`, only while a peer record names it (checked in
+    /// the command's transaction).
+    fn enroll_with(
+        &self,
+        installation: &str,
+        side: CredentialSide,
+        key: [u8; 32],
+        paired_only: bool,
+    ) -> Result<(), ErrorWire> {
+        self.0
+            .apply(CatalogCmd::EnrollCredential {
+                installation: installation.to_owned(),
+                side,
+                key,
+                paired_only,
+                generation: None,
+            })
+            .map(drop)
+    }
+
+    fn enroll(
+        &self,
+        installation: &str,
+        side: CredentialSide,
+        key: [u8; 32],
+    ) -> Result<(), ErrorWire> {
+        self.enroll_with(installation, side, key, false)
+    }
+
+    fn enroll_paired(
+        &self,
+        installation: &str,
+        side: CredentialSide,
+        key: [u8; 32],
+    ) -> Result<(), ErrorWire> {
+        self.enroll_with(installation, side, key, true)
+    }
+
+    fn forget(&self, installation: &str, side: CredentialSide) -> Result<(), ErrorWire> {
+        self.0
+            .apply(CatalogCmd::ForgetCredential {
+                installation: installation.to_owned(),
+                side,
+            })
+            .map(drop)
+    }
 }
 
 /// A credential job of the `peer-credentials` thread.
@@ -2533,7 +2606,7 @@ struct CredentialWriter {
 }
 
 impl CredentialWriter {
-    fn start(local: String, catalog: Option<Arc<Catalog>>) -> Arc<CredentialWriter> {
+    fn start(local: String, catalog: Option<Arc<CredentialCatalog>>) -> Arc<CredentialWriter> {
         let Some(catalog) = catalog else {
             return Arc::new(CredentialWriter {
                 tx: Mutex::new(None),
@@ -2580,7 +2653,7 @@ impl CredentialWriter {
     }
 }
 
-fn run_credential_job(local: &str, catalog: &Catalog, job: CredentialJob) {
+fn run_credential_job(local: &str, catalog: &CredentialCatalog, job: CredentialJob) {
     match job {
         CredentialJob::Enroll {
             conn,

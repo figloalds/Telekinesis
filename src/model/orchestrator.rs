@@ -74,10 +74,16 @@ pub mod limits {
     pub const HANDLER_QUEUE: usize = 16;
     /// Older sessions receive `GOAWAY{PAIRING_CODE_CHANGED}` within this.
     pub const ROTATION_GOAWAY: Duration = Duration::from_secs(1);
-    /// Lane reconnect backoff and its healthy reset.
+    /// Lane reconnect backoff and its healthy reset: a lane `Ready` this
+    /// long is healthy (its backoff resets, and its loss by the transport is
+    /// a network loss of the peer). 30 s until CCR-WP5.3-1 (WP5.INT).
     pub const LANE_BACKOFF_BASE: Duration = Duration::from_secs(1);
     pub const LANE_BACKOFF_CAP: Duration = Duration::from_secs(60);
-    pub const LANE_RESET_AFTER: Duration = Duration::from_secs(30);
+    pub const LANE_RESET_AFTER: Duration = Duration::from_secs(5);
+    /// While a peer's network is down its lanes redial on one shared
+    /// cadence whose spacing is the outage's age divided by this, between
+    /// `LANE_BACKOFF_BASE` and `LANE_BACKOFF_CAP` (CCR-WP5.3-1).
+    pub const NETWORK_SPACING_RATIO: u32 = 30;
     pub const INCOMPATIBLE_RECHECK: Duration = Duration::from_secs(600);
     pub const UNAUTHORIZED_RECHECK: Duration = Duration::from_secs(60);
     /// Remote catalog polling on lane 0.
