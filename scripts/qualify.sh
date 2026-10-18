@@ -15,6 +15,12 @@
 #   CARGO_TARGET_DIR=$HOME/tkfs-target/<pkg> scripts/qualify.sh --wave 1 [--files "a b"] [--filter NAME]
 #   scripts/qualify.sh --all | --baseline [--budget-s 120] [--file-timeout-min 90] [--evidence PATH] [--no-build]
 #   scripts/qualify.sh --all --merge --files "a b"   # re-run some files into an existing evidence
+#   scripts/qualify.sh --wave 5 --files qual_wp5_1_concurrent --heavy --filter conflict_storm
+#
+# --heavy (WP5.INT) also runs the two-hour WP5.1 daemon workloads
+# (qual_wp5_1_concurrent::conflict_storm, ::fast_two_way_editing), which a
+# run skips otherwise; a floor marked `heavy` is enforced only when its
+# scenario ran (as qualify.ps1 -Heavy).
 #
 # Evidence: test-evidence/qualification-<kind>-linux.json. A file passes only
 # when cargo exits 0 and its last `test result:` line says `ok.`; exit code and
@@ -36,12 +42,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$(pwd)
 
-wave=0; kind=""; files=""; filter=""; budget=""; file_timeout=""; evidence=""; build=1; baseline=0; merge=0
+wave=0; kind=""; files=""; filter=""; budget=""; file_timeout=""; evidence=""; build=1; baseline=0; merge=0; heavy=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --wave) wave="$2"; shift 2 ;;
-    --all) wave=4; kind="all"; shift ;;
-    --baseline) wave=4; kind="baseline"; baseline=1; shift ;;
+    --all) wave=5; kind="all"; shift ;;
+    --baseline) wave=5; kind="baseline"; baseline=1; shift ;;
+    --heavy) heavy=1; shift ;;
     --files) files="$2"; shift 2 ;;
     --filter) filter="$2"; shift 2 ;;
     --budget-s) budget="$2"; shift 2 ;;
@@ -52,7 +59,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument $1" >&2; exit 2 ;;
   esac
 done
-if [ "$wave" -lt 1 ] || [ "$wave" -gt 4 ]; then echo "use --wave 1..4, --all or --baseline" >&2; exit 2; fi
+if [ "$wave" -lt 1 ] || [ "$wave" -gt 5 ]; then echo "use --wave 1..5, --all or --baseline" >&2; exit 2; fi
 if [ "$kind" = "all" ]; then
   [ -n "$budget" ] || budget=2400
   [ -n "$file_timeout" ] || file_timeout=150
@@ -68,10 +75,16 @@ declare -A owner_wave=(
   [qual_wp2_1_lifecycle]=2 [qual_wp2_3_worker]=2 [qual_wp2_4_offlock]=2 [qual_wp2_5_feed]=2
   [qual_wp3_1_transport]=3 [qual_wp3_2_objects]=3 [qual_wp3_int_e2e]=3 [qual_scale]=4
   [qual_wp4_4_seal]=4
+  [qual_wp5_1_concurrent]=5 [qual_wp5_2_local]=5 [qual_wp5_3_recovery]=5
 )
 order="qual_wp1_4_worker qual_wp1_5_mount qual_wp1_6_activation qual_wp1_7_derive qual_wp1_8_objects
 qual_wp1_9_session qual_wp1_12_legacy qual_wp2_1_lifecycle qual_wp2_3_worker qual_wp2_4_offlock
-qual_wp2_5_feed qual_wp3_1_transport qual_wp3_2_objects qual_wp3_int_e2e qual_scale qual_wp4_4_seal"
+qual_wp2_5_feed qual_wp3_1_transport qual_wp3_2_objects qual_wp3_int_e2e qual_scale qual_wp4_4_seal
+qual_wp5_1_concurrent qual_wp5_2_local qual_wp5_3_recovery"
+# Scenarios a run skips unless --heavy (WP5.INT).
+declare -A heavy_skips=(
+  [qual_wp5_1_concurrent]="--skip conflict_storm --skip fast_two_way_editing"
+)
 selected=()
 for f in $order; do
   [ "${owner_wave[$f]}" -le "$wave" ] || continue
@@ -112,10 +125,12 @@ statuses=()
 for f in "${selected[@]}"; do
   echo "qualify: running $f (budget $budget s per scenario)"
   t0=$(date +%s)
+  skips=""
+  if [ "$heavy" = 0 ]; then skips="${heavy_skips[$f]:-}"; fi
   set +e
   TKFS_QUAL_OUT="$run_dir/$f.qual.jsonl" TKFS_QUAL_BUDGET_S="$budget" TKFS_QUAL_ENFORCE=0 \
     timeout --kill-after=30 "$((file_timeout * 60))" nice -n 10 \
-    cargo test --release --test "$f" -- --ignored --test-threads=1 --nocapture $filter \
+    cargo test --release --test "$f" -- --ignored --test-threads=1 --nocapture $filter $skips \
     >"$run_dir/$f.log" 2>&1
   code=$?
   set -e
@@ -194,7 +209,8 @@ if os.environ.get("TKFS_QUALIFY_MERGE") == "1" and os.path.exists(evidence):
     order = ["qual_wp1_4_worker", "qual_wp1_5_mount", "qual_wp1_6_activation", "qual_wp1_7_derive",
              "qual_wp1_8_objects", "qual_wp1_9_session", "qual_wp1_12_legacy", "qual_wp2_1_lifecycle",
              "qual_wp2_3_worker", "qual_wp2_4_offlock", "qual_wp2_5_feed", "qual_wp3_1_transport",
-             "qual_wp3_2_objects", "qual_wp3_int_e2e", "qual_scale", "qual_wp4_4_seal"]
+             "qual_wp3_2_objects", "qual_wp3_int_e2e", "qual_scale", "qual_wp4_4_seal",
+             "qual_wp5_1_concurrent", "qual_wp5_2_local", "qual_wp5_3_recovery"]
     files = sorted(kept + files, key=lambda f: order.index(f["file"]) if f["file"] in order else 99)
 selected = {f["file"] for f in files}
 ops = {"<": lambda v, l: v < l, "<=": lambda v, l: v <= l, ">": lambda v, l: v > l,
@@ -213,7 +229,9 @@ for fl in floors:
     elif measured is not None and ops[fl["op"]](measured, fl["value"]): verdict = "pass"
     else: verdict = "fail"
     platform_ok = "platforms" not in fl or "linux" in fl["platforms"]
-    enforced = (not baseline) and fl["wave"] <= wave and (ran or not flt) and platform_ok
+    # A heavy floor (WP5.INT) is enforced only when its scenario ran.
+    heavy_ok = ran or not fl.get("heavy")
+    enforced = (not baseline) and fl["wave"] <= wave and (ran or not flt) and platform_ok and heavy_ok
     results.append({**{k: fl[k] for k in ("id", "wave", "scenario", "metric", "op", "unit", "baseline")},
                     "platforms": fl.get("platforms"),
                     "floor": fl["value"], "measured": measured, "verdict": verdict, "enforced": enforced})
