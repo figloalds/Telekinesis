@@ -679,6 +679,12 @@ fn legacy_server() -> LegacyServer {
 /// and it cannot be interrupted (CCR-WP2.6-2). End-of-stream is forwarded
 /// both ways.
 fn slow_proxy(target: SocketAddr, delay: Duration) -> String {
+    delay_proxy(target, Duration::ZERO, delay)
+}
+
+/// A TCP proxy in front of `target` that holds every client-to-server chunk
+/// for `up` and every server-to-client chunk for `down`.
+fn delay_proxy(target: SocketAddr, up: Duration, down: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     thread::spawn(move || {
@@ -690,8 +696,8 @@ fn slow_proxy(target: SocketAddr, delay: Duration) -> String {
             let (Ok(client_out), Ok(server_in)) = (client.try_clone(), server.try_clone()) else {
                 continue;
             };
-            pump(client, server_in, Duration::ZERO);
-            pump(server, client_out, delay);
+            pump(client, server_in, up);
+            pump(server, client_out, down);
         }
     });
     endpoint
@@ -2246,10 +2252,404 @@ fn the_default_policy_matches_section_3_7() {
     assert_eq!(options.lane_backoff_base, Duration::from_secs(1));
     assert_eq!(options.lane_backoff_cap, Duration::from_secs(60));
     assert_eq!(options.lane_backoff_jitter, 0.2);
-    assert_eq!(options.lane_reset_after, Duration::from_secs(30));
+    // WP5.3 ("reset the backoff once the lane is healthy"): a lane is
+    // healthy after 5 s Ready (§3.7 said 30 s; CCR-WP5.3-1), and a down
+    // peer's lanes share one redial cadence (the outage's age / 30).
+    assert_eq!(options.lane_reset_after, Duration::from_secs(5));
+    assert_eq!(options.network_spacing_ratio, 30);
     assert_eq!(options.incompatible_recheck, Duration::from_secs(600));
     assert_eq!(options.unauthorized_recheck, Duration::from_secs(60));
     assert_eq!(options.catalog_poll, Duration::from_secs(2));
     assert_eq!(options.join, Duration::from_secs(5));
     assert_eq!(options.conn, ConnOptions::default());
+}
+
+// ---------------------------------------------------------------------------
+// WP5.3: network loss (REVAMP_PLAN §14.5b, "Lane reconnect")
+
+/// How a [`Link`] is down.
+const LINK_UP: usize = 0;
+/// A clean close: every connection is shut down, new ones at accept.
+const LINK_REFUSED: usize = 1;
+/// A silent link: connections stay open, every byte is dropped (new
+/// connections' too), and an end of stream is not passed on.
+const LINK_SILENT: usize = 2;
+
+/// A relay in front of `target` whose link can go down (WP5.3).
+struct Link {
+    endpoint: String,
+    state: Arc<LinkState>,
+}
+
+#[derive(Default)]
+struct LinkState {
+    mode: AtomicUsize,
+    live: Mutex<Vec<TcpStream>>,
+    /// When each connection was accepted.
+    accepts: Mutex<Vec<Instant>>,
+}
+
+fn link(target: SocketAddr) -> Link {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let state = Arc::new(LinkState::default());
+    let shared = state.clone();
+    thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { continue };
+            shared.accepts.lock().unwrap().push(Instant::now());
+            if shared.mode.load(Ordering::SeqCst) == LINK_REFUSED {
+                let _ = client.shutdown(Shutdown::Both);
+                continue;
+            }
+            let Ok(server) = TcpStream::connect(target) else {
+                continue;
+            };
+            let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
+                client.try_clone(),
+                server.try_clone(),
+                client.try_clone(),
+                server.try_clone(),
+            ) else {
+                continue;
+            };
+            shared.live.lock().unwrap().extend([a, b]);
+            link_pump(client, server, shared.clone());
+            link_pump(d, c, shared.clone());
+        }
+    });
+    Link { endpoint, state }
+}
+
+fn link_pump(mut from: TcpStream, mut to: TcpStream, state: Arc<LinkState>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match from.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if state.mode.load(Ordering::SeqCst) == LINK_SILENT {
+                        continue;
+                    }
+                    if to.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        if state.mode.load(Ordering::SeqCst) != LINK_SILENT {
+            let _ = to.shutdown(Shutdown::Write);
+        }
+    });
+}
+
+impl Link {
+    fn down(&self, mode: usize) {
+        self.state.mode.store(mode, Ordering::SeqCst);
+        if mode == LINK_REFUSED {
+            for stream in self.state.live.lock().unwrap().drain(..) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn up(&self) {
+        self.state.mode.store(LINK_UP, Ordering::SeqCst);
+    }
+
+    fn accepts_between(&self, from: Instant, to: Instant) -> Vec<Instant> {
+        self.state
+            .accepts
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|at| *at >= from && *at <= to)
+            .collect()
+    }
+}
+
+/// When each lane of `installation` first became `Ready` at or after `since`.
+fn ready_times(
+    node: &Local,
+    installation: &str,
+    pool: u32,
+    since: Instant,
+) -> Vec<Option<Instant>> {
+    (0..pool)
+        .map(|lane| {
+            node.recorder
+                .lane(installation, lane)
+                .into_iter()
+                .filter(|(at, _, state, _, _)| *at >= since && *state == LaneState::Ready)
+                .map(|(at, ..)| at)
+                .next()
+        })
+        .collect()
+}
+
+/// The spacing of a down peer's redials follows the outage's age: 1 s for
+/// the first 30 s, the age / 30 after, at most the 60 s cap.
+#[test]
+fn a_down_peers_redial_spacing_follows_the_outage_age() {
+    let options = PeerOptions::default();
+    let secs = |s: u64| Duration::from_secs(s);
+    assert_eq!(options.network_spacing(Duration::ZERO), secs(1));
+    assert_eq!(options.network_spacing(secs(30)), secs(1));
+    assert_eq!(
+        options.network_spacing(secs(45)),
+        Duration::from_millis(1500)
+    );
+    assert_eq!(options.network_spacing(secs(120)), secs(4));
+    assert_eq!(options.network_spacing(secs(1800)), secs(60));
+    assert_eq!(options.network_spacing(secs(7200)), secs(60));
+}
+
+/// The lab's fault (a clean close through a tunnel): the peer's lanes were
+/// healthy, the link closes, redials are refused. Through the outage the
+/// peer is dialed on one cadence (one dial per spacing, not one per lane
+/// per doubling backoff), and once the link is back every lane is `Ready`
+/// within about a spacing.
+#[test]
+fn a_lost_peer_redials_on_one_cadence_and_is_back_within_a_spacing() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    let link = link(server.addr);
+    node.add_peer(&link.endpoint, &code, SERVER, 4);
+    let options = PeerOptions {
+        lane_backoff_base: Duration::from_millis(200),
+        lane_backoff_cap: Duration::from_secs(3),
+        lane_reset_after: Duration::from_millis(300),
+        ..fast()
+    };
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    assert!(wait_until(Duration::from_secs(10), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Ready
+    )));
+    // Healthy (`lane_reset_after`), then the link goes down.
+    thread::sleep(Duration::from_millis(600));
+    let down = Instant::now();
+    link.down(LINK_REFUSED);
+    thread::sleep(Duration::from_secs(4));
+    let restored = Instant::now();
+    link.up();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            ready_times(&node, SERVER, 4, restored)
+                .iter()
+                .all(Option::is_some)
+        }),
+        "{:?}",
+        lanes(&manager, SERVER)
+    );
+    let back = ready_times(&node, SERVER, 4, restored)
+        .into_iter()
+        .map(|at| at.unwrap().duration_since(restored))
+        .max()
+        .unwrap();
+    // The spacing 4 s into the outage is the base (200 ms, ±20 %).
+    assert!(
+        back <= Duration::from_millis(1500),
+        "every lane Ready {back:?} after the restore"
+    );
+    // One cadence for the peer: the redials during the outage never bunch
+    // (each lane's own doubling backoff would dial all four at once, at
+    // 200, 600, 1400 ms, … after the loss) and come about every spacing.
+    let dials = link.accepts_between(down, restored);
+    assert!(dials.len() >= 8, "{} redials in 4 s", dials.len());
+    for pair in dials.windows(2) {
+        let gap = pair[1].duration_since(pair[0]);
+        assert!(
+            gap >= Duration::from_millis(100),
+            "redials {gap:?} apart: {:?}",
+            dials
+                .iter()
+                .map(|at| at.duration_since(down).as_millis())
+                .collect::<Vec<_>>()
+        );
+    }
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// When one lane connects, its siblings backing off after a failed dial
+/// dial at once instead of waiting for their own timers (eight lanes whose
+/// 3 s ±20 % timers would spread over more than a second).
+#[test]
+fn lanes_in_backoff_redial_at_once_when_a_sibling_connects() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    let link = link(server.addr);
+    link.down(LINK_REFUSED);
+    node.add_peer(&link.endpoint, &code, SERVER, 8);
+    let options = PeerOptions {
+        lane_backoff_base: Duration::from_secs(3),
+        lane_backoff_cap: Duration::from_secs(3),
+        ..fast()
+    };
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    // Every lane failed its first dial (never connected: its own backoff).
+    assert!(wait_until(Duration::from_secs(5), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Backoff
+    )));
+    let restored = Instant::now();
+    link.up();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ready_times(&node, SERVER, 8, restored)
+                .iter()
+                .all(Option::is_some)
+        }),
+        "{:?}",
+        lanes(&manager, SERVER)
+    );
+    let ready: Vec<Instant> = ready_times(&node, SERVER, 8, restored)
+        .into_iter()
+        .flatten()
+        .collect();
+    let first = *ready.iter().min().unwrap();
+    let last = *ready.iter().max().unwrap();
+    assert!(
+        last.duration_since(first) <= Duration::from_millis(400),
+        "the last lane was Ready {:?} after the first",
+        last.duration_since(first)
+    );
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// A silent link: sessions die by their liveness deadline and redials hang
+/// in their handshake. When the link is back, the first lane that connects
+/// interrupts the siblings' stale dials (begun into the silent link), which
+/// redial at once instead of waiting out their handshake timeouts (5 s).
+#[test]
+fn a_dial_into_a_silent_link_is_interrupted_when_a_sibling_connects() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    let link = link(server.addr);
+    node.add_peer(&link.endpoint, &code, SERVER, 4);
+    let mut options = PeerOptions {
+        lane_backoff_base: Duration::from_secs(1),
+        lane_backoff_cap: Duration::from_secs(3),
+        lane_reset_after: Duration::from_millis(300),
+        ..fast()
+    };
+    options.conn.dead_after = Duration::from_secs(1);
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    assert!(wait_until(Duration::from_secs(10), || all_lanes(
+        &manager,
+        SERVER,
+        LaneState::Ready
+    )));
+    thread::sleep(Duration::from_millis(600));
+    link.down(LINK_SILENT);
+    // The sessions die (1 s), then the peer's cadence starts one dial per
+    // second, each hanging in its handshake (about 3 s): three lanes hang at
+    // once, begun about a second apart.
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            lanes(&manager, SERVER)
+                .iter()
+                .filter(|lane| lane.state == LaneState::Dialing && lane.connects == 1)
+                .count()
+                >= 3
+        }),
+        "{:?}",
+        lanes(&manager, SERVER)
+    );
+    let restored = Instant::now();
+    link.up();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            ready_times(&node, SERVER, 4, restored)
+                .iter()
+                .all(Option::is_some)
+        }),
+        "{:?}",
+        lanes(&manager, SERVER)
+    );
+    let ready: Vec<Instant> = ready_times(&node, SERVER, 4, restored)
+        .into_iter()
+        .flatten()
+        .collect();
+    let first = *ready.iter().min().unwrap();
+    let last = *ready.iter().max().unwrap();
+    // Waiting out each hang would spread them over about two seconds.
+    assert!(
+        last.duration_since(first) <= Duration::from_millis(700),
+        "the last lane was Ready {:?} after the first",
+        last.duration_since(first)
+    );
+    manager.shutdown(Duration::from_secs(5));
+}
+
+/// A peer that closes every session as soon as it is established (a
+/// flapping acceptor: a lane runner that gives up on every session, a
+/// protocol-violation close), through a link with a real round trip. A
+/// lane's session then ends before a sibling's dial does, so lanes that
+/// woke each other on every connect would redial at one session per dial
+/// time for as long as the peer flaps (the WP5.3 review's blocker). Each
+/// lane keeps its own escalating backoff instead: no lane redials before
+/// the delay it declared after a session the peer ended, and the session
+/// rate decays.
+#[test]
+fn a_flapping_peer_keeps_escalating_over_a_slow_link() {
+    let node = local();
+    let (server, code) = FakePeer::start(SERVER);
+    server.state.close_next.store(1_000_000, Ordering::SeqCst);
+    // Every chunk is held 30 ms each way (a 60 ms round trip).
+    let endpoint = delay_proxy(
+        server.addr,
+        Duration::from_millis(30),
+        Duration::from_millis(30),
+    );
+    node.add_peer(&endpoint, &code, SERVER, 4);
+    let options = PeerOptions {
+        lane_backoff_base: Duration::from_millis(200),
+        lane_backoff_cap: Duration::from_secs(5),
+        ..fast()
+    };
+    let start = Instant::now();
+    let manager = PeerManager::start_with(node.ctx.clone(), options);
+    let established_at = |at: Duration| {
+        thread::sleep((start + at).saturating_duration_since(Instant::now()));
+        server.established()
+    };
+    let early = established_at(Duration::from_secs(3));
+    let before_late = established_at(Duration::from_secs(6));
+    let total = established_at(Duration::from_secs(9));
+    manager.shutdown(Duration::from_secs(5));
+    let late = total - before_late;
+    // Escalating (200 ms, 400 ms, … up to 5 s, ±20 %, plus a dial each
+    // time), each lane connects about four times in the first 3 s and once
+    // or twice from 6 s to 9 s; lanes waking each other connect at a
+    // constant rate (one session per dial time and lane pair).
+    assert!(early >= 4, "{early} sessions in the first 3 s");
+    assert!(
+        late * 2 < early,
+        "the session rate does not decay: {early} sessions in the first 3 s, {late} from 6 s to 9 s ({total} in all)"
+    );
+    for lane in 0..4 {
+        let events = node.recorder.lane(SERVER, lane);
+        for (index, (at, ms, state, _, until)) in events.iter().enumerate() {
+            // A backoff after a session (Ready before it), not after a dial.
+            if *state != LaneState::Backoff || index == 0 || events[index - 1].2 != LaneState::Ready
+            {
+                continue;
+            }
+            let delay = declared_delay(*ms, *until);
+            if let Some((next, ..)) = events[index + 1..]
+                .iter()
+                .find(|(_, _, state, _, _)| *state == LaneState::Dialing)
+            {
+                let waited = next.duration_since(*at).as_millis() as u64;
+                assert!(
+                    waited + 20 >= delay,
+                    "lane {lane}: redialed {waited} ms into the {delay} ms backoff after a session the peer closed"
+                );
+            }
+        }
+    }
 }

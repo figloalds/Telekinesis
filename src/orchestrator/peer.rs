@@ -24,7 +24,7 @@
 //! | `Dialing` | a dial starts (every resolved address, 3 s each) | `Handshaking` once the server's `HELLO_ACK` arrives |
 //! | `Handshaking` | the HMAC step (the dialer derives its key) | `Ready`, or a failure below |
 //! | `Ready` | an authenticated session | `Backoff` when the session closes |
-//! | `Backoff` | a transient failure or a closed session | `Dialing` after 1 s → 60 s (±20 %); the attempt count resets after 30 s `Ready` |
+//! | `Backoff` | a transient failure or a closed session | `Dialing` after 1 s → 60 s (±20 %), or on the peer's shared cadence while its network is down (below); at once when a sibling lane connects, unless the lane is backing off after a session the peer ended (below); the attempt count resets once the lane was `Ready` 5 s (healthy), and only then |
 //! | `Incompatible` | `PEER_NEEDS_UPGRADE`, `PEER_PROTOCOL_UNSUPPORTED`, any Incompatible-class refusal | rechecked after 10 min, on a change of the peer's record (a respawn), or on [`NetworkApi::reconfigure`] |
 //! | `Unauthorized` | a wrong or rotated code, `PEER_INSTALLATION_CHANGED`, any NeedsUserAction refusal | rechecked after 60 s, on a code change (a re-pair respawns the peer), or on [`NetworkApi::reconfigure`] |
 //! | `Closed` | the lane thread ended (unpair, respawn, shutdown) | |
@@ -36,6 +36,44 @@
 //! therefore sees one dial per lane, then one dial per recheck interval, and
 //! never a tight loop. A lane that reaches `Ready` clears the block.
 //!
+//! **Network loss** (WP5.3). The lab's 45 s Wi-Fi outage reconnected 36 s
+//! after the restore: each lane had doubled its own backoff through the
+//! outage (1, 2, 4, …, 32 s), and redialed on its own timer. Now:
+//!
+//! * A lane that was healthy (`Ready` for [`LANE_HEALTHY_AFTER`], 5 s) and
+//!   loses its session by the transport (`CONNECTION_LOST`,
+//!   `TRANSPORT_DEAD`, `WS_CLOSED`; not a `GOAWAY`, whose code says why,
+//!   and not a close of this side's own: a lane runner that gave up)
+//!   starts the peer's *network loss*. Until a lane connects again, every
+//!   lane whose dial reaches nothing (`WS_CONNECT_FAILED`, a handshake step
+//!   without an answer) or whose session the transport loses redials on one
+//!   cadence shared by the peer's lanes: the first redial a base delay (1 s)
+//!   after the loss, then one per *spacing*, the outage's age over
+//!   [`NETWORK_SPACING_RATIO`] (30) between the base and the cap (1 s for
+//!   the first 30 s, 1.5 s at 45 s, 4 s at 2 min, 60 s from 30 min on), each
+//!   ±20 %. A short outage is found within a spacing of its end, whatever
+//!   kind it is (a refused dial fails at once; a dial into a silent link
+//!   hangs until its handshake step times out, and the next slot goes to
+//!   another lane meanwhile), while a long one costs one dial per peer per
+//!   spacing instead of one per lane per backoff. Paced redials do not
+//!   escalate the lane's own backoff.
+//! * When a lane connects, the peer is reachable: its network loss ends,
+//!   every sibling waiting after a dial that failed (it reached no session)
+//!   or on the down peer's cadence dials at once, and every sibling dial
+//!   that is stale (begun before this one, no `HELLO_ACK` yet, running
+//!   500 ms longer than this one took) is interrupted and redialed at once.
+//!   A dial that fails while a sibling connects retries at once too. A
+//!   sibling backing off after a session that ended otherwise (one the peer
+//!   closed before it was healthy) keeps its delay: lanes of a flapping
+//!   acceptor that woke each other on every connect would redial it at one
+//!   session per dial time for ever, while their own backoffs escalate.
+//! * Everything else keeps the per-lane backoff: a peer never reached since
+//!   the supervisor started, a session the peer closes before it was
+//!   healthy (a flapping acceptor escalates), a `GOAWAY`, a refusal.
+//!
+//! Every redial is a fresh session (invariant 16): nothing in flight on a
+//! lost session is replayed; the lane runners start afresh on the new one.
+//!
 //! On `Ready` the lane hands its [`Conn`] to the lane runner on its own thread
 //! with a per-session child [`Cancel`]: `scheduler::run_control` on lane 0
 //! (`ctl-<installation>`), `objects::run_bulk_lane` on bulk lanes
@@ -43,7 +81,8 @@
 //! it closes, the runner is cancelled, joined (≤ 1 s, then detached) and the
 //! lane backs off and re-dials with a fresh session. A runner that returns
 //! while its session is open (or panics) gets its session closed, so the
-//! lane restarts it after a backoff (crash-only, §2.2 rule 6). Runners must
+//! lane restarts it after a backoff (crash-only, §2.2 rule 6); that close
+//! is this side's, never a network loss. Runners must
 //! therefore return only when their token is cancelled or their session is
 //! gone.
 //!
@@ -182,6 +221,22 @@ pub const REVOKE_BUDGET: Duration = Duration::from_secs(3);
 /// Queued credential jobs before new ones are dropped (the next session
 /// establishment queues an enrollment again).
 const CREDENTIAL_QUEUE: usize = 64;
+/// A lane is healthy once Ready this long (WP5.3: "reset the backoff once the
+/// lane is healthy"): a later loss starts over from the base delay, and a
+/// loss by the transport begins a network loss of the peer (module docs).
+/// A session the peer closes sooner (a flapping acceptor) keeps escalating.
+/// §3.7 said 30 s (`limits::LANE_RESET_AFTER`, frozen; CCR-WP5.3-1).
+pub const LANE_HEALTHY_AFTER: Duration = Duration::from_secs(5);
+/// While a peer's network is down its lanes redial on one shared cadence
+/// whose spacing is the outage's age divided by this (WP5.3; module docs,
+/// "Network loss"), between the lane backoff's base and its cap: 1 s for
+/// the first 30 s of an outage, 1.5 s at 45 s, 4 s at 2 min, 60 s from
+/// 30 min on.
+pub const NETWORK_SPACING_RATIO: u32 = 30;
+/// A sibling's dial is stale (and is interrupted when a lane connects)
+/// once it has run this much longer than the dial that just succeeded,
+/// without an answer from the peer.
+const STALE_DIAL_MARGIN: Duration = Duration::from_millis(500);
 
 /// `now + after`, capped at [`FAR_FUTURE`] instead of overflowing `Instant`.
 fn deadline_in(after: Duration) -> Instant {
@@ -199,8 +254,15 @@ pub struct PeerOptions {
     pub lane_backoff_cap: Duration,
     /// ±20 %.
     pub lane_backoff_jitter: f64,
-    /// The attempt count resets after this long `Ready` (30 s).
+    /// A lane is healthy once `Ready` this long ([`LANE_HEALTHY_AFTER`],
+    /// 5 s): its backoff resets, and its loss by the transport is a network
+    /// loss of the peer.
     pub lane_reset_after: Duration,
+    /// While the peer's network is down, its lanes share one redial cadence
+    /// whose spacing is the outage's age over this ratio, between
+    /// `lane_backoff_base` and `lane_backoff_cap` ([`NETWORK_SPACING_RATIO`],
+    /// 30).
+    pub network_spacing_ratio: u32,
     /// `Incompatible` peers are re-dialed after this (10 min).
     pub incompatible_recheck: Duration,
     /// `Unauthorized` peers are re-dialed after this (60 s).
@@ -226,7 +288,8 @@ impl Default for PeerOptions {
             lane_backoff_base: limits::LANE_BACKOFF_BASE,
             lane_backoff_cap: limits::LANE_BACKOFF_CAP,
             lane_backoff_jitter: limits::BACKOFF_JITTER,
-            lane_reset_after: limits::LANE_RESET_AFTER,
+            lane_reset_after: LANE_HEALTHY_AFTER,
+            network_spacing_ratio: NETWORK_SPACING_RATIO,
             incompatible_recheck: limits::INCOMPATIBLE_RECHECK,
             unauthorized_recheck: limits::UNAUTHORIZED_RECHECK,
             catalog_poll: limits::CATALOG_POLL,
@@ -240,13 +303,38 @@ impl Default for PeerOptions {
 }
 
 impl PeerOptions {
+    /// A lane's backoff. Its own healthy-period reset is unused (no
+    /// `success` call): `run_lane` resets it once a session was `Ready` for
+    /// `lane_reset_after`, and only then.
     fn lane_backoff(&self) -> Backoff {
         Backoff::new(
             self.lane_backoff_base,
             self.lane_backoff_cap,
             self.lane_backoff_jitter,
-            self.lane_reset_after,
+            Duration::MAX,
         )
+    }
+
+    /// The spacing of a down peer's redials `age` into its outage (before
+    /// jitter): `age / network_spacing_ratio`, between the backoff's base
+    /// and its cap.
+    pub fn network_spacing(&self, age: Duration) -> Duration {
+        let cap = self.lane_backoff_cap.max(self.lane_backoff_base);
+        (age / self.network_spacing_ratio.max(1)).clamp(self.lane_backoff_base, cap)
+    }
+
+    /// `delay` with the lane backoff's jitter (±20 %).
+    fn jittered(&self, delay: Duration) -> Duration {
+        let jitter = if self.lane_backoff_jitter.is_finite() {
+            self.lane_backoff_jitter.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if jitter == 0.0 || delay.is_zero() {
+            return delay;
+        }
+        let factor = rand::Rng::gen_range(&mut rand::thread_rng(), (1.0 - jitter)..=(1.0 + jitter));
+        Duration::try_from_secs_f64(delay.as_secs_f64() * factor).unwrap_or(delay)
     }
 }
 
@@ -1169,6 +1257,98 @@ struct Gate {
     generation: u64,
 }
 
+/// A down peer's shared redial cadence (module docs, "Network loss").
+#[derive(Debug)]
+struct NetLoss {
+    /// When the loss began (`None`: the peer is up, or was never reached).
+    since: Option<Instant>,
+    /// The next redial slot of any of the peer's lanes.
+    next: Instant,
+    /// Redial slots handed out since the loss began.
+    dials: u64,
+    /// The code of the session loss that began it (the reconnect is logged
+    /// under it).
+    cause: String,
+}
+
+/// What a lane waits on during one attempt (a dial, or the wait before the
+/// next one): its token, a child of the supervisor's, is cancelled when a
+/// sibling lane connects and the attempt is one a connect cuts short
+/// (module docs, "Network loss").
+struct Waker {
+    id: u64,
+    token: Cancel,
+    attempt: Attempt,
+}
+
+/// A lane's current attempt, as [`Supervisor::lane_connected`] judges it.
+#[derive(Clone, Copy, Debug)]
+enum Attempt {
+    /// A dial in progress: when it started, and whether the peer answered
+    /// (its `HELLO_ACK` arrived: the dial is not stale).
+    Dial { since: Instant, answered: bool },
+    /// The wait before the next dial. `wakeable`: a sibling that connects
+    /// ends it, because the lane reached no session (its dial failed) or a
+    /// down peer paces it. A wait after a session that ended otherwise (a
+    /// session the peer closed before it was healthy: a flapping acceptor)
+    /// keeps its escalating delay: lanes that woke each other on every
+    /// connect would redial a flapping peer at one session per dial time
+    /// for ever (the WP5.3 review's blocker).
+    Wait { wakeable: bool },
+}
+
+/// One attempt's registration in [`Supervisor::wakers`]; removed on drop.
+struct Armed<'a> {
+    supervisor: &'a Supervisor,
+    lane: u32,
+    id: u64,
+    token: Cancel,
+}
+
+impl Drop for Armed<'_> {
+    fn drop(&mut self) {
+        let mut wakers = self.supervisor.wakers.lock();
+        if wakers
+            .get(&self.lane)
+            .is_some_and(|waker| waker.id == self.id)
+        {
+            wakers.remove(&self.lane);
+        }
+    }
+}
+
+/// Whether a dial failure is the network's (the transport could not reach
+/// the peer, or a handshake step got no answer): such failures of a down
+/// peer redial on its shared cadence (module docs, "Network loss").
+fn dial_lost(error: &DialError) -> bool {
+    matches!(error, DialError::Connect(_) | DialError::Timeout)
+}
+
+/// How an established session ended ([`Supervisor::serve`]).
+struct Ended {
+    reason: ErrorWire,
+    /// This side closed it (its lane runner gave up on it, or could not
+    /// start): never a loss by the transport, although its code is
+    /// `WS_CLOSED` ("closed locally") like a peer's close without a
+    /// `GOAWAY` (the WP5.3 review's minor).
+    local: bool,
+}
+
+/// Whether a session ended by the transport (reset, closed without a
+/// `GOAWAY`, or silent past its liveness deadline) rather than by a
+/// `GOAWAY` of either side, whose code says why, or by this side.
+fn session_lost(ended: &Ended) -> bool {
+    !ended.local && transport_lost(&ended.reason)
+}
+
+/// Whether `reason` is one of the transport's (see [`session_lost`]).
+fn transport_lost(reason: &ErrorWire) -> bool {
+    matches!(
+        reason.code.as_str(),
+        "CONNECTION_LOST" | "TRANSPORT_DEAD" | "WS_CLOSED"
+    )
+}
+
 /// How a failed dial is handled.
 enum Failure {
     /// Peer-level: `Incompatible` or `Unauthorized`, rechecked on a timer.
@@ -1226,6 +1406,15 @@ struct Supervisor {
     /// Set by an unpair of this peer before its `peer.revoke`: no
     /// enrollment starts, and none running is stored.
     unpairing: Arc<AtomicBool>,
+    /// The peer's network loss and its shared redial cadence (WP5.3).
+    net: Tracked<NetLoss>,
+    /// Each lane's current attempt, so a lane that connects wakes the
+    /// others (WP5.3).
+    wakers: Tracked<BTreeMap<u32, Waker>>,
+    next_waker: AtomicU64,
+    /// Sessions established, by any lane (a dial that fails while a sibling
+    /// connects retries at once).
+    connects: AtomicU64,
     /// `true` once retired: nothing of this supervisor reaches
     /// `ctx.status` any more. Every status event is recorded under the read
     /// side and `retire` flips it under the write side, so no event recorded
@@ -1292,6 +1481,18 @@ impl Supervisor {
             refused_key: Mutex::new(None),
             enrolling: Arc::new(AtomicBool::new(false)),
             unpairing: Arc::new(AtomicBool::new(false)),
+            net: Tracked::new(
+                "peer.net",
+                NetLoss {
+                    since: None,
+                    next: Instant::now(),
+                    dials: 0,
+                    cause: String::new(),
+                },
+            ),
+            wakers: Tracked::new("peer.wakers", BTreeMap::new()),
+            next_waker: AtomicU64::new(0),
+            connects: AtomicU64::new(0),
         });
         // Lanes parked on the gate wake when the supervisor is cancelled. The
         // hook holds a weak reference: the token outlives nothing it needs.
@@ -1794,6 +1995,7 @@ impl Supervisor {
         &self,
         lane: u32,
         credential: Option<[u8; 32]>,
+        attempt: &Armed<'_>,
     ) -> Result<(Conn, session::ServerHello), DialError> {
         let role = role_of(lane);
         let hello = session::client_hello(
@@ -1809,7 +2011,10 @@ impl Supervisor {
             key,
             code: Some(self.record.code.clone()),
         });
-        let handshaking = || self.set_lane(lane, LaneState::Handshaking, None, None, None);
+        let handshaking = || {
+            self.answered(lane, attempt.id);
+            self.set_lane(lane, LaneState::Handshaking, None, None, None);
+        };
         let auth = AnnounceHandshake {
             inner: match &credential {
                 Some(peer) => peer,
@@ -1818,7 +2023,9 @@ impl Supervisor {
             on_key: &handshaking,
         };
         // CCR-WP2.6-2 (applied by WP3.1): stopping the supervisor (unpair,
-        // respawn, shutdown) interrupts a dial in progress.
+        // respawn, shutdown) interrupts a dial in progress, and so does a
+        // sibling that connected while this dial got no answer (WP5.3): the
+        // attempt's token is a child of the supervisor's.
         session::dial_cancellable(
             &self.record.endpoint,
             hello,
@@ -1826,16 +2033,143 @@ impl Supervisor {
             Some(&self.record.installation),
             None,
             self.options.conn,
-            &self.cancel,
+            &attempt.token,
         )
+    }
+
+    // -- reconnecting (WP5.3; module docs, "Network loss") -------------------
+
+    /// Registers `lane`'s attempt: its token is a child of the
+    /// supervisor's, and a sibling that connects cancels it when the attempt
+    /// is a stale dial or a wakeable wait ([`Supervisor::lane_connected`]).
+    fn arm(&self, lane: u32, attempt: Attempt) -> Armed<'_> {
+        let id = self.next_waker.fetch_add(1, Ordering::Relaxed);
+        let token = self.cancel.child();
+        self.wakers.lock().insert(
+            lane,
+            Waker {
+                id,
+                token: token.clone(),
+                attempt,
+            },
+        );
+        Armed {
+            supervisor: self,
+            lane,
+            id,
+            token,
+        }
+    }
+
+    /// The peer answered `lane`'s dial `id` (its `HELLO_ACK`): not stale.
+    fn answered(&self, lane: u32, id: u64) {
+        if let Some(waker) = self
+            .wakers
+            .lock()
+            .get_mut(&lane)
+            .filter(|waker| waker.id == id)
+            && let Attempt::Dial { answered, .. } = &mut waker.attempt
+        {
+            *answered = true;
+        }
+    }
+
+    /// `lane` connected with a dial that started at `started` and took
+    /// `took`: the peer is reachable now. Its network loss ends; every
+    /// sibling whose wait is wakeable (it reached no session, or the down
+    /// peer paced it: [`Attempt::Wait`]) dials at once, and every sibling
+    /// dial that is stale (started before this one, no answer from the peer,
+    /// and running [`STALE_DIAL_MARGIN`] longer than this one took: a dial
+    /// into a link that was down) is interrupted and redialed at once. A
+    /// sibling backing off after a session the peer ended keeps its delay.
+    fn lane_connected(&self, lane: u32, started: Instant, took: Duration) {
+        self.connects.fetch_add(1, Ordering::AcqRel);
+        let ended = {
+            let mut net = self.net.lock();
+            net.since
+                .take()
+                .map(|since| (since.elapsed(), net.dials, std::mem::take(&mut net.cause)))
+        };
+        if let Some((down, dials, cause)) = ended {
+            event!(info, (cause.as_str()), {
+                "peer": self.installation(),
+                "lane": lane,
+                "detail": "the peer is reachable again: its network loss ended",
+                "down_ms": u64::try_from(down.as_millis()).unwrap_or(u64::MAX),
+                "redials": dials,
+            });
+        }
+        let now = Instant::now();
+        let woken: Vec<Cancel> = self
+            .wakers
+            .lock()
+            .iter()
+            .filter(|(other, _)| **other != lane)
+            .filter(|(_, waker)| match waker.attempt {
+                Attempt::Wait { wakeable } => wakeable,
+                Attempt::Dial { since, answered } => {
+                    !answered
+                        && since < started
+                        && now.saturating_duration_since(since) >= took + STALE_DIAL_MARGIN
+                }
+            })
+            .map(|(_, waker)| waker.token.clone())
+            .collect();
+        for token in woken {
+            token.cancel();
+        }
+    }
+
+    /// `lane` lost a healthy session by the transport: the peer's network
+    /// loss begins, unless one is under way. Its lanes then redial on one
+    /// cadence ([`Supervisor::network_slot`]), the first one a base delay
+    /// (jittered) from now.
+    fn network_lost(&self, lane: u32, reason: &ErrorWire) {
+        let began = {
+            let mut net = self.net.lock();
+            if net.since.is_some() {
+                false
+            } else {
+                let now = Instant::now();
+                net.since = Some(now);
+                net.next = now + self.options.jittered(self.options.lane_backoff_base);
+                net.dials = 0;
+                net.cause = reason.code.clone();
+                true
+            }
+        };
+        if began {
+            event!(info, (reason.code.as_str()), {
+                "peer": self.installation(),
+                "lane": lane,
+                "detail": "a healthy session was lost by the transport: the peer's lanes redial on one cadence until one connects",
+                "message": reason.message,
+            });
+        }
+    }
+
+    /// The next redial slot while the peer's network is down (`None` while
+    /// it is up): one slot per spacing for all its lanes, the spacing
+    /// following the outage's age ([`PeerOptions::network_spacing`],
+    /// jittered).
+    fn network_slot(&self, now: Instant) -> Option<Instant> {
+        let mut net = self.net.lock();
+        let since = net.since?;
+        let slot = net.next.max(now);
+        let spacing = self
+            .options
+            .network_spacing(slot.saturating_duration_since(since));
+        net.next = slot + self.options.jittered(spacing);
+        net.dials += 1;
+        Some(slot)
     }
 
     // -- a Ready lane -------------------------------------------------------
 
-    /// Runs one established session until it closes (`Some(reason)`) or the
-    /// supervisor is cancelled (`None`). Always leaves the session closed or
-    /// closing and its runner cancelled.
-    fn serve(self: &Arc<Self>, lane: u32, conn: &Conn) -> Option<ErrorWire> {
+    /// Runs one established session until it closes (`Some`, with why and
+    /// whether this side closed it) or the supervisor is cancelled (`None`).
+    /// Always leaves the session closed or closing and its runner cancelled.
+    fn serve(self: &Arc<Self>, lane: u32, conn: &Conn) -> Option<Ended> {
         let session_cancel = self.cancel.child();
         {
             // GOAWAY as soon as the supervisor stops (a no-op once closed).
@@ -1856,7 +2190,8 @@ impl Supervisor {
         if lane == 0 {
             self.record_seen(None);
         }
-        let runner = self.spawn_runner(lane, conn, &session_cancel);
+        let closed_here = Arc::new(AtomicBool::new(false));
+        let runner = self.spawn_runner(lane, conn, &session_cancel, &closed_here);
         let ended = if lane == 0 {
             self.control_loop(lane, conn, &session_cancel)
         } else {
@@ -1890,16 +2225,22 @@ impl Supervisor {
             }
         }
         self.conns.lock().remove(&lane);
-        ended
+        ended.map(|reason| Ended {
+            reason,
+            local: closed_here.load(Ordering::Acquire),
+        })
     }
 
     /// Starts `scheduler::run_control` (lane 0) or `objects::run_bulk_lane`
     /// on its own thread. The receiver disconnects when the runner returns.
+    /// `closed_here` is set when the session is closed because the runner
+    /// ended on it (or could not start).
     fn spawn_runner(
         self: &Arc<Self>,
         lane: u32,
         conn: &Conn,
         cancel: &Cancel,
+        closed_here: &Arc<AtomicBool>,
     ) -> Option<(mpsc::Receiver<()>, JoinHandle<()>)> {
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let ctx = self.ctx.clone();
@@ -1907,6 +2248,7 @@ impl Supervisor {
         let spec = spec_of(lane, self.pool);
         let owned = conn.clone();
         let cancel = cancel.clone();
+        let closing = closed_here.clone();
         let installation = self.record.installation.clone();
         let name = match spec {
             None => thread_name("ctl", &installation, None),
@@ -1929,6 +2271,7 @@ impl Supervisor {
                     "detail": "the lane runner ended while its session was open; reconnecting",
                     "panicked": outcome.is_err(),
                 });
+                closing.store(true, Ordering::Release);
                 owned.close();
             }
         });
@@ -1941,6 +2284,7 @@ impl Supervisor {
                     "detail": "cannot start the lane runner; reconnecting",
                     "error": error.to_string(),
                 });
+                closed_here.store(true, Ordering::Release);
                 conn.close();
                 None
             }
@@ -2332,14 +2676,19 @@ impl Drop for LaneExit {
     }
 }
 
-/// One lane's thread: gate, dial, serve, back off, until cancelled.
+/// One lane's thread: gate, dial, serve, back off, until cancelled (module
+/// docs: the lane table and "Network loss").
 fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
     let _exit = LaneExit {
         supervisor: supervisor.clone(),
         lane,
     };
-    let mut backoff = supervisor.options.lane_backoff();
+    let options = supervisor.options;
+    let mut backoff = options.lane_backoff();
     let mut announced: Option<u64> = None;
+    // Consecutive failed attempts since the lane was last Ready (the view's
+    // `attempt`; a down peer's paced redials do not escalate `backoff`).
+    let mut failures = 0u32;
     loop {
         // WP4.INT (the WP4.1 review's minor): while the peer is being
         // unpaired its lanes do not dial. The acceptor was just told to
@@ -2355,9 +2704,25 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
         if !supervisor.admit(lane, &mut announced) {
             return;
         }
+        // The connects of siblings seen when this dial starts (or, below,
+        // when its session ends): one that connects later shows the peer
+        // reachable.
+        let mut seen = supervisor.connects.load(Ordering::Acquire);
+        let attempt = supervisor.arm(
+            lane,
+            Attempt::Dial {
+                since: Instant::now(),
+                answered: false,
+            },
+        );
         supervisor.set_lane(lane, LaneState::Dialing, None, None, None);
         let presented = supervisor.outbound_key();
-        let dialed = supervisor.dial(lane, presented);
+        let started = Instant::now();
+        let dialed = supervisor.dial(lane, presented, &attempt);
+        let took = started.elapsed();
+        // A sibling connected while this dial got no answer (WP5.3).
+        let interrupted = attempt.token.is_cancelled();
+        drop(attempt);
         if supervisor.cancel.is_cancelled() {
             if let Ok((conn, _)) = dialed {
                 conn.close();
@@ -2372,21 +2737,38 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
             supervisor.credential_refused(key);
             continue;
         }
-        let error = match dialed {
+        // `lost`: the network's failure (a dial that reached nothing, a
+        // session lost by the transport); `healthy`: a session that was
+        // Ready long enough to count (`lane_reset_after`).
+        let (error, lost, healthy, dial_failed) = match dialed {
             Ok((conn, server)) => {
                 supervisor.gate_success();
+                supervisor.lane_connected(lane, started, took);
                 if lane == 0 && !server.features.iter().any(|f| f == PEER_HMAC_V1) {
                     supervisor.enroll_later(&conn, &server);
                 }
-                backoff.success(Instant::now());
-                supervisor.update_lane(lane, |view| view.attempt = backoff.attempt());
+                // No `backoff.success`: the attempt count resets only once
+                // the session proves healthy (below), never through
+                // `Backoff`'s own healthy period, which a redial the down
+                // peer paces (no `failure`) would carry past an unhealthy
+                // session (the WP5.3 review's minor).
+                failures = 0;
+                supervisor.update_lane(lane, |view| view.attempt = 0);
                 let protocol = format!("{}/{}", server.protocol, server.version);
                 supervisor.update_lane(lane, |view| view.protocol = Some(protocol));
+                let ready = Instant::now();
                 match supervisor.serve(lane, &conn) {
                     None => return,
-                    Some(reason) => reason,
+                    Some(ended) => {
+                        seen = supervisor.connects.load(Ordering::Acquire);
+                        let lost = session_lost(&ended);
+                        let healthy = ready.elapsed() >= options.lane_reset_after;
+                        (ended.reason, lost, healthy, false)
+                    }
                 }
             }
+            // A stale dial a connected sibling interrupted: redial at once.
+            Err(_) if interrupted => continue,
             Err(error) => match classify_dial(&error) {
                 Failure::Block(state, wire) => {
                     supervisor.gate_block(lane, state, wire);
@@ -2394,19 +2776,49 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
                 }
                 Failure::Retry(wire) => {
                     supervisor.gate_transient(lane);
-                    wire
+                    (wire, dial_lost(&error), false, true)
                 }
             },
         };
-        let delay = backoff.failure(Instant::now());
+        failures = failures.saturating_add(1);
+        let now = Instant::now();
+        if healthy {
+            // A healthy lane starts over from the base delay; its loss by
+            // the transport is the peer's network loss.
+            backoff.reset();
+            if lost {
+                supervisor.network_lost(lane, &error);
+            }
+        }
+        let paced = if lost {
+            supervisor.network_slot(now)
+        } else {
+            None
+        };
+        // A sibling that connects ends the wait only when this lane reached
+        // no session (its dial failed) or the down peer paces it; after a
+        // session that ended otherwise (one the peer closed before it was
+        // healthy: a flapping acceptor) the lane keeps its own escalating
+        // delay, so lanes never wake each other into a loop. Armed before
+        // the connects are checked: a sibling that connects from now on
+        // cuts a wakeable wait short.
+        let wakeable = dial_failed || paced.is_some();
+        let wait = supervisor.arm(lane, Attempt::Wait { wakeable });
+        let mut until = paced.unwrap_or_else(|| now + backoff.failure(now));
+        if wakeable && supervisor.connects.load(Ordering::Acquire) != seen {
+            // A sibling connected since this dial began (or this session
+            // ended): the peer is reachable, try again now.
+            until = now;
+        }
+        let delay = until.saturating_duration_since(now);
         let until_ms = supervisor
             .ctx
             .clock
             .now_ms()
             .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
-        supervisor.update_lane(lane, |view| view.attempt = backoff.attempt());
+        supervisor.update_lane(lane, |view| view.attempt = failures);
         supervisor.set_lane(lane, LaneState::Backoff, Some(error), Some(until_ms), None);
-        if supervisor.cancel.sleep(delay) {
+        if wait.token.sleep(delay) && supervisor.cancel.is_cancelled() {
             return;
         }
     }
@@ -2471,4 +2883,43 @@ pub fn parse_catalog_reply(reply: &Reply) -> Result<CatalogListReply, ErrorWire>
             format!("{} reply does not parse: {error}", ops::CATALOG_LIST),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ended(code: &str, message: &str, local: bool) -> Ended {
+        Ended {
+            reason: ErrorWire::coded(code, message),
+            local,
+        }
+    }
+
+    /// A session this side closed (a lane runner that gave up on it, or
+    /// could not start) is never a network loss, although its code is the
+    /// transport's `WS_CLOSED`; the same code from the peer's side is, and
+    /// a `GOAWAY`'s code never is (the WP5.3 review's minor).
+    #[test]
+    fn only_the_transports_closes_are_network_losses() {
+        assert!(!session_lost(&ended(
+            "WS_CLOSED",
+            "the connection was closed locally",
+            true
+        )));
+        assert!(session_lost(&ended(
+            "WS_CLOSED",
+            "the peer closed the connection",
+            false
+        )));
+        for code in ["CONNECTION_LOST", "TRANSPORT_DEAD"] {
+            assert!(session_lost(&ended(code, "lost", false)), "{code}");
+            assert!(!session_lost(&ended(code, "lost", true)), "{code}");
+        }
+        assert!(!session_lost(&ended(
+            "ORCHESTRATOR_STOPPING",
+            "the peer is stopping",
+            false
+        )));
+    }
 }

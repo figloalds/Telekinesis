@@ -87,9 +87,22 @@
 //!    source or of another. `ObjectError` per failed object; an object
 //!    installed here resolves the errors every source had for it.
 //!
+//! 5. **Demand** (WP5.3): while the round is busy (pulls in flight or a
+//!    plan left), every [`DEMAND_POLL`] (500 ms after the last probe ended)
+//!    it asks our worker which of
+//!    the lane's objects a reader waits for (`objects.demand`, read-only,
+//!    newest demand first). Those it planned move to the front of its plan,
+//!    so the next pull carries them; one it has not planned is asked of the
+//!    worker with a small want (the worker lists demand first) whose demand
+//!    items go to the front too. An idle lane's key is due as soon as the
+//!    folder's demand queue grows (the heartbeat's `content.requested`, never
+//!    absorbed as an echo). A worker without the op is remembered and not
+//!    asked again; its wants still order demand first.
+//!
 //! When the round ends, what arrived is written (also when the session
-//! ended: it is valid and contiguous, so the next session resumes after it),
-//! unless the lane is told to stop.
+//! ended: it is valid and contiguous, so the next session resumes after it;
+//! since WP5.3 also when the supervisor cancelled the lane's runner after
+//! the session ended), unless the lane is told to stop.
 //!
 //! # Upload round (one key)
 //!
@@ -123,6 +136,13 @@
 //!   it was offered, or one its push failed or abandoned, is released for
 //!   another dialer, and excluded from that dialer's wants while it backs
 //!   off.
+//!
+//! * a lane that ends (its session lost, or the lane told to stop) gives
+//!   up the leases its rounds *kept* for the next round (a round that
+//!   reached its cap with objects unfinished, of a repository then waiting
+//!   for its turn or its next run), holding each key meanwhile so no round
+//!   overlaps the release (WP5.3: until then they waited for their lapse,
+//!   60 s, when the session ended between two rounds).
 //!
 //! A round that merely reached its cap keeps its leases (it continues them
 //! next round under the same ids). Before WP4.5 the daemon handed such
@@ -163,8 +183,8 @@ use super::{
     Config,
     meta_exchange::body_of,
     scheduler::{
-        DriveOptions, ExchangeError, Job, Next, Signals, Target, check_session, drive, refuse,
-        short, sync_interval,
+        DriveOptions, ExchangeError, Job, Next, Signals, Target, check_session, drive, hold_key,
+        refuse, short, sync_interval,
     },
     worker_client::{self, ReadFlow, ReadRange, SessionWorkerClient},
 };
@@ -180,13 +200,14 @@ use crate::{
                 MAX_RELEASE_ITEMS, MAX_WANT_ITEMS, ObjectOutcome, ObjectsPull, ObjectsPush,
                 ObjectsReport, ObjectsResult, ObjectsWantsReply, ObjectsWantsRequest,
                 PULL_BUDGET_BYTES, REPOS_PER_LANE, ReadHeader, ReleaseHeader, WantHeader, WantItem,
-                WantReply, WantRequest, WriteItem, WriteResult, ops as worker_ops,
+                WantPriority, WantReply, WantRequest, WriteItem, WriteResult, ops as worker_ops,
             },
             ops,
         },
         status::{Direction, ObjectSource, StatusEvent},
     },
     paired_sync::SyncRoute,
+    runtime::objects_rpc::{DEMAND, DemandHeader, DemandReply},
     session::{self, Priority},
     util::{backoff::Backoff, cancel::Cancel, lock::lock, log::event},
 };
@@ -234,6 +255,20 @@ const EVENT_WAIT: Duration = Duration::from_millis(100);
 /// quarter of the table it frees; WP3.INT re-review).
 const BACKOFF_MAX: usize = 16 * 1024;
 const BACKOFF_KEEP: usize = BACKOFF_MAX / 4 * 3;
+/// How often a download round busy with other objects asks our worker which
+/// objects a reader waits for (`objects.demand`; WP5.3): those get the
+/// round's next pull. Counted from the end of the previous probe.
+pub const DEMAND_POLL: Duration = Duration::from_millis(500);
+/// Items of the want a busy round makes for demanded objects it has not
+/// planned (the worker lists demand first).
+const DEMAND_WANT_ITEMS: u32 = 16;
+/// How long a demand probe (a local call) may take.
+const DEMAND_DEADLINE: Duration = Duration::from_secs(1);
+/// How long a lane whose session ended waits for its key to give up the
+/// leases its rounds kept (a round still running settles them itself).
+const KEPT_CLAIM_WAIT: Duration = Duration::from_secs(2);
+/// Kept leases remembered per repository at most (the rest lapse).
+const MAX_KEPT: usize = 4096;
 /// The SHA-256 of no bytes: the only object whose size is 0. A want item of
 /// another object with size 0 has an unknown size (an event without a size
 /// descriptor; WP3.INT re-review), and its sender's total defines it.
@@ -266,6 +301,8 @@ pub struct LaneOptions {
     pub idle: Duration,
     /// See [`ROUND_CAP`].
     pub round: Duration,
+    /// See [`DEMAND_POLL`].
+    pub demand_poll: Duration,
     /// Where to count what the lane does (tests and diagnostics).
     pub stats: Option<Arc<LaneStats>>,
 }
@@ -290,6 +327,7 @@ impl LaneOptions {
             reads: INFLIGHT_READS,
             idle: deadlines::OBJECTS_IDLE,
             round: ROUND_CAP,
+            demand_poll: DEMAND_POLL,
             stats: None,
         }
     }
@@ -323,6 +361,12 @@ pub struct LaneStats {
     /// Repositories with a round on the lane now / at most.
     pub repos: AtomicU64,
     pub repos_peak: AtomicU64,
+    /// `objects.demand` probes of busy rounds, and demanded objects they
+    /// moved to the front of their round (WP5.3).
+    pub demand_probes: AtomicU64,
+    pub demand_promoted: AtomicU64,
+    /// Kept leases given up because the lane's session ended (WP5.3).
+    pub kept_released: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, by: u64) -> u64 {
@@ -2046,8 +2090,11 @@ pub fn run_lane_with(
         outer: cancel.clone(),
         turns: Mutex::new(HashMap::new()),
         remote_content: Mutex::new(HashMap::new()),
+        kept: Mutex::new(HashMap::new()),
+        demand: Mutex::new(HashMap::new()),
         options: options.clone(),
     });
+    let ended = run.clone();
     let up = Arc::new(UploadJob(run.clone()));
     let uploads = {
         let (ctx, peer, conn, token, options, name) = (
@@ -2077,6 +2124,45 @@ pub fn run_lane_with(
     token.cancel();
     if let Ok(handle) = uploads {
         let _ = handle.join();
+    }
+    release_kept(&ended);
+}
+
+/// The lane ended (its session closed, or it is told to stop): the leases
+/// its rounds kept for the next round (module docs, "Leases given up") are
+/// given up at once, so another source's session (or this lane's next one)
+/// takes those objects now instead of after their lapse. Each key is held
+/// meanwhile ([`hold_key`]): no round of it, of this runner or of the next
+/// session's, overlaps the release; a round still running settles its own.
+/// Not while the daemon stops (an adopted worker's leases are continued by
+/// the restarted lanes under the same ids, or lapse).
+fn release_kept(lane: &LaneRun) {
+    if lane.ctx.stopping.load(Ordering::Relaxed) {
+        return;
+    }
+    let kept: Vec<(String, Kept)> = lock(&lane.kept).drain().collect();
+    let scope = format!("{}#{}", ops::OBJECTS_PULL, lane.spec.index);
+    for (repo, kept) in kept {
+        if kept.hashes.is_empty() {
+            continue;
+        }
+        let Some(_key) = hold_key(
+            &lane.ctx.installation,
+            &lane.peer.installation,
+            &scope,
+            &repo,
+            KEPT_CLAIM_WAIT,
+        ) else {
+            continue;
+        };
+        let mut by_slot: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (hash, (slot, _)) in kept.hashes {
+            by_slot.entry(slot).or_default().push(hash);
+        }
+        for (slot, hashes) in by_slot {
+            bump(&lane.stats.kept_released, hashes.len() as u64);
+            release_leases(&kept.client, &kept.route, &lane.lease(slot), hashes);
+        }
     }
 }
 
@@ -2135,7 +2221,24 @@ struct LaneRun {
     /// Per repository: the peer's published content counters (shared and
     /// current objects available) as the last download round saw them.
     remote_content: Mutex<HashMap<String, (u64, u64)>>,
+    /// Per repository: the unfinished objects its download rounds left
+    /// leased to the lane's ids for the next round (WP5.3: given up when the
+    /// lane ends, [`release_kept`]).
+    kept: Mutex<HashMap<String, Kept>>,
+    /// Per worker instance: whether it answers `objects.demand` (a worker of
+    /// an older build does not; WP5.3).
+    demand: Mutex<HashMap<String, bool>>,
     options: LaneOptions,
+}
+
+/// The leases one repository's rounds kept, and how to give them up.
+struct Kept {
+    route: SyncRoute,
+    client: Arc<SessionWorkerClient>,
+    /// Hash → its lease id (`slot` of [`pull_lease`]) and when a round last
+    /// planned it (an entry no round planned again for a lease TTL is
+    /// dropped: the lease lapsed, or it was never ours again).
+    hashes: BTreeMap<String, (usize, Instant)>,
 }
 
 /// The two pull lease ids of one repository's wants (module docs, step 1).
@@ -2197,9 +2300,14 @@ impl LaneRun {
     }
 
     /// The lane (or the daemon) is told to stop: what arrived is dropped
-    /// rather than written. A session that merely ended is not that.
+    /// rather than written. A session that merely ended is not that, even
+    /// once the supervisor cancelled the lane's runner after it (it does so
+    /// whenever a session ends): what arrived is valid and contiguous, and
+    /// written, so the next session resumes after it (WP5.3; it was dropped
+    /// whenever the cancel came first, up to a window of bytes re-sent).
     fn cancelled(&self) -> bool {
-        self.outer.is_cancelled() || self.ctx.stopping.load(Ordering::Relaxed)
+        (self.outer.is_cancelled() && self.conn.closed().is_none())
+            || self.ctx.stopping.load(Ordering::Relaxed)
     }
 
     /// The lease ids (`slot`s of [`pull_lease`]) `repo`'s next want asks
@@ -2244,6 +2352,102 @@ impl LaneRun {
     fn forget(&self, repo: &str) {
         lock(&self.turns).remove(repo);
         lock(&self.remote_content).remove(repo);
+    }
+
+    /// The leases `repo`'s rounds kept so far (taken: the caller puts back
+    /// what still holds).
+    fn take_kept(&self, repo: &str) -> BTreeMap<String, (usize, Instant)> {
+        lock(&self.kept)
+            .remove(repo)
+            .map(|kept| kept.hashes)
+            .unwrap_or_default()
+    }
+
+    /// `repo`'s kept leases after a round (at most [`MAX_KEPT`]).
+    fn put_kept(
+        &self,
+        repo: &str,
+        route: &SyncRoute,
+        client: &Arc<SessionWorkerClient>,
+        mut hashes: BTreeMap<String, (usize, Instant)>,
+    ) {
+        if hashes.is_empty() {
+            return;
+        }
+        while hashes.len() > MAX_KEPT {
+            let Some(oldest) = hashes
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(hash, _)| hash.clone())
+            else {
+                break;
+            };
+            hashes.remove(&oldest);
+        }
+        lock(&self.kept).insert(
+            repo.to_owned(),
+            Kept {
+                route: route.clone(),
+                client: client.clone(),
+                hashes,
+            },
+        );
+    }
+
+    /// The objects of this lane a reader waits for (`objects.demand`, newest
+    /// demand first), or none when our worker does not serve the op.
+    fn demanded(
+        &self,
+        target: &Target,
+        client: &SessionWorkerClient,
+        route: &SyncRoute,
+    ) -> Vec<String> {
+        let instance = target
+            .folder
+            .worker
+            .as_ref()
+            .map(|worker| worker.instance.clone())
+            .unwrap_or_default();
+        if lock(&self.demand).get(&instance) == Some(&false) {
+            return Vec::new();
+        }
+        bump(&self.stats.demand_probes, 1);
+        let header = DemandHeader {
+            route: route.clone(),
+            lane: Some(self.spec),
+            max_items: Some(DEMAND_WANT_ITEMS),
+        };
+        let Ok(header) = serde_json::to_value(&header) else {
+            return Vec::new();
+        };
+        match client.request(
+            DEMAND,
+            header,
+            Vec::new(),
+            Priority::Control,
+            DEMAND_DEADLINE,
+        ) {
+            Ok(reply) => {
+                lock(&self.demand).insert(instance, true);
+                body_of::<DemandReply>(&reply, DEMAND)
+                    .map(|reply| {
+                        reply
+                            .items
+                            .into_iter()
+                            .map(|item| item.hash)
+                            .filter(|hash| self.spec.owns(hash))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            Err(error) if error.code() == "UNSUPPORTED_OPERATION" => {
+                // A worker of an older build: its want lists still order
+                // demand first, at the start of each round.
+                lock(&self.demand).insert(instance, false);
+                Vec::new()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     fn route(&self, target: &Target) -> SyncRoute {
@@ -2433,7 +2637,11 @@ impl Job for DownloadJob {
 
     fn triggered(&self, before: &Signals, after: &Signals, absorbing: bool) -> bool {
         // Staging moves `sync`: objects of staged events are wanted at once.
-        objects_triggered(before, after, absorbing) || before.sync != after.sync
+        // A grown demand queue is a reader waiting, never an echo of ours
+        // (WP5.3).
+        objects_triggered(before, after, absorbing)
+            || before.sync != after.sync
+            || after.requested > before.requested
     }
 
     fn run(
@@ -2652,6 +2860,7 @@ fn download_round(
     let abort = AtomicBool::new(false);
     let started = Instant::now();
     let mut state = RoundState::default();
+    let mut probed = Instant::now();
     thread::scope(|scope| {
         loop {
             while let Ok(event) = rx.try_recv() {
@@ -2679,8 +2888,21 @@ fn download_round(
                     && !state.want_dry
                     && in_flight < lane.options.pulls.max(1)
                 {
-                    want_more(lane, target, client, &route, &mut state);
+                    want_more(lane, target, client, &route, &mut state, false);
                     continue;
+                }
+                // A reader waits for an object while the round is busy with
+                // others: it gets the round's next pull (WP5.3).
+                if !over
+                    && (in_flight > 0 || !state.plan.is_empty())
+                    && probed.elapsed() >= lane.options.demand_poll
+                {
+                    promote_demand(lane, target, client, &route, &mut state);
+                    // From the probe's end: a slow answer (its deadline is
+                    // longer than the poll) never makes the round probe
+                    // back to back instead of pulling (the WP5.3 review's
+                    // minor).
+                    probed = Instant::now();
                 }
                 if !over && !state.plan.is_empty() && in_flight < lane.options.pulls.max(1) {
                     let issued =
@@ -3018,21 +3240,39 @@ fn report_pulls(lane: &LaneRun, target: &Target, state: &mut RoundState) {
 /// (its session ended, the peer or our worker failed, the lane stops), so
 /// another source continues them at once. An unfinished object of a round
 /// that went well keeps its lease: the lane continues it next round, and its
-/// id is marked as holding (the next round asks it).
+/// id is marked as holding (the next round asks it). The objects kept so far
+/// (by earlier rounds, whether or not this one planned them again) are
+/// settled the same way, and what still holds is remembered for the lane's
+/// end (WP5.3, [`release_kept`]).
 #[allow(clippy::too_many_arguments)]
 fn settle_leases(
     lane: &LaneRun,
     target: &Target,
-    client: &SessionWorkerClient,
+    client: &Arc<SessionWorkerClient>,
     route: &SyncRoute,
     state: &RoundState,
     results: &HashMap<String, SinkResult>,
     failed: bool,
 ) {
-    let mut released: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    // What earlier rounds kept (planned again within a lease TTL), then
+    // this round's own plan (`true`: planned now).
+    let now = Instant::now();
+    let mut held: BTreeMap<String, (usize, Instant, bool)> = lane
+        .take_kept(&target.repo)
+        .into_iter()
+        .filter(|(_, (_, at))| now.saturating_duration_since(*at) < LEASE_TTL)
+        .map(|(hash, (slot, at))| (hash, (slot, at, false)))
+        .collect();
     for (hash, planned) in &state.planned {
+        held.insert(hash.clone(), (planned.slot, now, true));
+    }
+    let mut released: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut kept = BTreeMap::new();
+    for (hash, (slot, at, planned_now)) in held {
         let gone = matches!(
-            results.get(hash).and_then(|result| result.outcome.as_ref()),
+            results
+                .get(&hash)
+                .and_then(|result| result.outcome.as_ref()),
             Some(
                 ObjectOutcome::Completed
                     | ObjectOutcome::Skipped
@@ -3043,10 +3283,13 @@ fn settle_leases(
         if gone {
             continue;
         }
-        if state.failed.contains(hash) || failed {
-            released.entry(planned.slot).or_default().push(hash.clone());
+        if state.failed.contains(&hash) || failed {
+            released.entry(slot).or_default().push(hash);
         } else {
-            lane.holding(&target.repo, planned.slot);
+            if planned_now {
+                lane.holding(&target.repo, slot);
+            }
+            kept.insert(hash, (slot, at));
         }
     }
     if lane.ctx.stopping.load(Ordering::Relaxed) {
@@ -3055,22 +3298,74 @@ fn settle_leases(
         // they lapse).
         return;
     }
+    lane.put_kept(&target.repo, route, client, kept);
     for (slot, hashes) in released {
         release_leases(client, route, &lane.lease(slot), hashes);
     }
 }
 
-/// Asks the local worker for more wanted objects (module docs, step 1).
-fn want_more(
+/// A busy round's demand check (WP5.3, [`DEMAND_POLL`]): the objects of
+/// this lane a reader waits for (`objects.demand`, newest first) move to
+/// the front of the round's plan, so the next pull carries them; one the
+/// round has not planned (nor begun) is asked of our worker with a small
+/// want, whose demand items go to the front too (the worker lists demand
+/// first). One whose bytes are in flight already needs nothing.
+fn promote_demand(
     lane: &LaneRun,
     target: &Target,
     client: &SessionWorkerClient,
     route: &SyncRoute,
     state: &mut RoundState,
 ) {
+    let demanded = lane.demanded(target, client, route);
+    if demanded.is_empty() {
+        return;
+    }
+    let mut front: Vec<Planned> = Vec::new();
+    let mut unplanned = false;
+    for hash in &demanded {
+        let before = front.len();
+        let mut index = 0;
+        while index < state.plan.len() {
+            if state.plan[index].item.hash == *hash {
+                if let Some(planned) = state.plan.remove(index) {
+                    front.push(planned);
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if front.len() == before && !state.planned.contains_key(hash) {
+            unplanned = true;
+        }
+    }
+    let moved = front.len();
+    for planned in front.into_iter().rev() {
+        state.plan.push_front(planned);
+    }
+    bump(&lane.stats.demand_promoted, moved as u64);
+    if unplanned {
+        want_more(lane, target, client, route, state, true);
+    }
+}
+
+/// Asks the local worker for more wanted objects (module docs, step 1).
+/// `demand`: a busy round's small want for objects a reader waits for
+/// ([`promote_demand`]): at most [`DEMAND_WANT_ITEMS`], with one id (the
+/// one a want with a pull in flight uses), and the items the worker lists as
+/// demand go to the front of the plan.
+fn want_more(
+    lane: &LaneRun,
+    target: &Target,
+    client: &SessionWorkerClient,
+    route: &SyncRoute,
+    state: &mut RoundState,
+    demand: bool,
+) {
     let blocked = |hash: &str| object_blocked(&lane.key(&target.repo, false, hash));
     let mut fresh = 0;
-    let idle = state.in_flight() == 0;
+    let idle = state.in_flight() == 0 && !demand;
+    let mut promoted = Vec::new();
     for (index, slot) in lane.want_order(&target.repo, idle).into_iter().enumerate() {
         // The second id only when the first found nothing to move.
         if index > 0 && fresh > 0 {
@@ -3080,7 +3375,11 @@ fn want_more(
         let header = WantHeader {
             route: route.clone(),
             lane: lane.spec,
-            max_items: MAX_WANT_ITEMS as u32,
+            max_items: if demand {
+                DEMAND_WANT_ITEMS
+            } else {
+                MAX_WANT_ITEMS as u32
+            },
             max_bytes: lane.options.window_bytes,
             session: lease.clone(),
         };
@@ -3090,6 +3389,9 @@ fn want_more(
         state.excluded |= !exclude.is_empty();
         let items = match want_excluding(client, &header, exclude, worker_client::deadlines::WANT) {
             Ok(items) => items,
+            // A busy round's demand want is a hint: its failure is not the
+            // round's (the round's own wants report the worker's state).
+            Err(_) if demand => return,
             Err(error) => {
                 state.local_error.get_or_insert(error);
                 return;
@@ -3112,11 +3414,16 @@ fn want_more(
                 continue;
             }
             fresh += 1;
-            state.plan(Planned {
+            let planned = Planned {
                 item,
                 slot,
                 lease: lease.clone(),
-            });
+            };
+            if demand && planned.item.priority == WantPriority::Demand {
+                promoted.push(planned);
+            } else {
+                state.plan(planned);
+            }
         }
         if !refused.is_empty() {
             // Hidden from this source for the shortest of their remaining
@@ -3130,7 +3437,16 @@ fn want_more(
             release_leases_holding(client, route, &lease, refused, hold);
         }
     }
-    if fresh == 0 {
+    // Demand first, in the worker's order (newest demand first).
+    bump(&lane.stats.demand_promoted, promoted.len() as u64);
+    for planned in promoted.into_iter().rev() {
+        state
+            .planned
+            .entry(planned.item.hash.clone())
+            .or_insert_with(|| planned.clone());
+        state.plan.push_front(planned);
+    }
+    if fresh == 0 && !demand {
         state.want_dry = true;
     }
 }
