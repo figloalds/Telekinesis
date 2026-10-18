@@ -497,6 +497,10 @@ mod journal {
 use journal::JournalHash;
 
 pub(super) fn initialize(db: &Connection) -> Result<()> {
+    // The first step of `Store::open`: fixes the instant from which the
+    // verified set (`commit::verified`) counts availability rows as this
+    // process's, before the process installs anything.
+    super::commit::verified::epoch_ms();
     // Triggers also cover writes by older executables and repair tools. Sequence
     // numbers are local acceptance order, never CRDT version precedence.
     db.execute_batch("SAVEPOINT snapshot_schema;
