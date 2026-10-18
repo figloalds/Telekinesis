@@ -292,17 +292,50 @@ fn install_log(data_directory: &std::path::Path) {
     }
 }
 
-/// `path` without the Windows verbatim prefix (`\?\C:\…` becomes `C:\…`,
-/// `\?\UNC\host\share` becomes `\host\share`).
+/// `path` without the Windows verbatim prefix: `\\?\C:\…` becomes `C:\…` and
+/// `\\?\UNC\host\share\…` becomes `\\host\share\…`. Any other path is
+/// returned as it is: one without the prefix, and the verbatim forms that
+/// have no plain spelling (`\\?\Volume{…}\…`, `\\?\GLOBALROOT\…`; stripping
+/// their prefix would leave a relative path). The rest of the path is kept
+/// component by component, so a name that is not valid Unicode survives.
+/// Not a prefix outside Windows, where the path is returned as it is.
+///
+/// WP5.4: the WP4.INT version looked for `\?\` (one backslash), which no
+/// path starts with, so the daemon log path kept its prefix.
 fn plain_path(path: &std::path::Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\?\UNC\") {
-        PathBuf::from(format!(r"\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\?\") {
-        PathBuf::from(rest)
-    } else {
-        path.to_owned()
+    #[cfg(windows)]
+    {
+        use std::{
+            ffi::OsString,
+            path::{Component, Prefix},
+        };
+        let mut components = path.components().peekable();
+        if let Some(Component::Prefix(prefix)) = components.next() {
+            // `\\?\C:` alone has no plain spelling (`C:` is drive-relative).
+            let rooted = components.peek() == Some(&Component::RootDir);
+            let plain = match prefix.kind() {
+                Prefix::VerbatimDisk(letter) if rooted => {
+                    Some(OsString::from(format!("{}:", char::from(letter))))
+                }
+                Prefix::VerbatimUNC(server, share) => {
+                    let mut unc = OsString::from(r"\\");
+                    unc.push(server);
+                    unc.push(r"\");
+                    unc.push(share);
+                    Some(unc)
+                }
+                _ => None,
+            };
+            if let Some(plain) = plain {
+                let mut plain = PathBuf::from(plain);
+                for component in components {
+                    plain.push(component);
+                }
+                return plain;
+            }
+        }
     }
+    path.to_owned()
 }
 
 // Cancels a token when dropped (unless disarmed).
@@ -673,6 +706,84 @@ impl NetworkApi for DaemonNetwork {
                 }
             }
             None => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plain_path;
+    use std::path::{Path, PathBuf};
+
+    /// WP5.4: the real verbatim prefix (`\\?\`, two backslashes) is
+    /// stripped from drive and UNC paths; every other path is kept.
+    #[cfg(windows)]
+    #[test]
+    fn plain_path_strips_the_verbatim_prefix_of_drive_and_unc_paths() {
+        for (verbatim, plain) in [
+            (r"\\?\C:\tkfs\data", r"C:\tkfs\data"),
+            (r"\\?\C:\", r"C:\"),
+            (r"\\?\d:\lower\case", r"d:\lower\case"),
+            (r"\\?\UNC\host\share\tkfs\data", r"\\host\share\tkfs\data"),
+            (r"\\?\UNC\host\share", r"\\host\share"),
+            // No prefix: as it is.
+            (r"C:\tkfs\data", r"C:\tkfs\data"),
+            (r"\\host\share\data", r"\\host\share\data"),
+            (r"relative\data", r"relative\data"),
+            // Verbatim forms without a plain spelling: as they are.
+            (
+                r"\\?\Volume{0b3e0c5a-0000-0000-0000-100000000000}\data",
+                r"\\?\Volume{0b3e0c5a-0000-0000-0000-100000000000}\data",
+            ),
+            (r"\\?\C:", r"\\?\C:"),
+            (r"\\.\pipe\name", r"\\.\pipe\name"),
+        ] {
+            assert_eq!(
+                plain_path(Path::new(verbatim)),
+                PathBuf::from(plain),
+                "{verbatim}"
+            );
+        }
+        // What `Config::load` hands over: a data directory joined to the
+        // canonical (verbatim) configuration directory.
+        let canonical = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        assert!(canonical.to_string_lossy().starts_with(r"\\?\"));
+        let data = canonical.join("data");
+        let plain = plain_path(&data);
+        assert!(!plain.to_string_lossy().starts_with(r"\\?\"), "{plain:?}");
+        assert_eq!(
+            std::fs::canonicalize(plain.parent().unwrap()).unwrap(),
+            canonical
+        );
+    }
+
+    /// A name that is not valid Unicode survives (the WP4.INT version went
+    /// through `to_string_lossy`).
+    #[cfg(windows)]
+    #[test]
+    fn plain_path_keeps_names_that_are_not_unicode() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let wide = |text: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(text)
+                .encode_wide()
+                .chain([0xD800, u16::from(b'x')])
+                .collect()
+        };
+        let verbatim = PathBuf::from(std::ffi::OsString::from_wide(&wide(r"\\?\C:\data\")));
+        let plain = plain_path(&verbatim);
+        assert_eq!(
+            plain.as_os_str().encode_wide().collect::<Vec<_>>(),
+            wide(r"C:\data\")
+        );
+    }
+
+    /// Outside Windows a backslash is an ordinary character: nothing is a
+    /// verbatim prefix.
+    #[cfg(not(windows))]
+    #[test]
+    fn plain_path_is_the_path_outside_windows() {
+        for path in [r"\\?\C:\tkfs\data", "/var/lib/tkfs/data", "relative/data"] {
+            assert_eq!(plain_path(Path::new(path)), PathBuf::from(path));
         }
     }
 }
