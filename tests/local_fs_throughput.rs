@@ -8,7 +8,9 @@
 //!   last committed bytes (child processes, `TKFS_FAULT_*`).
 //! * The first write to a large file copies it without the engine lock.
 //! * Closed files are saved in the background, never racing a delete or a
-//!   rename over them.
+//!   rename over them; with no saver at all a close saves in line; an fsync
+//!   (`FlushFileBuffers`) during a burst of closes still commits before it
+//!   returns (fix round 2).
 //! * Reads of content still downloading wait while it progresses
 //!   (CCR-WP4.INT-2), end on a stall, a fence or the wait bound, and are
 //!   bounded in number.
@@ -425,6 +427,56 @@ fn a_corrupt_object_is_never_copied_for_writing() {
     lock(&engine).close(h).unwrap();
 }
 
+/// The availability state of `object` (`None`: no row).
+fn availability(e: &Engine, object: &str) -> Option<i64> {
+    e.store
+        .db
+        .query_row(
+            "SELECT state FROM object_availability WHERE hash=?",
+            [object],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+#[test]
+fn a_save_that_finds_a_corrupt_copy_of_its_object_records_it() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    let data = bytes(31, 4096);
+    let object = hash(&data);
+    committed_file(&mut lock(&engine), "first.bin", &data);
+    // Its availability row lands in a batch (`AvailabilityNotes`).
+    assert!(wait_until(Duration::from_secs(10), || {
+        availability(&lock(&engine), &object) == Some(objects::AVAILABLE)
+    }));
+    // The installed copy goes bad (same length), and a save of the same
+    // bytes elsewhere finds it while it stores them (phase 2, without the
+    // engine lock).
+    let mut damaged = data.clone();
+    damaged[10] ^= 0xff;
+    fs::write(dir.path().join("objects").join(&object), &damaged).unwrap();
+    let h = {
+        let mut e = lock(&engine);
+        let (h, _) = e.open("second.bin", Some("file"), true).unwrap();
+        e.write(h, 0, &data, false, false).unwrap();
+        h
+    };
+    let error = engine::save_handle(&engine, h).unwrap_err();
+    assert!(format!("{error:#}").contains("CORRUPT_OBJECT"), "{error:#}");
+    let e = lock(&engine);
+    // Recorded as `Store::put_object`'s dedupe records it: the inventory no
+    // longer advertises the bad copy.
+    assert_eq!(
+        availability(&e, &object),
+        Some(objects::CORRUPT),
+        "the corrupt copy is recorded"
+    );
+    assert_eq!(pending_rows(&e).len(), 1, "the save is retained");
+    assert!(e.sessions.values().any(|s| s.dirty));
+}
+
 #[test]
 fn closed_files_are_saved_in_the_background_and_a_stop_waits_for_them() {
     let _serial = serial();
@@ -589,6 +641,90 @@ fn closes_past_a_full_save_queue_save_before_they_return() {
     }
     assert!(pending_rows(&e).is_empty());
     no_conflicts(&e);
+}
+
+#[test]
+fn a_file_is_saved_in_line_when_no_saver_can_be_started() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    Engine::adopt_shared(&engine);
+    // The savers of earlier scenarios end once idle; then none can start.
+    assert!(wait_until(Duration::from_secs(10), || {
+        engine::saver_threads() == 0
+    }));
+    fault::configure(Some(FaultConfig::new(
+        "engine.saver.spawn",
+        FaultAction::Fail,
+    )));
+    let disarm = Disarm;
+    // A close in a burst: nothing would serve the queue, so it saves the file
+    // itself before it returns.
+    let closed = bytes(77, 3000);
+    let h = {
+        let mut e = lock(&engine);
+        let (h, _) = e.open("closed.bin", Some("file"), true).unwrap();
+        e.write(h, 0, &closed, false, false).unwrap();
+        e.cleanup_unsaved(h).unwrap();
+        h
+    };
+    engine::save_handle_in_background(&engine, h).unwrap();
+    assert!(
+        content(&lock(&engine), "closed.bin") == closed,
+        "the close saved its file itself"
+    );
+    assert_eq!(engine::background_saves(), 0, "nothing left in the queue");
+    engine::close_handle(&engine, h).unwrap();
+    // The pending-save retry saves under the lock then, instead of leaving
+    // the file to a saver that never comes.
+    let retried = bytes(78, 3000);
+    {
+        let mut e = lock(&engine);
+        let (h, _) = e.open("retried.bin", Some("file"), true).unwrap();
+        e.write(h, 0, &retried, false, false).unwrap();
+        e.release_handle(h).unwrap();
+    }
+    assert_eq!(lock(&engine).retry_pending_due(Instant::now()), 1);
+    let e = lock(&engine);
+    assert!(content(&e, "retried.bin") == retried, "saved in line");
+    assert!(e.quiet().is_ok(), "nothing is left unsaved");
+    assert_eq!(engine::background_saves(), 0);
+    drop(e);
+    drop(disarm);
+}
+
+#[test]
+fn a_pending_save_handed_to_the_savers_is_reported_for_the_status() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    Engine::adopt_shared(&engine);
+    let data = bytes(79, 5000);
+    {
+        let mut e = lock(&engine);
+        let (h, _) = e.open("retried.bin", Some("file"), true).unwrap();
+        e.write(h, 0, &data, false, false).unwrap();
+        e.release_handle(h).unwrap();
+    }
+    // Handed to a saver: counted at once (the maintenance thread marks the
+    // status content wanted), once, however often it is due meanwhile (its
+    // save is slowed down here)...
+    fault::configure(Some(FaultConfig {
+        ms: Some(500),
+        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
+    }));
+    let disarm = Disarm;
+    let now = Instant::now();
+    assert_eq!(lock(&engine).retry_pending_due(now), 1);
+    assert_eq!(lock(&engine).retry_pending_due(now), 0);
+    drop(disarm);
+    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
+        .quiet()
+        .is_ok()));
+    // ... and its commit by the saver at the next retry, once.
+    assert_eq!(lock(&engine).retry_pending_due(now), 1);
+    assert_eq!(lock(&engine).retry_pending_due(now), 0);
+    assert!(content(&lock(&engine), "retried.bin") == data);
 }
 
 /// A save of `path` in flight, as a background save that began after a
@@ -1703,6 +1839,85 @@ fn a_file_held_open_after_its_create_is_listed_renamed_and_deleted_through_the_m
     assert_eq!(content(&e, "renamed.txt"), b"first part, second part");
     assert!(e.lookup_visible("gone.txt").is_err());
     assert!(e.lookup_visible("held.txt").is_err());
+    assert!(pending_rows(&e).is_empty());
+    no_conflicts(&e);
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn an_fsync_during_a_burst_of_closes_commits_before_it_returns() {
+    use std::io::Write;
+    let _serial = serial();
+    let Some(m) = mounted::Mounted::new() else {
+        return;
+    };
+    // A burst of closes that lasts: every save's store phase is slowed down,
+    // and the saves of files closed outside the mount keep the savers busy
+    // for two rounds, so background saves run (`write_behind`) throughout.
+    let slow = Duration::from_millis(1500);
+    fault::configure(Some(FaultConfig {
+        ms: Some(slow.as_millis() as u64),
+        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
+    }));
+    let disarm = Disarm;
+    let mut written = BTreeMap::new();
+    for i in 0..2 * engine::MAX_BACKGROUND_SAVES as u64 {
+        let path = format!("burst{i:02}.bin");
+        let data = bytes(9100 + i, 2048);
+        let h = {
+            let mut e = lock(&m.engine);
+            let (h, _) = e.open(&path, Some("file"), true).unwrap();
+            e.write(h, 0, &data, false, false).unwrap();
+            e.cleanup_unsaved(h).unwrap();
+            h
+        };
+        engine::save_handle_in_background(&m.engine, h).unwrap();
+        engine::close_handle(&m.engine, h).unwrap();
+        written.insert(path, data);
+    }
+    assert!(engine::write_behind(), "a burst of closes is on");
+    // A close through the mount during the burst is write-behind: it returns
+    // before its file is committed (that save waits for a saver, then takes
+    // `slow`). FUSE: the close's `FUSE_FLUSH`; WinFsp: its cleanup.
+    let a = bytes(9200, 4096);
+    fs::write(m.mount.join("a.txt"), &a).unwrap();
+    {
+        let e = lock(&m.engine);
+        let id = e.lookup_visible("a.txt").unwrap().id;
+        assert!(
+            e.sessions.get(&id).is_some_and(|s| s.dirty),
+            "a close in a burst returns before its save commits"
+        );
+    }
+    written.insert("a.txt".to_owned(), a);
+    // An fsync during the same burst is a durability point: what was written
+    // is committed when it returns. FUSE: `FUSE_FSYNC` (it was routed as a
+    // close and went write-behind: fix round 2); WinFsp: `FlushFileBuffers`.
+    let b = bytes(9300, 4096);
+    let mut file = fs::File::create(m.mount.join("b.txt")).unwrap();
+    file.write_all(&b).unwrap();
+    assert!(engine::write_behind(), "the burst is still on");
+    file.sync_all().unwrap();
+    {
+        let e = lock(&m.engine);
+        assert!(
+            content(&e, "b.txt") == b,
+            "fsync returned before its commit"
+        );
+        let id = e.store.lookup("b.txt").unwrap().id;
+        assert!(
+            e.sessions.get(&id).is_none_or(|s| !s.dirty),
+            "nothing of b.txt is left unsaved"
+        );
+    }
+    drop(file);
+    written.insert("b.txt".to_owned(), b);
+    drop(disarm);
+    assert!(m.quiet(Duration::from_secs(60)), "everything is committed");
+    let e = lock(&m.engine);
+    for (path, data) in &written {
+        assert_eq!(&content(&e, path), data, "{path}");
+    }
     assert!(pending_rows(&e).is_empty());
     no_conflicts(&e);
 }
