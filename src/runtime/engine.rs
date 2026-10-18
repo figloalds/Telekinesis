@@ -47,12 +47,74 @@
 //!   (`ACCESS_DENIED`) until that branch is checked out, which restores the
 //!   record, or the record is discarded. It is not retried while its branch
 //!   is not active; a checkout makes every unrestored record due at once.
-use super::notify::{NotifyQueue, delta_notifications};
+//!
+//! **Saves off the engine lock (WP5.2, CCR-WP4.INT-5).** A save has three
+//! phases:
+//! 1. [`Engine::begin_save`], under the lock: snapshots the session's bytes
+//!    (a copy of in-memory bytes, at most 256 KiB, or a second handle to its
+//!    staging file) and marks it `saving`;
+//! 2. [`store_snapshot`], without the lock: hashes the bytes, writes them to
+//!    `objects/<id>.part`, `fsync`s it and installs it under its hash with a
+//!    write-through rename (invariant 1), or verifies the copy already there;
+//! 3. [`Engine::finish_save`], under the lock: commits the object as the
+//!    session's content with the bases of the snapshot (the base check: the
+//!    branch, the generation and the session's bases are those of the
+//!    snapshot; saves of one entity never overlap), together with the
+//!    removal (or the rebase) of a `pending_saves` record of it.
+//!
+//! While a save reads a staging file nothing writes it: writers wait for the
+//! save without the lock ([`lock_for_write`]), and an unsynchronized
+//! [`Engine::write`] is refused (`BUSY_VIEW`). In-memory bytes may change
+//! during the save; the session then stays dirty and saves again. Every
+//! failure of any phase retains the session (`pending_saves`), as a failed
+//! save always did, and a crash at any step leaves the last committed bytes
+//! (an orphaned `.part` is removed at the next startup). Dirty sessions keep
+//! surviving detach, stop and restart (invariant 8): a save in progress is a
+//! dirty session until its commit, so `quiet()` refuses it, a force detach
+//! or a poison exit retains it, and its commit then removes the record.
+//!
+//! The adapters save this way ([`save_handle`] for the durability points,
+//! `FlushFileBuffers` and fsync(2) (`FUSE_FSYNC`), never write-behind, and
+//! for renames, deletes on close and a lone close), and during a burst of
+//! closes ([`write_behind`]) a closed file is saved in the background
+//! ([`save_handle_in_background`], the WinFsp cleanup and the FUSE flush of a
+//! close(2)): a bounded pool of saver threads commits it
+//! shortly after the close, giving the engine to filesystem callbacks first
+//! ([`foreground`]); with their queue full a close saves before it returns
+//! (backpressure: closed files not committed yet are at most
+//! [`MAX_QUEUED_SAVES`] + [`MAX_BACKGROUND_SAVES`]); a delete or a rename over
+//! a closed file waits for its save ([`settle_entity`], [`lock_settled`]),
+//! and `quiet()` counts it as unsaved until it is committed. The
+//! availability rows of saved objects are written on a connection of their
+//! own, in batches ([`AvailabilityNotes`]).
+//!
+//! **Deferred creates (WP5.2).** A file created through the WinFsp mount
+//! ([`Engine::create_deferred`]) is not committed when it is created: its
+//! first save commits one event that creates it with its content (it used to
+//! be two commits, each `fsync`ing the journal under the engine lock, the
+//! first on the application's create). Until then it is a dirty session the
+//! mount shows like any file ([`Engine::lookup_visible`],
+//! [`Engine::children_visible`]; a second create of the name is refused,
+//! basic information set on it stays in the session), and every rule of
+//! dirty sessions holds: `quiet()` refuses it, a force detach or a poison
+//! exit retains it (its record holds its location, and a restart shows it
+//! again), and a crash before its first commit loses the new file only, as
+//! it loses any unsaved bytes. Anything that would change or replace its
+//! name commits it first ([`settle_entity`]: a rename of it saves it, a
+//! rename over it or a delete of it settles it). A directory, a FUSE create
+//! and every create outside the mount commit at once; `TKFS_DEFERRED_CREATE=0`
+//! turns deferred creates off. A remote create of the same name in the
+//! meantime makes a conflict, as two concurrent creates do.
+use super::{
+    Shared,
+    notify::{NotifyQueue, delta_notifications},
+};
 use crate::core::{inbox::SliceBudget, *};
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Write;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
@@ -70,6 +132,17 @@ pub struct Session {
     pub dirty: bool,
     pub references: usize,
     pub preserve_times: u8,
+    /// Bumped by every change of `bytes` (write, truncate): a save commits
+    /// the snapshot it took, and leaves the session dirty when it moved since.
+    pub edits: u64,
+    /// A save of this session runs ([`Engine::begin_save`] to
+    /// [`Engine::finish_save`]): no second save starts, and while the bytes
+    /// are a staging file nothing writes them ([`Engine::write_blocked`]).
+    pub saving: bool,
+    /// A background saver has the save of this session queued
+    /// ([`save_handle_in_background`]); cleared when a save of it begins or
+    /// ends.
+    pub queued: bool,
 }
 pub struct Handle {
     pub entity: String,
@@ -119,6 +192,25 @@ pub struct Engine {
     /// `pending_saves` records not restored into a session, by entity (module
     /// docs); retried by [`Engine::retry_pending_due`].
     unrecovered: BTreeMap<String, Unrecovered>,
+    /// Moves whenever a save ends (module docs, *Saves off the engine lock*).
+    saves: Arc<SaveSignal>,
+    /// The availability rows of objects saved off the engine lock.
+    notes: Arc<AvailabilityNotes>,
+    /// What `observation` was last built from ([`Engine::publish_observation`]).
+    observed: Mutex<Option<Observed>>,
+    /// Files created through the mount whose creation is not committed yet
+    /// (module docs, *Deferred creates*): `(parent, name key)` → entity.
+    pending_creates: BTreeMap<(String, String), String>,
+    /// The shared engine this engine is (set by the mount adapters'
+    /// `bind`): the pending-save retry hands staging-file saves to a thread
+    /// that stores them without the engine lock.
+    shared: Option<std::sync::Weak<Mutex<Engine>>>,
+    /// Entities whose save [`Engine::retry_pending_due`] handed to the
+    /// background savers, until it commits.
+    retry_handed: BTreeSet<String>,
+    /// Saves of `retry_handed` entities the savers committed since the last
+    /// [`Engine::retry_pending_due`] (which reports them).
+    retry_commits: usize,
 }
 
 /// What one activation committed, for [`Engine::after_activation`].
@@ -167,6 +259,15 @@ fn record_branch(record: &str) -> Option<String> {
     serde_json::from_str::<PendingSave>(record)
         .ok()
         .map(|pending| pending.branch)
+}
+
+/// What [`Engine::publish_observation`] last built the observation from.
+struct Observed {
+    /// `(generation, mounted, open handles, unflushed files)`.
+    key: (u64, bool, usize, usize),
+    health: Option<String>,
+    active: String,
+    branch: Value,
 }
 
 /// The delay before retry number `failures + 1` (1 s → 60 s).
@@ -443,7 +544,6 @@ fn count_pending_saves(store: &Store, vitals: &EngineVitals) {
 impl Engine {
     pub fn new(store: Store) -> Self {
         let mut engine = Self {
-            store,
             sessions: BTreeMap::new(),
             handles: BTreeMap::new(),
             next_handle: 1,
@@ -465,6 +565,14 @@ impl Engine {
             notify_queue: Arc::new(NotifyQueue::default()),
             retry_state: BTreeMap::new(),
             unrecovered: BTreeMap::new(),
+            saves: Arc::new(SaveSignal::default()),
+            notes: Arc::new(AvailabilityNotes::new(&store)),
+            shared: None,
+            retry_handed: BTreeSet::new(),
+            retry_commits: 0,
+            observed: Mutex::new(None),
+            pending_creates: BTreeMap::new(),
+            store,
         };
         if let Err(error) = engine.load_pending() {
             engine.health = Some(format!("RECOVERY_REQUIRED: {error:#}"));
@@ -472,13 +580,47 @@ impl Engine {
         engine.publish_observation();
         engine
     }
+    /// Refreshes the vitals and the observation. Every filesystem callback
+    /// calls it (WP5.2: it was a fifth of a cheap callback's cost): the
+    /// observation is rebuilt only when what it shows changed, and the
+    /// active branch's descriptor is read again only after a checkout.
     pub fn publish_observation(&self) {
         self.refresh_vitals();
-        let branch = self.store.branch(&self.store.active).ok();
+        let unflushed = self.sessions.values().filter(|s| s.dirty).count();
+        let health = self.reported_health();
+        let mut observed = crate::util::lock::lock(&self.observed);
+        let key = (
+            self.store.generation,
+            self.mounted,
+            self.handles.len(),
+            unflushed,
+        );
+        if let Some(known) = observed.as_ref()
+            && known.key == key
+            && known.health == health
+            && known.active == self.store.active
+        {
+            return;
+        }
+        let branch = match observed.take() {
+            Some(known)
+                if known.active == self.store.active && known.key.0 == self.store.generation =>
+            {
+                known.branch
+            }
+            _ => serde_json::to_value(self.store.branch(&self.store.active).ok())
+                .unwrap_or(Value::Null),
+        };
         *crate::util::lock::lock(&self.observation) = json!({"repo":self.store.repo,"device":self.store.device,
             "branch":branch,"generation":self.store.generation,"mounted":self.mounted,
-            "open_handles":self.handles.len(),"unflushed_files":self.sessions.values().filter(|s|s.dirty).count(),
-            "health":self.reported_health(),"sampled_at_ms":time(),"caught_up":false});
+            "open_handles":self.handles.len(),"unflushed_files":unflushed,
+            "health":health,"sampled_at_ms":time(),"caught_up":false});
+        *observed = Some(Observed {
+            key,
+            health,
+            active: self.store.active.clone(),
+            branch,
+        });
     }
     /// Copies the cheap counters into [`EngineVitals`] (no SQL: the store
     /// revision compares the connection's `total_changes`, the sync
@@ -765,6 +907,16 @@ impl Engine {
                     pending.stage
                 )
             })?;
+        if !self.is_committed(&pending.entry.id)? {
+            // A deferred create retained before its first commit (module
+            // docs, *Deferred creates*): visible again, committed by its save.
+            let key = name_key(&pending.entry.name)
+                .context("RECOVERY_REQUIRED: the unsaved new file's name is not valid")?;
+            self.pending_creates.insert(
+                (pending.entry.parent.clone(), key),
+                pending.entry.id.clone(),
+            );
+        }
         self.sessions.insert(
             pending.entry.id.clone(),
             Session {
@@ -775,9 +927,26 @@ impl Engine {
                 preserve_times: pending.preserve_times,
                 dirty: true,
                 references: 0,
+                edits: 0,
+                saving: false,
+                queued: false,
             },
         );
         Ok(())
+    }
+    /// Whether the active view has `entity`. `Ok(false)` only when it does
+    /// not: a failure to read the view is an error, never taken for a
+    /// deferred create (which would commit an existing entity's kind,
+    /// location and content again, with no parents).
+    fn is_committed(&self, entity: &str) -> Result<bool> {
+        match self.store.entry(entity) {
+            Ok(_) => Ok(true),
+            // `Store::entry`'s own answer for an entity the view lacks.
+            Err(error) if error.chain().count() == 1 && error.to_string() == "FILE_NOT_FOUND" => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
     /// Records that `entity`'s pending save (`record`) could not be restored
     /// (again).
@@ -1089,10 +1258,118 @@ impl Engine {
             .map_err(|(_, error)| error)
             .context("cannot close the connection")
     }
+    /// Saves `entity`'s dirty session under the caller's engine lock: the
+    /// three phases of an off-lock save ([`save_entity`]) run back to back.
+    /// While another save of the entity runs (off the lock), this one does
+    /// nothing: that save commits what it took, and edits made since leave
+    /// the session dirty for the next save.
     fn flush_entity(&mut self, entity: &str) -> Result<()> {
-        if !self.sessions.get(entity).context("INVALID_HANDLE")?.dirty {
-            return Ok(());
+        match self.begin_save(entity)? {
+            SaveStart::Clean | SaveStart::Busy(_) => Ok(()),
+            SaveStart::Started(job) => {
+                let stored = store_snapshot(&job);
+                self.finish_save(job, stored)
+            }
         }
+    }
+    /// Phase 1 of a save (CCR-WP4.INT-5), under the engine lock: snapshots the
+    /// dirty session's bytes ([`crate::staging::Staged::snapshot`]) and marks
+    /// it `saving`. `Clean`: nothing to save; `Busy`: a save of the entity
+    /// runs, wait for [`SaveSignal`] to move past the returned generation.
+    /// A snapshot that fails retains the session (`pending_saves`).
+    pub fn begin_save(&mut self, entity: &str) -> Result<SaveStart> {
+        let generation = self.saves.generation();
+        let session = self.sessions.get(entity).context("INVALID_HANDLE")?;
+        if !session.dirty {
+            return Ok(SaveStart::Clean);
+        }
+        if session.saving {
+            return Ok(SaveStart::Busy(generation));
+        }
+        let snapshot = crate::util::fault::trigger("engine.save.snapshot")
+            .and_then(|()| session.bytes.snapshot());
+        let bytes = match snapshot {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.retain_pending(entity, &error)
+                    .context("PENDING_SAVE_PERSIST_FAILED")?;
+                return Err(error);
+            }
+        };
+        let job = SaveJob {
+            entity: entity.to_owned(),
+            edits: session.edits,
+            content_base: session.content_base.clone(),
+            alive_base: session.alive_base.clone(),
+            branch: self.store.active.clone(),
+            generation: self.store.generation,
+            bytes,
+            root: self.store.root.clone(),
+            notes: self.notes.clone(),
+        };
+        let session = self.sessions.get_mut(entity).unwrap();
+        session.saving = true;
+        session.queued = false;
+        Ok(SaveStart::Started(job))
+    }
+    /// Phase 3 of a save, under the engine lock: commits the object phase 2
+    /// stored ([`store_snapshot`]) as the session's new content, with the
+    /// bases the snapshot was taken at, and ends the save (writers and other
+    /// saves of the entity may go on; [`SaveSignal`] moves). A retained
+    /// save's `pending_saves` row goes in the same transaction: removed when
+    /// the session was not edited since the snapshot (its bytes are the ones
+    /// committed), else rebased onto the new revision (it holds later bytes).
+    /// The session stays dirty when it was edited since the snapshot. Any
+    /// failure, also one of phase 2, retains the session, as a failed save
+    /// always did.
+    pub fn finish_save(&mut self, job: SaveJob, stored: Result<StoredObject>) -> Result<()> {
+        let result = self.finish_save_inner(&job, stored);
+        let entity = job.entity.as_str();
+        note_save_end();
+        if let Some(session) = self.sessions.get_mut(entity) {
+            session.saving = false;
+            session.queued = false;
+            if !session.dirty && session.references == 0 {
+                // Closed while it was saved: nothing keeps it now.
+                self.sessions.remove(entity);
+            }
+        }
+        self.saves.bump();
+        result
+    }
+    fn finish_save_inner(&mut self, job: &SaveJob, stored: Result<StoredObject>) -> Result<()> {
+        let entity = job.entity.as_str();
+        ensure!(self.sessions.contains_key(entity), "INVALID_HANDLE");
+        let stored = match stored {
+            Ok(stored) => stored,
+            Err(error) => {
+                if let Some(corrupt) = error.downcast_ref::<CorruptCopy>() {
+                    // Recorded as `Store::put_object`'s dedupe records it: the
+                    // store's own verification marks the object `CORRUPT` and
+                    // stops serving it (its `note_corrupt`), so the inventory
+                    // no longer advertises the bad copy. That verification
+                    // hashes the copy again, under the engine lock (only when
+                    // a copy is corrupt; CCR-WP5.2-7 asks for a hook that
+                    // records it without the hash).
+                    let _ = self.store.verify_object(&corrupt.object);
+                }
+                self.retain_pending(entity, &error)
+                    .context("PENDING_SAVE_PERSIST_FAILED")?;
+                return Err(error);
+            }
+        };
+        // The base check. A checkout or a branch switch needs a quiet engine,
+        // and saves of one entity never overlap, so neither can move under a
+        // running save; refuse rather than commit onto another view. The
+        // session stays dirty (and is retained by a stop as usual).
+        let session = &self.sessions[entity];
+        ensure!(
+            job.branch == self.store.active
+                && job.generation == self.store.generation
+                && job.content_base == session.content_base
+                && job.alive_base == session.alive_base,
+            "STALE_VIEW: the file's view changed while it was saved; it stays unsaved and is saved again"
+        );
         let row: Option<String> = self
             .store
             .db
@@ -1110,76 +1387,59 @@ impl Engine {
         let pending = row
             .as_deref()
             .is_some_and(|record| !self.of_other_branch(record));
-        let replaced = row.filter(|_| pending && self.unrecovered.contains_key(entity));
-        let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
-        // A retained save commits its write and the removal of its row
-        // together. From autocommit that transaction begins IMMEDIATE, taking
-        // SQLite's writer slot before the write reads the projection (as
-        // `Engine::control` does): a deferred read-then-write transaction fails
-        // at once with SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT when another connection
-        // (the bulk transfer view, a pooled secondary store) writes meanwhile.
-        // The bytes of a retained save are stored (hashed, copied, synced,
-        // installed) before the writer slot is taken below, so the slot is
-        // held for the commit, not for the copy (WP4.INT re-review: another
-        // connection's writer failed after its 5 s busy timeout behind a
-        // multi-GiB pending save). A failure is retained as below.
-        let stored: Result<Option<String>> = if pending {
-            match &mut session.bytes {
-                crate::staging::Staged::Memory(bytes) => self.store.put_object(bytes),
-                staged => staged
-                    .reader()
-                    .and_then(|mut source| self.store.put_stream(&mut source)),
-            }
-            .map(Some)
-        } else {
-            Ok(None)
-        };
-        let stored = match stored {
-            Ok(stored) => stored,
-            Err(error) => {
-                self.retain_pending(entity, &error)
-                    .context("PENDING_SAVE_PERSIST_FAILED")?;
-                return Err(error);
-            }
-        };
+        let replaced = row
+            .clone()
+            .filter(|_| pending && self.unrecovered.contains_key(entity));
+        let unedited = self.sessions[entity].edits == job.edits;
+        // A retained save commits its write and its row together. From
+        // autocommit that transaction begins IMMEDIATE, taking SQLite's writer
+        // slot before the write reads the projection (as `Engine::control`
+        // does): a deferred read-then-write transaction fails at once with
+        // SQLITE_BUSY/SQLITE_BUSY_SNAPSHOT when another connection writes
+        // meanwhile. The bytes are already stored (phase 2), so the slot is
+        // held for the commit only.
         let outer = if pending {
             Some(begin_staged_save(&self.store.db)?)
         } else {
             None
         };
+        let preserve_times = self.sessions[entity].preserve_times;
+        // A deferred create's first save (registered by `create_deferred` and
+        // `restore_pending`), never an entity whose view could not be read.
+        let deferred = self.is_deferred(entity);
         let result = (|| {
-            let revision = match (stored, &mut session.bytes) {
-                (Some(object), _) => self.store.write_object_with_base_and_times(
+            crate::util::fault::trigger("engine.save.commit")?;
+            let revision = if deferred {
+                self.commit_deferred_create(entity, &stored.object, preserve_times)?
+            } else {
+                self.store.write_object_with_base_and_times(
                     entity,
-                    session.content_base.clone(),
-                    session.alive_base.clone(),
-                    object,
-                    session.preserve_times,
-                )?,
-                (None, crate::staging::Staged::Memory(bytes)) => {
-                    self.store.write_with_base_and_times(
-                        entity,
-                        session.content_base.clone(),
-                        session.alive_base.clone(),
-                        bytes,
-                        session.preserve_times,
-                    )?
-                }
-                (None, staged) => {
-                    let mut source = staged.reader()?;
-                    self.store.write_stream_with_base_and_times(
-                        entity,
-                        session.content_base.clone(),
-                        session.alive_base.clone(),
-                        &mut source,
-                        session.preserve_times,
-                    )?
-                }
+                    job.content_base.clone(),
+                    job.alive_base.clone(),
+                    stored.object.clone(),
+                    preserve_times,
+                )?
             };
             if let Some(outer) = outer {
-                self.store
-                    .db
-                    .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
+                match row.as_deref().filter(|_| !unedited) {
+                    None => {
+                        self.store
+                            .db
+                            .execute("DELETE FROM pending_saves WHERE entity=?", [entity])?;
+                    }
+                    Some(record) => {
+                        // A retain after the snapshot recorded later bytes:
+                        // they stay retained, on top of this commit.
+                        let mut pending: PendingSave = serde_json::from_str(record)
+                            .context("RECOVERY_REQUIRED: the pending-save record cannot be read")?;
+                        pending.content_base = Some(revision.clone());
+                        pending.alive_base = Some(revision.clone());
+                        self.store.db.execute(
+                            "UPDATE pending_saves SET payload=? WHERE entity=?",
+                            rusqlite::params![serde_json::to_string(&pending)?, entity],
+                        )?;
+                    }
+                }
                 commit_staged_save(&self.store.db, outer)?;
             }
             Ok(revision)
@@ -1188,14 +1448,28 @@ impl Engine {
         // (committed here, rolled back below), never inside it.
         match result {
             Ok(revision) => {
+                // Qualification: a crash right after the commit.
+                crate::util::fault::exit("engine.save.committed");
                 if pending {
                     count_pending_saves(&self.store, &self.vitals);
                 }
+                if deferred {
+                    self.pending_creates.retain(|_, pending| pending != entity);
+                }
+                if self.retry_handed.remove(entity) {
+                    // A pending save the retry handed to a saver: reported by
+                    // the next retry (`retry_pending_due`).
+                    self.retry_commits += 1;
+                }
+                let entry = self.store.entry(entity);
+                let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
                 session.content_base = Some(revision.clone());
                 session.alive_base = Some(revision);
-                session.dirty = false;
-                session.bytes.release();
-                session.entry = self.store.entry(entity)?;
+                if unedited {
+                    session.dirty = false;
+                    session.bytes.release();
+                }
+                session.entry = entry?;
                 if pending {
                     self.forget_unrecovered(entity, replaced.as_deref(), None);
                 }
@@ -1216,11 +1490,236 @@ impl Engine {
             }
         }
     }
+    /// Commits a deferred create (module docs, *Deferred creates*) with its
+    /// first content, `object`: one event that creates the file at its
+    /// session's location, with that content and its basic information (the
+    /// write and change times of a save, unless preserved, as
+    /// `Store::write_object_with_base_and_times` sets them). Another entry
+    /// that took the name meanwhile (a remote create) makes a conflict, as
+    /// concurrent creates do.
+    fn commit_deferred_create(
+        &mut self,
+        entity: &str,
+        object: &str,
+        preserve_times: u8,
+    ) -> Result<String> {
+        let entry = self.sessions[entity].entry.clone();
+        let branch = self.store.branch(&self.store.active)?;
+        let change = |field: &str, value: Value| Change {
+            entity: entity.to_owned(),
+            field: field.into(),
+            parents: vec![],
+            value,
+        };
+        let changes = vec![
+            change("kind", json!(entry.kind)),
+            change(
+                "location",
+                json!({"parent": entry.parent, "name": entry.name}),
+            ),
+            change("alive", json!(true)),
+            change("content", json!(object)),
+        ];
+        let mut event = self.store.event(&branch, changes);
+        if entry.basic.is_some() || preserve_times != 0 {
+            let now = filetime(event.created_ms);
+            let mut basic = entry.basic_info();
+            if preserve_times & 2 == 0 {
+                basic.write_time = now;
+            }
+            if preserve_times & 4 == 0 {
+                basic.change_time = now;
+            }
+            basic.attributes = BasicInfo::attributes(&entry.kind, basic.attributes | 0x20)?;
+            event.changes.push(change("basic", json!(basic)));
+        }
+        let revision = event.id.clone();
+        self.store.commit(event, true)?;
+        Ok(revision)
+    }
+    /// Creates the file `path` through the mount without committing its
+    /// creation (module docs, *Deferred creates*): the file is visible at
+    /// once ([`Engine::lookup_visible`], directory listings), and its first
+    /// save commits it together with its content. `TKFS_DEFERRED_CREATE=0`
+    /// turns it off (the create commits at once, as before).
+    pub fn create_deferred(
+        &mut self,
+        path: &str,
+        writable: bool,
+        attributes: Option<u32>,
+    ) -> Result<(u64, Entry)> {
+        if !deferred_creates() {
+            return self.open_with_attributes(path, Some("file"), writable, attributes);
+        }
+        ensure!(!self.switching, "BUSY_VIEW");
+        let normalized = path.replace('\\', "/");
+        ensure!(
+            !normalized
+                .trim_matches('/')
+                .eq_ignore_ascii_case(".tkfs-runtime.json"),
+            "PERMISSION_DENIED"
+        );
+        let (parent, name) = split_path(path)?;
+        let key = name_key(&name)?;
+        let dir = self.store.lookup(&parent)?;
+        ensure!(dir.kind == "directory", "NOT_DIRECTORY");
+        ensure!(self.lookup_visible(path).is_err(), "NAME_COLLISION");
+        let now = time();
+        let basic = attributes
+            .map(|attributes| -> Result<BasicInfo> {
+                let stamp = filetime(now);
+                Ok(BasicInfo {
+                    posix_mode: None,
+                    attributes: BasicInfo::attributes("file", attributes)?,
+                    creation_time: stamp,
+                    access_time: stamp,
+                    write_time: stamp,
+                    change_time: stamp,
+                })
+            })
+            .transpose()?;
+        let entry = Entry {
+            id: id(),
+            kind: "file".into(),
+            parent: dir.id.clone(),
+            name,
+            content: Some(hash(b"")),
+            alive: true,
+            revisions: BTreeMap::new(),
+            modified_ms: now,
+            created_ms: now,
+            basic,
+        };
+        self.pending_creates.insert((dir.id, key), entry.id.clone());
+        self.sessions.insert(
+            entry.id.clone(),
+            Session {
+                entry: entry.clone(),
+                bytes: crate::staging::Staged::memory(vec![]),
+                content_base: None,
+                alive_base: None,
+                dirty: true,
+                references: 1,
+                preserve_times: 0,
+                edits: 0,
+                saving: false,
+                queued: false,
+            },
+        );
+        let h = self.next_handle;
+        self.next_handle += 1;
+        self.handles.insert(
+            h,
+            Handle {
+                entity: entry.id.clone(),
+                generation: self.store.generation,
+                cleaned: false,
+                writable,
+                time_update_disabled: 0,
+                directory: None,
+            },
+        );
+        Ok((h, entry))
+    }
+    /// Commits, inline, the deferred create that holds `path` (a rename's
+    /// target, module docs, *Deferred creates*), so the rename sees it. One a
+    /// background save is committing right now refuses the rename
+    /// (`ACCESS_DENIED`, as a rename over an open file does).
+    pub fn commit_created_at(&mut self, path: &str) -> Result<()> {
+        let Ok(entry) = self.lookup_visible(path) else {
+            return Ok(());
+        };
+        if !self.is_deferred(&entry.id) {
+            return Ok(());
+        }
+        self.flush_entity(&entry.id)?;
+        ensure!(
+            !self.is_deferred(&entry.id),
+            "ACCESS_DENIED: the file at the target is being saved"
+        );
+        Ok(())
+    }
+    /// Whether `entity` is a deferred create not committed yet.
+    pub fn is_deferred(&self, entity: &str) -> bool {
+        self.pending_creates
+            .values()
+            .any(|pending| pending == entity)
+    }
+    /// [`Store::lookup`], and the deferred creates (module docs, *Deferred
+    /// creates*): the entry the mount shows at `path`.
+    pub fn lookup_visible(&self, path: &str) -> Result<Entry> {
+        let found = self.store.lookup(path);
+        if found.is_ok() || self.pending_creates.is_empty() {
+            return found;
+        }
+        let Ok((parent, name)) = split_path(path) else {
+            return found;
+        };
+        let (Ok(dir), Ok(key)) = (self.store.lookup(&parent), name_key(&name)) else {
+            return found;
+        };
+        match self
+            .pending_creates
+            .get(&(dir.id, key))
+            .and_then(|entity| self.sessions.get(entity))
+        {
+            Some(session) => Ok(session.entry.clone()),
+            None => found,
+        }
+    }
+    /// The entries the mount shows in `directory`: [`Store::children`] and
+    /// the deferred creates in it.
+    pub fn children_visible(&self, directory: &str) -> Result<Vec<Entry>> {
+        let mut children = self.store.children(directory)?;
+        children.extend(
+            self.pending_creates
+                .range((directory.to_owned(), String::new())..)
+                .take_while(|((parent, _), _)| parent == directory)
+                .filter_map(|(_, entity)| self.sessions.get(entity))
+                .map(|session| session.entry.clone()),
+        );
+        Ok(children)
+    }
+    /// Whether a deferred create not committed yet is in `directory`.
+    fn has_deferred_children(&self, directory: &str) -> bool {
+        self.pending_creates
+            .range((directory.to_owned(), String::new())..)
+            .next()
+            .is_some_and(|((parent, _), _)| parent == directory)
+    }
+    /// The size the mount shows for `entry` (lookups, directory listings):
+    /// an unsaved session's bytes (a deferred create, a file being written,
+    /// a closed file still being saved in the background), else its
+    /// committed object's size. The times shown stay the committed ones
+    /// until the save commits (its write time is the commit's).
+    pub fn visible_size(&self, entry: &Entry) -> Result<usize> {
+        if let Some(session) = self.sessions.get(&entry.id).filter(|s| s.dirty) {
+            return Ok(session.bytes.len());
+        }
+        Ok(entry
+            .content
+            .as_ref()
+            .map(|object| self.store.object_size(object))
+            .transpose()?
+            .map_or(0, |size| size as usize))
+    }
+    /// Whether a write or truncate through handle `h` must wait: a save of
+    /// its session runs and reads the staging file (module docs, *Saves off
+    /// the engine lock*). `Some(generation)`: wait for [`SaveSignal`] to move
+    /// past it, without the engine lock, then try again.
+    pub fn write_blocked(&self, h: u64) -> Option<u64> {
+        let session = self.session(h).ok()?;
+        (session.saving && session.bytes.is_file()).then(|| self.saves.generation())
+    }
+    /// The signal saves move when they end ([`Engine::finish_save`]).
+    pub fn save_signal(&self) -> Arc<SaveSignal> {
+        self.saves.clone()
+    }
     pub fn retry_pending(&mut self) -> Result<()> {
         let entities: Vec<_> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.dirty && s.references == 0)
+            .filter(|(_, s)| s.dirty && s.references == 0 && !s.saving)
             .map(|(id, _)| id.clone())
             .collect();
         for entity in entities {
@@ -1232,48 +1731,86 @@ impl Engine {
     /// [`Engine::retry_pending`] with a per-entity backoff (1 s → 60 s, WP2.3
     /// task 5): each dirty, unreferenced session is tried when it is due; a
     /// failure (the session stays retained) delays only that entity, and the
-    /// others are still tried. Returns how many were committed.
+    /// others are still tried. Returns how many saves changed the store's
+    /// content for the status (the maintenance thread then marks the status
+    /// content wanted, `status_cell::note_mutation`): those it committed, those
+    /// it handed to the background savers (counted at once: by the time such
+    /// a save commits nothing may be left for the next tick to retry), and
+    /// those the savers committed for it since its previous call (reported
+    /// again, so a status refresh that ran before that commit is followed by
+    /// another one).
     pub fn retry_pending_due(&mut self, now: Instant) -> usize {
         self.retry_unrecovered_due(now);
         self.retry_state
             .retain(|entity, _| self.sessions.get(entity).is_some_and(|s| s.dirty));
+        self.retry_handed
+            .retain(|entity| self.sessions.get(entity).is_some_and(|s| s.dirty));
         let due: Vec<_> = self
             .sessions
             .iter()
-            .filter(|(_, s)| s.dirty && s.references == 0)
+            .filter(|(_, s)| s.dirty && s.references == 0 && !s.saving)
             .map(|(id, _)| id.clone())
             .filter(|id| self.retry_state.get(id).is_none_or(|s| s.next_at <= now))
             .collect();
-        let mut committed = 0;
+        let mut committed = std::mem::take(&mut self.retry_commits);
         for entity in due {
+            // Saved without the engine lock when the shared engine is known:
+            // a saver saves it and reports a failure back (`retry_failed`).
+            // With the queue full the savers are busy and their sweep
+            // (`orphan_dirty`) picks it up: never saved here then, under the
+            // lock (a backlog of closed files saved one after the other here
+            // held the engine for seconds). With no saver at all (none could
+            // be started) it is saved here.
+            if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade) {
+                if schedule(&shared, entity.clone()) {
+                    if let Some(session) = self.sessions.get_mut(&entity) {
+                        session.queued = true;
+                    }
+                    // Counted once (it is due again while it waits).
+                    if self.retry_handed.insert(entity) {
+                        committed += 1;
+                    }
+                    continue;
+                }
+                if saver_threads() > 0 {
+                    continue;
+                }
+            }
             match self.flush_entity(&entity) {
                 Ok(()) => {
                     self.sessions.remove(&entity);
                     self.retry_state.remove(&entity);
                     committed += 1;
                 }
-                Err(error) => {
-                    let state = self
-                        .retry_state
-                        .entry(entity.clone())
-                        .or_insert(RetryState {
-                            failures: 0,
-                            next_at: now,
-                        });
-                    state.failures = state.failures.saturating_add(1);
-                    let delay = retry_delay(state.failures);
-                    state.next_at = now + delay;
-                    crate::util::log::event!(warn, PENDING_SAVE, {
-                        "site": "engine.retry_pending",
-                        "entity": entity,
-                        "failures": state.failures,
-                        "retry_in_ms": delay.as_millis() as u64,
-                        "message": format!("{error:#}"),
-                    });
-                }
+                Err(error) => self.retry_failed(&entity, now, &error),
             }
         }
         committed
+    }
+    /// Records a failed pending-save retry of `entity` (its backoff grows).
+    fn retry_failed(&mut self, entity: &str, now: Instant, error: &anyhow::Error) {
+        let state = self
+            .retry_state
+            .entry(entity.to_owned())
+            .or_insert(RetryState {
+                failures: 0,
+                next_at: now,
+            });
+        state.failures = state.failures.saturating_add(1);
+        let delay = retry_delay(state.failures);
+        state.next_at = now + delay;
+        crate::util::log::event!(warn, PENDING_SAVE, {
+            "site": "engine.retry_pending",
+            "entity": entity,
+            "failures": state.failures,
+            "retry_in_ms": delay.as_millis() as u64,
+            "message": format!("{error:#}"),
+        });
+    }
+    /// Makes `engine` known to itself (the mount adapters' `bind`): the
+    /// pending-save retry then saves staging files without the engine lock.
+    pub fn adopt_shared(engine: &Shared) {
+        super::lock_engine(engine).shared = Some(Arc::downgrade(engine));
     }
     /// Tries again to restore the due records that could not be restored
     /// (module docs): a staging file a scanner held at startup, a record of
@@ -1338,6 +1875,13 @@ impl Engine {
     /// unsaved bytes were lost. A restored record is a dirty session, which
     /// `quiet()` refuses already; records of other branches do not block.
     pub fn checkout_allowed(&self) -> Result<()> {
+        // Files closed through the mount and still being saved: a checkout
+        // waits for them (WP5.2; `quiet` refuses them first).
+        let unsaved = self.sessions.values().filter(|s| s.dirty).count();
+        ensure!(
+            unsaved == 0,
+            "BUSY_VIEW: {unsaved} unsaved files are being saved; the checkout waits for them"
+        );
         let blocking: Vec<String> = self
             .pending_records()?
             .into_iter()
@@ -1401,9 +1945,10 @@ impl Engine {
                 ..Default::default()
             }
         } else if let Some(kind) = create {
+            ensure!(self.lookup_visible(path).is_err(), "NAME_COLLISION");
             self.store.create_with_attributes(path, kind, attributes)?
         } else {
-            self.store.lookup(path)?
+            self.lookup_visible(path)?
         };
         ensure!(
             create.is_some()
@@ -1445,6 +1990,9 @@ impl Engine {
                     dirty: false,
                     references: 0,
                     preserve_times: 0,
+                    edits: 0,
+                    saving: false,
+                    queued: false,
                 },
             );
         }
@@ -1470,6 +2018,27 @@ impl Engine {
         ensure!(handle.generation == self.store.generation, "STALE_VIEW");
         self.sessions.get(&handle.entity).context("INVALID_HANDLE")
     }
+    /// [`Engine::session`], mutable.
+    pub fn session_mut(&mut self, h: u64) -> Result<&mut Session> {
+        let handle = self.handles.get(&h).context("INVALID_HANDLE")?;
+        ensure!(handle.generation == self.store.generation, "STALE_VIEW");
+        let entity = handle.entity.clone();
+        self.sessions.get_mut(&entity).context("INVALID_HANDLE")
+    }
+    /// Removes handle `h` after an off-lock save ([`save_handle`]) without
+    /// saving again (it would hold the lock for a save that failed a moment
+    /// ago); the session goes when nothing keeps it. A dirty session stays
+    /// (its failed save retained it; the pending-save retry commits it).
+    pub fn release_handle(&mut self, h: u64) -> Result<()> {
+        let handle = self.handles.remove(&h).context("INVALID_HANDLE")?;
+        if let Some(s) = self.sessions.get_mut(&handle.entity) {
+            s.references = s.references.saturating_sub(1);
+            if s.references == 0 && !s.dirty && !s.saving {
+                self.sessions.remove(&handle.entity);
+            }
+        }
+        Ok(())
+    }
     /// One directory cut per enumeration, retained through marker continuations.
     /// A rewind sees later mutations; close releases the cursor. Generation
     /// validation applies even to an already populated cursor.
@@ -1482,7 +2051,7 @@ impl Engine {
         let directory = self.session(h)?.entry.clone();
         ensure!(directory.kind == "directory", "NOT_DIRECTORY");
         if restart || self.handles[&h].directory.is_none() {
-            let mut children = self.store.children(&directory.id)?;
+            let mut children = self.children_visible(&directory.id)?;
             children.sort_by_key(|entry| entry.name.to_lowercase());
             let mut parent = self
                 .store
@@ -1495,13 +2064,8 @@ impl Engine {
             cut.push((directory, 0));
             cut.push((parent, 0));
             for entry in children {
-                let size = entry
-                    .content
-                    .as_ref()
-                    .map(|object| self.store.object_size(object))
-                    .transpose()?
-                    .unwrap_or(0);
-                cut.push((entry, usize::try_from(size)?));
+                let size = self.visible_size(&entry)?;
+                cut.push((entry, size));
             }
             self.handles.get_mut(&h).unwrap().directory = Some(cut);
         }
@@ -1530,6 +2094,13 @@ impl Engine {
             session.entry.kind == "file" && session.entry.id != "control",
             "IS_DIRECTORY"
         );
+        // A save reads this staging file without the lock: the adapters wait
+        // for it first (`lock_for_write`), so only a caller that did not gets
+        // here, and is refused instead of tearing the save's snapshot.
+        ensure!(
+            !(session.saving && session.bytes.is_file()),
+            "BUSY_VIEW: the file is being saved"
+        );
         let start = if append {
             session.bytes.len()
         } else {
@@ -1547,6 +2118,7 @@ impl Engine {
         if end > session.bytes.len() {
             session.bytes.resize(&self.store.root, end)?;
         }
+        session.edits += 1;
         session
             .bytes
             .write_at(&self.store.root, start, &bytes[..count])?;
@@ -1561,6 +2133,12 @@ impl Engine {
         ensure!(session.entry.kind == "file", "IS_DIRECTORY");
         ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
         if !allocation || size < (session.bytes.len() as u64) {
+            // As in `write`: the adapters wait for a save of a staging file.
+            ensure!(
+                !(session.saving && session.bytes.is_file()),
+                "BUSY_VIEW: the file is being saved"
+            );
+            session.edits += 1;
             session.bytes.resize(&self.store.root, size as usize)?;
             session.preserve_times = handle.time_update_disabled;
             session.dirty = true;
@@ -1592,7 +2170,14 @@ impl Engine {
         let entry = self.session(h)?.entry.clone();
         ensure!(entry.id != "control", "PERMISSION_DENIED");
         ensure!(entry.id != ROOT, "UNSUPPORTED_FS_OPERATION: root metadata");
-        let current = self.store.entry(&entry.id)?;
+        // A deferred create keeps its basic information in its session until
+        // its first save commits it (module docs, *Deferred creates*).
+        let deferred = self.is_deferred(&entry.id);
+        let current = if deferred {
+            entry.clone()
+        } else {
+            self.store.entry(&entry.id)?
+        };
         let mut basic = current.basic_info();
         if attributes != u32::MAX {
             basic.attributes = BasicInfo::attributes(&entry.kind, attributes)?;
@@ -1613,7 +2198,16 @@ impl Engine {
                 _ => bail!("INVALID_TIMESTAMP"),
             }
         }
-        self.store.set_basic(&entry.id, basic)?;
+        if deferred {
+            // `Store::set_basic`'s checks, without its commit.
+            basic.validate()?;
+            ensure!(
+                basic.attributes == BasicInfo::attributes(&entry.kind, basic.attributes)?,
+                "INVALID_ATTRIBUTES"
+            );
+        } else {
+            self.store.set_basic(&entry.id, basic)?;
+        }
         self.handles.get_mut(&h).unwrap().time_update_disabled = disabled;
         let s = self.sessions.get_mut(&entry.id).unwrap();
         s.entry.basic = Some(basic);
@@ -1627,6 +2221,13 @@ impl Engine {
         }
         Ok(())
     }
+    /// Marks handle `h` cleaned up (the application closed it: no more
+    /// writes through it) without saving its session; the mount adapters
+    /// save it next, without the engine lock ([`save_handle_in_background`]).
+    pub fn cleanup_unsaved(&mut self, h: u64) -> Result<()> {
+        self.handles.get_mut(&h).context("INVALID_HANDLE")?.cleaned = true;
+        Ok(())
+    }
     pub fn cleanup(&mut self, h: u64, delete: bool) -> Result<()> {
         self.flush(h)?;
         if delete {
@@ -1636,6 +2237,11 @@ impl Engine {
                 .context("INVALID_HANDLE")?
                 .entity
                 .clone();
+            // `Store::delete` sees only committed children; a file created
+            // in the directory and not committed yet (module docs, *Deferred
+            // creates*) keeps it too, or its first save would commit it into
+            // a deleted directory.
+            ensure!(!self.has_deferred_children(&entity), "DIRECTORY_NOT_EMPTY");
             self.store.delete(&entity)?;
         }
         self.handles.get_mut(&h).context("INVALID_HANDLE")?.cleaned = true;
@@ -1657,6 +2263,13 @@ impl Engine {
     /// A `pending_saves` record that could not be restored does not count
     /// (module docs): its row stays and is retried; only a checkout waits for
     /// it ([`Engine::checkout_allowed`]).
+    /// Files closed through the mount and still being saved in the
+    /// background ([`Engine::settling`]) are unsaved files too: the stop, the
+    /// checkout and the control requests that need a quiet engine are refused
+    /// (`BUSY_VIEW`, retried) until they are committed, and a fork or a delete
+    /// never runs ahead of them. Saves are made in the background only during
+    /// a burst of closes ([`write_behind`]), so a lone close is committed
+    /// when it returns, as before.
     pub fn quiet(&self) -> Result<()> {
         let open = self.handles.len();
         let dirty = self.sessions.values().filter(|s| s.dirty).count();
@@ -1670,6 +2283,23 @@ impl Engine {
             "BUSY_VIEW: {open} open contexts, {dirty} unsaved files; {}",
             self.health.as_deref().unwrap_or("healthy")
         )
+    }
+    /// Dirty sessions whose save runs or a background saver has queued and
+    /// that the application no longer writes (every handle of it is cleaned
+    /// up, a WinFsp handle that only awaits its `Close` too, or none is
+    /// left): files closed through the mount, being saved.
+    pub fn settling(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter(|(entity, s)| {
+                s.dirty
+                    && (s.saving || s.queued)
+                    && !self
+                        .handles
+                        .values()
+                        .any(|h| &h.entity == *entity && !h.cleaned)
+            })
+            .count()
     }
     pub fn receive_peer(
         &mut self,
@@ -1707,6 +2337,908 @@ impl Engine {
             self.after_activation(&delta);
         }
         Ok(accepted)
+    }
+}
+
+/// How [`Engine::begin_save`] answered.
+pub enum SaveStart {
+    /// The session is clean: nothing to save.
+    Clean,
+    /// A save of the entity runs: wait until [`SaveSignal`] moves past this
+    /// generation (without the engine lock), then begin again.
+    Busy(u64),
+    /// Phase 1 is done: store the snapshot ([`store_snapshot`], without the
+    /// engine lock), then [`Engine::finish_save`].
+    Started(SaveJob),
+}
+
+/// A save between its snapshot (phase 1) and its commit (phase 3); see the
+/// module docs, *Saves off the engine lock*.
+pub struct SaveJob {
+    entity: String,
+    edits: u64,
+    content_base: Option<String>,
+    alive_base: Option<String>,
+    branch: String,
+    generation: u64,
+    bytes: crate::staging::StageSnapshot,
+    root: std::path::PathBuf,
+    notes: Arc<AvailabilityNotes>,
+}
+impl SaveJob {
+    /// The entity being saved.
+    pub fn entity(&self) -> &str {
+        &self.entity
+    }
+    /// The size of the snapshot being saved.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// The object phase 2 of a save stored ([`store_snapshot`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredObject {
+    pub object: String,
+    pub size: u64,
+}
+
+/// Moves whenever a save ends ([`Engine::finish_save`]), always under the
+/// engine lock; a writer or a save that must wait for a running save reads
+/// the generation under the engine lock, releases it, and waits for the
+/// generation to move ([`SaveSignal::wait_past`]).
+#[derive(Debug, Default)]
+pub struct SaveSignal {
+    generation: Mutex<u64>,
+    changed: std::sync::Condvar,
+}
+impl SaveSignal {
+    pub fn generation(&self) -> u64 {
+        *crate::util::lock::lock(&self.generation)
+    }
+    fn bump(&self) {
+        *crate::util::lock::lock(&self.generation) += 1;
+        self.changed.notify_all();
+    }
+    /// Waits until the generation moved past `seen`, at most `timeout`;
+    /// whether it moved.
+    pub fn wait_past(&self, seen: u64, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut generation = crate::util::lock::lock(&self.generation);
+        while *generation == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            generation = self
+                .changed
+                .wait_timeout(generation, deadline - now)
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|poison| poison.into_inner().0);
+        }
+        true
+    }
+}
+
+/// The availability-index rows of objects saved off the engine lock,
+/// written on a connection of their own (module docs): a write through the
+/// engine's connection outside a commit would make the engine's projection
+/// view stale, and its next operation would reload the whole projection
+/// (about 10 ms per save at 2K files; it was most of a small file's save
+/// before WP5.2). Another connection's commit that leaves the projection
+/// tables alone keeps the view (`Store::adopt_foreign_commits`).
+///
+/// The rows are written in batches, one transaction every
+/// [`NOTES_INTERVAL`], by a thread that runs only while rows wait:
+/// one row per transaction made the saves of a burst of small files wait on
+/// each other's commits (SQLite's busy handler sleeps). Best effort, like
+/// the index itself: until its row is written an object counts as present by
+/// the listing of `objects/` (never as corrupt), and one whose row a crash
+/// lost is verified again at the next startup.
+pub struct AvailabilityNotes {
+    root: std::path::PathBuf,
+    repo: String,
+    device: String,
+    state: Mutex<NotesState>,
+}
+#[derive(Default)]
+struct NotesState {
+    /// `(object, size, mtime_ns, verified_ms)` not yet written.
+    queue: Vec<(String, u64, i64, u64)>,
+    /// A flushing thread runs.
+    flusher: bool,
+}
+/// How long noted rows wait before the flushing thread writes them. Every
+/// batch is a commit of another connection: an engine commit that overlaps
+/// one cannot patch its projection view and drops it (the next operation
+/// reloads the whole projection, about 25 ms at 2K files), so batches are
+/// rare.
+pub const NOTES_INTERVAL: Duration = Duration::from_secs(1);
+impl AvailabilityNotes {
+    fn new(store: &Store) -> Self {
+        Self {
+            root: store.root.clone(),
+            repo: store.repo.clone(),
+            device: store.device.clone(),
+            state: Mutex::new(NotesState::default()),
+        }
+    }
+    /// Records `object` (`size` bytes, mtime `mtime_ns`) as available and
+    /// verified now, in the next batch.
+    fn note(self: &Arc<Self>, object: &str, size: u64, mtime_ns: i64) {
+        let mut state = crate::util::lock::lock(&self.state);
+        state
+            .queue
+            .push((object.to_owned(), size, mtime_ns, time()));
+        if state.flusher {
+            return;
+        }
+        let notes = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("availability-notes".into())
+            .spawn(move || notes.flush_loop());
+        state.flusher = spawned.is_ok();
+        if !state.flusher {
+            // No thread: written now (the rows are best effort either way).
+            let batch = std::mem::take(&mut state.queue);
+            drop(state);
+            self.write(batch);
+        }
+    }
+    /// Rows noted and not yet written.
+    pub fn queued(&self) -> usize {
+        crate::util::lock::lock(&self.state).queue.len()
+    }
+    /// Writes every queued row now.
+    pub fn flush(&self) {
+        let batch = std::mem::take(&mut crate::util::lock::lock(&self.state).queue);
+        self.write(batch);
+    }
+    fn flush_loop(&self) {
+        loop {
+            std::thread::sleep(NOTES_INTERVAL);
+            let batch = {
+                let mut state = crate::util::lock::lock(&self.state);
+                if state.queue.is_empty() {
+                    state.flusher = false;
+                    return;
+                }
+                std::mem::take(&mut state.queue)
+            };
+            self.write(batch);
+        }
+    }
+    /// One transaction on a connection opened for it (none stays open).
+    fn write(&self, batch: Vec<(String, u64, i64, u64)>) {
+        if batch.is_empty() {
+            return;
+        }
+        let written = (|| -> Result<()> {
+            crate::util::fault::trigger("engine.save.notes")?;
+            let store = Store::open_secondary(&self.root, &self.repo, &self.device)?;
+            store.db.execute_batch("BEGIN IMMEDIATE")?;
+            for (object, size, mtime_ns, verified_ms) in &batch {
+                store.note_available(object, *size, *mtime_ns, *verified_ms);
+            }
+            store.db.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            crate::util::log::event!(debug, OBJECT_IO_ERROR, {
+                "site": "engine.save.notes",
+                "rows": batch.len(),
+                "message": format!("{error:#}"),
+            });
+        }
+    }
+}
+impl Drop for AvailabilityNotes {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// Phase 2 of a save, without the engine lock: hashes the snapshot, writes it
+/// to a temporary file in `objects/`, makes it durable and installs it under
+/// its hash (invariant 1: whole-object SHA-256, `fsync`, write-through
+/// rename), or verifies the installed copy when the object exists already.
+/// Then records its availability ([`AvailabilityNotes`]). A crash at any
+/// step leaves at most an unreferenced object or a `.part` file (removed at
+/// the next startup, `Engine::remove_orphaned_spools`); the session and the
+/// store are as before the save until its commit (phase 3).
+pub fn store_snapshot(job: &SaveJob) -> Result<StoredObject> {
+    use crate::staging::StageSnapshot;
+    crate::util::fault::trigger("engine.save.store")?;
+    let objects = job.root.join("objects");
+    let (stored, mtime) = match &job.bytes {
+        StageSnapshot::Object { object, size } => {
+            return Ok(StoredObject {
+                object: object.clone(),
+                size: *size as u64,
+            });
+        }
+        StageSnapshot::Bytes(bytes) => {
+            let object = hash(bytes);
+            let size = bytes.len() as u64;
+            match verified_existing(&objects, &object, size)? {
+                Some(mtime) => (StoredObject { object, size }, mtime),
+                None => {
+                    let mtime = install_new(&objects, &object, |file| {
+                        file.write_all(bytes)?;
+                        Ok(())
+                    })?;
+                    (StoredObject { object, size }, mtime)
+                }
+            }
+        }
+        StageSnapshot::File { file, size } => store_file(&objects, file, *size)?,
+    };
+    job.notes.note(&stored.object, stored.size, mtime);
+    Ok(stored)
+}
+
+/// The mtime (read before hashing) of the installed copy of `object` when it
+/// exists and hashes to it; `None` when there is none; `CORRUPT_OBJECT`
+/// ([`CorruptCopy`]) when the installed bytes do not hash to it (as
+/// `Store::put_object` refuses).
+fn verified_existing(objects: &std::path::Path, object: &str, size: u64) -> Result<Option<i64>> {
+    let path = objects.join(object);
+    let Ok(before) = std::fs::metadata(&path) else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
+    if before.len() != size || crate::core::stream_hash(&mut file)? != object {
+        return Err(CorruptCopy {
+            object: object.to_owned(),
+        }
+        .into());
+    }
+    Ok(Some(crate::core::objects::mtime_ns(&before)))
+}
+
+/// Phase 2 of a save found the installed copy of `object` corrupt (its bytes
+/// do not hash to it): `CORRUPT_OBJECT`. Phase 3 records it in the store's
+/// index ([`Engine::finish_save`]), as `Store::put_object`'s dedupe does.
+#[derive(Debug)]
+pub struct CorruptCopy {
+    pub object: String,
+}
+impl std::fmt::Display for CorruptCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CORRUPT_OBJECT: {}", self.object)
+    }
+}
+impl std::error::Error for CorruptCopy {}
+
+/// Writes a temporary file in `objects/` with `write`, makes it durable and
+/// installs it as `object`; returns its mtime. When the object appears
+/// meanwhile (another save of the same bytes), the installed copy is
+/// verified and the temporary file removed.
+fn install_new(
+    objects: &std::path::Path,
+    object: &str,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<i64> {
+    let temp = objects.join(format!("{}.part", id()));
+    let dest = objects.join(object);
+    let result = (|| -> Result<i64> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        write(&mut file)?;
+        file.sync_all()?;
+        let mtime = crate::core::objects::stamp(&file)?;
+        drop(file);
+        // The legacy crash points of `Store::put_object` (`TKFS_FAULT`).
+        crate::core::fault("object_flushed");
+        crate::util::fault::trigger("engine.save.flushed")?;
+        match crate::core::objects::install_object(&temp, &dest) {
+            Ok(()) => {}
+            Err(error) => {
+                let size = std::fs::metadata(&temp)?.len();
+                match verified_existing(objects, object, size)? {
+                    Some(mtime) => {
+                        std::fs::remove_file(&temp)?;
+                        return Ok(mtime);
+                    }
+                    None => return Err(error),
+                }
+            }
+        }
+        crate::core::fault("object_installed");
+        crate::util::fault::trigger("engine.save.installed")?;
+        Ok(mtime)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Phase 2 for a staging file: streams it (positional reads, the session's
+/// handle keeps its own position) into a new object, hashing it on the way.
+fn store_file(
+    objects: &std::path::Path,
+    source: &std::fs::File,
+    size: usize,
+) -> Result<(StoredObject, i64)> {
+    ensure!(size as u64 <= MAX_CONTENT, "FILE_TOO_LARGE");
+    let temp_name = format!("{}.part", id());
+    let temp = objects.join(&temp_name);
+    let result = (|| -> Result<(StoredObject, i64)> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        let mut digest = <sha2::Sha256 as sha2::Digest>::new();
+        let mut buffer = vec![0; IO_CHUNK.min(size.max(1))];
+        let mut offset = 0usize;
+        while offset < size {
+            let n = buffer.len().min(size - offset);
+            crate::staging::read_file_at(source, offset as u64, &mut buffer[..n])?;
+            sha2::Digest::update(&mut digest, &buffer[..n]);
+            file.write_all(&buffer[..n])?;
+            offset += n;
+        }
+        let object = hex::encode(sha2::Digest::finalize(digest));
+        let stored = StoredObject {
+            object: object.clone(),
+            size: size as u64,
+        };
+        if let Some(mtime) = verified_existing(objects, &object, size as u64)? {
+            drop(file);
+            std::fs::remove_file(&temp)?;
+            return Ok((stored, mtime));
+        }
+        file.sync_all()?;
+        let mtime = crate::core::objects::stamp(&file)?;
+        drop(file);
+        crate::core::fault("object_flushed");
+        crate::util::fault::trigger("engine.save.flushed")?;
+        let dest = objects.join(&object);
+        if let Err(error) = crate::core::objects::install_object(&temp, &dest) {
+            match verified_existing(objects, &object, size as u64)? {
+                Some(mtime) => {
+                    std::fs::remove_file(&temp)?;
+                    return Ok((stored, mtime));
+                }
+                None => return Err(error),
+            }
+        }
+        crate::core::fault("object_installed");
+        crate::util::fault::trigger("engine.save.installed")?;
+        Ok((stored, mtime))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Saves `entity`'s dirty session without holding the engine lock while its
+/// bytes are hashed and stored (CCR-WP4.INT-5; module docs): phase 1 under
+/// the lock, phase 2 without it, phase 3 under it. Waits (without the lock)
+/// for a save of the same entity that runs. A panic in phase 2 still ends
+/// the save (the session is retained).
+pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
+    save_entity_as(engine, entity, false)
+}
+
+/// [`save_entity`]; `background` (the background savers): before each
+/// phase that takes the engine lock, give it to the filesystem callbacks in
+/// progress first ([`foreground`], at most [`YIELD_MAX`] each time); commit
+/// [`SETTLE`] after the bytes are stored; and leave an entity a save of
+/// which runs to that save (edits made since stay dirty for the savers'
+/// sweep, [`orphan_dirty`]).
+fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()> {
+    loop {
+        if background {
+            yield_to_foreground();
+        }
+        let mut e = super::lock_engine(engine);
+        if !e.sessions.contains_key(entity) {
+            // Saved and closed meanwhile (a background save ended it).
+            return Ok(());
+        }
+        let job = match e.begin_save(entity)? {
+            SaveStart::Clean => return Ok(()),
+            SaveStart::Busy(_) if background => return Ok(()),
+            SaveStart::Busy(seen) => {
+                let signal = e.save_signal();
+                drop(e);
+                signal.wait_past(seen, SAVE_WAIT_SLICE);
+                continue;
+            }
+            SaveStart::Started(job) => job,
+        };
+        drop(e);
+        let stored =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store_snapshot(&job)))
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("UNKNOWN_ERROR: storing a save panicked")));
+        if background {
+            std::thread::sleep(SETTLE);
+            yield_to_foreground();
+        }
+        return super::lock_engine(engine).finish_save(job, stored);
+    }
+}
+
+/// [`save_entity`] for the session of handle `h`; `h == 0`: every dirty
+/// session (a volume flush). An unknown handle is left to the caller.
+pub fn save_handle(engine: &Shared, h: u64) -> Result<()> {
+    let entities: Vec<String> = {
+        let e = super::lock_engine(engine);
+        if h == 0 {
+            e.sessions
+                .iter()
+                .filter(|(_, s)| s.dirty)
+                .map(|(entity, _)| entity.clone())
+                .collect()
+        } else {
+            match e.handles.get(&h) {
+                Some(handle) if e.sessions.get(&handle.entity).is_some_and(|s| s.dirty) => {
+                    vec![handle.entity.clone()]
+                }
+                _ => vec![],
+            }
+        }
+    };
+    let mut first = Ok(());
+    for entity in entities {
+        let saved = save_entity(engine, &entity);
+        if first.is_ok() {
+            first = saved;
+        }
+    }
+    first
+}
+
+/// Waits (without the engine lock) until a write through handle `h` no
+/// longer waits for a save ([`Engine::write_blocked`]), then returns the
+/// engine locked. Bounded only by the saves themselves.
+pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
+    loop {
+        let e = super::lock_engine(engine);
+        let Some(seen) = e.write_blocked(h) else {
+            return e;
+        };
+        let signal = e.save_signal();
+        drop(e);
+        signal.wait_past(seen, SAVE_WAIT_SLICE);
+    }
+}
+
+/// Waits (without the engine lock) until no save runs of handle `source`'s
+/// file nor of the entry at `target` (a rename's target, a removed entry's
+/// path), then returns the engine locked, for a namespace operation that
+/// deletes, renames or replaces them: a delete on close, a rename, an
+/// unlink. Under that lock no save of them can begin, so a save never
+/// commits its content (and `alive`) after the delete, which would bring
+/// the file back or make a conflict of it, and a deferred create is
+/// committed by the caller's inline save ([`Engine::flush`],
+/// [`Engine::commit_created_at`]) before its name changes (module docs,
+/// *Deferred creates*). The caller settled them first ([`settle_entity`]);
+/// this closes the window in which another close starts a save after that.
+/// Bounded only by the saves themselves.
+pub fn lock_settled<'a>(
+    engine: &'a Shared,
+    source: Option<u64>,
+    target: Option<&str>,
+) -> super::EngineGuard<'a> {
+    loop {
+        let e = super::lock_engine(engine);
+        let saving = |entity: &str| e.sessions.get(entity).is_some_and(|s| s.saving);
+        let busy = source
+            .and_then(|h| e.handles.get(&h))
+            .is_some_and(|handle| saving(&handle.entity))
+            || target
+                .and_then(|path| e.lookup_visible(path).ok())
+                .is_some_and(|entry| saving(&entry.id));
+        if !busy {
+            return e;
+        }
+        let seen = e.saves.generation();
+        let signal = e.save_signal();
+        drop(e);
+        signal.wait_past(seen, SAVE_WAIT_SLICE);
+    }
+}
+
+/// The longest single wait for a save's end before the waiter looks again.
+const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
+
+/// Background saver threads at most, in this process
+/// ([`save_handle_in_background`], a close, the pending-save retry).
+pub const MAX_BACKGROUND_SAVES: usize = 8;
+/// Closed files waiting for a background saver at most. With the queue full
+/// a close saves its file before it returns, as a lone close does
+/// (backpressure: [`save_handle_in_background`], [`close_handle`]), so the
+/// files a close has returned for and that are not committed yet are the
+/// queued ones and those the savers are saving: at most
+/// `MAX_QUEUED_SAVES + MAX_BACKGROUND_SAVES`. That bounds what a hard crash
+/// (power loss, a killed process) can lose of closed files (a failed save is
+/// retained in `pending_saves`, which a crash does not lose).
+pub const MAX_QUEUED_SAVES: usize = 64;
+/// A background save commits at least this long after it stored the bytes:
+/// an on-access scanner scans the object file just written, and the
+/// commit's verification of newly authored bytes (`check_commit`) waited
+/// for that scan under the engine lock (measured on the reference machine:
+/// about 3 ms of a 32 KiB file's 5.5 ms commit). Waiting before taking the
+/// lock costs only latency.
+pub const SETTLE: Duration = Duration::from_millis(10);
+/// How long an idle background saver thread waits for work before it ends.
+const SAVER_IDLE: Duration = Duration::from_secs(1);
+
+/// The background savers: a queue of `(engine, entity)` and up to
+/// [`MAX_BACKGROUND_SAVES`] threads that serve it (started as work comes,
+/// ending after [`SAVER_IDLE`]).
+struct Savers {
+    state: Mutex<SaversState>,
+    wake: std::sync::Condvar,
+}
+#[derive(Default)]
+struct SaversState {
+    jobs: std::collections::VecDeque<(Shared, String)>,
+    threads: usize,
+    idle: usize,
+    running: usize,
+}
+fn savers() -> &'static Savers {
+    static SAVERS: std::sync::OnceLock<Savers> = std::sync::OnceLock::new();
+    SAVERS.get_or_init(|| Savers {
+        state: Mutex::new(SaversState::default()),
+        wake: std::sync::Condvar::new(),
+    })
+}
+
+/// Whether the mount defers the commit of a file's creation to its first save
+/// (module docs, *Deferred creates*); `TKFS_DEFERRED_CREATE=0` turns it off.
+pub fn deferred_creates() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TKFS_DEFERRED_CREATE").as_deref() != Ok("0"))
+}
+
+/// How long after a save ended the next close still counts as part of a
+/// burst of closes ([`write_behind`]).
+pub const BURST_WINDOW: Duration = Duration::from_millis(100);
+
+/// Milliseconds after this process's first save at which the latest save
+/// ended (0: none yet).
+static LAST_SAVE_END: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn process_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    u64::try_from(START.get_or_init(Instant::now).elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+fn note_save_end() {
+    LAST_SAVE_END.store(process_ms(), Ordering::Relaxed);
+}
+
+/// Whether a close should leave its save to the background savers (WP5.2):
+/// during a burst of closes, that is while background saves run or wait, or
+/// within [`BURST_WINDOW`] of the end of a save. A lone close is saved before
+/// it returns, as before, so a command that follows it (a stop, a fork, a
+/// delete) never waits for it; in a burst (a copy, a build) the saves overlap
+/// the application's next files, and what follows the burst may find files
+/// still being saved for a few milliseconds (refused `BUSY_VIEW`, retried).
+/// A close in a burst that finds the savers' queue full saves before it
+/// returns, like a lone close ([`save_handle_in_background`]).
+pub fn write_behind() -> bool {
+    if background_saves() > 0 {
+        return true;
+    }
+    let last = LAST_SAVE_END.load(Ordering::Relaxed);
+    last != 0 && process_ms().saturating_sub(last) < BURST_WINDOW.as_millis() as u64
+}
+
+/// Background saver threads alive now.
+pub fn saver_threads() -> usize {
+    crate::util::lock::lock(&savers().state).threads
+}
+
+/// Saves running or waiting in the background now.
+pub fn background_saves() -> usize {
+    let state = crate::util::lock::lock(&savers().state);
+    state.jobs.len() + state.running
+}
+
+/// Queues the save of `entity` for a background saver; `false` when the
+/// queue is full: a close then saves the file itself ([`queue_or_save`]),
+/// the pending-save retry leaves it to the savers' sweep ([`orphan_dirty`]).
+/// Also `false` when no saver runs and none can be started (the thread
+/// could not be created): nothing would serve the queue, so the caller
+/// saves the file itself (a close without the engine lock, the pending-save
+/// retry under it). A save of `entity` queued already counts as queued, and
+/// a saver is started for it too when none is idle (one whose start failed
+/// before is tried again).
+fn schedule(engine: &Shared, entity: String) -> bool {
+    let savers = savers();
+    let mut state = crate::util::lock::lock(&savers.state);
+    let queued = state
+        .jobs
+        .iter()
+        .any(|(queued, name)| Arc::ptr_eq(queued, engine) && *name == entity);
+    if !queued {
+        if state.jobs.len() >= MAX_QUEUED_SAVES {
+            return false;
+        }
+        state.jobs.push_back((engine.clone(), entity));
+    }
+    if state.idle == 0 && state.threads < MAX_BACKGROUND_SAVES && spawn_saver() {
+        state.threads += 1;
+    }
+    if state.threads == 0 {
+        // Not even one saver: the job just queued goes again (one queued
+        // before stays: a saver started later finds it saved, a no-op).
+        if !queued {
+            state.jobs.pop_back();
+        }
+        return false;
+    }
+    drop(state);
+    savers.wake.notify_one();
+    true
+}
+
+/// Starts one background saver thread; `false` when it could not be
+/// created (fault point `engine.saver.spawn`: the qualification of that).
+fn spawn_saver() -> bool {
+    crate::util::fault::fail("engine.saver.spawn").is_ok()
+        && std::thread::Builder::new()
+            .name("save".into())
+            .spawn(saver_loop)
+            .is_ok()
+}
+
+/// One background saver: serves the queue, then sweeps the closed files of
+/// that engine left unsaved, until it is idle for [`SAVER_IDLE`].
+fn saver_loop() {
+    let savers = savers();
+    loop {
+        let (engine, entity) = {
+            let mut state = crate::util::lock::lock(&savers.state);
+            loop {
+                if let Some(job) = state.jobs.pop_front() {
+                    state.running += 1;
+                    break job;
+                }
+                state.idle += 1;
+                let (next, waited) = savers
+                    .wake
+                    .wait_timeout(state, SAVER_IDLE)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state = next;
+                state.idle -= 1;
+                if waited.timed_out() && state.jobs.is_empty() {
+                    state.threads -= 1;
+                    return;
+                }
+            }
+        };
+        // A panic (a poisoned engine under the test policy) ends this job,
+        // never the saver or its counts.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut next = Some(entity);
+            while let Some(entity) = next {
+                if let Err(error) = save_entity_as(&engine, &entity, true) {
+                    let wire = crate::model::errors::ErrorWire::from_error(&error);
+                    crate::util::log::event!(warn, (wire.code.as_str()), {
+                        "site": "engine.background_save",
+                        "entity": entity,
+                        "message": wire.message,
+                    });
+                    super::lock_engine(&engine).retry_failed(&entity, Instant::now(), &error);
+                }
+                next = orphan_dirty(&super::lock_engine(&engine), Instant::now());
+            }
+        }));
+        drop(engine);
+        crate::util::lock::lock(&savers.state).running -= 1;
+    }
+}
+
+/// Filesystem callbacks in progress that take the engine lock for the
+/// application ([`foreground`]); background saves let them go first.
+static FOREGROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The longest a background save defers one engine-lock phase to
+/// [`foreground`] callbacks.
+pub const YIELD_MAX: Duration = Duration::from_millis(20);
+
+/// Marks a filesystem callback that takes the engine lock for the
+/// application until the returned guard drops (the mount adapters).
+pub fn foreground() -> Foreground {
+    FOREGROUND.fetch_add(1, Ordering::SeqCst);
+    Foreground(())
+}
+
+/// Returned by [`foreground`].
+pub struct Foreground(());
+impl Drop for Foreground {
+    fn drop(&mut self) {
+        FOREGROUND.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Waits while [`foreground`] callbacks run, at most [`YIELD_MAX`].
+fn yield_to_foreground() {
+    let deadline = Instant::now() + YIELD_MAX;
+    while FOREGROUND.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
+/// The save of a closed file (WinFsp cleanup, FUSE flush): when the session
+/// of handle `h` is dirty and no save of it runs, it is queued for a
+/// background saver and this returns at once, so the application's close
+/// does not wait for the hashing, copying and commits (module docs, *Saves
+/// off the engine lock*). With the queue full ([`MAX_QUEUED_SAVES`]) the
+/// file is saved here, without the engine lock, before this returns
+/// (backpressure: an application closing files faster than the savers
+/// commit them waits for its saves, and the closed files not committed yet
+/// stay bounded). Until it is committed the session is a dirty session like
+/// any other:
+/// reads see its bytes, a graceful stop or detach waits for it (`quiet`), a
+/// forced one or a poison exit retains it (invariant 8), and a flush
+/// (`FlushFileBuffers`, `fsync`) waits for it ([`save_handle`]). A failed
+/// background save is retained (`pending_saves`) and retried with the
+/// pending-save backoff.
+pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
+    let entity = {
+        let mut e = super::lock_engine(engine);
+        let Some(entity) = e.handles.get(&h).map(|handle| handle.entity.clone()) else {
+            return Ok(());
+        };
+        match e.sessions.get_mut(&entity) {
+            Some(session) if session.dirty && !session.saving => session.queued = true,
+            _ => return Ok(()),
+        }
+        entity
+    };
+    queue_or_save(engine, entity)
+}
+
+/// [`schedule`]s the save of `entity`, marked `queued` by the caller. With
+/// the queue full the mark is cleared and the file is saved now, by the
+/// caller, without the engine lock ([`save_entity`]; backpressure, see
+/// [`MAX_QUEUED_SAVES`]).
+fn queue_or_save(engine: &Shared, entity: String) -> Result<()> {
+    if schedule(engine, entity.clone()) {
+        return Ok(());
+    }
+    if let Some(session) = super::lock_engine(engine).sessions.get_mut(&entity) {
+        session.queued = false;
+    }
+    save_entity(engine, &entity)
+}
+
+/// A dirty session no save covers and the application no longer writes:
+/// every handle of it is cleaned up (closed), or none is left, and its
+/// pending-save backoff (if any) is due.
+fn orphan_dirty(e: &Engine, now: Instant) -> Option<String> {
+    e.sessions
+        .iter()
+        .filter(|(_, s)| s.dirty && !s.saving)
+        .map(|(entity, _)| entity)
+        .find(|entity| {
+            e.retry_state.get(*entity).is_none_or(|s| s.next_at <= now)
+                && !e
+                    .handles
+                    .values()
+                    .any(|handle| &handle.entity == *entity && !handle.cleaned)
+        })
+        .cloned()
+}
+
+/// Makes `entity`'s content final before a namespace operation removes or
+/// replaces the entity (a delete, a rename over it): waits until no save of
+/// it runs, and saves what a closed file of it still holds unsaved (no
+/// handle writes it any more). A background save then never commits after
+/// the delete, which would bring the file back or make a conflict of it; the
+/// last bytes are committed first, as when a close saved before it returned.
+/// A session that an open handle still writes is left alone (as before).
+pub fn settle_entity(engine: &Shared, entity: &str) -> Result<()> {
+    loop {
+        let (seen, signal, orphan) = {
+            let e = super::lock_engine(engine);
+            let Some(session) = e.sessions.get(entity) else {
+                return Ok(());
+            };
+            if !session.saving && e.is_deferred(entity) {
+                // Its name must be in the store before anything replaces
+                // or removes it: saved even while a handle writes it.
+                drop(e);
+                save_entity(engine, entity)?;
+                continue;
+            }
+            if !session.saving {
+                let writing = e
+                    .handles
+                    .values()
+                    .any(|handle| handle.entity == entity && !handle.cleaned);
+                if !session.dirty || writing {
+                    return Ok(());
+                }
+            }
+            (
+                e.saves.generation(),
+                e.save_signal(),
+                !e.sessions[entity].saving,
+            )
+        };
+        if orphan {
+            save_entity(engine, entity)?;
+        } else {
+            signal.wait_past(seen, SAVE_WAIT_SLICE);
+        }
+    }
+}
+
+/// [`settle_entity`] for the entity at `path`, if one is there (a deferred
+/// create too).
+pub fn settle_path(engine: &Shared, path: &str) -> Result<()> {
+    let entity = super::lock_engine(engine)
+        .lookup_visible(path)
+        .ok()
+        .map(|entry| entry.id);
+    match entity {
+        Some(entity) => settle_entity(engine, &entity),
+        None => Ok(()),
+    }
+}
+
+/// [`settle_entity`] for the session of handle `h`.
+pub fn settle_handle(engine: &Shared, h: u64) -> Result<()> {
+    let entity = super::lock_engine(engine)
+        .handles
+        .get(&h)
+        .map(|handle| handle.entity.clone());
+    match entity {
+        Some(entity) => settle_entity(engine, &entity),
+        None => Ok(()),
+    }
+}
+
+/// Closes handle `h` (WinFsp close, FUSE release): removes the handle and,
+/// when its session is dirty, no save of it runs and its pending-save
+/// backoff is due, queues its save for a background saver. The close saves
+/// only when that queue is full (backpressure, [`MAX_QUEUED_SAVES`]): a
+/// WinFsp close holds the application's `CloseHandle` until it answers
+/// (measured: a save in it cost the application the whole save).
+pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
+    let unsaved = {
+        let mut e = super::lock_engine(engine);
+        let now = Instant::now();
+        let unsaved = e
+            .handles
+            .get(&h)
+            .and_then(|handle| e.sessions.get(&handle.entity).map(|s| (handle, s)))
+            .filter(|(handle, s)| {
+                s.dirty
+                    && !s.saving
+                    && e.retry_state
+                        .get(&handle.entity)
+                        .is_none_or(|state| state.next_at <= now)
+            })
+            .map(|(handle, _)| handle.entity.clone());
+        e.release_handle(h)?;
+        if let Some(session) = unsaved
+            .as_ref()
+            .and_then(|entity| e.sessions.get_mut(entity))
+        {
+            session.queued = true;
+        }
+        unsaved
+    };
+    match unsaved {
+        Some(entity) => queue_or_save(engine, entity),
+        None => Ok(()),
     }
 }
 
