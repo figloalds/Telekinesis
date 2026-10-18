@@ -17,12 +17,17 @@
 //! to the controller, and callback failures go to the mount-scoped error
 //! counter and log.
 //!
-//! WP5.2: reads, writes, fsyncs and size changes run on threads of their own
-//! and do the work that needs no engine lock first (content waits, the
-//! writable copy of a large file, a save's hashing and copying); a flush
-//! saves the closed file, or queues the save for a background saver during
-//! a burst of closes; a release, an
-//! unlink, an rmdir and a rename settle the entry first
+//! WP5.2: reads, writes, fsyncs, flushes and size changes run on threads of
+//! their own ([`Threads`]: at most [`MAX_THREADED`] at once, the others wait
+//! in line, none is refused) and do the work that needs no engine lock first
+//! (content waits, the writable copy of a large file, a save's hashing and
+//! copying). An fsync (`FUSE_FSYNC`, fsync(2)) is a durability point: it
+//! commits what was written before it answers, also during a burst of
+//! closes. A flush (`FUSE_FLUSH`, sent by every close(2) of a descriptor)
+//! saves the file before it answers, or, during a burst of closes, queues the
+//! save for a background saver (`runtime::engine::write_behind`; an fsync
+//! waits for it). A release closes through `runtime::engine::close_handle`;
+//! an unlink, an rmdir and a rename settle the entry first
 //! (`runtime::engine::settle_entity`). A read of content that cannot arrive
 //! answers `EIO` (it answered `EAGAIN`, CCR-WP4.INT-2).
 //!
@@ -49,7 +54,7 @@ use std::{
     process::Command,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
 };
@@ -1102,10 +1107,29 @@ impl Filesystem {
         }
     }
 }
+/// The FUSE opcodes [`serve`] routes itself (`enum fuse_opcode` in
+/// `linux/fuse.h`).
+const FUSE_SETATTR: u32 = 4;
+const FUSE_READ: u32 = 15;
+const FUSE_WRITE: u32 = 16;
+const FUSE_RELEASE: u32 = 18;
+/// fsync(2) of a file.
+const FUSE_FSYNC: u32 = 20;
+/// Every close(2) of a descriptor (the last one is followed by a release).
+const FUSE_FLUSH: u32 = 25;
+const FUSE_RELEASEDIR: u32 = 29;
 /// Failures on the close path (flush, release) and unexpected I/O errors are
 /// counted as mount errors; the rest are expected answers (`ENOENT`, …).
 fn counted(op: u32, error: &anyhow::Error) -> bool {
-    [18, 25, 29].contains(&op) || errno(error) == libc::EIO
+    [FUSE_RELEASE, FUSE_FLUSH, FUSE_RELEASEDIR].contains(&op) || errno(error) == libc::EIO
+}
+/// Whether [`serve`] runs a request on a thread of its own ([`threaded`]):
+/// reads, writes, fsyncs, flushes and size changes, whose work without the
+/// engine lock (a content wait, a writable copy, a save) may take long.
+/// `body` is the request after its header.
+fn runs_threaded(op: u32, body: &[u8]) -> bool {
+    [FUSE_READ, FUSE_WRITE, FUSE_FSYNC, FUSE_FLUSH].contains(&op)
+        || op == FUSE_SETATTR && u32_at(body, 0).is_ok_and(|valid| valid & (1 << 3) != 0)
 }
 /// Why the dispatch loop stopped.
 enum Exit {
@@ -1128,7 +1152,7 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
     );
     let fs = Arc::new(Mutex::new(Filesystem::new()));
     let writer = Arc::new(Mutex::new(device.try_clone()?));
-    let content = Arc::new(AtomicUsize::new(0));
+    let threads = Threads::new(MAX_THREADED);
     let mut bytes = vec![0; MAX_IO + 4096];
     loop {
         let mut fds = [
@@ -1185,28 +1209,18 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
         let inode = u64_at(p, 16)?;
         // Content waits and saves must not stop the single /dev/fuse reader
         // from serving unrelated lookups and metadata requests: reads,
-        // writes, fsyncs and size changes run on their own threads (WP5.2
-        // added the last two: their saves hash and copy without the engine
-        // lock, but they still take time). Bound outstanding requests.
-        let size_change = op == 4 && u32_at(p, 40).is_ok_and(|valid| valid & (1 << 3) != 0);
-        if [15, 16, 25].contains(&op) || size_change {
+        // writes, fsyncs, flushes and size changes run on threads of their
+        // own (WP5.2 added the last three: their saves hash and copy without
+        // the engine lock, but they still take time). At most
+        // `MAX_THREADED` run at once; the others wait in line for one of
+        // those threads, never refused (only reads waiting for downloads are
+        // bounded on their own, `CONTENT_WAITERS`).
+        if runs_threaded(op, &p[40..]) {
             let body = p[40..].to_vec();
-            if content.fetch_add(1, Ordering::Relaxed) >= MAX_THREADED {
-                content.fetch_sub(1, Ordering::Relaxed);
-                write_reply(
-                    &writer,
-                    unique,
-                    Err(anyhow::anyhow!(
-                        "CONTENT_UNAVAILABLE: {MAX_THREADED} file operations are already waiting"
-                    )),
-                )?;
-                continue;
-            }
             let engine = engine.clone();
             let fs = fs.clone();
             let writer = writer.clone();
-            let content = content.clone();
-            std::thread::spawn(move || {
+            threads.run(Box::new(move || {
                 let _callback = callback;
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     threaded(&engine, &fs, op, inode, &body)
@@ -1216,30 +1230,17 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
                     adapter::fs_error(op, error, counted(op, error));
                 }
                 let _ = write_reply(&writer, unique, result);
-                content.fetch_sub(1, Ordering::Relaxed);
-            });
+            }));
             continue;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if [18, 20, 29, 10, 11, 12, 45].contains(&op) {
+            if [FUSE_RELEASE, FUSE_RELEASEDIR, 10, 11, 12, 45].contains(&op) {
                 fenced(&engine)?;
             }
             match op {
-                // A close(2): during a burst of closes the save goes on in
-                // the background (`write_behind`; an fsync waits for it); a
-                // lone close saves before it is answered.
-                20 => {
-                    let handle = u64_at(&p[40..], 0)?;
-                    if crate::runtime::engine::write_behind() {
-                        crate::runtime::engine::save_handle_in_background(&engine, handle)?;
-                    } else {
-                        crate::runtime::engine::save_handle(&engine, handle)?;
-                    }
-                    return Ok(vec![]);
-                }
                 // The last close: saves without the engine lock what no save
                 // covers yet, then the handle goes (`close_handle`).
-                18 | 29 => {
+                FUSE_RELEASE | FUSE_RELEASEDIR => {
                     crate::runtime::engine::close_handle(&engine, u64_at(&p[40..], 0)?)?;
                     // Qualification hook: a close-path failure after the handle closed.
                     crate::util::fault::fail("fs.close")?;
@@ -1272,8 +1273,90 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
         drop(callback);
     }
 }
-/// Requests handled on a thread of their own at most at once.
+/// Requests handled on a thread of their own at most at once ([`Threads`]).
 const MAX_THREADED: usize = 64;
+/// A request [`serve`] hands to [`Threads`]: it replies itself.
+type Job = Box<dyn FnOnce() + Send>;
+/// The threads [`serve`] runs requests on: one per request, at most `max` at
+/// once. Past that a request waits in line (first in, first out) for one of
+/// them to finish its own, instead of being refused: a close, an fsync or a
+/// write never fails for want of a thread (WP5.2 fix round 2; they used to
+/// answer `EIO`). Only reads that wait for downloads are bounded on their
+/// own ([`CONTENT_WAITERS`]), and fail at once past that bound.
+struct Threads {
+    max: usize,
+    state: Mutex<ThreadsState>,
+}
+#[derive(Default)]
+struct ThreadsState {
+    /// Threads running requests.
+    running: usize,
+    /// Requests waiting for one of them.
+    waiting: std::collections::VecDeque<Job>,
+}
+impl Threads {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max: max.max(1),
+            state: Mutex::new(ThreadsState::default()),
+        })
+    }
+    /// Runs `job` on a thread of its own, or queues it for the next thread
+    /// that finishes. When no thread can be created, `job` runs here, on
+    /// the caller (the dispatch thread).
+    fn run(self: &Arc<Self>, job: Job) {
+        let mut state = lock(&self.state);
+        if state.running >= self.max {
+            state.waiting.push_back(job);
+            return;
+        }
+        state.running += 1;
+        drop(state);
+        // The job stays here if the thread cannot be created.
+        let slot = Arc::new(Mutex::new(Some(job)));
+        let (threads, theirs) = (self.clone(), slot.clone());
+        let spawned = std::thread::Builder::new()
+            .name("fuse-request".into())
+            .spawn(move || {
+                let job = lock(&theirs).take();
+                if let Some(job) = job {
+                    contained(job);
+                }
+                threads.serve_waiting();
+            });
+        if spawned.is_err() {
+            // Only `serve` queues, so nothing was queued since the count
+            // went up: the threads already running serve what waits.
+            lock(&self.state).running -= 1;
+            let job = lock(&slot).take();
+            if let Some(job) = job {
+                contained(job);
+            }
+        }
+    }
+    /// Runs the waiting requests one after the other until none is left,
+    /// then ends this thread's turn (under the same lock as [`Threads::run`]
+    /// queues, so a request never waits with no thread to serve it).
+    fn serve_waiting(&self) {
+        loop {
+            let job = {
+                let mut state = lock(&self.state);
+                match state.waiting.pop_front() {
+                    Some(job) => job,
+                    None => {
+                        state.running -= 1;
+                        return;
+                    }
+                }
+            };
+            contained(job);
+        }
+    }
+}
+/// Runs `job`; a panic ends the job, never the thread serving the line.
+fn contained(job: Job) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+}
 /// The `setattr` valid bits this adapter applies: mode, size, the times
 /// (and their `now` forms), the file handle, `ctime`; never ownership.
 const SETATTR_SUPPORTED: u32 = (1 << 0)
@@ -1316,9 +1399,10 @@ fn with_valid(body: &[u8], valid: u32) -> Vec<u8> {
     }
     body
 }
-/// One request on a thread of its own (`serve`): the work that needs no
-/// engine lock first (waiting for content, the writable copy of a large
-/// file, a save's hashing and copying), then the request under the lock.
+/// One request on a thread of its own (`serve`, [`runs_threaded`]): the work
+/// that needs no engine lock first (waiting for content, the writable copy
+/// of a large file, a save's hashing and copying), then the request under
+/// the lock.
 fn threaded(
     engine: &Shared,
     fs: &Mutex<Filesystem>,
@@ -1326,19 +1410,22 @@ fn threaded(
     inode: u64,
     body: &[u8],
 ) -> Result<Vec<u8>> {
-    use crate::runtime::{content, engine::save_handle};
+    use crate::runtime::{
+        content,
+        engine::{save_handle, save_handle_in_background, write_behind},
+    };
     // The work before the lock honours the fence as `dispatch` does: a
     // detach or checkout stops every request but the few `dispatch` exempts.
     fenced(engine)?;
     match op {
-        15 | 16 => {
+        FUSE_READ | FUSE_WRITE => {
             let handle = u64_at(body, 0)?;
             content::prepare_content_waiting(engine, handle, content_wait())?;
-            if op == 16 {
+            if op == FUSE_WRITE {
                 content::prepare_writable(engine, handle, None)?;
             }
             let _foreground = crate::runtime::engine::foreground();
-            let mut e = if op == 16 {
+            let mut e = if op == FUSE_WRITE {
                 crate::runtime::engine::lock_for_write(engine, handle)
             } else {
                 lock_engine(engine)
@@ -1347,14 +1434,31 @@ fn threaded(
             e.publish_observation();
             result
         }
-        25 => {
+        // fsync(2): a durability point, never write-behind. What was written
+        // through the descriptor is committed before the answer, a save that
+        // a close queued or a saver runs included (`save_handle` saves it
+        // itself, or waits for that save and saves what came after it).
+        FUSE_FSYNC => {
             save_handle(engine, u64_at(body, 0)?)?;
             let mut e = lock_engine(engine);
             let result = lock(fs).dispatch(&mut e, op, inode, body);
             e.publish_observation();
             result
         }
-        4 => setattr_size(engine, fs, inode, body),
+        // A close(2) of a descriptor: during a burst of closes the save goes
+        // on in the background (`write_behind`; with the savers' queue full
+        // it saves here, before the answer: backpressure); a lone close saves
+        // before it is answered.
+        FUSE_FLUSH => {
+            let handle = u64_at(body, 0)?;
+            if write_behind() {
+                save_handle_in_background(engine, handle)?;
+            } else {
+                save_handle(engine, handle)?;
+            }
+            Ok(vec![])
+        }
+        FUSE_SETATTR => setattr_size(engine, fs, inode, body),
         _ => bail!("UNSUPPORTED_FUSE_OPCODE: {op}"),
     }
 }
@@ -1489,6 +1593,77 @@ mod tests {
         assert_eq!(fs.attr(&e, &root).unwrap().len(), 88);
         assert_eq!(fs.entry_out(&e, &root).unwrap().len(), 128);
         assert_eq!(u32_at(&Filesystem::open_out(1, false), 8).unwrap(), 1);
+    }
+    #[test]
+    fn fsyncs_and_flushes_are_told_apart_and_run_on_threads_of_their_own() {
+        // `enum fuse_opcode` (linux/fuse.h): FUSE_FSYNC = 20, FUSE_FLUSH = 25
+        // (WP5.2 fix round 2: they were swapped, and fsync(2) went
+        // write-behind during a burst of closes).
+        assert_eq!((FUSE_FSYNC, FUSE_FLUSH), (20, 25));
+        assert_eq!((FUSE_RELEASE, FUSE_RELEASEDIR), (18, 29));
+        for op in [FUSE_READ, FUSE_WRITE, FUSE_FSYNC, FUSE_FLUSH] {
+            assert!(runs_threaded(op, &[0; 64]), "opcode {op}");
+        }
+        // A setattr runs threaded only when it changes the size.
+        let mut setattr = vec![0u8; 88];
+        assert!(!runs_threaded(FUSE_SETATTR, &setattr));
+        setattr[..4].copy_from_slice(&(1u32 << 3).to_ne_bytes());
+        assert!(runs_threaded(FUSE_SETATTR, &setattr));
+        // Lookups, releases and directory fsyncs stay on the dispatch thread.
+        for op in [1, 3, FUSE_RELEASE, FUSE_RELEASEDIR, 30] {
+            assert!(!runs_threaded(op, &[0; 64]), "opcode {op}");
+        }
+    }
+    #[test]
+    fn requests_past_the_thread_bound_wait_in_line_and_none_is_refused() {
+        use std::sync::{Condvar, atomic::AtomicUsize};
+        let threads = Threads::new(2);
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (now, most, done) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for i in 0..10 {
+            let (gate, now, most, done) = (gate.clone(), now.clone(), most.clone(), done.clone());
+            threads.run(Box::new(move || {
+                let running = now.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(running, Ordering::SeqCst);
+                let (open, opened) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+                drop(open);
+                now.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_add(1, Ordering::SeqCst);
+                // A panicking request ends, its thread goes on serving.
+                assert!(i != 3, "request 3 panics");
+            }));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while now.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        {
+            let state = lock(&threads.state);
+            assert_eq!(state.running, 2, "two threads run requests");
+            assert_eq!(state.waiting.len(), 8, "the other requests wait in line");
+        }
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        while (done.load(Ordering::SeqCst) < 10 || lock(&threads.state).running > 0)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 10, "every request ran");
+        assert!(
+            most.load(Ordering::SeqCst) <= 2,
+            "never more than two at once"
+        );
+        let state = lock(&threads.state);
+        assert_eq!((state.running, state.waiting.len()), (0, 0));
     }
     #[test]
     fn a_size_change_with_an_ownership_change_is_refused_before_anything_applies() {

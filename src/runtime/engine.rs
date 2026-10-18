@@ -73,10 +73,12 @@
 //! dirty session until its commit, so `quiet()` refuses it, a force detach
 //! or a poison exit retains it, and its commit then removes the record.
 //!
-//! The adapters save this way ([`save_handle`] for flushes, renames, deletes
-//! on close and a lone close), and during a burst of closes ([`write_behind`])
-//! a closed file is saved in the background ([`save_handle_in_background`],
-//! WinFsp cleanup and FUSE flush): a bounded pool of saver threads commits it
+//! The adapters save this way ([`save_handle`] for the durability points,
+//! `FlushFileBuffers` and fsync(2) (`FUSE_FSYNC`), never write-behind, and
+//! for renames, deletes on close and a lone close), and during a burst of
+//! closes ([`write_behind`]) a closed file is saved in the background
+//! ([`save_handle_in_background`], the WinFsp cleanup and the FUSE flush of a
+//! close(2)): a bounded pool of saver threads commits it
 //! shortly after the close, giving the engine to filesystem callbacks first
 //! ([`foreground`]); with their queue full a close saves before it returns
 //! (backpressure: closed files not committed yet are at most
@@ -203,6 +205,12 @@ pub struct Engine {
     /// `bind`): the pending-save retry hands staging-file saves to a thread
     /// that stores them without the engine lock.
     shared: Option<std::sync::Weak<Mutex<Engine>>>,
+    /// Entities whose save [`Engine::retry_pending_due`] handed to the
+    /// background savers, until it commits.
+    retry_handed: BTreeSet<String>,
+    /// Saves of `retry_handed` entities the savers committed since the last
+    /// [`Engine::retry_pending_due`] (which reports them).
+    retry_commits: usize,
 }
 
 /// What one activation committed, for [`Engine::after_activation`].
@@ -560,6 +568,8 @@ impl Engine {
             saves: Arc::new(SaveSignal::default()),
             notes: Arc::new(AvailabilityNotes::new(&store)),
             shared: None,
+            retry_handed: BTreeSet::new(),
+            retry_commits: 0,
             observed: Mutex::new(None),
             pending_creates: BTreeMap::new(),
             store,
@@ -1333,6 +1343,16 @@ impl Engine {
         let stored = match stored {
             Ok(stored) => stored,
             Err(error) => {
+                if let Some(corrupt) = error.downcast_ref::<CorruptCopy>() {
+                    // Recorded as `Store::put_object`'s dedupe records it: the
+                    // store's own verification marks the object `CORRUPT` and
+                    // stops serving it (its `note_corrupt`), so the inventory
+                    // no longer advertises the bad copy. That verification
+                    // hashes the copy again, under the engine lock (only when
+                    // a copy is corrupt; CCR-WP5.2-7 asks for a hook that
+                    // records it without the hash).
+                    let _ = self.store.verify_object(&corrupt.object);
+                }
                 self.retain_pending(entity, &error)
                     .context("PENDING_SAVE_PERSIST_FAILED")?;
                 return Err(error);
@@ -1435,6 +1455,11 @@ impl Engine {
                 }
                 if deferred {
                     self.pending_creates.retain(|_, pending| pending != entity);
+                }
+                if self.retry_handed.remove(entity) {
+                    // A pending save the retry handed to a saver: reported by
+                    // the next retry (`retry_pending_due`).
+                    self.retry_commits += 1;
                 }
                 let entry = self.store.entry(entity);
                 let session = self.sessions.get_mut(entity).context("INVALID_HANDLE")?;
@@ -1706,11 +1731,20 @@ impl Engine {
     /// [`Engine::retry_pending`] with a per-entity backoff (1 s → 60 s, WP2.3
     /// task 5): each dirty, unreferenced session is tried when it is due; a
     /// failure (the session stays retained) delays only that entity, and the
-    /// others are still tried. Returns how many were committed.
+    /// others are still tried. Returns how many saves changed the store's
+    /// content for the status (the maintenance thread then marks the status
+    /// content wanted, `status_cell::note_mutation`): those it committed, those
+    /// it handed to the background savers (counted at once: by the time such
+    /// a save commits nothing may be left for the next tick to retry), and
+    /// those the savers committed for it since its previous call (reported
+    /// again, so a status refresh that ran before that commit is followed by
+    /// another one).
     pub fn retry_pending_due(&mut self, now: Instant) -> usize {
         self.retry_unrecovered_due(now);
         self.retry_state
             .retain(|entity, _| self.sessions.get(entity).is_some_and(|s| s.dirty));
+        self.retry_handed
+            .retain(|entity| self.sessions.get(entity).is_some_and(|s| s.dirty));
         let due: Vec<_> = self
             .sessions
             .iter()
@@ -1718,18 +1752,23 @@ impl Engine {
             .map(|(id, _)| id.clone())
             .filter(|id| self.retry_state.get(id).is_none_or(|s| s.next_at <= now))
             .collect();
-        let mut committed = 0;
+        let mut committed = std::mem::take(&mut self.retry_commits);
         for entity in due {
             // Saved without the engine lock when the shared engine is known:
             // a saver saves it and reports a failure back (`retry_failed`).
             // With the queue full the savers are busy and their sweep
             // (`orphan_dirty`) picks it up: never saved here then, under the
             // lock (a backlog of closed files saved one after the other here
-            // held the engine for seconds).
+            // held the engine for seconds). With no saver at all (none could
+            // be started) it is saved here.
             if let Some(shared) = self.shared.as_ref().and_then(std::sync::Weak::upgrade) {
                 if schedule(&shared, entity.clone()) {
                     if let Some(session) = self.sessions.get_mut(&entity) {
                         session.queued = true;
+                    }
+                    // Counted once (it is due again while it waits).
+                    if self.retry_handed.insert(entity) {
+                        committed += 1;
                     }
                     continue;
                 }
@@ -2542,20 +2581,37 @@ pub fn store_snapshot(job: &SaveJob) -> Result<StoredObject> {
 }
 
 /// The mtime (read before hashing) of the installed copy of `object` when it
-/// exists and hashes to it; `None` when there is none; `CORRUPT_OBJECT` when
-/// the installed bytes do not hash to it (as `Store::put_object` refuses).
+/// exists and hashes to it; `None` when there is none; `CORRUPT_OBJECT`
+/// ([`CorruptCopy`]) when the installed bytes do not hash to it (as
+/// `Store::put_object` refuses).
 fn verified_existing(objects: &std::path::Path, object: &str, size: u64) -> Result<Option<i64>> {
     let path = objects.join(object);
     let Ok(before) = std::fs::metadata(&path) else {
         return Ok(None);
     };
     let mut file = std::fs::File::open(&path).map_err(anyhow::Error::from)?;
-    ensure!(
-        before.len() == size && crate::core::stream_hash(&mut file)? == object,
-        "CORRUPT_OBJECT: {object}"
-    );
+    if before.len() != size || crate::core::stream_hash(&mut file)? != object {
+        return Err(CorruptCopy {
+            object: object.to_owned(),
+        }
+        .into());
+    }
     Ok(Some(crate::core::objects::mtime_ns(&before)))
 }
+
+/// Phase 2 of a save found the installed copy of `object` corrupt (its bytes
+/// do not hash to it): `CORRUPT_OBJECT`. Phase 3 records it in the store's
+/// index ([`Engine::finish_save`]), as `Store::put_object`'s dedupe does.
+#[derive(Debug)]
+pub struct CorruptCopy {
+    pub object: String,
+}
+impl std::fmt::Display for CorruptCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CORRUPT_OBJECT: {}", self.object)
+    }
+}
+impl std::error::Error for CorruptCopy {}
 
 /// Writes a temporary file in `objects/` with `write`, makes it durable and
 /// installs it as `object`; returns its mtime. When the object appears
@@ -2883,7 +2939,7 @@ pub fn write_behind() -> bool {
 }
 
 /// Background saver threads alive now.
-fn saver_threads() -> usize {
+pub fn saver_threads() -> usize {
     crate::util::lock::lock(&savers().state).threads
 }
 
@@ -2896,32 +2952,49 @@ pub fn background_saves() -> usize {
 /// Queues the save of `entity` for a background saver; `false` when the
 /// queue is full: a close then saves the file itself ([`queue_or_save`]),
 /// the pending-save retry leaves it to the savers' sweep ([`orphan_dirty`]).
+/// Also `false` when no saver runs and none can be started (the thread
+/// could not be created): nothing would serve the queue, so the caller
+/// saves the file itself (a close without the engine lock, the pending-save
+/// retry under it). A save of `entity` queued already counts as queued, and
+/// a saver is started for it too when none is idle (one whose start failed
+/// before is tried again).
 fn schedule(engine: &Shared, entity: String) -> bool {
     let savers = savers();
     let mut state = crate::util::lock::lock(&savers.state);
-    if state
+    let queued = state
         .jobs
         .iter()
-        .any(|(queued, name)| Arc::ptr_eq(queued, engine) && *name == entity)
-    {
-        return true;
+        .any(|(queued, name)| Arc::ptr_eq(queued, engine) && *name == entity);
+    if !queued {
+        if state.jobs.len() >= MAX_QUEUED_SAVES {
+            return false;
+        }
+        state.jobs.push_back((engine.clone(), entity));
     }
-    if state.jobs.len() >= MAX_QUEUED_SAVES {
-        return false;
-    }
-    state.jobs.push_back((engine.clone(), entity));
-    if state.idle == 0
-        && state.threads < MAX_BACKGROUND_SAVES
-        && std::thread::Builder::new()
-            .name("save".into())
-            .spawn(saver_loop)
-            .is_ok()
-    {
+    if state.idle == 0 && state.threads < MAX_BACKGROUND_SAVES && spawn_saver() {
         state.threads += 1;
+    }
+    if state.threads == 0 {
+        // Not even one saver: the job just queued goes again (one queued
+        // before stays: a saver started later finds it saved, a no-op).
+        if !queued {
+            state.jobs.pop_back();
+        }
+        return false;
     }
     drop(state);
     savers.wake.notify_one();
     true
+}
+
+/// Starts one background saver thread; `false` when it could not be
+/// created (fault point `engine.saver.spawn`: the qualification of that).
+fn spawn_saver() -> bool {
+    crate::util::fault::fail("engine.saver.spawn").is_ok()
+        && std::thread::Builder::new()
+            .name("save".into())
+            .spawn(saver_loop)
+            .is_ok()
 }
 
 /// One background saver: serves the queue, then sweeps the closed files of
