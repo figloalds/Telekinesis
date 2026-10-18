@@ -2934,6 +2934,38 @@ pub fn lock_settled<'a>(
     }
 }
 
+/// The longest a graceful stop or a control request that needs a quiet
+/// engine waits for the saves of files the application closed
+/// ([`lock_after_saves`], CCR-WP5.2-4).
+pub const QUIET_SAVES_WAIT: Duration = Duration::from_secs(5);
+
+/// Returns the engine locked once no unsaved file is only waiting for its
+/// save: waits (without the engine lock), at most `bound`, while every
+/// dirty session is a closed file being saved ([`Engine::settling`]) and
+/// every handle is cleaned up, so a stop or a command right after a burst
+/// of closes finds them committed instead of being refused `BUSY_VIEW`
+/// (CCR-WP5.2-4, applied by WP5.INT). Anything else that keeps the engine
+/// from being quiet (an open file, a session being written, a health
+/// message) returns at once, for `quiet()` to report as before.
+pub fn lock_after_saves(engine: &Shared, bound: Duration) -> super::EngineGuard<'_> {
+    let deadline = Instant::now() + bound;
+    loop {
+        let e = super::lock_engine(engine);
+        let dirty = e.sessions.values().filter(|s| s.dirty).count();
+        let settling = e.settling();
+        let only_saves =
+            settling > 0 && settling == dirty && e.handles.values().all(|handle| handle.cleaned);
+        let now = Instant::now();
+        if !only_saves || now >= deadline {
+            return e;
+        }
+        let seen = e.saves.generation();
+        let signal = e.save_signal();
+        drop(e);
+        signal.wait_past(seen, SAVE_WAIT_SLICE.min(deadline - now));
+    }
+}
+
 /// The longest single wait for a save's end before the waiter looks again.
 const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 

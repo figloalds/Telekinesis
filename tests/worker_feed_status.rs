@@ -174,6 +174,43 @@ fn feed_peers_make_both_workers_caught_up() {
     assert_eq!(a.status()["upload_state"], "peer-acknowledged");
 }
 
+/// WP5.INT (CCR-WP5.4-4): the worker op `folder-details` embeds the same
+/// status claims as the `status` op (`caught_up`, `metadata_caught_up`,
+/// `upload_state`), so a v3 folder is caught up there too; before, it
+/// embedded the engine's own `status`, which counts only the legacy lanes
+/// (`false`, `peer-not-configured`).
+#[test]
+fn folder_details_tells_the_status_claims_of_the_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = id();
+    let a = worker(&dir.path().join("a"), &repo);
+    let b = worker(&dir.path().join("b"), &repo);
+    a.create("one");
+    let caught_up = |w: &Worker| w.status()["caught_up"] == true;
+    let mut rounds = 0;
+    while !(caught_up(&a) && caught_up(&b)) {
+        rounds += 1;
+        assert!(rounds <= 10, "not caught up after 10 rounds");
+        round(&b, &a);
+    }
+    let server = tkfs::runtime::server::start_rpc_server(a.ctx.clone()).unwrap();
+    let info = server.publish(None).unwrap();
+    let details = tkfs::runtime::rpc(&info, &id(), json!({"op": "folder-details"})).unwrap();
+    let status = tkfs::runtime::rpc(&info, &id(), json!({"op": "status"})).unwrap();
+    for member in ["caught_up", "metadata_caught_up", "upload_state"] {
+        assert_eq!(
+            details["status"][member], status[member],
+            "{member}: {details}"
+        );
+    }
+    assert_eq!(details["status"]["caught_up"], true, "{details}");
+    assert_eq!(
+        details["status"]["upload_state"], "peer-acknowledged",
+        "{details}"
+    );
+    assert!(details["conflicts"].is_array(), "{details}");
+}
+
 /// The freshness rule on a worker with nothing to do but one feed peer
 /// (its counters set as an exchange would set them): the last exchange
 /// counts for three of the peer's exchange intervals, at least 15 s and at
