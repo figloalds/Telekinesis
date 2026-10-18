@@ -349,10 +349,6 @@ pub unsafe extern "C" fn tk_call(
         let engine = &engine;
         let h = unsafe { *token };
         let path = unsafe { string(name) };
-        // Background saves let the application's callbacks take the engine
-        // first; a flush, a close, a cleanup and a rename wait for saves and
-        // are not the application's foreground.
-        let _foreground = (![7, 9, 10, 12].contains(&op)).then(crate::runtime::engine::foreground);
         // Work that needs no engine lock comes first (WP5.2): waiting for
         // content, the writable copy of a large file, and the hashing and
         // copying of a save. Each phase that needs the engine takes it
@@ -397,13 +393,21 @@ pub unsafe extern "C" fn tk_call(
             }
             _ => {}
         }
+        // Background saves let the application's callbacks take the engine
+        // first, from here on (the work before the lock, a content wait among
+        // it, does not hold them back); a flush, a close, a cleanup and a
+        // rename wait for saves and are not the application's foreground.
+        let _foreground = (![7, 9, 10, 12].contains(&op)).then(crate::runtime::engine::foreground);
         // A write waits (without the lock) for a save that reads its file; a
-        // rename or a delete of a file whose creation a save is committing
-        // waits for that commit (`runtime::engine`, *Deferred creates*).
+        // rename and a delete on close wait for any save of the file they
+        // rename, replace or delete, so none commits after them
+        // (`runtime::engine::lock_settled`).
         let mut e = if op == 5 || op == 6 {
             crate::runtime::engine::lock_for_write(engine, h)
-        } else if op == 12 || (op == 9 && flags & 1 != 0) {
-            crate::runtime::engine::lock_created(engine, h)
+        } else if op == 12 {
+            crate::runtime::engine::lock_settled(engine, Some(h), Some(&path))
+        } else if op == 9 && flags & 1 != 0 {
+            crate::runtime::engine::lock_settled(engine, Some(h), None)
         } else {
             lock_engine(engine)
         };
@@ -425,15 +429,8 @@ pub unsafe extern "C" fn tk_call(
                 };
                 let size = if special {
                     e.discovery.len()
-                } else if e.is_deferred(&entry.id) {
-                    e.visible_size(&entry)?
                 } else {
-                    entry
-                        .content
-                        .as_ref()
-                        .map(|h| e.store.object_size(h).map(|size| size as usize))
-                        .transpose()?
-                        .unwrap_or(0)
+                    e.visible_size(&entry)?
                 };
                 fill(&mut out, &entry, size);
             }

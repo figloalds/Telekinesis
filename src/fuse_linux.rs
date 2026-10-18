@@ -855,18 +855,7 @@ impl Filesystem {
             4 => {
                 let valid = u32_at(p, 0)?;
                 ensure!(
-                    valid
-                        & !((1 << 0)
-                            | (1 << 3)
-                            | (1 << 4)
-                            | (1 << 5)
-                            | (1 << 6)
-                            | (1 << 7)
-                            | (1 << 8)
-                            | (1 << 9)
-                            | (1 << 10)
-                            | (1 << 11))
-                        == 0,
+                    valid & !SETATTR_SUPPORTED == 0,
                     "UNSUPPORTED_POSIX_OWNERSHIP"
                 );
                 if valid & 1 != 0 {
@@ -1256,14 +1245,21 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
                     crate::util::fault::fail("fs.close")?;
                     return Ok(vec![]);
                 }
-                // An unlink, rmdir or rename: the entry it removes or
-                // replaces is final first (`settle_entity`).
-                10 | 11 | 12 | 45 => settle_target(&engine, &fs, op, inode, &p[40..])?,
                 _ => {}
             }
-            // Background saves let this request take the engine first.
-            let _foreground = crate::runtime::engine::foreground();
-            let mut e = lock_engine(&engine);
+            // An unlink, rmdir or rename: the entry it removes or replaces
+            // is final first (`settle_entity`), and no save of it runs while
+            // the request applies (`lock_settled`). Background saves let the
+            // other requests take the engine first.
+            let target = match op {
+                10 | 11 | 12 | 45 => settle_target(&engine, &fs, op, inode, &p[40..])?,
+                _ => None,
+            };
+            let _foreground = target.is_none().then(crate::runtime::engine::foreground);
+            let mut e = match &target {
+                Some(path) => crate::runtime::engine::lock_settled(&engine, None, Some(path)),
+                None => lock_engine(&engine),
+            };
             let result = lock(&fs).dispatch(&mut e, op, inode, &p[40..]);
             e.publish_observation();
             result
@@ -1278,6 +1274,18 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
 }
 /// Requests handled on a thread of their own at most at once.
 const MAX_THREADED: usize = 64;
+/// The `setattr` valid bits this adapter applies: mode, size, the times
+/// (and their `now` forms), the file handle, `ctime`; never ownership.
+const SETATTR_SUPPORTED: u32 = (1 << 0)
+    | (1 << 3)
+    | (1 << 4)
+    | (1 << 5)
+    | (1 << 6)
+    | (1 << 7)
+    | (1 << 8)
+    | (1 << 9)
+    | (1 << 10)
+    | (1 << 11);
 /// How long a read waits for content that is downloading (the WinFsp
 /// adapter's bounds: FUSE has no request timeout of its own).
 const CONTENT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -1351,14 +1359,16 @@ fn threaded(
     }
 }
 /// Settles the entry an unlink or rmdir (`10`, `11`) removes, or a rename
-/// (`12`, `45`) may replace ([`crate::runtime::engine::settle_entity`]).
+/// (`12`, `45`) may replace ([`crate::runtime::engine::settle_entity`]), and
+/// returns its path (`None`: the request itself reports a bad name or
+/// parent).
 fn settle_target(
     engine: &Shared,
     fs: &Mutex<Filesystem>,
     op: u32,
     inode: u64,
     body: &[u8],
-) -> Result<()> {
+) -> Result<Option<String>> {
     let target = {
         let e = lock_engine(engine);
         let fs = lock(fs);
@@ -1375,9 +1385,12 @@ fn settle_target(
         }
     };
     match target {
-        Ok(path) => crate::runtime::engine::settle_path(engine, &path),
+        Ok(path) => {
+            crate::runtime::engine::settle_path(engine, &path)?;
+            Ok(Some(path))
+        }
         // The request itself reports a bad name or parent.
-        Err(_) => Ok(()),
+        Err(_) => Ok(None),
     }
 }
 /// A `setattr` that changes the size, in the order `dispatch` applies one:
@@ -1391,6 +1404,12 @@ fn setattr_size(
 ) -> Result<Vec<u8>> {
     let valid = u32_at(body, 0)?;
     let size = u64_at(body, 16)?;
+    // The whole request is checked before any part of it applies, as
+    // `dispatch` checks it: an ownership change refuses it unchanged.
+    ensure!(
+        valid & !SETATTR_SUPPORTED == 0,
+        "UNSUPPORTED_POSIX_OWNERSHIP"
+    );
     if valid & 1 != 0 {
         let mut e = lock_engine(engine);
         lock(fs).dispatch(&mut e, 4, inode, &with_valid(body, 1))?;
@@ -1470,5 +1489,30 @@ mod tests {
         assert_eq!(fs.attr(&e, &root).unwrap().len(), 88);
         assert_eq!(fs.entry_out(&e, &root).unwrap().len(), 128);
         assert_eq!(u32_at(&Filesystem::open_out(1, false), 8).unwrap(), 1);
+    }
+    #[test]
+    fn a_size_change_with_an_ownership_change_is_refused_before_anything_applies() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = crate::runtime::Engine::new(Store::open(dir.path(), None).unwrap());
+        let (h, entry) = e.open("f.txt", Some("file"), true).unwrap();
+        e.write(h, 0, b"keep me", false, false).unwrap();
+        e.close(h).unwrap();
+        let before = e.store.lookup("f.txt").unwrap().content;
+        let engine: Shared = Arc::new(Mutex::new(e));
+        let fs = Mutex::new(Filesystem::new());
+        let inode = lock(&fs).inode(&entry.id);
+        // `fuse_setattr_in`: a truncate to 0 (`FATTR_SIZE`) with a uid
+        // (`FATTR_UID`), no file handle.
+        let mut body = vec![0u8; 88];
+        body[..4].copy_from_slice(&((1u32 << 3) | (1 << 1)).to_ne_bytes());
+        let error = setattr_size(&engine, &fs, inode, &body).unwrap_err();
+        assert!(format!("{error:#}").contains("UNSUPPORTED_POSIX_OWNERSHIP"));
+        let e = lock_engine(&engine);
+        assert_eq!(
+            e.store.lookup("f.txt").unwrap().content,
+            before,
+            "nothing was truncated or saved"
+        );
+        assert!(e.handles.is_empty() && e.sessions.is_empty());
     }
 }

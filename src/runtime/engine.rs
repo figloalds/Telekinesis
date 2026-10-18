@@ -78,10 +78,13 @@
 //! a closed file is saved in the background ([`save_handle_in_background`],
 //! WinFsp cleanup and FUSE flush): a bounded pool of saver threads commits it
 //! shortly after the close, giving the engine to filesystem callbacks first
-//! ([`foreground`]); a delete or a rename over a closed file waits for its
-//! save ([`settle_entity`]), and `quiet()` counts it as unsaved until it is
-//! committed. The availability rows of saved objects are written on a
-//! connection of their own, in batches ([`AvailabilityNotes`]).
+//! ([`foreground`]); with their queue full a close saves before it returns
+//! (backpressure: closed files not committed yet are at most
+//! [`MAX_QUEUED_SAVES`] + [`MAX_BACKGROUND_SAVES`]); a delete or a rename over
+//! a closed file waits for its save ([`settle_entity`], [`lock_settled`]),
+//! and `quiet()` counts it as unsaved until it is committed. The
+//! availability rows of saved objects are written on a connection of their
+//! own, in batches ([`AvailabilityNotes`]).
 //!
 //! **Deferred creates (WP5.2).** A file created through the WinFsp mount
 //! ([`Engine::create_deferred`]) is not committed when it is created: its
@@ -894,15 +897,15 @@ impl Engine {
                     pending.stage
                 )
             })?;
-        if self.store.entry(&pending.entry.id).is_err() {
+        if !self.is_committed(&pending.entry.id)? {
             // A deferred create retained before its first commit (module
             // docs, *Deferred creates*): visible again, committed by its save.
-            if let Ok(key) = name_key(&pending.entry.name) {
-                self.pending_creates.insert(
-                    (pending.entry.parent.clone(), key),
-                    pending.entry.id.clone(),
-                );
-            }
+            let key = name_key(&pending.entry.name)
+                .context("RECOVERY_REQUIRED: the unsaved new file's name is not valid")?;
+            self.pending_creates.insert(
+                (pending.entry.parent.clone(), key),
+                pending.entry.id.clone(),
+            );
         }
         self.sessions.insert(
             pending.entry.id.clone(),
@@ -920,6 +923,20 @@ impl Engine {
             },
         );
         Ok(())
+    }
+    /// Whether the active view has `entity`. `Ok(false)` only when it does
+    /// not: a failure to read the view is an error, never taken for a
+    /// deferred create (which would commit an existing entity's kind,
+    /// location and content again, with no parents).
+    fn is_committed(&self, entity: &str) -> Result<bool> {
+        match self.store.entry(entity) {
+            Ok(_) => Ok(true),
+            // `Store::entry`'s own answer for an entity the view lacks.
+            Err(error) if error.chain().count() == 1 && error.to_string() == "FILE_NOT_FOUND" => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
     /// Records that `entity`'s pending save (`record`) could not be restored
     /// (again).
@@ -1367,7 +1384,9 @@ impl Engine {
             None
         };
         let preserve_times = self.sessions[entity].preserve_times;
-        let deferred = self.store.entry(entity).is_err();
+        // A deferred create's first save (registered by `create_deferred` and
+        // `restore_pending`), never an entity whose view could not be read.
+        let deferred = self.is_deferred(entity);
         let result = (|| {
             crate::util::fault::trigger("engine.save.commit")?;
             let revision = if deferred {
@@ -1636,10 +1655,20 @@ impl Engine {
         );
         Ok(children)
     }
-    /// The size the mount shows for `entry`: an open session's bytes, else
-    /// its object's size.
+    /// Whether a deferred create not committed yet is in `directory`.
+    fn has_deferred_children(&self, directory: &str) -> bool {
+        self.pending_creates
+            .range((directory.to_owned(), String::new())..)
+            .next()
+            .is_some_and(|((parent, _), _)| parent == directory)
+    }
+    /// The size the mount shows for `entry` (lookups, directory listings):
+    /// an unsaved session's bytes (a deferred create, a file being written,
+    /// a closed file still being saved in the background), else its
+    /// committed object's size. The times shown stay the committed ones
+    /// until the save commits (its write time is the commit's).
     pub fn visible_size(&self, entry: &Entry) -> Result<usize> {
-        if let Some(session) = self.sessions.get(&entry.id) {
+        if let Some(session) = self.sessions.get(&entry.id).filter(|s| s.dirty) {
             return Ok(session.bytes.len());
         }
         Ok(entry
@@ -1996,17 +2025,8 @@ impl Engine {
             cut.push((directory, 0));
             cut.push((parent, 0));
             for entry in children {
-                let size = if self.is_deferred(&entry.id) {
-                    self.sessions[&entry.id].bytes.len() as u64
-                } else {
-                    entry
-                        .content
-                        .as_ref()
-                        .map(|object| self.store.object_size(object))
-                        .transpose()?
-                        .unwrap_or(0)
-                };
-                cut.push((entry, usize::try_from(size)?));
+                let size = self.visible_size(&entry)?;
+                cut.push((entry, size));
             }
             self.handles.get_mut(&h).unwrap().directory = Some(cut);
         }
@@ -2178,6 +2198,11 @@ impl Engine {
                 .context("INVALID_HANDLE")?
                 .entity
                 .clone();
+            // `Store::delete` sees only committed children; a file created
+            // in the directory and not committed yet (module docs, *Deferred
+            // creates*) keeps it too, or its first save would commit it into
+            // a deleted directory.
+            ensure!(!self.has_deferred_children(&entity), "DIRECTORY_NOT_EMPTY");
             self.store.delete(&entity)?;
         }
         self.handles.get_mut(&h).context("INVALID_HANDLE")?.cleaned = true;
@@ -2220,15 +2245,20 @@ impl Engine {
             self.health.as_deref().unwrap_or("healthy")
         )
     }
-    /// Dirty sessions no handle holds whose save a background saver runs or
-    /// has queued: files closed through the mount, being saved.
+    /// Dirty sessions whose save runs or a background saver has queued and
+    /// that the application no longer writes (every handle of it is cleaned
+    /// up, a WinFsp handle that only awaits its `Close` too, or none is
+    /// left): files closed through the mount, being saved.
     pub fn settling(&self) -> usize {
         self.sessions
             .iter()
             .filter(|(entity, s)| {
                 s.dirty
                     && (s.saving || s.queued)
-                    && !self.handles.values().any(|h| &h.entity == *entity)
+                    && !self
+                        .handles
+                        .values()
+                        .any(|h| &h.entity == *entity && !h.cleaned)
             })
             .count()
     }
@@ -2726,22 +2756,36 @@ pub fn lock_for_write(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
     }
 }
 
-/// Waits (without the engine lock) until no save of handle `h`'s file runs
-/// while that file is a deferred create (module docs, *Deferred creates*),
-/// then returns the engine locked: the caller's inline save
-/// ([`Engine::flush`]) commits the creation before a rename or a delete of
-/// the file. Bounded only by the saves themselves.
-pub fn lock_created(engine: &Shared, h: u64) -> super::EngineGuard<'_> {
+/// Waits (without the engine lock) until no save runs of handle `source`'s
+/// file nor of the entry at `target` (a rename's target, a removed entry's
+/// path), then returns the engine locked, for a namespace operation that
+/// deletes, renames or replaces them: a delete on close, a rename, an
+/// unlink. Under that lock no save of them can begin, so a save never
+/// commits its content (and `alive`) after the delete, which would bring
+/// the file back or make a conflict of it, and a deferred create is
+/// committed by the caller's inline save ([`Engine::flush`],
+/// [`Engine::commit_created_at`]) before its name changes (module docs,
+/// *Deferred creates*). The caller settled them first ([`settle_entity`]);
+/// this closes the window in which another close starts a save after that.
+/// Bounded only by the saves themselves.
+pub fn lock_settled<'a>(
+    engine: &'a Shared,
+    source: Option<u64>,
+    target: Option<&str>,
+) -> super::EngineGuard<'a> {
     loop {
         let e = super::lock_engine(engine);
-        let Some(seen) = e
-            .session(h)
-            .ok()
-            .filter(|s| s.saving && e.is_deferred(&s.entry.id))
-            .map(|_| e.saves.generation())
-        else {
+        let saving = |entity: &str| e.sessions.get(entity).is_some_and(|s| s.saving);
+        let busy = source
+            .and_then(|h| e.handles.get(&h))
+            .is_some_and(|handle| saving(&handle.entity))
+            || target
+                .and_then(|path| e.lookup_visible(path).ok())
+                .is_some_and(|entry| saving(&entry.id));
+        if !busy {
             return e;
-        };
+        }
+        let seen = e.saves.generation();
         let signal = e.save_signal();
         drop(e);
         signal.wait_past(seen, SAVE_WAIT_SLICE);
@@ -2754,10 +2798,14 @@ const SAVE_WAIT_SLICE: Duration = Duration::from_millis(100);
 /// Background saver threads at most, in this process
 /// ([`save_handle_in_background`], a close, the pending-save retry).
 pub const MAX_BACKGROUND_SAVES: usize = 8;
-/// Closed files waiting for a background saver at most. Past it a close
-/// leaves its file to the savers' sweep ([`orphan_dirty`]). With the savers
-/// it bounds what a hard crash (power loss, a killed process) can lose of
-/// files that were closed but not committed yet.
+/// Closed files waiting for a background saver at most. With the queue full
+/// a close saves its file before it returns, as a lone close does
+/// (backpressure: [`save_handle_in_background`], [`close_handle`]), so the
+/// files a close has returned for and that are not committed yet are the
+/// queued ones and those the savers are saving: at most
+/// `MAX_QUEUED_SAVES + MAX_BACKGROUND_SAVES`. That bounds what a hard crash
+/// (power loss, a killed process) can lose of closed files (a failed save is
+/// retained in `pending_saves`, which a crash does not lose).
 pub const MAX_QUEUED_SAVES: usize = 64;
 /// A background save commits at least this long after it stored the bytes:
 /// an on-access scanner scans the object file just written, and the
@@ -2824,6 +2872,8 @@ fn note_save_end() {
 /// delete) never waits for it; in a burst (a copy, a build) the saves overlap
 /// the application's next files, and what follows the burst may find files
 /// still being saved for a few milliseconds (refused `BUSY_VIEW`, retried).
+/// A close in a burst that finds the savers' queue full saves before it
+/// returns, like a lone close ([`save_handle_in_background`]).
 pub fn write_behind() -> bool {
     if background_saves() > 0 {
         return true;
@@ -2844,7 +2894,8 @@ pub fn background_saves() -> usize {
 }
 
 /// Queues the save of `entity` for a background saver; `false` when the
-/// queue is full (the savers' sweep picks the file up later).
+/// queue is full: a close then saves the file itself ([`queue_or_save`]),
+/// the pending-save retry leaves it to the savers' sweep ([`orphan_dirty`]).
 fn schedule(engine: &Shared, entity: String) -> bool {
     let savers = savers();
     let mut state = crate::util::lock::lock(&savers.state);
@@ -2954,8 +3005,12 @@ fn yield_to_foreground() {
 /// of handle `h` is dirty and no save of it runs, it is queued for a
 /// background saver and this returns at once, so the application's close
 /// does not wait for the hashing, copying and commits (module docs, *Saves
-/// off the engine lock*). With the queue full, a saver's sweep picks it up.
-/// Until it is committed the session is a dirty session like any other:
+/// off the engine lock*). With the queue full ([`MAX_QUEUED_SAVES`]) the
+/// file is saved here, without the engine lock, before this returns
+/// (backpressure: an application closing files faster than the savers
+/// commit them waits for its saves, and the closed files not committed yet
+/// stay bounded). Until it is committed the session is a dirty session like
+/// any other:
 /// reads see its bytes, a graceful stop or detach waits for it (`quiet`), a
 /// forced one or a poison exit retains it (invariant 8), and a flush
 /// (`FlushFileBuffers`, `fsync`) waits for it ([`save_handle`]). A failed
@@ -2973,18 +3028,21 @@ pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
         }
         entity
     };
-    queue(engine, entity);
-    Ok(())
+    queue_or_save(engine, entity)
 }
 
-/// [`schedule`]s the save of `entity`, marked `queued` by the caller; a full
-/// queue clears the mark (the savers' sweep picks the file up).
-fn queue(engine: &Shared, entity: String) {
-    if !schedule(engine, entity.clone())
-        && let Some(session) = super::lock_engine(engine).sessions.get_mut(&entity)
-    {
+/// [`schedule`]s the save of `entity`, marked `queued` by the caller. With
+/// the queue full the mark is cleared and the file is saved now, by the
+/// caller, without the engine lock ([`save_entity`]; backpressure, see
+/// [`MAX_QUEUED_SAVES`]).
+fn queue_or_save(engine: &Shared, entity: String) -> Result<()> {
+    if schedule(engine, entity.clone()) {
+        return Ok(());
+    }
+    if let Some(session) = super::lock_engine(engine).sessions.get_mut(&entity) {
         session.queued = false;
     }
+    save_entity(engine, &entity)
 }
 
 /// A dirty session no save covers and the application no longer writes:
@@ -3076,10 +3134,10 @@ pub fn settle_handle(engine: &Shared, h: u64) -> Result<()> {
 
 /// Closes handle `h` (WinFsp close, FUSE release): removes the handle and,
 /// when its session is dirty, no save of it runs and its pending-save
-/// backoff is due, queues its save for a background saver (with the queue
-/// full, a saver's sweep picks it up). The close itself
-/// never saves: a WinFsp close holds the application's `CloseHandle` until
-/// it answers (measured: a save in it cost the application the whole save).
+/// backoff is due, queues its save for a background saver. The close saves
+/// only when that queue is full (backpressure, [`MAX_QUEUED_SAVES`]): a
+/// WinFsp close holds the application's `CloseHandle` until it answers
+/// (measured: a save in it cost the application the whole save).
 pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
     let unsaved = {
         let mut e = super::lock_engine(engine);
@@ -3105,10 +3163,10 @@ pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
         }
         unsaved
     };
-    if let Some(entity) = unsaved {
-        queue(engine, entity);
+    match unsaved {
+        Some(entity) => queue_or_save(engine, entity),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Opens the transaction that commits a retained save (`SAVEPOINT staged_save`)

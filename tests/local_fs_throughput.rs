@@ -522,6 +522,251 @@ fn a_delete_or_a_rename_over_a_closed_file_waits_for_its_save() {
     }
 }
 
+#[test]
+fn closes_past_a_full_save_queue_save_before_they_return() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    lock(&engine).store.create("d", "directory").unwrap();
+    // Every save's store phase is slowed down: the savers fall behind the
+    // closes (files created as the mount creates them, committed by their
+    // first save), and their queue fills up.
+    let slow = Duration::from_millis(200);
+    fault::configure(Some(FaultConfig {
+        ms: Some(slow.as_millis() as u64),
+        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
+    }));
+    let disarm = Disarm;
+    let bound = engine::MAX_QUEUED_SAVES + engine::MAX_BACKGROUND_SAVES;
+    let mut written = BTreeMap::new();
+    let (mut most, mut waited) = (0, 0);
+    for i in 0..bound + 40 {
+        let path = format!("d/f{i:03}.bin");
+        let data = bytes(7000 + i as u64, 1024 + i * 37);
+        let h = {
+            let mut e = lock(&engine);
+            let (h, _) = e.create_deferred(&path, true, None).unwrap();
+            e.write(h, 0, &data, false, false).unwrap();
+            e.cleanup_unsaved(h).unwrap();
+            h
+        };
+        let closing = Instant::now();
+        engine::save_handle_in_background(&engine, h).unwrap();
+        engine::close_handle(&engine, h).unwrap();
+        if closing.elapsed() >= slow {
+            waited += 1;
+        }
+        written.insert(path, data);
+        // Every file the application closed and that is not committed yet
+        // is queued or being saved by a saver: bounded.
+        let unsaved = lock(&engine).sessions.values().filter(|s| s.dirty).count();
+        assert!(
+            unsaved <= bound,
+            "close {i}: {unsaved} closed files not committed, more than {bound}"
+        );
+        most = most.max(unsaved);
+    }
+    assert!(
+        most >= engine::MAX_QUEUED_SAVES,
+        "the savers' queue filled up (at most {most} closed files unsaved)"
+    );
+    assert!(
+        waited > 0,
+        "a close past the full queue saved before it returned"
+    );
+    drop(disarm);
+    assert!(
+        wait_until(Duration::from_secs(60), || lock(&engine).quiet().is_ok()),
+        "every closed file is committed"
+    );
+    assert!(wait_until(
+        Duration::from_secs(5),
+        || engine::background_saves() == 0
+    ));
+    let e = lock(&engine);
+    for (path, data) in &written {
+        assert_eq!(&content(&e, path), data, "{path}");
+    }
+    assert!(pending_rows(&e).is_empty());
+    no_conflicts(&e);
+}
+
+/// A save of `path` in flight, as a background save that began after a
+/// delete or a rename settled the file: written, closed, snapshotted.
+fn save_in_flight(engine: &Shared, path: &str, data: &[u8]) -> (String, runtime::engine::SaveJob) {
+    let mut e = lock(engine);
+    let entity = committed_file(&mut e, path, b"v1");
+    let (h, _) = e.open(path, None, true).unwrap();
+    e.write(h, 0, data, false, false).unwrap();
+    e.cleanup_unsaved(h).unwrap();
+    let job = started(e.begin_save(&entity).unwrap());
+    e.release_handle(h).unwrap();
+    (entity, job)
+}
+
+/// Runs `apply` on another thread while `job` is in flight: it must wait
+/// for the save, and go on once the save is committed.
+fn applied_after_the_save(
+    engine: &Shared,
+    job: runtime::engine::SaveJob,
+    apply: impl FnOnce(&Shared) + Send + 'static,
+) {
+    let done = Arc::new(Mutex::new(false));
+    let waiter = {
+        let (engine, done) = (engine.clone(), done.clone());
+        std::thread::spawn(move || {
+            apply(&engine);
+            *done.lock().unwrap() = true;
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!*done.lock().unwrap(), "it waits for the save in flight");
+    let stored = engine::store_snapshot(&job);
+    lock(engine).finish_save(job, stored).unwrap();
+    waiter.join().unwrap();
+    assert!(*done.lock().unwrap());
+}
+
+#[test]
+fn a_delete_or_a_rename_over_a_file_waits_for_a_save_of_it_that_began_after_the_settle() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    // A delete on close (WinFsp cleanup with delete).
+    let (doomed, job) = save_in_flight(&engine, "doomed.txt", b"v2");
+    let h = lock(&engine).open("doomed.txt", None, false).unwrap().0;
+    applied_after_the_save(&engine, job, move |engine| {
+        let mut e = engine::lock_settled(engine, Some(h), None);
+        e.cleanup(h, true).unwrap();
+        e.close(h).unwrap();
+    });
+    // A rename over a file (WinFsp rename with replace, FUSE rename).
+    let (replaced, job) = save_in_flight(&engine, "target.txt", b"replaced");
+    let source = committed_file(&mut lock(&engine), "source.txt", b"replacement");
+    let moved = source.clone();
+    applied_after_the_save(&engine, job, move |engine| {
+        let mut e = engine::lock_settled(engine, None, Some("target.txt"));
+        e.store.rename(&moved, "target.txt", true).unwrap();
+    });
+    let mut e = lock(&engine);
+    assert!(e.store.lookup("doomed.txt").is_err(), "stays deleted");
+    assert!(!e.store.entry(&doomed).unwrap().alive);
+    assert_eq!(content(&e, "target.txt"), b"replacement");
+    assert_eq!(e.store.lookup("target.txt").unwrap().id, source);
+    assert!(!e.store.entry(&replaced).unwrap().alive, "stays replaced");
+    assert!(e.quiet().is_ok());
+    no_conflicts(&e);
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
+#[test]
+fn a_directory_holding_an_uncommitted_new_file_is_not_deleted_on_close() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    e.store.create("d", "directory").unwrap();
+    let (hd, directory) = e.open("d", None, false).unwrap();
+    let (hf, _) = e.create_deferred("d/new.txt", true, None).unwrap();
+    e.write(
+        hf,
+        0,
+        b"created after the directory's CanDelete",
+        false,
+        false,
+    )
+    .unwrap();
+    assert!(
+        format!("{:#}", e.cleanup(hd, true).unwrap_err()).contains("DIRECTORY_NOT_EMPTY"),
+        "a new file not committed yet keeps its directory"
+    );
+    assert!(e.store.entry(&directory.id).unwrap().alive);
+    e.close(hd).unwrap();
+    e.close(hf).unwrap();
+    assert_eq!(
+        content(&e, "d/new.txt"),
+        b"created after the directory's CanDelete"
+    );
+    assert!(e.quiet().is_ok());
+    no_conflicts(&e);
+    let diff = e.store.verify_derived_state().unwrap();
+    assert!(diff.is_empty(), "{diff:?}");
+}
+
+#[test]
+fn a_file_still_being_saved_is_listed_with_its_new_size() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
+    e.store.create("d", "directory").unwrap();
+    let entity = committed_file(&mut e, "d/f.bin", b"0123456789");
+    let data = bytes(77, 5000);
+    let (h, _) = e.open("d/f.bin", None, true).unwrap();
+    e.write(h, 0, &data, false, false).unwrap();
+    e.cleanup_unsaved(h).unwrap();
+    // Closed, its save in flight (a background save).
+    let job = started(e.begin_save(&entity).unwrap());
+    let (hd, _) = e.open("d", None, false).unwrap();
+    let listed = |e: &mut Engine| {
+        (0..)
+            .map_while(|ordinal| e.directory_entry(hd, ordinal, ordinal == 0).unwrap())
+            .find(|(entry, _)| entry.id == entity)
+            .map(|(_, size)| size)
+    };
+    assert_eq!(
+        listed(&mut e),
+        Some(data.len()),
+        "the new size, not the committed one"
+    );
+    let entry = e.lookup_visible("d/f.bin").unwrap();
+    assert_eq!(e.visible_size(&entry).unwrap(), data.len());
+    let stored = engine::store_snapshot(&job);
+    e.finish_save(job, stored).unwrap();
+    assert_eq!(listed(&mut e), Some(data.len()));
+    e.close(h).unwrap();
+    e.close(hd).unwrap();
+    assert_eq!(content(&e, "d/f.bin"), data);
+    no_conflicts(&e);
+}
+
+#[test]
+fn a_closed_file_whose_handle_awaits_its_close_counts_as_settling() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let engine = shared(dir.path());
+    fault::configure(Some(FaultConfig {
+        ms: Some(400),
+        count: Some(1),
+        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
+    }));
+    let _disarm = Disarm;
+    let h = {
+        let mut e = lock(&engine);
+        let (h, _) = e.open("f.bin", Some("file"), true).unwrap();
+        e.write(h, 0, b"closed, not yet Closed", false, false)
+            .unwrap();
+        e.cleanup_unsaved(h).unwrap();
+        h
+    };
+    engine::save_handle_in_background(&engine, h).unwrap();
+    {
+        let e = lock(&engine);
+        // A WinFsp handle cleaned up and awaiting its `Close`: the graceful
+        // detach's fence waits for this save as long as for any other.
+        assert!(e.handles.contains_key(&h));
+        assert_eq!(
+            e.settling(),
+            1,
+            "queued or being saved, with a cleaned handle"
+        );
+    }
+    engine::close_handle(&engine, h).unwrap();
+    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
+        .quiet()
+        .is_ok()));
+    assert_eq!(content(&lock(&engine), "f.bin"), b"closed, not yet Closed");
+}
+
 /// Simulates a download of `object` into `state`: its spool grows by
 /// `step` bytes every `every` for `steps` steps, then the object is
 /// installed (verified) and the spool removed.
