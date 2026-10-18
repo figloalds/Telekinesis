@@ -1042,12 +1042,55 @@ impl Store {
     /// mtime read before hashing.
     fn verify_existing(&self, object: &str) -> Result<()> {
         let path = self.root.join("objects").join(object);
+        // No later than the `stat` (`commit::verified::note`).
+        let observed = super::commit::verified::now_ns();
         let before = fs::metadata(&path).ok();
         self.verify_object(object)?;
         if let Some(metadata) = before {
-            self.note_available(object, metadata.len(), mtime_ns(&metadata), time());
+            self.note_verified(object, metadata.len(), mtime_ns(&metadata), observed);
         }
         Ok(())
+    }
+    /// A verification or an install by this store, of `object` whose file
+    /// had `size` bytes and mtime `mtime_ns` as `stat` read them no earlier
+    /// than `observed_ns`: recorded in `check_commit`'s verified set
+    /// (CCR-WP5.1-1, applied by WP5.INT; nothing when it is racy, and an
+    /// installed object's stamp never is), then as available. The row is
+    /// object bookkeeping, not projection state, so the handle's view stays
+    /// fresh across it (CCR-WP5.2-2): on the engine's connection it made the
+    /// next commit reload the whole projection.
+    fn note_verified(&self, object: &str, size: u64, mtime_ns: i64, observed_ns: i64) {
+        super::commit::verified::note(&self.root, object, size, mtime_ns, observed_ns);
+        self.keeping_view(|| self.note_available(object, size, mtime_ns, time()));
+    }
+    /// Runs `write`, which changes no projection row (object bookkeeping:
+    /// availability, demand), keeping the handle's view fresh across it, as
+    /// the inbox's bookkeeping does (`keep_view` / `rekey_view`; WP5.INT).
+    /// Best effort: a view in use is left to its own freshness check.
+    pub(crate) fn keeping_view<T>(&self, write: impl FnOnce() -> T) -> T {
+        let kept = if self.view_cache.try_borrow_mut().is_ok() {
+            self.keep_view()
+        } else {
+            None
+        };
+        let result = write();
+        if kept.is_some() && self.view_cache.try_borrow_mut().is_ok() {
+            self.rekey_view(kept);
+        }
+        result
+    }
+    /// Records that a caller found the installed copy of `object` corrupt,
+    /// without hashing it again (CCR-WP5.2-7, applied by WP5.INT): the copy
+    /// a save hashed off the engine lock (`runtime::engine::store_snapshot`),
+    /// whose file had `len` bytes and mtime `mtime_ns` when it was hashed.
+    /// What [`Store::verify_object`] records for a mismatch (`CORRUPT`, no
+    /// longer served), only while the file is still that copy: a copy
+    /// installed or healed since is left to its own verification.
+    pub(crate) fn note_corrupt_copy(&self, object: &str, len: u64, mtime_ns: i64) {
+        let path = self.root.join("objects").join(object);
+        if fs::metadata(&path).is_ok_and(|m| m.len() == len && self::mtime_ns(&m) == mtime_ns) {
+            self.note_corrupt(object, len);
+        }
     }
     pub fn put_stream(&self, source: &mut impl Read) -> Result<String> {
         let temp = self.root.join("objects").join(format!("{}.part", id()));
@@ -1082,7 +1125,7 @@ impl Store {
             } else {
                 install_object(&temp, &dest)?;
                 fault("object_installed");
-                self.note_available(&object, size, mtime, time());
+                self.note_verified(&object, size, mtime, super::commit::verified::now_ns());
             }
             Ok(object)
         })();
@@ -1112,7 +1155,12 @@ impl Store {
         // MoveFileExW WRITE_THROUGH below supplies the Windows rename barrier.
         install_object(&temp, &dest)?;
         fault("object_installed");
-        self.note_available(&object, bytes.len() as u64, mtime, time());
+        self.note_verified(
+            &object,
+            bytes.len() as u64,
+            mtime,
+            super::commit::verified::now_ns(),
+        );
         Ok(object)
     }
     /// Shareable and available objects: one SQL join over the grants, the
@@ -1222,6 +1270,8 @@ fn served() -> std::sync::MutexGuard<'static, ServedMap> {
 /// corrupt or missing, or quarantined).
 fn forget_served(root: &Path, object: &str) {
     served().remove(&(root.to_path_buf(), object.to_owned()));
+    // And `check_commit`'s record of a recent verification (WP5.INT).
+    super::commit::verified::forget(root, object);
 }
 
 impl Store {

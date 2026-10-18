@@ -246,6 +246,17 @@ pub mod verified {
         );
     }
 
+    /// Drops what is recorded of `hash` under `root`: a later verification
+    /// found its bytes corrupt or missing, or they were quarantined
+    /// (WP5.INT, the WP5.1 review's minor; `objects::forget_served` calls
+    /// it, so the set never outlives what the index says).
+    pub fn forget(root: &Path, hash: &str) {
+        entries()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(root.to_owned(), hash.to_owned()));
+    }
+
     /// Whether `hash` under `root` was verified within [`FRESH_MS`] with the
     /// file at `len` bytes and mtime `mtime_ns`.
     pub fn recent(root: &Path, hash: &str, len: u64, mtime_ns: i64) -> bool {
@@ -721,13 +732,20 @@ impl Store {
         let before = fs::metadata(&path).ok();
         if let Some(metadata) = &before {
             let (len, mtime) = (metadata.len(), objects::mtime_ns(metadata));
-            if verified::recent(&self.root, object, len, mtime) {
+            // The index first (WP5.INT, the WP5.1 review's minor): a row
+            // that a later verification left `CORRUPT` or `MISSING` wins over
+            // the in-memory set, as it does over the served cache.
+            let row = self.availability_row(object)?;
+            if row.is_none_or(|row| row.state == objects::AVAILABLE)
+                && verified::recent(&self.root, object, len, mtime)
+            {
                 verified::count_skip();
                 return Ok(());
             }
-            // The install marker this process's `put_object` / `put_stream`
-            // left (the adapter of CCR-WP5.1-1); `trusted` is not racy.
-            let row = self.availability_row(object)?.filter(|row| {
+            // An install marker of this process (`put_object`, `put_stream`,
+            // and the engine's saves record their verifications in the set
+            // too, CCR-WP5.1-1); `trusted` is not racy.
+            let row = row.filter(|row| {
                 row.trusted(len, mtime) && verified::fresh_row(row.verified_ms, time())
             });
             if let Some(row) = row {
@@ -1017,7 +1035,7 @@ impl Store {
     /// The branch's projection as this handle's fresh view (loaded if
     /// needed) and its slots, taken out of the view cache; `None` when it
     /// cannot be read.
-    fn take_view(&self, branch: &str) -> Option<(Projection, ViewSlots)> {
+    fn take_view(&self, branch: &str) -> Option<ViewCache> {
         self.drop_rolled_back_view();
         if self.view(branch).is_err() {
             return None;
@@ -1027,7 +1045,18 @@ impl Store {
             .ok()?
             .take()
             .filter(|view| view.branch == branch)
-            .map(|view| (view.projection, view.slots))
+    }
+    /// Puts back a view [`Self::take_view`] took and nothing used (WP5.INT,
+    /// the WP5.1 review's minor: a declined `project_append` left the next
+    /// reader an O(entries) reload). Its freshness key is the one it was
+    /// taken with, which the next `view` checks as usual; a view cached
+    /// meanwhile wins.
+    fn restore_view(&self, view: ViewCache) {
+        if let Ok(mut cache) = self.view_cache.try_borrow_mut()
+            && cache.is_none()
+        {
+            *cache = Some(view);
+        }
     }
     /// `projection_delta` for a projection `derive::project_append` made from
     /// the stored one: it knows the entities that changed and whether the
@@ -1077,13 +1106,19 @@ impl Store {
         precompute: bool,
     ) -> Result<Option<Box<SlowPlan>>> {
         let branch = event.branch.id.as_str();
+        // Full mode stays the reference: it projects the branch in full, as
+        // it derives it in full, so it leaves the view where it is.
+        let full_mode = derive::conflict_mode() == derive::ConflictMode::Full;
         // The stored projection of the branch, as this handle's view: the
         // base of `derive::project_append` (WP5.1). It is consumed; a
-        // committing slow commit leaves its own projection as the view.
-        let (base, base_slots) = match self.take_view(branch) {
-            Some((base, slots)) => (Some(base), Some(slots)),
-            None => (None, None),
+        // committing slow commit leaves its own projection as the view, and
+        // a declined append hands it back to the view cache (WP5.INT).
+        let mut view = if full_mode {
+            None
+        } else {
+            self.take_view(branch)
         };
+        let base = view.as_mut().map(|v| std::mem::take(&mut v.projection));
         let computed =
             self.with_branch_index(branch, Some(event), committed_view, |events, index| {
                 let new = events.len() - 1;
@@ -1091,16 +1126,16 @@ impl Store {
                 if let Some(cell) = index {
                     derive::ensure_index(cell, &events[..new]);
                 }
-                // Full mode stays the reference: it projects the branch in
-                // full, as it derives it in full.
-                let full_mode = derive::conflict_mode() == derive::ConflictMode::Full;
-                let appended = match base {
-                    Some(base) if !full_mode => {
+                let (appended, returned) = match base {
+                    Some(base) => {
                         let index = index.map(|cell| cell.borrow());
                         let index = index.as_deref().and_then(Option::as_ref);
-                        derive::project_append(branch, base, events, new, index)?
+                        match derive::project_append_or_base(branch, base, events, new, index)? {
+                            Ok(appended) => (Some(appended), None),
+                            Err(base) => (None, Some(base)),
+                        }
                     }
-                    _ => None,
+                    None => (None, None),
                 };
                 let (projection, delta, fresh) = match appended {
                     Some(appended) => (
@@ -1125,7 +1160,7 @@ impl Store {
                     );
                 }
                 if !projection.pending.is_empty() {
-                    return Ok(None);
+                    return Ok((None, returned));
                 }
                 let reviewed = derive::read_reviewed(&self.db, branch, event)?;
                 let derived = derive_conflicts(&DeriveInput {
@@ -1137,8 +1172,18 @@ impl Store {
                         fresh: fresh.as_ref(),
                         index,
                     })?;
-                Ok::<_, anyhow::Error>(Some((projection, derived, delta)))
+                Ok::<_, anyhow::Error>((Some((projection, derived, delta)), returned))
             })??;
+        let (computed, returned) = computed;
+        if let Some(base) = returned
+            && let Some(mut taken) = view.take()
+        {
+            // Declined: the base is the view it was, for `projection_delta`
+            // below and the next reader.
+            taken.projection = base;
+            self.restore_view(taken);
+        }
+        let base_slots = view.map(|v| v.slots);
         let Some((projection, derived, delta)) = computed else {
             return Ok(None);
         };
@@ -2504,6 +2549,66 @@ mod tests {
         s.verify_new_object(&object).unwrap();
         assert_eq!(s.object_hashes(), hashes + 3);
         assert!(verified::skipped() > skipped);
+    }
+
+    /// WP5.INT (the WP5.1 review's minor, CCR-WP5.1-1): `put_object` records
+    /// the bytes it installs in the verified set, and a later verification
+    /// that finds them corrupt wins over it: the same process's (`forget`)
+    /// and one whose `CORRUPT` row is all this handle sees (another process:
+    /// the row is read first). The rewrite keeps the size and the stamped
+    /// mtime, so only the index can tell.
+    #[test]
+    fn a_later_corrupt_verdict_wins_over_the_verified_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), None).unwrap();
+        let rewrite = |s: &Store, object: &str, bytes: &[u8]| {
+            let path = s.root.join("objects").join(object);
+            let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+            fs::write(&path, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        };
+        // This process's verification: the installer recorded the bytes.
+        let object = s.put_object(b"original bytes").unwrap();
+        let hashes = s.object_hashes();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes, "the install was recorded");
+        rewrite(&s, &object, b"Original bytes");
+        assert!(s.verify_object(&object).is_err());
+        let refused = s.verify_new_object(&object).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("CORRUPT_OBJECT"),
+            "{refused:#}"
+        );
+        // Another process's verdict: only its row.
+        let object = s.put_object(b"second bytes").unwrap();
+        s.verify_new_object(&object).unwrap();
+        rewrite(&s, &object, b"Second bytes");
+        s.db.execute(
+            "UPDATE object_availability SET state=?1,verified_ms=0 WHERE hash=?2",
+            params![objects::CORRUPT, object],
+        )
+        .unwrap();
+        let path = s.root.join("objects").join(&object);
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(
+            verified::recent(
+                &s.root,
+                &object,
+                metadata.len(),
+                objects::mtime_ns(&metadata)
+            ),
+            "the set still holds the install"
+        );
+        let refused = s.verify_new_object(&object).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("CORRUPT_OBJECT"),
+            "{refused:#}"
+        );
     }
 
     /// WP4.4 (CCR-WP2.4-2): every seal is written by `snapshot::seal`, so a

@@ -30,10 +30,17 @@ impl Store {
                 .query_row([object], |r| r.get::<_, bool>(0))?,
             "UNREFERENCED_OBJECT"
         );
-        self.db.execute("INSERT INTO object_requests VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET requested_ms=excluded.requested_ms", params![object, time()])?;
-        // A request means a reader found no usable bytes: reconcile the index.
-        self.object_available_for_demand(object);
-        Ok(())
+        // Demand is bookkeeping, not projection state: the handle's view stays
+        // fresh across it (WP5.INT, the WP5.2 review's minor: a read waiting
+        // for a download renews its demand on the engine's connection every
+        // 10 s, and each renewal made the next callback reload the whole
+        // projection under the engine lock).
+        self.keeping_view(|| -> Result<()> {
+            self.db.execute("INSERT INTO object_requests VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET requested_ms=excluded.requested_ms", params![object, time()])?;
+            // A request means a reader found no usable bytes: reconcile the index.
+            self.object_available_for_demand(object);
+            Ok(())
+        })
     }
     /// Objects this replica wants, newest demand first (at most `MAX_WANTED`,
     /// requests younger than `DEMAND_TTL_MS`), excluding available ones (the

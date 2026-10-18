@@ -1529,7 +1529,7 @@ impl Store {
     /// The `data_version` under which the cached view is fresh right now, if
     /// it is. Pair with `rekey_view` around writes that touch no projection
     /// state (inbox rows, object bookkeeping, transaction boundaries).
-    fn keep_view(&self) -> Option<i64> {
+    pub(super) fn keep_view(&self) -> Option<i64> {
         self.adopt_foreign_commits();
         let data_version = self.data_version().ok()?;
         self.view_cache
@@ -1545,7 +1545,7 @@ impl Store {
     /// Re-key a view kept by `keep_view` to the connection's current change
     /// count and transaction state, unless another connection committed in
     /// between (then the view is dropped, exactly as `view` would).
-    fn rekey_view(&self, kept: Option<i64>) {
+    pub(super) fn rekey_view(&self, kept: Option<i64>) {
         let Some(data_version) = kept else {
             return;
         };

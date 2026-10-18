@@ -1131,6 +1131,67 @@ fn common_remote_workloads_take_the_append_path() {
     assert!(b.store().lookup("lin-11.txt").is_err());
 }
 
+/// WP5.INT (the WP5.1 review's minor): a slow commit that does not append
+/// (full mode, or a declined append) leaves the handle's view where it is,
+/// so it loads the stored projection no more often than an appending one
+/// (before: full mode took the view out, dropped it unused and then loaded
+/// it again for its delta, one extra O(entries) load per slow commit).
+#[test]
+fn slow_commits_that_do_not_append_keep_the_view() {
+    let loads = |mode: ConflictMode| -> (u64, usize) {
+        let _mode = ModeGuard::new(mode);
+        let mut a = Replica::new();
+        let mut b = Replica::new();
+        let allowed: BTreeSet<String> = [a.store().device.clone(), b.store().device.clone()].into();
+        let shared = a.store().create("shared.txt", "file").unwrap();
+        for i in 0..20 {
+            a.store()
+                .create(&format!("lin-{i:02}.txt"), "file")
+                .unwrap();
+        }
+        let seed = a.store().shared_bundle(&BTreeSet::new()).unwrap();
+        b.store().receive(seed, &allowed).unwrap();
+        // B's unseen local edit makes every one of A's events a slow commit.
+        let local = b.store().lookup("shared.txt").unwrap();
+        b.store()
+            .write_revision(
+                &shared.id,
+                local.revisions.get("content").cloned(),
+                b"b edit",
+            )
+            .unwrap();
+        let before = b.store().shared_event_inventory().unwrap();
+        for i in 0..12 {
+            a.store()
+                .create(&format!("backlog-{i:02}.txt"), "file")
+                .unwrap();
+        }
+        let mut events = a.store().shared_bundle(&before).unwrap().events;
+        events.sort_by_key(|e| e.created_ms);
+        let count = events.len();
+        // The first delivery warms the view; the rest are measured.
+        let mut events = events.into_iter();
+        b.store()
+            .receive(bundle(vec![events.next().unwrap()]), &allowed)
+            .unwrap();
+        let start = b.store().view_loads();
+        for event in events {
+            b.store().receive(bundle(vec![event]), &allowed).unwrap();
+        }
+        let loads = b.store().view_loads() - start;
+        let diff = oracle(b.store()).unwrap();
+        assert!(diff.is_empty(), "{mode:?}: {diff:#?}");
+        (loads, count - 1)
+    };
+    let (append, measured) = loads(ConflictMode::Append);
+    let (full, _) = loads(ConflictMode::Full);
+    assert!(measured >= 10, "{measured} slow deliveries");
+    assert!(
+        full <= append,
+        "full mode loaded the view {full} times for {measured} slow commits, append mode {append}"
+    );
+}
+
 /// The only precondition failure honest histories produce: a slow-path TRUE
 /// presence assertion that extends a compressed TRUE segment past its rank
 /// extreme displaces an old witness (so full mode would stop enumerating the

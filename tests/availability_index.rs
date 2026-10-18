@@ -1209,3 +1209,48 @@ fn the_cached_want_scan_follows_every_change() {
     assert!(!last.contains(&own) && !last.contains(&backed), "{last:?}");
     assert_eq!(last.len(), 2);
 }
+
+/// WP5.INT (CCR-WP5.2-2, and the WP5.2 review's minor on renewed demand):
+/// installing or deduplicating an object and registering demand write only
+/// object bookkeeping, so the handle's view stays fresh across them; before,
+/// each one moved the connection's `total_changes` and the next lookup
+/// reloaded the whole projection (on the engine's connection: under the
+/// engine lock, once per renewed demand of a waiting read). The view still
+/// follows a real change of the projection.
+#[test]
+fn object_bookkeeping_keeps_the_handles_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::open(dir.path(), None).unwrap();
+    for i in 0..20 {
+        write_file(
+            &mut s,
+            &format!("f{i:02}.txt"),
+            format!("bytes {i}").as_bytes(),
+        );
+    }
+    s.lookup("f00.txt").unwrap();
+    let loads = s.view_loads();
+    let object = s.put_object(b"a new object").unwrap();
+    s.put_object(b"a new object").unwrap();
+    let mut stream: &[u8] = b"a streamed object";
+    s.put_stream(&mut stream).unwrap();
+    let referenced = s.lookup("f01.txt").unwrap().content.unwrap();
+    s.request_object(&referenced).unwrap();
+    s.request_object(&referenced).unwrap();
+    s.lookup("f02.txt").unwrap();
+    assert_eq!(
+        s.view_loads(),
+        loads,
+        "an install, a dedupe or a demand reloaded the view"
+    );
+    assert!(requested(&s, &referenced));
+    assert_eq!(availability_state(&s, &object), Some(AVAILABLE));
+    // A real change is still seen.
+    write_file(&mut s, "f03.txt", b"changed");
+    let entry = s.lookup("f03.txt").unwrap();
+    assert_eq!(
+        s.read_object(entry.content.as_ref().unwrap()).unwrap(),
+        b"changed"
+    );
+    assert!(s.lookup("f99.txt").is_err());
+}
