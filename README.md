@@ -31,6 +31,7 @@ Contents:
 - [Error classes and what to do](#error-classes-and-what-to-do)
 - [Runbooks](#runbooks)
 - [Filesystem behaviour](#filesystem-behaviour)
+- [Known limitations](#known-limitations)
 - [Building](#building)
 - Reference: [CLI](docs/CLI.md), [configuration](docs/CONFIGURATION.md),
   [architecture](docs/ARCHITECTURE.md), [Linux](docs/LINUX.md),
@@ -400,7 +401,7 @@ up`, `last exchange`.
 |---|---|---|
 | `online for …` | `Online` | At least one lane (or one inbound session) is up. |
 | `connecting` | `Connecting…` | Dialing or authenticating. |
-| `backing off (retry in …)` | `Backoff (retry in 12 s)` | Every lane waits to redial after a failure (1 s doubling up to 60 s, reset after 30 s connected). |
+| `backing off (retry in …)` | `Backoff (retry in 12 s)` | Every lane waits to redial after a failure (1 s doubling up to 60 s, reset after 5 s connected). After the network drops (a connection that had been up for 5 s is lost), the peer's lanes redial on one shared schedule instead: about once a second for the first 30 s, then less often as the outage gets older (1.5 s at 45 s, 4 s at 2 min, once a minute after 30 min), and as soon as one lane is back the others follow at once. |
 | `offline for …` | `Offline N min` | No lane and no inbound session. |
 | `needs upgrade (incompatible protocol)` | `Peer needs upgrade` | The peer runs the previous release or an incompatible protocol; rechecked every 10 min. |
 | `unauthorized: pair again with the current code` | `Unauthorized — re-pair` | The peer refused our pairing code or our per-peer credential (code rotated or wrong, credential revoked); rechecked every 60 s. |
@@ -456,12 +457,16 @@ folder.
 
 The gate is about metadata: once it opens, the mount lists every file with
 its size, while file content may still be downloading. Opening such a file
-moves its download to the front; a read waits for the whole object for up to
-15 s and then fails as offline (Windows: `STATUS_FILE_IS_OFFLINE`, which
-many programs report as "invalid argument"; Linux: `EAGAIN`). Reading it
-again after the download (the folder's `downloading` row) succeeds. The
-two-machine lab hit this with a 512 MiB file opened 3 s after the mount
-attached ([validation](docs/VALIDATION.md#two-machine-lab)).
+moves its download to the front of the queue, and a read waits while the
+download makes progress, then returns the verified bytes (a 512 MiB file read
+while it downloads returns its bytes once the download ends). A read fails
+with a status programs report meaningfully (Windows:
+`STATUS_DEVICE_NOT_READY`, "The device is not ready"; Linux: `EIO`;
+`CONTENT_UNAVAILABLE` in the logs) only when no byte arrived for 60 s, after
+240 s in all, or when the folder is being detached or switched to another
+branch. The previous builds of this release failed it as offline after 15 s,
+which many programs reported as "invalid argument"
+([validation](docs/VALIDATION.md#two-machine-lab)).
 
 ### Three separate claims
 
@@ -642,9 +647,13 @@ its last phase is named.
 because files are open in the mount or unsaved data is pending. Close them
 (the daemon retries every 2 s), or `tkfs manage force-stop STATE`: unsaved
 files go to the folder's pending saves and are committed on its next start.
-While the worker is busy saving a large file, the force stop waits for it
-(up to 2 minutes from the force stop, however long the stop was blocked
-before) rather than kill a worker that still holds unsaved files.
+Files an application has just closed and that are still being saved (a
+copy or a build closes many files at once; they are saved in the background)
+do not block a stop: the stop, like every command that needs the folder
+quiet, waits up to 5 s for those saves. While the worker is busy with the
+engine, the force stop waits for it (up to 2 minutes from the force stop,
+however long the stop was blocked before) rather than kill a worker that
+still holds unsaved files.
 
 ### Unsaved file that cannot be restored
 
@@ -727,27 +736,73 @@ resumes by itself when it serves again.
   checkpoints never leave the computer; only shared branches sync.
 - Concurrent edits become conflicts that are kept and shown (`journal … N
   unresolved conflicts`); nothing is merged automatically. Resolve them in the
-  desktop (Conflicts) or with `tkfs resolve` / `tkfs recover`. Leave few
-  unresolved: an event from a peer that conflicts with the local history is
-  activated by a full replay, whose cost grows with the history and its
-  conflicts (at about 9,000 events and 9,000 unresolved conflicts, minutes
-  per event; [validation](docs/VALIDATION.md#soak)). An open conflict slows
-  only what touches it: creating, renaming, moving or deleting other files
-  stays on the fast path, local or from a peer; changing the name or place
-  of a conflicted entry (or of its folder) is a full replay, about 0.3–0.5 s at
-  10,000 events and 1 s at 30,000. A rename to a new name and a first
-  delete also count the folder's concurrent history (CCR-WP1.6-5): about
-  0.1 s at 10,000 events, with or without conflicts.
+  desktop (Conflicts) or with `tkfs resolve` / `tkfs recover`. An event from
+  a peer that conflicts with the local history is activated by the slow
+  path, whose cost follows the part of the history the event touches, not
+  the length of the history or the number of open conflicts (about 8 ms of
+  CPU per concurrent rename or move at 5,000 events and 1,000 open
+  conflicts, where the previous builds of this release took 269 ms). Two
+  hours of both sides editing one shared set of names, an operation every
+  50–400 ms each, converge (24,000 open conflicts, in minutes;
+  [validation](docs/VALIDATION.md#soak)). An open conflict slows only what
+  touches it: creating, renaming, moving or deleting other files stays on
+  the fast path, local or from a peer. Keep unresolved conflicts few all the
+  same: each commit that changes the set of open conflicts writes the whole
+  list (about 0.15 s at 13,000; see [known limitations](#known-limitations)).
 - Metadata and content travel separately: a file can be listed, renamed or
   moved before its bytes arrive. Opening a file whose bytes have not arrived
-  moves it to the front of the download queue and waits for it for up to 15
-  seconds; then the read fails with `CONTENT_UNAVAILABLE` and the download
-  continues. A partial download is never shown as a truncated file.
+  moves it to the front of the download queue, and a read waits while the
+  download progresses (see the [initial-sync gate](#initial-sync-gate)). A
+  partial download is never shown as a truncated file.
+- Saving is fast and never blocks the folder: a file's bytes are hashed and
+  stored without holding the folder's store, and while an application closes
+  many files in a row (a copy, a build, an unzip) each close returns at once
+  and the file is committed in the background within tens of milliseconds.
+  `fsync` (`FlushFileBuffers` on Windows) commits before it returns. A new
+  file created through the Windows mount enters the history with its first
+  save (one commit instead of two); `TKFS_DEFERRED_CREATE=0` turns that off.
+  What this means for a power loss is under [known
+  limitations](#known-limitations).
 - Closing the desktop leaves the daemon and the mounts running.
   `manage shutdown` stops folders cooperatively and keeps which folders should
   run, so the next start brings them back.
 - Not implemented: automatic text merges, symlinks, hard links, native ACL
   replication, garbage collection of old content. Files up to 16 GiB.
+
+## Known limitations
+
+- **A close is not a durability point during a burst of closes.** A power
+  loss or a killed worker can lose the files closed in the last tens of
+  milliseconds (at most 72, the ones queued or being saved), never tear one;
+  an application that needs a file on disk calls `fsync`
+  (`FlushFileBuffers`), which waits for the commit. A new file created
+  through the Windows mount that is lost this way is lost entirely (it
+  enters the history with its first save). On Linux, `sync(2)` does not wait
+  for those files (FUSE 7.31 has no `syncfs`); `fsync(2)` does.
+- **A read of content that cannot arrive fails after a while**: when no byte
+  of it arrived for 60 s, or after 240 s in all (a file of several GiB on a
+  slow link). At most half the mount's dispatcher threads wait for
+  downloads; reads beyond that fail at once instead of waiting.
+- **Thousands of unresolved conflicts** make each commit that changes them
+  write the whole conflict list twice (the stored projection's header and
+  the startup snapshot's): about 0.15 s per such commit at 13,000 open
+  conflicts. Resolve conflicts.
+- **A long outage is found later**: the redial schedule grows with the
+  outage (once a minute after 30 min), so a host back after a long outage
+  can take up to that long to reconnect. A link that silently drops
+  everything is noticed by the session's liveness check (20 s), not at once.
+- **Files someone opens jump the queue per repository**: a busy lane serving
+  other repositories may hold an opened file's download for up to 10 s.
+- **`caught_up` of the worker's own `status`** (CLI `tkfs status`) follows
+  every peer the folder exchanged with since its worker started: a peer
+  that is unpaired for good, or whose folder was recreated, keeps it `false`
+  until the worker restarts (`manage status` is not affected).
+- **On-access antivirus scanning** of the mount costs about 5 ms per written
+  file on Windows (Defender scans each closed file through the mount); the
+  previous release paid it too.
+- **The two-machine lab** (desktop and laptop over Wi-Fi) was last run on the
+  Wave 4 base; this release's network recovery, copy and download
+  measurements are single-machine ([validation](docs/VALIDATION.md)).
 
 ## Building
 
