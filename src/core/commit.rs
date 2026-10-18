@@ -1257,7 +1257,12 @@ impl Store {
                         write_part(&tx, &branch, entity, &slow.projection)?;
                     }
                     if *header {
-                        snapshot::write_header(&tx, &branch, &slow.projection)?;
+                        snapshot::write_header(
+                            &tx,
+                            &branch,
+                            &slow.projection,
+                            Some(&self.caches.commit.anchors),
+                        )?;
                     }
                 } else {
                     let state = match &slow.json {

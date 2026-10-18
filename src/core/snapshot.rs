@@ -93,7 +93,13 @@
 //! rewrite deletes the row. Older binaries never read it: they reconstruct
 //! (above), which rewrites `current_state` with the lists.
 use super::*;
-use std::{borrow::Cow, cell::Cell, collections::HashMap, sync::OnceLock, time::Instant};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 // Bump when projection/validation semantics or the sealed layout change,
 // even without a SQL migration. 2: incremental seals (WP4.4).
@@ -790,14 +796,59 @@ fn load_header(db: &Connection, branch: &str) -> Result<Option<Header>> {
 /// Stores `p`'s conflict and pending lists as `branch`'s header
 /// (`current_meta`), so that a commit that changes them writes only them and
 /// its changed entities' `current_parts` rows (CCR-WP2.INT-5).
-pub(super) fn write_header(db: &Connection, branch: &str, p: &Projection) -> Result<()> {
-    let payload = serde_json::to_string(&Header {
-        conflicts: p.conflicts.clone(),
-        pending: p.pending.clone(),
-    })?;
+pub(super) fn write_header(
+    db: &Connection,
+    branch: &str,
+    p: &Projection,
+    anchors: Option<&AnchorCache>,
+) -> Result<()> {
+    let payload = format!(
+        "{{\"conflicts\":{},\"pending\":{}}}",
+        conflicts_text(anchors, branch, &p.conflicts)?,
+        serde_json::to_string(&p.pending)?
+    );
+    debug_assert_eq!(
+        payload,
+        serde_json::to_string(&Header {
+            conflicts: p.conflicts.clone(),
+            pending: p.pending.clone(),
+        })?
+    );
     db.prepare_cached("INSERT INTO current_meta(branch,payload) VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload")?
         .execute(params![branch, payload])?;
     Ok(())
+}
+
+/// `serde_json::to_string(conflicts)`, from `anchors`' text of each record
+/// when it holds the same record (WP5.1): a commit that changes a few of
+/// thousands of records serializes those few. Without a cache, serialized.
+fn conflicts_text(
+    anchors: Option<&AnchorCache>,
+    branch: &str,
+    conflicts: &[Conflict],
+) -> Result<String> {
+    let Some(mut cache) = anchors.and_then(|anchors| anchors.records.try_borrow_mut().ok()) else {
+        return Ok(serde_json::to_string(conflicts)?);
+    };
+    let old = cache.remove(branch).unwrap_or_default();
+    let mut texts: HashMap<String, (Conflict, Arc<str>)> = HashMap::with_capacity(conflicts.len());
+    let mut out = String::with_capacity(old.values().map(|(_, t)| t.len() + 1).sum::<usize>() + 2);
+    out.push('[');
+    let mut old = old;
+    for (k, c) in conflicts.iter().enumerate() {
+        if k > 0 {
+            out.push(',');
+        }
+        let text = match old.remove(&c.id) {
+            Some((cached, text)) if cached == *c => text,
+            _ => Arc::from(serde_json::to_string(c)?),
+        };
+        out.push_str(&text);
+        texts.insert(c.id.clone(), (c.clone(), text));
+    }
+    out.push(']');
+    cache.insert(branch.to_owned(), texts);
+    Ok(out)
 }
 
 /// `current_state` is being rewritten with the whole projection (its lists
@@ -979,6 +1030,16 @@ fn read_conflicts(db: &Connection, branch: &str) -> Result<Vec<Conflict>> {
 /// the JSON of `Projection { conflicts, pending, .. }`, serialized from the
 /// borrowed lists (WP5.1: no copy of the conflict list per seal).
 fn header_json(conflicts: &[Conflict], pending: &[String]) -> Result<String> {
+    header_json_cached(None, "", conflicts, pending)
+}
+
+/// `header_json`, with the records' text from `anchors` (`conflicts_text`).
+fn header_json_cached(
+    anchors: Option<&AnchorCache>,
+    branch: &str,
+    conflicts: &[Conflict],
+    pending: &[String],
+) -> Result<String> {
     #[derive(Serialize)]
     struct HeaderRef<'h> {
         entries: BTreeMap<String, Entry>,
@@ -986,12 +1047,29 @@ fn header_json(conflicts: &[Conflict], pending: &[String]) -> Result<String> {
         conflicts: &'h [Conflict],
         pending: &'h [String],
     }
-    Ok(serde_json::to_string(&HeaderRef {
-        entries: BTreeMap::new(),
-        heads: BTreeMap::new(),
-        conflicts,
-        pending,
-    })?)
+    if anchors.is_none() {
+        return Ok(serde_json::to_string(&HeaderRef {
+            entries: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            conflicts,
+            pending,
+        })?);
+    }
+    let text = format!(
+        "{{\"entries\":{{}},\"heads\":{{}},\"conflicts\":{},\"pending\":{}}}",
+        conflicts_text(anchors, branch, conflicts)?,
+        serde_json::to_string(pending)?
+    );
+    debug_assert_eq!(
+        text,
+        serde_json::to_string(&HeaderRef {
+            entries: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            conflicts,
+            pending,
+        })?
+    );
+    Ok(text)
 }
 
 /// The header (`projection` field) of a rows anchor's JSON, as text: the
@@ -1016,7 +1094,13 @@ fn header_text(payload: &str) -> Option<&str> {
 #[derive(Default)]
 pub(crate) struct AnchorCache {
     anchors: std::cell::RefCell<HashMap<String, Written>>,
+    /// Per branch: the serialized text of each record of the last conflict
+    /// list this handle wrote, with the record (`conflicts_text`).
+    records: std::cell::RefCell<HashMap<String, RecordTexts>>,
 }
+
+/// A conflict list's records by id, each with its JSON text.
+type RecordTexts = HashMap<String, (Conflict, Arc<str>)>;
 
 /// One anchor as written.
 struct Written {
@@ -1111,6 +1195,50 @@ fn previous(
     cursor: i64,
     anchors: Option<&AnchorCache>,
 ) -> Result<Option<Previous>> {
+    // The anchor this handle wrote last, still stored (its checksum, cursor
+    // and length unchanged): continue from what it wrote, without reading
+    // the payload (WP5.1). A stored anchor that differs from it in any byte
+    // has another checksum (another writer's seal, a rolled-back one); one
+    // damaged behind the checksum is replaced by this seal anyway.
+    if let Some(anchors) = anchors
+        && let Ok(written) = anchors.anchors.try_borrow()
+        && let Some(written) = written.get(&identity.branch.id)
+    {
+        let stored: Option<(Option<i64>, Option<String>, Option<i64>)> = db
+            .prepare_cached(
+                "SELECT cursor,checksum,length(CAST(payload AS BLOB)) FROM startup_snapshots WHERE branch=?",
+            )?
+            .query_row([&identity.branch.id], |r| {
+                Ok((
+                    r.get_ref(0)?.as_i64().ok(),
+                    r.get_ref(1)?.as_str().ok().map(str::to_owned),
+                    r.get_ref(2)?.as_i64().ok(),
+                ))
+            })
+            .optional()?;
+        if let Some((Some(saved), Some(checksum), Some(length))) = stored
+            && saved == written.cursor
+            && checksum == written.checksum
+            && usize::try_from(length).ok() == Some(written.payload.len())
+        {
+            if written.identity != *identity || saved > cursor {
+                return Ok(None);
+            }
+            let rows = match &written.rows {
+                None => None,
+                Some(rows) => match header_text(&written.payload) {
+                    Some(header) => Some((rows.clone(), header.to_owned())),
+                    None => return Ok(None),
+                },
+            };
+            return Ok(Some(Previous {
+                cursor: saved,
+                journal: written.journal.clone(),
+                rows,
+                ours: true,
+            }));
+        }
+    }
     let row = db
         .prepare_cached("SELECT cursor,payload,checksum FROM startup_snapshots WHERE branch=?")?
         .query_row([&identity.branch.id], anchor_columns)
@@ -1740,7 +1868,12 @@ fn seal_rows_incremental(
     // this handle's previous anchor (WP5.1: its text is reused).
     let header = match input.projection {
         Some(_) if ours && input.lists_unchanged => header,
-        Some(projection) => header_json(&projection.conflicts, &projection.pending)?,
+        Some(projection) => header_json_cached(
+            input.anchors,
+            branch,
+            &projection.conflicts,
+            &projection.pending,
+        )?,
         None => header,
     };
     let payload = anchor_payload(
