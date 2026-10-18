@@ -1042,13 +1042,16 @@ impl Store {
                 if let Some(cell) = index {
                     derive::ensure_index(cell, &events[..new]);
                 }
+                // Full mode stays the reference: it projects the branch in
+                // full, as it derives it in full.
+                let full_mode = derive::conflict_mode() == derive::ConflictMode::Full;
                 let appended = match base {
-                    Some(base) => {
+                    Some(base) if !full_mode => {
                         let index = index.map(|cell| cell.borrow());
                         let index = index.as_deref().and_then(Option::as_ref);
                         derive::project_append(branch, base, events, new, index)?
                     }
-                    None => None,
+                    _ => None,
                 };
                 let (projection, delta, fresh) = match appended {
                     Some(appended) => (
