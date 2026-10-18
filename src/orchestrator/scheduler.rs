@@ -25,8 +25,11 @@
 //!   (bulk lanes: `generations.content`, and the remote's content counters)
 //!   moved while no local exchange of that repository ran or had ended
 //!   within `absorb` (a bump in that window is the exchange's own echo, and
-//!   counting it would make exchanges trigger each other forever). A trigger
-//!   that arrives during an exchange makes the key due as soon as it ends.
+//!   counting it would make exchanges trigger each other forever). On bulk
+//!   download lanes the local demand queue growing (the heartbeat's
+//!   `content.requested`: a reader waits) is a trigger that is never
+//!   absorbed (WP5.3). A trigger that arrives during an exchange makes the
+//!   key due as soon as it ends.
 //! * **Resets** (due now, retry state cleared): the key became ready, or the
 //!   local worker instance or the remote replica changed.
 //! * **Anti-entropy:** `interval` (`sync_interval_ms`) after the last
@@ -820,6 +823,9 @@ pub(crate) struct Signals {
     pub remote_replica: String,
     pub remote_tip: Option<FeedTip>,
     pub remote_content: Option<ContentCounters>,
+    /// Objects in the local demand queue (`content.requested` of the
+    /// heartbeat): a reader waits for them (WP5.3).
+    pub requested: u64,
 }
 
 impl Signals {
@@ -834,6 +840,9 @@ impl Signals {
             remote_replica: remote.replica.clone(),
             remote_tip: remote.tip.clone(),
             remote_content: remote.content,
+            requested: heartbeat
+                .and_then(|hb| hb.content.as_ref())
+                .map_or(0, |content| content.requested),
         }
     }
 }
@@ -1406,10 +1415,7 @@ impl Engine {
     }
 
     fn claim_key(&self, repo: &str) -> String {
-        format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{repo}",
-            self.local, self.peer, self.scope
-        )
+        claim_name(&self.local, &self.peer, &self.scope, repo)
     }
 
     fn activity_key(&self, repo: &str) -> String {
@@ -1711,6 +1717,42 @@ impl Pool {
 
 // ---------------------------------------------------------------------------
 // Process-wide registries
+
+/// The claim of (local installation, peer, op scope, repo).
+fn claim_name(local: &str, peer: &str, scope: &str, repo: &str) -> String {
+    format!("{local}\u{1f}{peer}\u{1f}{scope}\u{1f}{repo}")
+}
+
+/// A key held outside an exchange ([`hold_key`]); released on drop.
+pub(crate) struct KeyClaim {
+    _claim: Claim,
+}
+
+/// Holds the key `(local, peer, scope, repo)` of this process's schedulers
+/// (no exchange of it starts meanwhile, on any scheduler), waiting up to
+/// `wait` for one in flight to end. For work on a key's behalf outside an
+/// exchange: a bulk lane whose session ended gives up the leases its rounds
+/// kept, so the next session's first round cannot overlap it (WP5.3).
+/// `None` when the key stays claimed (that exchange settles them itself).
+pub(crate) fn hold_key(
+    local: &str,
+    peer: &str,
+    scope: &str,
+    repo: &str,
+    wait: Duration,
+) -> Option<KeyClaim> {
+    let name = claim_name(local, peer, scope, repo);
+    let until = Instant::now() + wait;
+    loop {
+        if let Some(claim) = Claim::take(name.clone()) {
+            return Some(KeyClaim { _claim: claim });
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        thread::sleep(CLAIM_RETRY.min(until.saturating_duration_since(Instant::now())));
+    }
+}
 
 /// One exchange per (local installation, peer, op scope, repo) at a time in
 /// this process, also across scheduler instances (a respawned lane).

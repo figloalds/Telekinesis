@@ -85,6 +85,33 @@
 //! ended early, its session went away), is given up the same way (without a
 //! backoff when the object did not fail).
 //!
+//! **An offer whose session went away** (WP5.3: leases of a dead session
+//! end at once). A dialer pushes right after its `objects.wants`, on the
+//! same peer slot, so an offer that no push followed is either settled by
+//! the dialer's next request on that session (above), or its session ended
+//! in between (an outage cut it: the leases would hide those objects from
+//! every other source, our own pull lanes to that peer included, until they
+//! lapsed, 60 s, plus the stall backoff the lapse imposes on the peer's
+//! replica, 60 s more). The acceptor has no word of a session's end
+//! (CCR-WP5.3-2 asks for one), so it watches for it: once an offer and its
+//! session have both been silent for [`OFFER_GRACE`] (5 s: no push, no
+//! `objects.*` request of that session), its leases are given up at our
+//! worker, without a backoff (nothing says the dialer could not serve
+//! them). The offer itself stays: a dialer still there settles it at its
+//! next request as before (its next `objects.wants` backs off what it did
+//! not send; a late push is matched against it), and a push of it still
+//! writes (a free lease is taken by the write) unless another session took
+//! it meanwhile (then `IN_FLIGHT_ELSEWHERE`: never two owners, invariant
+//! 19). A dialer that comes back on a new session is offered them again at
+//! once. Lease ids are per dialer lane, so a new session of the same lane
+//! shares the dead one's: the reaper decides and marks an offer under the
+//! offers' lock, and while it gives the leases up, an exchange of that lane
+//! (`objects.wants`, `objects.push`) waits for it before it takes the offer
+//! (at most [`RELEASE_DEADLINE`] + 1 s), so a release never ends the leases
+//! a new session's want has just taken (the WP5.3 review's minor). An offer
+//! an exchange took or replaced first is not reaped: its leases are that
+//! exchange's.
+//!
 //! **Report.** A report makes our worker re-read a whole object, so it is
 //! taken only for an object of the session's lane (`OBJECT_ON_WRONG_LANE`)
 //! that a pull of ours sent this peer through its end in the last hour
@@ -101,10 +128,11 @@ use super::{
         status_lane, worker_deadline,
     },
     objects::{
-        KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, Sink, SinkEvent, SinkOptions,
-        SinkResult, allot, blocked_objects, covered, is_failure, object_blocked, object_failed,
-        object_installed, object_key, object_unserved, outcome_error, push_lease, read_outcome,
-        read_ranges, release_leases, size_unknown, want_excluding, wire_pieces,
+        KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, RELEASE_DEADLINE, Sink,
+        SinkEvent, SinkOptions, SinkResult, allot, blocked_objects, covered, is_failure,
+        object_blocked, object_failed, object_installed, object_key, object_unserved,
+        outcome_error, push_lease, read_outcome, read_ranges, release_leases, size_unknown,
+        want_excluding, wire_pieces,
     },
     worker_client::{self, ReadFlow, SessionWorkerClient},
 };
@@ -134,7 +162,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::RandomState},
     hash::BuildHasher,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
         mpsc::RecvTimeoutError,
     },
@@ -161,6 +189,7 @@ pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incomi
         req.responder.error(error);
         return;
     }
+    seen_session(&peer.session);
     match req.op.as_str() {
         ops::OBJECTS_PULL => pull(ctx, peer, req),
         ops::OBJECTS_WANTS => wants(ctx, peer, req),
@@ -508,6 +537,12 @@ struct Offer {
     session: String,
     at: Instant,
     items: Vec<Offered>,
+    /// How to give its leases up when its session goes away (WP5.3), and
+    /// whether that was done.
+    client: Arc<SessionWorkerClient>,
+    route: SyncRoute,
+    lease: String,
+    released: bool,
 }
 
 #[derive(Clone)]
@@ -519,11 +554,32 @@ struct Offered {
     covered: bool,
 }
 
-/// Offers per (worker instance, dialer lane's lease).
-fn offers() -> &'static Mutex<HashMap<String, Offer>> {
-    static OFFERS: OnceLock<Mutex<HashMap<String, Offer>>> = OnceLock::new();
-    OFFERS.get_or_init(|| Mutex::new(HashMap::new()))
+/// Offers per (worker instance, dialer lane's lease), and the offers whose
+/// leases the reaper is giving up right now.
+#[derive(Default)]
+struct OfferMap {
+    offers: HashMap<String, Offer>,
+    /// Keys being reaped ([`reap_offers`]); [`take_offer`] waits for them.
+    reaping: HashSet<String>,
 }
+
+struct Offers {
+    map: Mutex<OfferMap>,
+    /// Notified when a reap of a key ends.
+    reaped: Condvar,
+}
+
+fn offers() -> &'static Offers {
+    static OFFERS: OnceLock<Offers> = OnceLock::new();
+    OFFERS.get_or_init(|| Offers {
+        map: Mutex::new(OfferMap::default()),
+        reaped: Condvar::new(),
+    })
+}
+
+/// How long an exchange waits at most for a reap of its offer's leases
+/// (one `objects.release` of at most `MAX_RELEASE_ITEMS`).
+const REAP_WAIT: Duration = Duration::from_secs(RELEASE_DEADLINE.as_secs() + 1);
 
 /// Offers remembered at most, and for at most this long.
 const MAX_OFFERS: usize = 4096;
@@ -533,19 +589,143 @@ fn offer_key(instance: &str, lease: &str) -> String {
     format!("{instance}\u{1f}{lease}")
 }
 
+/// Takes the offer of `key`. A reap of its leases in progress ends first
+/// (at most [`REAP_WAIT`]): its release, by the lane's lease id, must not
+/// end the leases the caller's exchange takes next under that same id.
 fn take_offer(key: &str) -> Option<Offer> {
-    lock(offers()).remove(key)
+    let offers = offers();
+    let until = Instant::now() + REAP_WAIT;
+    let mut map = lock(&offers.map);
+    while map.reaping.contains(key) {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        map = offers
+            .reaped
+            .wait_timeout(map, left)
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+    }
+    map.offers.remove(key)
 }
 
 fn put_offer(key: String, offer: Offer) {
-    let mut map = lock(offers());
-    if map.len() >= MAX_OFFERS {
-        map.retain(|_, offer| offer.at.elapsed() < OFFER_AGE);
-        if map.len() >= MAX_OFFERS {
-            return;
+    {
+        let mut map = lock(&offers().map);
+        if map.offers.len() >= MAX_OFFERS {
+            map.offers.retain(|_, offer| offer.at.elapsed() < OFFER_AGE);
+            if map.offers.len() >= MAX_OFFERS {
+                return;
+            }
+        }
+        map.offers.insert(key, offer);
+    }
+    start_reaper();
+}
+
+/// An offer whose session sent no `objects.*` request since the offer for
+/// this long lost its session (module docs, "An offer whose session went
+/// away").
+pub const OFFER_GRACE: Duration = Duration::from_secs(5);
+/// How often the reaper looks.
+const REAP_EVERY: Duration = Duration::from_millis(500);
+/// Sessions whose last request is remembered at most (the oldest go first).
+const MAX_SESSIONS_SEEN: usize = 4096;
+
+/// When each bulk session last sent an `objects.*` request.
+fn sessions_seen() -> &'static Mutex<HashMap<String, Instant>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `session` sent a request now.
+fn seen_session(session: &str) {
+    let now = Instant::now();
+    let mut seen = lock(sessions_seen());
+    if seen.len() >= MAX_SESSIONS_SEEN && !seen.contains_key(session) {
+        seen.retain(|_, at| now.saturating_duration_since(*at) < OFFER_AGE);
+        if seen.len() >= MAX_SESSIONS_SEEN
+            && let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(session, _)| session.clone())
+        {
+            seen.remove(&oldest);
         }
     }
-    map.insert(key, offer);
+    seen.insert(session.to_owned(), now);
+}
+
+/// The process's offer reaper, started with the first offer.
+fn start_reaper() {
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        thread::Builder::new()
+            .name("offer-reaper".into())
+            .spawn(|| {
+                loop {
+                    thread::sleep(REAP_EVERY);
+                    reap_offers(Instant::now());
+                }
+            })
+            .is_ok()
+    });
+}
+
+/// Gives up the leases of every offer whose session went away (module
+/// docs): the offer and its session both silent for [`OFFER_GRACE`]. The
+/// offer stays (marked), for a dialer that is still there. Each offer is
+/// judged and marked under the offers' lock right before its release, and
+/// its key stays marked as reaping until the release ends ([`take_offer`]
+/// waits for it). Returns how many offers it gave up (tests).
+pub fn reap_offers(now: Instant) -> usize {
+    let silent = |at: Instant| now.saturating_duration_since(at) >= OFFER_GRACE;
+    let keys: Vec<String> = lock(&offers().map)
+        .offers
+        .iter()
+        .filter(|(_, offer)| !offer.released && silent(offer.at))
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut count = 0;
+    for key in keys {
+        // Judged again now: an exchange of a new session may have taken or
+        // replaced the offer since (its leases are that exchange's then).
+        let gone = {
+            let seen = lock(sessions_seen());
+            let mut map = lock(&offers().map);
+            let OfferMap { offers, reaping } = &mut *map;
+            match offers.get_mut(&key) {
+                Some(offer)
+                    if !offer.released
+                        && silent(offer.at)
+                        && seen.get(&offer.session).is_none_or(|last| silent(*last)) =>
+                {
+                    offer.released = true;
+                    reaping.insert(key.clone());
+                    Some((
+                        offer.client.clone(),
+                        offer.route.clone(),
+                        offer.lease.clone(),
+                        offer
+                            .items
+                            .iter()
+                            .map(|offered| offered.item.hash.clone())
+                            .collect::<Vec<_>>(),
+                    ))
+                }
+                _ => None,
+            }
+        };
+        let Some((client, route, lease, hashes)) = gone else {
+            continue;
+        };
+        release_leases(&client, &route, &lease, hashes);
+        lock(&offers().map).reaping.remove(&key);
+        offers().reaped.notify_all();
+        count += 1;
+    }
+    count
 }
 
 /// Where one dialer's lane stands in our worker's leases: its lease session
@@ -648,9 +828,9 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         Ok(bound) => bound,
         Err(error) => return responder.error(error),
     };
-    let Some(wait) = worker_deadline(deadline, worker_client::deadlines::WANT) else {
+    if worker_deadline(deadline, worker_client::deadlines::WANT).is_none() {
         return responder.error(deadline_error(op));
-    };
+    }
     let source = Source::new(ctx, peer, &request.repo, &bound);
     let key = offer_key(&source.instance, &source.lease);
     // The last offer on this session was followed by no push: the dialer
@@ -668,6 +848,14 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         }
     }
     exclude.truncate(MAX_RELEASE_ITEMS);
+    // `take_offer` may have waited for a reap of this lane's offer: the
+    // worker gets what is left of the dialer's deadline.
+    let Some(wait) = worker_deadline(deadline, worker_client::deadlines::WANT) else {
+        if !exclude.is_empty() {
+            release_leases(&bound.client, &bound.route, &source.lease, exclude);
+        }
+        return responder.error(deadline_error(op));
+    };
     let max_items = request.max_items.clamp(1, MAX_WANT_ITEMS as u32);
     let max_bytes = request.max_bytes.clamp(1, PULL_BUDGET_BYTES);
     let want = WantHeader {
@@ -726,6 +914,10 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                 item: item.clone(),
             })
             .collect(),
+        client: bound.client.clone(),
+        route: bound.route.clone(),
+        lease: source.lease.clone(),
+        released: false,
     };
     if !offer.items.is_empty() {
         put_offer(key, offer);

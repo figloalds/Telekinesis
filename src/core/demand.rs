@@ -60,6 +60,34 @@ impl Store {
         }
         Ok(wanted)
     }
+    /// The objects with a waiting reader (WP5.3, `objects.demand`): demand
+    /// younger than `DEMAND_TTL_MS` whose object is not available here,
+    /// newest first, at most `limit`, with when it was requested. Two index
+    /// lookups per demand row (`object_requests` is small: registration
+    /// deletes a row), so a lane busy with other objects can ask often.
+    /// Availability is the index's word: an object it shows available that
+    /// is not is still listed by the want scan, and one listed here that
+    /// arrived meanwhile is simply not wanted.
+    pub fn demanded_objects(&self, limit: usize) -> Result<Vec<(String, i64)>> {
+        let since = time().saturating_sub(DEMAND_TTL_MS) as i64;
+        let mut statement = self.db.prepare_cached(
+            "SELECT q.hash, q.requested_ms FROM object_requests q
+             LEFT JOIN object_availability a ON a.hash = q.hash
+             WHERE q.requested_ms >= ?1 AND (a.state IS NULL OR a.state != ?2)
+             ORDER BY q.requested_ms DESC, q.hash LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    since,
+                    super::objects::AVAILABLE,
+                    limit.min(MAX_WANTED) as i64
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
     pub fn peer_requests(&self, peer: &str) -> Result<BTreeSet<String>> {
         Ok(self
             .db
