@@ -86,7 +86,10 @@ static NTSTATUS read_dir(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR pattern,PWSTR m
     FspFileSystemAddDirInfo(0,buffer,length,count);return STATUS_SUCCESS;
 }
 static FSP_FILE_SYSTEM_INTERFACE Interface;
-UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out) {
+/* threads: dispatcher threads (0: the WinFsp default); irp_timeout_ms: how
+   long the FSD waits for a callback before it cancels the request (0: the
+   default). Rust bounds its content waits below it. */
+UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp_timeout_ms) {
     if(!Security) {
         /* WinFsp requires a descriptor; the mount adds no user/owner policy. */
         if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -102,6 +105,7 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out) {
     FSP_FSCTL_VOLUME_PARAMS p={0};p.Version=sizeof p;p.SectorSize=4096;p.SectorsPerAllocationUnit=1;
     p.MaxComponentLength=255;p.FileInfoTimeout=0;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
     p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
+    if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;
     wcscpy_s(p.FileSystemName,sizeof p.FileSystemName/sizeof(WCHAR),L"TKFS");
     NTSTATUS status=FspFileSystemCreate(L"WinFsp.Disk",&p,&Interface,out);
     if(!NT_SUCCESS(status))return status;
@@ -109,7 +113,7 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out) {
        a read waiting for remote content cannot hold a volume-wide mutex. */
     FspFileSystemSetOperationGuardStrategy(*out,FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
     status=FspFileSystemSetMountPoint(*out,path);
-    if(NT_SUCCESS(status))status=FspFileSystemStartDispatcher(*out,0);
+    if(NT_SUCCESS(status))status=FspFileSystemStartDispatcher(*out,threads);
     if(!NT_SUCCESS(status)){FspFileSystemDelete(*out);*out=0;}return status;
 }
 void tk_mount_stop(FSP_FILE_SYSTEM *fs) {FspFileSystemStopDispatcher(fs);FspFileSystemDelete(fs);}
