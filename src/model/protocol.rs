@@ -729,6 +729,10 @@ pub mod objects {
         /// Gives up a session's leases ([`super::ReleaseHeader`];
         /// CCR-WP3.3-4, WP4.5).
         pub const RELEASE: &str = "objects.release";
+        /// The objects readers wait for ([`super::DemandHeader`]; WP5.3,
+        /// CCR-WP5.3-3, registered by WP5.INT). Read-only: no lease, no
+        /// backoff. An older worker answers `UNSUPPORTED_OPERATION`.
+        pub const DEMAND: &str = "objects.demand";
     }
 
     /// Items per want list.
@@ -925,6 +929,38 @@ pub mod objects {
     pub struct ReleaseReply {
         /// Leases that ended (held by `session`).
         pub released: u32,
+    }
+
+    /// Demanded objects one `objects.demand` lists at most.
+    pub const MAX_DEMAND_ITEMS: u32 = MAX_WANT_ITEMS as u32;
+
+    /// Worker `objects.demand{route, lane?, max_items?}` (WP5.3,
+    /// CCR-WP5.3-3): the objects a reader waits for (demand younger than
+    /// [`DEMAND_EXPIRY`] whose bytes are not available), newest first,
+    /// only this lane's with `lane`. Reply [`DemandReply`].
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DemandHeader {
+        pub route: SyncRoute,
+        /// Only the objects this lane owns (`LaneSpec::owns`).
+        #[serde(default)]
+        pub lane: Option<LaneSpec>,
+        /// At most this many (default and cap [`MAX_DEMAND_ITEMS`]).
+        #[serde(default)]
+        pub max_items: Option<u32>,
+    }
+
+    /// One object a reader waits for.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DemandItem {
+        pub hash: String,
+        /// When the demand was (last) registered, Unix ms.
+        pub requested_ms: i64,
+    }
+
+    /// `objects.demand` reply: newest demand first.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DemandReply {
+        pub items: Vec<DemandItem>,
     }
 
     /// Worker `objects.read` header; reply header [`ReadReply`], body = bytes.

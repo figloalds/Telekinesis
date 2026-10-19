@@ -93,7 +93,13 @@
 //! rewrite deletes the row. Older binaries never read it: they reconstruct
 //! (above), which rewrites `current_state` with the lists.
 use super::*;
-use std::{borrow::Cow, cell::Cell, collections::HashMap, sync::OnceLock, time::Instant};
+use std::{
+    borrow::Cow,
+    cell::Cell,
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 
 // Bump when projection/validation semantics or the sealed layout change,
 // even without a SQL migration. 2: incremental seals (WP4.4).
@@ -491,6 +497,10 @@ mod journal {
 use journal::JournalHash;
 
 pub(super) fn initialize(db: &Connection) -> Result<()> {
+    // The first step of `Store::open`: fixes the instant from which the
+    // verified set (`commit::verified`) counts availability rows as this
+    // process's, before the process installs anything.
+    super::commit::verified::epoch_ms();
     // Triggers also cover writes by older executables and repair tools. Sequence
     // numbers are local acceptance order, never CRDT version precedence.
     db.execute_batch("SAVEPOINT snapshot_schema;
@@ -620,6 +630,17 @@ fn incremental_schema(db: &Connection) -> Result<()> {
 /// key, with startup progress after each chunk, then the marker. The
 /// triggers already cover every row written since the table was created.
 fn backfill_journal_branch(db: &Connection) -> Result<()> {
+    backfill_journal_branch_with(db, JOURNAL_BRANCH_CHUNK, &mut |_| Ok(()))
+}
+
+/// `backfill_journal_branch` in chunks of `chunk` rows; `after_chunk` runs
+/// after each committed chunk with its upper sequence (tests: an error there
+/// stands for a crash between chunks).
+fn backfill_journal_branch_with(
+    db: &Connection,
+    chunk: i64,
+    after_chunk: &mut dyn FnMut(i64) -> Result<()>,
+) -> Result<()> {
     let value = |key: &str| -> Result<Option<String>> {
         Ok(db
             .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
@@ -638,7 +659,7 @@ fn backfill_journal_branch(db: &Connection) -> Result<()> {
         loop {
             let upper: Option<i64> = db.query_row(
                 "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",
-                params![cursor, JOURNAL_BRANCH_CHUNK],
+                params![cursor, chunk],
                 |r| r.get(0),
             )?;
             let Some(upper) = upper else { break };
@@ -647,14 +668,19 @@ fn backfill_journal_branch(db: &Connection) -> Result<()> {
                     "INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT s.seq,e.branch FROM journal_sequence s JOIN events e ON e.id=s.event WHERE s.seq>?1 AND s.seq<=?2",
                     params![cursor, upper],
                 )?;
+                // An upsert: the cursor key is missing when an earlier build
+                // crashed between creating the table and writing its keys
+                // (an `UPDATE` would then record no progress, and a crash
+                // would restart the build from the beginning).
                 db.execute(
-                    "UPDATE config SET value=?2 WHERE key=?1",
+                    "INSERT INTO config(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     params![JOURNAL_BRANCH_CURSOR, upper.to_string()],
                 )?;
                 Ok(())
             })?;
             cursor = upper;
             crate::startup::progress("indexing the journal");
+            after_chunk(upper)?;
         }
     }
     in_savepoint(db, || {
@@ -774,14 +800,59 @@ fn load_header(db: &Connection, branch: &str) -> Result<Option<Header>> {
 /// Stores `p`'s conflict and pending lists as `branch`'s header
 /// (`current_meta`), so that a commit that changes them writes only them and
 /// its changed entities' `current_parts` rows (CCR-WP2.INT-5).
-pub(super) fn write_header(db: &Connection, branch: &str, p: &Projection) -> Result<()> {
-    let payload = serde_json::to_string(&Header {
-        conflicts: p.conflicts.clone(),
-        pending: p.pending.clone(),
-    })?;
+pub(super) fn write_header(
+    db: &Connection,
+    branch: &str,
+    p: &Projection,
+    anchors: Option<&AnchorCache>,
+) -> Result<()> {
+    let payload = format!(
+        "{{\"conflicts\":{},\"pending\":{}}}",
+        conflicts_text(anchors, branch, &p.conflicts)?,
+        serde_json::to_string(&p.pending)?
+    );
+    debug_assert_eq!(
+        payload,
+        serde_json::to_string(&Header {
+            conflicts: p.conflicts.clone(),
+            pending: p.pending.clone(),
+        })?
+    );
     db.prepare_cached("INSERT INTO current_meta(branch,payload) VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload")?
         .execute(params![branch, payload])?;
     Ok(())
+}
+
+/// `serde_json::to_string(conflicts)`, from `anchors`' text of each record
+/// when it holds the same record (WP5.1): a commit that changes a few of
+/// thousands of records serializes those few. Without a cache, serialized.
+fn conflicts_text(
+    anchors: Option<&AnchorCache>,
+    branch: &str,
+    conflicts: &[Conflict],
+) -> Result<String> {
+    let Some(mut cache) = anchors.and_then(|anchors| anchors.records.try_borrow_mut().ok()) else {
+        return Ok(serde_json::to_string(conflicts)?);
+    };
+    let old = cache.remove(branch).unwrap_or_default();
+    let mut texts: HashMap<String, (Conflict, Arc<str>)> = HashMap::with_capacity(conflicts.len());
+    let mut out = String::with_capacity(old.values().map(|(_, t)| t.len() + 1).sum::<usize>() + 2);
+    out.push('[');
+    let mut old = old;
+    for (k, c) in conflicts.iter().enumerate() {
+        if k > 0 {
+            out.push(',');
+        }
+        let text = match old.remove(&c.id) {
+            Some((cached, text)) if cached == *c => text,
+            _ => Arc::from(serde_json::to_string(c)?),
+        };
+        out.push_str(&text);
+        texts.insert(c.id.clone(), (c.clone(), text));
+    }
+    out.push(']');
+    cache.insert(branch.to_owned(), texts);
+    Ok(out)
 }
 
 /// `current_state` is being rewritten with the whole projection (its lists
@@ -869,6 +940,7 @@ fn full_journal(db: &Connection, branch: &str, cursor: i64) -> Result<(JournalHa
 }
 
 /// The identity a snapshot binds: repository, device and branch descriptor.
+#[derive(Clone, PartialEq, Eq)]
 struct Identity {
     repo: String,
     device: String,
@@ -958,21 +1030,137 @@ fn read_conflicts(db: &Connection, branch: &str) -> Result<Vec<Conflict>> {
     Ok(conflicts)
 }
 
-/// A projection without its entries and heads (a rows anchor's header).
+/// A projection without its entries and heads (a rows anchor's header):
+/// the JSON of `Projection { conflicts, pending, .. }`, serialized from the
+/// borrowed lists (WP5.1: no copy of the conflict list per seal).
 fn header_json(conflicts: &[Conflict], pending: &[String]) -> Result<String> {
-    Ok(serde_json::to_string(&Projection {
-        conflicts: conflicts.to_vec(),
-        pending: pending.to_vec(),
-        ..Projection::default()
-    })?)
+    header_json_cached(None, "", conflicts, pending)
 }
 
-fn write_anchor(db: &Connection, branch: &str, cursor: i64, payload: &str) -> Result<()> {
+/// `header_json`, with the records' text from `anchors` (`conflicts_text`).
+fn header_json_cached(
+    anchors: Option<&AnchorCache>,
+    branch: &str,
+    conflicts: &[Conflict],
+    pending: &[String],
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct HeaderRef<'h> {
+        entries: BTreeMap<String, Entry>,
+        heads: BTreeMap<String, Vec<Version>>,
+        conflicts: &'h [Conflict],
+        pending: &'h [String],
+    }
+    if anchors.is_none() {
+        return Ok(serde_json::to_string(&HeaderRef {
+            entries: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            conflicts,
+            pending,
+        })?);
+    }
+    let text = format!(
+        "{{\"entries\":{{}},\"heads\":{{}},\"conflicts\":{},\"pending\":{}}}",
+        conflicts_text(anchors, branch, conflicts)?,
+        serde_json::to_string(pending)?
+    );
+    debug_assert_eq!(
+        text,
+        serde_json::to_string(&HeaderRef {
+            entries: BTreeMap::new(),
+            heads: BTreeMap::new(),
+            conflicts,
+            pending,
+        })?
+    );
+    Ok(text)
+}
+
+/// The header (`projection` field) of a rows anchor's JSON, as text: the
+/// value between the anchor's `"projection"` key and its `"conflicts":[]`
+/// (`anchor_payload`'s field order; a JSON string never holds an unescaped
+/// quote, so neither marker can occur inside a value).
+fn header_text(payload: &str) -> Option<&str> {
+    const START: &str = ",\"projection\":";
+    const END: &str = ",\"conflicts\":[],\"frontier\":";
+    let start = payload.find(START)? + START.len();
+    let end = payload.rfind(END)?;
+    (start <= end).then(|| &payload[start..end])
+}
+
+/// The last anchor a store handle wrote for each branch (WP5.1): a seal that
+/// finds the stored anchor byte-equal to it trusts it (its checksum was
+/// computed from these bytes, and its head was parsed from them) without
+/// hashing or parsing the anchor again, and reuses its header text when the
+/// projection's lists did not change since (`Seal::lists_unchanged`). A
+/// rolled-back seal leaves a different stored anchor, which is then read as
+/// before.
+#[derive(Default)]
+pub(crate) struct AnchorCache {
+    anchors: std::cell::RefCell<HashMap<String, Written>>,
+    /// Per branch: the serialized text of each record of the last conflict
+    /// list this handle wrote, with the record (`conflicts_text`).
+    records: std::cell::RefCell<HashMap<String, RecordTexts>>,
+}
+
+/// A conflict list's records by id, each with its JSON text.
+type RecordTexts = HashMap<String, (Conflict, Arc<str>)>;
+
+/// One anchor as written.
+struct Written {
+    payload: String,
+    checksum: String,
+    cursor: i64,
+    identity: Identity,
+    journal: JournalHash,
+    rows: Option<RowSet>,
+}
+
+impl AnchorCache {
+    fn put(&self, branch: &str, written: Written) {
+        if let Ok(mut anchors) = self.anchors.try_borrow_mut() {
+            anchors.insert(branch.to_owned(), written);
+        }
+    }
+}
+
+fn write_anchor(db: &Connection, branch: &str, cursor: i64, payload: &str) -> Result<String> {
     fault("before_startup_snapshot");
+    let checksum = hash(payload.as_bytes());
     db.prepare_cached("INSERT INTO startup_snapshots VALUES(?,?,?,?) ON CONFLICT(branch) DO UPDATE SET cursor=excluded.cursor,payload=excluded.payload,checksum=excluded.checksum")?
-        .execute(params![branch, cursor, payload, hash(payload.as_bytes())])?;
+        .execute(params![branch, cursor, payload, &checksum])?;
     fault("startup_snapshot_written");
-    Ok(())
+    Ok(checksum)
+}
+
+/// Writes the anchor and remembers it in `input.anchors`.
+#[allow(clippy::too_many_arguments)]
+fn write_anchor_cached(
+    db: &Connection,
+    branch: &str,
+    identity: &Identity,
+    cursor: i64,
+    journal: &JournalHash,
+    rows: Option<&RowSet>,
+    payload: String,
+    input: &Seal<'_>,
+) -> Result<u64> {
+    let checksum = write_anchor(db, branch, cursor, &payload)?;
+    let bytes = payload.len() as u64;
+    if let Some(anchors) = input.anchors {
+        anchors.put(
+            branch,
+            Written {
+                payload,
+                checksum,
+                cursor,
+                identity: identity.clone(),
+                journal: journal.clone(),
+                rows: rows.cloned(),
+            },
+        );
+    }
+    Ok(bytes)
 }
 
 /// The branch's previous seal, when a seal may continue from it: its
@@ -981,8 +1169,11 @@ fn write_anchor(db: &Connection, branch: &str, cursor: i64, payload: &str) -> Re
 struct Previous {
     cursor: i64,
     journal: JournalHash,
-    /// A rows anchor: its rows and header (conflict and pending lists).
-    rows: Option<(RowSet, Projection)>,
+    /// A rows anchor: its rows and header (conflict and pending lists), as
+    /// text.
+    rows: Option<(RowSet, String)>,
+    /// The anchor is byte for byte the last one this handle wrote.
+    ours: bool,
 }
 
 /// The anchor row's `(cursor, payload, checksum)`, or `None` when a column
@@ -1002,7 +1193,56 @@ fn anchor_columns(r: &rusqlite::Row<'_>) -> rusqlite::Result<Option<(i64, String
 /// continue from. Never an error for anything the snapshot tables hold:
 /// any unreadable, damaged or foreign anchor is no previous seal, and the
 /// seal is full (which replaces it).
-fn previous(db: &Connection, identity: &Identity, cursor: i64) -> Result<Option<Previous>> {
+fn previous(
+    db: &Connection,
+    identity: &Identity,
+    cursor: i64,
+    anchors: Option<&AnchorCache>,
+) -> Result<Option<Previous>> {
+    // The anchor this handle wrote last, still stored (its checksum, cursor
+    // and length unchanged): continue from what it wrote, without reading
+    // the payload (WP5.1). A stored anchor that differs from it in any byte
+    // has another checksum (another writer's seal, a rolled-back one); one
+    // damaged behind the checksum is replaced by this seal anyway.
+    if let Some(anchors) = anchors
+        && let Ok(written) = anchors.anchors.try_borrow()
+        && let Some(written) = written.get(&identity.branch.id)
+    {
+        let stored: Option<(Option<i64>, Option<String>, Option<i64>)> = db
+            .prepare_cached(
+                "SELECT cursor,checksum,length(CAST(payload AS BLOB)) FROM startup_snapshots WHERE branch=?",
+            )?
+            .query_row([&identity.branch.id], |r| {
+                Ok((
+                    r.get_ref(0)?.as_i64().ok(),
+                    r.get_ref(1)?.as_str().ok().map(str::to_owned),
+                    r.get_ref(2)?.as_i64().ok(),
+                ))
+            })
+            .optional()?;
+        if let Some((Some(saved), Some(checksum), Some(length))) = stored
+            && saved == written.cursor
+            && checksum == written.checksum
+            && usize::try_from(length).ok() == Some(written.payload.len())
+        {
+            if written.identity != *identity || saved > cursor {
+                return Ok(None);
+            }
+            let rows = match &written.rows {
+                None => None,
+                Some(rows) => match header_text(&written.payload) {
+                    Some(header) => Some((rows.clone(), header.to_owned())),
+                    None => return Ok(None),
+                },
+            };
+            return Ok(Some(Previous {
+                cursor: saved,
+                journal: written.journal.clone(),
+                rows,
+                ours: true,
+            }));
+        }
+    }
     let row = db
         .prepare_cached("SELECT cursor,payload,checksum FROM startup_snapshots WHERE branch=?")?
         .query_row([&identity.branch.id], anchor_columns)
@@ -1010,6 +1250,31 @@ fn previous(db: &Connection, identity: &Identity, cursor: i64) -> Result<Option<
     let Some(Some((saved, payload, checksum))) = row else {
         return Ok(None);
     };
+    // The anchor this handle wrote last, unchanged: its checksum and head
+    // are known (WP5.1).
+    if let Some(anchors) = anchors
+        && let Ok(written) = anchors.anchors.try_borrow()
+        && let Some(written) = written.get(&identity.branch.id)
+        && written.payload == payload
+        && written.checksum == checksum
+    {
+        if written.identity != *identity || written.cursor != saved || saved > cursor {
+            return Ok(None);
+        }
+        let rows = match &written.rows {
+            None => None,
+            Some(rows) => match header_text(&payload) {
+                Some(header) => Some((rows.clone(), header.to_owned())),
+                None => return Ok(None),
+            },
+        };
+        return Ok(Some(Previous {
+            cursor: saved,
+            journal: written.journal.clone(),
+            rows,
+            ours: true,
+        }));
+    }
     if hash(payload.as_bytes()) != checksum {
         return Ok(None);
     }
@@ -1040,13 +1305,17 @@ fn previous(db: &Connection, identity: &Identity, cursor: i64) -> Result<Option<
             if RowsDigest::parse(&rows.digest).is_none() {
                 return Ok(None);
             }
-            Some((rows, anchor.projection))
+            Some((
+                rows,
+                header_json(&anchor.projection.conflicts, &anchor.projection.pending)?,
+            ))
         }
     };
     Ok(Some(Previous {
         cursor: saved,
         journal,
         rows,
+        ours: false,
     }))
 }
 
@@ -1147,6 +1416,13 @@ pub(super) struct Seal<'a> {
     /// Its JSON, serialized off-lock (a prepared slow commit).
     pub(super) json: Option<&'a str>,
     pub(super) changed: Changed<'a>,
+    /// The handle's anchor cache (WP5.1; `None`: read every anchor in full).
+    pub(super) anchors: Option<&'a AnchorCache>,
+    /// The projection's conflict and pending lists are the stored ones
+    /// before this commit (a fast commit, or a slow commit whose delta left
+    /// them): the previous anchor's header, when it is this handle's, is
+    /// still the header.
+    pub(super) lists_unchanged: bool,
 }
 
 /// Whether `branch` is sealed as rows (it has sealed rows). A hint, read
@@ -1196,7 +1472,7 @@ pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<Sea
     let identity = Identity::read(db, branch)?;
     let previous = match input.changed {
         Changed::Rebuild => None,
-        _ => previous(db, &identity, cursor)?,
+        _ => previous(db, &identity, cursor, input.anchors)?,
     };
     let (journal, journal_rows) = match &previous {
         Some(previous) => extend_journal(
@@ -1213,9 +1489,10 @@ pub(super) fn seal(db: &Connection, branch: &str, input: Seal<'_>) -> Result<Sea
     let incremental = match previous {
         Some(Previous {
             rows: Some((rows, header)),
+            ours,
             ..
         }) if matches!(input.changed, Changed::Marked | Changed::Plus(_)) => seal_rows_incremental(
-            db, branch, &identity, cursor, &journal, &frontier, &input, rows, header,
+            db, branch, &identity, cursor, &journal, &frontier, &input, rows, header, ours,
         )?,
         _ => None,
     };
@@ -1281,10 +1558,11 @@ fn seal_full(
             db.prepare_cached("DELETE FROM snapshot_conflicts WHERE branch=?")?
                 .execute([branch])?;
             clear_marks(db, branch)?;
-            write_anchor(db, branch, cursor, &payload)?;
+            let bytes =
+                write_anchor_cached(db, branch, identity, cursor, journal, None, payload, input)?;
             return Ok(SealReport {
                 mode: SealMode::Inline,
-                bytes: payload.len() as u64,
+                bytes,
                 used_json: input.json.is_some(),
                 ..SealReport::default()
             });
@@ -1343,10 +1621,19 @@ fn seal_full(
         frontier,
         Some(&rows),
     )?;
-    write_anchor(db, branch, cursor, &payload)?;
+    let anchor_bytes = write_anchor_cached(
+        db,
+        branch,
+        identity,
+        cursor,
+        journal,
+        Some(&rows),
+        payload,
+        input,
+    )?;
     Ok(SealReport {
         mode: SealMode::RowsFull,
-        bytes: payload.len() as u64 + rows.bytes,
+        bytes: anchor_bytes + rows.bytes,
         entity_rows: rows.entries,
         conflict_rows: rows.conflicts,
         ..SealReport::default()
@@ -1441,7 +1728,8 @@ fn seal_rows_incremental(
     frontier: &[String],
     input: &Seal<'_>,
     mut rows: RowSet,
-    header: Projection,
+    header: String,
+    ours: bool,
 ) -> Result<Option<SealReport>> {
     let Some(mut digest) = RowsDigest::parse(&rows.digest) else {
         return Ok(None);
@@ -1580,10 +1868,17 @@ fn seal_rows_incremental(
     fault("seal_marks_cleared");
     rows.digest = digest.hex();
     // A fast commit never changes the header; a slow commit passes the
-    // projection it holds.
+    // projection it holds, whose lists, when unchanged, are the header of
+    // this handle's previous anchor (WP5.1: its text is reused).
     let header = match input.projection {
-        Some(projection) => header_json(&projection.conflicts, &projection.pending)?,
-        None => header_json(&header.conflicts, &header.pending)?,
+        Some(_) if ours && input.lists_unchanged => header,
+        Some(projection) => header_json_cached(
+            input.anchors,
+            branch,
+            &projection.conflicts,
+            &projection.pending,
+        )?,
+        None => header,
     };
     let payload = anchor_payload(
         identity,
@@ -1594,10 +1889,19 @@ fn seal_rows_incremental(
         frontier,
         Some(&rows),
     )?;
-    write_anchor(db, branch, cursor, &payload)?;
+    let anchor_bytes = write_anchor_cached(
+        db,
+        branch,
+        identity,
+        cursor,
+        journal,
+        Some(&rows),
+        payload,
+        input,
+    )?;
     Ok(Some(SealReport {
         mode: SealMode::RowsIncremental,
-        bytes: payload.len() as u64 + written_bytes,
+        bytes: anchor_bytes + written_bytes,
         entity_rows: written_entities,
         conflict_rows: written_conflicts,
         ..SealReport::default()
@@ -1615,6 +1919,8 @@ pub(super) fn persist(db: &Connection, branch: &str) -> Result<()> {
             projection: None,
             json: None,
             changed: Changed::Rebuild,
+            anchors: None,
+            lists_unchanged: false,
         },
     )?;
     Ok(())
@@ -1747,6 +2053,8 @@ impl Store {
                     projection: fresh.map(|view| &view.projection),
                     json: None,
                     changed: Changed::Marked,
+                    anchors: None,
+                    lists_unchanged: false,
                 },
             )?
         };
@@ -1988,6 +2296,8 @@ impl Store {
                         projection: fresh.map(|view| &view.projection),
                         json: None,
                         changed: Changed::Marked,
+                        anchors: None,
+                        lists_unchanged: false,
                     },
                 )?
             };
@@ -2171,6 +2481,174 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WP5.1: a seal that trusts the handle's cached anchor (no hash, no
+    /// parse) and reuses its header text writes the same anchor, byte for
+    /// byte, as a seal that reads the stored anchor in full and serializes
+    /// the header, after fast commits and after slow commits with and
+    /// without a change of the conflict list (rows layout).
+    #[test]
+    fn a_cached_anchor_seals_the_same_bytes() {
+        let previous_limit = set_thread_inline_limit(Some(1));
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), None).unwrap();
+        let file = s.create("f.txt", "file").unwrap();
+        s.create("g.txt", "file").unwrap();
+        let entry = s.entry(&file.id).unwrap();
+        let (content, alive) = (
+            entry.revisions.get("content").cloned(),
+            entry.revisions.get("alive").cloned(),
+        );
+        // Concurrent saves: slow commits that change the conflict list.
+        s.write_with_base(&file.id, content.clone(), alive.clone(), b"one")
+            .unwrap();
+        s.write_with_base(&file.id, content, alive, b"two").unwrap();
+        let branch = s.active.clone();
+        let anchor = |s: &Store| -> String {
+            s.db.query_row(
+                "SELECT payload FROM startup_snapshots WHERE branch=?",
+                [&branch],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        for step in 0..4 {
+            match step {
+                0 => {}
+                1 => {
+                    s.create(&format!("h{step}.txt"), "file").unwrap();
+                }
+                _ => {
+                    let target = s.lookup("g.txt").unwrap();
+                    let content = target.revisions.get("content").cloned();
+                    s.write_revision(&target.id, content, format!("{step}").as_bytes())
+                        .unwrap();
+                }
+            }
+            let projection = load_projection(&s.db, &branch).unwrap();
+            let cursor = cursor(&s.db, &branch).unwrap();
+            let changed = BTreeSet::from([file.id.clone()]);
+            let seal_with = |anchors: Option<&AnchorCache>, lists_unchanged: bool| {
+                s.db.execute_batch("SAVEPOINT cached_anchor").unwrap();
+                let report = seal(
+                    &s.db,
+                    &branch,
+                    Seal {
+                        cursor: Some(cursor),
+                        projection: Some(&projection),
+                        json: None,
+                        changed: Changed::Plus(&changed),
+                        anchors,
+                        lists_unchanged,
+                    },
+                )
+                .unwrap();
+                let written = anchor(&s);
+                s.db.execute_batch("ROLLBACK TO cached_anchor; RELEASE cached_anchor")
+                    .unwrap();
+                (report.mode, written)
+            };
+            let plain = seal_with(None, false);
+            assert_eq!(plain.0, SealMode::RowsIncremental, "step {step}");
+            // Prime the cache with the stored anchor as this handle's own.
+            let anchors = AnchorCache::default();
+            let stored: (i64, String, String) =
+                s.db.query_row(
+                    "SELECT cursor,payload,checksum FROM startup_snapshots WHERE branch=?",
+                    [&branch],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            let head: AnchorHead = serde_json::from_str(&stored.1).unwrap();
+            anchors.put(
+                &branch,
+                Written {
+                    payload: stored.1.clone(),
+                    checksum: stored.2.clone(),
+                    cursor: stored.0,
+                    identity: Identity::read(&s.db, &branch).unwrap(),
+                    journal: JournalHash::decode(&head.journal_state).unwrap(),
+                    rows: head.rows.clone(),
+                },
+            );
+            assert_eq!(
+                seal_with(Some(&anchors), true),
+                plain,
+                "step {step}: cached, reused header"
+            );
+            assert_eq!(
+                seal_with(Some(&anchors), false),
+                plain,
+                "step {step}: cached"
+            );
+        }
+        set_thread_inline_limit(previous_limit);
+    }
+
+    /// WP5.1 (the WP4.INT review minor): a `journal_branch` build that starts
+    /// without its cursor key (an earlier build crashed between creating the
+    /// table and writing its keys) records its progress from the first
+    /// chunk, so a crash after a chunk resumes after it instead of from the
+    /// start; the resumed build completes the index row for row.
+    #[test]
+    fn a_journal_index_build_without_its_cursor_resumes_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), None).unwrap();
+        for i in 0..25 {
+            s.create(&format!("f{i:03}"), "file").unwrap();
+        }
+        let db = &s.db;
+        let indexed = |db: &Connection| -> Vec<(i64, String)> {
+            db.prepare("SELECT seq,branch FROM journal_branch ORDER BY seq")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let expected = indexed(db);
+        assert!(expected.len() >= 25);
+        let cursor = |db: &Connection| -> Option<String> {
+            db.query_row(
+                "SELECT value FROM config WHERE key=?1",
+                [JOURNAL_BRANCH_CURSOR],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        db.execute_batch(
+            "DELETE FROM journal_branch; DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+        )
+        .unwrap();
+        // A crash after the first chunk of 10 rows.
+        let mut first = None;
+        let crashed = backfill_journal_branch_with(db, 10, &mut |upper| {
+            first = Some(upper);
+            anyhow::bail!("crash after a chunk")
+        });
+        assert!(crashed.is_err());
+        let first = first.expect("one chunk ran");
+        assert_eq!(
+            cursor(db),
+            Some(first.to_string()),
+            "the first chunk's progress"
+        );
+        assert_eq!(indexed(db).len(), 10);
+        // The resumed build starts after the recorded cursor.
+        let mut chunks = vec![];
+        backfill_journal_branch_with(db, 10, &mut |upper| {
+            chunks.push(upper);
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            chunks.iter().all(|&upper| upper > first),
+            "{chunks:?} after {first}"
+        );
+        assert_eq!(indexed(db), expected);
+        assert_eq!(cursor(db), None);
+    }
 
     /// The anchor's JSON parses back into what was written, in both
     /// layouts, and the head parse skips the bulk.

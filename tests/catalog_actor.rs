@@ -26,8 +26,8 @@ use tkfs::{
     model::{
         errors::{ErrorClass, ErrorWire, code_of},
         orchestrator::{
-            CatalogApi, CatalogCmd, CatalogSnapshot, EntryState, FeedTip, FolderRecord, GateRecord,
-            PeerRecord, PublishedCatalogApi, PublishedEntry,
+            CatalogApi, CatalogCmd, CatalogSnapshot, CredentialSide, EntryState, FeedTip,
+            FolderRecord, GateRecord, PeerRecord, PublishedCatalogApi, PublishedEntry,
         },
     },
     orchestrator::{
@@ -1990,4 +1990,214 @@ fn published_updates_from_many_threads_count_every_change() {
     assert_eq!(generation, 1_000 + 8 * 50);
     assert_eq!(list.len(), 8);
     assert!(list.iter().all(|e| e.sync_generation == 50));
+}
+
+// ---------------------------------------------------------------------------
+// Per-peer credentials through the catalog contract (CCR-WP4.1-1, WP5.4)
+
+fn enroll(installation: &str, side: CredentialSide, key: [u8; 32]) -> CatalogCmd {
+    CatalogCmd::EnrollCredential {
+        installation: installation.into(),
+        side,
+        key,
+        paired_only: false,
+        generation: None,
+    }
+}
+
+/// Everything WP4.1 did through `Catalog::of` and the concrete catalog's
+/// own calls runs through `dyn CatalogApi`: the credentials view and the
+/// three credential commands, with the paired-only and verifier-generation
+/// conditions checked in the command's transaction. A credential change
+/// moves no snapshot generation; a rotation and an unpair change both.
+#[test]
+fn credentials_are_read_and_changed_through_the_catalog_contract() {
+    let _faults = shared();
+    let env = env();
+    let catalog = Catalog::open(&env.config).unwrap();
+    let api: Arc<dyn CatalogApi> = catalog.clone();
+    let credentials = || api.credentials().expect("the actor keeps credentials");
+    assert!(credentials().is_empty());
+    let generation = api.snapshot().generation;
+    let (inbound, outbound) = ([7u8; 32], [8u8; 32]);
+
+    // Enroll both sides of one peer: the credentials change, the snapshot
+    // does not (no generation, no wake-up).
+    let before = api.snapshot();
+    let returned = api
+        .apply(enroll("peer", CredentialSide::Inbound, inbound))
+        .unwrap();
+    assert_eq!(returned.generation, generation);
+    api.apply(enroll("peer", CredentialSide::Outbound, outbound))
+        .unwrap();
+    assert_eq!(api.snapshot().generation, generation);
+    assert_same_content(&api.snapshot(), &before);
+    let woke = api.wait_newer(generation, Duration::from_millis(50));
+    assert_eq!(
+        woke.generation, generation,
+        "a credential change woke a waiter"
+    );
+    assert_eq!(
+        credentials().active("peer", CredentialSide::Inbound),
+        Some(inbound)
+    );
+    assert_eq!(
+        credentials().active("peer", CredentialSide::Outbound),
+        Some(outbound)
+    );
+    assert_eq!(credentials().len(), 2);
+    // The same view as the concrete catalog's own call.
+    assert_eq!(*credentials(), *catalog.credentials());
+    // Neither the command nor the view ever prints a key.
+    let text = format!(
+        "{:?} {:?}",
+        enroll("peer", CredentialSide::Inbound, inbound),
+        credentials()
+    );
+    assert!(!text.contains(&hex::encode(inbound)), "{text}");
+    assert!(!text.contains("7, 7, 7"), "{text}");
+
+    // Refusals, each storing nothing.
+    let own = api.snapshot().installation.clone();
+    let refused = |cmd: CatalogCmd| api.apply(cmd).unwrap_err().code;
+    assert_eq!(
+        refused(enroll(&own, CredentialSide::Inbound, inbound)),
+        "CANNOT_PAIR_WITH_SELF"
+    );
+    assert_eq!(
+        refused(CatalogCmd::EnrollCredential {
+            installation: "unpaired".into(),
+            side: CredentialSide::Outbound,
+            key: outbound,
+            paired_only: true,
+            generation: None,
+        }),
+        "PEER_NOT_PAIRED"
+    );
+    let verifier_generation = api.snapshot().verifier_generation;
+    assert_eq!(
+        refused(CatalogCmd::EnrollCredential {
+            installation: "dialer".into(),
+            side: CredentialSide::Inbound,
+            key: inbound,
+            paired_only: false,
+            generation: Some(verifier_generation + 1),
+        }),
+        "PAIRING_CODE_CHANGED"
+    );
+    assert!(
+        credentials()
+            .get("unpaired", CredentialSide::Outbound)
+            .is_none()
+    );
+    assert!(
+        credentials()
+            .get("dialer", CredentialSide::Inbound)
+            .is_none()
+    );
+    // At the current generation, and with a peer record, both conditions hold.
+    api.apply(CatalogCmd::EnrollCredential {
+        installation: "dialer".into(),
+        side: CredentialSide::Inbound,
+        key: inbound,
+        paired_only: false,
+        generation: Some(verifier_generation),
+    })
+    .unwrap();
+    let paired = api
+        .apply(CatalogCmd::UpsertPeer {
+            record: peer("ws://peer:1", "peer"),
+        })
+        .unwrap();
+    assert_eq!(paired.generation, generation + 1);
+    api.apply(CatalogCmd::EnrollCredential {
+        installation: "peer".into(),
+        side: CredentialSide::Outbound,
+        key: [9; 32],
+        paired_only: true,
+        generation: None,
+    })
+    .unwrap();
+    assert_eq!(
+        credentials().active("peer", CredentialSide::Outbound),
+        Some([9; 32])
+    );
+
+    // Revoke keeps the row, marked; forget deletes it.
+    api.apply(CatalogCmd::RevokeCredential {
+        installation: "dialer".into(),
+        side: CredentialSide::Inbound,
+    })
+    .unwrap();
+    let revoked = credentials();
+    let row = revoked.get("dialer", CredentialSide::Inbound).unwrap();
+    assert!(row.revoked_ms.is_some() && row.active_key().is_none());
+    api.apply(CatalogCmd::ForgetCredential {
+        installation: "dialer".into(),
+        side: CredentialSide::Inbound,
+    })
+    .unwrap();
+    assert!(
+        credentials()
+            .get("dialer", CredentialSide::Inbound)
+            .is_none()
+    );
+    assert_eq!(api.snapshot().generation, generation + 1);
+
+    // A rotation revokes every inbound credential with its generation bump;
+    // the outbound one stays.
+    let (_, verifier) = Verifier::generate();
+    let rotated = api.apply(CatalogCmd::SetVerifier { verifier }).unwrap();
+    assert_eq!(rotated.generation, generation + 2);
+    assert_eq!(credentials().active("peer", CredentialSide::Inbound), None);
+    assert_eq!(
+        credentials().active("peer", CredentialSide::Outbound),
+        Some([9; 32])
+    );
+    // An unpair forgets the outbound credential with the last record.
+    api.apply(CatalogCmd::RemovePeer {
+        endpoint: "ws://peer:1".into(),
+    })
+    .unwrap();
+    assert!(
+        credentials()
+            .get("peer", CredentialSide::Outbound)
+            .is_none()
+    );
+
+    // What is stored survives a reopen, read through the contract again.
+    api.apply(enroll("later", CredentialSide::Inbound, inbound))
+        .unwrap();
+    let kept = credentials();
+    drop(api);
+    assert!(catalog.close());
+    drop(catalog);
+    let reopened: Arc<dyn CatalogApi> = Catalog::open(&env.config).unwrap();
+    assert_eq!(*reopened.credentials().unwrap(), *kept);
+}
+
+/// A catalog that keeps no credentials (a test's fake) answers `None` by
+/// default: its peers authenticate with the pairing code alone.
+#[test]
+fn a_catalog_without_credentials_answers_none() {
+    struct Fake(Arc<CatalogSnapshot>);
+    impl CatalogApi for Fake {
+        fn snapshot(&self) -> Arc<CatalogSnapshot> {
+            self.0.clone()
+        }
+        fn apply(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
+            Err(ErrorWire::coded("CATALOG_UNAVAILABLE", cmd.name()))
+        }
+        fn wait_newer(&self, _: u64, _: Duration) -> Arc<CatalogSnapshot> {
+            self.0.clone()
+        }
+    }
+    let fake: Arc<dyn CatalogApi> = Arc::new(Fake(Arc::new(CatalogSnapshot::default())));
+    assert!(fake.credentials().is_none());
+    assert_eq!(
+        fake.apply(enroll("peer", CredentialSide::Inbound, [1; 32]))
+            .unwrap_err()
+            .message,
+        "CATALOG_UNAVAILABLE: enroll_credential"
+    );
 }

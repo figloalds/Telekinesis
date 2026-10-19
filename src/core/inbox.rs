@@ -881,7 +881,11 @@ impl Store {
         }
         let incremental = fast.is_some();
         // Row bookkeeping first, the commit last: the commit's view patch then
-        // stays valid for the next event (no write follows it).
+        // stays valid for the next event (no write follows it). The inbox rows
+        // are no projection state: a fresh view stays fresh across them, so a
+        // slow commit after another one in the slice derives from it instead
+        // of reloading it (WP5.1).
+        let view = self.keep_view();
         self.db.execute_batch("SAVEPOINT inbox_event")?;
         let released = match self.finish_row(id) {
             Ok(released) => released,
@@ -890,6 +894,7 @@ impl Store {
                 return Err(error);
             }
         };
+        self.rekey_view(view);
         match self.commit_checked(event, false, checked, fast) {
             Ok(()) => {
                 self.db.execute_batch("RELEASE inbox_event")?;
@@ -1524,7 +1529,7 @@ impl Store {
     /// The `data_version` under which the cached view is fresh right now, if
     /// it is. Pair with `rekey_view` around writes that touch no projection
     /// state (inbox rows, object bookkeeping, transaction boundaries).
-    fn keep_view(&self) -> Option<i64> {
+    pub(super) fn keep_view(&self) -> Option<i64> {
         self.adopt_foreign_commits();
         let data_version = self.data_version().ok()?;
         self.view_cache
@@ -1540,7 +1545,7 @@ impl Store {
     /// Re-key a view kept by `keep_view` to the connection's current change
     /// count and transaction state, unless another connection committed in
     /// between (then the view is dropped, exactly as `view` would).
-    fn rekey_view(&self, kept: Option<i64>) {
+    pub(super) fn rekey_view(&self, kept: Option<i64>) {
         let Some(data_version) = kept else {
             return;
         };

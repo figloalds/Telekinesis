@@ -1456,13 +1456,22 @@ const QUAL_FILES: &[(&str, &str)] = &[
     ("qual_scale", "WP4.2"),
 ];
 
+/// Qualification files created after WP0.5's baseline evidence, so not in
+/// it (WP5.INT; CCR-WP5.2-6, CCR-WP5.3-4): their ignores name their owner
+/// too.
+const LATER_QUAL_FILES: &[(&str, &str)] = &[
+    ("qual_wp5_1_concurrent", "WP5.1"),
+    ("qual_wp5_2_local", "WP5.2"),
+    ("qual_wp5_3_recovery", "WP5.3"),
+];
+
 fn tests_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests")
 }
 
 #[test]
 fn qual_files_exist_and_ignores_name_their_owner() {
-    for (file, owner) in QUAL_FILES {
+    for (file, owner) in QUAL_FILES.iter().chain(LATER_QUAL_FILES) {
         let path = tests_dir().join(format!("{file}.rs"));
         let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert!(text.contains("mod support;"), "{file} uses the harness");
@@ -1499,7 +1508,7 @@ fn qualify_sh_runs_with_lf_and_crlf() {
         fs::write(&script, text).unwrap();
         for (args, message) in [
             (&["--bogus-arg"][..], "unknown argument --bogus-arg"),
-            (&["--wave", "9"][..], "use --wave 1..4"),
+            (&["--wave", "9"][..], "use --wave 1..5"),
             (
                 &["--wave", "1", "--files", "qual_none", "--no-build"][..],
                 "no qualification files selected",
@@ -1583,7 +1592,10 @@ fn floors_reference_existing_scenarios() {
             matches!(floor["op"].as_str(), Some("<" | "<=" | ">" | ">=" | "==")),
             "{id}"
         );
-        assert!((1..=4).contains(&floor["wave"].as_u64().unwrap()), "{id}");
+        assert!((1..=5).contains(&floor["wave"].as_u64().unwrap()), "{id}");
+        if let Some(heavy) = floor.get("heavy") {
+            assert!(heavy.is_boolean(), "{id}: heavy is a boolean");
+        }
     }
 }
 
