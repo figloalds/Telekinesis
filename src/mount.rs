@@ -12,6 +12,17 @@
 //! [`checkout`] hold it across their mount I/O (so they wait for each other);
 //! a callback, [`attached`], [`serves`] and [`inflight`] never take it, and
 //! [`notify`] only tries it, so readers never wait for a transition.
+//!
+//! WP5.2: a callback does the work that needs no engine lock first (waiting
+//! for content that is downloading, the writable copy of a large file, the
+//! hashing and copying of a save; `runtime::engine`, *Saves off the engine
+//! lock*), and takes the engine only for its own short phases. During a
+//! burst of closes a cleanup queues the save of the closed file for a
+//! background saver and returns (`runtime::engine::write_behind`); a lone
+//! cleanup, a flush, a rename and a delete-on-close wait for the save. A read of content
+//! that cannot arrive answers `STATUS_DEVICE_NOT_READY` (programs report "the
+//! device is not ready"); `STATUS_FILE_IS_OFFLINE` read as "invalid argument"
+//! (CCR-WP4.INT-2). At most half of the dispatcher threads wait for content.
 use crate::{
     core::*,
     model::ipc::timing::DETACH_DRAIN,
@@ -47,7 +58,7 @@ pub struct Info {
 }
 unsafe extern "C" {
     fn tk_winfsp_load(attempted: *mut u16, count: u32) -> u32;
-    fn tk_mount_start(path: *const u16, out: *mut usize) -> u32;
+    fn tk_mount_start(path: *const u16, out: *mut usize, threads: u32, irp_timeout_ms: u32) -> u32;
     fn tk_mount_stop(native: usize);
     fn tk_mount_notify(native: usize, path: *const u16, action: u32) -> u32;
 }
@@ -102,6 +113,23 @@ fn load_runtime() -> Result<()> {
     );
     Ok(())
 }
+/// Starts a native WinFsp instance at `path` (dispatcher threads and the
+/// request timeout of [`dispatcher_threads`] and [`REQUEST_TIMEOUT`]).
+fn start_native(path: &Path) -> Result<usize> {
+    let threads = dispatcher_threads();
+    CONTENT_WAITERS.set_max((threads / 2) as usize);
+    let mut native = 0;
+    let status = unsafe {
+        tk_mount_start(
+            wide(path).as_ptr(),
+            &mut native,
+            threads,
+            REQUEST_TIMEOUT.as_millis() as u32,
+        )
+    };
+    ensure!(status == 0, "WINFSP_MOUNT_FAILED: 0x{status:08x}");
+    Ok(native)
+}
 fn bound() -> Result<Shared> {
     ENGINE
         .read()
@@ -125,6 +153,8 @@ pub fn bind(engine: &Shared) -> Result<()> {
         );
     }
     *slot = Some(engine.clone());
+    drop(slot);
+    crate::runtime::Engine::adopt_shared(engine);
     Ok(())
 }
 /// `MOUNT_PATH_MUST_NOT_EXIST` unless nothing is at `path`.
@@ -171,9 +201,7 @@ pub fn attach(path: &Path) -> Result<()> {
     let engine = bound()?;
     load_runtime()?;
     adapter::vacant(path)?;
-    let mut native = 0;
-    let status = unsafe { tk_mount_start(wide(path).as_ptr(), &mut native) };
-    ensure!(status == 0, "WINFSP_MOUNT_FAILED: 0x{status:08x}");
+    let native = start_native(path)?;
     *guard = Some(Mount {
         native,
         path: path.to_owned(),
@@ -245,6 +273,8 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         let p = e.store.projection(&branch.id)?;
         ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
         e.switching = true;
+        // Content waits end now (they would hold the drain below).
+        adapter::set_fenced(true);
     }
     // New opens fenced before stopping. No engine mutex during dispatcher stop.
     adapter::drain(DETACH_DRAIN);
@@ -255,12 +285,7 @@ pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value
         e.mounted = false;
         e.quiet().and_then(|()| e.control(request, payload))
     };
-    let remount = crate::util::fault::fail("fs.remount").and_then(|()| {
-        let mut native = 0;
-        let status = unsafe { tk_mount_start(wide(&mount.path).as_ptr(), &mut native) };
-        ensure!(status == 0, "WINFSP_MOUNT_FAILED: 0x{status:08x}");
-        Ok(native)
-    });
+    let remount = crate::util::fault::fail("fs.remount").and_then(|()| start_native(&mount.path));
     match remount {
         Ok(native) => {
             mount.native = native;
@@ -324,10 +349,68 @@ pub unsafe extern "C" fn tk_call(
         let engine = &engine;
         let h = unsafe { *token };
         let path = unsafe { string(name) };
+        // Work that needs no engine lock comes first (WP5.2): waiting for
+        // content, the writable copy of a large file, and the hashing and
+        // copying of a save. Each phase that needs the engine takes it
+        // briefly on its own.
         if op == 4 || op == 5 || op == 6 && offset != 0 {
-            crate::runtime::prepare_content(engine, h, std::time::Duration::from_secs(15))?;
+            crate::runtime::content::prepare_content_waiting(engine, h, content_wait())?;
         }
-        let mut e = lock_engine(engine);
+        match op {
+            5 => crate::runtime::content::prepare_writable(engine, h, None)?,
+            6 if offset != 0 => crate::runtime::content::prepare_writable(
+                engine,
+                h,
+                Some((offset, flags & 1 != 0)),
+            )?,
+            // A flush (`FlushFileBuffers`) and a rename wait for the save; so
+            // does a delete-on-close cleanup (the save comes before the delete).
+            7 => crate::runtime::engine::save_handle(engine, h)?,
+            12 => {
+                crate::runtime::engine::save_handle(engine, h)?;
+                // The entry at the target (one a rename replaces, or a
+                // deferred create holding the name) is final first.
+                crate::runtime::engine::settle_path(engine, &path)?;
+            }
+            9 if flags & 1 != 0 => {
+                crate::runtime::engine::save_handle(engine, h)?;
+                crate::runtime::engine::settle_handle(engine, h)?;
+            }
+            // The application's close: during a burst of closes the save goes
+            // on in the background (`write_behind`, `save_handle_in_background`);
+            // a lone close saves before it returns.
+            9 if crate::runtime::engine::write_behind() => {
+                lock_engine(engine).cleanup_unsaved(h)?;
+                crate::runtime::engine::save_handle_in_background(engine, h)?;
+                return Ok(0);
+            }
+            9 => crate::runtime::engine::save_handle(engine, h)?,
+            10 => {
+                crate::runtime::engine::close_handle(engine, h)?;
+                // Qualification hook: a close-path failure after the handle closed.
+                crate::util::fault::fail("fs.close")?;
+                return Ok(0);
+            }
+            _ => {}
+        }
+        // Background saves let the application's callbacks take the engine
+        // first, from here on (the work before the lock, a content wait among
+        // it, does not hold them back); a flush, a close, a cleanup and a
+        // rename wait for saves and are not the application's foreground.
+        let _foreground = (![7, 9, 10, 12].contains(&op)).then(crate::runtime::engine::foreground);
+        // A write waits (without the lock) for a save that reads its file; a
+        // rename and a delete on close wait for any save of the file they
+        // rename, replace or delete, so none commits after them
+        // (`runtime::engine::lock_settled`).
+        let mut e = if op == 5 || op == 6 {
+            crate::runtime::engine::lock_for_write(engine, h)
+        } else if op == 12 {
+            crate::runtime::engine::lock_settled(engine, Some(h), Some(&path))
+        } else if op == 9 && flags & 1 != 0 {
+            crate::runtime::engine::lock_settled(engine, Some(h), None)
+        } else {
+            lock_engine(engine)
+        };
         let mut out = Info::default();
         let mut count = 0;
         match op {
@@ -342,17 +425,12 @@ pub unsafe extern "C" fn tk_call(
                         ..Default::default()
                     }
                 } else {
-                    e.store.lookup(&path)?
+                    e.lookup_visible(&path)?
                 };
                 let size = if special {
                     e.discovery.len()
                 } else {
-                    entry
-                        .content
-                        .as_ref()
-                        .map(|h| e.store.object_size(h).map(|size| size as usize))
-                        .transpose()?
-                        .unwrap_or(0)
+                    e.visible_size(&entry)?
                 };
                 fill(&mut out, &entry, size);
             }
@@ -367,8 +445,13 @@ pub unsafe extern "C" fn tk_call(
                 } else {
                     None
                 };
-                let (handle, entry) =
-                    e.open_with_attributes(&path, create, flags & 2 != 0, attributes)?;
+                // A file's creation commits with its first save (`runtime::engine`,
+                // *Deferred creates*); a directory's at once.
+                let (handle, entry) = if create == Some("file") {
+                    e.create_deferred(&path, flags & 2 != 0, attributes)?
+                } else {
+                    e.open_with_attributes(&path, create, flags & 2 != 0, attributes)?
+                };
                 unsafe { *token = handle };
                 fill(&mut out, &entry, e.session(handle)?.bytes.len());
             }
@@ -390,11 +473,8 @@ pub unsafe extern "C" fn tk_call(
             7 => e.flush(h)?,
             8 => {}
             9 => e.cleanup(h, flags & 1 != 0)?,
-            10 => {
-                e.close(h)?;
-                // Qualification hook: a close-path failure after the handle closed.
-                crate::util::fault::fail("fs.close")?;
-            }
+            // Closed before the lock (`close_handle`).
+            10 => {}
             11 => {
                 let s = e.session(h)?;
                 ensure!(
@@ -405,13 +485,15 @@ pub unsafe extern "C" fn tk_call(
                     s.entry.kind == "directory" || s.entry.basic_info().attributes & 1 == 0,
                     "ACCESS_DENIED: readonly file"
                 );
+                let entity = s.entry.id.clone();
                 ensure!(
-                    e.store.children(&s.entry.id)?.is_empty(),
+                    e.children_visible(&entity)?.is_empty(),
                     "DIRECTORY_NOT_EMPTY"
                 );
             }
             12 => {
                 e.flush(h)?;
+                e.commit_created_at(&path)?;
                 let entity = e.session(h)?.entry.id.clone();
                 e.store.rename(&entity, &path, flags & 1 != 0)?;
                 let entry = e.store.lookup(&path)?;
@@ -491,10 +573,44 @@ pub unsafe extern "C" fn tk_call(
     }
 }
 const STATUS_IO_DEVICE_ERROR: u32 = 0xc0000185;
+/// What a read of content that cannot arrive in time answers.
+pub const STATUS_DEVICE_NOT_READY: u32 = 0xc00000a3;
+/// The WinFsp request timeout this adapter sets (`IrpTimeout`, the SDK's
+/// default, made explicit): a callback must answer within it.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// How long a read waits for content that is downloading (crate docs of
+/// `runtime::content`): until no byte arrived for a minute, at most four
+/// minutes in all, a minute below [`REQUEST_TIMEOUT`].
+pub const CONTENT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const CONTENT_BOUND: std::time::Duration = std::time::Duration::from_secs(240);
+/// Reads waiting for downloads at once: half the dispatcher threads, so the
+/// mount's other operations always find a thread.
+static CONTENT_WAITERS: crate::runtime::content::WaitSlots =
+    crate::runtime::content::WaitSlots::new(4);
+/// The dispatcher threads of a WinFsp instance: the processor count (the
+/// WinFsp default), at least 8 and at most 64.
+pub fn dispatcher_threads() -> u32 {
+    std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .clamp(8, 64) as u32
+}
+fn content_wait() -> crate::runtime::content::ContentWait {
+    let (stall, bound) = crate::runtime::content::wait_bounds(CONTENT_STALL, CONTENT_BOUND);
+    crate::runtime::content::ContentWait {
+        stall,
+        bound,
+        slots: Some(&CONTENT_WAITERS),
+        cancelled: adapter::fenced,
+    }
+}
 fn nt_status(error: &anyhow::Error) -> u32 {
     let message = format!("{error:#}");
     if message.contains("CONTENT_UNAVAILABLE") {
-        0xc0000267 // STATUS_FILE_IS_OFFLINE
+        // Not STATUS_FILE_IS_OFFLINE: the C runtime maps its Win32 error to
+        // EINVAL, so programs reported "invalid argument" (CCR-WP4.INT-2).
+        // ERROR_NOT_READY reads "The device is not ready." in Win32 programs
+        // and maps to EACCES in the C runtime.
+        STATUS_DEVICE_NOT_READY
     } else if message.contains("FILE_NOT_FOUND") {
         0xc0000034
     } else if message.contains("NAME_COLLISION") {

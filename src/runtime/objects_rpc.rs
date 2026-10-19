@@ -43,6 +43,16 @@
 //! free for the next want of another session, at its durable offset, with
 //! no stall backoff: the orchestrator keeps its own per-source backoff.
 //!
+//! **Demand** (WP5.3): `objects.demand{route, lane?, max_items?}` →
+//! `{items:[{hash, requested_ms}]}` lists the objects a reader waits for
+//! (`Store::demanded_objects`, newest first; only the lane's own with
+//! `lane`). It is read-only: it leases nothing and touches no backoff. A
+//! lane busy with other objects asks it every half second and gives the
+//! demanded ones its next pull; the want list orders them first anyway.
+//! The op name and its types live here until `model::protocol::objects`
+//! takes them (CCR-WP5.3-3); a worker without it answers
+//! `UNSUPPORTED_OPERATION`, which the lane remembers.
+//!
 //! **Ordered parts:** a session may keep several writes of one object in
 //! flight; handler threads can run them out of order. A write whose first
 //! part starts past the object's durable offset waits (at most
@@ -99,6 +109,13 @@ pub const STALL_BACKOFF: Duration = LEASE_TTL;
 /// Lease holders kept (see [`ObjectsState::holders`]).
 const MAX_LEASE_HOLDERS: usize = 64 * 1024;
 
+/// `objects.demand` (module docs, "Demand"; WP5.3). Its name and types are
+/// the model's since CCR-WP5.3-3 (applied by WP5.INT), re-exported here for
+/// the callers that named them here.
+pub use crate::model::protocol::objects::{
+    DemandHeader, DemandItem, DemandReply, MAX_DEMAND_ITEMS, ops::DEMAND,
+};
+
 pub fn dispatch(
     ctx: &WorkerCtx,
     op: &str,
@@ -111,6 +128,7 @@ pub fn dispatch(
         ops::WRITE => write(ctx, parse(op, header)?, body),
         ops::REPORT => report(ctx, parse(op, header)?),
         ops::RELEASE => release_op(ctx, parse(op, header)?),
+        DEMAND => demand(ctx, parse(op, header)?),
         _ => Err(ErrorWire::coded("UNSUPPORTED_OPERATION", op)),
     }
 }
@@ -432,6 +450,40 @@ fn want(ctx: &WorkerCtx, request: WantRequest) -> Result<(Value, Vec<u8>), Error
         });
     }
     Ok((json!(WantReply { items }), vec![]))
+}
+
+/// `objects.demand{route, lane?, max_items?}` → `{items}` (module docs,
+/// "Demand"): read-only.
+fn demand(ctx: &WorkerCtx, header: DemandHeader) -> Result<(Value, Vec<u8>), ErrorWire> {
+    bind(ctx, &header.route)?;
+    if let Some(lane) = header.lane
+        && !lane.is_valid()
+    {
+        return Err(ErrorWire::coded(
+            "INVALID_BULK_LANE",
+            format!("lane {}/{}", lane.index, lane.count),
+        ));
+    }
+    let limit = header
+        .max_items
+        .unwrap_or(MAX_DEMAND_ITEMS)
+        .clamp(1, MAX_DEMAND_ITEMS) as usize;
+    // The lane's share of the demand: ask for more rows than `limit` when
+    // filtering, so another lane's objects do not crowd this one's out.
+    let rows = store(ctx)?
+        .demanded_objects(if header.lane.is_some() {
+            limit * 4
+        } else {
+            limit
+        })
+        .map_err(wire)?;
+    let items = rows
+        .into_iter()
+        .filter(|(hash, _)| header.lane.is_none_or(|lane| lane.owns(hash)))
+        .take(limit)
+        .map(|(hash, requested_ms)| DemandItem { hash, requested_ms })
+        .collect();
+    Ok((json!(DemandReply { items }), vec![]))
 }
 
 /// `objects.release{route, session, hashes}` → `{released}` (module docs,

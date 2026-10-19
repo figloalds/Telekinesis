@@ -20,7 +20,8 @@
 //! catalog snapshot (O(1)): our installation (self-pair refusal), the
 //! verifier and its generation, revocation (`peer_meta.revoked_ms`) and,
 //! since WP4.1, the dialer's per-peer credential (`peer_credentials`, side
-//! `inbound`, through `Catalog::of`): a dialer offering `peer-hmac-v1`
+//! `inbound`, through the catalog contract's `CatalogApi::credentials`,
+//! CCR-WP5.4-1): a dialer offering `peer-hmac-v1`
 //! without an active credential is refused `GOAWAY{PEER_REVOKED}`.
 //!
 //! **Per-peer credentials (WP4.1).** Two more peer ops, allowed on any
@@ -115,8 +116,8 @@ use crate::{
         errors::ErrorWire,
         ipc::{self, FeedExchangeReply, FeedExchangeRequest},
         orchestrator::{
-            CallError, CatalogSnapshot, Ctx, FolderCmd, FolderPhase, FolderView, PublishedEntry,
-            WorkerClient, limits,
+            CallError, CatalogCmd, CatalogSnapshot, CredentialSide, Ctx, FolderCmd, FolderPhase,
+            FolderView, PublishedEntry, WorkerClient, limits,
         },
         protocol::{
             self, CatalogListRequest, LaneRole, MetaExchangeHeader,
@@ -126,7 +127,6 @@ use crate::{
         },
         status::{Direction, StatusEvent},
     },
-    orchestrator::catalog::{Catalog, CredentialSide},
     paired_sync::SyncRoute,
     pairing_code::Verifier,
     session::{
@@ -306,7 +306,6 @@ pub fn start_with(
         counters: Counters::default(),
         next_session: AtomicU64::new(1),
         exchanges: AtomicUsize::new(0),
-        catalog: Catalog::of(&ctx.catalog),
         ctx,
     });
     if let Some(poller) = &poller {
@@ -492,9 +491,6 @@ struct Inner {
     next_session: AtomicU64,
     /// Worker-bound exchanges running now, server-wide.
     exchanges: AtomicUsize,
-    /// The concrete catalog, for the per-peer credentials (WP4.1); `None`
-    /// under a test's fake catalog.
-    catalog: Option<Arc<Catalog>>,
 }
 
 struct State {
@@ -766,7 +762,7 @@ impl Inner {
     fn serve_connection(self: Arc<Self>, stream: TcpStream, address: SocketAddr) {
         let preauth = PreauthSlot(&self);
         let policy = ConnPolicy {
-            policy: CatalogAcceptPolicy::with_catalog(self.ctx.clone(), self.catalog.clone()),
+            policy: CatalogAcceptPolicy::new(self.ctx.clone()),
             inner: self.clone(),
             reserved: AtomicBool::new(false),
             revocation_epoch: Mutex::new(None),
@@ -820,6 +816,8 @@ impl Inner {
             }
         };
         drop(registered);
+        // The leases of the session's offers end now (CCR-WP5.3-2).
+        super::inbound_objects::session_closed(&peer);
         // The peer unpaired us (its GOAWAY explains the close). A peer we do
         // not dial ourselves shared nothing with us but through these
         // sessions: it is gone, not offline (WP3.INT re-review; the hub
@@ -1132,17 +1130,11 @@ impl Drop for Registered<'_> {
 /// snapshot load.
 pub struct CatalogAcceptPolicy {
     ctx: Arc<Ctx>,
-    catalog: Option<Arc<Catalog>>,
 }
 
 impl CatalogAcceptPolicy {
     pub fn new(ctx: Arc<Ctx>) -> Self {
-        let catalog = Catalog::of(&ctx.catalog);
-        Self { ctx, catalog }
-    }
-
-    fn with_catalog(ctx: Arc<Ctx>, catalog: Option<Arc<Catalog>>) -> Self {
-        Self { ctx, catalog }
+        Self { ctx }
     }
 }
 
@@ -1186,13 +1178,12 @@ impl AcceptPolicy for CatalogAcceptPolicy {
     }
 
     fn peer_key(&self, installation: &str) -> Result<[u8; 32], ErrorWire> {
-        let Some(catalog) = &self.catalog else {
+        let Some(credentials) = self.ctx.catalog.credentials() else {
             return Err(ErrorWire::coded(
                 "PEER_REVOKED",
                 "this orchestrator keeps no per-peer credentials",
             ));
         };
-        let credentials = catalog.credentials();
         match credentials.get(installation, CredentialSide::Inbound) {
             Some(credential) => credential.active_key().ok_or_else(|| {
                 ErrorWire::coded(
@@ -1411,7 +1402,7 @@ impl Handler for SessionHandler {
             ops::META_EXCHANGE => self.exchange(req, meta_exchange),
             op if op.starts_with("objects.") => self.exchange(req, objects),
             peer_auth::ops::PEER_ENROLL | peer_auth::ops::PEER_REVOKE
-                if self.inner.catalog.is_some() =>
+                if self.inner.ctx.catalog.credentials().is_some() =>
             {
                 let inner = self.inner.clone();
                 let peer = self.peer.clone();
@@ -1875,7 +1866,9 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incomin
     } = req;
     let op = peer_auth::ops::PEER_ENROLL;
     let enrolled = (|| {
-        let catalog = inner.catalog.as_ref().ok_or_else(|| unknown_op(op))?;
+        if inner.ctx.catalog.credentials().is_none() {
+            return Err(unknown_op(op));
+        }
         let request: EnrollRequest =
             serde_json::from_value(header).map_err(|error| invalid_request(op, &error))?;
         let snapshot = inner.ctx.catalog.snapshot();
@@ -1898,16 +1891,17 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incomin
             &inner.ctx.installation,
             &request,
         )?;
-        catalog.enroll_at_generation(
-            &peer.installation,
-            CredentialSide::Inbound,
-            peer_auth::peer_key(&secret),
-            peer.verifier_generation,
-        )?;
+        inner.ctx.catalog.apply(CatalogCmd::EnrollCredential {
+            installation: peer.installation.clone(),
+            side: CredentialSide::Inbound,
+            key: peer_auth::peer_key(&secret),
+            paired_only: false,
+            generation: Some(peer.verifier_generation),
+        })?;
         if revoked_since() {
             // A `peer.revoke` ran meanwhile; it may have revoked before this
             // stored. The revocation wins.
-            catalog.revoke(&peer.installation, CredentialSide::Inbound)?;
+            revoke_inbound(&inner.ctx, &peer.installation)?;
             return Err(revoked_during_session());
         }
         Ok(())
@@ -1931,15 +1925,14 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incomin
 fn peer_revoke(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
     let responder = req.responder;
     let op = peer_auth::ops::PEER_REVOKE;
-    let revoked = match &inner.catalog {
-        Some(catalog) => {
-            // First the epoch: a `peer.enroll` of this installation running
-            // now either stores before the revocation below, or sees the
-            // epoch moved after it stored and revokes itself.
-            Inner::bump_revocation(&mut inner.state.lock(), &peer.installation);
-            catalog.revoke(&peer.installation, CredentialSide::Inbound)
-        }
-        None => Err(unknown_op(op)),
+    let revoked = if inner.ctx.catalog.credentials().is_some() {
+        // First the epoch: a `peer.enroll` of this installation running
+        // now either stores before the revocation below, or sees the
+        // epoch moved after it stored and revokes itself.
+        Inner::bump_revocation(&mut inner.state.lock(), &peer.installation);
+        revoke_inbound(&inner.ctx, &peer.installation)
+    } else {
+        Err(unknown_op(op))
     };
     match revoked {
         Ok(()) => {
@@ -1952,6 +1945,16 @@ fn peer_revoke(inner: &Arc<Inner>, peer: &AcceptedPeer, req: Incoming) {
         }
         Err(error) => responder.error(error),
     }
+}
+
+/// `CatalogCmd::RevokeCredential` of `installation`'s inbound credential.
+fn revoke_inbound(ctx: &Ctx, installation: &str) -> Result<(), ErrorWire> {
+    ctx.catalog
+        .apply(CatalogCmd::RevokeCredential {
+            installation: installation.to_owned(),
+            side: CredentialSide::Inbound,
+        })
+        .map(drop)
 }
 
 fn revoked_during_session() -> ErrorWire {

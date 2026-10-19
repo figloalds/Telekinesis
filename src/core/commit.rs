@@ -156,10 +156,135 @@ use std::{
     sync::OnceLock,
 };
 
+/// Objects this process verified (WP5.1 task 5): `(state root, hash)` →
+/// the file's size and mtime when it was verified, and when. Process-wide,
+/// bounded; `check_commit` skips the re-hash of an object recorded here
+/// within [`FRESH_MS`](verified::FRESH_MS) whose file still has that size
+/// and mtime. A verification is recorded only when it is not racy: observed
+/// at least [`RACY_NS`](verified::RACY_NS) after the file's mtime, so that a
+/// same-size rewrite within one timestamp tick cannot hide (the rule of the
+/// availability rows' `trusted`).
+pub mod verified {
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::{
+            Mutex, OnceLock, PoisonError,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    /// How long a verification counts as "moments ago".
+    pub const FRESH_MS: u64 = 300_000;
+    const FRESH: Duration = Duration::from_millis(FRESH_MS);
+    /// A verification observed within this long of the file's mtime is racy
+    /// and not recorded: the availability rows' `objects::RACY_NS` (larger
+    /// than any common mtime granularity; FAT: 2 s).
+    pub const RACY_NS: i64 = 3_000_000_000;
+    /// Entries kept (the oldest are dropped past it).
+    const CAPACITY: usize = 4096;
+
+    type Entries = HashMap<(PathBuf, String), (u64, i64, Instant)>;
+
+    fn entries() -> &'static Mutex<Entries> {
+        static ENTRIES: OnceLock<Mutex<Entries>> = OnceLock::new();
+        ENTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    static SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// The wall clock, in ns since the epoch (`observed_ns` of [`note`]).
+    pub fn now_ns() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+    }
+
+    /// When this process started trusting availability rows, in ms since the
+    /// epoch: fixed by the first call, which `Store::open` makes (through
+    /// `snapshot::initialize`) before the process installs anything.
+    pub fn epoch_ms() -> u64 {
+        static EPOCH: OnceLock<u64> = OnceLock::new();
+        *EPOCH.get_or_init(super::time)
+    }
+
+    /// Whether an observation at `observed_ns` of a file with mtime
+    /// `mtime_ns` is not racy.
+    pub fn settled(mtime_ns: i64, observed_ns: i64) -> bool {
+        i128::from(observed_ns) - i128::from(mtime_ns) >= i128::from(RACY_NS)
+    }
+
+    /// Whether an availability row verified at `verified_ms` stands for a
+    /// verification by this process moments ago (at `now_ms`): not before
+    /// [`epoch_ms`] (a previous process's row, until CCR-WP5.1-1 lets the
+    /// installers record their verifications here) and within
+    /// [`FRESH_MS`].
+    pub fn fresh_row(verified_ms: i64, now_ms: u64) -> bool {
+        u64::try_from(verified_ms)
+            .is_ok_and(|at| at >= epoch_ms() && now_ms.saturating_sub(at) <= FRESH_MS)
+    }
+
+    /// Record that this process verified `hash` under `root` while its file
+    /// had `len` bytes and mtime `mtime_ns`, as `stat` read them no earlier
+    /// than `observed_ns` (wall clock, ns since the epoch). Nothing is
+    /// recorded when that observation is racy ([`settled`]).
+    pub fn note(root: &Path, hash: &str, len: u64, mtime_ns: i64, observed_ns: i64) {
+        if !settled(mtime_ns, observed_ns) {
+            return;
+        }
+        let mut entries = entries().lock().unwrap_or_else(PoisonError::into_inner);
+        if entries.len() >= CAPACITY {
+            entries.retain(|_, (_, _, at)| at.elapsed() < FRESH);
+            if entries.len() >= CAPACITY {
+                entries.clear();
+            }
+        }
+        entries.insert(
+            (root.to_owned(), hash.to_owned()),
+            (len, mtime_ns, Instant::now()),
+        );
+    }
+
+    /// Drops what is recorded of `hash` under `root`: a later verification
+    /// found its bytes corrupt or missing, or they were quarantined
+    /// (WP5.INT, the WP5.1 review's minor; `objects::forget_served` calls
+    /// it, so the set never outlives what the index says).
+    pub fn forget(root: &Path, hash: &str) {
+        entries()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&(root.to_owned(), hash.to_owned()));
+    }
+
+    /// Whether `hash` under `root` was verified within [`FRESH_MS`] with the
+    /// file at `len` bytes and mtime `mtime_ns`.
+    pub fn recent(root: &Path, hash: &str, len: u64, mtime_ns: i64) -> bool {
+        entries()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(root.to_owned(), hash.to_owned()))
+            .is_some_and(|&(l, m, at)| l == len && m == mtime_ns && at.elapsed() < FRESH)
+    }
+
+    pub(super) fn count_skip() {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Re-verifications `check_commit` skipped in this process (tests).
+    #[doc(hidden)]
+    pub fn skipped() -> u64 {
+        SKIPPED.load(Ordering::Relaxed)
+    }
+}
+
+/// A view's slots: (parent, name key) to its visible entry.
+type ViewSlots = BTreeMap<(String, String), String>;
+
 /// The view slots (`(parent, name key)` → entity) of the alive entries of
 /// `projection`; `None` if a name cannot be keyed, which a committed
 /// projection never has.
-fn view_slots(projection: &Projection) -> Option<BTreeMap<(String, String), String>> {
+fn view_slots(projection: &Projection) -> Option<ViewSlots> {
     projection
         .entries
         .values()
@@ -167,6 +292,33 @@ fn view_slots(projection: &Projection) -> Option<BTreeMap<(String, String), Stri
         .map(|e| Ok(((e.parent.clone(), name_key(&e.name)?), e.id.clone())))
         .collect::<Result<_>>()
         .ok()
+}
+
+/// `view_slots` of a projection `derive::project_append` made from a view
+/// whose slots are `slots` (WP5.1): only the entities that changed can move,
+/// and each slot has at most one visible entry. `placements`: the changed
+/// entities with their visible placement in the base (`Appended`).
+fn patched_slots(
+    mut slots: BTreeMap<(String, String), String>,
+    placements: &[(String, Option<(String, String)>)],
+    projection: &Projection,
+) -> Option<BTreeMap<(String, String), String>> {
+    for (id, before) in placements {
+        if let Some((parent, name)) = before {
+            let key = (parent.clone(), name_key(name).ok()?);
+            if slots.get(&key) == Some(id) {
+                slots.remove(&key);
+            }
+        }
+    }
+    for (id, _) in placements {
+        if let Some(e) = projection.entries.get(id)
+            && e.alive
+        {
+            slots.insert((e.parent.clone(), name_key(&e.name).ok()?), id.clone());
+        }
+    }
+    Some(slots)
 }
 
 /// The view of `branch` after a slow commit stored `projection` (`None` if a
@@ -255,6 +407,8 @@ pub(crate) struct Cache {
     /// Views dropped because a commit was rolled back around the store
     /// (tests).
     rolled_back_views: Cell<u64>,
+    /// The anchors this handle's seals wrote (WP5.1, `snapshot::AnchorCache`).
+    pub(super) anchors: snapshot::AnchorCache,
     /// Full loads of the view from the stored projection (tests; WP3.INT).
     view_loads: Cell<u64>,
 }
@@ -295,6 +449,10 @@ struct EventCache {
     /// The rows the cache covers that are not known committed (`None`: all
     /// are).
     tentative: Option<Tentative>,
+    /// WP5.1: the derivation index of `events` (`derive::BranchIndex`),
+    /// built by the first slow commit that needs it and extended with the
+    /// events that join the cache; dropped with the entry.
+    index: derive::IndexCell,
 }
 
 /// Journal rows an event cache entry covers that may still roll back.
@@ -514,7 +672,7 @@ impl Store {
                     |r| r.get::<_, bool>(0),
                 )?
             {
-                self.verify_object(object)?;
+                self.verify_new_object(object)?;
             }
         }
         let mut seen = BTreeSet::new();
@@ -555,6 +713,60 @@ impl Store {
         }
         Ok(Check::Ready(Checked { payload, objects }))
     }
+    /// `check_commit`'s verification of newly authored bytes (WP5.1 task 5,
+    /// CCR-WP4.INT-5's re-hash): skipped when this process verified the
+    /// object moments ago and the file still has the size and mtime it had
+    /// then ([`verified`]), else a full `verify_object`, recorded on success
+    /// unless racy. The bytes were hashed by this process (or installed from
+    /// bytes it hashed: the trusted availability marker `put_object` /
+    /// `put_stream` leave, written since this process started and read within
+    /// [`verified::FRESH_MS`]) and `stat` shows them unchanged, with an mtime
+    /// at least [`verified::RACY_NS`] older than the verification: the rule
+    /// startup trusts markers by (`VerifyMode::Changed`), narrowed to this
+    /// process and to moments ago, so invariant 1 (a verified, durable
+    /// install) holds.
+    fn verify_new_object(&self, object: &str) -> Result<()> {
+        let path = self.root.join("objects").join(object);
+        // No later than the `stat` below (`verified::note`).
+        let observed = verified::now_ns();
+        let before = fs::metadata(&path).ok();
+        if let Some(metadata) = &before {
+            let (len, mtime) = (metadata.len(), objects::mtime_ns(metadata));
+            // The index first (WP5.INT, the WP5.1 review's minor): a row
+            // that a later verification left `CORRUPT` or `MISSING` wins over
+            // the in-memory set, as it does over the served cache.
+            let row = self.availability_row(object)?;
+            if row.is_none_or(|row| row.state == objects::AVAILABLE)
+                && verified::recent(&self.root, object, len, mtime)
+            {
+                verified::count_skip();
+                return Ok(());
+            }
+            // An install marker of this process (`put_object`, `put_stream`,
+            // and the engine's saves record their verifications in the set
+            // too, CCR-WP5.1-1); `trusted` is not racy.
+            let row = row.filter(|row| {
+                row.trusted(len, mtime) && verified::fresh_row(row.verified_ms, time())
+            });
+            if let Some(row) = row {
+                let verified_ns = row.verified_ms.saturating_mul(1_000_000);
+                verified::note(&self.root, object, len, mtime, verified_ns);
+                verified::count_skip();
+                return Ok(());
+            }
+        }
+        self.verify_object(object)?;
+        if let Some(metadata) = before {
+            verified::note(
+                &self.root,
+                object,
+                metadata.len(),
+                objects::mtime_ns(&metadata),
+                observed,
+            );
+        }
+        Ok(())
+    }
     /// The incremental projection delta for `event`, if a successor proves it
     /// equal to full replay; `None` means the slow path. A namespace
     /// successor first counts the competing cuts full replay would count
@@ -591,14 +803,17 @@ impl Store {
     /// replay would refuse it with `NAMESPACE_HISTORY_LIMIT` (module docs).
     fn check_namespace_successor(&self, event: &Event, committed_view: bool) -> Result<()> {
         let branch = event.branch.id.as_str();
-        self.with_branch_events(branch, Some(event), committed_view, |events| {
+        self.with_branch_index(branch, Some(event), committed_view, |events, index| {
             let new = events.len() - 1;
             if !derive::successor_may_add_cuts(events, new) {
                 return Ok(());
             }
             let counted = &self.caches.commit.successor_checks;
             counted.set(counted.get().saturating_add(1));
-            derive::check_successor_cuts(branch, events, new)
+            if let Some(cell) = index {
+                derive::ensure_index(cell, &events[..new]);
+            }
+            derive::check_successor_cuts(branch, events, new, index)
         })?
     }
     /// CCR-WP4.4-5: refuse a content successor commit exactly when full
@@ -619,14 +834,17 @@ impl Store {
             return Ok(());
         }
         let branch = event.branch.id.as_str();
-        self.with_branch_events(branch, Some(event), committed_view, |events| {
+        self.with_branch_index(branch, Some(event), committed_view, |events, index| {
             let new = events.len() - 1;
             if !derive::content_successor_may_add_cuts(events, new) {
                 return Ok(());
             }
             let counted = &self.caches.commit.successor_checks;
             counted.set(counted.get().saturating_add(1));
-            derive::check_successor_cuts(branch, events, new)
+            if let Some(cell) = index {
+                derive::ensure_index(cell, &events[..new]);
+            }
+            derive::check_successor_cuts(branch, events, new, index)
         })?
     }
     /// How many namespace successor commits had their competing cuts counted
@@ -814,6 +1032,64 @@ impl Store {
             Some(_) => Stored::Fold { changed },
         }
     }
+    /// The branch's projection as this handle's fresh view (loaded if
+    /// needed) and its slots, taken out of the view cache; `None` when it
+    /// cannot be read.
+    fn take_view(&self, branch: &str) -> Option<ViewCache> {
+        self.drop_rolled_back_view();
+        if self.view(branch).is_err() {
+            return None;
+        }
+        self.view_cache
+            .try_borrow_mut()
+            .ok()?
+            .take()
+            .filter(|view| view.branch == branch)
+    }
+    /// Puts back a view [`Self::take_view`] took and nothing used (WP5.INT,
+    /// the WP5.1 review's minor: a declined `project_append` left the next
+    /// reader an O(entries) reload). Its freshness key is the one it was
+    /// taken with, which the next `view` checks as usual; a view cached
+    /// meanwhile wins.
+    fn restore_view(&self, view: ViewCache) {
+        if let Ok(mut cache) = self.view_cache.try_borrow_mut()
+            && cache.is_none()
+        {
+            *cache = Some(view);
+        }
+    }
+    /// `projection_delta` for a projection `derive::project_append` made from
+    /// the stored one: it knows the entities that changed and whether the
+    /// lists did, so nothing is compared (WP5.1). The same layout decision:
+    /// a delta, or a fold of a small projection whose parts would outnumber
+    /// half of its entries.
+    fn appended_delta(
+        &self,
+        branch: &str,
+        p: &Projection,
+        changed: BTreeSet<String>,
+        header: bool,
+    ) -> Stored {
+        if p.entries.len() > FOLD_MAX_ENTRIES {
+            return Stored::Delta { changed, header };
+        }
+        let parts: Option<usize> = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM current_parts WHERE branch=?",
+                [branch],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+            .and_then(|parts| usize::try_from(parts).ok());
+        match parts {
+            None => Stored::Rewrite,
+            Some(parts) if parts.saturating_add(changed.len()) <= p.entries.len() / 2 => {
+                Stored::Delta { changed, header }
+            }
+            Some(_) => Stored::Fold { changed },
+        }
+    }
     /// The slow path's computation for `event` (WP2.4): the branch's events
     /// (the event cache) plus `event`, projected; `None` when the projection
     /// is pending (a prerequisite outside the branch's journal); then the
@@ -830,33 +1106,110 @@ impl Store {
         precompute: bool,
     ) -> Result<Option<Box<SlowPlan>>> {
         let branch = event.branch.id.as_str();
+        // Full mode stays the reference: it projects the branch in full, as
+        // it derives it in full, so it leaves the view where it is.
+        let full_mode = derive::conflict_mode() == derive::ConflictMode::Full;
+        // The stored projection of the branch, as this handle's view: the
+        // base of `derive::project_append` (WP5.1). It is consumed; a
+        // committing slow commit leaves its own projection as the view, and
+        // a declined append hands it back to the view cache (WP5.INT).
+        let mut view = if full_mode {
+            None
+        } else {
+            self.take_view(branch)
+        };
+        let base = view.as_mut().map(|v| std::mem::take(&mut v.projection));
         let computed =
-            self.with_branch_events(branch, Some(event), committed_view, |events| {
-                let projection = project(branch, events)?;
+            self.with_branch_index(branch, Some(event), committed_view, |events, index| {
+                let new = events.len() - 1;
+                // The index of the cached events, built once per cache entry.
+                if let Some(cell) = index {
+                    derive::ensure_index(cell, &events[..new]);
+                }
+                let (appended, returned) = match base {
+                    Some(base) => {
+                        let index = index.map(|cell| cell.borrow());
+                        let index = index.as_deref().and_then(Option::as_ref);
+                        match derive::project_append_or_base(branch, base, events, new, index)? {
+                            Ok(appended) => (Some(appended), None),
+                            Err(base) => (None, Some(base)),
+                        }
+                    }
+                    None => (None, None),
+                };
+                let (projection, delta, fresh) = match appended {
+                    Some(appended) => (
+                        appended.projection,
+                        Some((appended.changed, appended.lists, appended.placements)),
+                        Some(appended.fresh),
+                    ),
+                    None => (
+                        project(branch, events)?,
+                        None,
+                        None,
+                    ),
+                };
+                if delta.is_some() && derive::checks_projections() {
+                    // The commit checks (and verify mode) compare it with
+                    // `project` itself.
+                    let full = project(branch, events)?;
+                    ensure!(
+                        full == projection,
+                        "CONFLICT_MODE_MISMATCH: the appended projection of {} differs from project",
+                        event.id
+                    );
+                }
                 if !projection.pending.is_empty() {
-                    return Ok(None);
+                    return Ok((None, returned));
                 }
                 let reviewed = derive::read_reviewed(&self.db, branch, event)?;
                 let derived = derive_conflicts(&DeriveInput {
-                    branch,
-                    projection: &projection,
-                    events,
-                    new_event: Some(&event.id),
-                    reviewed: &reviewed,
-                })?;
-                Ok::<_, anyhow::Error>(Some((projection, derived)))
+                        branch,
+                        projection: &projection,
+                        events,
+                        new_event: Some(&event.id),
+                        reviewed: &reviewed,
+                        fresh: fresh.as_ref(),
+                        index,
+                    })?;
+                Ok::<_, anyhow::Error>((Some((projection, derived, delta)), returned))
             })??;
-        let Some((projection, derived)) = computed else {
+        let (computed, returned) = computed;
+        if let Some(base) = returned
+            && let Some(mut taken) = view.take()
+        {
+            // Declined: the base is the view it was, for `projection_delta`
+            // below and the next reader.
+            taken.projection = base;
+            self.restore_view(taken);
+        }
+        let base_slots = view.map(|v| v.slots);
+        let Some((projection, derived, delta)) = computed else {
             return Ok(None);
         };
-        let stored = self.projection_delta(branch, &projection);
+        let (stored, patched) = match delta {
+            Some((changed, lists, placements)) => {
+                let patched =
+                    base_slots.and_then(|slots| patched_slots(slots, &placements, &projection));
+                if patched.is_some() && derive::checks_projections() {
+                    ensure!(
+                        patched == view_slots(&projection),
+                        "CONFLICT_MODE_MISMATCH: the patched view slots of {} differ",
+                        event.id
+                    );
+                }
+                let stored = self.appended_delta(branch, &projection, changed, lists);
+                (stored, patched)
+            }
+            None => (self.projection_delta(branch, &projection), None),
+        };
         let (json, slots) = if precompute {
             let json = (!stored.is_delta() || !snapshot::sealed_as_rows(&self.db, branch))
                 .then(|| serde_json::to_string(&projection))
                 .transpose()?;
-            (json, view_slots(&projection))
+            (json, patched.or_else(|| view_slots(&projection)))
         } else {
-            (None, None)
+            (None, patched)
         };
         Ok(Some(Box::new(SlowPlan {
             projection,
@@ -1001,7 +1354,12 @@ impl Store {
                         write_part(&tx, &branch, entity, &slow.projection)?;
                     }
                     if *header {
-                        snapshot::write_header(&tx, &branch, &slow.projection)?;
+                        snapshot::write_header(
+                            &tx,
+                            &branch,
+                            &slow.projection,
+                            Some(&self.caches.commit.anchors),
+                        )?;
                     }
                 } else {
                     let state = match &slow.json {
@@ -1061,6 +1419,8 @@ impl Store {
                             projection: known,
                             json: None,
                             changed: snapshot::Changed::Marked,
+                            anchors: Some(&self.caches.commit.anchors),
+                            lists_unchanged: true,
                         },
                     )?;
                     drop(cache);
@@ -1084,6 +1444,7 @@ impl Store {
                     }
                     Stored::Rewrite => snapshot::Changed::All,
                 };
+                let lists_unchanged = matches!(slow.stored, Stored::Delta { header: false, .. });
                 let report = snapshot::seal(
                     &tx,
                     &branch,
@@ -1092,6 +1453,8 @@ impl Store {
                         projection: Some(&slow.projection),
                         json: slow.json.as_deref(),
                         changed,
+                        anchors: Some(&self.caches.commit.anchors),
+                        lists_unchanged,
                     },
                 )?;
                 record_seal(&self.caches.commit, &report);
@@ -1232,6 +1595,17 @@ impl Store {
         committed_view: bool,
         f: impl FnOnce(&[Event]) -> T,
     ) -> Result<T> {
+        self.with_branch_index(branch, extra, committed_view, |events, _| f(events))
+    }
+    /// `with_branch_events`, with the cache entry's derivation index (WP5.1)
+    /// when the entry is kept: it indexes the cached events, `extra` aside.
+    pub(super) fn with_branch_index<T>(
+        &self,
+        branch: &str,
+        extra: Option<&Event>,
+        committed_view: bool,
+        f: impl FnOnce(&[Event], Option<&derive::IndexCell>) -> T,
+    ) -> Result<T> {
         let committed = committed_view || self.db.is_autocommit();
         let (tip, total): (i64, i64) = self
             .db
@@ -1260,7 +1634,7 @@ impl Store {
         if let Some(extra) = extra {
             cache.events.push(extra.clone());
         }
-        let result = f(&cache.events);
+        let result = f(&cache.events, keep.then_some(&cache.index));
         if extra.is_some() {
             cache.events.pop();
         }
@@ -1304,6 +1678,7 @@ impl Store {
             upto: tip,
             total,
             tentative: None,
+            index: Default::default(),
         };
         if committed {
             return Ok((cache, true));
@@ -1391,20 +1766,31 @@ impl Store {
             added.sort_by(|a, b| a.id.cmp(&b.id));
             let old = std::mem::take(&mut cache.events);
             let mut merged = Vec::with_capacity(old.len() + added.len());
+            let mut positions = Vec::with_capacity(added.len());
             let mut old = old.into_iter().peekable();
             let mut added = added.into_iter().peekable();
             loop {
                 let next = match (old.peek(), added.peek()) {
                     (Some(a), Some(b)) if a.id == b.id => return Ok(None),
                     (Some(a), Some(b)) if a.id < b.id => old.next(),
-                    (Some(_), Some(_)) => added.next(),
+                    (Some(_), Some(_)) | (None, Some(_)) => {
+                        positions.push(merged.len());
+                        added.next()
+                    }
                     (Some(_), None) => old.next(),
-                    (None, Some(_)) => added.next(),
                     (None, None) => break,
                 };
                 merged.extend(next);
             }
             cache.events = merged;
+            // The index follows the cache, or is dropped (rebuilt on demand).
+            let follows = match cache.index.get_mut() {
+                Some(index) => index.extend(&cache.events, &positions)?,
+                None => true,
+            };
+            if !follows {
+                *cache.index.get_mut() = None;
+            }
         }
         cache.upto = tip;
         cache.total = total;
@@ -2045,6 +2431,186 @@ fn injected_busy() -> rusqlite::Error {
 mod tests {
     use super::*;
 
+    /// WP5.1 task 5: a local commit of bytes this process has just stored
+    /// (`put_object`, `put_stream`) does not hash them again; bytes that
+    /// changed on disk since (another size or mtime) are verified, and
+    /// corrupt ones are refused as before.
+    #[test]
+    fn a_local_commit_skips_the_rehash_of_bytes_just_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(dir.path(), None).unwrap();
+        let file = s.create("f.txt", "file").unwrap();
+        let skipped = verified::skipped();
+        let hashes = s.object_hashes();
+        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
+        s.write_revision(&file.id, content, b"fresh bytes").unwrap();
+        assert_eq!(
+            s.object_hashes(),
+            hashes,
+            "the fresh object was hashed again"
+        );
+        assert!(verified::skipped() > skipped);
+        let mut stream: &[u8] = b"streamed bytes";
+        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
+        s.write_stream_with_base_and_times(&file.id, content, None, &mut stream, 0)
+            .unwrap();
+        assert_eq!(
+            s.object_hashes(),
+            hashes,
+            "the streamed object was hashed again"
+        );
+        // Changed behind the store's back (same size): verified, refused.
+        let object = s.put_object(b"other bytes").unwrap();
+        fs::write(s.root.join("objects").join(&object), b"Other bytes").unwrap();
+        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
+        let refused = s.write_object_with_base_and_times(&file.id, content, None, object, 0);
+        assert!(
+            format!("{:#}", refused.unwrap_err()).contains("CORRUPT_OBJECT"),
+            "corrupt bytes accepted"
+        );
+        assert_eq!(s.object_hashes(), hashes + 1);
+    }
+
+    /// WP5.1 review (round 1): a verification observed within `RACY_NS` of
+    /// the file's mtime is not recorded, so a same-size rewrite in that tick
+    /// is hashed again and refused; a verification well after the mtime is
+    /// recorded and skips the next re-hash. Availability rows count only when
+    /// written since this process started, and within `FRESH_MS`.
+    #[test]
+    fn a_racy_or_earlier_verification_is_not_trusted() {
+        // The set's rule.
+        let root = Path::new("racy-root");
+        let mtime = 1_000_000_000_000_000_000;
+        verified::note(root, "h1", 5, mtime, mtime + verified::RACY_NS - 1);
+        assert!(!verified::recent(root, "h1", 5, mtime));
+        verified::note(root, "h2", 5, mtime, mtime + verified::RACY_NS);
+        assert!(verified::recent(root, "h2", 5, mtime));
+        assert!(!verified::recent(root, "h2", 6, mtime));
+        assert!(!verified::recent(root, "h2", 5, mtime + 1));
+        // Availability rows.
+        let now = time();
+        let epoch = verified::epoch_ms();
+        assert!(epoch <= now);
+        assert!(verified::fresh_row(now as i64, now));
+        assert!(!verified::fresh_row(epoch as i64 - 1, now));
+        assert!(!verified::fresh_row(0, now));
+        assert!(!verified::fresh_row(
+            now as i64,
+            now + verified::FRESH_MS + 1
+        ));
+        // Bytes installed behind the store's back with a racy mtime: hashed,
+        // not recorded; rewritten (same size) and given that mtime again,
+        // they are hashed again and refused.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), None).unwrap();
+        let bytes = b"racy bytes";
+        let object = hash(bytes);
+        let path = s.root.join("objects").join(&object);
+        fs::write(&path, bytes).unwrap();
+        // In the future: racy however long the machine stalls before the
+        // verification reads it (a minute).
+        let stamp = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        let hashes = s.object_hashes();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes + 1);
+        fs::write(&path, b"Racy bytes").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        let refused = s.verify_new_object(&object).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("CORRUPT_OBJECT"),
+            "{refused:#}"
+        );
+        assert_eq!(s.object_hashes(), hashes + 2);
+        // Bytes whose mtime is well before the verification: recorded.
+        let bytes = b"settled bytes";
+        let object = hash(bytes);
+        let path = s.root.join("objects").join(&object);
+        fs::write(&path, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .unwrap();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes + 3);
+        let skipped = verified::skipped();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes + 3);
+        assert!(verified::skipped() > skipped);
+    }
+
+    /// WP5.INT (the WP5.1 review's minor, CCR-WP5.1-1): `put_object` records
+    /// the bytes it installs in the verified set, and a later verification
+    /// that finds them corrupt wins over it: the same process's (`forget`)
+    /// and one whose `CORRUPT` row is all this handle sees (another process:
+    /// the row is read first). The rewrite keeps the size and the stamped
+    /// mtime, so only the index can tell.
+    #[test]
+    fn a_later_corrupt_verdict_wins_over_the_verified_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), None).unwrap();
+        let rewrite = |s: &Store, object: &str, bytes: &[u8]| {
+            let path = s.root.join("objects").join(object);
+            let mtime = fs::metadata(&path).unwrap().modified().unwrap();
+            fs::write(&path, bytes).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime)
+                .unwrap();
+        };
+        // This process's verification: the installer recorded the bytes.
+        let object = s.put_object(b"original bytes").unwrap();
+        let hashes = s.object_hashes();
+        s.verify_new_object(&object).unwrap();
+        assert_eq!(s.object_hashes(), hashes, "the install was recorded");
+        rewrite(&s, &object, b"Original bytes");
+        assert!(s.verify_object(&object).is_err());
+        let refused = s.verify_new_object(&object).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("CORRUPT_OBJECT"),
+            "{refused:#}"
+        );
+        // Another process's verdict: only its row.
+        let object = s.put_object(b"second bytes").unwrap();
+        s.verify_new_object(&object).unwrap();
+        rewrite(&s, &object, b"Second bytes");
+        s.db.execute(
+            "UPDATE object_availability SET state=?1,verified_ms=0 WHERE hash=?2",
+            params![objects::CORRUPT, object],
+        )
+        .unwrap();
+        let path = s.root.join("objects").join(&object);
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(
+            verified::recent(
+                &s.root,
+                &object,
+                metadata.len(),
+                objects::mtime_ns(&metadata)
+            ),
+            "the set still holds the install"
+        );
+        let refused = s.verify_new_object(&object).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("CORRUPT_OBJECT"),
+            "{refused:#}"
+        );
+    }
+
     /// WP4.4 (CCR-WP2.4-2): every seal is written by `snapshot::seal`, so a
     /// prepared commit's seal from the JSON it serialized off-lock is the
     /// seal of the projection itself, byte for byte (it replaces WP2.4's
@@ -2076,6 +2642,8 @@ mod tests {
                         projection: Some(&projection),
                         json,
                         changed: snapshot::Changed::All,
+                        anchors: None,
+                        lists_unchanged: false,
                     },
                 )
                 .unwrap()

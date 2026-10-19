@@ -1718,8 +1718,10 @@ fn every_daemon_installs_its_log_and_reports_it() {
         .log_path
         .clone()
         .expect("the daemon reports its log");
+    // WP5.4 (a WP4.INT review minor): the verbatim prefix is `\\?\`; the
+    // check named `\?\`, which no path starts with, so it always held.
     assert!(
-        !reported.starts_with(r"\?\"),
+        !reported.starts_with(r"\\?\"),
         "a path as the user knows it: {reported}"
     );
     let path = log::daemon_log_path(&node.data_dir());

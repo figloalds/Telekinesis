@@ -58,13 +58,18 @@
 //! lanes present it). Both sides of a mutual pairing are separate rows, so
 //! the key is `(installation, side)`. The table is created on every open
 //! (`IF NOT EXISTS`; `catalog_schema` stays 1, older binaries never read
-//! it). The actor publishes the rows as [`Credentials`] beside the frozen
-//! [`CatalogSnapshot`] ([`Catalog::credentials`]); they change through
-//! [`Catalog::enroll`] (and [`Catalog::enroll_paired`], which requires a
-//! peer record in the same transaction), [`Catalog::revoke`] and
-//! [`Catalog::forget`], which run as commands of the same actor (same
-//! transaction, retry and
-//! [`APPLY_WAIT`] rules), and as part of three catalog commands:
+//! it). The actor publishes the rows as [`Credentials`] beside the
+//! [`CatalogSnapshot`] ([`CatalogApi::credentials`]; a credential change
+//! moves no snapshot generation). They change through the catalog
+//! contract's credential commands (CCR-WP4.1-1, applied by WP5.4):
+//! `CatalogCmd::EnrollCredential` (optionally only while a peer record
+//! names the installation, or only at a verifier generation, both checked
+//! in the same transaction), `RevokeCredential` and `ForgetCredential`, run
+//! like every command (same transaction, retry and [`APPLY_WAIT`] rules;
+//! [`Catalog::enroll`], [`Catalog::enroll_paired`],
+//! [`Catalog::enroll_at_generation`], [`Catalog::revoke`] and
+//! [`Catalog::forget`] are shorthands for them), and as part of three other
+//! catalog commands:
 //!
 //! * `SetVerifier` (ResetPairingCode), and a rotation by a downgraded binary
 //!   folded in at open, revoke every inbound credential with the verifier
@@ -80,11 +85,14 @@
 //!   the record is replaced in place) does the same for the old
 //!   installation.
 //!
-//! A component that holds only `Arc<dyn CatalogApi>` finds the concrete
-//! catalog with [`Catalog::of`] (the frozen trait has no credential calls:
-//! CCR-WP4.1-1). `folders.sqlite` holds these keys and the dialers' codes:
-//! on Unix it is made owner-only (0600) at open; on Windows it inherits the
-//! profile ACL.
+//! A component that holds only `Arc<dyn CatalogApi>` reads and changes the
+//! credentials through the trait; a catalog that keeps none (a test's fake)
+//! answers `credentials()` with `None`, and its peers use the pairing code
+//! alone. Every caller does so since CCR-WP5.4-1 (applied by WP5.INT), which
+//! removed WP4.1's adapter to the concrete catalog (`Catalog::of`) with its
+//! registry of open catalogs. `folders.sqlite` holds these keys and the
+//! dialers' codes: on Unix it is made owner-only (0600) at open; on Windows
+//! it inherits the profile ACL.
 use super::{Config, lock};
 use crate::{
     core::id,
@@ -107,7 +115,7 @@ use std::{
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, PoisonError, Weak,
+        Arc, Condvar, Mutex, PoisonError,
         atomic::{AtomicU8, AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
@@ -276,157 +284,15 @@ mod sql {
 // ---------------------------------------------------------------------------
 // Per-peer credentials (WP4.1)
 
-/// Which way a per-peer credential works (module docs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum CredentialSide {
-    /// A dialer enrolled this credential with us; the inbound server
-    /// verifies its `peer-hmac-v1` sessions with it.
-    Inbound,
-    /// We enrolled this credential with an acceptor; our lanes present it.
-    Outbound,
-}
-
-impl CredentialSide {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CredentialSide::Inbound => "inbound",
-            CredentialSide::Outbound => "outbound",
-        }
-    }
-
-    fn parse(text: &str) -> Option<CredentialSide> {
-        match text {
-            "inbound" => Some(CredentialSide::Inbound),
-            "outbound" => Some(CredentialSide::Outbound),
-            _ => None,
-        }
-    }
-}
-
-/// One `peer_credentials` row. `Debug` never shows the key.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PeerCredential {
-    pub installation: String,
-    pub side: CredentialSide,
-    key: [u8; 32],
-    pub created_ms: u64,
-    pub revoked_ms: Option<u64>,
-}
-
-impl PeerCredential {
-    /// `K_peer`, unless the credential is revoked.
-    pub fn active_key(&self) -> Option<[u8; 32]> {
-        self.revoked_ms.is_none().then_some(self.key)
-    }
-}
-
-impl fmt::Debug for PeerCredential {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PeerCredential")
-            .field("installation", &self.installation)
-            .field("side", &self.side)
-            .field("key", &"<redacted>")
-            .field("created_ms", &self.created_ms)
-            .field("revoked_ms", &self.revoked_ms)
-            .finish()
-    }
-}
-
-/// Every per-peer credential, as the actor last published them.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Credentials {
-    entries: BTreeMap<(String, CredentialSide), PeerCredential>,
-}
-
-impl Credentials {
-    pub fn get(&self, installation: &str, side: CredentialSide) -> Option<&PeerCredential> {
-        self.entries.get(&(installation.to_owned(), side))
-    }
-
-    /// The active `K_peer` of `installation` on `side`.
-    pub fn active(&self, installation: &str, side: CredentialSide) -> Option<[u8; 32]> {
-        self.get(installation, side)
-            .and_then(PeerCredential::active_key)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &PeerCredential> {
-        self.entries.values()
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-}
-
-/// A change of `peer_credentials`.
-#[derive(Clone)]
-enum CredentialCmd {
-    Enroll {
-        installation: String,
-        side: CredentialSide,
-        key: [u8; 32],
-        /// Refused (`PEER_NOT_PAIRED`) unless a peer record names the
-        /// installation, checked in the same transaction.
-        paired_only: bool,
-        /// Refused (`PAIRING_CODE_CHANGED`) unless the verifier generation
-        /// is this one, checked in the same transaction (WP4.INT: an
-        /// enrollment authenticated by a code that a rotation replaced
-        /// meanwhile never stores an active credential, invariant 21).
-        generation: Option<u64>,
-    },
-    Revoke {
-        installation: String,
-        side: CredentialSide,
-    },
-    Forget {
-        installation: String,
-        side: CredentialSide,
-    },
-}
-
-impl CredentialCmd {
-    fn name(&self) -> &'static str {
-        match self {
-            CredentialCmd::Enroll { .. } => "enroll_credential",
-            CredentialCmd::Revoke { .. } => "revoke_credential",
-            CredentialCmd::Forget { .. } => "forget_credential",
-        }
-    }
-}
-
-/// What the actor runs: a frozen [`CatalogCmd`], or a credential change.
-#[derive(Clone)]
-enum Work {
-    Catalog(CatalogCmd),
-    Credential(CredentialCmd),
-}
-
-impl Work {
-    fn name(&self) -> &'static str {
-        match self {
-            Work::Catalog(cmd) => cmd.name(),
-            Work::Credential(cmd) => cmd.name(),
-        }
-    }
-}
-
-/// The open catalogs of this process, by the address of their handle, so a
-/// `dyn CatalogApi` can be told to be one ([`Catalog::of`]).
-static CATALOGS: Mutex<Vec<(usize, Weak<Catalog>)>> = Mutex::new(Vec::new());
-
-fn catalog_key<T: ?Sized>(handle: *const T) -> usize {
-    handle.cast::<()>() as usize
-}
+/// The credential types live in the catalog contract since CCR-WP4.1-1
+/// (applied by WP5.4); re-exported here for the paths callers use.
+pub use crate::model::orchestrator::{CredentialSide, Credentials, PeerCredential};
 
 // ---------------------------------------------------------------------------
 // The public handle
 
 struct Request {
-    work: Work,
+    cmd: CatalogCmd,
     reply: SyncSender<Result<Arc<CatalogSnapshot>, ErrorWire>>,
     /// `QUEUED` until the actor starts the command (`STARTED`), or until the
     /// caller gave up first (`WITHDRAWN`: the actor skips it).
@@ -512,9 +378,6 @@ impl Catalog {
                     busy_since_ms,
                     credentials,
                 });
-                let mut catalogs = crate::util::lock::lock(&CATALOGS);
-                catalogs.retain(|(_, handle)| handle.strong_count() > 0);
-                catalogs.push((catalog_key(Arc::as_ptr(&catalog)), Arc::downgrade(&catalog)));
                 Ok(catalog)
             }
             failed => {
@@ -532,52 +395,42 @@ impl Catalog {
         &self.data_directory
     }
 
-    /// The concrete catalog behind `api`, if it is one (`None` for another
-    /// [`CatalogApi`], such as a test's fake). The per-peer credentials are
-    /// reached through it (the frozen trait has no such calls,
-    /// CCR-WP4.1-1).
-    pub fn of(api: &Arc<dyn CatalogApi>) -> Option<Arc<Catalog>> {
-        let key = catalog_key(Arc::as_ptr(api));
-        crate::util::lock::lock(&CATALOGS)
-            .iter()
-            .find(|(handle, _)| *handle == key)
-            .and_then(|(_, handle)| handle.upgrade())
-    }
-
     /// The per-peer credentials (WP4.1): an O(1) load of what the actor last
-    /// published.
+    /// published. [`CatalogApi::credentials`], which is never `None` for
+    /// the actor.
     pub fn credentials(&self) -> Arc<Credentials> {
         self.credentials.load()
     }
 
-    /// Stores `key` (`K_peer`) as the active credential of `installation` on
-    /// `side`, replacing (and un-revoking) any earlier one.
+    /// `CatalogCmd::EnrollCredential` without conditions: stores `key`
+    /// (`K_peer`) as the active credential of `installation` on `side`,
+    /// replacing (and un-revoking) any earlier one.
     pub fn enroll(
         &self,
         installation: &str,
         side: CredentialSide,
         key: [u8; 32],
     ) -> Result<(), ErrorWire> {
-        self.submit(Work::Credential(CredentialCmd::Enroll {
+        self.submit(CatalogCmd::EnrollCredential {
             installation: installation.to_owned(),
             side,
             key,
             paired_only: false,
             generation: None,
-        }))
+        })
         .map(drop)
     }
 
     /// [`Catalog::enroll`] only while the pairing verifier is still at
     /// `generation`, checked in the same transaction: `PAIRING_CODE_CHANGED`
-    /// otherwise, and nothing is stored. For an acceptor's `peer.enroll`
-    /// (WP4.INT, invariant 21): the session that carries it was
-    /// authenticated at `generation`, and the actor serializes this with a
-    /// rotation (`SetVerifier`), so either the enrollment commits first and
-    /// the rotation revokes it, or the rotation commits first and this is
-    /// refused. A check of the published snapshot before the call cannot
-    /// tell: a rotation queued in the actor (or committing) still shows the
-    /// old generation there.
+    /// otherwise, and nothing is stored (`CatalogCmd::EnrollCredential` with
+    /// `generation`). For an acceptor's `peer.enroll` (WP4.INT, invariant
+    /// 21): the session that carries it was authenticated at `generation`,
+    /// and the actor serializes this with a rotation (`SetVerifier`), so
+    /// either the enrollment commits first and the rotation revokes it, or
+    /// the rotation commits first and this is refused. A check of the
+    /// published snapshot before the call cannot tell: a rotation queued in
+    /// the actor (or committing) still shows the old generation there.
     pub fn enroll_at_generation(
         &self,
         installation: &str,
@@ -585,54 +438,57 @@ impl Catalog {
         key: [u8; 32],
         generation: u64,
     ) -> Result<(), ErrorWire> {
-        self.submit(Work::Credential(CredentialCmd::Enroll {
+        self.submit(CatalogCmd::EnrollCredential {
             installation: installation.to_owned(),
             side,
             key,
             paired_only: false,
             generation: Some(generation),
-        }))
+        })
         .map(drop)
     }
 
     /// [`Catalog::enroll`] only while a peer record names `installation`,
     /// checked in the same transaction: `PEER_NOT_PAIRED` otherwise, and
-    /// nothing is stored. For an enrollment that can race an unpair (lane
-    /// 0's, WP4.1): `RemovePeer` either runs first (refused here) or deletes
-    /// the outbound credential with the record, so no credential outlives
-    /// its peer.
+    /// nothing is stored (`CatalogCmd::EnrollCredential` with
+    /// `paired_only`). For an enrollment that can race an unpair (lane 0's,
+    /// WP4.1): `RemovePeer` either runs first (refused here) or deletes the
+    /// outbound credential with the record, so no credential outlives its
+    /// peer.
     pub fn enroll_paired(
         &self,
         installation: &str,
         side: CredentialSide,
         key: [u8; 32],
     ) -> Result<(), ErrorWire> {
-        self.submit(Work::Credential(CredentialCmd::Enroll {
+        self.submit(CatalogCmd::EnrollCredential {
             installation: installation.to_owned(),
             side,
             key,
             paired_only: true,
             generation: None,
-        }))
+        })
         .map(drop)
     }
 
-    /// Revokes the credential of `installation` on `side` (kept, marked
-    /// `revoked_ms`); a missing one is left missing.
+    /// `CatalogCmd::RevokeCredential`: revokes the credential of
+    /// `installation` on `side` (kept, marked `revoked_ms`); a missing one
+    /// is left missing.
     pub fn revoke(&self, installation: &str, side: CredentialSide) -> Result<(), ErrorWire> {
-        self.submit(Work::Credential(CredentialCmd::Revoke {
+        self.submit(CatalogCmd::RevokeCredential {
             installation: installation.to_owned(),
             side,
-        }))
+        })
         .map(drop)
     }
 
-    /// Deletes the credential of `installation` on `side`.
+    /// `CatalogCmd::ForgetCredential`: deletes the credential of
+    /// `installation` on `side`.
     pub fn forget(&self, installation: &str, side: CredentialSide) -> Result<(), ErrorWire> {
-        self.submit(Work::Credential(CredentialCmd::Forget {
+        self.submit(CatalogCmd::ForgetCredential {
             installation: installation.to_owned(),
             side,
-        }))
+        })
         .map(drop)
     }
 
@@ -680,18 +536,22 @@ impl CatalogApi for Catalog {
 
     /// Bounded by [`APPLY_WAIT`] (see there).
     fn apply(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
-        self.submit(Work::Catalog(cmd))
+        self.submit(cmd)
     }
 
     fn wait_newer(&self, generation: u64, timeout: Duration) -> Arc<CatalogSnapshot> {
         self.cell.wait_newer(generation, timeout);
         self.cell.load()
     }
+
+    fn credentials(&self) -> Option<Arc<Credentials>> {
+        Some(self.credentials.load())
+    }
 }
 
 impl Catalog {
-    /// [`CatalogApi::apply`] for any [`Work`], bounded by [`APPLY_WAIT`].
-    fn submit(&self, work: Work) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
+    /// [`CatalogApi::apply`], bounded by [`APPLY_WAIT`].
+    fn submit(&self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
         if self.exit.has_exited() {
             return Err(unavailable("the catalog thread has exited"));
         }
@@ -701,10 +561,10 @@ impl Catalog {
             return Err(refusal(format!(
                 "a catalog write has been running for {} ms; {} was not queued behind it",
                 now_ms().saturating_sub(since),
-                work.name()
+                cmd.name()
             )));
         }
-        let name = work.name();
+        let name = cmd.name();
         let ticket = Arc::new(AtomicU8::new(QUEUED));
         let (reply, answer) = mpsc::sync_channel(1);
         {
@@ -713,7 +573,7 @@ impl Catalog {
                 return Err(unavailable("the catalog is closed"));
             };
             let request = Request {
-                work,
+                cmd,
                 reply,
                 ticket: ticket.clone(),
             };
@@ -869,17 +729,17 @@ impl Actor {
                 let _ = request.reply.send(Err(ErrorWire::from_error(&error)));
                 continue;
             }
-            let result = self.execute(request.work);
+            let result = self.execute(request.cmd);
             busy_since_ms.store(0, Ordering::Release);
             let _ = request.reply.send(result);
         }
     }
 
-    fn execute(&mut self, work: Work) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
-        let name = work.name();
+    fn execute(&mut self, cmd: CatalogCmd) -> Result<Arc<CatalogSnapshot>, ErrorWire> {
+        let name = cmd.name();
         let mut retries = 0;
         loop {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| self.transact(&work)));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| self.transact(&cmd)));
             let error = match outcome {
                 Ok(Ok((next, credentials))) => {
                     if let Some(credentials) = credentials {
@@ -934,16 +794,16 @@ impl Actor {
     /// Runs one command in one transaction. `Some(snapshot)` when the visible
     /// catalog changed, `None` when the command was a no-op; likewise the
     /// credentials.
-    fn transact(&mut self, work: &Work) -> Result<(Option<CatalogSnapshot>, Option<Credentials>)> {
+    fn transact(
+        &mut self,
+        cmd: &CatalogCmd,
+    ) -> Result<(Option<CatalogSnapshot>, Option<Credentials>)> {
         let current = &self.current;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_ms();
-        match work {
-            Work::Catalog(cmd) => apply_command(&tx, cmd, current, now)?,
-            Work::Credential(cmd) => apply_credential(&tx, cmd, current, now)?,
-        }
+        apply_command(&tx, cmd, current, now)?;
         let next = load_snapshot(&tx, current.generation + 1)?;
         let credentials = load_credentials(&tx)?;
         fault::trigger(faults::SLOW_WRITE)?;
@@ -1161,18 +1021,7 @@ fn apply_command(
             ])?;
             Ok(())
         }
-    }
-}
-
-/// A credential change (WP4.1).
-fn apply_credential(
-    tx: &Transaction<'_>,
-    cmd: &CredentialCmd,
-    current: &CatalogSnapshot,
-    now: u64,
-) -> Result<()> {
-    match cmd {
-        CredentialCmd::Enroll {
+        CatalogCmd::EnrollCredential {
             installation,
             side,
             key,
@@ -1205,20 +1054,22 @@ fn apply_credential(
                 hex::encode(key),
                 ms(now)
             ])?;
+            Ok(())
         }
-        CredentialCmd::Revoke { installation, side } => {
+        CatalogCmd::RevokeCredential { installation, side } => {
             tx.prepare_cached(sql::REVOKE)?.execute(params![
                 ms(now),
                 installation,
                 side.as_str()
             ])?;
+            Ok(())
         }
-        CredentialCmd::Forget { installation, side } => {
+        CatalogCmd::ForgetCredential { installation, side } => {
             tx.prepare_cached(sql::FORGET)?
                 .execute(params![installation, side.as_str()])?;
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn create_folder(
@@ -1518,7 +1369,7 @@ fn load_snapshot(conn: &Connection, generation: u64) -> Result<CatalogSnapshot> 
 /// left out (it reads as missing: such a dialer is refused `PEER_REVOKED`
 /// and falls back to its code).
 fn load_credentials(conn: &Connection) -> Result<Credentials> {
-    let mut entries = BTreeMap::new();
+    let mut credentials = Credentials::default();
     let rows = conn
         .prepare_cached(sql::CREDENTIALS)?
         .query_map([], |r| {
@@ -1543,18 +1394,15 @@ fn load_credentials(conn: &Connection) -> Result<Credentials> {
             });
             continue;
         };
-        entries.insert(
-            (installation.clone(), side),
-            PeerCredential {
-                installation,
-                side,
-                key,
-                created_ms: unsigned(created_ms),
-                revoked_ms: revoked_ms.map(unsigned),
-            },
-        );
+        credentials.insert(PeerCredential::new(
+            installation,
+            side,
+            key,
+            unsigned(created_ms),
+            revoked_ms.map(unsigned),
+        ));
     }
-    Ok(Credentials { entries })
+    Ok(credentials)
 }
 
 /// Makes `folders.sqlite` (and its WAL files) owner-only on Unix: it holds

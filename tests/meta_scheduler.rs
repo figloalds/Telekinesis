@@ -1254,7 +1254,19 @@ fn a_request_id_is_never_sent_twice() {
         "the repeated id went out again"
     );
     assert_eq!(meta.seen("repo-a")[0].request, fixed);
-    assert!(lane.key("repo-a").failures >= 1);
+    // The slot thread records `ExchangeFinished` before it hands the result
+    // to the lane's loop, which counts the failure and publishes its view
+    // afterwards: wait for the counter instead of reading it at once (WP5.4:
+    // read right after the event, it was still 0 in 12 of 1,000 runs under
+    // load).
+    assert!(
+        wait_until(Duration::from_secs(5), || lane
+            .view()
+            .key("repo-a")
+            .is_some_and(|key| key.failures >= 1)),
+        "the reused id was not counted as the key's failure: {:#?}",
+        lane.view()
+    );
     lane.stop();
 }
 

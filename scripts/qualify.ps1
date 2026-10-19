@@ -10,10 +10,20 @@
   the hardware it ran on.
 
   -Wave N    run the qual files owned by waves <= N; enforce floors tagged <= N.
-  -All       every qual file and every floor (same as -Wave 4), with the
+  -All       every qual file and every floor (same as -Wave 5), with the
              budgets the long scenarios need (150K-event feeds, 1 GiB
              objects): -BudgetS 2400 and -FileTimeoutMin 150 unless given.
              Evidence: test-evidence/qualification-all.json (WP4.2).
+  -Heavy     also run the heavy scenarios (WP5.INT): the two-hour WP5.1
+             daemon workloads (qual_wp5_1_concurrent::conflict_storm and
+             ::fast_two_way_editing, about 2.5 h each), which a run skips
+             otherwise (each file then gets -FileTimeoutMin 200 unless
+             given). A floor marked `heavy` in
+             tests/qualification-floors.json is enforced only when its
+             scenario ran (a run without -Heavy records it as not_run). They
+             are usually run on their own, beside the soak:
+               qualify.ps1 -Wave 5 -Files qual_wp5_1_concurrent -Heavy
+                   -Filter conflict_storm -Evidence <file>
   -Baseline  every qual file; floors are evaluated and recorded, never enforced
              (exit 0); writes test-evidence/qualification-baseline.json.
   -Merge     keep the other files' results from the existing evidence file and
@@ -71,6 +81,7 @@ param(
     [switch]$NoBuild,
     [switch]$Merge,
     [switch]$SelfTest,
+    [switch]$Heavy,
     [ValidateSet("Idle", "BelowNormal", "Normal")][string]$Priority = "BelowNormal"
 )
 $ErrorActionPreference = "Stop"
@@ -80,6 +91,9 @@ Set-Location $root
 # unless the caller chose one (WP4.2).
 if ($All -and -not $PSBoundParameters.ContainsKey("BudgetS")) { $BudgetS = 2400 }
 if ($All -and -not $PSBoundParameters.ContainsKey("FileTimeoutMin")) { $FileTimeoutMin = 150 }
+# -Heavy runs two-hour workloads (2 h of edits, up to 30 min to settle, the
+# oracles): a file gets 200 minutes unless the caller chose (WP5.INT).
+if ($Heavy -and -not $PSBoundParameters.ContainsKey("FileTimeoutMin")) { $FileTimeoutMin = 200 }
 
 # File status from the exit code and the last `test result:` line. A pass
 # needs both: exit code 0 and `test result: ok.`. An unknown ($null) exit code
@@ -167,10 +181,19 @@ $qualFiles = [ordered]@{
     "qual_scale"            = 4
     # CCR-WP4.4-4 (applied by WP4.INT): WP4.4's seal-path scenarios.
     "qual_wp4_4_seal"       = 4
+    # Wave 5 (WP5.INT; CCR-WP5.1-4, CCR-WP5.2-6, CCR-WP5.3-4).
+    "qual_wp5_1_concurrent" = 5
+    "qual_wp5_2_local"      = 5
+    "qual_wp5_3_recovery"   = 5
+}
+# Scenarios a run skips unless -Heavy (WP5.INT): the two-hour WP5.1 daemon
+# workloads, run on their own (each about 2.5 h).
+$heavySkips = @{
+    "qual_wp5_1_concurrent" = "--skip conflict_storm --skip fast_two_way_editing"
 }
 
-if ($All -or $Baseline) { $Wave = 4 }
-if ($Wave -lt 1 -or $Wave -gt 4) { throw "use -Wave 1..4, -All or -Baseline" }
+if ($All -or $Baseline) { $Wave = 5 }
+if ($Wave -lt 1 -or $Wave -gt 5) { throw "use -Wave 1..5, -All or -Baseline" }
 $selected = @($qualFiles.Keys | Where-Object { $qualFiles[$_] -le $Wave })
 if ($Files) {
     # `powershell -File` passes "a,b" as one string: accept commas as separators.
@@ -281,6 +304,7 @@ foreach ($file in $selected) {
     $env:TKFS_QUAL_OUT = $qualOut
     $env:TKFS_QUAL_BUDGET_S = "$BudgetS"
     $cargoArgs = "test --release --test $file -- --ignored --test-threads=1 --nocapture $Filter"
+    if (-not $Heavy -and $heavySkips.Contains($file)) { $cargoArgs += " " + $heavySkips[$file] }
     Write-Host "qualify: running $file (budget $BudgetS s per scenario)"
     $t0 = Get-Date
     $run = Invoke-QualProcess "cargo" $cargoArgs $log ($FileTimeoutMin * 60 * 1000) $Priority
@@ -376,7 +400,9 @@ foreach ($floor in $floorsDoc.floors) {
     $scenarioStatus = ($fileResults | ForEach-Object { $_.scenarios } |
         Where-Object { $_.scenario -eq $floor.scenario } | Select-Object -First 1).status
     $platformOk = (-not $floor.platforms) -or (@($floor.platforms) -contains "windows")
-    $enforced = (-not $Baseline) -and ($floor.wave -le $Wave) -and ($ran -or -not $Filter) -and $platformOk
+    # A heavy floor (WP5.INT) is enforced only when its scenario ran.
+    $heavyOk = $ran -or -not $floor.heavy
+    $enforced = (-not $Baseline) -and ($floor.wave -le $Wave) -and ($ran -or -not $Filter) -and $platformOk -and $heavyOk
     if (-not $ran) { $verdict = "not_run" }
     elseif ($null -eq $metric) { $verdict = "missing" }
     elseif ($scenarioStatus -in @("timeout", "killed", "incomplete")) { $verdict = "incomplete" }
@@ -425,6 +451,7 @@ $evidenceDoc = [ordered]@{
         file_timeout_min = $FileTimeoutMin
         priority         = $Priority
         filter           = $Filter
+        heavy            = [bool]$Heavy
         profile          = "release"
         temp_dir         = $tempDir
         target_dir       = $targetDir

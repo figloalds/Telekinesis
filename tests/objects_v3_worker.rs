@@ -2549,3 +2549,96 @@ fn a_release_with_a_hold_hides_the_objects_from_their_source() {
     assert!(offered(&again, &hy).is_some(), "{again:?}");
     assert!(offered(&want_op(&w, &route_c, "c1"), &hx).is_some());
 }
+
+// ---------------------------------------------------------------------------
+// WP5.3: demand (`objects.demand`)
+
+/// The objects of `w` a reader waits for, as `objects.demand` lists them.
+fn demand_op(w: &Worker, lane: Option<Value>) -> Vec<String> {
+    let mut header = json!({"route": w.route_b});
+    if let Some(lane) = lane {
+        header["lane"] = lane;
+    }
+    let (reply, body) = op(&w.ctx, "objects.demand", header, &[]).unwrap();
+    assert!(body.is_empty());
+    reply["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| {
+            assert!(item["requested_ms"].as_i64().unwrap() > 0, "{item}");
+            item["hash"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// `objects.demand` (WP5.3) lists the objects a reader waits for, newest
+/// demand first, the lane's own with a lane, never one that arrived; it is
+/// read-only (no lease, no backoff) and checks its route and lane like
+/// every op.
+#[test]
+fn objects_demand_lists_what_readers_wait_for_and_leases_nothing() {
+    let x = vec![1u8; 50_000];
+    let y = vec![2u8; 60_000];
+    let z = vec![3u8; 70_000];
+    let w = worker(|a| {
+        file(a, "x", &x);
+        file(a, "y", &y);
+        file(a, "z", &z);
+    });
+    let (hx, hy) = (tkfs::core::hash(&x), tkfs::core::hash(&y));
+    assert!(demand_op(&w, None).is_empty(), "no reader waits yet");
+    {
+        let store = w.ctx.sync_stores.checkout().unwrap();
+        store.request_object(&hx).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        store.request_object(&hy).unwrap();
+    }
+    assert_eq!(demand_op(&w, None), vec![hy.clone(), hx.clone()]);
+    // A lane lists only its own.
+    for index in 0..2 {
+        let lane = LaneSpec::new(index, 2);
+        let expected: Vec<String> = [&hy, &hx]
+            .into_iter()
+            .filter(|hash| lane.owns(hash))
+            .cloned()
+            .collect();
+        assert_eq!(
+            demand_op(&w, Some(json!({"index": index, "count": 2}))),
+            expected
+        );
+    }
+    // Read-only: nothing is leased, and the want list still offers both,
+    // demand first.
+    assert!(w.ctx.inflight_objects.lock().unwrap().leases.is_empty());
+    let items = want_op(&w, &w.route_b, "pull:peer-a:0/1:a");
+    assert_eq!(items[0]["hash"], hy.as_str());
+    assert_eq!(items[0]["priority"], "demand");
+    assert_eq!(items[1]["hash"], hx.as_str());
+    // An object that arrived is no longer listed.
+    let (_, bytes) = w.a.read_object_range(&hx, 0, MIB as usize).unwrap();
+    let done = write_op(
+        &w,
+        &w.route_b,
+        "pull:peer-a:0/1:a",
+        &hx,
+        0,
+        x.len() as u64,
+        &bytes,
+    );
+    assert_eq!(done["outcome"], "completed", "{done}");
+    assert_eq!(demand_op(&w, None), vec![hy.clone()]);
+    // Routes and lanes are checked.
+    let mut wrong = w.route_b.clone();
+    wrong["repo"] = json!("another-repository");
+    let refused = op(&w.ctx, "objects.demand", json!({"route": wrong}), &[]).unwrap_err();
+    assert_eq!(refused.code, "REPOSITORY_MISMATCH");
+    let refused = op(
+        &w.ctx,
+        "objects.demand",
+        json!({"route": w.route_b, "lane": {"index": 3, "count": 2}}),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(refused.code, "INVALID_BULK_LANE");
+}
