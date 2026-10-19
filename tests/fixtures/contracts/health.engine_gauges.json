@@ -1,0 +1,8 @@
+{
+  "waiters": 1,
+  "holds": 99000,
+  "wait_p99_ms": 4,
+  "longest_hold_ms": 310,
+  "current_hold_ms": 0,
+  "stalled": false
+}

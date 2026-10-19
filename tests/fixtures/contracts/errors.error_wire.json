@@ -1,0 +1,5 @@
+{
+  "code": "MOUNT_PATH_MUST_NOT_EXIST",
+  "class": "needs_user_action",
+  "message": "MOUNT_PATH_MUST_NOT_EXIST: C:\\mounts\\photos exists and is not empty"
+}

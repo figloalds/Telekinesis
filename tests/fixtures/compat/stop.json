@@ -1,0 +1,17 @@
+{
+  "desired_running": false,
+  "device": "<device:stop>",
+  "directory": "<path>",
+  "error": null,
+  "initial_sync_pending": false,
+  "label": "Compat stop",
+  "mount": null,
+  "mounted": false,
+  "publication_error": null,
+  "repo": "<repo:stop>",
+  "running": false,
+  "starting": false,
+  "startup_phase": null,
+  "state": "<state:stop>",
+  "sync": []
+}

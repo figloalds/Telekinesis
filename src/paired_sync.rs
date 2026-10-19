@@ -1,6 +1,7 @@
 //! Bounded replication pages, proxied by orchestrators to local workers.
 use crate::{
     core::*,
+    model::health::InboxCounts,
     runtime::{Engine, MAX_FRAME},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -8,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// CCR-WP0.4-1 (applied by WP0.INT): routes compare by value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncRoute {
     pub peer: String,
     pub repo: String,
@@ -105,25 +107,25 @@ fn offer_for_lane(
     } else {
         engine.store.shared_page(&known, &objects, budget)?
     };
-    let permitted: BTreeSet<_> = bundle
-        .events
-        .iter()
-        .flat_map(Event::objects)
-        .chain(
-            engine
-                .store
-                .events()?
-                .iter()
-                .filter(|e| known.contains(&e.id))
-                .flat_map(Event::objects),
-        )
-        .collect();
     let wanted = inventory
         .map(|page| Ok(page.wanted_objects.clone()))
         .unwrap_or_else(|| engine.store.peer_requests(&route.remote_replica))?;
     let parts = if metadata_only {
         BTreeMap::new()
     } else {
+        let permitted: BTreeSet<_> = bundle
+            .events
+            .iter()
+            .flat_map(Event::objects)
+            .chain(
+                engine
+                    .store
+                    .events()?
+                    .iter()
+                    .filter(|e| known.contains(&e.id))
+                    .flat_map(Event::objects),
+            )
+            .collect();
         engine.store.transfer_parts(
             &bundle,
             &objects,
@@ -143,8 +145,16 @@ fn offer_for_lane(
         .events
         .iter()
         .flat_map(Event::objects)
-        .map(|h| engine.store.object_size(&h).map(|size| (h, size)))
-        .collect::<Result<_>>()?;
+        .map(|h| {
+            engine
+                .store
+                .object_size_if_known(&h)
+                .map(|size| size.map(|size| (h, size)))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let wanted_objects = engine.store.wanted_objects()?;
     Ok(SyncPage {
         object_sizes,
@@ -169,21 +179,21 @@ fn offer_for_lane(
         object_parts: parts,
         bundle,
         ack: vec![],
-        pending_events: engine.store.db.query_row(
-            "SELECT count(*) FROM incoming_events",
-            [],
-            |row| row.get(0),
-        )?,
+        // Quarantined and blocked rows are reported separately, never as
+        // pending: one bad event must not hold `caught_up` false forever.
+        pending_events: usize::try_from(engine.store.inbox_counts()?.pending_active())
+            .unwrap_or(usize::MAX),
     })
 }
 pub fn receive(engine: &mut Engine, route: &SyncRoute, page: &SyncPage) -> Result<Vec<String>> {
-    receive_for_lane(engine, route, page, false)
+    receive_for_lane(engine, route, page, false, false)
 }
 fn receive_for_lane(
     engine: &mut Engine,
     route: &SyncRoute,
     page: &SyncPage,
     metadata_only: bool,
+    bounded: bool,
 ) -> Result<Vec<String>> {
     if metadata_only {
         ensure!(
@@ -231,12 +241,21 @@ fn receive_for_lane(
     );
     // Orchestrators relay events from any replica. Retain the immutable local
     // event check so a relayed page cannot rewrite this replica's history.
-    let existing: BTreeMap<_, _> = engine
-        .store
-        .events()?
-        .into_iter()
-        .map(|event| (event.id.clone(), event))
-        .collect();
+    let existing: BTreeMap<_, _> = if page
+        .bundle
+        .events
+        .iter()
+        .any(|event| event.device == route.local_replica)
+    {
+        engine
+            .store
+            .events()?
+            .into_iter()
+            .map(|event| (event.id.clone(), event))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     for event in &page.bundle.events {
         ensure!(
             event.device != route.local_replica
@@ -258,12 +277,9 @@ fn receive_for_lane(
         "PRIVATE_BRANCH_REJECTED"
     );
     let referenced: BTreeSet<_> = page.bundle.events.iter().flat_map(Event::objects).collect();
-    for object in &referenced {
-        ensure!(
-            page.object_sizes.contains_key(object) || engine.store.object_size(object).is_ok(),
-            "CONTENT_SIZE_REQUIRED"
-        );
-    }
+    // Legacy events can lack both bytes and size descriptors. Their causal
+    // metadata still replicates; unknown sizes stay unknown until a peer supplies
+    // a descriptor or verified content. Never rewrite immutable event payloads.
     for event in &page.bundle.events {
         for (object, size) in &event.object_sizes {
             ensure!(
@@ -278,7 +294,7 @@ fn receive_for_lane(
         ensure!(referenced.contains(object), "UNREFERENCED_OBJECT_SIZE");
         engine.store.remember_object_size(object, *size)?;
     }
-    let ack = engine.receive_peer(page.bundle.clone(), &allowed)?;
+    let ack = engine.receive_peer_budget(page.bundle.clone(), &allowed, bounded.then_some(32))?;
     engine
         .store
         .receive_parts(page.object_parts.clone(), &page.bundle.events, &allowed)?;
@@ -302,21 +318,26 @@ fn receive_for_lane(
             .store
             .remember_peer_partials(&route.remote_replica, &page.partial_objects)?;
     }
-    let pending: i64 =
-        engine
-            .store
-            .db
-            .query_row("SELECT count(*) FROM incoming_events", [], |r| r.get(0))?;
+    let incoming = engine.store.inbox_counts()?;
     let caught_up = engine.store.shared_event_inventory()? == page.known
-        && pending == 0
+        && incoming.pending_active() == 0
         && page.pending_events == 0;
+    // No O(repository) content scan on the sync path (RC2): the observation
+    // carries O(1) inbox and outbox counters instead.
     let observation = json!({"caught_up":caught_up,"metadata_caught_up":caught_up,
-        "at":time(),"peer":route.peer,"replica":route.remote_replica,"content":engine.store.content_status()?});
+        "at":time(),"peer":route.peer,"replica":route.remote_replica,
+        "content":sync_counters(engine, &incoming)?});
     engine
         .peer_sync
         .insert(route.remote_replica.clone(), observation.clone());
     engine.last_sync = Some(observation);
     Ok(ack)
+}
+/// The O(1) counters a sync result carries as `content`: the local inbox by
+/// state and the unacknowledged outbox (REVAMP_PLAN WP1.6 task 6).
+fn sync_counters(engine: &Engine, incoming: &InboxCounts) -> Result<Value> {
+    Ok(json!({"incoming":incoming,
+        "outgoing_unacknowledged":engine.store.outgoing_unacknowledged()?}))
 }
 pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
     let op = payload["op"].as_str().context("INVALID_REQUEST")?;
@@ -325,6 +346,7 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
     }
     let route: SyncRoute = serde_json::from_value(payload["route"].clone())?;
     let metadata_only = payload["metadata_only"].as_bool().unwrap_or(false);
+    let bounded = payload["bounded_metadata"] == true;
     binding(engine, &route)?;
     let maximum = payload["max_frame"].as_u64().unwrap_or(MAX_FRAME as u64) as usize;
     ensure!(
@@ -342,9 +364,15 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
         "published-exchange" => {
             let page: SyncPage = serde_json::from_value(payload["page"].clone())?;
             ensure!(page.reply_to.is_none(), "INVALID_SYNC_REQUEST");
-            let ack = receive_for_lane(engine, &route, &page, metadata_only)?;
+            let ack = receive_for_lane(engine, &route, &page, metadata_only, bounded)?;
             let mut response = offer_for_lane(engine, &route, Some(&page), maximum, metadata_only)?;
-            response.ack = ack;
+            // A bounded slice may also activate events queued by earlier pages.
+            // Advertise those in inventory; explicit ACKs bind to this request.
+            let sent: BTreeSet<_> = page.bundle.events.iter().map(|event| &event.id).collect();
+            response.ack = ack
+                .into_iter()
+                .filter(|event| sent.contains(event))
+                .collect();
             Ok(json!(response))
         }
         "published-apply" => {
@@ -364,14 +392,22 @@ pub fn worker_control(engine: &mut Engine, payload: &Value) -> Result<Value> {
                     .all(|ack| sent.contains(ack) && page.known.contains(ack)),
                 "UNBOUND_OR_EARLY_ACK"
             );
-            receive_for_lane(engine, &route, &page, metadata_only)?;
+            let before = engine.store.shared_event_inventory()?;
+            let remote_before = engine.store.known_by_peer(&route.remote_replica)?;
+            receive_for_lane(engine, &route, &page, metadata_only, bounded)?;
             engine.store.acknowledge(&page.ack)?;
-            let pending: i64 =
-                engine
-                    .store
-                    .db
-                    .query_row("SELECT count(*) FROM incoming_events", [], |row| row.get(0))?;
-            let status = json!({"caught_up":engine.store.shared_event_inventory()?==page.known&&pending==0&&page.pending_events==0&&engine.store.outgoing_unacknowledged()?==0&&engine.health.is_none()&&!engine.sessions.values().any(|session|session.dirty),"peer":route.peer,"replica":route.remote_replica,"metadata_caught_up":engine.store.shared_event_inventory()?==page.known&&pending==0&&page.pending_events==0,"content":engine.store.content_status()?,"durability":"metadata acknowledged independently; objects verified separately","at":time()});
+            let incoming = engine.store.inbox_counts()?;
+            let pending = incoming.pending_active();
+            let known = engine.store.shared_event_inventory()?;
+            let progress = json!({"local_events":known.len(),"remote_events":page.known.len(),
+                "local_only_events":known.difference(&page.known).count(),
+                "remote_only_events":page.known.difference(&known).count(),
+                "local_pending":pending,"remote_pending":page.pending_events,
+                "local_blocked":incoming.blocked,"local_quarantined":incoming.quarantined});
+            let metadata_caught_up =
+                known == page.known && pending == 0 && page.pending_events == 0;
+            let content = sync_counters(engine, &incoming)?;
+            let status = json!({"caught_up":metadata_caught_up&&content["outgoing_unacknowledged"]==0&&engine.health.is_none()&&!engine.sessions.values().any(|session|session.dirty),"peer":route.peer,"replica":route.remote_replica,"metadata_caught_up":metadata_caught_up,"metadata_progress":progress,"metadata_advanced":known != before || page.known.intersection(&known).any(|event| !remote_before.contains(event)),"content":content,"durability":"metadata acknowledged independently; objects verified separately","at":time()});
             engine.last_sync = Some(status.clone());
             Ok(status)
         }

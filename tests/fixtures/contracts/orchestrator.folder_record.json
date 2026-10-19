@@ -1,0 +1,11 @@
+{
+  "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+  "label": "Photos",
+  "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+  "device": "3c9e7a10-1f2b-4c3d-8e9f-a0b1c2d3e4f5",
+  "directory": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+  "mount": "C:\\mounts\\photos",
+  "desired_running": true,
+  "sync_enabled": true,
+  "mount_enabled": true
+}

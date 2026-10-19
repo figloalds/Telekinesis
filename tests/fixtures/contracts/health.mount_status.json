@@ -1,0 +1,67 @@
+[
+  {
+    "intent": "headless",
+    "path": null,
+    "state": "disabled"
+  },
+  {
+    "intent": "detach",
+    "path": "C:\\mounts\\photos",
+    "state": "detached"
+  },
+  {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "preflight"
+  },
+  {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attaching"
+  },
+  {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attached",
+    "since_ms": 1790000000000
+  },
+  {
+    "intent": "detach",
+    "path": "C:\\mounts\\photos",
+    "state": "detaching"
+  },
+  {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attach_failed",
+    "error": {
+      "code": "MOUNT_PATH_MUST_NOT_EXIST",
+      "class": "needs_user_action",
+      "message": "MOUNT_PATH_MUST_NOT_EXIST: C:\\mounts\\photos exists and is not empty"
+    },
+    "attempt": 2,
+    "next_retry_at_ms": null
+  },
+  {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attach_failed",
+    "error": {
+      "code": "WINFSP_MOUNT_FAILED",
+      "class": "transient",
+      "message": "WINFSP_MOUNT_FAILED: 0xc0000034"
+    },
+    "attempt": 3,
+    "next_retry_at_ms": 1790000008000
+  },
+  {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "lost",
+    "error": {
+      "code": "REMOUNT_FAILED",
+      "class": "transient",
+      "message": "REMOUNT_FAILED: checkout remount"
+    }
+  }
+]

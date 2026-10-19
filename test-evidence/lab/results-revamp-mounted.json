@@ -1,0 +1,814 @@
+{
+ "label": "revamp-mounted",
+ "harness_version": "1.4",
+ "desktop_exe": "C:\\tkfs-build\\lab\\target-revamp\\release\\tkfs.exe",
+ "laptop_exe": "C:\\tkfs-lab\\target-revamp\\release\\tkfs.exe",
+ "endpoint": "ws://127.0.0.1:43281",
+ "scenarios": {
+  "M1": {
+   "name": "M1 mounted receive (laptop -> desktop WinFsp mount)",
+   "status": "incomplete or mismatched",
+   "mount_point": "C:\\tkfs-build\\lab\\mnt\\revamp-mounted",
+   "mount_point_existed_before": false,
+   "dataset": {
+    "files": 201,
+    "bytes": 543508342,
+    "generate_ms": 12617
+   },
+   "source": {
+    "state": "bf303e0a-01e6-438b-a29b-29793d0050d3",
+    "repo": "b17f4824-cc67-44a4-93de-33637d08e04d",
+    "mount": "\\\\?\\C:\\tkfs-lab\\mnt\\revamp-mounted-src"
+   },
+   "source_ingest": {
+    "copy_ms": 25082,
+    "bytes": 543508342,
+    "files": 201,
+    "MBps": 21.7,
+    "projection_ready_after_copy_s": 0.5,
+    "idle_status_seen": true
+   },
+   "source_settle": {
+    "settled": true,
+    "waited_s": 14.7,
+    "threshold_cores": 0.25,
+    "window_s": 10,
+    "series": [
+     {
+      "t_s": 14.7,
+      "procs": 2,
+      "cores": 0.003
+     }
+    ]
+   },
+   "manage_status_text": [
+    {
+     "t": 1.04,
+     "tag": "gate",
+     "file": "manage-status-00-gate.txt",
+     "rc": 0
+    },
+    {
+     "t": 3.13,
+     "tag": "gate-cleared",
+     "file": "manage-status-01-gate-cleared.txt",
+     "rc": 0
+    }
+   ],
+   "timeline_s": {
+    "paired": 0.39,
+    "remote_list_visible": 0.7,
+    "receive_returned": 0.98,
+    "gate_open_seen": 1.04,
+    "gate_cleared": 3.13,
+    "mount_attached": 3.13,
+    "inspect_running": 3.13,
+    "mount_usable": 3.15,
+    "listing_done": 3.37,
+    "hash_done": 34.98,
+    "new_file_written": 35.0,
+    "new_file_on_laptop": 38.34
+   },
+   "receive_reply": {
+    "desired_running": true,
+    "device": "08ad474d-a262-4b2a-a8f9-da6614fd9e76",
+    "directory": "\\\\?\\C:\\tkfs-build\\lab\\nodes\\revamp-mounted\\data\\states\\b0b75367-abf4-4cdb-87b4-978c94c4cf67",
+    "error": null,
+    "initial_sync_pending": true,
+    "label": "lab-revamp-mounted",
+    "mount": "\\\\?\\C:\\tkfs-build\\lab\\mnt\\revamp-mounted",
+    "mounted": false,
+    "publication_error": null,
+    "repo": "b17f4824-cc67-44a4-93de-33637d08e04d",
+    "running": false,
+    "starting": true,
+    "startup_phase": "launching worker",
+    "state": "b0b75367-abf4-4cdb-87b4-978c94c4cf67",
+    "status": {
+     "activation": {
+      "counters": {
+       "activated": 0,
+       "fast": 0,
+       "last_activation_at_ms": null,
+       "last_slice_ms": 0,
+       "quarantined": 0,
+       "retried": 0,
+       "running": false,
+       "slices": 0,
+       "slow": 0,
+       "stale": 0,
+       "starved_since_ms": null
+      },
+      "inbox": {
+       "blocked": 0,
+       "quarantined": 0,
+       "ready": 0,
+       "retry": 0,
+       "unclassified": 0,
+       "waiting": 0
+      }
+     },
+     "content": {
+      "complete": false,
+      "current_available": 0,
+      "current_missing": 0,
+      "current_missing_bytes": 0,
+      "current_objects": 0,
+      "downloading": 0,
+      "partial_bytes": 0,
+      "requested": 0,
+      "shared_available": 0,
+      "shared_missing_bytes": 0,
+      "shared_objects": 0
+     },
+     "device": "08ad474d-a262-4b2a-a8f9-da6614fd9e76",
+     "errors": [],
+     "gate": {
+      "since_ms": 1792171257698,
+      "source": "9cdc7fcf-582b-4bd4-a25a-ff2bd0629863",
+      "state": "awaiting",
+      "waiting_on": []
+     },
+     "intents": {
+      "desired_running": true,
+      "mount_enabled": true,
+      "sync_enabled": true
+     },
+     "journal": {
+      "branches": 0,
+      "epoch": null,
+      "events": 0,
+      "outgoing_unacknowledged": 0,
+      "shared_events": 0,
+      "tip": 0,
+      "unresolved_conflicts": 0
+     },
+     "label": "lab-revamp-mounted",
+     "lifecycle": {
+      "adopted": false,
+      "degraded": false,
+      "detail": "launching worker",
+      "instance": null,
+      "last_exit": null,
+      "next_retry_at_ms": null,
+      "phase": "starting",
+      "pid": null,
+      "restarts": 0,
+      "since_ms": 1792171257700,
+      "startup": {
+       "phase": "launching worker",
+       "seq": 0
+      }
+     },
+     "mount": {
+      "intent": "attach",
+      "path": "\\\\?\\C:\\tkfs-build\\lab\\mnt\\revamp-mounted",
+      "state": "detached"
+     },
+     "repo": "b17f4824-cc67-44a4-93de-33637d08e04d",
+     "state": "b0b75367-abf4-4cdb-87b4-978c94c4cf67",
+     "store": {
+      "health": {
+       "state": "healthy"
+      },
+      "open_handles": 0,
+      "pending_saves": 0,
+      "unflushed_files": 0
+     },
+     "sync": {
+      "peers": [
+       {
+        "backoff_until_ms": null,
+        "direction": "outbound",
+        "endpoint": "ws://127.0.0.1:43281",
+        "error": null,
+        "installation": "9cdc7fcf-582b-4bd4-a25a-ff2bd0629863",
+        "label": null,
+        "last_progress_ms": null,
+        "metadata": {
+         "blocked": 0,
+         "caught_up": false,
+         "cursor_seq": 0,
+         "last_exchange_ms": null,
+         "local_pending": 0,
+         "quarantined": 0,
+         "rejected": 0,
+         "remote_pending": 0,
+         "remote_tip": 502,
+         "to_receive": 0,
+         "to_send": 0
+        },
+        "objects_down": {
+         "bytes_remaining": 0,
+         "eta_s": null,
+         "in_flight": 0,
+         "last_progress_ms": null,
+         "objects_remaining": 0,
+         "rate_bps": 0,
+         "total_bytes": 0
+        },
+        "objects_up": {
+         "bytes_remaining": 0,
+         "eta_s": null,
+         "in_flight": 0,
+         "last_progress_ms": null,
+         "objects_remaining": 0,
+         "rate_bps": 0,
+         "total_bytes": 0
+        },
+        "stalled_since_ms": null,
+        "state": "waiting_for_worker"
+       }
+      ],
+      "state": "stopped",
+      "summary": "Not syncing: worker starting (launching worker)"
+     }
+    },
+    "sync": [
+     {
+      "connected": true,
+      "endpoint": "ws://127.0.0.1:43281",
+      "error": null,
+      "lanes": [
+       {
+        "connected": true,
+        "error": null,
+        "lane": 0,
+        "parallel_bulk": true,
+        "repository": null,
+        "role": "control",
+        "transport": "tkfs-peer/3"
+       },
+       {
+        "connected": true,
+        "error": null,
+        "lane": 1,
+        "parallel_bulk": true,
+        "repository": {
+         "caught_up": false,
+         "consecutive_failures": 0,
+         "error": null,
+         "last_progress_ms": null,
+         "last_success_ms": null,
+         "metadata_caught_up": false,
+         "metadata_progress": null,
+         "object_inventory": {
+          "local_available": 0,
+          "local_only": 0,
+          "local_partial": 0,
+          "remote_available": 0,
+          "remote_only": 0,
+          "remote_partial": 0
+         },
+         "retry_at_ms": null,
+         "total_received_object_bytes": 0,
+         "total_received_wire_bytes": 0,
+         "total_sent_object_bytes": 0,
+         "total_sent_wire_bytes": 0,
+         "transfer": {
+          "apply_ms": null,
+          "object_lane": {
+           "count": 3,
+           "index": 0
+          },
+          "offer_ms": null,
+          "received_object_bytes": 0,
+          "received_wire_bytes": 0,
+          "remote_exchange_ms": null,
+          "sent_object_bytes": 0,
+          "sent_wire_bytes": 0,
+          "total_ms": null,
+          "transport": "tkfs-peer/3"
+         }
+        },
+        "role": "bulk",
+        "transport": "tkfs-peer/3"
+       },
+       {
+        "connected": true,
+        "error": null,
+        "lane": 2,
+        "parallel_bulk": true,
+        "repository": {
+         "caught_up": false,
+         "consecutive_failures": 0,
+         "error": null,
+         "last_progress_ms": null,
+         "last_success_ms": null,
+         "metadata_caught_up": false,
+         "metadata_progress": null,
+         "object_inventory": {
+          "local_available": 0,
+          "local_only": 0,
+          "local_partial": 0,
+          "remote_available": 0,
+          "remote_only": 0,
+          "remote_partial": 0
+         },
+         "retry_at_ms": null,
+         "total_received_object_bytes": 0,
+         "total_received_wire_bytes": 0,
+         "total_sent_object_bytes": 0,
+         "total_sent_wire_bytes": 0,
+         "transfer": {
+          "apply_ms": null,
+          "object_lane": {
+           "count": 3,
+           "index": 1
+          },
+          "offer_ms": null,
+          "received_object_bytes": 0,
+          "received_wire_bytes": 0,
+          "remote_exchange_ms": null,
+          "sent_object_bytes": 0,
+          "sent_wire_bytes": 0,
+          "total_ms": null,
+          "transport": "tkfs-peer/3"
+         }
+        },
+        "role": "bulk",
+        "transport": "tkfs-peer/3"
+       },
+       {
+        "connected": true,
+        "error": null,
+        "lane": 3,
+        "parallel_bulk": true,
+        "repository": {
+         "caught_up": false,
+         "consecutive_failures": 0,
+         "error": null,
+         "last_progress_ms": null,
+         "last_success_ms": null,
+         "metadata_caught_up": false,
+         "metadata_progress": null,
+         "object_inventory": {
+          "local_available": 0,
+          "local_only": 0,
+          "local_partial": 0,
+          "remote_available": 0,
+          "remote_only": 0,
+          "remote_partial": 0
+         },
+         "retry_at_ms": null,
+         "total_received_object_bytes": 0,
+         "total_received_wire_bytes": 0,
+         "total_sent_object_bytes": 0,
+         "total_sent_wire_bytes": 0,
+         "transfer": {
+          "apply_ms": null,
+          "object_lane": {
+           "count": 3,
+           "index": 2
+          },
+          "offer_ms": null,
+          "received_object_bytes": 0,
+          "received_wire_bytes": 0,
+          "remote_exchange_ms": null,
+          "sent_object_bytes": 0,
+          "sent_wire_bytes": 0,
+          "total_ms": null,
+          "transport": "tkfs-peer/3"
+         }
+        },
+        "role": "bulk",
+        "transport": "tkfs-peer/3"
+       }
+      ],
+      "metadata": null,
+      "remote_available": true
+     }
+    ]
+   },
+   "replica": {
+    "state": "b0b75367-abf4-4cdb-87b4-978c94c4cf67",
+    "directory": "\\\\?\\C:\\tkfs-build\\lab\\nodes\\revamp-mounted\\data\\states\\b0b75367-abf4-4cdb-87b4-978c94c4cf67"
+   },
+   "during_gate": {
+    "status_samples": 1,
+    "inspect_samples": 1,
+    "status_failures": 0,
+    "examples": [
+     {
+      "t": 1.04,
+      "status_folder": {
+       "phase": "starting",
+       "startup": {
+        "phase": "opening state",
+        "seq": 1
+       },
+       "gate": {
+        "since_ms": 1792171257698,
+        "source": "9cdc7fcf-582b-4bd4-a25a-ff2bd0629863",
+        "state": "awaiting",
+        "waiting_on": []
+       },
+       "mount_state": "detached",
+       "mount_intent": "attach",
+       "activation": {
+        "counters": {
+         "activated": 0,
+         "fast": 0,
+         "last_activation_at_ms": null,
+         "last_slice_ms": 0,
+         "quarantined": 0,
+         "retried": 0,
+         "running": false,
+         "slices": 0,
+         "slow": 0,
+         "stale": 0,
+         "starved_since_ms": null
+        },
+        "inbox": {
+         "blocked": 0,
+         "quarantined": 0,
+         "ready": 0,
+         "retry": 0,
+         "unclassified": 0,
+         "waiting": 0
+        }
+       },
+       "content": {
+        "complete": false,
+        "current_available": 0,
+        "current_missing": 0,
+        "current_missing_bytes": 0,
+        "current_objects": 0,
+        "downloading": 0,
+        "partial_bytes": 0,
+        "requested": 0,
+        "shared_available": 0,
+        "shared_missing_bytes": 0,
+        "shared_objects": 0
+       },
+       "sync": {
+        "peers": [
+         {
+          "backoff_until_ms": null,
+          "direction": "outbound",
+          "endpoint": "ws://127.0.0.1:43281",
+          "error": null,
+          "installation": "9cdc7fcf-582b-4bd4-a25a-ff2bd0629863",
+          "label": null,
+          "last_progress_ms": null,
+          "metadata": {
+           "blocked": 0,
+           "caught_up": false,
+           "cursor_seq": 0,
+           "last_exchange_ms": null,
+           "local_pending": 0,
+           "quarantined": 0,
+           "rejected": 0,
+           "remote_pending": 0,
+           "remote_tip": 502,
+           "to_receive": 0,
+           "to_send": 0
+          },
+          "objects_down": {
+           "bytes_remaining": 0,
+           "eta_s": null,
+           "in_flight": 0,
+           "last_progress_ms": null,
+           "objects_remaining": 0,
+           "rate_bps": 0,
+           "total_bytes": 0
+          },
+          "objects_up": {
+           "bytes_remaining": 0,
+           "eta_s": null,
+           "in_flight": 0,
+           "last_progress_ms": null,
+           "objects_remaining": 0,
+           "rate_bps": 0,
+           "total_bytes": 0
+          },
+          "stalled_since_ms": null,
+          "state": "waiting_for_worker"
+         }
+        ],
+        "state": "stopped",
+        "summary": "Not syncing: worker starting (opening state)"
+       },
+       "errors": []
+      },
+      "inspect": {
+       "running": false,
+       "starting": true,
+       "mounted": false,
+       "initial_sync_pending": true,
+       "startup_phase": "synchronizing remote metadata",
+       "error": null
+      }
+     }
+    ],
+    "status_latency_ms": {
+     "p50": 26,
+     "p95": 26,
+     "max": 26
+    },
+    "inspect_latency_ms": {
+     "p50": 37,
+     "p95": 37,
+     "max": 37
+    }
+   },
+   "gate_cleared_as": "none",
+   "gate_transitions": [
+    [
+     1.04,
+     "awaiting"
+    ],
+    [
+     3.13,
+     "none"
+    ]
+   ],
+   "mount_transitions": [
+    [
+     1.04,
+     "detached"
+    ],
+    [
+     3.13,
+     "attached"
+    ]
+   ],
+   "content_at_mount": {
+    "complete": false,
+    "current_available": 200,
+    "current_missing": 1,
+    "current_objects": 201,
+    "downloading": 1,
+    "items": [
+     {
+      "downloaded": 6123461,
+      "error": null,
+      "object": "eb47383a505e8996a9bed0c31d1202518225722bb81ae3ee52ab05cd83998631",
+      "path": "big.bin",
+      "size": 536870912,
+      "size_known": true,
+      "state": "downloading"
+     }
+    ],
+    "partial_bytes": 6123461,
+    "requested": 0,
+    "shared_available": 201,
+    "shared_objects": 202
+   },
+   "content_complete_at_mount": false,
+   "backing_at_mount": {
+    "layout_known": true,
+    "present": 200,
+    "total": 201,
+    "missing": [
+     "eb47383a505e8996a9bed0c31d1202518225722bb81ae3ee52ab05cd83998631"
+    ]
+   },
+   "listing": {
+    "seconds": 0.18,
+    "files_listed": 201,
+    "expected": 201,
+    "missing": [],
+    "extra": [],
+    "tkfs_entries": [],
+    "size_mismatch": [],
+    "all_listed": true
+   },
+   "hash_via_mount": {
+    "files": 201,
+    "ok": 200,
+    "bad": [
+     "big.bin: [Errno 22] Invalid argument"
+    ],
+    "bytes": 6637430,
+    "seconds": 31.6,
+    "MBps": 0.21,
+    "large_file_seconds": null,
+    "all_match": false
+   },
+   "new_file": {
+    "path": "mounted-check/desktop-new.bin",
+    "size": 1048576,
+    "sha256": "4bf69f22c10ce559368ebf649ed178ffb10d16ec78d2bef5ecf446e40346683c",
+    "write_s": 0.022,
+    "desktop_projection_s": 2.73,
+    "laptop_projection_s": 0.67,
+    "laptop_content_complete_s": 3.34,
+    "laptop_mount_sha256_matches": true,
+    "laptop_mount_hash_s": 1.88
+   },
+   "window_ms": [
+    1792171256730,
+    1792171296951
+   ],
+   "stop": {
+    "rc": 0,
+    "seconds": 0.05,
+    "output": ",\n              \"offer_ms\": null,\n              \"received_object_bytes\": 8388608,\n              \"received_wire_bytes\": 8388608,\n              \"remote_exchange_ms\": null,\n              \"sent_object_bytes\": 0,\n              \"sent_wire_bytes\": 0,\n              \"total_ms\": 1501,\n              \"transport\": \"tkfs-peer/3\"\n            }\n          },\n          \"role\": \"bulk\",\n          \"transport\": \"tkfs-peer/3\"\n        }\n      ],\n      \"metadata\": {\n        \"caught_up\": true,\n        \"consecutive_failures\": 0,\n        \"error\": null,\n        \"last_progress_ms\": 1792171292366,\n        \"last_success_ms\": 1792171296608,\n        \"metadata_caught_up\": true,\n        \"metadata_progress\": {\n          \"local_events\": 505,\n          \"local_only_events\": 0,\n          \"local_pending\": 0,\n          \"remote_events\": 505,\n          \"remote_only_events\": 0,\n          \"remote_pending\": 0\n        },\n        \"object_inventory\": null,\n        \"retry_at_ms\": null,\n        \"total_received_object_bytes\": 0,\n        \"total_received_wire_bytes\": 646546,\n        \"total_sent_object_bytes\": 0,\n        \"total_sent_wire_bytes\": 100230,\n        \"transfer\": {\n          \"apply_ms\": null,\n          \"offer_ms\": null,\n          \"received_object_bytes\": 0,\n          \"received_wire_bytes\": 836,\n          \"remote_exchange_ms\": null,\n          \"sent_object_bytes\": 0,\n          \"sent_wire_bytes\": 765,\n          \"total_ms\": 62,\n          \"transport\": \"tkfs-peer/3\"\n        }\n      },\n      \"remote_available\": true\n    }\n  ]\n}\n",
+    "mount_point_gone": true,
+    "inspect_after": {
+     "running": false,
+     "starting": false,
+     "mounted": false,
+     "initial_sync_pending": false,
+     "startup_phase": null,
+     "error": null
+    }
+   },
+   "snapshot_summary": {
+    "snapshots": 80,
+    "peers": {
+     "count": 20,
+     "failures": 0,
+     "busy_or_stale": 0,
+     "latency_ms_p50": 27,
+     "latency_ms_p95": 33,
+     "latency_ms_max": 35
+    },
+    "inspect": {
+     "count": 20,
+     "failures": 0,
+     "busy_or_stale": 0,
+     "latency_ms_p50": 27,
+     "latency_ms_p95": 35,
+     "latency_ms_max": 36
+    },
+    "status": {
+     "count": 20,
+     "failures": 0,
+     "busy_or_stale": 0,
+     "latency_ms_p50": 26,
+     "latency_ms_p95": 34,
+     "latency_ms_max": 38
+    },
+    "manage-status": {
+     "count": 20,
+     "failures": 0,
+     "busy_or_stale": 0,
+     "latency_ms_p50": 25,
+     "latency_ms_p95": 34,
+     "latency_ms_max": 51
+    }
+   },
+   "metadata_summary": {
+    "first": {
+     "t": 1792171258406,
+     "control_exchanges": 1,
+     "control_received_wire_bytes": 586977,
+     "local_events": 0,
+     "remote_events": 502,
+     "local_only_events": 0,
+     "remote_only_events": 0,
+     "local_pending": 502,
+     "remote_pending": 0
+    },
+    "last": {
+     "t": 1792171296577,
+     "control_exchanges": 71,
+     "control_received_wire_bytes": 645710,
+     "local_events": 505,
+     "remote_events": 505,
+     "local_only_events": 0,
+     "remote_only_events": 0,
+     "local_pending": 0,
+     "remote_pending": 0
+    },
+    "local_events_per_s": 13.23,
+    "control_exchanges_per_s": 1.83,
+    "events_per_control_exchange": 7.21,
+    "last_local_vs_remote_events_pct": 100.0
+   }
+  }
+ },
+ "caveats": [
+  "Desktop is shared with concurrent heavy builds/tests; see desktop_load (CPU %, build process counts) per scenario.",
+  "Peer traffic crosses an SSH -L tunnel (encryption + single TCP stream over Wi-Fi); compare against link.tunnel_* not raw Wi-Fi.",
+  "Milestones are observed by polling (2 s snapshots, 0.5-1 s in S3); resolution is about +/-2 s, except S2 whose loop reads both projections each pass (about 4.5 s per pass on an idle pair, far more when a `state` read times out; S2 window / reads.polls gives the period).",
+  "S3 fault = ssh client terminated: desktop-side sockets close immediately (RST/EOF), not a silent black-hole.",
+  "Laptop timestamps are corrected by clock_offset_ms (uncertainty listed there).",
+  "Status polling itself takes worker locks on both sides; identical polling is used for every build (manage status only with --capture-manage-status). The `state` projection dump polled every ~2 s (desktop in S1, both machines in S2) holds the worker's engine lock: see progress state_ms.",
+  "Control-lane metadata_summary counters (local_events, exchanges, wire bytes) are diagnostics whose meaning changes with the protocol (v3 reports feed tips); compare builds on projection/content milestones.",
+  "cat-object can fetch a missing object on demand; verification.backing_files hashes installed objects directly and is the replication check."
+ ],
+ "errors": [],
+ "build_commits": {
+  "desktop": "e8c2979",
+  "laptop": "e8c2979"
+ },
+ "check": "mounted receive",
+ "check_version": "1.1",
+ "started_at_ms": 1792171158011,
+ "exe": {
+  "desktop_version": "tkfs 0.1.0",
+  "laptop_version": "tkfs 0.1.0",
+  "desktop_sha256": "424e37612df4247c40ad738f5e6f2a54c9dd18b8340dfd508a78c2a58ed0fbff",
+  "laptop_sha256": "cd6687e09cfe365cc35f9820fa732dd66b64c338c02109e8e966a8975510c604"
+ },
+ "laptop_free_bytes_before": 39791980544,
+ "laptop_idle_cpu": [
+  {
+   "load_pct": 1,
+   "top_cpu_time_processes": [
+    "System",
+    "MsMpEng",
+    "perfmon",
+    "Taskmgr",
+    "svchost",
+    "svchost",
+    "ChatGPT",
+    "svchost"
+   ]
+  },
+  {
+   "load_pct": 2,
+   "top_cpu_time_processes": [
+    "System",
+    "MsMpEng",
+    "perfmon",
+    "Taskmgr",
+    "svchost",
+    "svchost",
+    "ChatGPT",
+    "svchost"
+   ]
+  },
+  {
+   "load_pct": 8,
+   "top_cpu_time_processes": [
+    "System",
+    "MsMpEng",
+    "perfmon",
+    "Taskmgr",
+    "svchost",
+    "svchost",
+    "ChatGPT",
+    "svchost"
+   ]
+  }
+ ],
+ "desktop_idle_cpu": {
+  "cpu_mean": 14.2,
+  "cpu_p50": 10.1,
+  "cpu_p95": 43.8,
+  "cpu_max": 43.8,
+  "samples": 9,
+  "build_procs_mean": 0,
+  "build_procs_max": 0
+ },
+ "clock_offset_ms": {
+  "laptop_minus_desktop": -944,
+  "uncertainty_ms": 690
+ },
+ "tunnel_starts": [
+  {
+   "tag": "tunnel",
+   "pid": 29496,
+   "seconds": 0.26
+  }
+ ],
+ "teardown": {
+  "desktop_shutdown_rc": 0,
+  "laptop_shutdown_rc": 0,
+  "laptop_killed_leftovers": [],
+  "desktop_killed_leftovers": ""
+ },
+ "mount_point_exists_after": false,
+ "finished_at_ms": 1792171309427,
+ "desktop_load": {
+  "M1": {
+   "cpu_mean": 9.0,
+   "cpu_p50": 7.7,
+   "cpu_p95": 16.6,
+   "cpu_max": 22.1,
+   "samples": 37,
+   "build_procs_mean": 0,
+   "build_procs_max": 0
+  }
+ },
+ "laptop_load": {
+  "snapshots": 84,
+  "M1": {
+   "cpu_mean": 13.4,
+   "cpu_max": 23.8,
+   "status_calls": 20,
+   "status_ms_p50": 20,
+   "status_ms_max": 21,
+   "status_failures": 0
+  }
+ },
+ "cleanup": {
+  "C:\\tkfs-lab\\data\\revamp-mounted": {
+   "deleted": 1
+  },
+  "C:\\tkfs-lab\\runs\\revamp-mounted\\node\\data": {
+   "deleted": 1
+  },
+  "C:\\tkfs-lab\\mnt\\revamp-mounted-src": {
+   "deleted": 1
+  },
+  "C:\\tkfs-build\\lab\\nodes\\revamp-mounted\\data": {
+   "deleted": 1
+  },
+  "laptop_free_bytes_after": 39574577152
+ }
+}

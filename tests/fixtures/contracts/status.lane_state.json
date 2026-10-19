@@ -1,0 +1,10 @@
+[
+  "idle",
+  "dialing",
+  "handshaking",
+  "ready",
+  "backoff",
+  "incompatible",
+  "unauthorized",
+  "closed"
+]

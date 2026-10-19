@@ -1,6 +1,21 @@
 //! Bounded-memory random-access staging. Failed saves keep their spool on disk.
+//!
+//! WP5.2 (CCR-WP4.INT-5, the staging part):
+//! * [`Staged::snapshot`] is a stable view of a session's bytes for a save
+//!   that stores them without the engine lock (`runtime::engine`): a copy of
+//!   the in-memory bytes (at most [`MEMORY_LIMIT`]), or a second handle to the
+//!   staging file, which the engine keeps from being written until the save
+//!   ends (writers of that file wait off the lock), or the object a clean
+//!   reference already is.
+//! * [`writable_copy`] makes the private writable copy of a large object
+//!   (`Reference` above [`MEMORY_LIMIT`]) that its first write needs, off the
+//!   engine lock: it copies and verifies in one pass, and the engine installs
+//!   it only if the session still references the same object
+//!   ([`Staged::install_writable`]). The first write then no longer copies the
+//!   whole file under the lock.
 use crate::core::{IO_CHUNK, MAX_CONTENT, Store, id};
 use anyhow::{Result, ensure};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
@@ -8,7 +23,106 @@ use std::{
     sync::OnceLock,
 };
 
-const MEMORY_LIMIT: usize = 256 * 1024;
+/// Sessions up to this size stage in memory; larger ones in a staging file.
+pub const MEMORY_LIMIT: usize = 256 * 1024;
+
+/// A stable view of a session's staged bytes ([`Staged::snapshot`]).
+pub enum StageSnapshot {
+    /// A copy of in-memory bytes.
+    Bytes(Vec<u8>),
+    /// A second handle to the staging file and its length. Read only with
+    /// positional reads ([`read_file_at`]): the handle shares its file
+    /// position with the session's.
+    File { file: File, size: usize },
+    /// The bytes are already the object `object` (an unmodified reference).
+    Object { object: String, size: usize },
+}
+
+impl StageSnapshot {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::File { size, .. } | Self::Object { size, .. } => *size,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Reads `bytes.len()` bytes at `offset` of `file` (positional; never moves
+/// a position another handle relies on). `STAGING_TRUNCATED` at end of file.
+pub fn read_file_at(file: &File, offset: u64, bytes: &mut [u8]) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::FileExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::FileExt;
+    let mut read = 0;
+    while read < bytes.len() {
+        #[cfg(windows)]
+        let n = file.seek_read(&mut bytes[read..], offset + read as u64)?;
+        #[cfg(unix)]
+        let n = file.read_at(&mut bytes[read..], offset + read as u64)?;
+        ensure!(n > 0, "STAGING_TRUNCATED");
+        read += n;
+    }
+    Ok(())
+}
+
+/// A new staging file under `root/staging` (not retained).
+fn new_stage(root: &Path) -> Result<(File, PathBuf)> {
+    let folder = root.join("staging");
+    fs::create_dir_all(&folder)?;
+    let path = folder.join(format!("{}.stage", id()));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok((file, path))
+}
+
+/// The writable copy of the object at `path` (`object`, `size` bytes) as a
+/// staging file, verified while it is copied (one read of the object). Runs
+/// without the engine lock (module docs). The copy is removed again when the
+/// result is dropped without being installed.
+pub fn writable_copy(root: &Path, path: &Path, object: &str, size: usize) -> Result<Staged> {
+    let mut source =
+        File::open(path).map_err(|e| anyhow::anyhow!("CONTENT_UNAVAILABLE: {object}: {e}"))?;
+    ensure!(
+        source.metadata()?.len() == size as u64,
+        "CORRUPT_OBJECT: {object}"
+    );
+    let (file, path) = new_stage(root)?;
+    // Removed on drop unless installed.
+    let mut staged = Staged::Disk {
+        file,
+        path,
+        size,
+        retained: false,
+    };
+    let Staged::Disk { file, .. } = &mut staged else {
+        unreachable!()
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; IO_CHUNK];
+    let mut copied = 0usize;
+    loop {
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        copied += n;
+        ensure!(copied <= size, "CORRUPT_OBJECT: {object}");
+        digest.update(&buffer[..n]);
+        file.write_all(&buffer[..n])?;
+    }
+    ensure!(
+        copied == size && hex::encode(digest.finalize()) == object,
+        "CORRUPT_OBJECT: {object}"
+    );
+    Ok(staged)
+}
 pub enum Staged {
     Memory(Vec<u8>),
     Reference {
@@ -39,6 +153,9 @@ impl Staged {
             verified: OnceLock::new(),
         })
     }
+    /// `(path, object, size)` of a reference whose bytes were not verified
+    /// yet (`runtime::prepare_content` verifies them off the engine lock).
+    /// An empty one has no bytes to verify (every new file's session is one).
     pub fn reference(&self) -> Option<(&Path, &str, usize)> {
         if let Self::Reference {
             path,
@@ -47,6 +164,7 @@ impl Staged {
             verified,
         } = self
             && verified.get().is_none()
+            && *size > 0
         {
             return Some((path, object, *size));
         }
@@ -78,6 +196,50 @@ impl Staged {
             let _ = verified.set(file);
         }
         Ok(verified.get().unwrap())
+    }
+    /// A stable view of these bytes for an off-lock save (module docs). For a
+    /// staging file the caller must keep the file from being written until
+    /// the snapshot is dropped.
+    pub fn snapshot(&self) -> Result<StageSnapshot> {
+        Ok(match self {
+            Self::Memory(bytes) => StageSnapshot::Bytes(bytes.clone()),
+            Self::Disk { file, size, .. } => StageSnapshot::File {
+                file: file.try_clone()?,
+                size: *size,
+            },
+            Self::Reference { object, size, .. } => StageSnapshot::Object {
+                object: object.clone(),
+                size: *size,
+            },
+        })
+    }
+    /// Whether the bytes are a staging file (a save then holds writers back,
+    /// [`Staged::snapshot`]).
+    pub fn is_file(&self) -> bool {
+        matches!(self, Self::Disk { .. })
+    }
+    /// `(path, object, size)` of a reference whose first write would copy it
+    /// whole into a staging file (larger than [`MEMORY_LIMIT`]): the copy
+    /// [`writable_copy`] makes off the engine lock.
+    pub fn large_reference(&self) -> Option<(PathBuf, String, usize)> {
+        match self {
+            Self::Reference {
+                path, object, size, ..
+            } if *size > MEMORY_LIMIT => Some((path.clone(), object.clone(), *size)),
+            _ => None,
+        }
+    }
+    /// Replaces a reference to `object` (`size` bytes) with its writable copy
+    /// ([`writable_copy`]); `false`, and the copy is dropped (removed), when
+    /// these bytes are no longer that reference.
+    pub fn install_writable(&mut self, object: &str, size: usize, copy: Staged) -> bool {
+        let same =
+            matches!(self, Self::Reference { object: o, size: s, .. } if o == object && *s == size);
+        if same && copy.is_file() && copy.len() == size {
+            *self = copy;
+            return true;
+        }
+        false
     }
     pub fn len(&self) -> usize {
         match self {
@@ -117,14 +279,7 @@ impl Staged {
             *self = staged;
         }
         if let Self::Memory(bytes) = self {
-            let folder = root.join("staging");
-            fs::create_dir_all(&folder)?;
-            let path = folder.join(format!("{}.stage", id()));
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
+            let (mut file, path) = new_stage(root)?;
             file.write_all(bytes)?;
             *self = Self::Disk {
                 file,
@@ -230,6 +385,14 @@ impl Staged {
             unreachable!()
         };
         file.sync_all()?;
+        // The caller commits a `pending_saves` row naming this file next; make
+        // its directory entry durable first, or a power loss can keep the row
+        // and lose the file (CCR-WP0.INT-3). Unix only, like the object
+        // install in `core::objects` (std cannot open a directory on Windows).
+        #[cfg(unix)]
+        if let Some(folder) = path.parent() {
+            File::open(folder)?.sync_all()?;
+        }
         *retained = true;
         Ok(path.file_name().unwrap().to_string_lossy().into_owned())
     }

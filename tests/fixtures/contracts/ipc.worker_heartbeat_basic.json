@@ -1,0 +1,39 @@
+{
+  "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+  "seq": 42,
+  "at_ms": 1790000042000,
+  "uptime_ms": 42000,
+  "mount": {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attached",
+    "since_ms": 1790000000900
+  },
+  "engine": {
+    "waiters": 1,
+    "holds": 99000,
+    "wait_p99_ms": 4,
+    "longest_hold_ms": 310,
+    "current_hold_ms": 0,
+    "stalled": false
+  },
+  "store_health": {
+    "state": "healthy"
+  },
+  "pending_saves": 0,
+  "open_handles": 3,
+  "unflushed_files": 1,
+  "generations": {
+    "sync": 0,
+    "branches": 0,
+    "content": 0,
+    "mount": 0
+  },
+  "tip": null,
+  "inbox": null,
+  "activation": null,
+  "content": null,
+  "journal": null,
+  "peers": [],
+  "mount_errors": 0
+}

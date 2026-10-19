@@ -1,0 +1,100 @@
+{
+  "generation": 9,
+  "record": {
+    "state": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "label": "Photos",
+    "repo": "5b0c2f0e-7d4a-4c51-9a3e-0e6f1d2c3b4a",
+    "device": "3c9e7a10-1f2b-4c3d-8e9f-a0b1c2d3e4f5",
+    "directory": "C:\\tkfs\\data\\folders\\5b0c2f0e",
+    "mount": "C:\\mounts\\photos",
+    "desired_running": true,
+    "sync_enabled": true,
+    "mount_enabled": true
+  },
+  "phase": {
+    "kind": "running",
+    "since_ms": 1790000000000,
+    "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+    "pid": 1234,
+    "address": "ws://127.0.0.1:5555",
+    "adopted": false
+  },
+  "gate": {
+    "kind": "awaiting",
+    "source": "inst-bbbb-2222",
+    "since_ms": 1790000000000,
+    "waiting_on": [
+      "412 events remaining at source"
+    ]
+  },
+  "mount": {
+    "intent": "attach",
+    "path": "C:\\mounts\\photos",
+    "state": "attached",
+    "since_ms": 1790000000900
+  },
+  "worker": {
+    "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+    "pid": 1234,
+    "address": "ws://127.0.0.1:5555",
+    "version": "0.1.0+6298d0b"
+  },
+  "heartbeat": {
+    "instance": "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d",
+    "seq": 42,
+    "at_ms": 1790000042000,
+    "uptime_ms": 42000,
+    "mount": {
+      "intent": "attach",
+      "path": "C:\\mounts\\photos",
+      "state": "attached",
+      "since_ms": 1790000000900
+    },
+    "engine": {
+      "waiters": 1,
+      "holds": 99000,
+      "wait_p99_ms": 4,
+      "longest_hold_ms": 310,
+      "current_hold_ms": 0,
+      "stalled": false
+    },
+    "store_health": {
+      "state": "healthy"
+    },
+    "pending_saves": 0,
+    "open_handles": 3,
+    "unflushed_files": 1,
+    "generations": {
+      "sync": 0,
+      "branches": 0,
+      "content": 0,
+      "mount": 0
+    },
+    "tip": null,
+    "inbox": null,
+    "activation": null,
+    "content": null,
+    "journal": null,
+    "peers": [],
+    "mount_errors": 0
+  },
+  "last_error": null,
+  "restarts": 1,
+  "degraded": false,
+  "published_error": {
+    "error": {
+      "code": "PUBLISHED_SUMMARY_FAILED",
+      "class": "transient",
+      "message": "PUBLISHED_SUMMARY_FAILED: REQUEST_TIMEOUT"
+    },
+    "scope": {
+      "kind": "folder",
+      "state": "C:\\tkfs\\data\\folders\\5b0c2f0e"
+    },
+    "first_at_ms": 1790000000100,
+    "last_at_ms": 1790000000100,
+    "count": 1,
+    "next_retry_at_ms": null,
+    "resolved_at_ms": null
+  }
+}
