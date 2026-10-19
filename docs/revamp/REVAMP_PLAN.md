@@ -54,7 +54,7 @@ This document is the single source of truth for the implementing agents. It cove
 
 - **Metadata:** a cursor feed over `journal_sequence`, validated by `(epoch, seq, id)`, with payload elision via `peer_known`, need lists, and acknowledgements derived only from per-id evidence in the peer's committed feed.
 - **Objects:** receiver-driven object wants with per-object results and demand > current > history priority.
-- **Transport:** a single non-blocking I/O thread per connection, driven by `polling`. This is the only design that is full duplex and WSS-safe on Windows without `SO_RCVTIMEO` polling.
+- **Transport:** a single non-blocking I/O thread per connection, driven by `polling`. This is the selected full-duplex, Windows/WSS-safe design within the original dependency scope, without `SO_RCVTIMEO` polling. It is not the only possible safe architecture; proposed Wave 6 evaluates an async alternative.
 - **Upgrade header:** the `X-Tkfs-Sync` upgrade header for fail-closed detection, so the code is never sent to an old acceptor.
 - **Startup verification:** `Verify::Changed` verification markers.
 - **Status:** status aggregation as pure, table-tested functions.
@@ -1247,7 +1247,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
      - split reader and writer threads (tungstenite `read()` writes Pong and Close, `protocol/mod.rs:457-466`);
      - a WSS pump with 20 ms read timeouts;
      - a socket-shutdown watchdog only (no multiplexing);
-     - tokio (excluded);
+     - tokio (excluded from the original scope; proposed WP6.4 reopens evaluation with a measured prototype);
      - crossbeam (std mpsc with an enum mailbox suffices);
      - arc-swap or parking_lot (`Snapshot` is `RwLock<Arc<T>>`).
 3. **No `hmac` crate.** RFC 2104 HMAC-SHA256 is about 30 lines over `sha2` 0.10, checked against RFC 4231 vectors (`util::hmac`).
@@ -1297,7 +1297,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
 
 ## 12. Scope cuts
 
-- No tokio or async migration. No separate mount-adapter process: a native adapter crash still kills its worker, which is restarted with backoff.
+- No tokio or async migration in Waves 0–5. Proposed WP6.4 evaluates a bounded prototype and runtime ADR; it does not authorize a wholesale migration. No separate mount-adapter process: a native adapter crash still kills its worker, which is restarted with backoff.
 - No sparse or range spools, no striping of one object across lanes, no cross-file group fsync, no pack files.
 - No clock or version-vector incremental conflict derivation. Append mode plus off-lock prepare is the plan.
 - No chain hash for snapshots. (Superseded in part by WP4.4: snapshot format 2 seals incrementally, O(change) per seal, and keeps the journal hash's meaning; CCR-WP4.4-3.)
@@ -3018,6 +3018,46 @@ Also, reading a 512 MiB file through the WinFsp mount while it was still downloa
 
 The coordinator re-runs the two-machine lab afterwards.
 
+
+### 14.5c Proposed Wave 6: independent metadata and object engines
+
+**Investigation/proposal, not implemented or a release commitment.** See the
+[build-sync incident and JuiceFS study](notes/wp6-build-sync-juicefs-study.md)
+for evidence, source references, design limits and the acceptance matrix.
+The [TigerBeetle supplement](notes/wp6-tigerbeetle-metadata-study.md) adds
+local metadata ownership, bounded batching/pipelining, repair budgets and
+deterministic fault tests while retaining offline peer reconciliation.
+
+The 2026-10-19 mounted-build incident produced 19 transiently reported
+`NOT_PERMITTED` download errors for locally authored objects, followed by a
+148-second stall indication. The indication itself did not pause sync. A
+best-effort availability-index update is a concrete source hazard; the exact
+cause of the deployed incident and the subsequent wait remain unproven.
+
+The direction is two independently progressing engines: metadata owns causal
+validation, convergence and authorization; objects own availability, transfer,
+source selection and demand. Metadata has priority on peer and loopback lanes
+and a fair share of shared DB/disk/CPU resources. Their narrow admission
+interface is durable and replayable. Objects are admitted per committed
+reference, without a folder-wide caught-up barrier. Local byte durability
+still precedes announcing a local write; remote metadata activation must not
+wait for content. This explicitly proposes revisiting §6.4's staged-reference
+fetch policy, with content-independent activation tested before changing it.
+
+| Package | Proposed scope |
+|---|---|
+| WP6.0 | Capture stall-transition evidence; reproduce/falsify local-object wants and lost availability updates. |
+| WP6.1 | Durable metadata/object admission, reconciliation after lost notifications, consistent availability repair and authorization checks. |
+| WP6.2 | Joined cancellable reads, reserved/yielding demand capacity, source-scoped retries and bounded resources. |
+| WP6.3 | Separate engine progress, explicit wait states and aggregated error episodes; retain genuine denial/corruption diagnostics. |
+| WP6.4 | Shared resource budgets and a measured Tokio prototype/runtime ADR, preserving synchronous mount/store boundaries where appropriate. |
+| WP6.INT | Crash/fault/security tests and two-machine build/read qualification against Wave 5 floors. |
+
+Reconcile with WP5.1–5.4 before freezing ownership: activation, off-lock saves,
+read lifetime, lease recovery, next-slot demand and freshness already have
+Wave 5 work. JuiceFS informs bounded concurrency, single-flight reads,
+recovery, transaction retries and diagnostics; its shared authoritative
+metadata service is not a substitute for TKFS peer-replication semantics.
 
 ### 14.6 Qualification scenario catalog (created by WP0.5; owner un-ignores)
 

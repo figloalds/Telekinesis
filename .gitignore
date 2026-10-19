@@ -6,6 +6,7 @@
 !/test-evidence/qualification-*.json
 # ...and the two-machine lab results (WP4.INT, docs/VALIDATION.md).
 !/test-evidence/lab/
+!/test-evidence/build-sync-20261019/
 # Legacy report locations (current harnesses use the directories above).
 /VALIDATION.json
 /*-VALIDATION.json

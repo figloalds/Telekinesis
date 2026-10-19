@@ -15,3 +15,8 @@
 - `revamp/`: the production revamp's plan (`REVAMP_PLAN.md`), the root-cause
   analysis of the previous release (`ROOT_CAUSES.md`) and each work package's
   notes.
+- [Proposed Wave 6: metadata/object engines](revamp/notes/wp6-build-sync-juicefs-study.md):
+  mounted-build stall evidence, JuiceFS source study, per-reference admission,
+  demand scheduling, error handling and the concurrency/Tokio decision study.
+- [TigerBeetle metadata supplement](revamp/notes/wp6-tigerbeetle-metadata-study.md):
+  offline authority, bounded metadata pipelines, batching, repair and simulation.
