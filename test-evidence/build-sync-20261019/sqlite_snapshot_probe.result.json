@@ -1,0 +1,9 @@
+{
+  "sqlite_version": "3.51.1",
+  "error_code": 517,
+  "error_name": "SQLITE_BUSY_SNAPSHOT",
+  "local_bytes_present_but_model_wanted_object": true,
+  "index_repair_removed_model_want": true,
+  "tkfs_reproduction": false,
+  "incident_causality_proven": false
+}

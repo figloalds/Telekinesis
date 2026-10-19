@@ -1,0 +1,57 @@
+{
+  "kind": "incident_investigation_not_qualification",
+  "date": "2026-10-19",
+  "timezone": "America/Sao_Paulo",
+  "utc_offset": "-03:00",
+  "diagnostics_bundle": "20261019T045133.507Z",
+  "deployed_version": "0.1.0+b14d7bd79566",
+  "inspected_tkfs_revision": "c6948c9569751fbb96d35dec8266bd4d8c57b06f",
+  "inspected_juicefs_revision": "506808b0c521984e1780ff6ae8ca05cc0caddfaf",
+  "deployed_revision_available_locally": false,
+  "build_association": "user_report_no_build_trace_captured",
+  "download_errors": {
+    "code": "NOT_PERMITTED",
+    "count": 19,
+    "first_at": "2026-10-19T01:44:05.785-03:00",
+    "last_at": "2026-10-19T01:45:14.607-03:00",
+    "last_reported_resolution_at": "2026-10-19T01:45:24.996-03:00",
+    "all_hashes_joined_to_locally_authored_events": true,
+    "event_to_error_delay_ms": { "min": 127, "max": 870 },
+    "reported_resolution_proves_successful_download": false
+  },
+  "stall": {
+    "last_logged_upload_at": "2026-10-19T01:45:32.075-03:00",
+    "entered_at": "2026-10-19T01:46:32.946-03:00",
+    "cleared_at": "2026-10-19T01:49:00.764-03:00",
+    "indicator_duration_ms": 147818,
+    "last_upload_to_clearance_ms": 208689,
+    "intervening_exchange_or_error_activity": false,
+    "flag_itself_pauses_or_restarts_sync_in_inspected_source": false,
+    "specific_wait_cause_proven": false
+  },
+  "post_incident_snapshot": {
+    "current_objects": 9697,
+    "current_available": 9697,
+    "shared_objects": 9935,
+    "shared_available": 9935,
+    "current_missing": 0,
+    "pending_saves": 0,
+    "unflushed_sessions": 0,
+    "inbox_total": 0,
+    "outgoing_unacknowledged": 0,
+    "unresolved_conflicts": 0,
+    "journal_events": 21177,
+    "longest_engine_hold_ms_lifetime": 663,
+    "current_engine_hold_ms": 0,
+    "engine_waiters": 0,
+    "mount_errors": 0,
+    "peer_lanes_ready": 4
+  },
+  "availability_index_hypothesis": {
+    "source_hazard_identified": true,
+    "exact_tkfs_interleaving_reproduced": false,
+    "incident_causality_proven": false,
+    "next_step": "instrument note_available failures and want admission, then reproduce with a controlled concurrent SQLite writer"
+  },
+  "privacy": "Normalized summary excludes object hashes, peer addresses, repository identifiers and project paths. Raw diagnostics remain local."
+}
