@@ -1,0 +1,4 @@
+{
+  "code": "PAIRING_CODE_CHANGED",
+  "message": "PAIRING_CODE_CHANGED: the verifier was rotated"
+}

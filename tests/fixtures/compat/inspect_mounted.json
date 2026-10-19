@@ -1,0 +1,17 @@
+{
+  "desired_running": true,
+  "device": "<device:mounted>",
+  "directory": "<path>",
+  "error": null,
+  "initial_sync_pending": false,
+  "label": "Compat mounted",
+  "mount": "<path>",
+  "mounted": true,
+  "publication_error": null,
+  "repo": "<repo:mounted>",
+  "running": true,
+  "starting": false,
+  "startup_phase": null,
+  "state": "<state:mounted>",
+  "sync": []
+}

@@ -1,6 +1,11 @@
 //! Durable semantic journal and deterministic multi-value registers.
 //! Receipt order is never used to choose a version. Ordinary edits parent only
 //! their actual visible/base revision; only explicit review can parent competitors.
+//!
+//! The root keeps the data model, helpers, `Store`, its view cache, opening and
+//! recovery phases, branches/events/projection access, rebuilds and every local
+//! filesystem or branch operation. Per-concern `impl Store` blocks live in the
+//! submodules; `pub use` keeps every historical `tkfs::core::*` path.
 use crate::backend::ObjectBackend;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -10,14 +15,36 @@ use sha2::{Digest, Sha256};
 use std::{
     cell::{Ref, RefCell},
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+pub mod commit;
+pub mod demand;
+pub mod derive;
+pub mod inbox;
+pub mod objects;
+pub mod sharing;
 mod snapshot;
+pub mod status;
+pub mod transfer;
+pub mod verify;
+
+use derive::{activated_ids, persist_projection};
+use inbox::{validate_direct_links, validate_known_links};
+
+pub use derive::project;
+pub use objects::ScrubOutcome;
+pub(crate) use objects::install_object;
+pub use objects::{ObjectLocks, VerifyMode};
+/// The startup-snapshot seal cadence (CCR-WP2.4-3, applied by WP3.INT): read
+/// by the activator's seal forecast with the store's own rule.
+pub use snapshot::{MAX_SEAL_INTERVAL, MIN_SEAL_INTERVAL, SEALED_SQL, seal_interval};
+pub use transfer::{Bundle, ObjectPart, PartOutcome};
+pub use verify::DerivedDiff;
 
 pub const ROOT: &str = "root";
 pub const MAX_FILE: usize = 16 * 1024 * 1024;
@@ -268,6 +295,20 @@ pub fn name_key(name: &str) -> Result<String> {
         .collect())
 }
 
+/// How `Store::open_existing_with` runs the recovery phases of `Store::open`.
+/// `VerifyMode::default()` is `Changed` (WP1.8): objects whose recorded size
+/// and mtime still match are trusted without hashing, changed ones are
+/// hashed, and a one-time full verify runs after an upgrade; `Lazy` skips
+/// hashing; `Full` hashes everything. Activation is never deferred yet
+/// (`startup_drain` still activates staged events). CCR-WP1.8-1.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Leave staged incoming events to a background activator (classify only).
+    pub defer_activation: bool,
+    /// Startup verification of referenced, locally present objects.
+    pub verify: VerifyMode,
+}
+
 pub struct Store {
     pub db: Connection,
     pub root: PathBuf,
@@ -276,13 +317,36 @@ pub struct Store {
     pub active: String,
     pub generation: u64,
     view_cache: RefCell<Option<ViewCache>>,
+    /// Module-owned derived caches; see `StoreCaches`.
+    #[allow(dead_code)]
+    pub(crate) caches: StoreCaches,
 }
+/// One projection view. It is fresh only while all of these are unchanged:
+/// the branch, this connection's own `total_changes`, `PRAGMA data_version`
+/// (bumped only by commits of *other* connections, so secondary handles see
+/// engine commits) and whether a transaction is open.
 struct ViewCache {
     branch: String,
     changes: u64,
+    data_version: i64,
     transactional: bool,
+    /// `projection_version` when the view was loaded or last patched by this
+    /// connection's own commit (`None`: unknown, never adopted).
+    projection_version: Option<i64>,
     projection: Projection,
     slots: BTreeMap<(String, String), String>,
+}
+/// The only `Store` field the revamp adds. Each module owns its `Cache` type and
+/// chooses its own interior mutability; caches are derived and disposable.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct StoreCaches {
+    pub(crate) objects: objects::Cache,
+    pub(crate) inbox: inbox::Cache,
+    pub(crate) commit: commit::Cache,
+    pub(crate) derive: derive::Cache,
+    pub(crate) sharing: sharing::Cache,
+    pub(crate) status: status::Cache,
 }
 impl Store {
     /// Initialize an operation-owned new store with identities chosen by its caller.
@@ -314,6 +378,10 @@ impl Store {
     /// Validate before invoking the legacy schema/recovery path. Missing metadata
     /// or identities must never become a newly initialized healthy replica.
     pub fn open_existing(root: &Path) -> Result<Self> {
+        Self::open_existing_with(root, OpenOptions::default())
+    }
+    /// `open_existing` with explicit recovery options (see `OpenOptions`).
+    pub fn open_existing_with(root: &Path, options: OpenOptions) -> Result<Self> {
         ensure!(
             root.join("objects").is_dir() && root.join("metadata.sqlite").is_file(),
             "STATE_NOT_INITIALIZED"
@@ -331,10 +399,33 @@ impl Store {
         let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM branches WHERE id=(SELECT value FROM config WHERE key='active'))", [], |r| r.get(0))?;
         ensure!(valid, "INVALID_SELECTED_BRANCH");
         drop(db);
-        Self::open(root, None)
+        Self::open_with(root, None, options)
     }
 
     pub fn open(root: &Path, repo: Option<&str>) -> Result<Self> {
+        Self::open_with(root, repo, OpenOptions::default())
+    }
+    /// Recovery as named phases, in their historical order. Every phase runs
+    /// on the opening thread, so startup progress stays truthful (invariant 28),
+    /// and the RPC listener can only open after all of them (invariant 24).
+    fn open_with(root: &Path, repo: Option<&str>, options: OpenOptions) -> Result<Self> {
+        let db = Self::open_schema(root)?;
+        snapshot::initialize(&db)?;
+        let mut store = Self::open_identity(db, root, repo)?;
+        objects::ensure_schema(&mut store)?;
+        inbox::ensure_schema(&mut store)?;
+        sharing::ensure_schema(&mut store)?;
+        objects::startup_object_check(&mut store, options.verify)?;
+        crate::startup::progress("validating journal");
+        store.evacuate_unvalidated_journal()?;
+        crate::startup::progress("rebuilding frontiers");
+        store.rebuild_frontiers()?;
+        store.resume_or_rebuild()?;
+        inbox::startup_drain(&mut store, options.defer_activation)?;
+        Ok(store)
+    }
+    /// Phase 1: the legacy schema. Every statement is idempotent.
+    fn open_schema(root: &Path) -> Result<Connection> {
         fs::create_dir_all(root.join("objects"))?;
         let db = Connection::open(root.join("metadata.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -359,7 +450,11 @@ impl Store {
             CREATE TABLE IF NOT EXISTS object_references(hash TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS object_errors(hash TEXT PRIMARY KEY,error TEXT NOT NULL,at INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS peer_requests(peer TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(peer,hash));")?;
-        snapshot::initialize(&db)?;
+        Ok(db)
+    }
+    /// Phase 2 (after `snapshot::initialize`): legacy branch-table migration,
+    /// store identity and the in-memory handle.
+    fn open_identity(db: Connection, root: &Path, repo: Option<&str>) -> Result<Self> {
         let schema: String = db.query_row(
             "SELECT sql FROM sqlite_master WHERE name='branches'",
             [],
@@ -393,7 +488,7 @@ impl Store {
         ] {
             db.execute("INSERT OR IGNORE INTO config VALUES(?,?)", [k, v])?;
         }
-        let mut store = Self {
+        Ok(Self {
             db,
             root: root.to_owned(),
             repo: repo_id,
@@ -401,350 +496,47 @@ impl Store {
             active,
             generation,
             view_cache: RefCell::new(None),
-        };
-        // Missing content is a supported state. Verify existing bytes once during
-        // recovery, quarantine corrupt content, and keep the semantic journal.
-        let legacy = store
-            .db
-            .query_row(
-                "SELECT value FROM config WHERE key='availability_v1'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?
-            .is_none();
-        let events = store.events()?;
-        let shared: BTreeSet<_> = events
-            .iter()
-            .filter(|e| e.branch.shared)
-            .flat_map(Event::objects)
-            .collect();
-        let objects: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
-        for event in &events {
-            for object in event.objects() {
-                store.db.execute(
-                    "INSERT OR IGNORE INTO object_references VALUES(?)",
-                    [object],
-                )?;
-            }
-            for (object, size) in &event.object_sizes {
-                store.remember_object_size(object, *size)?;
-            }
-        }
-        for object in objects {
-            crate::startup::progress("verifying available objects");
-            let path = store.root.join("objects").join(&object);
-            if path.is_file() {
-                if let Err(error) = store.verify_object(&object) {
-                    fs::rename(&path, path.with_extension(format!("corrupt-{}", id())))?;
-                    store.db.execute("INSERT INTO object_errors VALUES(?,?,?) ON CONFLICT(hash) DO UPDATE SET error=excluded.error,at=excluded.at", params![object, format!("{error:#}"), time()])?;
-                } else {
-                    store.remember_object_size(&object, fs::metadata(&path)?.len())?;
-                    if legacy && shared.contains(&object) {
-                        store.db.execute(
-                            "INSERT OR IGNORE INTO published_objects VALUES(?)",
-                            [&object],
-                        )?;
-                    }
-                }
-            }
-        }
-        store.db.execute(
-            "INSERT OR IGNORE INTO config VALUES('availability_v1','1')",
-            [],
-        )?;
-        crate::startup::progress("validating journal");
-        store.evacuate_unvalidated_journal()?;
-        crate::startup::progress("rebuilding frontiers");
-        store.rebuild_frontiers()?;
-        for branch in store.branches()? {
-            if !store.resume_snapshot(&branch)? {
+            caches: StoreCaches::default(),
+        })
+    }
+    /// Phase 7: resume each branch from its startup snapshot, else rebuild it.
+    fn resume_or_rebuild(&mut self) -> Result<()> {
+        for branch in self.branches()? {
+            if !self.resume_snapshot(&branch)? {
                 crate::startup::progress("reconstructing snapshot");
-                store.rebuild(&branch.id)?;
+                self.rebuild(&branch.id)?;
             }
         }
-        crate::startup::progress("recovering incoming events");
-        store.drain_incoming()?;
-        Ok(store)
-    }
-    pub fn read_object(&self, object: &str) -> Result<Vec<u8>> {
-        ensure!(
-            self.object_size(object)? <= MAX_FILE as u64,
-            "OBJECT_REQUIRES_STREAMING"
-        );
-        let mut file = self.open_object(object)?;
-        ensure!(
-            file.metadata()?.len() <= MAX_FILE as u64,
-            "OBJECT_REQUIRES_STREAMING"
-        );
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
-    }
-    pub fn object_size(&self, object: &str) -> Result<u64> {
-        valid_object(object)?;
-        if let Some(size) = self
-            .db
-            .query_row(
-                "SELECT size FROM object_sizes WHERE hash=?",
-                [object],
-                |r| r.get(0),
-            )
-            .optional()?
-        {
-            return Ok(size);
-        }
-        Ok(fs::metadata(self.root.join("objects").join(object))
-            .map_err(object_error)?
-            .len())
-    }
-    pub fn remember_object_size(&self, object: &str, size: u64) -> Result<()> {
-        valid_object(object)?;
-        ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
-        let old: Option<u64> = self
-            .db
-            .query_row(
-                "SELECT size FROM object_sizes WHERE hash=?",
-                [object],
-                |r| r.get(0),
-            )
-            .optional()?;
-        ensure!(old.is_none_or(|old| old == size), "OBJECT_SIZE_CHANGED");
-        self.db.execute(
-            "INSERT OR IGNORE INTO object_sizes VALUES(?,?)",
-            params![object, size],
-        )?;
         Ok(())
-    }
-    pub fn object_available(&self, object: &str) -> bool {
-        valid_object(object).is_ok()
-            && fs::metadata(self.root.join("objects").join(object)).is_ok_and(|m| {
-                m.is_file() && self.object_size(object).is_ok_and(|size| size == m.len())
-            })
-    }
-    pub fn request_object(&self, object: &str) -> Result<()> {
-        valid_object(object)?;
-        ensure!(
-            self.events()?.iter().any(|e| e.objects().contains(object)),
-            "UNREFERENCED_OBJECT"
-        );
-        self.db.execute("INSERT INTO object_requests VALUES(?,?) ON CONFLICT(hash) DO UPDATE SET requested_ms=excluded.requested_ms", params![object, time()])?;
-        Ok(())
-    }
-    pub fn wanted_objects(&self) -> Result<BTreeSet<String>> {
-        let requests = self
-            .db
-            .prepare("SELECT hash FROM object_requests ORDER BY requested_ms LIMIT 1024")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(requests
-            .into_iter()
-            .filter(|h| !self.object_available(h))
-            .collect())
-    }
-    pub fn object_state(&self, object: &str) -> Result<Value> {
-        let available = self.object_available(object);
-        let size = self.object_size(object)?;
-        let partial = fs::metadata(self.root.join("incoming-objects").join(object))
-            .ok()
-            .map(|m| m.len());
-        let requested: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM object_requests WHERE hash=?)",
-            [object],
-            |r| r.get(0),
-        )?;
-        let error: Option<String> = self
-            .db
-            .query_row(
-                "SELECT error FROM object_errors WHERE hash=?",
-                [object],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let state = if available {
-            "available"
-        } else if error.is_some() {
-            "retrying"
-        } else if partial == Some(size) {
-            "verifying"
-        } else if partial.is_some() {
-            "downloading"
-        } else if requested {
-            "queued"
-        } else {
-            "missing"
-        };
-        Ok(
-            json!({"object":object,"size":size,"state":state,"downloaded":partial.unwrap_or(0),"error":if available { None } else { error }}),
-        )
     }
     /// Separate connection for bulk I/O. No replay, projection rebuild or engine
     /// mutex; accepted metadata remains owned by the worker's semantic engine.
     pub fn transfer_view(&self) -> Result<Self> {
-        let db = Connection::open(self.root.join("metadata.sqlite"))?;
+        Self::open_transfer(&self.root, &self.repo, &self.device)
+    }
+    pub(crate) fn open_transfer(root: &Path, repo: &str, device: &str) -> Result<Self> {
+        let db = Connection::open(root.join("metadata.sqlite"))?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch("PRAGMA synchronous=FULL;")?;
+        let active = db.query_row("SELECT value FROM config WHERE key='active'", [], |row| {
+            row.get(0)
+        })?;
         Ok(Self {
             db,
-            root: self.root.clone(),
-            repo: self.repo.clone(),
-            device: self.device.clone(),
-            active: self.active.clone(),
-            generation: self.generation,
+            root: root.to_owned(),
+            repo: repo.to_owned(),
+            device: device.to_owned(),
+            active,
+            generation: 0,
             view_cache: RefCell::new(None),
+            caches: StoreCaches::default(),
         })
     }
-    pub fn peer_requests(&self, peer: &str) -> Result<BTreeSet<String>> {
-        Ok(self
-            .db
-            .prepare("SELECT hash FROM peer_requests WHERE peer=?")?
-            .query_map([peer], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?)
-    }
-    pub fn remember_requests(&self, peer: &str, wanted: &BTreeSet<String>) -> Result<()> {
-        let references: BTreeSet<_> = self
-            .events()?
-            .iter()
-            .filter(|e| e.branch.shared)
-            .flat_map(Event::objects)
-            .collect();
-        self.db
-            .execute("DELETE FROM peer_requests WHERE peer=?", [peer])?;
-        for object in wanted.intersection(&references) {
-            self.db.execute(
-                "INSERT OR IGNORE INTO peer_requests VALUES(?,?)",
-                params![peer, object],
-            )?;
-            if !self.object_available(object) {
-                self.request_object(object)?;
-            }
-        }
-        Ok(())
-    }
-    pub fn content_status(&self) -> Result<Value> {
-        let objects: BTreeSet<_> = self
-            .events()?
-            .iter()
-            .filter(|e| e.branch.shared)
-            .flat_map(Event::objects)
-            .collect();
-        let available = self.shared_object_inventory()?;
-        let partial = self.partial_objects()?;
-        let projection = self.projection(&self.active)?;
-        let current: BTreeSet<_> = projection
-            .entries
-            .values()
-            .filter(|e| e.alive)
-            .filter_map(|e| e.content.clone())
-            .collect();
-        let missing = projection
-            .entries
-            .values()
-            .filter(|e| e.alive)
-            .filter_map(|e| e.content.as_ref().map(|object| (e, object)))
-            .filter(|(_, h)| !self.object_available(h))
-            .take(20)
-            .map(|(entry, object)| {
-                let mut state = self.object_state(object)?;
-                let mut path = vec![entry.name.clone()];
-                let mut parent = &entry.parent;
-                let mut seen = BTreeSet::new();
-                while parent != ROOT && seen.insert(parent.clone()) {
-                    let Some(e) = projection.entries.get(parent) else {
-                        break;
-                    };
-                    path.push(e.name.clone());
-                    parent = &e.parent;
-                }
-                path.reverse();
-                state["path"] = json!(path.join("/"));
-                Ok(state)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let present = current.iter().filter(|h| self.object_available(h)).count();
-        Ok(
-            json!({"items":missing,"current_objects":current.len(),"current_available":present,
-            "current_missing":current.len()-present,"shared_objects":objects.len(),
-            "shared_available":objects.intersection(&available).count(),"downloading":partial.len(),
-            "partial_bytes":partial.values().sum::<u64>(),"complete":objects.is_subset(&available),
-            "requested":self.wanted_objects()?.len()}),
-        )
-    }
-    pub fn open_object(&self, object: &str) -> Result<fs::File> {
-        valid_object(object)?;
-        let mut file =
-            fs::File::open(self.root.join("objects").join(object)).map_err(object_error)?;
-        ensure!(file.metadata()?.len() <= MAX_CONTENT, "FILE_TOO_LARGE");
-        ensure!(
-            stream_hash(&mut file)? == object,
-            "CORRUPT_OBJECT: {object}"
-        );
-        file.rewind()?;
-        Ok(file)
-    }
-    pub fn verify_object(&self, object: &str) -> Result<()> {
-        self.open_object(object).map(|_| ())
-    }
-    pub fn put_stream(&self, source: &mut impl Read) -> Result<String> {
-        let temp = self.root.join("objects").join(format!("{}.part", id()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            let mut digest = Sha256::new();
-            let mut buffer = [0; 64 * 1024];
-            let mut size = 0u64;
-            loop {
-                let count = source.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                size += count as u64;
-                ensure!(size <= MAX_CONTENT, "FILE_TOO_LARGE");
-                digest.update(&buffer[..count]);
-                file.write_all(&buffer[..count])?;
-            }
-            file.sync_all()?;
-            drop(file);
-            fault("object_flushed");
-            let object = hex::encode(digest.finalize());
-            let dest = self.root.join("objects").join(&object);
-            if dest.exists() {
-                self.verify_object(&object)?;
-                fs::remove_file(&temp)?;
-            } else {
-                install_object(&temp, &dest)?;
-            }
-            fault("object_installed");
-            Ok(object)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp);
-        }
-        result
-    }
-    pub fn put_object(&self, bytes: &[u8]) -> Result<String> {
-        ensure!(bytes.len() <= MAX_FILE, "FILE_TOO_LARGE");
-        let object = hash(bytes);
-        let dest = self.root.join("objects").join(&object);
-        if dest.exists() {
-            self.verify_object(&object)?;
-            return Ok(object);
-        }
-        let temp = self.root.join("objects").join(format!("{}.part", id()));
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
-        fault("object_flushed");
-        // MoveFileExW WRITE_THROUGH below supplies the Windows rename barrier.
-        install_object(&temp, &dest)?;
-        fault("object_installed");
-        Ok(object)
+    /// Public secondary handle: an alias of the bulk transfer view. It runs no
+    /// schema work, recovery or replay; its view cache follows other
+    /// connections' commits through `PRAGMA data_version`.
+    pub fn open_secondary(root: &Path, repo: &str, device: &str) -> Result<Store> {
+        Self::open_transfer(root, repo, device)
     }
     pub fn branches(&self) -> Result<Vec<Branch>> {
         Ok(self
@@ -788,14 +580,68 @@ impl Store {
     pub fn projection(&self, branch: &str) -> Result<Projection> {
         Ok(self.view(branch)?.projection.clone())
     }
+    /// Changes only when another connection commits; a connection's own
+    /// commits leave it unchanged (those are covered by `total_changes`).
+    fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .db
+            .prepare_cached("PRAGMA data_version")?
+            .query_row([], |r| r.get(0))?)
+    }
+    /// Keeps the cached view across other connections' commits that changed
+    /// no projection row (WP3.INT): when `PRAGMA data_version` moved but the
+    /// projection tables' counter (`snapshot::projection_version`) is the
+    /// one the view was built at, the view is re-keyed to the current
+    /// `data_version` instead of being reloaded in full (O(entries)) at its
+    /// next use. Read after `data_version`, so a projection change that
+    /// lands in between only costs a reload. Own writes are still keyed by
+    /// `total_changes` and the transaction state, as before.
+    pub(super) fn adopt_foreign_commits(&self) {
+        let Ok(data_version) = self.data_version() else {
+            return;
+        };
+        let stale = self.view_cache.try_borrow().is_ok_and(|cache| {
+            cache
+                .as_ref()
+                .is_some_and(|v| v.data_version != data_version && v.projection_version.is_some())
+        });
+        if !stale {
+            return;
+        }
+        let current = snapshot::projection_version(&self.db);
+        if current.is_none() {
+            return;
+        }
+        if let Ok(mut cache) = self.view_cache.try_borrow_mut()
+            && let Some(view) = cache.as_mut()
+            && view.data_version != data_version
+            && view.projection_version == current
+        {
+            view.data_version = data_version;
+        }
+    }
     fn view(&self, branch: &str) -> Result<Ref<'_, ViewCache>> {
+        // CCR-WP2.4-6 (WP2.INT): a caller's rollback (`ROLLBACK`, `ROLLBACK
+        // TO`) can undo a commit of this connection without moving the
+        // freshness key below; drop such a view before any reader sees it.
+        self.drop_rolled_back_view();
+        self.adopt_foreign_commits();
         let changes = self.db.total_changes();
+        let data_version = self.data_version()?;
         let transactional = !self.db.is_autocommit();
         let fresh = self.view_cache.borrow().as_ref().is_some_and(|v| {
-            v.branch == branch && v.changes == changes && v.transactional == transactional
+            v.branch == branch
+                && v.changes == changes
+                && v.data_version == data_version
+                && v.transactional == transactional
         });
         if !fresh {
+            // Read before the projection: a projection change that lands in
+            // between makes the recorded counter older (a later reload),
+            // never newer than what was loaded.
+            let projection_version = snapshot::projection_version(&self.db);
             let projection = snapshot::load_projection(&self.db, branch)?;
+            self.count_view_load();
             let slots = projection
                 .entries
                 .values()
@@ -805,7 +651,9 @@ impl Store {
             *self.view_cache.borrow_mut() = Some(ViewCache {
                 branch: branch.into(),
                 changes,
+                data_version,
                 transactional,
+                projection_version,
                 projection,
                 slots,
             });
@@ -918,619 +766,6 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
-    }
-    pub fn commit(&mut self, event: Event, local: bool) -> Result<()> {
-        if local {
-            return self.commit_ready(event, true);
-        }
-        // Trusted core callers supply the actual local bytes explicitly. The
-        // network path uses receive directly and never promotes global CAS hashes.
-        let objects = event
-            .objects()
-            .into_iter()
-            .map(|h| Ok((h.clone(), hex::encode(self.read_object(&h)?))))
-            .collect::<Result<_>>()?;
-        let revision = event.id.clone();
-        let device = event.device.clone();
-        self.receive(
-            Bundle {
-                repo: self.repo.clone(),
-                branches: vec![],
-                events: vec![event],
-                objects,
-            },
-            &BTreeSet::from([device]),
-        )?;
-        let error: Option<String> = self
-            .db
-            .query_row(
-                "SELECT error FROM incoming_events WHERE id=?",
-                [&revision],
-                |r| r.get(0),
-            )
-            .optional()?
-            .flatten();
-        if let Some(error) = error {
-            bail!("{error}");
-        }
-        Ok(())
-    }
-    fn commit_ready(&mut self, event: Event, local: bool) -> Result<()> {
-        ensure!(event.repo == self.repo, "REPOSITORY_MISMATCH");
-        ensure!(
-            event.id.len() <= 128 && !event.id.is_empty() && event.device.len() <= 128,
-            "INVALID_EVENT"
-        );
-        ensure!(
-            !event.changes.is_empty() && event.changes.len() <= 10000,
-            "INVALID_EVENT"
-        );
-        ensure!(local || event.branch.shared, "PRIVATE_EVENT_REJECTED");
-        let payload = serde_json::to_string(&event)?;
-        ensure!(payload.len() <= MAX_EVENT, "EVENT_METADATA_TOO_LARGE");
-        name_key(&event.branch.name)?;
-        ensure!(
-            !event.branch.id.is_empty() && event.branch.id.len() <= 128,
-            "INVALID_BRANCH_ID"
-        );
-        let existing: Option<String> = self
-            .db
-            .query_row("SELECT payload FROM events WHERE id=?", [&event.id], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if let Some(old) = existing {
-            ensure!(old == payload, "EVENT_ID_REUSED");
-            return Ok(());
-        }
-        let objects = event.objects();
-        ensure!(
-            event.object_sizes.keys().all(|h| objects.contains(h)),
-            "UNREFERENCED_OBJECT_SIZE"
-        );
-        for object in &objects {
-            valid_object(object)?;
-            if let Some(size) = event.object_sizes.get(object) {
-                ensure!(*size <= MAX_CONTENT, "FILE_TOO_LARGE");
-                if let Ok(old) = self.object_size(object) {
-                    ensure!(old == *size, "OBJECT_SIZE_CHANGED");
-                }
-            }
-            // Newly authored bytes must exist; metadata decisions may refer to
-            // previously accepted, currently unavailable revisions.
-            if local
-                && !self.db.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM object_references WHERE hash=?)",
-                    [object],
-                    |r| r.get::<_, bool>(0),
-                )?
-            {
-                self.verify_object(object)?;
-            }
-        }
-        let mut seen = BTreeSet::new();
-        for change in &event.changes {
-            ensure!(
-                seen.insert(register(&change.entity, &change.field)),
-                "DUPLICATE_REGISTER"
-            );
-            ensure!(
-                change.entity != ROOT && !change.entity.is_empty() && change.entity.len() <= 128,
-                "INVALID_ENTITY"
-            );
-            ensure!(
-                ["kind", "location", "content", "alive", "basic"].contains(&change.field.as_str()),
-                "INVALID_FIELD"
-            );
-            ensure!(!change.parents.contains(&event.id), "CAUSAL_CYCLE");
-            match change.field.as_str() {
-                "location" => {
-                    name_key(change.value["name"].as_str().context("INVALID_LOCATION")?)?;
-                    ensure!(
-                        change.value["parent"].as_str().is_some(),
-                        "INVALID_LOCATION"
-                    );
-                }
-                "kind" => ensure!(
-                    [json!("file"), json!("directory")].contains(&change.value),
-                    "INVALID_KIND"
-                ),
-                "alive" => ensure!(change.value.is_boolean(), "INVALID_ALIVE"),
-                "content" => ensure!(change.value.is_string(), "INVALID_CONTENT"),
-                "basic" => serde_json::from_value::<BasicInfo>(change.value.clone())?.validate()?,
-                _ => {}
-            }
-        }
-        if let Ok(b) = self.branch(&event.branch.id) {
-            ensure!(b == event.branch, "BRANCH_DESCRIPTOR_CHANGED");
-        }
-        let mut fast = self.content_successor(&event)?;
-        if fast.is_none() && local {
-            fast = self.creation_successor(&event)?;
-            if fast.is_none() {
-                fast = self.namespace_successor(&event)?;
-            }
-        }
-        let incremental = fast.is_some();
-        let events = if fast.is_none() {
-            let mut events: Vec<_> = self
-                .events()?
-                .into_iter()
-                .filter(|e| e.branch.id == event.branch.id)
-                .collect();
-            events.push(event.clone());
-            events
-        } else {
-            vec![]
-        };
-        let projection = if let Some(p) = fast.take() {
-            p
-        } else {
-            project(&event.branch.id, &events)?
-        };
-        if !projection.pending.is_empty() {
-            return Err(CausalPrerequisitesPending.into());
-        }
-        fault("before_sql");
-        let tx = self.db.savepoint()?;
-        for object in &objects {
-            tx.execute(
-                "INSERT OR IGNORE INTO object_references VALUES(?)",
-                [object],
-            )?;
-        }
-        for (object, size) in &event.object_sizes {
-            tx.execute(
-                "INSERT OR IGNORE INTO object_sizes VALUES(?,?)",
-                params![object, size],
-            )?;
-        }
-        // Explicit content authorship/publication grants sharing. A resolution
-        // of an inbound hash alone must not expose private-only local bytes.
-        if local && event.branch.shared && event.reviewed.is_empty() {
-            for object in &objects {
-                if self.root.join("objects").join(object).is_file() {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO published_objects VALUES(?)",
-                        [object],
-                    )?;
-                }
-            }
-        }
-        tx.execute(
-            "INSERT OR IGNORE INTO branches VALUES(?,?,?)",
-            params![event.branch.id, event.branch.name, event.branch.shared],
-        )?;
-        tx.execute(
-            "INSERT INTO events VALUES(?,?,?)",
-            params![event.id, event.branch.id, payload],
-        )?;
-        if event.branch.shared {
-            tx.execute("INSERT INTO outbox(event) VALUES(?)", [&event.id])?;
-        }
-        if incremental {
-            for entity in event
-                .changes
-                .iter()
-                .map(|c| &c.entity)
-                .collect::<BTreeSet<_>>()
-            {
-                let heads: BTreeMap<_, _> = ["kind", "location", "alive", "content", "basic"]
-                    .into_iter()
-                    .filter_map(|field| {
-                        let key = register(entity, field);
-                        projection.heads.get(&key).map(|v| (key, v))
-                    })
-                    .collect();
-                tx.execute("INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads",
-                    params![event.branch.id,entity,serde_json::to_string(&projection.entries[entity])?,serde_json::to_string(&heads)?])?;
-            }
-        } else {
-            persist_projection(&tx, &event.branch.id, &projection, &events, Some(&event.id))?;
-        }
-        for parent in event
-            .dependencies
-            .iter()
-            .chain(event.changes.iter().flat_map(|c| c.parents.iter()))
-        {
-            tx.execute(
-                "DELETE FROM event_frontier WHERE branch=? AND event=?",
-                params![event.branch.id, parent],
-            )?;
-        }
-        tx.execute(
-            "INSERT INTO event_frontier VALUES(?,?)",
-            params![event.branch.id, event.id],
-        )?;
-        snapshot::maybe_persist(&tx, &event.branch.id, !incremental)?;
-        tx.commit()?;
-        let mut cache = self.view_cache.borrow_mut();
-        if incremental && cache.as_ref().is_some_and(|v| v.branch == event.branch.id) {
-            let view = cache.as_mut().unwrap();
-            let entities: BTreeSet<_> = event.changes.iter().map(|c| &c.entity).collect();
-            // A replacement moves one entry into another's old slot. Remove
-            // all old slots first, independent of entity ID ordering.
-            for entity in &entities {
-                if let Some(old) = view.projection.entries.get(*entity).filter(|e| e.alive) {
-                    view.slots
-                        .remove(&(old.parent.clone(), name_key(&old.name)?));
-                }
-            }
-            for entity in entities {
-                let entry = &projection.entries[entity];
-                if entry.alive {
-                    view.slots.insert(
-                        (entry.parent.clone(), name_key(&entry.name)?),
-                        entity.clone(),
-                    );
-                }
-            }
-            view.projection.entries.extend(projection.entries);
-            view.projection.heads.extend(projection.heads);
-            view.changes = self.db.total_changes();
-            view.transactional = !self.db.is_autocommit();
-        } else {
-            *cache = None;
-        }
-        fault("sql_committed");
-        Ok(())
-    }
-    fn content_successor(&self, event: &Event) -> Result<Option<Projection>> {
-        if !event.reviewed.is_empty()
-            || !event
-                .changes
-                .iter()
-                .any(|c| ["content", "basic"].contains(&c.field.as_str()))
-            || event.changes.iter().any(|c| {
-                !["content", "alive", "basic"].contains(&c.field.as_str())
-                    || (c.field == "alive" && c.value != true)
-            })
-        {
-            return Ok(None);
-        }
-        let Ok(view) = self.view(&event.branch.id) else {
-            return Ok(None);
-        };
-        let current = &view.projection;
-        if !current.pending.is_empty() {
-            return Ok(None);
-        }
-        for change in &event.changes {
-            let Some(entry) = current.entries.get(&change.entity) else {
-                return Ok(None);
-            };
-            let Some(heads) = current.heads.get(&register(&change.entity, &change.field)) else {
-                if change.field == "basic" && change.parents.is_empty() && entry.alive {
-                    continue;
-                }
-                return Ok(None);
-            };
-            if (entry.kind != "file" && change.field != "basic")
-                || !entry.alive
-                || heads.len() != 1
-                || change.parents != vec![heads[0].revision.clone()]
-            {
-                return Ok(None);
-            }
-        }
-        // Frontier dependencies are checked against accepted journal rows only.
-        // A missing or cross-branch prerequisite falls back to full validation.
-        for dependency in &event.dependencies {
-            let branch: Option<String> = self
-                .db
-                .query_row("SELECT branch FROM events WHERE id=?", [dependency], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            if branch.as_deref() != Some(&event.branch.id) {
-                return Ok(None);
-            }
-        }
-        let mut p = Projection::default();
-        for entity in event
-            .changes
-            .iter()
-            .map(|c| &c.entity)
-            .collect::<BTreeSet<_>>()
-        {
-            p.entries
-                .insert(entity.clone(), current.entries[entity].clone());
-            for field in ["kind", "location", "alive", "content", "basic"] {
-                let key = register(entity, field);
-                if let Some(heads) = current.heads.get(&key) {
-                    p.heads.insert(key, heads.clone());
-                }
-            }
-        }
-        for change in &event.changes {
-            p.heads.insert(
-                register(&change.entity, &change.field),
-                vec![Version {
-                    revision: event.id.clone(),
-                    device: event.device.clone(),
-                    created_ms: event.created_ms,
-                    parents: change.parents.clone(),
-                    value: change.value.clone(),
-                }],
-            );
-            let entry = p.entries.get_mut(&change.entity).unwrap();
-            entry
-                .revisions
-                .insert(change.field.clone(), event.id.clone());
-            if change.field == "content" {
-                entry.content = change.value.as_str().map(str::to_owned);
-            } else if change.field == "basic" {
-                entry.basic = Some(serde_json::from_value(change.value.clone())?);
-            }
-        }
-        for entity in event
-            .changes
-            .iter()
-            .map(|c| &c.entity)
-            .collect::<BTreeSet<_>>()
-        {
-            let modified = ["kind", "location", "alive", "content"]
-                .iter()
-                .filter_map(|field| {
-                    p.heads
-                        .get(&register(entity, field))
-                        .and_then(|heads| heads.last())
-                })
-                .map(|v| v.created_ms)
-                .max()
-                .unwrap_or(0);
-            p.entries.get_mut(entity).unwrap().modified_ms = modified;
-        }
-        // Each changed register has one head and this event parents it. All old
-        // versions are ancestors, so no new historical pair/namespace conflict
-        // is possible. Existing durable records remain untouched.
-        Ok(Some(p))
-    }
-    /// A local fresh entry ordered after the entire accepted frontier cannot
-    /// introduce a concurrent namespace cut. All other placements use replay.
-    fn creation_successor(&self, event: &Event) -> Result<Option<Projection>> {
-        if event.device != self.device || !event.reviewed.is_empty() || event.changes.is_empty() {
-            return Ok(None);
-        }
-        let entity = &event.changes[0].entity;
-        if event
-            .changes
-            .iter()
-            .any(|c| &c.entity != entity || !c.parents.is_empty())
-        {
-            return Ok(None);
-        }
-        let fields: BTreeMap<_, _> = event
-            .changes
-            .iter()
-            .map(|c| (c.field.as_str(), &c.value))
-            .collect();
-        if !fields.contains_key("kind")
-            || !fields.contains_key("location")
-            || fields.get("alive") != Some(&&json!(true))
-        {
-            return Ok(None);
-        }
-        let kind = fields["kind"].as_str().context("INVALID_KIND")?;
-        if (kind == "file" && !fields.contains_key("content"))
-            || (kind == "directory" && fields.contains_key("content"))
-        {
-            return Ok(None);
-        }
-        let frontier = self
-            .db
-            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
-            .query_map([&event.branch.id], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if event.dependencies != frontier {
-            return Ok(None);
-        }
-        let Ok(view) = self.view(&event.branch.id) else {
-            return Ok(None);
-        };
-        let current = &view.projection;
-        if current.entries.contains_key(entity)
-            || !current.pending.is_empty()
-            || !current.conflicts.is_empty()
-            || !self.conflicts()?.is_empty()
-        {
-            return Ok(None);
-        }
-        let parent = fields["location"]["parent"]
-            .as_str()
-            .context("INVALID_LOCATION")?;
-        let name = fields["location"]["name"]
-            .as_str()
-            .context("INVALID_LOCATION")?;
-        if parent != ROOT
-            && !current
-                .entries
-                .get(parent)
-                .is_some_and(|e| e.alive && e.kind == "directory")
-        {
-            return Ok(None);
-        }
-        let key = name_key(name)?;
-        if view.slots.contains_key(&(parent.into(), key)) {
-            return Ok(None);
-        }
-        let mut p = Projection::default();
-        let mut entry = Entry {
-            id: entity.clone(),
-            kind: kind.into(),
-            parent: parent.into(),
-            name: name.into(),
-            alive: true,
-            created_ms: event.created_ms,
-            modified_ms: event.created_ms,
-            ..Default::default()
-        };
-        for change in &event.changes {
-            entry
-                .revisions
-                .insert(change.field.clone(), event.id.clone());
-            if change.field == "content" {
-                entry.content = change.value.as_str().map(str::to_owned);
-            }
-            if change.field == "basic" {
-                entry.basic = Some(serde_json::from_value(change.value.clone())?);
-            }
-            p.heads.insert(
-                register(entity, &change.field),
-                vec![Version {
-                    revision: event.id.clone(),
-                    device: event.device.clone(),
-                    created_ms: event.created_ms,
-                    parents: vec![],
-                    value: change.value.clone(),
-                }],
-            );
-        }
-        p.entries.insert(entity.clone(), entry);
-        Ok(Some(p))
-    }
-    /// A placement/deletion after the complete frontier adds only the new cut.
-    /// If it preserves a valid namespace, no historical conflict can be added.
-    /// Directory moves preserve descendant entity IDs; empty directory deletes
-    /// are equally safe. Replaying every historical cut here can hold the mounted
-    /// filesystem's engine and WinFsp namespace locks for minutes on IDE cleanup.
-    fn namespace_successor(&self, event: &Event) -> Result<Option<Projection>> {
-        if event.device != self.device
-            || !event.reviewed.is_empty()
-            || !(1..=2).contains(&event.changes.len())
-        {
-            return Ok(None);
-        }
-        let replacement = if event.changes.len() == 2 {
-            let location = event.changes.iter().find(|c| c.field == "location");
-            let removed = event
-                .changes
-                .iter()
-                .find(|c| c.field == "alive" && c.value == false);
-            match (location, removed) {
-                (Some(a), Some(b)) if a.entity != b.entity => Some((&a.entity, &b.entity)),
-                _ => return Ok(None),
-            }
-        } else {
-            None
-        };
-        if event.changes.iter().any(|change| {
-            change.field != "location" && !(change.field == "alive" && change.value == false)
-        }) {
-            return Ok(None);
-        }
-        let frontier = self
-            .db
-            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
-            .query_map([&event.branch.id], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        if event.dependencies != frontier {
-            return Ok(None);
-        }
-        let Ok(view) = self.view(&event.branch.id) else {
-            return Ok(None);
-        };
-        let current = &view.projection;
-        if !current.pending.is_empty()
-            || !current.conflicts.is_empty()
-            || !self.conflicts()?.is_empty()
-        {
-            return Ok(None);
-        }
-        let mut delta = Projection::default();
-        for change in &event.changes {
-            let Some(entry) = current.entries.get(&change.entity).filter(|e| e.alive) else {
-                return Ok(None);
-            };
-            let key = register(&change.entity, &change.field);
-            let Some(heads) = current.heads.get(&key) else {
-                return Ok(None);
-            };
-            if heads.len() != 1 || change.parents != vec![heads[0].revision.clone()] {
-                return Ok(None);
-            }
-            let mut entry = entry.clone();
-            if change.field == "location" {
-                let parent = change.value["parent"]
-                    .as_str()
-                    .context("INVALID_LOCATION")?;
-                let name = change.value["name"].as_str().context("INVALID_LOCATION")?;
-                if parent != ROOT
-                    && !current
-                        .entries
-                        .get(parent)
-                        .is_some_and(|e| e.alive && e.kind == "directory")
-                {
-                    return Ok(None);
-                }
-                let occupying = view.slots.get(&(parent.into(), name_key(name)?));
-                if let Some((source, removed)) = replacement {
-                    if source != &entry.id
-                        || occupying != Some(removed)
-                        || entry.kind != "file"
-                        || current.entries[removed].kind != "file"
-                    {
-                        return Ok(None);
-                    }
-                } else if occupying.is_some_and(|e| e != &entry.id) {
-                    return Ok(None);
-                }
-                // Validate here as well as in rename(): snapshot replay and
-                // direct commits also use this path. Cycles need the reducer.
-                if entry.kind == "directory" {
-                    let mut ancestor = parent;
-                    let mut seen = BTreeSet::new();
-                    while ancestor != ROOT {
-                        if ancestor == entry.id || !seen.insert(ancestor) {
-                            return Ok(None);
-                        }
-                        let Some(dir) = current
-                            .entries
-                            .get(ancestor)
-                            .filter(|e| e.alive && e.kind == "directory")
-                        else {
-                            return Ok(None);
-                        };
-                        ancestor = &dir.parent;
-                    }
-                }
-                entry.parent = parent.into();
-                entry.name = name.into();
-            } else {
-                // Deleting a parent with live children can suppress their
-                // namespace and create conflicts, even on a sequential event.
-                if current
-                    .entries
-                    .values()
-                    .any(|e| e.alive && e.parent == entry.id)
-                {
-                    return Ok(None);
-                }
-                entry.alive = false;
-            }
-            entry
-                .revisions
-                .insert(change.field.clone(), event.id.clone());
-            entry.modified_ms = entry.modified_ms.max(event.created_ms);
-            for field in ["kind", "location", "alive", "content", "basic"] {
-                let key = register(&entry.id, field);
-                if let Some(heads) = current.heads.get(&key) {
-                    delta.heads.insert(key, heads.clone());
-                }
-            }
-            delta.heads.insert(
-                key,
-                vec![Version {
-                    revision: event.id.clone(),
-                    device: event.device.clone(),
-                    created_ms: event.created_ms,
-                    parents: change.parents.clone(),
-                    value: change.value.clone(),
-                }],
-            );
-            delta.entries.insert(entry.id.clone(), entry);
-        }
-        Ok(Some(delta))
     }
     pub fn children(&self, parent: &str) -> Result<Vec<Entry>> {
         let view = self.view(&self.active)?;
@@ -1749,6 +984,26 @@ impl Store {
         preserve_times: u8,
     ) -> Result<String> {
         let object = self.put_stream(source)?;
+        self.write_object_with_parents(
+            entity,
+            content_base,
+            alive_base.into_iter().collect(),
+            object,
+            preserve_times,
+        )
+    }
+    /// [`Store::write_with_base_and_times`] of bytes already stored
+    /// ([`Store::put_object`], [`Store::put_stream`]): the commit alone, so a
+    /// caller can store the bytes before it takes SQLite's writer slot
+    /// (WP4.INT re-review: a retained save held it for the whole copy).
+    pub fn write_object_with_base_and_times(
+        &mut self,
+        entity: &str,
+        content_base: Option<String>,
+        alive_base: Option<String>,
+        object: String,
+        preserve_times: u8,
+    ) -> Result<String> {
         self.write_object_with_parents(
             entity,
             content_base,
@@ -1978,13 +1233,6 @@ impl Store {
         self.commit(event, true)?;
         Ok(revision)
     }
-    pub fn known_by_peer(&self, peer: &str) -> Result<BTreeSet<String>> {
-        Ok(self
-            .db
-            .prepare("SELECT event FROM peer_known WHERE peer=?")?
-            .query_map([peer], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?)
-    }
     /// Move an explicitly reviewed displaced namespace entry to a free path.
     /// Only reviewed location revisions are parented; unseen competitors remain.
     pub fn recover(&mut self, entity: &str, target: &str, reviewed: &[String]) -> Result<String> {
@@ -2149,28 +1397,6 @@ impl Store {
         }
         Ok(branch)
     }
-    pub fn shared_event_inventory(&self) -> Result<BTreeSet<String>> {
-        Ok(self
-            .db
-            .prepare("SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1")?
-            .query_map([], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?)
-    }
-    /// The configured authenticated peer advertises accepted, durable events,
-    /// not staged manifests or object possession. Record this current receipt
-    /// snapshot and reconcile the two-device outbox in the same transaction.
-    /// A withdrawn event is queued again (for example after a peer restore).
-    pub fn remember_peer_inventory(&mut self, peer: &str, known: &BTreeSet<String>) -> Result<()> {
-        let tx = self.db.savepoint()?;
-        tx.execute("DELETE FROM peer_known WHERE peer=?", [peer])?;
-        for event in known {
-            tx.execute("INSERT INTO peer_known VALUES(?,?)", params![peer, event])?;
-        }
-        tx.execute("UPDATE outbox SET acknowledged=EXISTS(SELECT 1 FROM peer_known p WHERE p.peer=? AND p.event=outbox.event)
-            WHERE event IN (SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1)", [peer])?;
-        tx.commit()?;
-        Ok(())
-    }
     pub fn checkpoint(&mut self, message: &str) -> Result<String> {
         let snapshot = self.projection(&self.active)?;
         ensure!(snapshot.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
@@ -2184,322 +1410,6 @@ impl Store {
             params![checkpoint, self.active, object, message],
         )?;
         Ok(checkpoint)
-    }
-    pub fn shared_bundle(&self, known: &BTreeSet<String>) -> Result<Bundle> {
-        let events: Vec<_> = self
-            .events()?
-            .into_iter()
-            .filter(|e| e.branch.shared && !known.contains(&e.id))
-            .collect();
-        // Authorization starts with shared semantic events, never the object dir.
-        let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
-        let available = self.shared_object_inventory()?;
-        let objects = hashes
-            .into_iter()
-            .filter(|h| available.contains(h))
-            .map(|h| Ok((h.clone(), hex::encode(self.read_object(&h)?))))
-            .collect::<Result<_>>()?;
-        Ok(Bundle {
-            repo: self.repo.clone(),
-            branches: self.branches()?.into_iter().filter(|b| b.shared).collect(),
-            events,
-            objects,
-        })
-    }
-    pub fn receive(
-        &mut self,
-        bundle: Bundle,
-        allowed_devices: &BTreeSet<String>,
-    ) -> Result<Vec<String>> {
-        ensure!(bundle.repo == self.repo, "REPOSITORY_MISMATCH");
-        for b in &bundle.branches {
-            ensure!(b.shared, "PRIVATE_BRANCH_REJECTED");
-        }
-        for e in &bundle.events {
-            ensure!(
-                e.branch.shared && allowed_devices.contains(&e.device),
-                "UNAUTHORIZED_EVENT"
-            );
-        }
-        let authorized: BTreeSet<_> = bundle.events.iter().flat_map(Event::objects).collect();
-        for (h, data) in bundle.objects {
-            ensure!(authorized.contains(&h), "UNAUTHORIZED_OBJECT");
-            let bytes = hex::decode(data)?;
-            ensure!(hash(&bytes) == h, "CORRUPT_OBJECT");
-            self.put_object(&bytes)?;
-            // Only actual verified inbound bytes grant reuse authorization. A
-            // manifest/hash alone cannot relabel private-only local CAS content.
-            self.db.execute(
-                "INSERT OR IGNORE INTO received_shared_objects VALUES(?)",
-                [h],
-            )?;
-        }
-        for e in bundle.events {
-            let payload = serde_json::to_string(&e)?;
-            let old: Option<String> = self
-                .db
-                .query_row(
-                    "SELECT payload FROM incoming_events WHERE id=?",
-                    [&e.id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(old) = old {
-                ensure!(old == payload, "EVENT_ID_REUSED");
-            } else {
-                self.db.execute(
-                    "INSERT INTO incoming_events(id,payload) VALUES(?,?)",
-                    params![e.id, payload],
-                )?;
-            }
-        }
-        let accepted = self.drain_incoming()?;
-        for b in bundle.branches {
-            if let Ok(existing) = self.branch(&b.id) {
-                ensure!(existing == b, "BRANCH_DESCRIPTOR_CHANGED");
-            } else {
-                let pending = self
-                    .db
-                    .prepare("SELECT payload FROM incoming_events")?
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                if pending.iter().any(|payload| {
-                    serde_json::from_str::<Event>(payload).is_ok_and(|e| e.branch.id == b.id)
-                }) {
-                    continue;
-                }
-                self.db
-                    .execute("INSERT INTO branches VALUES(?,?,1)", params![b.id, b.name])?;
-                self.rebuild(&b.id)?;
-            }
-        }
-        Ok(accepted)
-    }
-    fn drain_incoming(&mut self) -> Result<Vec<String>> {
-        if !self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM incoming_events WHERE error IS NULL)",
-            [],
-            |r| r.get::<_, bool>(0),
-        )? {
-            return Ok(vec![]);
-        }
-        // One received frame is acknowledged only after activation completes.
-        // Batch its validated mutations/receipts behind one SQLite durability
-        // barrier; nested per-event savepoints still isolate semantic failures.
-        // All referenced objects were installed durably before entering here.
-        let name = format!("incoming_{}", id().replace('-', ""));
-        self.db.execute_batch(&format!("SAVEPOINT {name}"))?;
-        let result = self.drain_incoming_inner();
-        match result {
-            Ok(accepted) => {
-                if let Err(error) = self.db.execute_batch(&format!("RELEASE {name}")) {
-                    let _ = self
-                        .db
-                        .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"));
-                    return Err(error.into());
-                }
-                Ok(accepted)
-            }
-            Err(error) => {
-                self.db
-                    .execute_batch(&format!("ROLLBACK TO {name}; RELEASE {name}"))?;
-                Err(error)
-            }
-        }
-    }
-    fn drain_incoming_inner(&mut self) -> Result<Vec<String>> {
-        let mut accepted = vec![];
-        loop {
-            let staged: Vec<(String, Option<String>)> = self
-                .db
-                .prepare("SELECT payload,error FROM incoming_events ORDER BY id")?
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            let staged: Vec<(Event, Option<String>)> = staged
-                .into_iter()
-                .map(|(payload, error)| Ok((serde_json::from_str(&payload)?, error)))
-                .collect::<Result<_>>()?;
-            let mut known: BTreeMap<_, _> = self
-                .events()?
-                .into_iter()
-                .map(|e| (e.id.clone(), e))
-                .collect();
-            let mut committed: BTreeSet<_> = known.keys().cloned().collect();
-            for (e, _) in &staged {
-                known.entry(e.id.clone()).or_insert_with(|| e.clone());
-            }
-            let quarantined: BTreeSet<_> = staged
-                .iter()
-                .filter(|(e, error)| error.is_some() && !committed.contains(&e.id))
-                .map(|(e, _)| e.id.clone())
-                .collect();
-            let mut progress = false;
-            for (e, error) in &staged {
-                crate::startup::progress("recovering incoming events");
-                if error.is_some() {
-                    continue;
-                }
-                let links = validate_incoming_links(e, &known, &quarantined, &committed);
-                let result = match links {
-                    Err(error) => Err(error),
-                    Ok(())
-                        if !e
-                            .dependencies
-                            .iter()
-                            .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
-                            .all(|p| committed.contains(p)) =>
-                    {
-                        continue;
-                    }
-                    Ok(()) => self.commit_ready(e.clone(), false),
-                };
-                match result {
-                    Ok(()) => {
-                        self.db
-                            .execute("DELETE FROM incoming_events WHERE id=?", [&e.id])?;
-                        accepted.push(e.id.clone());
-                        committed.insert(e.id.clone());
-                        progress = true;
-                    }
-                    Err(error) if error.downcast_ref::<CausalPrerequisitesPending>().is_some() => {}
-                    Err(error) => {
-                        self.db.execute(
-                            "UPDATE incoming_events SET error=? WHERE id=?",
-                            params![format!("{error:#}"), e.id],
-                        )?;
-                        progress = true;
-                    }
-                }
-            }
-            if !progress {
-                break;
-            }
-        }
-        Ok(accepted)
-    }
-    pub fn shared_object_inventory(&self) -> Result<BTreeSet<String>> {
-        let candidates = self
-            .db
-            .prepare(
-                "SELECT hash FROM published_objects UNION SELECT hash FROM received_shared_objects",
-            )?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(candidates
-            .into_iter()
-            .filter(|h| self.object_available(h))
-            .collect())
-    }
-    pub fn known_objects_by_peer(&self, peer: &str) -> Result<BTreeSet<String>> {
-        Ok(self
-            .db
-            .prepare("SELECT hash FROM peer_objects WHERE peer=?")?
-            .query_map([peer], |r| r.get(0))?
-            .collect::<std::result::Result<_, _>>()?)
-    }
-    pub fn remember_peer_objects(&mut self, peer: &str, objects: &BTreeSet<String>) -> Result<()> {
-        let tx = self.db.savepoint()?;
-        tx.execute("DELETE FROM peer_objects WHERE peer=?", [peer])?;
-        for h in objects {
-            tx.execute("INSERT INTO peer_objects VALUES(?,?)", params![peer, h])?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-    /// Manifests and objects can cross separately. A large atomic root remains
-    /// visible after causal validation; content availability is tracked separately.
-    pub fn shared_page(
-        &self,
-        known: &BTreeSet<String>,
-        known_objects: &BTreeSet<String>,
-        budget: usize,
-    ) -> Result<Bundle> {
-        self.shared_page_content(known, known_objects, budget, true)
-    }
-    /// Event manifests without reading CAS content. Reserved network lanes must
-    /// never build bulk payloads only to discard them afterwards.
-    pub fn shared_metadata_page(&self, known: &BTreeSet<String>, budget: usize) -> Result<Bundle> {
-        self.shared_page_content(known, &BTreeSet::new(), budget, false)
-    }
-    fn shared_page_content(
-        &self,
-        known: &BTreeSet<String>,
-        known_objects: &BTreeSet<String>,
-        budget: usize,
-        include_objects: bool,
-    ) -> Result<Bundle> {
-        let branches: Vec<_> = self.branches()?.into_iter().filter(|b| b.shared).collect();
-        let mut used = serde_json::to_vec(&branches)?.len() + 1024;
-        let mut events = vec![];
-        for e in self
-            .events()?
-            .into_iter()
-            .filter(|e| e.branch.shared && !known.contains(&e.id))
-        {
-            let size = serde_json::to_vec(&e)?.len() + 1;
-            ensure!(size < budget / 3, "EVENT_METADATA_TOO_LARGE");
-            if used + size > budget / 3 {
-                break;
-            }
-            used += size;
-            events.push(e);
-        }
-        let available = self.shared_object_inventory()?;
-        let hashes: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
-        let mut objects = BTreeMap::new();
-        for h in hashes
-            .into_iter()
-            .filter(|h| include_objects && available.contains(h) && !known_objects.contains(h))
-        {
-            let length = self.object_size(&h)?;
-            if length > MAX_FILE as u64 || used + length as usize * 2 + h.len() + 8 > budget {
-                continue;
-            }
-            let bytes = self.read_object(&h)?;
-            let size = bytes.len() * 2 + h.len() + 8;
-            if used + size > budget {
-                continue;
-            }
-            used += size;
-            objects.insert(h, hex::encode(bytes));
-        }
-        let bundle = Bundle {
-            repo: self.repo.clone(),
-            branches,
-            events,
-            objects,
-        };
-        ensure!(
-            serde_json::to_vec(&bundle)?.len() <= budget,
-            "BUNDLE_TOO_LARGE"
-        );
-        Ok(bundle)
-    }
-    pub fn acknowledge(&self, events: &[String]) -> Result<()> {
-        for rev in events {
-            self.db.execute(
-                "UPDATE outbox SET acknowledged=1 WHERE event=? AND event IN
-                    (SELECT e.id FROM events e JOIN branches b ON b.id=e.branch WHERE b.shared=1)",
-                [rev],
-            )?;
-        }
-        Ok(())
-    }
-    pub fn outgoing_unacknowledged(&self) -> Result<i64> {
-        Ok(self.db.query_row(
-            "SELECT count(*) FROM outbox WHERE acknowledged=0",
-            [],
-            |r| r.get(0),
-        )?)
-    }
-    pub fn status(&self) -> Result<Value> {
-        let p = self.projection(&self.active)?;
-        let outgoing = self.outgoing_unacknowledged()?;
-        Ok(
-            json!({"repo":self.repo,"device":self.device,"branch":self.branch(&self.active)?,"generation":self.generation,
-            "content":self.content_status()?,"local_durability":"metadata:sqlite-full; content:per-object","outgoing_unacknowledged":outgoing,"incoming_pending":self.db.query_row("SELECT count(*) FROM incoming_events",[],|r|r.get::<_,i64>(0))?,"incoming_quarantined":self.db.query_row("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL",[],|r|r.get::<_,i64>(0))?,"peer_protocol":PEER_FORMAT,
-            "caught_up":"unknown-until-peer-roundtrip","pending_causal_events":p.pending,"unresolved_conflicts":self.conflicts()?.iter().filter(|c|c.resolved_by.is_none()).count()}),
-        )
     }
     pub fn receipt(&self, request: &str, payload: &Value) -> Result<Option<Value>> {
         let old: Option<(String, String)> = self
@@ -2519,1255 +1429,6 @@ impl Store {
         } else {
             Ok(None)
         }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Bundle {
-    pub repo: String,
-    pub branches: Vec<Branch>,
-    pub events: Vec<Event>,
-    pub objects: BTreeMap<String, String>,
-}
-/// A sequential, bounded transfer segment. Whole-object hash verification is
-/// required before it enters the available shared-object inventory.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ObjectPart {
-    pub offset: u64,
-    pub total: u64,
-    pub hex: String,
-}
-impl Store {
-    pub fn partial_objects(&self) -> Result<BTreeMap<String, u64>> {
-        let mut partial = BTreeMap::new();
-        let folder = self.root.join("incoming-objects");
-        if folder.is_dir() {
-            for entry in fs::read_dir(folder)? {
-                let entry = entry?;
-                let object = entry.file_name().to_string_lossy().into_owned();
-                if valid_object(&object).is_ok() && entry.file_type()?.is_file() {
-                    partial.insert(object, entry.metadata()?.len());
-                }
-            }
-        }
-        Ok(partial)
-    }
-    pub fn peer_partial_objects(&self, peer: &str) -> Result<BTreeMap<String, u64>> {
-        let payload: Option<String> = self
-            .db
-            .query_row(
-                "SELECT value FROM config WHERE key=?",
-                [format!("peer-partials:{peer}")],
-                |r| r.get(0),
-            )
-            .optional()?;
-        payload
-            .map(|p| serde_json::from_str(&p).map_err(Into::into))
-            .transpose()
-            .map(|p| p.unwrap_or_default())
-    }
-    pub fn remember_peer_partials(
-        &self,
-        peer: &str,
-        offsets: &BTreeMap<String, u64>,
-    ) -> Result<()> {
-        ensure!(offsets.len() <= 10000, "PARTIAL_INVENTORY_TOO_LARGE");
-        for (object, offset) in offsets {
-            valid_object(object)?;
-            ensure!(*offset <= MAX_CONTENT, "FILE_TOO_LARGE");
-        }
-        self.db.execute(
-            "INSERT INTO config VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![
-                format!("peer-partials:{peer}"),
-                serde_json::to_string(offsets)?
-            ],
-        )?;
-        Ok(())
-    }
-    pub fn shared_parts(
-        &self,
-        page: &Bundle,
-        known: &BTreeSet<String>,
-        offsets: &BTreeMap<String, u64>,
-        budget: usize,
-    ) -> Result<BTreeMap<String, ObjectPart>> {
-        self.transfer_parts(
-            page,
-            known,
-            offsets,
-            budget,
-            &self.shared_object_inventory()?,
-            &BTreeSet::new(),
-        )
-    }
-    pub fn transfer_parts(
-        &self,
-        page: &Bundle,
-        known: &BTreeSet<String>,
-        offsets: &BTreeMap<String, u64>,
-        budget: usize,
-        permitted: &BTreeSet<String>,
-        wanted: &BTreeSet<String>,
-    ) -> Result<BTreeMap<String, ObjectPart>> {
-        let mut parts = BTreeMap::new();
-        let mut used = serde_json::to_vec(page)?.len() + 1024;
-        let mut candidates: Vec<_> = self
-            .shared_object_inventory()?
-            .intersection(permitted)
-            .cloned()
-            .collect();
-        candidates.sort_by_key(|h| (!wanted.contains(h), h.clone()));
-        for object in candidates {
-            if known.contains(&object) || page.objects.contains_key(&object) {
-                continue;
-            }
-            let total = self.object_size(&object)?;
-            let advertised = offsets.get(&object).copied().unwrap_or(0);
-            ensure!(advertised <= total, "INVALID_OBJECT_OFFSET");
-            // A crash may leave a complete spool before verification/install.
-            // Replay its final byte to trigger finalization without restarting.
-            let offset = advertised.min(total.saturating_sub(1));
-            let count = ((budget.saturating_sub(used + 256)) / 2)
-                .min(4 * IO_CHUNK)
-                .min((total - offset) as usize);
-            if count == 0 && total != 0 {
-                break;
-            }
-            // Immutable CAS was verified at installation/open; the receiver
-            // independently verifies its entire assembled object before ACK.
-            let mut file =
-                fs::File::open(self.root.join("objects").join(&object)).map_err(object_error)?;
-            file.seek(SeekFrom::Start(offset))?;
-            let mut bytes = vec![0; count];
-            file.read_exact(&mut bytes)?;
-            used += count * 2 + 256;
-            parts.insert(
-                object,
-                ObjectPart {
-                    offset,
-                    total,
-                    hex: hex::encode(bytes),
-                },
-            );
-        }
-        Ok(parts)
-    }
-    pub fn receive_parts(
-        &mut self,
-        parts: BTreeMap<String, ObjectPart>,
-        events: &[Event],
-        allowed: &BTreeSet<String>,
-    ) -> Result<()> {
-        let completed = self.receive_parts_data(parts, events, allowed)?;
-        self.register_received(&completed)
-    }
-    pub fn register_received(&self, completed: &[(String, u64)]) -> Result<()> {
-        for (object, size) in completed {
-            self.remember_object_size(object, *size)?;
-            self.db.execute(
-                "INSERT OR IGNORE INTO received_shared_objects VALUES(?)",
-                [object],
-            )?;
-            self.db
-                .execute("DELETE FROM object_requests WHERE hash=?", [object])?;
-            self.db
-                .execute("DELETE FROM object_errors WHERE hash=?", [object])?;
-        }
-        Ok(())
-    }
-    /// File I/O only: the caller registers completed objects on its serialized
-    /// metadata connection. This avoids SQLite snapshot-upgrade races.
-    pub fn receive_parts_data(
-        &self,
-        parts: BTreeMap<String, ObjectPart>,
-        events: &[Event],
-        allowed: &BTreeSet<String>,
-    ) -> Result<Vec<(String, u64)>> {
-        let mut completed = vec![];
-        ensure!(
-            events
-                .iter()
-                .all(|e| e.repo == self.repo && e.branch.shared && allowed.contains(&e.device)),
-            "UNAUTHORIZED_EVENT"
-        );
-        let authorized: BTreeSet<_> = self
-            .events()?
-            .iter()
-            .filter(|e| e.branch.shared)
-            .chain(events.iter())
-            .flat_map(Event::objects)
-            .collect();
-        for (object, part) in parts {
-            valid_object(&object)?;
-            ensure!(authorized.contains(&object), "UNAUTHORIZED_OBJECT");
-            if self.shared_object_inventory()?.contains(&object) {
-                self.verify_object(&object)?;
-                continue;
-            }
-            ensure!(
-                part.total <= MAX_CONTENT && part.hex.len() <= 8 * IO_CHUNK,
-                "INVALID_OBJECT_PART"
-            );
-            if let Ok(size) = self.object_size(&object) {
-                ensure!(size == part.total, "OBJECT_SIZE_CHANGED");
-            }
-            let bytes = hex::decode(&part.hex)?;
-            ensure!(
-                (!bytes.is_empty() || part.total == 0 && part.offset == 0)
-                    && part
-                        .offset
-                        .checked_add(bytes.len() as u64)
-                        .is_some_and(|end| end <= part.total),
-                "INVALID_OBJECT_PART"
-            );
-            let folder = self.root.join("incoming-objects");
-            fs::create_dir_all(&folder)?;
-            let path = folder.join(&object);
-            let mut file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
-            let mut length = file.metadata()?.len();
-            if length > part.total {
-                file.set_len(0)?;
-                file.sync_all()?;
-                length = 0;
-            }
-            // A peer may retain a pre-crash resume cursor. Return the current
-            // inventory without accepting a gap; the next bulk page rewinds.
-            if part.offset > length {
-                continue;
-            }
-            if part.offset < length {
-                ensure!(
-                    part.offset + bytes.len() as u64 <= length,
-                    "OBJECT_PART_OVERLAP"
-                );
-                file.seek(SeekFrom::Start(part.offset))?;
-                let mut old = vec![0; bytes.len()];
-                file.read_exact(&mut old)?;
-                if old != bytes {
-                    file.set_len(0)?;
-                    file.sync_all()?;
-                    bail!("OBJECT_PART_CHANGED");
-                }
-            } else {
-                file.seek(SeekFrom::Start(length))?;
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-            }
-            if file.metadata()?.len() == part.total {
-                file.sync_all()?;
-                file.rewind()?;
-                if stream_hash(&mut file)? != object {
-                    drop(file);
-                    fs::remove_file(path)?;
-                    bail!("CORRUPT_OBJECT");
-                }
-                drop(file);
-                let dest = self.root.join("objects").join(&object);
-                if dest.exists() {
-                    self.verify_object(&object)?;
-                    fs::remove_file(&path)?;
-                } else {
-                    install_object(&path, &dest)?;
-                    #[cfg(unix)]
-                    fs::File::open(&folder)?.sync_all()?;
-                }
-                completed.push((object, part.total));
-            }
-        }
-        Ok(completed)
-    }
-}
-
-fn persist_projection(
-    tx: &Connection,
-    branch: &str,
-    p: &Projection,
-    events: &[Event],
-    new_event: Option<&str>,
-) -> Result<()> {
-    tx.execute("DELETE FROM current_parts WHERE branch=?", [branch])?;
-    tx.execute("INSERT INTO current_state VALUES(?,?) ON CONFLICT(branch) DO UPDATE SET payload=excluded.payload",params![branch,serde_json::to_string(p)?])?;
-    // Derive historical concurrent pairs from the full activated DAG too, so a
-    // fast-forward delivered before a competitor cannot hide the earlier pair.
-    let mut history: BTreeMap<String, Vec<Version>> = BTreeMap::new();
-    for e in events.iter().filter(|e| !p.pending.contains(&e.id)) {
-        for c in &e.changes {
-            history
-                .entry(register(&c.entity, &c.field))
-                .or_default()
-                .push(Version {
-                    revision: e.id.clone(),
-                    device: e.device.clone(),
-                    created_ms: e.created_ms,
-                    parents: c.parents.clone(),
-                    value: c.value.clone(),
-                });
-        }
-    }
-    let mut conflicts = p.conflicts.clone();
-    if let Some(event) = events.iter().find(|e| Some(e.id.as_str()) == new_event) {
-        for reviewed in &event.reviewed {
-            let payload: Option<String> = tx
-                .query_row(
-                    "SELECT payload FROM conflicts WHERE id=? AND branch=?",
-                    params![reviewed, branch],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(payload) = payload {
-                conflicts.push(serde_json::from_str(&payload)?);
-            }
-        }
-    }
-    // Namespace collisions also have a deterministic historical basis. A later
-    // rename arriving first must not erase evidence of concurrent same-name
-    // placement. Sequential temp replacement is ordered by event context.
-    let activated: Vec<_> = events
-        .iter()
-        .filter(|e| !p.pending.contains(&e.id))
-        .collect();
-    let mut locations = vec![];
-    for e in &activated {
-        for c in &e.changes {
-            if c.field == "location" {
-                locations.push((*e, c));
-            }
-        }
-    }
-    for (i, (a, ac)) in locations.iter().enumerate() {
-        crate::startup::progress("rebuilding namespace conflicts");
-        for (b, bc) in &locations[i + 1..] {
-            if ac.entity == bc.entity
-                || ac.value["parent"] != bc.value["parent"]
-                || name_key(ac.value["name"].as_str().unwrap())?
-                    != name_key(bc.value["name"].as_str().unwrap())?
-            {
-                continue;
-            }
-            if event_ancestors(a, events).contains(&b.id)
-                || event_ancestors(b, events).contains(&a.id)
-            {
-                continue;
-            }
-            let mut entities = [ac.entity.clone(), bc.entity.clone()];
-            entities.sort();
-            let alternatives = [(*a, *ac), (*b, *bc)]
-                .into_iter()
-                .map(|(e, c)| Version {
-                    revision: e.id.clone(),
-                    device: e.device.clone(),
-                    created_ms: e.created_ms,
-                    parents: c.parents.clone(),
-                    value: c.value.clone(),
-                })
-                .collect();
-            conflicts.push(make_conflict(
-                branch,
-                &entities.join(","),
-                "namespace",
-                "same name / file-directory collision",
-                alternatives,
-                vec![],
-            ));
-        }
-    }
-    // Explicit reviews carry their observed cut. Recover namespace records from
-    // it even when resolution was delivered before its prerequisites.
-    for e in &activated {
-        if !e.reviewed.is_empty() {
-            let ancestors = event_ancestors(e, events);
-            let cut: Vec<_> = events
-                .iter()
-                .filter(|prior| ancestors.contains(&prior.id))
-                .cloned()
-                .collect();
-            conflicts.extend(project(branch, &cut)?.conflicts);
-        }
-    }
-    // Every namespace causal cut is represented by an antichain of maximal
-    // namespace-changing events. Include arbitrary-width concurrency, not just
-    // pairs; content-only events add no new namespace projection. The explicit
-    // budget refuses a commit before acknowledgement rather than losing history.
-    conflicts.extend(namespace_history(branch, events)?);
-    for (key, versions) in &history {
-        crate::startup::progress("rebuilding register conflicts");
-        let candidate = new_event.and_then(|id| versions.iter().position(|v| v.revision == id));
-        if new_event.is_some() && candidate.is_none() {
-            continue;
-        }
-        // The overwhelmingly common single-parent chain has no historical
-        // concurrency. Detect it in O(revisions), without enumerating pairs.
-        if linear_versions(versions) {
-            continue;
-        }
-        let reach = VersionReach::new(versions);
-        let (entity, field) = key.rsplit_once('/').unwrap();
-        // Appending a validated event cannot change old/old register ancestry.
-        // Keep their durable records and derive only new/old pairs on append.
-        // Startup/repair still derives the entire historical set from the DAG.
-        let pairs: Box<dyn Iterator<Item = (usize, usize)>> = if let Some(i) = candidate {
-            Box::new(
-                (0..versions.len())
-                    .filter(move |&j| j != i)
-                    .map(move |j| (i, j)),
-            )
-        } else {
-            Box::new(
-                (0..versions.len()).flat_map(|i| ((i + 1)..versions.len()).map(move |j| (i, j))),
-            )
-        };
-        for (i, j) in pairs {
-            crate::startup::progress("rebuilding register conflicts");
-            let a = &versions[i];
-            let b = &versions[j];
-            if a.value != b.value && !reach.has(i, j) && !reach.has(j, i) {
-                let mut bases: Vec<_> = versions
-                    .iter()
-                    .enumerate()
-                    .filter(|(k, _)| reach.has(i, *k) && reach.has(j, *k))
-                    .map(|(_, v)| v)
-                    .cloned()
-                    .collect();
-                bases.sort_by(|a, b| a.revision.cmp(&b.revision));
-                conflicts.push(make_conflict(
-                    branch,
-                    entity,
-                    field,
-                    "concurrent revisions",
-                    vec![a.clone(), b.clone()],
-                    bases,
-                ));
-            }
-        }
-    }
-    let conflicts: Vec<_> = conflicts
-        .into_iter()
-        .map(|c| (c.id.clone(), c))
-        .collect::<BTreeMap<_, _>>()
-        .into_values()
-        .collect();
-    let namespace_ids: BTreeSet<_> = conflicts
-        .iter()
-        .filter(|c| c.field == "namespace")
-        .map(|c| c.id.clone())
-        .collect();
-    let old: Vec<(String, String)> = tx
-        .prepare("SELECT id,payload FROM conflicts WHERE branch=? AND json_extract(payload,'$.field')='namespace'")?
-        .query_map([branch], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<std::result::Result<_, _>>()?;
-    for (id, payload) in old {
-        let c: Conflict = serde_json::from_str(&payload)?;
-        if c.field == "namespace" && !namespace_ids.contains(&id) {
-            tx.execute("DELETE FROM conflicts WHERE id=?", [id])?;
-        }
-    }
-    {
-        let mut insert=tx.prepare_cached("INSERT INTO conflicts(id,branch,payload) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE conflicts.payload<>excluded.payload")?;
-        for c in &conflicts {
-            insert.execute(params![c.id, branch, serde_json::to_string(c)?])?;
-        }
-    }
-    for e in events {
-        if !p.pending.contains(&e.id) && new_event.is_none_or(|id| id == e.id) {
-            for reviewed in &e.reviewed {
-                let c = conflicts
-                    .iter()
-                    .find(|c| &c.id == reviewed)
-                    .context("INVALID_CONFLICT_REVIEW")?;
-                let valid_review = if c.field == "namespace" {
-                    e.changes.iter().any(|change| {
-                        change.field == "location"
-                            && c.entity.split(',').any(|entity| entity == change.entity)
-                            && c.alternatives
-                                .iter()
-                                .any(|v| change.parents.contains(&v.revision))
-                            && c.alternatives
-                                .iter()
-                                .filter(|v| {
-                                    events
-                                        .iter()
-                                        .find(|prior| prior.id == v.revision)
-                                        .is_some_and(|prior| {
-                                            prior.changes.iter().any(|ch| {
-                                                ch.entity == change.entity
-                                                    && ch.field == "location"
-                                                    && ch.value == v.value
-                                            })
-                                        })
-                                })
-                                .all(|v| change.parents.contains(&v.revision))
-                    })
-                } else {
-                    e.changes.iter().any(|change| {
-                        change.entity == c.entity
-                            && change.field == c.field
-                            && c.alternatives
-                                .iter()
-                                .all(|v| change.parents.contains(&v.revision))
-                    })
-                };
-                ensure!(valid_review, "INVALID_CONFLICT_REVIEW");
-                // Concurrent review events converge on a stable receipt as well.
-                tx.execute("UPDATE conflicts SET resolved_by=CASE WHEN resolved_by IS NULL OR resolved_by < ? THEN ? ELSE resolved_by END WHERE id=? AND branch=?",params![e.id,e.id,reviewed,branch])?;
-            }
-        }
-    }
-    Ok(())
-}
-fn ancestors(version: &Version, versions: &[Version]) -> BTreeSet<String> {
-    let index: BTreeMap<_, _> = versions.iter().map(|v| (v.revision.as_str(), v)).collect();
-    let mut found = BTreeSet::new();
-    let mut todo = version.parents.clone();
-    while let Some(revision) = todo.pop() {
-        if found.insert(revision.clone())
-            && let Some(v) = index.get(revision.as_str())
-        {
-            todo.extend(v.parents.iter().cloned());
-        }
-    }
-    found
-}
-fn event_ancestors(event: &Event, events: &[Event]) -> BTreeSet<String> {
-    let index: BTreeMap<_, _> = events.iter().map(|e| (e.id.as_str(), e)).collect();
-    let mut seen = BTreeSet::new();
-    let mut todo = event.dependencies.clone();
-    todo.extend(event.changes.iter().flat_map(|c| c.parents.iter().cloned()));
-    while let Some(revision) = todo.pop() {
-        if seen.insert(revision.clone())
-            && let Some(e) = index.get(revision.as_str())
-        {
-            todo.extend(e.dependencies.iter().cloned());
-            todo.extend(e.changes.iter().flat_map(|c| c.parents.iter().cloned()));
-        }
-    }
-    seen
-}
-fn linear_versions(versions: &[Version]) -> bool {
-    let mut children = BTreeSet::new();
-    let mut roots = 0;
-    for v in versions {
-        if v.parents.is_empty() {
-            roots += 1;
-        }
-        if v.parents.len() > 1 || v.parents.iter().any(|p| !children.insert(p)) {
-            return false;
-        }
-    }
-    roots == 1
-}
-struct VersionReach {
-    rows: Vec<Vec<u64>>,
-}
-impl VersionReach {
-    fn new(versions: &[Version]) -> Self {
-        let index: BTreeMap<_, _> = versions
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (v.revision.as_str(), i))
-            .collect();
-        let mut children = vec![vec![]; versions.len()];
-        let mut degree = vec![0; versions.len()];
-        let mut parents = vec![vec![]; versions.len()];
-        for (i, v) in versions.iter().enumerate() {
-            for parent in &v.parents {
-                if let Some(&j) = index.get(parent.as_str()) {
-                    parents[i].push(j);
-                    children[j].push(i);
-                    degree[i] += 1;
-                }
-            }
-        }
-        let mut ready: Vec<_> = (0..versions.len()).filter(|&i| degree[i] == 0).collect();
-        let mut rows = vec![vec![0; versions.len().div_ceil(64)]; versions.len()];
-        while let Some(i) = ready.pop() {
-            for &parent in &parents[i] {
-                for word in 0..rows[i].len() {
-                    rows[i][word] |= rows[parent][word];
-                }
-                rows[i][parent / 64] |= 1 << (parent % 64);
-            }
-            for &child in &children[i] {
-                degree[child] -= 1;
-                if degree[child] == 0 {
-                    ready.push(child);
-                }
-            }
-        }
-        Self { rows }
-    }
-    fn has(&self, child: usize, parent: usize) -> bool {
-        self.rows[child][parent / 64] & (1 << (parent % 64)) != 0
-    }
-}
-fn validate_known_links(
-    event: &Event,
-    known: &BTreeMap<String, Event>,
-    quarantined: &BTreeSet<String>,
-) -> Result<()> {
-    validate_incoming_links(event, known, quarantined, &BTreeSet::new())
-}
-fn validate_incoming_links(
-    event: &Event,
-    known: &BTreeMap<String, Event>,
-    quarantined: &BTreeSet<String>,
-    committed: &BTreeSet<String>,
-) -> Result<()> {
-    validate_direct_links(event, known, quarantined)?;
-    let mut visited = BTreeSet::new();
-    let mut todo = event.dependencies.clone();
-    todo.extend(event.changes.iter().flat_map(|c| c.parents.iter().cloned()));
-    while let Some(revision) = todo.pop() {
-        ensure!(revision != event.id, "CAUSAL_CYCLE");
-        if committed.contains(&revision) {
-            continue;
-        }
-        if visited.insert(revision.clone())
-            && let Some(parent) = known.get(&revision)
-        {
-            todo.extend(parent.dependencies.iter().cloned());
-            todo.extend(
-                parent
-                    .changes
-                    .iter()
-                    .flat_map(|c| c.parents.iter().cloned()),
-            );
-        }
-    }
-    Ok(())
-}
-fn validate_direct_links(
-    event: &Event,
-    known: &BTreeMap<String, Event>,
-    quarantined: &BTreeSet<String>,
-) -> Result<()> {
-    for dependency in &event.dependencies {
-        ensure!(
-            !quarantined.contains(dependency),
-            "QUARANTINED_CAUSAL_ANCESTOR: {dependency}"
-        );
-        if let Some(parent) = known.get(dependency) {
-            ensure!(
-                parent.branch == event.branch,
-                "INVALID_CAUSAL_DEPENDENCY: {dependency}"
-            );
-        }
-    }
-    for change in &event.changes {
-        for revision in &change.parents {
-            ensure!(
-                !quarantined.contains(revision),
-                "QUARANTINED_CAUSAL_ANCESTOR: {revision}"
-            );
-            if let Some(parent) = known.get(revision) {
-                ensure!(
-                    parent.branch == event.branch
-                        && parent
-                            .changes
-                            .iter()
-                            .any(|c| c.entity == change.entity && c.field == change.field),
-                    "INVALID_CAUSAL_PARENT: {revision}"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-fn activated_ids(events: &[Event]) -> BTreeSet<String> {
-    let mut degrees = BTreeMap::new();
-    let mut children: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut ready = BTreeSet::new();
-    for e in events {
-        let parents: BTreeSet<_> = e
-            .dependencies
-            .iter()
-            .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
-            .collect();
-        degrees.insert(e.id.as_str(), parents.len());
-        if parents.is_empty() {
-            ready.insert(e.id.as_str());
-        }
-        for parent in parents {
-            children
-                .entry(parent.as_str())
-                .or_default()
-                .push(e.id.as_str());
-        }
-    }
-    let mut active = BTreeSet::new();
-    while let Some(id) = ready.pop_first() {
-        crate::startup::progress("validating causal history");
-        active.insert(id.to_owned());
-        if let Some(children) = children.get(id) {
-            for child in children {
-                let degree = degrees.get_mut(child).unwrap();
-                *degree -= 1;
-                if *degree == 0 {
-                    ready.insert(*child);
-                }
-            }
-        }
-    }
-    active
-}
-fn namespace_history(branch: &str, events: &[Event]) -> Result<Vec<Conflict>> {
-    let graph = FactGraph::events(events);
-    let cones = NamespaceCones::new(events)?;
-    let mut alive: BTreeMap<&str, Vec<(usize, &Change)>> = BTreeMap::new();
-    for (i, e) in events.iter().enumerate() {
-        for c in &e.changes {
-            if c.field == "alive" {
-                alive.entry(&c.entity).or_default().push((i, c));
-            }
-        }
-    }
-    let mut conflicts = BTreeMap::new();
-    for members in cones.members() {
-        crate::startup::progress("rebuilding namespace history");
-        let mut relevant = BTreeSet::new();
-        for (i, e) in events.iter().enumerate() {
-            if e.changes.iter().any(|c| {
-                members.contains(&c.entity)
-                    && (["kind", "location"].contains(&c.field.as_str())
-                        || (c.field == "alive"
-                            && (c.value == false
-                                || c.parents.iter().any(|parent| {
-                                    graph.index.get(parent.as_str()).is_some_and(|&j| {
-                                        events[j].changes.iter().any(|p| {
-                                            p.entity == c.entity
-                                                && p.field == "alive"
-                                                && p.value == false
-                                        })
-                                    })
-                                }))))
-            }) {
-                relevant.insert(i);
-            }
-        }
-        let primary: Vec<_> = relevant
-            .iter()
-            .map(|&i| (graph.closure(i, false), graph.closure(i, true)))
-            .collect();
-        // Pure TRUE presence assertions cannot change namespace when there is
-        // no tombstone. If tombstones exist, retain rank extrema per unbranched
-        // TRUE segment and topology/false-revision causal relationship signature.
-        // This preserves possible boolean winners without counting every save.
-        for entity in &members {
-            let Some(versions) = alive.get(entity.as_str()) else {
-                continue;
-            };
-            let false_ids: Vec<_> = versions
-                .iter()
-                .filter(|(_, c)| c.value == false)
-                .map(|(i, _)| *i)
-                .collect();
-            if false_ids.is_empty() {
-                continue;
-            }
-            let register = FactGraph::register(events, versions);
-            let false_context: Vec<_> = false_ids
-                .iter()
-                .map(|&i| (register.closure(i, false), register.closure(i, true)))
-                .collect();
-            let segments = register.segments();
-            let mut groups: BTreeMap<(usize, Vec<u8>), (usize, usize)> = BTreeMap::new();
-            for &(i, c) in versions {
-                if c.value != true || relevant.contains(&i) {
-                    continue;
-                }
-                let signature = primary
-                    .iter()
-                    .chain(&false_context)
-                    .map(|(anc, desc)| {
-                        if anc.contains(&i) {
-                            1
-                        } else if desc.contains(&i) {
-                            2
-                        } else {
-                            0
-                        }
-                    })
-                    .collect();
-                let range = groups.entry((segments[i], signature)).or_insert((i, i));
-                let rank = |j: usize| (&events[j].device, &events[j].id);
-                if rank(i) < rank(range.0) {
-                    range.0 = i;
-                }
-                if rank(i) > rank(range.1) {
-                    range.1 = i;
-                }
-            }
-            for (min, max) in groups.values() {
-                relevant.extend([*min, *max]);
-            }
-        }
-        let relevant: Vec<_> = relevant.into_iter().collect();
-        let ancestors: Vec<_> = relevant.iter().map(|&i| graph.closure(i, false)).collect();
-        let mut antichains: Vec<Vec<usize>> = vec![vec![]];
-        let mut competing_cuts = 0;
-        for (i, &event) in relevant.iter().enumerate() {
-            let before = antichains.len();
-            for index in 0..before {
-                crate::startup::progress("replaying namespace cuts");
-                if !antichains[index].iter().all(|&j| {
-                    !ancestors[i].contains(&relevant[j]) && !ancestors[j].contains(&event)
-                }) {
-                    continue;
-                }
-                let mut selected = antichains[index].clone();
-                selected.push(i);
-                if selected.len() > 1 {
-                    competing_cuts += 1;
-                    ensure!(
-                        competing_cuts <= MAX_NAMESPACE_CUTS,
-                        "NAMESPACE_HISTORY_LIMIT: more than {MAX_NAMESPACE_CUTS} competing topology cuts in one dependency cone; commit refused without discarding conflicts"
-                    );
-                }
-                let mut ids = BTreeSet::new();
-                for &j in &selected {
-                    ids.extend(&ancestors[j]);
-                    ids.insert(relevant[j]);
-                }
-                let cut: Vec<_> = ids.into_iter().map(|j| events[j].clone()).collect();
-                for c in project(branch, &cut)?.conflicts.into_iter().filter(|c| {
-                    c.field == "namespace" && c.entity.split(',').any(|e| members.contains(e))
-                }) {
-                    conflicts.insert(c.id.clone(), c);
-                }
-                antichains.push(selected);
-            }
-        }
-    }
-    Ok(conflicts.into_values().collect())
-}
-struct FactGraph {
-    index: BTreeMap<String, usize>,
-    parents: Vec<Vec<usize>>,
-    children: Vec<Vec<usize>>,
-}
-impl FactGraph {
-    fn events(events: &[Event]) -> Self {
-        let index: BTreeMap<_, _> = events
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (e.id.clone(), i))
-            .collect();
-        let parents: Vec<_> = events
-            .iter()
-            .map(|e| {
-                e.dependencies
-                    .iter()
-                    .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
-                    .filter_map(|p| index.get(p).copied())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect()
-            })
-            .collect();
-        Self::from_parents(index, parents)
-    }
-    fn register(events: &[Event], versions: &[(usize, &Change)]) -> Self {
-        let index: BTreeMap<_, _> = versions
-            .iter()
-            .map(|(i, _)| (events[*i].id.clone(), *i))
-            .collect();
-        let mut parents = vec![vec![]; events.len()];
-        for &(i, c) in versions {
-            parents[i] = c
-                .parents
-                .iter()
-                .filter_map(|p| index.get(p).copied())
-                .collect();
-        }
-        let graph = Self::from_parents(index.clone(), parents);
-        // Explicit review can list many ancestors as parents. Such redundant
-        // edges are evidence, not new branches in an unchanged-TRUE segment.
-        // Reduce only this analysis graph; immutable event parents stay intact.
-        let mut degree: Vec<_> = graph.parents.iter().map(Vec::len).collect();
-        let mut ready: Vec<_> = (0..degree.len()).filter(|&i| degree[i] == 0).collect();
-        let mut rank = vec![0; degree.len()];
-        let mut sequence = 0;
-        while let Some(i) = ready.pop() {
-            rank[i] = sequence;
-            sequence += 1;
-            for &child in &graph.children[i] {
-                degree[child] -= 1;
-                if degree[child] == 0 {
-                    ready.push(child);
-                }
-            }
-        }
-        let mut reduced = graph.parents.clone();
-        for ps in &mut reduced {
-            if ps.len() < 2 {
-                continue;
-            }
-            ps.sort_by_key(|&p| std::cmp::Reverse(rank[p]));
-            let mut covered = BTreeSet::new();
-            ps.retain(|&p| {
-                if covered.contains(&p) {
-                    false
-                } else {
-                    covered.extend(graph.closure(p, false));
-                    true
-                }
-            });
-        }
-        Self::from_parents(index, reduced)
-    }
-    fn from_parents(index: BTreeMap<String, usize>, parents: Vec<Vec<usize>>) -> Self {
-        let mut children = vec![vec![]; parents.len()];
-        for (i, ps) in parents.iter().enumerate() {
-            for &p in ps {
-                children[p].push(i);
-            }
-        }
-        Self {
-            index,
-            parents,
-            children,
-        }
-    }
-    fn closure(&self, id: usize, forward: bool) -> BTreeSet<usize> {
-        let edges = if forward {
-            &self.children
-        } else {
-            &self.parents
-        };
-        let mut found = BTreeSet::new();
-        let mut todo = edges[id].clone();
-        while let Some(i) = todo.pop() {
-            if found.insert(i) {
-                todo.extend(&edges[i]);
-            }
-        }
-        found
-    }
-    fn segments(&self) -> Vec<usize> {
-        let mut degree: Vec<_> = self.parents.iter().map(Vec::len).collect();
-        let mut ready: Vec<_> = (0..degree.len()).filter(|&i| degree[i] == 0).collect();
-        let mut segment: Vec<_> = (0..degree.len()).collect();
-        while let Some(i) = ready.pop() {
-            if self.parents[i].len() == 1 && self.children[self.parents[i][0]].len() == 1 {
-                segment[i] = segment[self.parents[i][0]];
-            }
-            for &child in &self.children[i] {
-                degree[child] -= 1;
-                if degree[child] == 0 {
-                    ready.push(child);
-                }
-            }
-        }
-        segment
-    }
-}
-struct NamespaceCones {
-    parents: BTreeMap<String, BTreeSet<String>>,
-    entity_slots: BTreeMap<String, BTreeSet<(String, String)>>,
-    slots: BTreeMap<(String, String), BTreeSet<String>>,
-}
-impl NamespaceCones {
-    fn new(events: &[Event]) -> Result<Self> {
-        let mut result = Self {
-            parents: BTreeMap::new(),
-            entity_slots: BTreeMap::new(),
-            slots: BTreeMap::new(),
-        };
-        for e in events {
-            for c in &e.changes {
-                result.parents.entry(c.entity.clone()).or_default();
-                if c.field == "location" {
-                    let parent = c.value["parent"].as_str().unwrap();
-                    if parent != ROOT {
-                        result
-                            .parents
-                            .entry(c.entity.clone())
-                            .or_default()
-                            .insert(parent.to_owned());
-                        result.parents.entry(parent.to_owned()).or_default();
-                    }
-                    let key = (
-                        parent.to_owned(),
-                        name_key(c.value["name"].as_str().unwrap())?,
-                    );
-                    result
-                        .entity_slots
-                        .entry(c.entity.clone())
-                        .or_default()
-                        .insert(key.clone());
-                    result
-                        .slots
-                        .entry(key)
-                        .or_default()
-                        .insert(c.entity.clone());
-                }
-            }
-        }
-        Ok(result)
-    }
-    fn members(&self) -> BTreeSet<BTreeSet<String>> {
-        let mut cones = BTreeSet::new();
-        for entity in self.parents.keys() {
-            crate::startup::progress("analyzing namespace dependencies");
-            let mut members = BTreeSet::new();
-            let mut visited_slots = BTreeSet::new();
-            let mut pending = vec![entity.clone()];
-            while let Some(next) = pending.pop() {
-                if !members.insert(next.clone()) {
-                    continue;
-                }
-                pending.extend(self.parents[&next].iter().cloned());
-                if let Some(slots) = self.entity_slots.get(&next) {
-                    for slot in slots {
-                        if visited_slots.insert(slot.clone()) {
-                            pending.extend(self.slots[slot].iter().cloned());
-                        }
-                    }
-                }
-            }
-            // Ancestors and slot competitors can affect this entry's visibility.
-            // Sharing an ancestor alone does not make sibling histories interact.
-            cones.insert(members);
-        }
-        cones
-    }
-}
-
-/// Complete topological activation followed by per-register ancestry. Unknown
-/// parents keep the entire atomic event pending; child-before-parent is durable.
-pub fn project(branch: &str, events: &[Event]) -> Result<Projection> {
-    let by_id: BTreeMap<_, _> = events.iter().map(|e| (e.id.clone(), e)).collect();
-    for e in events {
-        for c in &e.changes {
-            for parent in &c.parents {
-                if let Some(parent) = by_id.get(parent) {
-                    ensure!(
-                        parent
-                            .changes
-                            .iter()
-                            .any(|pc| pc.entity == c.entity && pc.field == c.field),
-                        "INVALID_CAUSAL_PARENT"
-                    );
-                }
-            }
-        }
-    }
-    let active = activated_ids(events);
-    // A known closed dependency cycle is malformed, rather than permanently pending.
-    let pending: Vec<_> = by_id
-        .keys()
-        .filter(|e| !active.contains(*e))
-        .cloned()
-        .collect();
-    if !pending.is_empty() {
-        let has_missing = events.iter().any(|e| {
-            e.dependencies.iter().any(|p| !by_id.contains_key(p))
-                || e.changes
-                    .iter()
-                    .any(|c| c.parents.iter().any(|p| !by_id.contains_key(p)))
-        });
-        ensure!(has_missing, "CAUSAL_CYCLE");
-    }
-    let mut registers: BTreeMap<String, Vec<Version>> = BTreeMap::new();
-    for e in events.iter().filter(|e| active.contains(&e.id)) {
-        for c in &e.changes {
-            registers
-                .entry(register(&c.entity, &c.field))
-                .or_default()
-                .push(Version {
-                    revision: e.id.clone(),
-                    device: e.device.clone(),
-                    created_ms: e.created_ms,
-                    parents: c.parents.clone(),
-                    value: c.value.clone(),
-                });
-        }
-    }
-    let mut p = Projection {
-        pending,
-        ..Default::default()
-    };
-    for (key, mut versions) in registers {
-        crate::startup::progress("projecting registers");
-        // All ancestors are dominated before the stable concurrent rank is used.
-        let dominated: BTreeSet<_> = versions
-            .iter()
-            .flat_map(|v| v.parents.iter().cloned())
-            .collect();
-        let mut heads: Vec<_> = versions
-            .iter()
-            .filter(|v| !dominated.contains(&v.revision))
-            .cloned()
-            .collect();
-        heads.sort_by(|a, b| (&a.device, &a.revision).cmp(&(&b.device, &b.revision)));
-        let winner = heads.last().unwrap();
-        let (entity, field) = key.rsplit_once('/').unwrap();
-        let entry = p.entries.entry(entity.into()).or_insert_with(|| Entry {
-            id: entity.into(),
-            ..Default::default()
-        });
-        entry
-            .revisions
-            .insert(field.into(), winner.revision.clone());
-        if field != "basic" {
-            entry.modified_ms = entry.modified_ms.max(winner.created_ms);
-        }
-        match field {
-            "kind" => {
-                entry.kind = winner.value.as_str().unwrap().into();
-                entry.created_ms = winner.created_ms;
-            }
-            "location" => {
-                entry.parent = winner.value["parent"].as_str().unwrap().into();
-                entry.name = winner.value["name"].as_str().unwrap().into();
-            }
-            "alive" => entry.alive = winner.value.as_bool().unwrap(),
-            "content" => entry.content = winner.value.as_str().map(str::to_owned),
-            "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
-            _ => {}
-        }
-        if heads.len() > 1
-            && heads
-                .iter()
-                .map(|v| serde_json::to_string(&v.value).unwrap())
-                .collect::<BTreeSet<_>>()
-                .len()
-                > 1
-        {
-            versions.sort_by(|a, b| a.revision.cmp(&b.revision));
-            // Pair records have stable identity even when a third competitor is
-            // learned later. No delivery-dependent subset record is persisted.
-            for (i, a) in heads.iter().enumerate() {
-                for b in &heads[i + 1..] {
-                    if a.value != b.value {
-                        let aa = ancestors(a, &versions);
-                        let ba = ancestors(b, &versions);
-                        let bases = versions
-                            .iter()
-                            .filter(|v| aa.contains(&v.revision) && ba.contains(&v.revision))
-                            .cloned()
-                            .collect();
-                        p.conflicts.push(make_conflict(
-                            branch,
-                            entity,
-                            field,
-                            "concurrent revisions",
-                            vec![a.clone(), b.clone()],
-                            bases,
-                        ));
-                    }
-                }
-            }
-        }
-        p.heads.insert(key, heads);
-    }
-    // Make a deterministic, acyclic visible namespace, retaining suppressed
-    // entities and their complete registers in conflicts/current-state.
-    let ids: Vec<_> = p.entries.keys().cloned().collect();
-    let mut slots: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
-    for entity in &ids {
-        let e = &p.entries[entity];
-        if e.alive {
-            slots
-                .entry((e.parent.clone(), name_key(&e.name)?))
-                .or_default()
-                .push(entity.clone());
-        }
-    }
-    for members in slots.values().filter(|m| m.len() > 1) {
-        let mut alternatives = vec![];
-        for entity in members {
-            alternatives.extend(p.heads[&register(entity, "location")].clone());
-        }
-        let winner = members.iter().max().unwrap();
-        for entity in members {
-            if entity != winner {
-                p.entries.get_mut(entity).unwrap().alive = false;
-            }
-        }
-        for (i, a) in members.iter().enumerate() {
-            for b in &members[i + 1..] {
-                let pair = [
-                    p.heads[&register(a, "location")].clone(),
-                    p.heads[&register(b, "location")].clone(),
-                ]
-                .concat();
-                p.conflicts.push(make_conflict(
-                    branch,
-                    &format!("{a},{b}"),
-                    "namespace",
-                    "same name / file-directory collision",
-                    pair,
-                    vec![],
-                ));
-            }
-        }
-    }
-    for entity in &ids {
-        let mut cursor = entity.clone();
-        let mut visited = BTreeSet::new();
-        let mut invalid = false;
-        while cursor != ROOT {
-            if !visited.insert(cursor.clone()) {
-                invalid = true;
-                break;
-            }
-            if let Some(e) = p.entries.get(&cursor) {
-                if !e.alive || (cursor != *entity && e.kind != "directory") {
-                    invalid = true;
-                    break;
-                }
-                cursor = e.parent.clone();
-            } else {
-                invalid = true;
-                break;
-            }
-        }
-        if invalid && p.entries[entity].alive {
-            p.entries.get_mut(entity).unwrap().alive = false;
-            let alternatives = p
-                .heads
-                .get(&register(entity, "location"))
-                .cloned()
-                .unwrap_or_default();
-            p.conflicts.push(make_conflict(
-                branch,
-                entity,
-                "namespace",
-                "deleted/missing parent or directory cycle",
-                alternatives,
-                vec![],
-            ));
-        }
-    }
-    p.conflicts.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(p)
-}
-fn make_conflict(
-    branch: &str,
-    entity: &str,
-    field: &str,
-    reason: &str,
-    mut alternatives: Vec<Version>,
-    bases: Vec<Version>,
-) -> Conflict {
-    alternatives.sort_by(|a, b| a.revision.cmp(&b.revision));
-    let revs: Vec<_> = alternatives.iter().map(|v| &v.revision).collect();
-    let conflict_id = hash(&serde_json::to_vec(&(branch, entity, field, reason, revs)).unwrap());
-    Conflict {
-        id: conflict_id,
-        branch: branch.into(),
-        entity: entity.into(),
-        field: field.into(),
-        reason: reason.into(),
-        alternatives,
-        bases,
-        resolved_by: None,
     }
 }
 pub fn lookup(p: &Projection, path: &str) -> Result<Entry> {
@@ -3801,25 +1462,4 @@ pub fn fault(point: &str) {
     if std::env::var("TKFS_FAULT").as_deref() == Ok(point) {
         std::process::exit(86);
     }
-}
-
-#[cfg(windows)]
-pub(crate) fn install_object(temp: &Path, dest: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(old: *const u16, new: *const u16, flags: u32) -> i32;
-    }
-    let old: Vec<_> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let new: Vec<_> = dest.as_os_str().encode_wide().chain(Some(0)).collect();
-    if unsafe { MoveFileExW(old.as_ptr(), new.as_ptr(), 8) } == 0 {
-        bail!(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-#[cfg(not(windows))]
-pub(crate) fn install_object(temp: &Path, dest: &Path) -> Result<()> {
-    fs::rename(temp, dest)?;
-    fs::File::open(dest.parent().unwrap())?.sync_all()?;
-    Ok(())
 }

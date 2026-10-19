@@ -1,0 +1,9 @@
+[
+  "online",
+  "connecting",
+  "offline",
+  "backoff",
+  "incompatible",
+  "unauthorized",
+  "revoked"
+]

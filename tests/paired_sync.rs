@@ -29,7 +29,118 @@ fn fixture() -> (tempfile::TempDir, Engine, Engine, SyncRoute, SyncRoute) {
 }
 fn write(engine: &mut Engine, name: &str, bytes: &[u8]) {
     let file = engine.store.create(name, "file").unwrap();
-    engine.store.write_revision(&file.id, None, bytes).unwrap();
+    engine
+        .store
+        .write_revision(&file.id, file.revisions.get("content").cloned(), bytes)
+        .unwrap();
+}
+
+#[test]
+fn legacy_missing_size_does_not_block_status_or_metadata_and_content_can_recover() {
+    let (_temp, mut a, mut b, ga, gb) = fixture();
+    write(&mut a, "legacy.txt", b"legacy content");
+    let object = hash(b"legacy content");
+    // Reproduce a pre-descriptor journal whose original content is unavailable.
+    for mut event in a.store.events().unwrap() {
+        event.object_sizes.clear();
+        a.store
+            .db
+            .execute(
+                "UPDATE events SET payload=? WHERE id=?",
+                rusqlite::params![serde_json::to_string(&event).unwrap(), event.id],
+            )
+            .unwrap();
+    }
+    a.store.db.execute("DELETE FROM object_sizes", []).unwrap();
+    std::fs::remove_file(a.store.root.join("objects").join(&object)).unwrap();
+    let status = a.control("status", &json!({"op":"status"})).unwrap();
+    assert_eq!(status["content"]["current_missing"], 1);
+    assert_eq!(
+        status["content"]["items"][0]["size"],
+        serde_json::Value::Null
+    );
+    assert_eq!(status["content"]["items"][0]["size_known"], false);
+    let before = a.store.events().unwrap();
+    let page = paired_sync::worker_control(
+        &mut a,
+        &json!({"op":"published-offer","route":ga,"metadata_only":true}),
+    )
+    .unwrap();
+    assert!(page["object_sizes"].get(&object).is_none());
+    paired_sync::worker_control(
+        &mut b,
+        &json!({"op":"published-exchange","route":gb,"page":page,"metadata_only":true}),
+    )
+    .unwrap();
+    assert!(b.store.lookup("legacy.txt").is_ok());
+    assert_eq!(b.store.object_size_if_known(&object).unwrap(), None);
+    assert_eq!(b.store.events().unwrap(), before);
+    assert_eq!(
+        roundtrip(&mut a, &mut b, &ga, &gb)["metadata_caught_up"],
+        true
+    );
+    assert_eq!(b.store.content_status().unwrap()["complete"], false);
+    a.store.put_object(b"legacy content").unwrap();
+    roundtrip(&mut a, &mut b, &ga, &gb);
+    assert_eq!(b.store.read_object(&object).unwrap(), b"legacy content");
+    assert_eq!(
+        b.store.events().unwrap(),
+        before,
+        "descriptors must not rewrite journal events"
+    );
+}
+
+#[test]
+fn bounded_metadata_pages_make_progress_with_reverse_sorted_dependencies() {
+    let (_temp, mut a, mut b, ga, gb) = fixture();
+    a.store.create("chain", "file").unwrap();
+    let mut base = a.store.events().unwrap().pop().unwrap();
+    // Explicit descending IDs force children before parents in UUID/string order.
+    let mut parent = base.id.clone();
+    let entity = base.changes[0].entity.clone();
+    for index in (0..24).rev() {
+        base.id = format!("00000000-0000-4000-8000-{index:012}");
+        base.dependencies = vec![parent.clone()];
+        base.changes = vec![Change {
+            entity: entity.clone(),
+            field: "alive".into(),
+            parents: vec![parent],
+            value: json!(true),
+        }];
+        base.object_sizes.clear();
+        a.store.commit(base.clone(), true).unwrap();
+        parent = base.id.clone();
+    }
+    let mut rounds = 0;
+    while a.store.shared_event_inventory().unwrap() != b.store.shared_event_inventory().unwrap() {
+        let known = b.store.shared_event_inventory().unwrap();
+        let bundle = a.store.shared_metadata_page(&known, 6000).unwrap();
+        assert!(!bundle.events.is_empty());
+        let mut page: SyncPage = serde_json::from_value(
+            paired_sync::worker_control(
+                &mut a,
+                &json!({"op":"published-offer","route":ga,"metadata_only":true}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let referenced: BTreeSet<_> = bundle.events.iter().flat_map(Event::objects).collect();
+        page.object_sizes.retain(|h, _| referenced.contains(h));
+        page.bundle = bundle;
+        paired_sync::receive(&mut b, &gb, &page).unwrap();
+        assert!(
+            b.store.shared_event_inventory().unwrap().len() > known.len(),
+            "each page must activate events"
+        );
+        assert_eq!(b.store.status().unwrap()["incoming_pending"], 0);
+        rounds += 1;
+        assert!(rounds <= 25);
+    }
+    assert!(rounds > 1, "fixture must exercise pagination");
+    assert_eq!(
+        a.store.projection(&a.store.active).unwrap(),
+        b.store.projection(&b.store.active).unwrap()
+    );
 }
 fn roundtrip(a: &mut Engine, b: &mut Engine, ga: &SyncRoute, gb: &SyncRoute) -> serde_json::Value {
     let page = paired_sync::offer(a, ga, None).unwrap();

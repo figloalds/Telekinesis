@@ -1,0 +1,258 @@
+[
+  {
+    "configured_connections": 3,
+    "connections": 3,
+    "endpoint": "<endpoint>",
+    "installation": "<installation:A>",
+    "lanes": [
+      {
+        "connected": true,
+        "error": null,
+        "exchanges": "<u64>",
+        "last_success_ms": "<ms?>",
+        "parallel_bulk": true,
+        "repositories": {
+          "<repo:gated-source>": {
+            "caught_up": false,
+            "consecutive_failures": "<u64>",
+            "error": null,
+            "last_progress_ms": "<ms?>",
+            "last_success_ms": "<ms?>",
+            "metadata_caught_up": false,
+            "metadata_progress": {
+              "local_events": "<u64>",
+              "local_only_events": "<u64>",
+              "local_pending": "<u64>",
+              "remote_events": "<u64>",
+              "remote_only_events": "<u64>",
+              "remote_pending": "<u64>"
+            },
+            "object_inventory": null,
+            "retry_at_ms": "<ms?>",
+            "total_received_object_bytes": "<u64>",
+            "total_received_wire_bytes": "<u64>",
+            "total_sent_object_bytes": "<u64>",
+            "total_sent_wire_bytes": "<u64>",
+            "transfer": {
+              "apply_ms": "<ms?>",
+              "offer_ms": "<ms?>",
+              "received_object_bytes": "<u64>",
+              "received_wire_bytes": "<u64>",
+              "remote_exchange_ms": "<ms?>",
+              "sent_object_bytes": "<u64>",
+              "sent_wire_bytes": "<u64>",
+              "total_ms": "<ms?>",
+              "transport": "<transport>"
+            }
+          },
+          "<repo:source>": {
+            "caught_up": true,
+            "consecutive_failures": "<u64>",
+            "error": null,
+            "last_progress_ms": "<ms?>",
+            "last_success_ms": "<ms?>",
+            "metadata_caught_up": true,
+            "metadata_progress": {
+              "local_events": "<u64>",
+              "local_only_events": "<u64>",
+              "local_pending": "<u64>",
+              "remote_events": "<u64>",
+              "remote_only_events": "<u64>",
+              "remote_pending": "<u64>"
+            },
+            "object_inventory": null,
+            "retry_at_ms": "<ms?>",
+            "total_received_object_bytes": "<u64>",
+            "total_received_wire_bytes": "<u64>",
+            "total_sent_object_bytes": "<u64>",
+            "total_sent_wire_bytes": "<u64>",
+            "transfer": {
+              "apply_ms": "<ms?>",
+              "offer_ms": "<ms?>",
+              "received_object_bytes": "<u64>",
+              "received_wire_bytes": "<u64>",
+              "remote_exchange_ms": "<ms?>",
+              "sent_object_bytes": "<u64>",
+              "sent_wire_bytes": "<u64>",
+              "total_ms": "<ms?>",
+              "transport": "<transport>"
+            }
+          }
+        },
+        "role": "control",
+        "transport": "<transport>"
+      },
+      {
+        "connected": true,
+        "error": null,
+        "exchanges": "<u64>",
+        "last_success_ms": "<ms?>",
+        "parallel_bulk": true,
+        "repositories": {
+          "<repo:gated-source>": {
+            "caught_up": false,
+            "consecutive_failures": "<u64>",
+            "error": null,
+            "last_progress_ms": "<ms?>",
+            "last_success_ms": "<ms?>",
+            "metadata_caught_up": false,
+            "metadata_progress": null,
+            "object_inventory": {
+              "local_available": "<u64>",
+              "local_only": "<u64>",
+              "local_partial": "<u64>",
+              "remote_available": "<u64>",
+              "remote_only": "<u64>",
+              "remote_partial": "<u64>"
+            },
+            "retry_at_ms": "<ms?>",
+            "total_received_object_bytes": "<u64>",
+            "total_received_wire_bytes": "<u64>",
+            "total_sent_object_bytes": "<u64>",
+            "total_sent_wire_bytes": "<u64>",
+            "transfer": {
+              "apply_ms": "<ms?>",
+              "object_lane": {
+                "count": 2,
+                "index": 0
+              },
+              "offer_ms": "<ms?>",
+              "received_object_bytes": "<u64>",
+              "received_wire_bytes": "<u64>",
+              "remote_exchange_ms": "<ms?>",
+              "sent_object_bytes": "<u64>",
+              "sent_wire_bytes": "<u64>",
+              "total_ms": "<ms?>",
+              "transport": "<transport>"
+            }
+          },
+          "<repo:source>": {
+            "caught_up": false,
+            "consecutive_failures": "<u64>",
+            "error": null,
+            "last_progress_ms": "<ms?>",
+            "last_success_ms": "<ms?>",
+            "metadata_caught_up": false,
+            "metadata_progress": null,
+            "object_inventory": {
+              "local_available": "<u64>",
+              "local_only": "<u64>",
+              "local_partial": "<u64>",
+              "remote_available": "<u64>",
+              "remote_only": "<u64>",
+              "remote_partial": "<u64>"
+            },
+            "retry_at_ms": "<ms?>",
+            "total_received_object_bytes": "<u64>",
+            "total_received_wire_bytes": "<u64>",
+            "total_sent_object_bytes": "<u64>",
+            "total_sent_wire_bytes": "<u64>",
+            "transfer": {
+              "apply_ms": "<ms?>",
+              "object_lane": {
+                "count": 2,
+                "index": 0
+              },
+              "offer_ms": "<ms?>",
+              "received_object_bytes": "<u64>",
+              "received_wire_bytes": "<u64>",
+              "remote_exchange_ms": "<ms?>",
+              "sent_object_bytes": "<u64>",
+              "sent_wire_bytes": "<u64>",
+              "total_ms": "<ms?>",
+              "transport": "<transport>"
+            }
+          }
+        },
+        "role": "bulk",
+        "transport": "<transport>"
+      },
+      {
+        "connected": true,
+        "error": null,
+        "exchanges": "<u64>",
+        "last_success_ms": "<ms?>",
+        "parallel_bulk": true,
+        "repositories": {
+          "<repo:gated-source>": {
+            "caught_up": false,
+            "consecutive_failures": "<u64>",
+            "error": null,
+            "last_progress_ms": "<ms?>",
+            "last_success_ms": "<ms?>",
+            "metadata_caught_up": false,
+            "metadata_progress": null,
+            "object_inventory": {
+              "local_available": "<u64>",
+              "local_only": "<u64>",
+              "local_partial": "<u64>",
+              "remote_available": "<u64>",
+              "remote_only": "<u64>",
+              "remote_partial": "<u64>"
+            },
+            "retry_at_ms": "<ms?>",
+            "total_received_object_bytes": "<u64>",
+            "total_received_wire_bytes": "<u64>",
+            "total_sent_object_bytes": "<u64>",
+            "total_sent_wire_bytes": "<u64>",
+            "transfer": {
+              "apply_ms": "<ms?>",
+              "object_lane": {
+                "count": 2,
+                "index": 1
+              },
+              "offer_ms": "<ms?>",
+              "received_object_bytes": "<u64>",
+              "received_wire_bytes": "<u64>",
+              "remote_exchange_ms": "<ms?>",
+              "sent_object_bytes": "<u64>",
+              "sent_wire_bytes": "<u64>",
+              "total_ms": "<ms?>",
+              "transport": "<transport>"
+            }
+          },
+          "<repo:source>": {
+            "caught_up": false,
+            "consecutive_failures": "<u64>",
+            "error": null,
+            "last_progress_ms": "<ms?>",
+            "last_success_ms": "<ms?>",
+            "metadata_caught_up": false,
+            "metadata_progress": null,
+            "object_inventory": {
+              "local_available": "<u64>",
+              "local_only": "<u64>",
+              "local_partial": "<u64>",
+              "remote_available": "<u64>",
+              "remote_only": "<u64>",
+              "remote_partial": "<u64>"
+            },
+            "retry_at_ms": "<ms?>",
+            "total_received_object_bytes": "<u64>",
+            "total_received_wire_bytes": "<u64>",
+            "total_sent_object_bytes": "<u64>",
+            "total_sent_wire_bytes": "<u64>",
+            "transfer": {
+              "apply_ms": "<ms?>",
+              "object_lane": {
+                "count": 2,
+                "index": 1
+              },
+              "offer_ms": "<ms?>",
+              "received_object_bytes": "<u64>",
+              "received_wire_bytes": "<u64>",
+              "remote_exchange_ms": "<ms?>",
+              "sent_object_bytes": "<u64>",
+              "sent_wire_bytes": "<u64>",
+              "total_ms": "<ms?>",
+              "transport": "<transport>"
+            }
+          }
+        },
+        "role": "bulk",
+        "transport": "<transport>"
+      }
+    ],
+    "reserved_connections": 1
+  }
+]

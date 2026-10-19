@@ -1,0 +1,19 @@
+{
+  "protocol": "tkfs-peer",
+  "version": 3,
+  "installation": "inst-bbbb-2222",
+  "role": "bulk",
+  "lane": {
+    "index": 1,
+    "count": 3
+  },
+  "salt": "2222222222222222222222222222222222222222222222222222222222222222",
+  "server_nonce": "3333333333333333333333333333333333333333333333333333333333333333",
+  "verifier_generation": 5,
+  "features": [],
+  "limits": {
+    "max_header": 65536,
+    "max_chunk": 1048576,
+    "max_body": 16777216
+  }
+}
