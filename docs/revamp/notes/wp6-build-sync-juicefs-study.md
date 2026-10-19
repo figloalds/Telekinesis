@@ -1,5 +1,9 @@
 # Proposed Wave 6: independent metadata and object engines
 
+Planning update: [WAVE_6_PLAN.md](../WAVE_6_PLAN.md) now owns the selected wave
+scope, package numbering and gates. The package table here is historical
+investigation material; its evidence and unresolved causal claims are retained.
+
 Investigation: 2026-10-19. **Design proposal, not implemented or qualified.**
 This records the mounted solution-build incident, a source study of JuiceFS,
 and the user's direction: prioritize metadata convergence, give objects their
