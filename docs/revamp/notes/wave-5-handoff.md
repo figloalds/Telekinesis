@@ -120,6 +120,11 @@ Closing this branch does not itself deploy or restart the installation.
 
 ## Knowledge index
 
+- [Selected Wave 6 plan](../WAVE_6_PLAN.md): the post-closure continuation scope,
+  package dependencies, 64 KiB contracts and build-performance acceptance.
+- [Chunked content and future Git workspaces](chunked-cow-and-git-workspaces.md):
+  post-closure direction, proposed 64 KiB chunks, format/admission/retention
+  contracts, source-size sample and banked hybrid Git-backed COW views.
 - [WP5.INT](wp5-int.md): package integration, review fixes, carried CCRs,
   historical tests and qualifications.
 - [WP5.1](wp5-1.md), [design details](wp5-1-design.md), [WP5.2](wp5-2.md),
@@ -134,7 +139,8 @@ Closing this branch does not itself deploy or restart the installation.
 - [Archived catch-up probe](../../../test-evidence/wave-5-handoff/README.md):
   exploratory source kept outside the normal test suite.
 
-Next arbitration starts from the integrated `master` tree and this index:
-measure the actual build on the integrated code, identify its dominant costs,
-then select a bounded continuation scope with explicit latency and durability
-requirements.
+At closure, continuation remained for arbitration. The subsequent user discussion
+selected [Wave 6](../WAVE_6_PLAN.md): 64 KiB content, independent engines,
+Git-ready seams and build performance, with actual Git integration deferred.
+Start its measurement package from the integrated `master` baseline; the
+historical limitations above remain current until implementation proves fixes.

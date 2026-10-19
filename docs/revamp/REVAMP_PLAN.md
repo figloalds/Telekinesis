@@ -2,7 +2,9 @@
 
 Baseline: branch `revamp/production-sync`, commit `6298d0b`. Inputs: `synthesis.md` (RC1–RC13, invariants 1–30, pillars 0/A–F) and `reports.json`. Every claim below that cites a file or line was re-checked against the working tree. Where judges disagreed, the code decided.
 
-This document is the single source of truth for the implementing agents. It covers:
+This document is the Waves 0–5 source of truth. The selected next wave is
+specified in [WAVE_6_PLAN.md](WAVE_6_PLAN.md), which supersedes the earlier
+exploratory Wave 6 package numbering and scopes here. This document covers:
 
 | § | Content |
 |---|---|
@@ -1252,7 +1254,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
      - split reader and writer threads (tungstenite `read()` writes Pong and Close, `protocol/mod.rs:457-466`);
      - a WSS pump with 20 ms read timeouts;
      - a socket-shutdown watchdog only (no multiplexing);
-     - tokio (excluded from the original scope; proposed WP6.4 reopens evaluation with a measured prototype);
+     - tokio (excluded from the original scope; the selected Wave 6 plan retains the runtime unless measured gates justify a scoped ADR);
      - crossbeam (std mpsc with an enum mailbox suffices);
      - arc-swap or parking_lot (`Snapshot` is `RwLock<Arc<T>>`).
 3. **No `hmac` crate.** RFC 2104 HMAC-SHA256 is about 30 lines over `sha2` 0.10, checked against RFC 4231 vectors (`util::hmac`).
@@ -1302,8 +1304,8 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
 
 ## 12. Scope cuts
 
-- No tokio or async migration in Waves 0–5. Proposed WP6.4 evaluates a bounded prototype and runtime ADR; it does not authorize a wholesale migration. No separate mount-adapter process: a native adapter crash still kills its worker, which is restarted with backoff.
-- No sparse or range spools, no striping of one object across lanes, no cross-file group fsync, no pack files.
+- No tokio or async migration in Waves 0–5. Wave 6 retains the runtime unless measured gates justify a scoped ADR; the earlier mandatory prototype proposal is superseded by [the selected plan](WAVE_6_PLAN.md). No separate mount-adapter process: a native adapter crash still kills its worker, which is restarted with backoff.
+- Waves 0–5: no sparse or range spools, no striping of one object across lanes, no cross-file group fsync, no pack files. Wave 6 explicitly designs private dirty-range recovery and batched durable work; it keeps independently verified chunks and defers packs. Its new contracts must prove ordering instead of silently relaxing these historical rules.
 - No clock or version-vector incremental conflict derivation. Append mode plus off-lock prepare is the plan.
 - No chain hash for snapshots. (Superseded in part by WP4.4: snapshot format 2 seals incrementally, O(change) per seal, and keeps the journal hash's meaning; CCR-WP4.4-3.)
 - No deterministic single session under mutual pairing. Worker leases prevent duplicate bytes, and duplicate metadata polling is O(1) when idle.
@@ -3031,50 +3033,31 @@ Also, reading a 512 MiB file through the WinFsp mount while it was still downloa
 The coordinator re-runs the two-machine lab afterwards.
 
 
-### 14.5c Proposed Wave 6: independent metadata and object engines
+### 14.5c Wave 6: chunked foundation, independent engines and build performance
 
-Wave 5 closure and the user's reduced-test integration policy are recorded in
-the [continuation handoff](notes/wave-5-handoff.md). That index preserves
-package knowledge and distinguishes the older live-build observations from
-fixes already integrated in Wave 5. Continuation scope remains for arbitration.
+The user selected this next-wave scope after Wave 5 integration. The concrete
+[Wave 6 plan](WAVE_6_PLAN.md) owns contracts, dependencies, package numbering,
+compatibility, performance gates and verification. It is a plan, not implemented
+behavior. The [Wave 5 handoff](notes/wave-5-handoff.md) remains the baseline.
 
-**Investigation/proposal, not implemented or a release commitment.** See the
-[build-sync incident and JuiceFS study](notes/wp6-build-sync-juicefs-study.md)
-for evidence, source references, design limits and the acceptance matrix.
-The [TigerBeetle supplement](notes/wp6-tigerbeetle-metadata-study.md) adds
-local metadata ownership, bounded batching/pipelining, repair budgets and
-deterministic fault tests while retaining offline peer reconciliation.
-
-The 2026-10-19 mounted-build incident produced 19 transiently reported
-`NOT_PERMITTED` download errors for locally authored objects, followed by a
-148-second stall indication. The indication itself did not pause sync. A
-best-effort availability-index update is a concrete source hazard; the exact
-cause of the deployed incident and the subsequent wait remain unproven.
-
-The direction is two independently progressing engines: metadata owns causal
-validation, convergence and authorization; objects own availability, transfer,
-source selection and demand. Metadata has priority on peer and loopback lanes
-and a fair share of shared DB/disk/CPU resources. Their narrow admission
-interface is durable and replayable. Objects are admitted per committed
-reference, without a folder-wide caught-up barrier. Local byte durability
-still precedes announcing a local write; remote metadata activation must not
-wait for content. This explicitly proposes revisiting §6.4's staged-reference
-fetch policy, with content-independent activation tested before changing it.
-
-| Package | Proposed scope |
+| Package | Selected scope |
 |---|---|
-| WP6.0 | Capture stall-transition evidence; reproduce/falsify local-object wants and lost availability updates. |
-| WP6.1 | Durable metadata/object admission, reconciliation after lost notifications, consistent availability repair and authorization checks. |
-| WP6.2 | Joined cancellable reads, reserved/yielding demand capacity, source-scoped retries and bounded resources. |
-| WP6.3 | Separate engine progress, explicit wait states and aggregated error episodes; retain genuine denial/corruption diagnostics. |
-| WP6.4 | Shared resource budgets and a measured Tokio prototype/runtime ADR, preserving synchronous mount/store boundaries where appropriate. |
-| WP6.INT | Crash/fault/security tests and two-machine build/read qualification against Wave 5 floors. |
+| WP6.0 | Native/mounted build baseline, phase observability and frozen content/admission/durability contracts. |
+| WP6.1 | 64 KiB chunk representation, direct small files, indexed manifests, provider interfaces and lifetimes. |
+| WP6.2 | Independent metadata engine, replayable admission and content-independent activation. |
+| WP6.3 | Independent object engine, manifest/chunk authorization, cross-repository demand and generation leases. |
+| WP6.4 | Dirty-range COW saves/reads, recoverable closes and explicit local flush durability. |
+| WP6.5 | Build performance, coherent caches, overlapping-commit freshness and resumable change journal. |
+| WP6.6 | Feature activation, compatibility, retention/GC safety and scoped status/errors. |
+| WP6.INT | Correctness, build and recovery gates; migration rehearsal and documented handoff. |
 
-Reconcile with WP5.1–5.4 before freezing ownership: activation, off-lock saves,
-read lifetime, lease recovery, next-slot demand and freshness already have
-Wave 5 work. JuiceFS informs bounded concurrency, single-flight reads,
-recovery, transaction retries and diagnostics; its shared authoritative
-metadata service is not a substitute for TKFS peer-replication semantics.
+Git providers, worktree commands, fsmonitor integration and shared directory-tree
+cloning stay deferred. The wave delivers their generic seams. Runtime replacement
+and SQLite replacement are not prerequisites. Retain the evidence and rationale
+in the [JuiceFS study](notes/wp6-build-sync-juicefs-study.md),
+[TigerBeetle supplement](notes/wp6-tigerbeetle-metadata-study.md) and
+[chunked/Git design notes](notes/chunked-cow-and-git-workspaces.md); their old
+package labels are historical and must not be treated as current assignments.
 
 ### 14.6 Qualification scenario catalog (created by WP0.5; owner un-ignores)
 

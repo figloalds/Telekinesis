@@ -1,5 +1,8 @@
 # Wave 6 supplement: TigerBeetle lessons for offline metadata sync
 
+Planning update: [WAVE_6_PLAN.md](../WAVE_6_PLAN.md) owns current scope, package
+numbering and gates. WP6 labels below refer to the earlier exploratory plan.
+
 2026-10-19. **Source study and proposal; no runtime implementation.** Builds on
 the [JuiceFS/build investigation](wp6-build-sync-juicefs-study.md). Inspected
 the sibling `..\tigerbeetle` at clean revision
