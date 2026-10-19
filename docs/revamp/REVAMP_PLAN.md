@@ -3033,6 +3033,11 @@ The coordinator re-runs the two-machine lab afterwards.
 
 ### 14.5c Proposed Wave 6: independent metadata and object engines
 
+Wave 5 closure and the user's reduced-test integration policy are recorded in
+the [continuation handoff](notes/wave-5-handoff.md). That index preserves
+package knowledge and distinguishes the older live-build observations from
+fixes already integrated in Wave 5. Continuation scope remains for arbitration.
+
 **Investigation/proposal, not implemented or a release commitment.** See the
 [build-sync incident and JuiceFS study](notes/wp6-build-sync-juicefs-study.md)
 for evidence, source references, design limits and the acceptance matrix.

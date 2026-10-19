@@ -7,6 +7,7 @@
 # ...and the two-machine lab results (WP4.INT, docs/VALIDATION.md).
 !/test-evidence/lab/
 !/test-evidence/build-sync-20261019/
+!/test-evidence/wave-5-handoff/
 # Legacy report locations (current harnesses use the directories above).
 /VALIDATION.json
 /*-VALIDATION.json

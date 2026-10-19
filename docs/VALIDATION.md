@@ -11,6 +11,13 @@ Four layers:
 3. the **desktop manual checklist** (below), for what the window itself does;
 4. the **soak** and the **two-machine lab**, run for the final integration.
 
+**2026-10-19 closure:** the user requested integrating Wave 5 into `master`
+while skipping long tests. The completed 2026-10-18 evidence below is preserved,
+not rerun or relabeled as fresh qualification. Current focused checks,
+omissions and continuation decisions are recorded in the
+[closure handoff](revamp/notes/wave-5-handoff.md) and
+`test-evidence/qualification-wave-5.json`.
+
 ## The test suite
 
 ```powershell
@@ -271,42 +278,45 @@ the links heal, and it passes when, within 30 min
 Its `QUAL` records keep the edits, the fault phases, a status sample of both
 folders every minute and the final state.
 
-**Results** (release, the final code; the details are in
-`test-evidence/qualification-final.json` and the WP4.INT notes):
+Two heavier workloads of the same daemons, links and checks are WP5.1's
+acceptance (`tests/qual_wp5_1_concurrent.rs`, `conflict_storm` and
+`fast_two_way_editing`, each about 2.5 h; `qualify.ps1 -Wave 5 -Files
+qual_wp5_1_concurrent -Heavy -Filter <name>` runs one with its floors):
+both sides edit an operation every 50–400 ms each for two hours, (a) every
+operation on one shared name pool (a conflict storm), (b) 10 % shared; (b)
+also requires the activation backlog to have no upward trend over the
+second hour (at most 2 events/min).
 
-- **The two-hour soak passes** (default workload, at `9dc5720`, 7,257 s):
-  4,889 edits (2,415 and 2,474; 768 more refused, e.g. a rename onto an
-  occupied name), 396 MB written, 180 fault phases (40 resets, 40 stalls,
-  20 blackholes, 20 refused-connection phases, …), 178 proxy resets, 662
-  connections and 495 MB through the proxies. Of the 240 per-minute folder
-  samples 159 read `up_to_date`, the others the fault in progress
-  (`backoff` 42, `offline` 13, transfers 25). When the edits stopped both
-  folders were up to date already (settled in 0.01 s): 5,630 shared events
-  on each side, equal journals and projections, all content, nothing
-  staged, every event acknowledged, both oracles empty.
-- Faster or conflict-heavy workloads (`TKFS_SOAK_PAUSE_MS_*`,
-  `TKFS_SOAK_SHARED_PERCENT`):
+**Results of Wave 5** (release, WP5.INT's final code: the storm and the fast
+editing at `90ad052`, the soak at `492e00b`, whose code is the same; all three at the same
+time on the shared development machine, beside the release oracles, the
+WSL test subset and the other WP5.1 scenarios during their first hour; the
+details are in
+`test-evidence/qualification-wave-5.json` and the WP5.INT notes):
 
-| Run | Workload | Outcome |
-|---|---|---|
-| storm, 8 min | every operation of both sides on the shared pool, one every 50–400 ms | **pass**: 3,408 events, 236 unresolved conflicts, settled in 1.6 s, oracle empty |
-| storm, 20 min | the same | **pass**: 7,082 events, 1,300 unresolved conflicts, settled in 1.6 s, oracle empty |
-| storm, 2 h | the same | **did not converge**: 8,973 and 7,905 events, 9,399 and 5,861 unresolved conflicts; 1,549 and 2,617 events still waiting after the 30 min settle, each conflicting event a full replay of minutes; the final oracle check of the two stopped stores had not finished after 3 h (stopped) |
-| fast editing, 91 min of 2 h (stopped) | 10 % on the shared pool, one operation every 50–400 ms | **falling behind**: 21.5K events and 100–107 unresolved conflicts on each side, the activation backlog growing (140 events after 30 min, 1.5K after 91 min) |
+| Run | Edits (A / B) | At the end | Settle | Oracles | Result |
+|---|---|---|---|---|---|
+| default soak, 2 h (an operation every 1–4 s, 10 % shared) | 2,408 / 2,459 (765 refused, e.g. a name taken) | 5,606 shared events each, 0 unresolved conflicts; 180 fault phases, 261 proxy resets, 1,201 connections, 507 MB through the proxies | 0.02 s | empty | **pass** (7,210 s); 172 of the 240 per-minute folder samples `up_to_date`, the others the fault in progress (`backoff` 28, `offline` 20, transfers 19) |
+| (a) conflict storm, 2 h (every operation on the shared pool) | 13,749 / 13,596 | 24,993 shared events, **24,269 unresolved conflicts** | **198 s** (≤ 30 min) | empty (8.9 s / 8.7 s) | **pass** (7,425 s); backlog over the second hour +3.9 / +5.0 events/min, peaks 304 / 391 |
+| (b) fast two-way editing, 2 h (10 % shared) | 16,589 / 16,500 | 31,341 shared events, 52 unresolved conflicts | **12.6 s** | empty (19.5 s / 19.4 s) | **pass** (7,262 s); backlog trend over the second hour **+0.38 / +0.41 events/min** (≤ 2), peaks 199 / 213 |
 
-The last two show this release's limit (measured before the WP4.INT
-re-review's scoped conflict gate, under which creations and namespace
-changes that touch no conflicted entry, parent or slot keep the fast path
-while other conflicts are open): an event that conflicts, or that touches a
-conflicted entry, is a slow event, and a slow event whose append-mode
-precondition fails is a full replay, whose cost grows with the history and,
-steeply, with the unresolved conflicts;
-under continuous local writes the prepared replays also go stale and are
-redone (2,420 stale outcomes in the stopped run). Activation then falls
-behind a peer that keeps writing. Resolving conflicts keeps it fast
-(README, *Filesystem behaviour*); the plan's scope cut keeps conflict
-derivation to append mode plus the off-lock replay, and WP4.INT files the
-rest as CCR-WP4.INT-3.
+Before Wave 5 (WP4.INT, `9dc5720`): the default soak passed; a two-hour storm
+did not converge (9,399 unresolved conflicts, 1,549 and 2,617 events still
+waiting after the 30 min settle, the oracle unfinished after 3 h) and fast
+editing fell behind (the backlog growing from 140 to 1.5K events over 91
+minutes), because a conflicting event's full replay grew with the history
+and the open conflicts. WP5.1's slow path costs the event's cones instead
+(about 8 ms of CPU per concurrent namespace event at 5K events and 1K open
+conflicts, against 269 ms; a full rebuild at 9K open conflicts in about 4 s,
+against 519–549 s; *Floors* above). What grows with the open conflicts is
+the conflict list each conflict-changing commit writes (README, *Known
+limitations*): the storm's backlog peaked at a few hundred events during
+fault phases and cleared within minutes of the last edit.
+
+The Wave 4 runs (`9dc5720`, `test-evidence/qualification-final.json`): the
+default soak passed (7,257 s: 4,889 edits, 180 fault phases, 5,630 shared
+events each, settled in 0.01 s, oracles empty), and the conflict storms of
+8 and 20 minutes passed (236 and 1,300 unresolved conflicts).
 
 ## Two-machine lab
 
@@ -353,6 +363,17 @@ argument" (`STATUS_FILE_IS_OFFLINE`: a read waits up to 15 s for content
 that is still downloading, then fails; README, *Initial-sync gate*). A file
 written through the mount reached the laptop and hashed correctly there,
 and the folder stopped cleanly with its mount point removed.
+
+**Wave 5** addresses the three findings and measures them on one machine
+(the coordinator re-runs the lab afterwards): a read of content still
+downloading now waits while the download progresses and returns the bytes
+(`qual_wp5_2_local::mounted_read_of_a_512mib_object_while_it_downloads`);
+after a 45 s outage in the middle of a 512 MiB transfer every lane is
+`Ready` and bytes flow again within about a second of the restore, from the
+durable offset (`qual_wp5_3_recovery`, four outage kinds); and copying
+2,000 files into a WinFsp mount is more than twice as fast as with the
+previous release on the same machine (`qual_wp5_2_local::copy_2000_small_files_into_a_mount`;
+*Floors* above).
 
 ## Earlier validation records
 

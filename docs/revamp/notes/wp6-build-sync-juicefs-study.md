@@ -7,6 +7,12 @@ own robust engine, and admit urgent reads without coupling either engine's
 overall progress to the other. Production code and the running installation
 were not changed during this investigation.
 
+**After Wave 5 integration:** the observed installation and inspected base
+predate several relevant fixes. See the
+[closure handoff](wave-5-handoff.md#what-the-live-build-investigation-does-and-does-not-describe)
+for which findings Wave 5 addresses and which remain open. Keep the incident
+as historical evidence; re-measure the integrated version before continuing.
+
 The [TigerBeetle metadata supplement](wp6-tigerbeetle-metadata-study.md)
 extends this proposal with offline-authority boundaries, bounded metadata
 pipelines, batching, repair and deterministic simulation lessons.

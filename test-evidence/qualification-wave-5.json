@@ -1,0 +1,159 @@
+{
+  "schema": 1,
+  "kind": "wave-5-integration-closure",
+  "package": "WP5.INT",
+  "generated_at": "2026-10-19T02:42:23.853904-03:00",
+  "source_integration_commit": "90ad052a1dc72e5a872bab20f399506886c64ae8",
+  "production_merge_commit": "ef9bb23",
+  "policy": "User requested Wave 5 completion and merge to master, skipping long tests. Completed prior evidence is preserved; no fresh full qualification claimed.",
+  "prior_machine_readable_records": [
+    {
+      "path": "qualification-all.json",
+      "git": {
+        "commit": "90ad052a1dc72e5a872bab20f399506886c64ae8",
+        "branch": "revamp/wp5-int",
+        "dirty": true,
+        "dirty_paths": [
+          "?? docs/revamp/notes/wp5-int.md",
+          "?? test-evidence/qualification-wave-5-conflict-storm.json",
+          "?? test-evidence/qualification-wave-5-fast-two-way.json"
+        ]
+      },
+      "generated_at": "2026-10-18T10:15:15.7166207-03:00",
+      "summary": {
+        "ok": true,
+        "scenarios": 103,
+        "by_status": {
+          "pass": 102,
+          "skipped": 1
+        },
+        "floors_evaluated": 79,
+        "floors_passed": 76,
+        "floors_failed": 0,
+        "floors_missing": 0,
+        "floors_not_run": 3,
+        "floors_incomplete": 0,
+        "enforced_failures": []
+      }
+    },
+    {
+      "path": "qualification-wave-5-conflict-storm.json",
+      "git": {
+        "commit": "90ad052a1dc72e5a872bab20f399506886c64ae8",
+        "branch": "revamp/wp5-int",
+        "dirty": false,
+        "dirty_paths": []
+      },
+      "generated_at": "2026-10-18T08:14:41.2592710-03:00",
+      "summary": {
+        "ok": true,
+        "scenarios": 1,
+        "by_status": {
+          "pass": 1
+        },
+        "floors_evaluated": 7,
+        "floors_passed": 1,
+        "floors_failed": 0,
+        "floors_missing": 0,
+        "floors_not_run": 6,
+        "floors_incomplete": 0,
+        "enforced_failures": []
+      }
+    },
+    {
+      "path": "qualification-wave-5-fast-two-way.json",
+      "git": {
+        "commit": "90ad052a1dc72e5a872bab20f399506886c64ae8",
+        "branch": "revamp/wp5-int",
+        "dirty": false,
+        "dirty_paths": []
+      },
+      "generated_at": "2026-10-18T08:12:06.9254961-03:00",
+      "summary": {
+        "ok": true,
+        "scenarios": 1,
+        "by_status": {
+          "pass": 1
+        },
+        "floors_evaluated": 7,
+        "floors_passed": 2,
+        "floors_failed": 0,
+        "floors_missing": 0,
+        "floors_not_run": 5,
+        "floors_incomplete": 0,
+        "enforced_failures": []
+      }
+    }
+  ],
+  "combined_prior_floors": {
+    "distinct_expected": 79,
+    "passed": 79,
+    "failed": 0,
+    "missing": 0
+  },
+  "prior_reported_checks": {
+    "provenance": "docs/revamp/notes/wp5-int.md; historical reports, not rerun during closure",
+    "windows_full_suite": {
+      "passed": 1157,
+      "failed": 0,
+      "ignored": 137
+    },
+    "wsl_subset": "773 passed, 1 timing failure; isolated reruns and whole failing binary subsequently passed; see notes",
+    "oracles": "1000 fuzz + 40 stress seeds reported",
+    "default_soak": "2 hours reported passed; see docs/VALIDATION.md"
+  },
+  "closure_checks": {
+    "status": "passed",
+    "source_code_matches_integration_branch": true,
+    "format": {
+      "command": "cargo fmt --check",
+      "exit_code": 0
+    },
+    "focused_tests": {
+      "command": "cargo test --test local_fs_throughput --test availability_index --test worker_feed_status --test contracts --test harness_selftest -- --test-threads=4",
+      "exit_code": 0,
+      "passed": 124,
+      "failed": 0,
+      "ignored": 2,
+      "by_binary": {
+        "local_fs_throughput": 39,
+        "availability_index": 23,
+        "worker_feed_status": 4,
+        "contracts": 40,
+        "harness_selftest": 18
+      }
+    },
+    "network_regressions": {
+      "exit_code": 0,
+      "passed": 3,
+      "tests": [
+        "peer_supervisor::lanes_in_backoff_redial_at_once_when_a_sibling_connects",
+        "objects_v3_lanes::a_demanded_object_gets_the_next_pull_of_a_busy_lane",
+        "objects_v3_lanes::an_offer_whose_session_went_away_gives_up_its_leases"
+      ]
+    },
+    "total_fresh_tests_passed": 127,
+    "total_fresh_tests_failed": 0,
+    "total_fresh_tests_ignored": 2,
+    "cli_smoke": {
+      "command": "C:/tkfs-target/wp5-int/debug/tkfs.exe --help",
+      "exit_code": 0
+    },
+    "documentation": "13 handoff local links checked, evidence JSON parsed, git diff --check passed",
+    "build": "Fresh Windows debug CLI and selected test binaries compiled successfully; initial test build 1m30s."
+  },
+  "not_run_during_closure": [
+    "full test suite",
+    "qualify -All",
+    "multi-hour soak",
+    "heavy concurrent editing campaigns",
+    "large oracle fuzz/stress",
+    "two-machine lab",
+    "desktop manual checklist",
+    "Docker upgrade rehearsal",
+    "full Linux qualification"
+  ],
+  "handoff": "docs/revamp/notes/wave-5-handoff.md",
+  "deployment": "Running Desktop/v installation not replaced or restarted by this closure.",
+  "merge_target": "master"
+}
