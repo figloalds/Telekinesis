@@ -20,3 +20,5 @@
   demand scheduling, error handling and the concurrency/Tokio decision study.
 - [TigerBeetle metadata supplement](revamp/notes/wp6-tigerbeetle-metadata-study.md):
   offline authority, bounded metadata pipelines, batching, repair and simulation.
+- [Wave 5 closure and continuation handoff](revamp/notes/wave-5-handoff.md):
+  integrated fixes, retained evidence, current limitations and pending decisions.
