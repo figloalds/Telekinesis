@@ -687,30 +687,47 @@ fn seen_session(session: &str) {
 /// Fixed process-wide release workers, shared across every daemon fixture,
 /// peer and repository. Pending work stays in the bounded offer registry.
 pub const OFFER_RELEASE_WORKERS: usize = 2;
-static RELEASE_STARTED: OnceLock<usize> = OnceLock::new();
+static RELEASE_STARTED: Mutex<(usize, Option<Instant>)> = Mutex::new((0, None));
 
 fn start_reaper() -> bool {
-    *RELEASE_STARTED.get_or_init(|| {
-        (0..OFFER_RELEASE_WORKERS)
-            .filter(|index| {
-                thread::Builder::new()
-                    .name(format!("offer-release-{index}"))
-                    .spawn(|| loop {
-                        let result = std::panic::catch_unwind(|| reap_offers(Instant::now()));
-                        if result.is_err() {
-                            crate::util::log::event!(error, UNKNOWN_ERROR, {
-                                "site":"inbound.offer_cleanup", "detail":"release attempt panicked; cleanup worker continues",
-                            });
-                        }
-                        let _ = offers()
-                            .changed
-                            .wait_timeout(lock(&offers().map), REAP_EVERY)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    })
-                    .is_ok()
-            })
-            .count()
-    }) > 0
+    let mut started = lock(&RELEASE_STARTED);
+    if started.0 == OFFER_RELEASE_WORKERS || started.1.is_some_and(|at| Instant::now() < at) {
+        return started.0 > 0;
+    }
+    for index in started.0..OFFER_RELEASE_WORKERS {
+        match thread::Builder::new()
+            .name(format!("offer-release-{index}"))
+            .spawn(release_loop)
+        {
+            Ok(_) => started.0 += 1,
+            Err(error) => {
+                crate::util::log::event!(warn, CONTENT_RESOURCE_LIMIT, {
+                    "site":"inbound.offer_cleanup.start", "message":error.to_string(),
+                });
+                break;
+            }
+        }
+    }
+    started.1 =
+        (started.0 < OFFER_RELEASE_WORKERS).then(|| Instant::now() + Duration::from_secs(1));
+    started.0 > 0
+}
+
+fn release_loop() {
+    loop {
+        let result = std::panic::catch_unwind(|| reap_offers(Instant::now()));
+        if result.is_err() {
+            crate::util::log::event!(error, UNKNOWN_ERROR, {
+                "site":"inbound.offer_cleanup", "detail":"release attempt panicked; cleanup worker continues",
+            });
+        }
+        drop(
+            offers()
+                .changed
+                .wait_timeout(lock(&offers().map), REAP_EVERY)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -723,9 +740,10 @@ pub struct OfferCleanupView {
     pub closed_pending: usize,
 }
 pub fn offer_cleanup_view() -> OfferCleanupView {
+    let worker_threads = lock(&RELEASE_STARTED).0;
     let map = lock(&offers().map);
     OfferCleanupView {
-        worker_threads: RELEASE_STARTED.get().copied().unwrap_or(0),
+        worker_threads,
         active: map.active_cleanup,
         peak: map.cleanup_peak,
         attempts_completed: map.cleanup_attempts,
@@ -1242,6 +1260,12 @@ fn push(
                     // A refused part (the object settled, the worker gone)
                     // shows in the object's result.
                     let _ = sink.offer(hash, chunk.offset, chunk.total, &bytes, 0);
+                    if let Err(error) =
+                        crate::util::fault::trigger("inbound.objects.push.after_admit")
+                    {
+                        failure = Some(ErrorWire::from_error(&error));
+                        break;
+                    }
                     sink.wait_below(PUSH_BUFFERED_BYTES, &stop);
                     if let Some(error) = sink.fatal() {
                         failure = Some(worker_failure(&error));
