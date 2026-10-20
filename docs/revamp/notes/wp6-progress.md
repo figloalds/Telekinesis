@@ -453,7 +453,51 @@ corrected that test. Neither failure was addressed by relaxing a timing bound.
 
 This is short native package evidence for CCR-WP5.INT-1, not the final sustained
 fairness/platform/build gate. Still pending: full retained legacy job/spool/lease
-budget, cross-lane-count generation and acceptor push-generation audits, cancellation within legacy
+budget and acceptor push-generation audits, cancellation within legacy
 first-serve hashing, large working-set/idle-poll overhead, mounted range demand,
 recoverable private saves and WP6.4–6.6 integration/qualification. Ordinary
 typed-content activation remains off.
+
+## Pull-pool ownership across lane counts (WP6.3, in progress)
+
+CCR-WP6.3-6 gives every real peer supervisor an ordered pool identity before
+starting its lanes. Lanes and reconnects retain that identity; a replacement
+supervisor receives a newer one. The local opaque pull ID appends the pool
+counter, including foreground frame IDs. A delayed lane of an older context
+cannot acquire a new pool merely because its run starts later. Production
+contexts refuse unregistered pools; fixtures without a supervisor use the
+documented lazy registration path.
+
+Worker fences now order daemon incarnation, pool and lane run separately. This
+closes the count-dependent scope gap: changing the bulk lane count, and later
+returning to a previous count, cannot make an old layout current again. It also
+handles old-layout requests for a shard not previously seen by the worker.
+Canonical classic IDs and the previous qualified form remain recognizable;
+after a newer family is claimed, they cannot release its leases or change its
+source backoff. The historical opaque session behavior, including its loose
+lane-name interpretation, remains for classic requests before a new family
+fence is established. New qualified requests retain strict lane validation.
+
+Both worker family/run tables and the daemon context registry have explicit
+16,384-entry bounds. Worker fences are never evicted for capacity. Existing
+owners can advance while full. The daemon registry only reclaims dead weak
+contexts, so a live old lane retains its original identity. Native tests cover
+capacity, delayed higher-numbered old runs, count reversal, daemon restart,
+stale writes/releases/backoff and malformed/bounded IDs. Expiry of an already
+superseded lease no longer backs off a healthy replacement source.
+
+The authenticated native reconnect test now explicitly establishes a verified
+empty-history receipt before arming its read stall, then asserts the actual
+nonempty file is still missing and leased. The same helper exercises a real
+one-to-two-lane resize. The first resize sample restored 150,000 verified bytes
+in 9.25 ms while the predecessor's two-second read was still in flight. The
+tests retain the one-second limit, verify the newer worker fence after old
+cleanup, and exercise the existing foreground-demand regression as well.
+
+This is retained pull ownership, not completion of the inbound push audit.
+Inbound push offers still use stable per-lane worker IDs and a reaper wait;
+the pull pool's local `PeerContext` identity is not an authenticated remote
+push-pool identity. That lifecycle needs its own generation and native stale
+completion evidence. Full legacy budgets, hash cancellation, mounted reads,
+recoverable saves, final saturation/build/platform qualification and WP6.6
+compatibility/activation remain pending.
