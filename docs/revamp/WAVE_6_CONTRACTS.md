@@ -586,3 +586,31 @@ network wants/pushes use the registered session owner. An unregistered direct
 wants/push call has no worker authority. Existing close-release helper fanout,
 complete legacy job/byte/spool budgets, cancellation within first-serve hashing,
 final fairness and platform qualification remain separate outstanding work.
+
+## CCR-WP6.3-8: interruptible legacy first-serve verification
+
+Legacy `objects.read` and the reserved foreground `content-v1` legacy-read
+operation keep whole-file SHA-256 verification before first serve. Their
+loopback request deadline, cancellation/disconnect and worker shutdown now
+reach the hash loop. Verification checks its caller before and after each
+64 KiB read, including EOF, and before publishing trust. Cancellation does
+not supply a partial digest, quarantine good bytes, publish a verified marker
+or create an object retry. Individual blocking filesystem calls remain
+OS-bound; cancellation takes effect when the current bounded call returns.
+
+The existing `Store::read_object_range` seam remains. The checked variant
+accepts a synchronous caller-owned predicate and checks it around bounded
+range reads as well. The foreground provider permit checks request cancellation
+while waiting for its existing reserved capacity. No cancellation hook or
+helper thread survives a completed request. The reserved operation retains its
+64 KiB frame limit and five-second maximum; ordinary legacy reads retain the
+1 MiB reply limit and use their actual loopback request deadline. Direct worker
+dispatch uses a 60-second fallback for ordinary reads.
+
+After potentially long first-serve verification, the reader rechecks the
+committed-shared-reference/shareable triad before reading the frame. This
+is a local authorization check, not an offline/global revocation promise.
+Wire identities and legacy byte digests do not change, and no normal typed
+content activation is enabled. Full legacy scheduler/byte/spool budgets,
+close-release helper fanout, mounted demand and report/scrub cancellation
+remain separate work.

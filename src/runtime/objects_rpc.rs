@@ -127,7 +127,13 @@ pub fn dispatch(
     }
     match op {
         ops::WANT => want(ctx, parse(op, header)?),
-        ops::READ => read(ctx, parse(op, header)?),
+        ops::READ => read_request(
+            ctx,
+            op,
+            header,
+            Instant::now() + Duration::from_secs(60),
+            &|| false,
+        ),
         ops::WRITE => write(ctx, parse(op, header)?, body),
         ops::REPORT => report(ctx, parse(op, header)?),
         ops::RELEASE => release_op(ctx, parse(op, header)?),
@@ -568,24 +574,67 @@ pub(super) fn legacy_prepare(
 }
 
 pub(super) fn legacy_read(ctx: &WorkerCtx, header: &Value) -> Result<(Value, Vec<u8>), ErrorWire> {
-    let header: ReadHeader = parse("legacy-read", header)?;
+    read_request(
+        ctx,
+        crate::model::content_wire::LEGACY_READ,
+        header,
+        Instant::now() + Duration::from_secs(5),
+        &|| false,
+    )
+}
+
+/// Loopback request cancellation reaches first-serve hashing. The responder's
+/// predicate is borrowed for this call; no hook/thread survives the request.
+pub(super) fn read_request(
+    ctx: &WorkerCtx,
+    op: &str,
+    header: &Value,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Value, Vec<u8>), ErrorWire> {
+    let foreground = op == crate::model::content_wire::LEGACY_READ;
+    let header: ReadHeader = parse(op, header)?;
     bind(ctx, &header.route)?;
-    if header.len > crate::model::content_wire::FRAME_BYTES as u64 {
+    if foreground && header.len > crate::model::content_wire::FRAME_BYTES as u64 {
         return Err(ErrorWire::coded(
             "CONTENT_BUFFER_LIMIT",
             "legacy foreground read",
         ));
     }
     let context = crate::content::ReadContext {
-        deadline: Instant::now() + Duration::from_secs(5),
+        deadline: if foreground {
+            deadline.min(Instant::now() + Duration::from_secs(5))
+        } else {
+            deadline
+        },
         cancel: lock(&ctx.inflight_objects).legacy_cancel.child(),
     };
-    let provider = crate::content::LocalContent::open(&ctx.root).map_err(wire)?;
-    let _buffers = provider.foreground_permit(&context).map_err(wire)?;
+    let check = || {
+        context.check()?;
+        anyhow::ensure!(
+            !cancelled() && !ctx.stopping.load(Ordering::Relaxed),
+            "CONTENT_CANCELLED"
+        );
+        Ok(())
+    };
+    check().map_err(wire)?;
+    let provider = foreground
+        .then(|| crate::content::LocalContent::open(&ctx.root))
+        .transpose()
+        .map_err(wire)?;
+    let _buffers = provider
+        .as_ref()
+        .map(|p| p.foreground_permit_checked(&context, &check))
+        .transpose()
+        .map_err(wire)?;
     let store = super::content_rpc::connection(ctx).map_err(wire)?;
-    let (total, bytes) =
-        store.read_object_range(&header.hash, header.offset, header.len as usize)?;
-    context.check().map_err(wire)?;
+    let (total, bytes) = store.read_object_range_checked(
+        &header.hash,
+        header.offset,
+        header.len.min(MAX_READ_LEN) as usize,
+        check,
+    )?;
+    check().map_err(wire)?;
     Ok((json!(ReadReply { total }), bytes))
 }
 
@@ -813,14 +862,6 @@ fn release_op(ctx: &WorkerCtx, header: ReleaseHeader) -> Result<(Value, Vec<u8>)
 /// The durable-progress signal of `ctx`'s worker.
 fn progress(ctx: &WorkerCtx) -> std::sync::Arc<super::ctx::ProgressSignal> {
     lock(&ctx.inflight_objects).progress.clone()
-}
-
-/// `objects.read{route, hash, offset, len ≤ 1 MiB}` → `{total}` / bytes.
-fn read(ctx: &WorkerCtx, header: ReadHeader) -> Result<(Value, Vec<u8>), ErrorWire> {
-    bind(ctx, &header.route)?;
-    let len = header.len.min(MAX_READ_LEN) as usize;
-    let (total, bytes) = store(ctx)?.read_object_range(&header.hash, header.offset, len)?;
-    Ok((json!(ReadReply { total }), bytes))
 }
 
 /// `objects.report{route, hash, code}` → `{action}`.
