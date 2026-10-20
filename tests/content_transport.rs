@@ -560,9 +560,23 @@ impl LegacyPushReceiver {
         bytes: &[u8],
         lane: LaneSpec,
     ) {
+        let reply = self.send_lane(conn, item, bytes, lane).unwrap();
+        assert_eq!(reply.results.len(), 1);
+        assert_eq!(
+            reply.results[0].outcome,
+            tkfs::model::protocol::objects::ObjectOutcome::Completed
+        );
+    }
+    fn send_lane(
+        &self,
+        conn: &Conn,
+        item: tkfs::model::protocol::objects::WantItem,
+        bytes: &[u8],
+        lane: LaneSpec,
+    ) -> Result<tkfs::model::protocol::objects::ObjectsResult, CallError> {
         use tkfs::model::protocol::{
             frame::ChunkHeader,
-            objects::{ObjectOutcome, ObjectsPush, ObjectsResult},
+            objects::{ObjectsPush, ObjectsResult},
         };
         let request = ObjectsPush {
             repo: self.scope.repo.clone(),
@@ -571,37 +585,34 @@ impl LegacyPushReceiver {
             lane,
             items: vec![item.clone()],
         };
-        let mut upload = conn
-            .upload(
-                "objects.push",
-                serde_json::to_value(request).unwrap(),
-                Priority::Control,
-                Duration::from_secs(5),
-            )
-            .unwrap();
+        let mut upload = conn.upload(
+            "objects.push",
+            serde_json::to_value(request).unwrap(),
+            Priority::Control,
+            Duration::from_secs(5),
+        )?;
         for (index, chunk) in bytes[item.offset as usize..].chunks(65536).enumerate() {
             let offset = item.offset + (index * 65536) as u64;
-            upload
-                .chunk(
-                    ChunkHeader {
-                        id: 0,
-                        hash: Some(item.hash.clone()),
-                        offset,
-                        total: bytes.len() as u64,
-                        last: offset + chunk.len() as u64 == bytes.len() as u64,
-                    },
-                    chunk,
-                )
-                .unwrap();
+            upload.chunk(
+                ChunkHeader {
+                    id: 0,
+                    hash: Some(item.hash.clone()),
+                    offset,
+                    total: bytes.len() as u64,
+                    last: offset + chunk.len() as u64 == bytes.len() as u64,
+                },
+                chunk,
+            )?;
         }
-        let reply = upload.finish().unwrap();
+        let reply = upload.finish()?;
         let reply: ObjectsResult = if reply.body.is_empty() {
-            serde_json::from_value(reply.header).unwrap()
+            serde_json::from_value(reply.header)
+                .map_err(|e| CallError::Remote(ErrorWire::coded("INVALID_REPLY", e)))?
         } else {
-            serde_json::from_slice(&reply.body).unwrap()
+            serde_json::from_slice(&reply.body)
+                .map_err(|e| CallError::Remote(ErrorWire::coded("INVALID_REPLY", e)))?
         };
-        assert_eq!(reply.results.len(), 1);
-        assert_eq!(reply.results[0].outcome, ObjectOutcome::Completed);
+        Ok(reply)
     }
 }
 impl Drop for LegacyPushReceiver {
@@ -821,6 +832,80 @@ fn native_inbound_push_pool_resize_fences_an_old_still_open_session() {
         "WAVE6_PUSH {}",
         serde_json::json!({"scenario":"native_push_pool_resize","admission_ms":admission.as_secs_f64()*1000.0,"bound_ms":250,"old_lane_count":1,"new_lane_count":2,"typed_activation":false})
     );
+}
+
+#[test]
+fn native_push_backoff_is_fenced_at_mutation_after_a_superseding_transfer_completes() {
+    use tkfs::{
+        model::protocol::objects::ObjectOutcome,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let bytes = vec![104; 150_000];
+    let wrong = vec![105; bytes.len()];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let old = receiver.dial();
+    let hash = p.root.digest.to_string();
+    let item = receiver
+        .wants(&old)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    let mut config = FaultConfig::new("objects.write.before_source_backoff", FaultAction::Hang);
+    config.ms = Some(2000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let _reset = Reset;
+    thread::scope(|scope| {
+        let pending = scope.spawn(|| receiver.send_lane(&old, item, &wrong, LANE));
+        let until = Instant::now() + Duration::from_secs(3);
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fault::fired(),
+            1,
+            "old source verdict must already be collected before its projection stalls"
+        );
+        let new = receiver.dial();
+        let started = Instant::now();
+        let item = receiver
+            .wants(&new)
+            .into_iter()
+            .find(|item| item.hash == hash)
+            .unwrap();
+        receiver.push(&new, item, &bytes);
+        let availability = started.elapsed();
+        let previous = pending.join().unwrap();
+        match previous {
+            Ok(reply) => assert_eq!(reply.results[0].outcome, ObjectOutcome::CorruptAtSource),
+            Err(error) => assert_eq!(error.code(), "IN_FLIGHT_ELSEWHERE"),
+        }
+        let mut out = vec![0; bytes.len()];
+        p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .unwrap();
+        assert!(
+            runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.a.ctx.device, &hash).is_none(),
+            "old verdict applied a backoff to the completed replacement"
+        );
+        assert_eq!(out, bytes);
+        assert!(
+            availability < Duration::from_secs(1),
+            "replacement waited {availability:?}"
+        );
+        new.close();
+        println!(
+            "WAVE6_PUSH {}",
+            serde_json::json!({"scenario":"native_backoff_after_replacement","availability_ms":availability.as_secs_f64()*1000.0,"bound_ms":1000,"old_projection_stall_ms":2000,"typed_activation":false})
+        );
+    });
+    old.close();
 }
 
 #[test]

@@ -348,7 +348,11 @@ fn source_entry<'a>(
 pub fn back_off_source(ctx: &WorkerCtx, source: &str, hash: &str) -> u64 {
     let now = now_ms();
     let mut state = lock(&ctx.inflight_objects);
-    let entry = source_entry(&mut state, source, hash, now);
+    back_off_source_locked(&mut state, source, hash, now)
+}
+
+fn back_off_source_locked(state: &mut ObjectsState, source: &str, hash: &str, now: u64) -> u64 {
+    let entry = source_entry(state, source, hash, now);
     entry.0 = entry.0.saturating_add(1);
     let delay = Backoff::objects().nominal(entry.0);
     entry.1 = now.saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
@@ -1054,7 +1058,14 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         }
     }
     for (hash, code) in &blamed {
-        let retry_at = back_off_source(ctx, source, hash);
+        crate::util::fault::trigger("objects.write.before_source_backoff").map_err(wire)?;
+        let retry_at = {
+            let mut state = lock(&ctx.inflight_objects);
+            if !run_owns(&state, owned.as_ref()) {
+                continue;
+            }
+            back_off_source_locked(&mut state, source, hash, now_ms())
+        };
         crate::util::log::event!(warn, (code.as_str()), {
             "site": "worker.objects.write",
             "hash": hash,
