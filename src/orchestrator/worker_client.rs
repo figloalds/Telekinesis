@@ -866,8 +866,11 @@ impl SessionWorkerClient {
                         if cancelled() {
                             return Err(CallError::Cancelled);
                         }
-                        thread::sleep(until.saturating_duration_since(Instant::now())
-                            .min(Duration::from_millis(20)));
+                        thread::sleep(
+                            until
+                                .saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(20)),
+                        );
                     }
                     pause = (pause * 2).min(REFUSED_RETRY_CAP);
                 }
@@ -1188,11 +1191,11 @@ fn read_loop(
             // waits for this range, is never left waiting.
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 client.read_cancellable(&header, deadline, &|| {
-                        cancelled() || {
-                            let state = lock(&shared.state);
-                            state.stop || state.skipped.contains(&range.hash)
-                        }
-                    })
+                    cancelled() || {
+                        let state = lock(&shared.state);
+                        state.stop || state.skipped.contains(&range.hash)
+                    }
+                })
             }));
             Some(read.unwrap_or_else(|_| {
                 Err(CallError::Remote(ErrorWire::coded(
