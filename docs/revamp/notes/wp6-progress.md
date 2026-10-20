@@ -644,3 +644,31 @@ Full legacy budgets, bounded close-release work, durable local-failure error
 projection, mounted range demand, recoverable saves, the change journal/cache,
 compatibility/retention/activation and final platform/build/load gates remain
 pending. Ordinary typed-content activation remains off.
+
+## Bounded offer cleanup and closed-session authority (WP6.3, in progress)
+
+CCR-WP6.3-9 replaces a thread per closed inbound session with two process-wide
+release workers. Close only marks entries in the existing 4,096-offer table and
+wakes the workers. There is no separate queue of copied release batches.
+Oldest eligible offers are claimed first; two guarded client release attempts
+may run at once, including explicit sweeps. Closed offers are removed when
+claimed, silent live offers retain their historical released marker, and every
+RPC carries the exact qualified lease ID. The guards survive RPC and unwind.
+Workers retry missing startup capacity at most once per second on later offers
+and contain an attempt's panic. Their fixed process lifetime is explicit.
+
+The authenticated registration guard also retires its push session before
+unregistering. Close and guarded offer/status publication use the same short
+pool gate. This prevents a delayed want from publishing after close even when
+the close initially saw no offer. Sibling sessions and pool identity remain
+independent. An already-admitted data prefix may still become durable under
+its original, unsuperseded lineage; it then releases only its own lease.
+Closing authority does not discard that valid prefix or create source backoff.
+
+This change qualifies the release helper count and client attempt ownership,
+not all retained legacy memory, job, connection or shutdown budgets. A timed-out
+client attempt does not prove its remote handler already stopped. Large-backlog
+tails, cleanup fairness across worker instances/repositories, durable failure
+projection, the other legacy budgets, mounted saves/ranges, cache/journal,
+compatibility/retention and final platform/build/load gates remain pending.
+Ordinary typed-content activation remains off.
