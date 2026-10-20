@@ -163,6 +163,56 @@ fn pool_identity_capacity_retains_live_owners_and_only_reclaims_dead_contexts() 
         first.layout
     );
 }
+
+#[test]
+fn inbound_sessions_retain_their_authenticated_pool_and_get_distinct_session_roots() {
+    let clock = Clock::new(60);
+    let a = clock.accept_push("peer-a", 3).unwrap();
+    let b = clock.accept_push("peer-a", 3).unwrap();
+    assert_eq!(a.run.layout, b.run.layout);
+    assert!(b.run.generation > a.run.generation);
+    assert!(a.current() && b.current());
+    let resized = clock.accept_push("peer-a", 2).unwrap();
+    assert!(!a.current() && !b.current() && resized.current());
+    let returned = clock.accept_push("peer-a", 3).unwrap();
+    assert!(returned.run.layout > resized.run.layout);
+    assert!(!resized.current() && returned.current());
+    assert!(clock.accept_push("peer-b", 1).unwrap().current());
+    for count in [0, 16] {
+        assert_eq!(
+            clock.accept_push("peer-a", count).err().unwrap().code,
+            "INVALID_REQUEST"
+        );
+    }
+}
+
+#[test]
+fn push_frame_ids_remain_local_bounded_and_preserve_the_stable_lane_scope() {
+    let run = lease::PushRun {
+        generation: Generation {
+            incarnation: 60,
+            run: 3,
+        },
+        layout: 1,
+    };
+    let peer = uuid::Uuid::new_v4().to_string();
+    let base = format!("push:{peer}:14/15");
+    let session = lease::qualify_push(&base, run, 4).unwrap();
+    let owned = lease::parse(&session).unwrap().unwrap();
+    assert_eq!(owned.scope, base);
+    assert_eq!(owned.family, format!("push:{peer}"));
+    assert_eq!(owned.generation, run.generation);
+    assert_eq!(owned.layout, Some(1));
+    assert_eq!(owned.frame, Some(4));
+    assert!(session.len() <= 128);
+    assert!(lease::qualify_push(&base, run, 0).is_err());
+    assert!(
+        lease::parse(
+            "push:p:0/1:c000000000000000A~w6.0000000000000001.0000000000000003.0000000000000001"
+        )
+        .is_err()
+    );
+}
 #[test]
 fn ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base() {
     let g = Generation {

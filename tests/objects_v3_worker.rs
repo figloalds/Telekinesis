@@ -3308,3 +3308,117 @@ fn a_classic_opaque_session_that_resembles_another_peers_lane_keeps_its_old_mean
         "completed"
     );
 }
+
+#[test]
+fn push_offer_frames_fence_old_wants_writes_and_cleanup_even_after_the_new_offer_is_released() {
+    use tkfs::model::lease::{self, Generation, PushRun};
+    let bytes = vec![91; 100_000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "push-frames", &bytes);
+    });
+    let session = |root, layout, frame| {
+        lease::qualify_push(
+            "push:peer-a:0/1",
+            PushRun {
+                generation: Generation {
+                    incarnation: 60,
+                    run: root,
+                },
+                layout,
+            },
+            frame,
+        )
+        .unwrap()
+    };
+    let first = session(10, 1, 100);
+    assert_eq!(want_op(&w, &w.route_b, &first).len(), 1);
+    assert_eq!(
+        write_op(&w, &w.route_b, &first, &hash, 0, 100_000, &bytes[..65536])["durable_offset"],
+        65536
+    );
+    let second = session(10, 1, 101);
+    assert_eq!(want_op(&w, &w.route_b, &second)[0]["offset"], 65536);
+    let before = lease(&w, &hash);
+    let (reply, _) = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route":w.route_b,"session":first,"hashes":[hash],"hold_ms":60_000}),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(reply["released"], 0);
+    assert_eq!(lease(&w, &hash), before);
+    assert_eq!(op(&w.ctx,"objects.write",json!({"route":w.route_b,"session":first,"items":[{"hash":hash,"offset":65536,"total":100_000,"len":1,"last":false}]}),&[91]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
+    op(
+        &w.ctx,
+        "objects.release",
+        json!({"route":w.route_b,"session":second,"hashes":[hash]}),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":first,"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
+    let next_session = session(11, 1, 1);
+    assert_eq!(want_op(&w, &w.route_b, &next_session)[0]["offset"], 65536);
+    assert_eq!(op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(10,1,1000),"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
+    let next_pool = session(3, 2, 1);
+    assert_eq!(want_op(&w, &w.route_b, &next_pool)[0]["offset"], 65536);
+    assert!(
+        objects_rpc::source_retry_at(&w.ctx, w.route_b["remote_replica"].as_str().unwrap(), &hash)
+            .is_none()
+    );
+    assert_eq!(
+        write_op(
+            &w,
+            &w.route_b,
+            &next_pool,
+            &hash,
+            65536,
+            100_000,
+            &bytes[65536..]
+        )["outcome"],
+        "completed"
+    );
+}
+
+#[test]
+fn another_source_can_take_a_lease_left_by_an_offer_superseded_on_a_different_object() {
+    use tkfs::model::lease::{self, Generation, PushRun};
+    let first = vec![92; 100_000];
+    let hash = tkfs::core::hash(&first);
+    let w = worker(|a| {
+        file(a, "first", &first);
+        file(a, "second", &vec![93; 200_000]);
+    });
+    let session = |frame| {
+        lease::qualify_push(
+            "push:peer-a:0/1",
+            PushRun {
+                generation: Generation {
+                    incarnation: 61,
+                    run: 2,
+                },
+                layout: 1,
+            },
+            frame,
+        )
+        .unwrap()
+    };
+    let (offered,_)=op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(3),"max_items":1,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap();
+    assert_eq!(offered["items"][0]["hash"], hash);
+    let (next,_)=op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(4),"max_items":1,"max_bytes":PULL_BUDGET_BYTES,"exclude":[hash]}),&[]).unwrap();
+    assert_eq!(next["items"].as_array().unwrap().len(), 1);
+    assert_ne!(next["items"][0]["hash"], hash);
+    let mut route = w.route_b.clone();
+    route["peer"] = json!("peer-b");
+    assert!(
+        want_op(&w, &route, "other-source")
+            .iter()
+            .any(|item| item["hash"] == hash)
+    );
+    assert_eq!(lease(&w, &hash).session, "other-source");
+    assert_eq!(
+        write_op(&w, &route, "other-source", &hash, 0, 100_000, &first)["outcome"],
+        "completed"
+    );
+}

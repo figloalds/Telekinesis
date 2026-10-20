@@ -13,11 +13,12 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+type InboundPool = (u32, Arc<Mutex<u64>>);
 pub struct Clock {
     incarnation: u64,
     next: AtomicU64,
     pools: Mutex<BTreeMap<usize, (Weak<PeerContext>, Generation)>>,
-    inbound: Mutex<BTreeMap<String, (u32, Arc<Mutex<u64>>)>>,
+    inbound: Mutex<BTreeMap<String, InboundPool>>,
 }
 
 pub struct PushSession {
@@ -133,10 +134,7 @@ impl Clock {
         let generation = self.next()?;
         let layout = *lock(&pool);
         Ok(Arc::new(PushSession {
-            run: PushRun {
-                generation,
-                layout,
-            },
+            run: PushRun { generation, layout },
             current_pool: pool,
         }))
     }
