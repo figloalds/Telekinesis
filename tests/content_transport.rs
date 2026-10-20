@@ -510,9 +510,17 @@ impl LegacyPushReceiver {
         }
     }
     fn dial(&self) -> Conn {
+        self.dial_lane(LANE)
+    }
+    fn dial_lane(&self, lane: LaneSpec) -> Conn {
         session::dial(
             &self.address,
-            session::client_hello(&self.installation, LaneRole::Bulk, Some(LANE), 2),
+            session::client_hello(
+                &self.installation,
+                LaneRole::Bulk,
+                Some(lane),
+                lane.count + 1,
+            ),
             &CodeAuth {
                 code: self.code.clone(),
             },
@@ -543,6 +551,15 @@ impl LegacyPushReceiver {
         reply.items
     }
     fn push(&self, conn: &Conn, item: tkfs::model::protocol::objects::WantItem, bytes: &[u8]) {
+        self.push_lane(conn, item, bytes, LANE);
+    }
+    fn push_lane(
+        &self,
+        conn: &Conn,
+        item: tkfs::model::protocol::objects::WantItem,
+        bytes: &[u8],
+        lane: LaneSpec,
+    ) {
         use tkfs::model::protocol::{
             frame::ChunkHeader,
             objects::{ObjectOutcome, ObjectsPush, ObjectsResult},
@@ -551,7 +568,7 @@ impl LegacyPushReceiver {
             repo: self.scope.repo.clone(),
             sender: self.scope.sender.clone(),
             receiver: self.scope.receiver.clone(),
-            lane: LANE,
+            lane,
             items: vec![item.clone()],
         };
         let mut upload = conn
@@ -725,6 +742,84 @@ fn native_late_push_offer_reply_cannot_replace_a_newer_offer_on_the_same_session
     println!(
         "WAVE6_PUSH {}",
         serde_json::json!({"scenario":"native_late_offer_publication","admission_ms":admission.as_secs_f64()*1000.0,"bound_ms":250,"old_offer_stall_ms":2000,"typed_activation":false})
+    );
+}
+
+#[test]
+fn native_inbound_push_pool_resize_fences_an_old_still_open_session() {
+    use tkfs::model::protocol::objects::ObjectsWantsReply;
+    let bytes = vec![103; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let old = receiver.dial();
+    let hash = p.root.digest.to_string();
+    assert!(receiver.wants(&old).iter().any(|item| item.hash == hash));
+    let old_id = p.b.ctx.inflight_objects.lock().unwrap().leases[&hash]
+        .session
+        .clone();
+    let lane = (0..2)
+        .map(|index| LaneSpec::new(index, 2))
+        .find(|lane| lane.owns(&hash))
+        .unwrap();
+    let new = receiver.dial_lane(lane);
+    let mut header = receiver.wants_header();
+    header["lane"] = serde_json::to_value(lane).unwrap();
+    let started = Instant::now();
+    let reply = new
+        .call(
+            "objects.wants",
+            header,
+            vec![],
+            Priority::Control,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let offered: ObjectsWantsReply = serde_json::from_value(reply.header).unwrap();
+    let item = offered
+        .items
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    let admission = started.elapsed();
+    let current = p.b.ctx.inflight_objects.lock().unwrap().leases[&hash].clone();
+    assert!(
+        tkfs::model::lease::parse(&current.session)
+            .unwrap()
+            .unwrap()
+            .layout
+            > tkfs::model::lease::parse(&old_id).unwrap().unwrap().layout
+    );
+    assert_eq!(
+        old.call(
+            "objects.wants",
+            receiver.wants_header(),
+            vec![],
+            Priority::Control,
+            Duration::from_secs(5)
+        )
+        .unwrap_err()
+        .code(),
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    old.close();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        p.b.ctx.inflight_objects.lock().unwrap().leases[&hash],
+        current
+    );
+    receiver.push_lane(&new, item, &bytes, lane);
+    let mut out = vec![0; bytes.len()];
+    p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    new.close();
+    assert_eq!(out, bytes);
+    assert!(
+        admission < Duration::from_millis(250),
+        "push pool resize waited {admission:?}"
+    );
+    println!(
+        "WAVE6_PUSH {}",
+        serde_json::json!({"scenario":"native_push_pool_resize","admission_ms":admission.as_secs_f64()*1000.0,"bound_ms":250,"old_lane_count":1,"new_lane_count":2,"typed_activation":false})
     );
 }
 

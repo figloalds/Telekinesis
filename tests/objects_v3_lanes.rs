@@ -522,7 +522,8 @@ impl FakeWorker {
         {
             let mut state = self.state.lock().unwrap();
             state.leases.retain(|hash, (session, _)| {
-                !(excluded.contains(hash.as_str()) && *session == header.session)
+                !(excluded.contains(hash.as_str())
+                    && (*session == header.session || newer_push(&header.session, session)))
             });
         }
         // Spools are locked without the state lock (a completing write

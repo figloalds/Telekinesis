@@ -3406,7 +3406,13 @@ fn another_source_can_take_a_lease_left_by_an_offer_superseded_on_a_different_ob
     };
     let (offered,_)=op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(3),"max_items":1,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap();
     assert_eq!(offered["items"][0]["hash"], hash);
-    let (next,_)=op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(4),"max_items":1,"max_bytes":PULL_BUDGET_BYTES,"exclude":[hash]}),&[]).unwrap();
+    w.ctx
+        .sync_stores
+        .checkout()
+        .unwrap()
+        .request_object(&tkfs::core::hash(&vec![93; 200_000]))
+        .unwrap();
+    let (next,_)=op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(4),"max_items":1,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap();
     assert_eq!(next["items"].as_array().unwrap().len(), 1);
     assert_ne!(next["items"][0]["hash"], hash);
     let mut route = w.route_b.clone();
@@ -3419,6 +3425,52 @@ fn another_source_can_take_a_lease_left_by_an_offer_superseded_on_a_different_ob
     assert_eq!(lease(&w, &hash).session, "other-source");
     assert_eq!(
         write_op(&w, &route, "other-source", &hash, 0, 100_000, &first)["outcome"],
+        "completed"
+    );
+}
+
+#[test]
+fn fresh_push_offer_exclusions_retire_only_superseded_owners() {
+    use tkfs::model::lease::{self, Generation, PushRun};
+    let bytes = vec![94; 100_000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "excluded-old-push", &bytes);
+    });
+    let session = |frame| {
+        lease::qualify_push(
+            "push:peer-a:0/1",
+            PushRun {
+                generation: Generation {
+                    incarnation: 63,
+                    run: 2,
+                },
+                layout: 1,
+            },
+            frame,
+        )
+        .unwrap()
+    };
+    assert_eq!(want_op(&w, &w.route_b, &session(3)).len(), 1);
+    let exclude = |frame| {
+        op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(frame),"max_items":256,"max_bytes":PULL_BUDGET_BYTES,"exclude":[hash]}),&[]).unwrap()
+    };
+    assert!(exclude(4).0["items"].as_array().unwrap().is_empty());
+    assert!(
+        !w.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash)
+    );
+    let mut route = w.route_b.clone();
+    route["peer"] = json!("peer-b");
+    assert_eq!(want_op(&w, &route, "source-b").len(), 1);
+    assert!(exclude(5).0["items"].as_array().unwrap().is_empty());
+    assert_eq!(lease(&w, &hash).session, "source-b");
+    assert_eq!(
+        write_op(&w, &route, "source-b", &hash, 0, 100_000, &bytes)["outcome"],
         "completed"
     );
 }

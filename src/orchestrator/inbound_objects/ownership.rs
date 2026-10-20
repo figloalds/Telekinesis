@@ -17,6 +17,38 @@ struct Slot {
     latest: Mutex<Option<Order>>,
 }
 
+fn slot_for(key: &str) -> Result<Arc<Slot>, ErrorWire> {
+    let mut pruned = false;
+    loop {
+        let mut slots = lock(&SLOTS);
+        if let Some(slot) = slots.get(key).and_then(Weak::upgrade) {
+            return Ok(slot);
+        }
+        if slots.len() >= MAX_SLOTS && !pruned {
+            drop(slots);
+            super::prune_expired_offers();
+            pruned = true;
+            // Another caller can create this key while the registry lock
+            // is released. Recheck it before creating a coordination slot.
+            continue;
+        }
+        if slots.len() >= MAX_SLOTS {
+            slots.retain(|_, slot| slot.strong_count() > 0);
+            if slots.len() >= MAX_SLOTS {
+                return Err(ErrorWire::coded(
+                    "CONTENT_RESOURCE_LIMIT",
+                    "inbound offer ownership capacity",
+                ));
+            }
+        }
+        let slot = Arc::new(Slot {
+            latest: Mutex::new(None),
+        });
+        slots.insert(key.to_owned(), Arc::downgrade(&slot));
+        return Ok(slot);
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Owner {
     session: Arc<PushSession>,
@@ -30,30 +62,7 @@ impl Owner {
         key: &str,
         advance: bool,
     ) -> Result<Self, ErrorWire> {
-        let slot = {
-            let mut slots = lock(&SLOTS);
-            if let Some(slot) = slots.get(key).and_then(Weak::upgrade) {
-                slot
-            } else {
-                if slots.len() >= MAX_SLOTS {
-                    drop(slots);
-                    super::prune_expired_offers();
-                    slots=lock(&SLOTS);
-                    slots.retain(|_, slot| slot.strong_count() > 0);
-                    if slots.len() >= MAX_SLOTS {
-                        return Err(ErrorWire::coded(
-                            "CONTENT_RESOURCE_LIMIT",
-                            "inbound offer ownership capacity",
-                        ));
-                    }
-                }
-                let slot = Arc::new(Slot {
-                    latest: Mutex::new(None),
-                });
-                slots.insert(key.to_owned(), Arc::downgrade(&slot));
-                slot
-            }
-        };
+        let slot = slot_for(key)?;
         let parent = (
             session.run.generation.incarnation,
             session.run.layout,
@@ -104,5 +113,47 @@ impl Owner {
     }
     pub(super) fn lease(&self, base: &str) -> Result<String, ErrorWire> {
         crate::model::lease::qualify_push(base, self.session.run, self.frame)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn bounded_slots_preserve_live_owners_and_concurrent_creation_shares_one_slot() {
+        let mut held: Vec<_> = (0..MAX_SLOTS)
+            .map(|i| slot_for(&format!("bounded-fixture-{i}")).unwrap())
+            .collect();
+        assert!(Arc::ptr_eq(
+            &held[0],
+            &slot_for("bounded-fixture-0").unwrap()
+        ));
+        assert_eq!(
+            slot_for("overflow-fixture").err().unwrap().code,
+            "CONTENT_RESOURCE_LIMIT"
+        );
+        held.pop();
+        held.pop();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let shared = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        slot_for("concurrent-fixture").unwrap()
+                    })
+                })
+                .collect();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert!(shared.iter().all(|slot| Arc::ptr_eq(slot, &shared[0])));
+        assert!(Arc::ptr_eq(
+            &held[0],
+            &slot_for("bounded-fixture-0").unwrap()
+        ));
+        assert!(lock(&SLOTS).len() <= MAX_SLOTS);
     }
 }
