@@ -626,3 +626,38 @@ Wire identities and legacy byte digests do not change, and no normal typed
 content activation is enabled. Full legacy scheduler/byte/spool budgets,
 close-release helper fanout, mounted demand and report/scrub cancellation
 remain separate work.
+
+## CCR-WP6.3-9: bounded offer cleanup and session retirement
+
+Closed/silent inbound offers share two process-wide release workers. Closing a
+bulk session marks its existing bounded offer-table entries and wakes those
+workers; it starts no thread and copies no queued release batch. Pending work
+remains within the 4,096-offer table. Oldest eligible offers are selected first.
+At most two client release attempts hold extracted hash batches, including
+explicit synchronous sweeps; each normal offer has at most 256 hashes. The
+guards remain held across RPC and release on return or unwind. Attempts are
+best effort under the existing two-second per-call deadline and exact qualified
+lease ID. A timeout is not proof that its remote handler has already ended;
+the worker's own bounded handler pool and generation checks still apply.
+
+The fixed workers wake on close/completion and poll at most 500 ms apart when
+idle. Panics in a release attempt are contained and the worker continues.
+Startup failure refuses retention when no cleanup worker exists and retries
+missing workers no more than once per second on subsequent offers. These
+workers have process lifetime; they are not created per daemon fixture, peer,
+repository, offer or session. This bound does not qualify all legacy job, byte,
+spool, connection or shutdown budgets.
+
+An authenticated push session now has a permanent closed state. Its registration
+guard retires it before unregistering, including unwind. Close and guarded
+publication/status mutation use the same short pool gate. A late want cannot
+publish after close, even when close saw no offer yet. Retiring one session does
+not retire its siblings or allocate a new pool identity.
+
+Close stops new authority and backoff publication; it does not by itself
+supersede the admitted data generation. An active push may drain its already
+admitted contiguous prefix while its original pool/session/frame lineage is
+still current. An actual newer owner still fences that drain in the worker.
+After draining, cleanup releases only that push's exact lease without a source
+failure. Reconnect resumes at the durable offset. Ordinary typed activation,
+wire shapes and legacy whole-file identities remain unchanged.

@@ -842,6 +842,115 @@ fn native_closed_session_cannot_publish_an_offer_after_its_close_cleanup_ran() {
 }
 
 #[test]
+fn native_closed_push_drains_its_admitted_prefix_and_releases_its_exact_lease() {
+    use tkfs::{
+        model::protocol::{frame::ChunkHeader, objects::ObjectsPush},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![121; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let conn = receiver.dial();
+    let hash = p.root.digest.to_string();
+    let item = receiver
+        .wants(&conn)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    let mut config = FaultConfig::new("inbound.objects.push.after_admit", FaultAction::Hang);
+    config.ms = Some(300);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let request = ObjectsPush {
+        repo: receiver.scope.repo.clone(),
+        sender: receiver.scope.sender.clone(),
+        receiver: receiver.scope.receiver.clone(),
+        lane: LANE,
+        items: vec![item],
+    };
+    let mut upload = conn
+        .upload(
+            "objects.push",
+            serde_json::to_value(request).unwrap(),
+            Priority::Control,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    upload
+        .chunk(
+            ChunkHeader {
+                id: 0,
+                hash: Some(hash.clone()),
+                offset: 0,
+                total: bytes.len() as u64,
+                last: false,
+            },
+            &bytes[..65536],
+        )
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let probe = Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device).unwrap();
+    assert!(
+        probe.spool_state(&hash).unwrap().is_none(),
+        "prefix must still be buffered at the close"
+    );
+    conn.close();
+    drop(upload);
+    let until = Instant::now() + Duration::from_secs(2);
+    while (receiver.server.stats().sessions != 0 || receiver.server.stats().exchanges != 0)
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(receiver.server.stats().sessions, 0);
+    assert_eq!(receiver.server.stats().exchanges, 0);
+    assert_eq!(
+        probe.spool_state(&hash).unwrap().map(|state| state.durable),
+        Some(65536)
+    );
+    assert!(
+        !p.b.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash)
+    );
+    assert!(runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.a.ctx.device, &hash).is_none());
+    fault::configure(None);
+    let new = receiver.dial();
+    let item = receiver
+        .wants(&new)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    assert_eq!(item.offset, 65536);
+    receiver.push(&new, item, &bytes);
+    new.close();
+    let mut out = vec![0; bytes.len()];
+    p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    assert_eq!(out, bytes);
+    println!(
+        "WAVE6_CLEANUP {}",
+        serde_json::json!({"scenario":"closed_push_prefix",
+        "admitted_prefix_bytes":65536,"durable_prefix_bytes":65536,"verified_file_bytes":bytes.len(),
+        "admit_stall_ms":300,"typed_activation":false})
+    );
+}
+
+#[test]
 fn native_legacy_push_reconnect_admits_before_old_release_and_late_cleanup_cannot_release_it() {
     use tkfs::util::fault::{self, FaultAction, FaultConfig};
     struct Reset;
