@@ -3292,3 +3292,18 @@ fn daemon_incarnations_dominate_pool_numbers_and_the_previous_qualified_id_forma
         "IN_FLIGHT_ELSEWHERE"
     );
 }
+
+#[test]
+fn a_classic_opaque_session_that_resembles_another_peers_lane_keeps_its_old_meaning() {
+    let bytes = vec![85; 1000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "opaque-session", &bytes);
+    });
+    let session = "pull:custom-name:0/7:a";
+    assert_eq!(want_op(&w, &w.route_b, session).len(), 1);
+    assert_eq!(
+        write_op(&w, &w.route_b, session, &hash, 0, 1000, &bytes)["outcome"],
+        "completed"
+    );
+}
