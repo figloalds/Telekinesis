@@ -665,6 +665,33 @@ independent. An already-admitted data prefix may still become durable under
 its original, unsuperseded lineage; it then releases only its own lease.
 Closing authority does not discard that valid prefix or create source backoff.
 
+Final source passed 329 checks: library 85, authenticated transport 28,
+generations 11, native worker 54, retained lanes 53, inbound 20, peer supervisors
+30, contracts 41 and seams 7. Strict Clippy compiled/linted all test targets;
+formatting and diff checks passed. The 20 ignored cases (18 long legacy lane
+qualifications and two library probes), the previously qualified filtered
+10,000-object worker case and the unchanged provider target are not claimed
+executed here.
+
+Actual native evidence includes 22 authenticated want/close connections with
+both release workers stalled for 1.5 seconds. The additional 20-connection burst
+completed in 21.32 ms; peak want admission was 0.45 ms against the unchanged
+250 ms bound. Active cleanup and the fixed thread count stayed at two, an
+explicit sweep could not bypass the cap, a pending closed offer stayed leased,
+and it drained after 1,488.97 ms. Reconnect then installed 150,000 verified bytes
+without source backoff. A separate late-publication case closed before offer
+publication and left no lease after 1,507.08 ms, without a replacement owner.
+The prefix regression paused after admitting 65,536 bytes while no spool offset
+existed, closed the session, observed exactly that durable offset and no lease,
+then resumed and verified the complete 150,000-byte file. All used legacy
+content with typed activation disabled. These are controlled samples, not the
+final sustained-load gate.
+
+`test-evidence/wave-6/offer-cleanup-checks.json` retains commands, native samples,
+faults, raw outputs, source/executable identity and remaining qualifications.
+Its 364-file source manifest matched before and after the final invocation:
+`d4249bc4c27548ab0e5dce8d8b2f43b670e3e9e8ff1e456b8f40d02bbea60b5c`.
+
 This change qualifies the release helper count and client attempt ownership,
 not all retained legacy memory, job, connection or shutdown budgets. A timed-out
 client attempt does not prove its remote handler already stopped. Large-backlog
