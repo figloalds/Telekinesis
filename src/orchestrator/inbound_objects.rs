@@ -634,6 +634,10 @@ fn put_offer(key: String, offer: Offer) -> bool {
     true
 }
 
+fn prune_expired_offers() {
+    lock(&offers().map).offers.retain(|_,offer|offer.at.elapsed()<OFFER_AGE);
+}
+
 /// An offer whose session sent no `objects.*` request since the offer for
 /// this long lost its session (module docs, "An offer whose session went
 /// away").
@@ -710,14 +714,20 @@ pub fn session_closed(peer: &session::AcceptedPeer) {
     }
     let session = peer.session.clone();
     lock(sessions_seen()).remove(&session);
-    let offered = lock(&offers().map)
-        .offers
-        .values()
-        .any(|offer| !offer.released && offer.session == session);
+    let offered = {
+        let mut map=lock(&offers().map);
+        map.offers.retain(|_,offer|!(offer.released && offer.session==session));
+        map.offers.values().any(|offer|offer.session==session)
+    };
     if offered {
         let _ = thread::Builder::new()
             .name("offer-release".into())
-            .spawn(move || reap_where(|offer, _| offer.session == session));
+            .spawn(move || {
+                reap_where(|offer,_|offer.session==session);
+                // Remove only this closed session's offers; a newer session
+                // may already have replaced the same logical table key.
+                lock(&offers().map).offers.retain(|_,offer|offer.session!=session);
+            });
     }
 }
 
