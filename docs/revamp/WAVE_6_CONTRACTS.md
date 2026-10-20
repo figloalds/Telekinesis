@@ -492,6 +492,6 @@ and the provider's foreground buffer reservation. Unsupported peers use the
 existing bounded legacy pull and cannot provide the new source reservation.
 
 This extension does not establish a complete legacy job/spool/lease budget,
-acceptor push-generation, sustained fairness, first-serve hash cancellation or
+cross-lane-count/push generation, sustained fairness, first-serve hash cancellation or
 mounted-read qualification. Their remaining audits and the package test stages
 are recorded in the implementation record. Typed metadata remains fixture-only.
