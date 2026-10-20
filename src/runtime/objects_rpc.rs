@@ -221,7 +221,11 @@ fn layout_current(state: &ObjectsState, owned: &crate::model::lease::Owned<'_>) 
 fn run_owns(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
     owned.is_none_or(|o| {
         layout_current(state, o)
-            && state.lease_runs.get(o.scope) == Some(&crate::model::lease::RunFence {generation:o.generation,layout:o.layout})
+            && state.lease_runs.get(o.scope)
+                == Some(&crate::model::lease::RunFence {
+                    generation: o.generation,
+                    layout: o.layout,
+                })
             && o.layout.is_none_or(|run| {
                 state.lease_layouts.get(o.family)
                     == Some(&(
@@ -274,7 +278,13 @@ fn claim_run(
                 ),
             );
         }
-        state.lease_runs.insert(o.scope.to_owned(), crate::model::lease::RunFence {generation:o.generation,layout:o.layout});
+        state.lease_runs.insert(
+            o.scope.to_owned(),
+            crate::model::lease::RunFence {
+                generation: o.generation,
+                layout: o.layout,
+            },
+        );
     }
     Ok(())
 }
@@ -561,7 +571,10 @@ fn want_selected(
     bind(ctx, &header.route)?;
     session_id(&header.session)?;
     let owned = owned_run(&header.session, &header.route)?;
-    if owned.as_ref().is_some_and(|o| o.lane != header.lane) {
+    if owned
+        .as_ref()
+        .is_some_and(|o| o.generation.run != 0 && o.lane != header.lane)
+    {
         return Err(ErrorWire::coded(
             "INVALID_BULK_LANE",
             "lease generation lane does not match want",

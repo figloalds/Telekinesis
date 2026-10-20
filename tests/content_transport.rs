@@ -1387,6 +1387,15 @@ fn background_dispatch_progresses_while_a_foreground_source_is_stalled() {
 
 #[test]
 fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes() {
+    legacy_reconnect(1, "native_legacy_reconnect");
+}
+
+#[test]
+fn a_real_legacy_pool_resize_resumes_before_old_io_and_fences_old_pool_cleanup() {
+    legacy_reconnect(2, "native_legacy_pool_resize");
+}
+
+fn legacy_reconnect(new_count: u32, scenario: &str) {
     use tkfs::{
         orchestrator::objects,
         util::fault::{self, FaultAction, FaultConfig},
@@ -1399,6 +1408,19 @@ fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_fin
     }
     let bytes = vec![73; 150_000];
     let p = Pair::with_legacy(&bytes, true);
+    // Ensure the injected stall is the actual nonempty file, rather than
+    // its empty historical revision.
+    runtime::objects_rpc::dispatch(
+        &p.b.ctx,
+        "objects.write",
+        &serde_json::json!({
+            "route":p.route,"session":"fixture-empty-receipt","items":[{
+                "hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true
+            }]
+        }),
+        &[],
+    )
+    .unwrap();
     let mut cfg = FaultConfig::new("worker.rpc.objects.read", FaultAction::Hang);
     cfg.ms = Some(2000);
     cfg.count = Some(1);
@@ -1432,15 +1454,38 @@ fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_fin
             .session
             .clone();
     let old_owned = tkfs::model::lease::parse(&old_id).unwrap().unwrap();
-    let new_cancel = Cancel::new();
-    let (ctx, peer, conn, token) = (
-        p.dest.clone(),
-        p.peer(&p.dest),
-        p.dial_for(&p.dest),
-        new_cancel.clone(),
+    let mut probe = vec![0; bytes.len()];
+    assert!(
+        p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut probe, &context())
+            .is_err(),
+        "old file must still be unavailable while its read is stalled"
     );
+    let new_lane = (0..new_count)
+        .map(|index| LaneSpec::new(index, new_count))
+        .find(|lane| lane.owns(&p.root.digest.to_string()))
+        .unwrap();
+    let mut new_peer = p.peer(&p.dest);
+    Arc::get_mut(&mut new_peer).unwrap().pool = new_count + 1;
+    let new_conn = session::dial(
+        &p.address,
+        session::client_hello(
+            &p.dest.installation,
+            LaneRole::Bulk,
+            Some(new_lane),
+            new_count + 1,
+        ),
+        &CodeAuth {
+            code: p.code.clone(),
+        },
+        None,
+        ConnOptions::for_role(LaneRole::Bulk),
+    )
+    .unwrap()
+    .0;
+    let new_cancel = Cancel::new();
+    let (ctx, peer, conn, token) = (p.dest.clone(), new_peer, new_conn, new_cancel.clone());
     let started = Instant::now();
-    let newer = thread::spawn(move || objects::run_bulk_lane(ctx, peer, LANE, conn, token));
+    let newer = thread::spawn(move || objects::run_bulk_lane(ctx, peer, new_lane, conn, token));
     let mut out = vec![0; bytes.len()];
     let mut available = false;
     while started.elapsed() < Duration::from_secs(1) {
@@ -1454,14 +1499,15 @@ fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_fin
         thread::sleep(Duration::from_millis(2));
     }
     let elapsed = started.elapsed();
+    let new_scope = objects::pull_holder(&p.source.installation, new_lane);
     let generation =
         p.b.ctx
             .inflight_objects
             .lock()
             .unwrap()
             .lease_runs
-            .get(old_owned.scope)
-            .map(|fence| fence.generation);
+            .get(&new_scope)
+            .copied();
     old_cancel.cancel();
     new_cancel.cancel();
     old.join().unwrap();
@@ -1471,22 +1517,24 @@ fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_fin
         "a new legacy run waited for old IO/lease expiry ({elapsed:?})"
     );
     assert_eq!(out, bytes);
-    assert!(generation.unwrap() > old_owned.generation);
+    assert!(generation.unwrap().generation > old_owned.generation);
+    assert!(generation.unwrap().layout > old_owned.layout);
     assert_eq!(
         p.b.ctx
             .inflight_objects
             .lock()
             .unwrap()
             .lease_runs
-            .get(old_owned.scope)
-            .map(|fence| fence.generation),
+            .get(&new_scope)
+            .copied(),
         generation,
         "old runner cleanup changed the newer run's fence"
     );
     println!(
         "WAVE6_LEASE {}",
-        serde_json::json!({"scenario":"native_legacy_reconnect",
-        "available_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":1000,"old_source_stall_ms":2000})
+        serde_json::json!({"scenario":scenario,
+        "available_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":1000,"old_source_stall_ms":2000,
+        "old_lane_count":1,"new_lane_count":new_count,"old_layout":old_owned.layout,"new_layout":generation.unwrap().layout})
     );
 }
 
