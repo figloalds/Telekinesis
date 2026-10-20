@@ -492,6 +492,40 @@ and the provider's foreground buffer reservation. Unsupported peers use the
 existing bounded legacy pull and cannot provide the new source reservation.
 
 This extension does not establish a complete legacy job/spool/lease budget,
-cross-lane-count/push generation, sustained fairness, first-serve hash cancellation or
+push generation, sustained fairness, first-serve hash cancellation or
 mounted-read qualification. Their remaining audits and the package test stages
 are recorded in the implementation record. Typed metadata remains fixture-only.
+
+## CCR-WP6.3-6: pull ownership across peer-pool replacement
+
+Pull IDs now append the pool counter as a third 16-digit lowercase hexadecimal
+integer: `~w6.<incarnation>.<run>.<pool>`. The full local ID remains at most
+128 bytes, including a foreground `c` slot. The previous two-integer form is
+still parsed. These are local opaque worker session IDs; legacy peer object
+messages, file identities and metadata activation do not change.
+
+A real peer supervisor allocates its pool identity when constructing its
+`PeerContext`, before any lane starts. All lanes and reconnects of that context
+retain the pool identity. Replacing the supervisor assigns a later identity,
+including when a prior lane count returns. A lane from an older context that
+starts late retains its older pool, even if its run counter is newer. Production
+pulls refuse an unregistered pool. Hand-built fixture contexts register lazily.
+The daemon registry holds at most 16,384 context/identity associations and only
+reclaims associations whose context has no remaining strong references.
+
+Workers retain at most 16,384 direction/peer family fences in addition to the
+16,384 lane-run fences. Daemon incarnation dominates pool counter, which in turn
+dominates per-lane run counter. Thus a newer pool takes over an old layout's
+leases immediately at their durable offsets, without the historical 15-second
+idle heuristic. Old requests cannot acquire another shard's free work, write,
+release or apply source backoff after replacement. The checks run again after
+SQL/byte work. An expired superseded lease is cleanup, not evidence that the
+replacement source failed. Existing families can advance at capacity; new
+families are refused without evicting a live fence.
+
+Canonical pre-extension pull IDs are recognized as old ownership and are fenced
+once a newer qualified family claims the worker. Arbitrary historical opaque
+session strings keep their old meaning; launcher/version and adopted-worker
+fencing still require WP6.6. These checks cover retained pull layouts. Inbound
+push-offer ownership and its authenticated session/pool lifecycle still require
+separate work; the local pull-pool registry is not an inbound ownership source.

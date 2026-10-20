@@ -119,6 +119,50 @@ fn pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_re
     .unwrap();
     assert!(long.len() <= 128);
 }
+
+#[test]
+fn pool_identity_capacity_retains_live_owners_and_only_reclaims_dead_contexts() {
+    use tkfs::{
+        model::{
+            lease::MAX_RUN_FENCES,
+            orchestrator::{PeerContext, RemoteCatalog},
+        },
+        util::{Cancel, snapshot::Snapshot},
+    };
+    let peer = || {
+        Arc::new(PeerContext {
+            installation: "peer-a".into(),
+            endpoint: "ws://fixture".into(),
+            local_installation: "local".into(),
+            pool: 3,
+            catalog: Snapshot::new(RemoteCatalog::default()),
+        })
+    };
+    let clock = Clock::new(42);
+    let mut all = Vec::new();
+    for _ in 0..MAX_RUN_FENCES {
+        let p = peer();
+        clock.register_peer(&p).unwrap();
+        all.push(p);
+    }
+    let first = clock.pull(&all[0], &Cancel::new()).unwrap();
+    let pending = peer();
+    assert_eq!(
+        clock.register_peer(&pending).unwrap_err().code,
+        "CONTENT_RESOURCE_LIMIT"
+    );
+    assert_eq!(
+        clock.pull(&all[0], &Cancel::new()).unwrap().layout,
+        first.layout
+    );
+    all.pop();
+    let reclaimed = clock.register_peer(&pending).unwrap();
+    assert!(reclaimed.run > MAX_RUN_FENCES as u64);
+    assert_eq!(
+        clock.pull(&all[0], &Cancel::new()).unwrap().layout,
+        first.layout
+    );
+}
 #[test]
 fn ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base() {
     let g = Generation {

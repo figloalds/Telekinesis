@@ -197,10 +197,11 @@ fn owned_run<'a>(
 fn run_current(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
     owned.is_none_or(|o| {
         layout_current(state, o)
-            && state
-                .lease_runs
-                .get(o.scope)
-                .is_none_or(|g| g.layout != o.layout || g.generation <= o.generation)
+            && state.lease_runs.get(o.scope).is_none_or(|g| {
+                g.generation.incarnation < o.generation.incarnation
+                    || (g.generation.incarnation == o.generation.incarnation
+                        && (g.layout != o.layout || g.generation <= o.generation))
+            })
     })
 }
 
@@ -209,13 +210,9 @@ fn layout_current(state: &ObjectsState, owned: &crate::model::lease::Owned<'_>) 
         .lease_layouts
         .get(owned.family)
         .is_none_or(|(seen, count)| {
-            owned.layout.is_some_and(|run| {
-                let incoming = crate::model::lease::Generation {
-                    incarnation: owned.generation.incarnation,
-                    run,
-                };
-                incoming > *seen || (incoming == *seen && owned.lane.count == *count)
-            })
+            let incoming = pool_generation(owned);
+            incoming > *seen
+                || (incoming == *seen && (owned.layout.is_none() || owned.lane.count == *count))
         })
 }
 fn run_owns(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
@@ -226,16 +223,9 @@ fn run_owns(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>
                     generation: o.generation,
                     layout: o.layout,
                 })
-            && o.layout.is_none_or(|run| {
-                state.lease_layouts.get(o.family)
-                    == Some(&(
-                        crate::model::lease::Generation {
-                            incarnation: o.generation.incarnation,
-                            run,
-                        },
-                        o.lane.count,
-                    ))
-            })
+            && (o.generation.run == 0
+                || state.lease_layouts.get(o.family)
+                    == Some(&(pool_generation(o), o.layout.map_or(0, |_| o.lane.count))))
     })
 }
 fn claim_run(
@@ -257,7 +247,7 @@ fn claim_run(
                 "object lease generation fence capacity",
             ));
         }
-        if o.layout.is_some()
+        if o.generation.run > 0
             && !state.lease_layouts.contains_key(o.family)
             && state.lease_layouts.len() >= crate::model::lease::MAX_RUN_FENCES
         {
@@ -266,16 +256,10 @@ fn claim_run(
                 "object lease layout fence capacity",
             ));
         }
-        if let Some(run) = o.layout {
+        if o.generation.run > 0 {
             state.lease_layouts.insert(
                 o.family.to_owned(),
-                (
-                    crate::model::lease::Generation {
-                        incarnation: o.generation.incarnation,
-                        run,
-                    },
-                    o.lane.count,
-                ),
+                (pool_generation(o), o.layout.map_or(0, |_| o.lane.count)),
             );
         }
         state.lease_runs.insert(
@@ -287,6 +271,13 @@ fn claim_run(
         );
     }
     Ok(())
+}
+
+fn pool_generation(owned: &crate::model::lease::Owned<'_>) -> crate::model::lease::Generation {
+    crate::model::lease::Generation {
+        incarnation: owned.generation.incarnation,
+        run: owned.layout.unwrap_or(0),
+    }
 }
 
 fn wire(error: anyhow::Error) -> ErrorWire {
@@ -439,16 +430,10 @@ fn superseded(held: &ObjectLease, session: &str, now: u64) -> bool {
         crate::model::lease::parse_transfer(session),
     ) {
         if old.family == new.family {
-            let layout = |o: &crate::model::lease::Owned<'_>| {
-                o.layout.map(|run| crate::model::lease::Generation {
-                    incarnation: o.generation.incarnation,
-                    run,
-                })
-            };
-            if layout(&old) < layout(&new) {
+            if pool_generation(&old) < pool_generation(&new) {
                 return true;
             }
-            if layout(&old) > layout(&new) {
+            if pool_generation(&old) > pool_generation(&new) {
                 return false;
             }
             if old.scope == new.scope
@@ -490,6 +475,15 @@ fn sweep_lapsed(state: &mut ObjectsState, now: u64) {
             continue;
         };
         if holder != session {
+            continue;
+        }
+        // A replacement pool/run is already authoritative. Expiry of its
+        // predecessor is cleanup, not evidence that the current source failed.
+        if crate::model::lease::parse_transfer(&session)
+            .ok()
+            .flatten()
+            .is_some_and(|owned| !run_current(state, Some(&owned)))
+        {
             continue;
         }
         let retry_at = back_off_stalled(state, &source, &hash, now);

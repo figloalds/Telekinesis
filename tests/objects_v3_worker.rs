@@ -3209,3 +3209,86 @@ fn full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_poo
     );
     assert_eq!(op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(1),"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
 }
+
+#[test]
+fn an_expired_predecessor_lease_does_not_back_off_its_replacement_pool() {
+    use tkfs::model::lease::{self, Generation, PullRun};
+    let bytes = vec![83; 100_000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "expired-layout", &bytes);
+    });
+    let session = |layout| {
+        lease::qualify_pull(
+            "pull:peer-a:0/1:a",
+            PullRun {
+                generation: Generation {
+                    incarnation: 41,
+                    run: layout + 1,
+                },
+                layout,
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(want_op(&w, &w.route_b, &session(1)).len(), 1);
+    w.ctx
+        .inflight_objects
+        .lock()
+        .unwrap()
+        .leases
+        .get_mut(&hash)
+        .unwrap()
+        .expires_ms = 0;
+    assert_eq!(want_op(&w, &w.route_b, &session(3)).len(), 1);
+    assert!(
+        objects_rpc::source_retry_at(&w.ctx, w.route_b["remote_replica"].as_str().unwrap(), &hash)
+            .is_none()
+    );
+    assert_eq!(lease(&w, &hash).session, session(3));
+}
+
+#[test]
+fn daemon_incarnations_dominate_pool_numbers_and_the_previous_qualified_id_format() {
+    use tkfs::model::lease::{self, Generation, PullRun};
+    let bytes = vec![84; 100_000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "ordered-incarnations", &bytes);
+    });
+    let previous = owned_session(0, 50, 1);
+    assert_eq!(want_op(&w, &w.route_b, &previous).len(), 1);
+    let pool = |incarnation, run, layout| {
+        lease::qualify_pull(
+            "pull:peer-a:0/2:a",
+            PullRun {
+                generation: Generation { incarnation, run },
+                layout,
+            },
+        )
+        .unwrap()
+    };
+    let want = |session: &str| {
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":w.route_b,"lane":{"index":0,"count":2},"session":session,"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[],
+        )
+    };
+    assert_eq!(
+        want(&pool(49, 1000, 900)).unwrap_err().code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    // Advancing a pool can fence the old family even if this particular
+    // lane has no object in its shard.
+    want(&pool(51, 2, 1)).unwrap();
+    assert_eq!(op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":previous,"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
+    let later = owned_session(0, 52, 1);
+    assert_eq!(want_op(&w, &w.route_b, &later).len(), 1);
+    assert_eq!(lease(&w, &hash).session, later);
+    assert_eq!(
+        want(&pool(51, 1000, 900)).unwrap_err().code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+}
