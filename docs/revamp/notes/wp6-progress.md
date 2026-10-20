@@ -515,10 +515,53 @@ link attempt; that attempt was retried only after both earlier tool processes
 were observed terminal. Final source-set SHA-256:
 `82483906af8734f7a0a8c9649480bbbd93b3d216a2cbbc0659b45afcc546eb1f`.
 
-This is retained pull ownership, not completion of the inbound push audit.
-Inbound push offers still use stable per-lane worker IDs and a reaper wait;
-the pull pool's local `PeerContext` identity is not an authenticated remote
-push-pool identity. That lifecycle needs its own generation and native stale
-completion evidence. Full legacy budgets, hash cancellation, mounted reads,
+The pull pool's local `PeerContext` identity is not an authenticated remote
+push-pool identity. CCR-WP6.3-7 below adds the separate inbound ownership
+lifecycle. Full legacy budgets, hash cancellation, mounted reads,
 recoverable saves, final saturation/build/platform qualification and WP6.6
 compatibility/activation remain pending.
+
+## Authenticated inbound push ownership (WP6.3, in progress)
+
+CCR-WP6.3-7 replaces stable local inbound push lease IDs with authenticated
+session, acceptor pool and per-offer frame identities. Sessions receive their
+root before serving requests; old open sessions retain their original root.
+Each new offer advances its frame, and the native worker keeps that frame floor
+after object leases are released. Reconnect, count reversal, delayed writes,
+late wants and exact cleanup cannot restore an older owner. The acceptor orders
+pool-count changes when authenticated connections become admissible; the
+unchanged legacy hello does not attest a persistent sender-side pool epoch.
+
+Shared weak ownership slots coordinate offers for a worker/peer/lane. The slot
+stays alive while an offer or handler can still finish. Publication and short
+backoff/status mutations revalidate session/frame and pool, without holding
+ownership locks across worker RPC, hashing, streaming or durable I/O. A late
+reply cannot overwrite a newer offer, even after that newer offer was consumed.
+Old reaper RPCs use exact IDs and no longer block replacement preparation.
+There are at most 4,096 slots and 16,384 acceptor peer-pool identities; existing
+identities keep working at capacity. Pruning removes expired offers/dead weak
+slots and rechecks concurrent creation. Closed-session cleanup cannot remove a
+replacement session's offer table entry.
+
+Actual authenticated peer/loopback tests with real Store/CAS workers exercise
+a two-second old release, a two-second delayed offer publication, and a bulk
+pool resize while the old session remains open. The new owner pushes and
+verifies 150,000 bytes with typed activation disabled. Initial same-count
+admissions were 0.44/0.43 ms against the unchanged 250 ms bound. Native worker
+tests cover frame/session/pool precedence, late writes/releases, the retained
+frame floor and another source acquiring a predecessor's remaining object.
+
+The first broader run caught an unknown-size handoff: a new frame's exclusion
+did not physically remove its predecessor's old lease. Fresh wants now retire
+excluded leases only when their owner is already superseded, without an extra
+release-RPC wait, and preserve a current other source's lease. A native test
+asserts both cases. Legacy lane fixtures retain exact qualified strings in
+their lease tables and release logs; only historical peer/lane assertions
+normalize their view. The delayed-reap regression now asserts prompt admission
+and that the old release finds no ownership of the replacement.
+
+This work does not establish the remaining full legacy job/byte/spool budget or
+close-release helper fanout bounds. Those, hash cancellation, sustained fairness,
+mounted range reads, recoverable private saves, caching/change journal,
+capability/deployment fencing and final Windows/FUSE/build/load qualification
+remain pending. Ordinary typed-content activation remains off.
