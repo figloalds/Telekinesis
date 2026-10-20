@@ -432,10 +432,16 @@ for the third without changing its published folder heartbeat. Its 1,048,599
 bytes require five foreground frames. With typed activation disabled, admission
 was 22.06 ms against the unchanged 250 ms bound, and verified availability was
 219.43 ms against the one-second bound. The pre-disabled-fixture run was
-59.48/248.61 ms. The first focused invocation passed 108 checks: transport 17,
+59.48/248.61 ms. The first successful focused invocation passed 108 checks: transport 17,
 contracts 41, parser/catalog crash 4 and native worker 46. Its one previously
 passed 10,000-object case was filtered, not counted again. Further regression
-results and exact source/executable stages are retained in the package evidence.
+results and exact source/executable stages are retained in
+`test-evidence/wave-6/legacy-foreground-checks.json`. The final regression run
+passed transport 17, retained legacy lanes 53 and session core 59. Across both
+invocations, 220 distinct checks passed; the repeated transport tests are counted
+once. The 18 existing long lane qualifications remain ignored. Strict Clippy,
+formatting and diff checks passed. Source-set SHA-256:
+`7f7b8c920be5f070dedfbd4e246d9213fc186045d9e1e525de5dda8caedb60e3`.
 
 Test corrections are explicit: the original naive stall setup accidentally
 spent faults on empty historical revisions; the corrected setup verifies shared
@@ -447,7 +453,7 @@ corrected that test. Neither failure was addressed by relaxing a timing bound.
 
 This is short native package evidence for CCR-WP5.INT-1, not the final sustained
 fairness/platform/build gate. Still pending: full retained legacy job/spool/lease
-budget and acceptor push-generation audits, cancellation within legacy
+budget, cross-lane-count generation and acceptor push-generation audits, cancellation within legacy
 first-serve hashing, large working-set/idle-poll overhead, mounted range demand,
 recoverable private saves and WP6.4–6.6 integration/qualification. Ordinary
 typed-content activation remains off.

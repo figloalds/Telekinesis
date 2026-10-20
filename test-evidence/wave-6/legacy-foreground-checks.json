@@ -1,0 +1,443 @@
+{
+  "date": "2026-10-20",
+  "scope": "WP6.3 CCR-WP6.3-5: reserved retained whole-file foreground admission (CCR-WP5.INT-1); complete Wave 6 remains in progress and ordinary typed activation remains off",
+  "source_revision": "3f028960bfc9c10bdfcbb8bcc83efd42eb8254d9",
+  "host": "Windows-11-10.0.26300-SP0",
+  "target": "x86_64-pc-windows-msvc",
+  "working_tree_source_sha256": "7f7b8c920be5f070dedfbd4e246d9213fc186045d9e1e525de5dda8caedb60e3",
+  "source_files_sha256": {
+    "build.rs": "70dbed753d54e99544840af6b172da5915f5d3bf68a761fe4b324a10039d9f1a",
+    "Cargo.lock": "a4bc80a508b334c1b142d540cff312ddc0da9503ab23b239b0ddd04e5fea84b5",
+    "Cargo.toml": "4e57ac04c7ac26b8727572504c773f8be2c8c2ba8fb5145f42ea3bf6efa2b119",
+    "src/backend.rs": "4ef24f0d6d9a4b752b1188aace8230f11f92f88f06dce3f15d660aedd9c895c3",
+    "src/bulk_sync.rs": "bbe702d832c7b3354c5e414d1da5931d91cf05741a7bb4810fd5bc05c6905594",
+    "src/content/local.rs": "eac5825b729b27ba94896715f4cb784f4423f910519e5aa1de134ccc47ba9f9d",
+    "src/content/mod.rs": "1628df4290430d5f0ee7118999b184a13bf29c1f174976732dddf92c041040b1",
+    "src/content/provider.rs": "ee193232475409431c8d34b9f8a3223ac150ee292e29bb410790b5072861f1c9",
+    "src/content/receipt.rs": "e52221c624af4d98e9f1bb5a111b80384a6248f081dd567fd50d17fab9c19e03",
+    "src/content/scheduler.rs": "179f4e7ba85f6c206b89f345e9ae52f559769bbb33ebfb6cb9e0bf56c09361da",
+    "src/content/walk.rs": "00f24d730acf47e2796496fee2bea63eab05de21527c0f8d3113779e84cbb2d0",
+    "src/content/work.rs": "193a4b1667fbc2536ab1e44569979085c5e6ca6b249c02bff3997d4525515b1a",
+    "src/core/admission.rs": "57c575a9cb688cd6567b23e536235b50fe591974f8e4fb8fa1053af8cab1487d",
+    "src/core/commit.rs": "91a3e2226b1617a0a8549ac4592a8ea6c5cfa043b24aa06bf3c833479ad688c4",
+    "src/core/content_objects/graph.rs": "69cc9c3a27a6beb60ad6faade0d3715148cb1f176464ce050c1d428146dfe380",
+    "src/core/content_objects.rs": "022a08d8b41ec3edc0c2ccae7464504e768f0f4ad1f75fae6643a245f710873e",
+    "src/core/demand.rs": "99f500ad6c59dc708b3a88fb6ecb29e7d9000baaf0b63ac93264a76897e3a263",
+    "src/core/derive.rs": "9c52d5abebe02ee7a0c27e8a800cdb08a73637751d9358932d9db8d9c66e8e7f",
+    "src/core/inbox.rs": "caba15a380bf0d43575ea8a02eb27ab3d2598f8207da2bfe8ac5cc3abb67fc49",
+    "src/core/objects.rs": "51b0189a97a7a4edd3de14689f0ef23e1f2465d379304b69e92d465b4d7284ee",
+    "src/core/sharing.rs": "9612e63a7b58284126d1a19a644966d2d8f63a1492daec2177381b5809a4b69a",
+    "src/core/snapshot.rs": "a398d1a5f27b8cff97a193387f6751c90add2d144a6322a1854db9a46740e393",
+    "src/core/status.rs": "5cacf0ada3d5f163a518462621de038e91f72aaec48510c986ff94538fc299cf",
+    "src/core/transfer.rs": "f717b14b56f30651b3247c0c70ad639af3723002a5eacaea4ec03c9b23008d03",
+    "src/core/verify.rs": "36adc98314b94e1832ffa492cc0073dcf3b5a26a1bc18973cce4889b25966838",
+    "src/core.rs": "24b3776d630cf4b55ab3a2559b9e96495bd1dbceb1fc1a07c6170ece236d9310",
+    "src/fuse_linux.rs": "c66f4407cb1da627aa73dff9e778ae6af22e7d9a42b15b1ff950d6853f334a0a",
+    "src/gui.rs": "1d8533767a48fb7352bcb918dbb6701dde328cd31667e760ed581c1d80e466a5",
+    "src/lib.rs": "68fb16e1b199d58813c08949b9973bc2a6be10f0ed833ab92b784427c542f1de",
+    "src/main.rs": "b23ecf6b85e007fa3ece8d3a7cee48e6ebbf0223a6202d71682f72378848688b",
+    "src/model/content.rs": "ac7a1e366df167bb7e3b64f67571a5797b79371bc8f1c9f57a6ad162586c75d0",
+    "src/model/content_wire.rs": "d5eda545a36541917edcedb0d335733658a05357805d1e7eb02c953bfa13c2f9",
+    "src/model/errors.rs": "6e317a050dc3a29d01f35b4af092f34b77fd4bb2a2c3e375ac4b2d79d0c7ab65",
+    "src/model/health.rs": "ab6dd44f6bda8f39219c6460cd8c3cf6c733f38dd853ff2600ffbddf2b1f2be0",
+    "src/model/ipc.rs": "dda59a06ac3fe5a7ee0f2ae33938a5079f6d281a516e9341b0f86804fe4f2b91",
+    "src/model/lease.rs": "6a3f9f9cdf9483e67ac6f477673458b3d573a6779971a5e4d351a7d5ea75ce3f",
+    "src/model/mod.rs": "16be4777d746aa91b51d47f9c242cb5c477bfdf1024fdc6ed494e8deafde6671",
+    "src/model/orchestrator.rs": "262f199c058ed2f154eda34cebfc3a375097b4108e2183de13f3892b92881866",
+    "src/model/protocol.rs": "362a616834b6508f19678d9c9d34370a6297ff5e3821a5f879ceef60e161608b",
+    "src/model/status.rs": "9a7a46d09f136e5278984f364c348144366dceb29b3e5b50c0092247d5e5d2ab",
+    "src/model/workspace.rs": "53cc631a80f1a1605189ba31a27e667551ef86b6bb41abcaab46cb87642442e9",
+    "src/mount.rs": "9891e8b92707803bbb8941fbcc1be177aa8880c36682867420bfb3faf9ce564d",
+    "src/orchestrator/api.rs": "cd7ee3dd72f885abc64858b74a21ed098e25c6872dd29a96c7a3e84110729fb0",
+    "src/orchestrator/catalog.rs": "2ffd61b6279a56cd79b73a91ca10dd5242ba83d4ed5ebafa20635c104332c30d",
+    "src/orchestrator/compat.rs": "8e27b4eb849e6330c37b0d8bb163b2506226b1b3568deaeef1721413bae5a76c",
+    "src/orchestrator/config.rs": "6269219da980a0bbc3ed684d6399e42b89d635258dd2dc5d01a2d749278f48fd",
+    "src/orchestrator/content_dispatch.rs": "0133cf4e37167a753ee5c81f0ddbb8af17153dc564a7ada77687b6e900e760a4",
+    "src/orchestrator/content_transport.rs": "fe302c9fba3bd52f008aec2b7b31d4e0a6695768fc2ac5b2847339492d352922",
+    "src/orchestrator/ctx.rs": "ffc54886d544c433a2b16031030e30cc364e0d2e332e39dd2fe2e74c0fb812b0",
+    "src/orchestrator/diagnostics.rs": "22431e1902bbbb66ead6254faa8a673ffe588d29a565b0223ee882b472080ada",
+    "src/orchestrator/folder.rs": "3903243bd9231f7b3a739872659540fa5a609186b9b914926b1b1f62b367bdac",
+    "src/orchestrator/hub.rs": "396691e312abd7682cf37de7a9988682a1410b0054828c2142a540c0daa5514a",
+    "src/orchestrator/hub_rules.rs": "5bb82444a904b53c6bc2220761d945f2193954a94f1c7e399581f565accaf802",
+    "src/orchestrator/inbound.rs": "5a75c1d89a5283a4a51ef6a155021dc79431044519365ed3e51a0e7b7037d4eb",
+    "src/orchestrator/inbound_objects.rs": "6cdaa9a694bfcc809b0cf0bf6475485115ac467e8a97c111dbb3fd7ade6213ed",
+    "src/orchestrator/lease_clock.rs": "1f9724d89393e997d7294b994856b87f051620cd0c493eb004530280907d3f84",
+    "src/orchestrator/legacy_demand.rs": "dc1758750db1a9d384ce3ae6b96990ec3160f9c564e25fde912a86051249f5ed",
+    "src/orchestrator/manage.rs": "65154b11e94336120596ceb62eb7c87ec963975d7d71d337c7a592c5cf01c91f",
+    "src/orchestrator/manage_v2.rs": "6cb65cc28e806919d5d04c59c47dd4be027e913acb9fa5c4ad35b4f2f1dd2082",
+    "src/orchestrator/meta_exchange.rs": "ac90586fd1c7c8cba67ac235a6fac20365d7204d12876274165791aff01c916e",
+    "src/orchestrator/mod.rs": "6556e8a141f4e2d974c06db6525c6d8fa6340a5eec0050130abb3e19b16c3d25",
+    "src/orchestrator/objects.rs": "115b5e71675499d84375f2b6e0ff4aabfea9c8a6b25e2650792cb92b832fe40e",
+    "src/orchestrator/peer.rs": "860c9231104bec47b931012df42bd68480256589c0482d5dc30aeed7294c8174",
+    "src/orchestrator/process.rs": "30efdd5db1283f5c90f5b5994be61d22fba9af00a9a7b872e83a90437096d421",
+    "src/orchestrator/published.rs": "41b29eea0c48e6b167619aeaaddd42210a02d819bf2a5f8bf97f9398342eb364",
+    "src/orchestrator/registry.rs": "23f9167a85f550f199eb7d7b911f621ba0c0156a98e3655dbe3d4a292c053618",
+    "src/orchestrator/run.rs": "83fd1c261d2ef1e17f258b650ba6c000ac82b1b0c8bd9090ea2a299e26e730b1",
+    "src/orchestrator/scheduler.rs": "16335b944b87b10f81bec1ebed31600b1d9b6eeb39e7ec981efcb8def3c0b4a5",
+    "src/orchestrator/shutdown.rs": "451d48388fd425a991cb2e6f08bbff79223af3ff19f961a0ac8930328bfd1ab5",
+    "src/orchestrator/worker_client.rs": "19f42985155cbfa1d0979f708d319245ea84757fb2db4d3e537fb4346b7fbc1c",
+    "src/paired_sync.rs": "d9d23722db191ca2b9096a3ce67b936e1205d3aec435a12b8d714ba08ae45b56",
+    "src/pairing_code.rs": "15e92303767dfff4b75177960ef48c01fd73cac105b6b30cf80c5a26d2f74691",
+    "src/runtime/content.rs": "2f050d15602ba9674b158739dd23b2ef5f33fdd3ef4a04737c35830f72626103",
+    "src/runtime/content_rpc.rs": "dd7661fdc387f934742b7242816da5239b874e7e80e3a77b3fb8d8c183e06f98",
+    "src/runtime/control.rs": "875d2272a56f3b6fdbb38bda0a1a0c15d5aef9275226f8ff4ddb595d859c87d2",
+    "src/runtime/ctx.rs": "e5f1dcf1b862cc11bdd87f7f872cec326de46a791495028b76f23d4aee5d1713",
+    "src/runtime/engine.rs": "10bb6d7009e2d2decedca91393de998ee89303c00dd47a8dfd6245118a33e212",
+    "src/runtime/export.rs": "265057ab699a30749a3f099b1cd2556edcc4e27ca87375b69b551a4bc98c5d0e",
+    "src/runtime/mod.rs": "ebccf25c15f040a31fbd08206a34ada641daad22151208e0f8983f528286c2c3",
+    "src/runtime/notify.rs": "5f69457ce29a3ed055b345ee8cd88ba283f14ac969a4f049fc85b3cda7e671d7",
+    "src/runtime/objects_rpc.rs": "72cf7381110848c8277c2723f7ce5c8855fa8e9a456bc7bce63713f526b0523a",
+    "src/runtime/published.rs": "9ad7cdd40191b239486788d390f452d88f85dbc9ab366b14eaa7e1bbacb3840f",
+    "src/runtime/server.rs": "88ca3903894444e27116fdd013e879b9e7e8b22c0ec95a5f6214d03cc5212295",
+    "src/runtime/sync_rpc.rs": "f392691573dc3b5db0b2ddaf63991d39b15fffffb7bf5e08a7a275e540b4b3ff",
+    "src/session/auth.rs": "688543b36e3f36d233ec0c5c301ef112ecdab2ba3649cb8f2d923bfd9489ad6c",
+    "src/session/conn.rs": "56193e7251b9c056d883f7176fe609b80f187c87af01e28a4d46e16625c5154b",
+    "src/session/frame.rs": "3ed6238885ae5eabf57d6556ef44be837ed26f5b4a8ed546705b05e694354c26",
+    "src/session/handshake.rs": "884cab66c0df463b534aeea623ad0201dd1fed119254b5ec9c4210fed7c5517a",
+    "src/session/io.rs": "cabdb2aafa103ed36372c6fec8c2285d94f4869da2c6b4f04e571531de88f0c3",
+    "src/session/mod.rs": "a62631a8f264404bddc9ef06924d13c00c9d13af7cee6a8dfa821ee135ef1f98",
+    "src/staging.rs": "8b3b963a6b133a5744abcb5452fa7b00699a84cb4196b197cd521451ef982819",
+    "src/startup.rs": "bb375d5d3d2eee00cb404dfc5fc1b264419b451293eaa780ff4b16c428de7b57",
+    "src/ui_model.rs": "aee8988b21018f8506d506e06204ffeece0f42716a05969c70b41b97ec61c830",
+    "src/util/backoff.rs": "069294f2ee76e33910ff68bcb44cb5397807c8ae46b2a9a7cc6a7523b41a954f",
+    "src/util/cancel.rs": "8ed07385f548ceedda00ea20d0787395533dc9b5f98ed92890b22a7d5e8848aa",
+    "src/util/fault.rs": "1371796dd14fb237d53ee577b625683aa523dcb6e720e2fb7747bd76d94ac644",
+    "src/util/hmac.rs": "80be00c209b438b9e0369a05958bfce61588f489cde4d89fbe80b2c00afb6043",
+    "src/util/lock.rs": "38172ce4dcded00f9257a667f48f7e53575b9fe54c04062aa0866e97bc8f1055",
+    "src/util/log.rs": "224cf2e6acc65b5297cdbb539a91badf5f4542a4b12ea982ad6acde29d422a65",
+    "src/util/mod.rs": "c092ec6d43e77cb0aa0fed21e62dfaddce2466094a0ded5c1d9bc4c9b8e72a37",
+    "src/util/notify.rs": "2208bc8488c89caf788c7964482b441ea19c99dd219406cd83011996a6ce28c9",
+    "src/util/phases.rs": "f846d6846a8c794f97bce97421f573d7131cd4d8e206fab4065ec7400dc69458",
+    "src/util/snapshot.rs": "3e8fa488a13885fe07cb836b22c33aad01475183005a5f834185861fa3afdb18",
+    "src/util/time.rs": "d9708704100f9d4c408551c480d8f1d1c8c28102df18d48bb86a2eef980ac8b4",
+    "src/wire.rs": "8d80dce0906f5f2ec573fe11ccad945c97d57dae4b4062857bc59b599b2ce2d5",
+    "src/worker/activator.rs": "89d57596656a31813893d38a622d0a087f7a4dc9e563854b2d4490250864984a",
+    "src/worker/heartbeat.rs": "61caa9a8bd3188936886c440079edbd4fb58e580bbf7448601fe5f0805c1d028",
+    "src/worker/maintenance.rs": "8785eb4341826d36615e27371db5b9af6f62570030faa3391380804edcb91059",
+    "src/worker/mod.rs": "f79368de962ce857b755b22236f3464d3bd08cd05ef0e9c8827e4772c4d66f3a",
+    "src/worker/mount_ctl.rs": "78f2ef60a54b6a39f4cd5b7c80c436f768e60824e9ca271d7a3688eab9a121ab",
+    "src/worker/record.rs": "6786613df74a9933a19dbed3fdf305ee01e35e7656abb72b9257a7d74a242e4c",
+    "src/worker/status_cell.rs": "86f9e8e08347bebcc4da7273f38bc131d6b5cb71a1b978b39efe136f619d7c8c",
+    "src/ws.rs": "34c5d2cca8310aecb8cca832f01fe4a247e47556747ae5bb0ed8918bde86ddce",
+    "tests/content_transport.rs": "d2ec80ff4fc14a34763917adf56b35065c0fc930a77186c23328c012c2b204b8",
+    "tests/contracts.rs": "0a642a6e7cedda81a719161925e1034b49ad043b0876e2a06cc9ccf9b990da93",
+    "tests/lease_generations.rs": "815621660a36b5f2470ddc172719e119999b626f8857f8f9599ff717f6961c01",
+    "tests/objects_v3_lanes.rs": "d723ef6274e29fae382879eae79cf5164c2d548f6148bcdcc7330ad53db59e81",
+    "tests/objects_v3_worker.rs": "bf58e1d1e6fd35ef83d8b57783cc208b6f7048c57e12f66d19e7492146f51bae",
+    "tests/session_core.rs": "fe0621cf49eaa8d5228174761f864627c64b775f9c5c3fcf3fcad102d3e9686d"
+  },
+  "executables_sha256": {
+    "content_transport-45a007033282eb55.exe": "f6699f417e643d5570478d4602726a2284c50a14d2e20904119a925f86078e72",
+    "contracts-299e0621d4b830f3.exe": "a12597268c7aedf29833e2068139af1bbd767637a0156ad7dda4e5b3f21685fa",
+    "lease_generations-7c9e057918b7ca6c.exe": "63c9fb27f8de59f45103894c6ecb966bc4424a08daab78f4ef8ebb2282e31e8e",
+    "objects_v3_worker-5c6601c542723b58.exe": "cd0509d28df25f38350050ee050bc2eaab1b55457e1e3a85c440cfda3994a6c7",
+    "objects_v3_lanes-1e7d56d13c6245d0.exe": "dcc10d63d9cdd2a2bff264c6f5621002e6701777e3c5be3eb0c69f2f8212255c",
+    "session_core-ca9282992a234916.exe": "ccfd13cfe990ffa47bac5a657c134d627ca68d131ff8ea174977fb4012a0a706",
+    "tkfs.exe": "d9a05bc748bc6a94acee0b6e5e115eb04099c1a56867307f2997a4d125b4f583"
+  },
+  "checks": [
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test objects_v3_worker --test content_transport --test lease_generations --test contracts -- --test-threads=1 --skip tiny_objects_one_data_fsync_per_object_and_one_registration_per_batch --nocapture",
+      "exit_code": 0,
+      "results": {
+        "content_transport": {
+          "passed": 17,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 26.64
+        },
+        "contracts": {
+          "passed": 41,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 5.47
+        },
+        "lease_generations": {
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 0.09
+        },
+        "objects_v3_worker": {
+          "passed": 46,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 1,
+          "elapsed_seconds": 18.21
+        }
+      },
+      "samples": [
+        {
+          "available_ms": 116.5133,
+          "bound_ms": 1000,
+          "old_source_stall_ms": 2000,
+          "scenario": "native_legacy_reconnect"
+        },
+        {
+          "available": true,
+          "available_ms": 65.1461,
+          "bound_ms": 1000,
+          "foreground_completions": 0,
+          "scenario": "background_while_foreground_stalled"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 52.7821,
+          "drained": true,
+          "scenario": "lane_cancel"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 27.611900000000002,
+          "drained": true,
+          "scenario": "daemon_cancel"
+        },
+        {
+          "admission_ms": 43.6931,
+          "admitted": true,
+          "bound_ms": 250,
+          "scenario": "foreground_behind_two_stalled_repositories",
+          "stalled_background_completions": 0
+        },
+        {
+          "admission_bound_ms": 250,
+          "admission_ms": 59.484,
+          "availability_bound_ms": 1000,
+          "availability_ms": 248.6111,
+          "background_stall_ms": 2000,
+          "heartbeat_changed": false
+        },
+        {
+          "available": true,
+          "available_ms": 37.466699999999996,
+          "bound_ms": 1000,
+          "scenario": "replace_stalled_lane"
+        }
+      ],
+      "stage": "final library source; foreground regression still used fixture activation, before the final test-only activation-disabled assertion"
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_transport --test objects_v3_lanes --test session_core -- --test-threads=1 --nocapture",
+      "exit_code": 0,
+      "results": {
+        "content_transport": {
+          "passed": 17,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 26.49
+        },
+        "objects_v3_lanes": {
+          "passed": 53,
+          "failed": 0,
+          "ignored": 18,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 93.45
+        },
+        "session_core": {
+          "passed": 59,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 54.28
+        }
+      },
+      "samples": [
+        {
+          "available_ms": 119.7291,
+          "bound_ms": 1000,
+          "old_source_stall_ms": 2000,
+          "scenario": "native_legacy_reconnect"
+        },
+        {
+          "available": true,
+          "available_ms": 37.629000000000005,
+          "bound_ms": 1000,
+          "foreground_completions": 0,
+          "scenario": "background_while_foreground_stalled"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 65.1571,
+          "drained": true,
+          "scenario": "lane_cancel"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 25.165699999999998,
+          "drained": true,
+          "scenario": "daemon_cancel"
+        },
+        {
+          "admission_ms": 44.7038,
+          "admitted": true,
+          "bound_ms": 250,
+          "scenario": "foreground_behind_two_stalled_repositories",
+          "stalled_background_completions": 0
+        },
+        {
+          "admission_bound_ms": 250,
+          "admission_ms": 22.0562,
+          "availability_bound_ms": 1000,
+          "availability_ms": 219.43480000000002,
+          "background_stall_ms": 2000,
+          "bytes": 1048599,
+          "foreground_frames_completed": 5,
+          "heartbeat_changed": false,
+          "typed_activation": false
+        },
+        {
+          "available": true,
+          "available_ms": 34.9831,
+          "bound_ms": 1000,
+          "scenario": "replace_stalled_lane"
+        }
+      ],
+      "stage": "final library and test source; actual foreground regression has typed activation disabled"
+    },
+    {
+      "command": "cargo clippy --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib --test content_transport --test objects_v3_worker --test objects_v3_lanes --test session_core --test contracts --test lease_generations -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --all --check; git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "unique_package_checks_passed": 220,
+  "final_results_by_target": {
+    "content_transport": {
+      "passed": 17,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "elapsed_seconds": 26.49
+    },
+    "contracts": {
+      "passed": 41,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "elapsed_seconds": 5.47
+    },
+    "lease_generations": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "elapsed_seconds": 0.09
+    },
+    "objects_v3_worker": {
+      "passed": 46,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 1,
+      "elapsed_seconds": 18.21
+    },
+    "objects_v3_lanes": {
+      "passed": 53,
+      "failed": 0,
+      "ignored": 18,
+      "measured": 0,
+      "filtered": 0,
+      "elapsed_seconds": 93.45
+    },
+    "session_core": {
+      "passed": 59,
+      "failed": 0,
+      "ignored": 0,
+      "measured": 0,
+      "filtered": 0,
+      "elapsed_seconds": 54.28
+    }
+  },
+  "source_identity_note": "All six targets use the final library source. Content_transport was rebuilt and rerun after the final test-only activation-disabled setup and five-frame assertion. The other five targets had no subsequent source changes. No overlapping invocation is counted twice.",
+  "fault_configuration": [
+    {
+      "point": "worker.rpc.objects.read",
+      "action": "hang",
+      "ms": 2000,
+      "count": 2,
+      "purpose": "two actual nonempty background files on one peer/lane; verify missing native CAS and active leases before demand"
+    },
+    {
+      "point": "worker.rpc.objects.content-v1.legacy-read",
+      "action": "hang",
+      "ms": 300,
+      "count": 1,
+      "purpose": "ACK while source handler remains active; retain shared byte/job credit"
+    },
+    {
+      "seed": null,
+      "note": "named deterministic interleavings, real native Store/CAS and authenticated peer/loopback workers, not simulated object RPCs"
+    }
+  ],
+  "failed_development_stages": [
+    {
+      "log": "legacy-foreground-final.log",
+      "exit_code": 101,
+      "result": "transport 15 pass / 2 fail",
+      "reason": "larger transfer verifier exceeded one-MiB provider read limit; stale-credit assertion expected a different code; subsequent bounded reads and actual CONTENT_CANCELLED assertion fixed tests"
+    },
+    {
+      "log": "legacy-foreground-diagnostic.log",
+      "exit_code": 101,
+      "result": "3 pass / 1 fail",
+      "reason": "all five foreground frames completed with no spool left; oversized provider verification still failed; active-credit test passed"
+    },
+    {
+      "command": "cargo test --release --test objects_v3_worker foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame -- --exact --nocapture",
+      "outcome": "cancelled",
+      "reason": "invoked default fresh build cache accidentally; deliberately interrupted, then used the established explicit Windows target/cache; no tests claimed"
+    }
+  ],
+  "unretained_context_observations": [
+    "Before the adapter, the corrected cross-repository admission test failed at 250.8654 ms. This tool-output observation has no retained raw log and is not a reproducible baseline check in this report.",
+    "An earlier invalid stall setup hit empty historical revisions. The retained test first establishes actual verified shared empty receipts, then asserts both nonempty background files are missing and leased."
+  ],
+  "not_qualified": [
+    "18 existing long lane qualification cases remain ignored; no waiver inferred",
+    "previously passed 10,000-object worker case filtered in this package invocation; not claimed again",
+    "complete retained legacy job/spool/lease, cross-lane-count generation and acceptor push-generation audits",
+    "cancellation inside native legacy first-serve hashing, legacy foreground repeated cancellation and all source-failure interleavings",
+    "large working-set / idle polling overhead / sustained fairness and 30-minute saturation recovery",
+    "mounted range demand, recoverable private saves, workspace journal/cache and WP6.4-WP6.6 integration",
+    "final Windows/FUSE compatibility, migration/downgrade fencing, release build matrix and normal activation"
+  ],
+  "retained_outputs": {
+    "legacy-foreground-qualified.log": {
+      "sha256": "90497ff40d498df7b12c807d1536cc40078a4aa227715cdac98f4b367b58a903",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 24.25s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 17 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":116.5133,\"bound_ms\":1000,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":65.1461,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":52.7821,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":27.611900000000002,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":43.6931,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":59.484,\"availability_bound_ms\":1000,\"availability_ms\":248.6111,\"background_stall_ms\":2000,\"heartbeat_changed\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":37.466699999999996,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.64s\n\n     Running tests\\contracts.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\contracts-299e0621d4b830f3.exe)\n\nrunning 41 tests\ntest backoff_resets_only_after_a_healthy_period ... ok\ntest backoff_sanitizes_a_jitter_set_through_the_field ... ok\ntest backoff_stays_within_bounds_over_10000_samples ... ok\ntest call_errors_are_classified_and_uncertainty_is_explicit ... ok\n\nthread 'cancel_hooks_run_once_and_children_follow_their_parent' (62660) panicked at tests\\contracts.rs:3156:33:\na panicking killer is contained\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest cancel_hooks_run_once_and_children_follow_their_parent ... ok\ntest cancel_runs_children_before_the_parents_hooks ... ok\ntest cancel_sleep_returns_within_50ms_of_cancel ... ok\ntest classify_covers_every_code_literal_in_src ... ok\ntest classify_matches_the_section_8_table ... ok\ntest clocks_tell_time ... ok\ntest code_of_finds_the_first_code_in_the_chain ... ok\ntest ctx_reports_network_not_ready_until_set ... ok\ntest error_records_count_and_resolve ... ok\ntest event_identifier_codes_are_scanned ... ok\ntest every_fixture_file_is_covered ... ok\ntest fault_environment_variables_arm_a_point_in_a_child_process ... ok\n\nthread 'fault_points_match_by_name_scope_and_count' (53036) panicked at src\\util\\fault.rs:218:31:\nFAULT_INJECTED: contracts.panic\ntest fault_points_match_by_name_scope_and_count ... ok\ntest feed_digest_is_the_first_16_hex_of_sha256 ... ok\ntest golden_fixtures_round_trip_byte_for_byte ... ok\ntest heartbeat_without_mount_errors_parses ... ok\ntest hmac_matches_rfc_4231_cases_1_to_7 ... ok\ntest lane_spec_owns_exactly_like_the_legacy_bulk_lane ... ok\n\nthread '<unnamed>' (70400) panicked at tests\\contracts.rs:3299:9:\npoison the mutex\n\nthread 'lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy' (46136) panicked at src\\util\\lock.rs:76:17:\nLOCK_POISONED: a thread panicked while holding this lock\ntest lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy ... ok\ntest lock_or_exit_runs_the_hook_then_exits_70_under_exit_policy ... ok\ntest log_events_are_json_lines_rate_limited_per_code ... ok\ntest log_rate_windows_are_bounded ... ok\ntest model_helpers_follow_the_spec ... ok\ntest need_budget_fits_the_meta_exchange_body ... ok\ntest notify_wakes_within_10ms_and_never_loses_pokes ... ok\ntest op_allowed_follows_the_op_table ... ok\ntest pairing_secrets_are_never_serialized_or_debug_printed ... ok\ntest session_entry_points_fail_closed ... ok\ntest shared_handles_are_send_and_sync ... ok\ntest snapshot_wait_newer_wakes_within_10ms ... ok\ntest spec_examples_parse_into_the_frozen_types ... ok\ntest status_events_without_the_wave_2_members_parse ... ok\ntest tracked_reports_after_release_and_log_writes_after_unlock ... ok\ntest tracked_reports_holds_longer_than_50ms ... ok\ntest tracked_violation_is_logged_in_debug_builds ... ok\ntest upgrade_kind_reads_the_sync_header ... ok\ntest wave6_error_scopes_extend_the_historical_table ... ok\n\ntest result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.47s\n\n     Running tests\\lease_generations.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\lease_generations-7c9e057918b7ca6c.exe)\n\nrunning 4 tests\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... \nrunning 1 test\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... ok\ntest a_run_clock_is_monotonic_under_concurrent_lane_creation ... ok\ntest corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch ... ok\ntest ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\n     Running tests\\objects_v3_worker.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe)\n\nrunning 46 tests\ntest a_busy_writer_fails_the_registration_once_not_per_object ... ok\ntest a_committed_object_not_yet_received_is_not_available ... ok\n{\"at_ms\":1792490850440,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.write\",\"hash\":\"915d3c02390ff83c51d44ed628cea5a48fa4481363ad7b4f9f1aa7736204356d\",\"source\":\"840b6967-c104-4744-bac0-6a5612d75cbd\",\"retry_at_ms\":1792490880440}\ntest a_corrupt_source_is_backed_off_for_that_source_only ... ok\ntest a_corrupt_verdict_outranks_an_earlier_serve ... ok\ntest a_new_lane_count_takes_over_the_old_lanes_leases ... ok\ntest a_release_with_a_hold_hides_the_objects_from_their_source ... ok\ntest a_released_lease_moves_the_object_to_another_source_at_once ... ok\ntest a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open ... ok\n{\"at_ms\":1792490851422,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"s1\",\"source\":\"dad6d723-374d-4168-a9a6-2d14832c8a2f\",\"retry_at_ms\":1792490911422}\n{\"at_ms\":1792490851422,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"37403058a25f1eab9350bd10a3feb7df32e9b0bf424aa8df0b8574a8c796f38a\",\"session\":\"s1\",\"source\":\"dad6d723-374d-4168-a9a6-2d14832c8a2f\",\"retry_at_ms\":1792490911422}\n{\"at_ms\":1792490851434,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"c1\",\"source\":\"replica-c\",\"retry_at_ms\":1792490911434}\ntest a_stalled_lease_moves_the_object_to_another_source ... ok\ntest a_verified_read_quarantines_corrupt_bytes_through_the_store ... ok\ntest a_want_that_excludes_gives_its_leases_up ... ok\ntest an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects ... ok\ntest an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease ... ok\ntest corrupt_spool_never_installed ... ok\ntest crash_between_install_and_register_retransfers ... ok\ntest crash_mid_object_resumes_from_durable ... ok\ntest duplicate_sessions_transfer_once ... ok\n{\"at_ms\":1792490854510,\"level\":\"warn\",\"code\":\"SIZE_MISMATCH\",\"site\":\"worker.objects.write\",\"hash\":\"7596d22592aebe69b1aca3e9f5543dc13281f1cb7464106536f462ea66451b5b\",\"source\":\"7ac59b8c-a0d7-45ca-bce2-2221f0c65001\",\"retry_at_ms\":1792490884510}\ntest failed_writes_back_their_object_off ... ok\ntest foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame ... ok\ntest full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes ... ok\ntest hash_only_request_not_permitted ... ok\ntest json_ops_over_a_session_fire_their_fault_point_once ... ok\ntest kill_mid_object_resumes_from_durable ... ok\ntest legacy_receive_path_keeps_spool_state ... ok\nStartup snapshot fallback for b008f62d255d6454ebe571b5ec42461b3ad97990604456269c53b81188d3a950: SNAPSHOT_VERSION_OR_IDENTITY: missing field `journal_state` at line 1 column 13336\ntest legacy_spool_is_adopted_once ... ok\n{\"at_ms\":1792490859065,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.report\",\"hash\":\"c1f3f2c7f73413791c760de4f2566edac16cd4f6cdc5431d71625e7211112263\",\"reporter\":\"071fdbca-9f98-415b-8cd2-1a60f8af9734\",\"action\":\"verified_ok\"}\ntest loopback_sessions_serve_objects_and_json_ops_next_to_the_json_rpc ... ok\n{\"at_ms\":1792490859196,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"353fa51965fa99ca44d6185f24a0fc973486d5c73ab1a8b1544115d4dc173878\",\"session\":\"dialer-session\",\"source\":\"db2f8080-7cd0-432d-b751-bb1aaf26b4a1\",\"retry_at_ms\":1792490919196}\ntest mutual_pairing_transfers_once_and_leases_expire ... ok\ntest newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them ... ok\ntest objects_demand_lists_what_readers_wait_for_and_leases_nothing ... ok\ntest objects_state_belongs_to_its_worker_context ... ok\ntest objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete ... ok\ntest out_of_order_writes_wait_for_their_turn ... ok\ntest overlapping_parts_are_verified_and_resume_where_durable ... ok\ntest private_present_object_is_retransferred_verified_then_registered ... ok\ntest report_of_a_good_copy_keeps_it ... ok\ntest report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read ... ok\ntest staged_objects_without_a_size_descriptor_complete ... ok\ntest staged_only_objects_are_wanted_received_but_not_served ... ok\ntest startup_truncates_spools_to_durable ... ok\ntest tampered_spool_never_installed ... ok\ntest unsolicited_write_rejected ... ok\ntest want_lists_interleave_a_large_object_fairly ... ok\ntest want_lists_shard_by_lane ... ok\ntest want_never_renews_a_lease_only_progress_does ... ok\ntest want_ordering_is_demand_then_current_then_history_smaller_first ... ok\ntest worker_ops_check_routes_and_requests ... ok\n\ntest result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.21s\n\n"
+    },
+    "legacy-foreground-regressions.log": {
+      "sha256": "feccde86a8c358be5046815964a941055f387f17a32fca33079321257beed083",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 9.32s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 17 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":119.7291,\"bound_ms\":1000,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":37.629000000000005,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":65.1571,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":25.165699999999998,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":44.7038,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":22.0562,\"availability_bound_ms\":1000,\"availability_ms\":219.43480000000002,\"background_stall_ms\":2000,\"bytes\":1048599,\"foreground_frames_completed\":5,\"heartbeat_changed\":false,\"typed_activation\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":34.9831,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.49s\n\n     Running tests\\objects_v3_lanes.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_lanes-1e7d56d13c6245d0.exe)\n\nrunning 71 tests\ntest a_busy_database_is_no_failure_of_the_objects ... ok\ntest a_connection_loss_resumes_from_the_durable_offset ... ok\ntest a_corrupt_push_is_reported_to_our_worker_and_backs_off ... ok\ntest a_demanded_object_gets_the_next_pull_of_a_busy_lane ... ok\ntest a_failed_worker_call_fails_the_push_not_its_objects ... ok\ntest a_failing_repository_never_stalls_the_others_on_its_lane ... ok\ntest a_grown_demand_queue_starts_an_idle_lanes_round ... ok\ntest a_holder_that_goes_away_hands_the_pulled_object_on ... ok\ntest a_holder_that_goes_away_hands_the_pushed_object_on ... ok\ntest a_large_object_never_idles_between_rounds ... ok\ntest a_lost_session_gives_up_every_lease_its_rounds_kept ... ok\ntest a_peer_reply_counts_only_for_the_objects_it_was_asked_for ... ok\ntest a_peer_without_objects_v3_fails_its_key_without_an_interim_exchange ... ok\ntest a_pull_never_carries_more_items_than_the_acceptor_takes ... ok\ntest a_pull_stream_must_start_each_object_at_its_span ... ok\ntest a_push_of_objects_never_offered_records_no_errors ... ok\ntest a_push_of_partial_objects_never_stalls_the_acceptor ... ok\ntest a_push_outside_its_shares_is_refused ... ok\ntest a_reap_never_ends_the_lease_of_the_lanes_next_session ... ok\ntest a_replica_change_moves_the_key_to_the_new_route ... ok\ntest a_resume_point_resynchronizes_the_object_without_a_backoff ... ok\ntest a_saturating_push_does_not_delay_pulls_on_a_slow_uplink ... ok\ntest a_settled_object_is_not_pulled_again_in_its_round ... ok\ntest a_source_that_cannot_serve_hands_its_pull_lease_on ... ok\ntest a_source_that_cannot_serve_hands_its_push_lease_on ... ok\ntest a_source_whose_content_grows_is_asked_again_at_once ... ok\ntest a_stalled_push_does_not_block_pulls_on_the_same_lane ... ok\ntest a_stalled_source_leaves_the_window_to_other_repositories ... ok\ntest a_worker_without_loopback_sessions_is_remembered ... ok\ntest an_inbound_only_peer_that_unpairs_is_recorded_gone ... ok\ntest an_object_a_dialer_lacked_is_offered_again_soon ... ok\ntest an_object_no_longer_wanted_settles_without_an_error ... ok\ntest an_object_of_unknown_size_is_handed_on_after_partial_progress ... ok\ntest an_object_of_unknown_size_pushed_in_part_is_handed_on ... ok\ntest an_offer_whose_session_went_away_gives_up_its_leases ... ok\ntest at_most_16_mib_in_flight_per_lane ... ok\ntest at_most_two_repositories_share_a_lane ... ok\ntest both_directions_complete_with_per_object_results ... ok\ntest control_carries_no_object_bytes ... ok\ntest empty_chunks_cannot_hold_a_pull ... ok\ntest every_shared_repository_runs_on_the_lane_with_its_own_route ... ok\ntest inbound_checks_keep_their_codes ... ok\ntest inbound_routes_name_the_authenticated_installation ... ok\ntest objects_of_unknown_size_travel_both_ways ... ok\ntest one_stalled_push_leaves_a_third_repository_its_turn ... ok\ntest qual_large_object_loopback ... ignored, WP3.3 qualification (release)\ntest qual_large_object_loopback_memory ... ignored, WP3.3 qualification (release)\ntest qual_large_object_rtt50 ... ignored, WP3.3 qualification (release)\ntest qual_large_object_rtt50_100mbit ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_loopback ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_loopback_memory ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_rtt50 ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_rtt50_100mbit ... ignored, WP3.3 qualification (release)\ntest qual_wp4_5_both_directions_loopback ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_both_directions_loopback_memory ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_both_directions_rtt50_20mib ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_both_directions_rtt50_20mib_memory ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_control_latency_under_a_saturated_lane ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_large_object_rtt50_20mib ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_large_object_rtt50_20mib_disk ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_session_server ... ignored, WP4.5 qualification (release; a measurement helper)\ntest qual_wp4_5_session_throughput_loopback ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_session_throughput_remote ... ignored, WP4.5 qualification (release; needs a remote server)\ntest socket_buffers_are_tuned_on_loopback_only ... ok\ntest staging_alone_starts_a_download ... ok\ntest stalled_pushes_of_two_repositories_leave_a_slot_to_pulls ... ok\ntest the_session_client_dials_without_its_lock ... ok\ntest the_session_client_retries_refusals_and_never_replays_uncertain_calls ... ok\ntest two_stalled_pushes_leave_a_third_repository_its_turn ... ok\ntest wants_for_objects_we_cannot_serve_record_no_errors ... ok\ntest zero_size_objects_travel_both_ways ... ok\n\ntest result: ok. 53 passed; 0 failed; 18 ignored; 0 measured; 0 filtered out; finished in 93.45s\n\n     Running tests\\session_core.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\session_core-ca9282992a234916.exe)\n\nrunning 59 tests\ntest a_holding_server_sends_progress_for_streams_behind_the_hold ... ok\ntest a_queued_stream_never_holds_reads_for_running_ones ... ok\ntest a_queued_stream_that_fits_waits_its_turn ... ok\ntest a_stuck_consumer_of_a_finished_stream_does_not_hold_the_connection ... ok\ntest a_stuck_stream_consumer_does_not_hold_the_connection ... ok\ntest an_oversized_batch_is_not_starved_by_smaller_ones ... ok\ntest backpressure_bounds_a_streamed_reply ... ok\ntest backpressure_bounds_queue_memory_with_a_slow_receiver ... ok\ntest backpressure_bounds_queue_memory_with_a_slow_receiver_over_wss ... ok\ntest bounds ... ok\ntest client_idle_limit_does_not_run_while_reads_are_held ... ok\ntest client_idle_limits_survive_a_server_hold ... ok\ntest client_rejects_server_violations ... ok\ntest close_fails_in_flight_calls_as_uncertain ... ok\ntest control_call_is_fast_while_data_is_queued ... ok\ntest control_call_is_fast_while_data_is_queued_over_wss ... ok\ntest dropped_upload_cancels_the_request ... ok\ntest duplex_32mib_each_way ... ok\ntest duplex_32mib_each_way_over_wss ... ok\ntest early_reply_purges_the_rest_of_an_upload ... ok\ntest empty_parts_behind_a_full_channel_are_delivered ... ok\n\nthread 'failed_stream_callbacks_release_flow_control' (34216) panicked at tests\\session_core.rs:1589:17:\ntest callback panics after the stream completed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread 'failed_stream_callbacks_release_flow_control' (34216) panicked at tests\\session_core.rs:1589:17:\ntest callback panics after the stream completed\ntest failed_stream_callbacks_release_flow_control ... ok\ntest finish_after_a_chunk_timeout_returns_at_once ... ok\ntest full_handler_queue_answers_busy ... ok\ntest goaway_closes_after_the_grace_period ... ok\ntest goaway_drains_in_flight_and_refuses_new_calls ... ok\n\nthread 'sess-62-h0' (26884) panicked at tests\\session_core.rs:755:13:\nhandler panic (expected by the test)\ntest handler_panic_answers_and_the_pool_survives ... ok\ntest header_only_parts_are_charged_to_the_receive_bound ... ok\ntest header_only_stream_chunks_are_charged_to_the_receive_bound ... ok\ntest health_reports_traffic ... ok\ntest heartbeat_detects_a_stalled_link ... ok\ntest heartbeat_detects_a_stalled_link_over_wss ... ok\ntest idle_connection_stays_up ... ok\ntest large_bodies_are_chunked_and_reassembled ... ok\ntest large_bodies_are_chunked_and_reassembled_over_wss ... ok\ntest late_reply_after_cancel_is_dropped ... ok\ntest lost_request_not_replayed ... ok\ntest more_streams_than_handlers_are_served_or_refused_busy ... ok\ntest ping_is_answered_without_a_handler ... ok\ntest progress_resets_the_idle_deadline ... ok\ntest protocol_violations_close_the_connection ... ok\ntest raw_frame_layout_matches_the_codec ... ok\ntest remote_error_keeps_conn ... ok\ntest requests_crossing_a_goaway_are_refused_not_lost ... ok\ntest responder_is_send_and_sync ... ok\ntest server_idle_limit_does_not_run_while_reads_are_held ... ok\ntest server_side_does_not_originate_requests ... ok\ntest slow_handler_does_not_delay_fast_calls ... ok\ntest slow_handler_does_not_delay_fast_calls_over_wss ... ok\ntest stream_chunks_do_not_pin_received_messages ... ok\ntest stuck_handler_is_cancelled_after_its_idle_limit ... ok\ntest thousand_concurrent_requests_are_paired ... ok\ntest thousand_concurrent_requests_are_paired_over_wss ... ok\ntest timeout_sends_cancel_and_the_handler_sees_it ... ok\ntest timeout_sends_cancel_and_the_handler_sees_it_over_wss ... ok\ntest unread_handler_replies_stay_bounded ... ok\ntest unread_ping_replies_hold_reads_and_stay_bounded ... ok\ntest upload_rejected_early_reports_the_error ... ok\ntest zero_handler_queue_serves_while_a_handler_is_idle ... ok\n\ntest result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 54.28s\n\n"
+    },
+    "legacy-foreground-clippy-final.log": {
+      "sha256": "bfbc15da33d5334f7c7d1cf4a6dd28fbb8ceb9aa1e7e618f80f04c16463839f1",
+      "text": "    Checking tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 1.59s\n"
+    },
+    "legacy-foreground-final.log": {
+      "sha256": "b97c0b6c9eaad65977b9cbf757f6e3eeb735748e90a7387373059c63b7918248",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 1m 48s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 17 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":113.1792,\"bound_ms\":1000,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":52.574200000000005,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":60.1715,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":25.105800000000002,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":5.6231,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\n\nthread 'legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat' (71080) panicked at tests\\content_transport.rs:1665:5:\nlegacy foreground bytes waited 1.0000571s\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... FAILED\n\nthread 'legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack' (61688) panicked at tests\\content_transport.rs:1726:5:\nassertion `left == right` failed\n  left: \"CONTENT_CANCELLED\"\n right: \"STALE_ADMISSION_GENERATION\"\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... FAILED\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":67.2553,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\nfailures:\n\nfailures:\n    legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat\n    legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack\n\ntest result: FAILED. 15 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.46s\n\nerror: test failed, to rerun pass `--test content_transport`\n"
+    },
+    "legacy-foreground-diagnostic.log": {
+      "sha256": "06a3ebfc61e6bec68de71e00b3781406d1892ced76d7e906bf3d6f5d110406d5",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 1m 42s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 4 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":111.076,\"bound_ms\":1000,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\n\nthread 'legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat' (41560) panicked at tests\\content_transport.rs:1667:5:\nlegacy foreground bytes waited 1.0018262s; dispatch=Some(DispatchView { lanes: 1, groups: 3, deferred: 0, preparing: 0, queued: 0, running: 0, peak_queue: 1, admitted: [5, 0, 0], completed: [5, 0, 0], failed: [0, 0, 0], retried: [0, 0, 0], errors: [] }); spool=None\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... FAILED\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\n\nfailures:\n\nfailures:\n    legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat\n\ntest result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 13 filtered out; finished in 7.53s\n\nerror: test failed, to rerun pass `--test content_transport`\n"
+    }
+  }
+}
