@@ -239,6 +239,37 @@ struct FakeWorker {
     stopped: AtomicBool,
 }
 
+// Historical assertions compare peer/lane ownership. Keep exact qualified
+// IDs in the fake's lease table and release log; normalize only those views.
+fn lease_base(session: &str) -> String {
+    tkfs::model::lease::parse_transfer(session)
+        .ok()
+        .flatten()
+        .filter(|owned| owned.family.starts_with("push:"))
+        .map_or_else(|| session.to_owned(), |owned| owned.scope.to_owned())
+}
+fn newer_push(next: &str, prior: &str) -> bool {
+    let (Ok(Some(next)), Ok(Some(prior))) = (
+        tkfs::model::lease::parse_transfer(next),
+        tkfs::model::lease::parse_transfer(prior),
+    ) else {
+        return false;
+    };
+    next.family.starts_with("push:")
+        && next.family == prior.family
+        && (
+            next.generation.incarnation,
+            next.layout.unwrap_or(0),
+            next.generation.run,
+            next.frame,
+        ) > (
+            prior.generation.incarnation,
+            prior.layout.unwrap_or(0),
+            prior.generation.run,
+            prior.frame,
+        )
+}
+
 impl FakeWorker {
     fn start(device: &str) -> Arc<FakeWorker> {
         Self::start_in(device, None)
@@ -434,6 +465,9 @@ impl FakeWorker {
 
     /// The session holding a live lease on `hash`.
     fn lease_of(&self, hash: &str) -> Option<String> {
+        self.raw_lease_of(hash).map(|session| lease_base(&session))
+    }
+    fn raw_lease_of(&self, hash: &str) -> Option<String> {
         let state = self.state.lock().unwrap();
         state
             .leases
@@ -449,7 +483,7 @@ impl FakeWorker {
             .unwrap()
             .iter()
             .filter(|(_, written, _, _)| written == hash)
-            .map(|(session, ..)| session.clone())
+            .map(|(session, ..)| lease_base(session))
             .collect()
     }
 
@@ -504,10 +538,11 @@ impl FakeWorker {
                         && !excluded.contains(hash.as_str())
                 })
                 .filter(|(hash, _)| {
-                    state
-                        .leases
-                        .get(*hash)
-                        .is_none_or(|(session, until)| *session == header.session || now >= *until)
+                    state.leases.get(*hash).is_none_or(|(session, until)| {
+                        *session == header.session
+                            || now >= *until
+                            || newer_push(&header.session, session)
+                    })
                 })
                 .map(|(hash, spool)| (hash.clone(), spool.clone()))
                 .collect()
@@ -643,7 +678,7 @@ impl FakeWorker {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(by, _)| by == session)
+            .filter(|(by, _)| by == session || lease_base(by) == session)
             .flat_map(|(_, hashes)| hashes.iter().cloned())
             .collect()
     }
@@ -785,6 +820,7 @@ impl FakeWorker {
             if let Some((holder, until)) = state.leases.get(&item.hash)
                 && holder != session
                 && now < *until
+                && !newer_push(session, holder)
             {
                 return result(ObjectOutcome::InFlightElsewhere, 0);
             }
@@ -2299,7 +2335,7 @@ fn inbound_routes_name_the_authenticated_installation() {
             }
         );
         assert_eq!(
-            want.session,
+            lease_base(&want.session),
             objects::push_lease(&dialer.ctx.installation, LANE)
         );
         assert_eq!(want.lane, LANE);
@@ -2482,7 +2518,10 @@ fn every_shared_repository_runs_on_the_lane_with_its_own_route() {
         let served = b.wants();
         assert!(!served.is_empty(), "{repo}");
         for want in &served {
-            assert_eq!(want.session, objects::push_lease(&a_installation, LANE));
+            assert_eq!(
+                lease_base(&want.session),
+                objects::push_lease(&a_installation, LANE)
+            );
             assert_eq!(
                 want.route,
                 SyncRoute {
@@ -2782,11 +2821,9 @@ fn a_source_that_cannot_serve_hands_its_push_lease_on() {
     // (B gives the lease up within the round now: the want log, not the
     // lease, shows the offer.)
     assert!(
-        wait_until(Duration::from_secs(10), || b
-            .worker
-            .wants()
-            .iter()
-            .any(|want| want.session == a1_lease && want.items.contains(&hash))),
+        wait_until(Duration::from_secs(10), || b.worker.wants().iter().any(
+            |want| lease_base(&want.session) == a1_lease && want.items.contains(&hash)
+        )),
         "A1 was never offered Y: lease {:?}",
         b.worker.lease_of(&hash)
     );
@@ -4304,7 +4341,7 @@ fn an_object_of_unknown_size_pushed_in_part_is_handed_on() {
         b.worker
             .wants()
             .iter()
-            .any(|want| want.session == a1_lease && want.exclude.contains(&hash)),
+            .any(|want| lease_base(&want.session) == a1_lease && want.exclude.contains(&hash)),
         "A1's wants never excluded Y"
     );
     lane_a1.stop();
@@ -5255,7 +5292,7 @@ fn an_offer_whose_session_went_away_gives_up_its_leases() {
             .lock()
             .unwrap()
             .iter()
-            .any(|(session, released)| *session == lease && released.contains(&hash))
+            .any(|(session, released)| lease_base(session) == lease && released.contains(&hash))
     );
     // A session that stays open and silent after its wants: the reaper.
     let conn = a.dial(&b.endpoint, &b.code, LANE);
@@ -5322,6 +5359,7 @@ fn a_reap_never_ends_the_lease_of_the_lanes_next_session() {
     let first = a.dial(&b.endpoint, &b.code, LANE);
     assert_eq!(offered_on(&first), vec![hash.clone()]);
     assert_eq!(b.worker.lease_of(&hash), Some(lease.clone()));
+    let old_id = b.worker.raw_lease_of(&hash).unwrap();
     // The worker's releases take 1.5 s; the session goes away before any
     // push, and the reaper begins to give its offer up.
     b.worker.faults().release_delay = Some(Duration::from_millis(1500));
@@ -5336,7 +5374,14 @@ fn a_reap_never_ends_the_lease_of_the_lanes_next_session() {
     );
     // Inside that release, the lane comes back on a new session and asks.
     let second = a.dial(&b.endpoint, &b.code, LANE);
+    let began = Instant::now();
     assert_eq!(offered_on(&second), vec![hash.clone()]);
+    assert!(
+        began.elapsed() < Duration::from_millis(250),
+        "a replacement still waited for old cleanup"
+    );
+    let new_id = b.worker.raw_lease_of(&hash).unwrap();
+    assert_ne!(old_id, new_id);
     b.worker.faults().release_delay = None;
     assert!(
         wait_until(Duration::from_secs(5), || {
@@ -5345,16 +5390,17 @@ fn a_reap_never_ends_the_lease_of_the_lanes_next_session() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(session, released)| *session == lease && released.contains(&hash))
+                .any(|(session, released)| *session == old_id && !released.contains(&hash))
         }),
-        "the reaper's release did not end the dead session's lease"
+        "the reaper did not finish its now-superseded release"
     );
-    // The new session's offer stands: its lease was taken after the release.
+    // The new session owns its lease while old cleanup is still outstanding.
     assert_eq!(
         b.worker.lease_of(&hash),
         Some(lease),
         "the reap ended the lease the lane's next session was offered"
     );
+    assert_eq!(b.worker.raw_lease_of(&hash), Some(new_id));
     drop(second);
 }
 

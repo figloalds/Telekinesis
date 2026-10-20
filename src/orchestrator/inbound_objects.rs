@@ -961,6 +961,15 @@ fn wants(
     if responder.cancelled() {
         return;
     }
+    if let Err(error) = crate::util::fault::trigger("inbound.objects.before_offer_publish") {
+        release_leases(
+            &bound.client,
+            &bound.route,
+            &source.lease,
+            offered.iter().map(|item| item.hash.clone()).collect(),
+        );
+        return responder.error(ErrorWire::from_error(&error));
+    }
     let spans = allot(&offered, PUSH_BUDGET_BYTES);
     let offer = Offer {
         owner: source.owner.clone(),
