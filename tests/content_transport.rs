@@ -2472,3 +2472,265 @@ fn native_legacy_hashing_stops_on_request_deadline_disconnect_and_worker_shutdow
         }
     }
 }
+
+#[test]
+fn native_background_read_stream_cancels_pending_calls_and_keeps_the_worker_session_usable() {
+    use tkfs::{
+        orchestrator::worker_client::{ReadFlow, ReadRange},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    // Exercise both an externally cancelled read and an existing read_stream
+    // consumer that stops after the first range while a later one is hashing.
+    for external in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::initialize(dir.path(), &tkfs::core::id(), &tkfs::core::id()).unwrap();
+        let mut hashes = Vec::new();
+        for (name, bytes) in [
+            ("small", vec![19; 17]),
+            ("large", vec![71; 3 * 1024 * 1024 + 17]),
+        ] {
+            let entry = s.create(name, "file").unwrap();
+            s.write_revision(&entry.id, entry.revisions.get("content").cloned(), &bytes)
+                .unwrap();
+            hashes.push(tkfs::core::hash(&bytes));
+        }
+        let large_path = s.root.join("objects").join(&hashes[1]);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(large_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        let before: i64 =
+            s.db.query_row(
+                "SELECT mtime_ns FROM object_availability WHERE hash=?",
+                [&hashes[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let route = SyncRoute {
+            peer: "peer".into(),
+            repo: s.repo.clone(),
+            local_replica: s.device.clone(),
+            remote_replica: "remote".into(),
+        };
+        let worker = Worker::new(s);
+        let client = worker.client();
+        let ranges = if external {
+            vec![ReadRange {
+                hash: hashes[1].clone(),
+                offset: 0,
+                len: 65536,
+            }]
+        } else {
+            hashes
+                .iter()
+                .map(|hash| ReadRange {
+                    hash: hash.clone(),
+                    offset: 0,
+                    len: if hash == &hashes[0] { 17 } else { 65536 },
+                })
+                .collect()
+        };
+        let mut config = FaultConfig::new("core.hash.after_chunk", FaultAction::Hang);
+        config.count = Some(1);
+        config.ms = Some(400);
+        fault::configure(Some(config));
+        let cancel = Cancel::new();
+        let (task_client, token, route) = (client.clone(), cancel.clone(), route.clone());
+        let task = thread::spawn(move || {
+            let consume = &mut |_: &ReadRange, result: Result<(u64, Vec<u8>), CallError>| {
+                assert!(!external, "cancelled range reached consumer");
+                assert_eq!(result.unwrap().1, vec![19; 17]);
+                let until = Instant::now() + Duration::from_secs(1);
+                while fault::fired() == 0 && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(fault::fired(), 1, "later hash was not in flight");
+                ReadFlow::Stop
+            };
+            let began = Instant::now();
+            if external {
+                task_client.read_stream_cancellable(
+                    &route,
+                    &ranges,
+                    2,
+                    Duration::from_secs(5),
+                    &|| token.is_cancelled(),
+                    consume,
+                );
+            } else {
+                task_client.read_stream(&route, &ranges, 2, Duration::from_secs(5), consume);
+            }
+            began.elapsed()
+        });
+        let until = Instant::now() + Duration::from_secs(1);
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fault::fired(), 1);
+        let began = Instant::now();
+        cancel.cancel();
+        let duration = task.join().unwrap();
+        assert!(
+            began.elapsed() < Duration::from_millis(250),
+            "local readers waited for stalled hash"
+        );
+        assert!(duration < Duration::from_millis(300));
+        // The abandoned call sends CANCEL for that request, keeping unrelated
+        // loopback users connected. A destructive socket close would fail here.
+        assert_eq!(
+            client
+                .call("hello", serde_json::json!({}), Duration::from_secs(1))
+                .unwrap()["device"],
+            worker.ctx.device
+        );
+        // Park the already-idle fast reader's connection. The next returned
+        // connection then belongs to the slow hash, even if the pool reused a
+        // single handle for both requests.
+        let parked: Vec<_> = (0..worker.ctx.sync_stores.idle())
+            .map(|_| worker.ctx.sync_stores.checkout().unwrap())
+            .collect();
+        let until = Instant::now() + Duration::from_secs(1);
+        while worker.ctx.sync_stores.idle() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            worker.ctx.sync_stores.idle() > 0,
+            "abandoned native hash did not drain"
+        );
+        drop(parked);
+        fault::configure(None);
+        let probe =
+            Store::open_secondary(dir.path(), &worker.ctx.repo, &worker.ctx.device).unwrap();
+        let recorded_mtime: i64 = probe
+            .db
+            .query_row(
+                "SELECT mtime_ns FROM object_availability WHERE hash=?",
+                [&hashes[1]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded_mtime, before,
+            "abandoned verification became trusted"
+        );
+        println!(
+            "WAVE6_HASH {}",
+            serde_json::json!({"scenario":if external {"background_external_cancel"} else {"background_consumer_stop"},
+            "local_stream_ms":duration.as_secs_f64()*1000.0,"io_stall_ms":400,"bound_ms":300,
+            "worker_session_usable":true,"partial_verification_trusted":false,"typed_activation":false})
+        );
+    }
+}
+
+#[test]
+fn native_legacy_read_rechecks_sharing_after_first_serve_verification() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Store::initialize(dir.path(), &tkfs::core::id(), &tkfs::core::id()).unwrap();
+    let bytes = vec![29; 2 * 1024 * 1024 + 7];
+    let hash = tkfs::core::hash(&bytes);
+    let entry = s.create("shared", "file").unwrap();
+    s.write_revision(&entry.id, entry.revisions.get("content").cloned(), &bytes)
+        .unwrap();
+    let path = s.root.join("objects").join(&hash);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+        .unwrap();
+    let route = serde_json::json!({"peer":"remote","repo":s.repo,
+        "local_replica":s.device,"remote_replica":"receiver"});
+    let worker = Worker::new(s);
+    let probe = Store::open_secondary(dir.path(), &worker.ctx.repo, &worker.ctx.device).unwrap();
+    let conn = session::dial_loopback(
+        &worker.endpoint.address,
+        worker.endpoint.token.as_deref(),
+        ConnOptions::default(),
+    )
+    .unwrap();
+    let header = serde_json::json!({"route":route,"hash":hash,"offset":0,"len":65536});
+    let mut config = FaultConfig::new("core.hash.after_chunk", FaultAction::Hang);
+    config.count = Some(1);
+    config.ms = Some(250);
+    fault::configure(Some(config));
+    let (request, payload) = (conn.clone(), header.clone());
+    let task = thread::spawn(move || {
+        request.call(
+            wire::LEGACY_READ,
+            payload,
+            vec![],
+            Priority::Control,
+            Duration::from_secs(2),
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let shared = || -> bool { probe.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM published_objects WHERE hash=?1 UNION ALL SELECT 1 FROM received_shared_objects WHERE hash=?1)",
+        [&hash], |row|row.get(0),
+    ).unwrap() };
+    assert!(shared());
+    probe
+        .db
+        .execute("DELETE FROM published_objects WHERE hash=?", [&hash])
+        .unwrap();
+    probe
+        .db
+        .execute("DELETE FROM received_shared_objects WHERE hash=?", [&hash])
+        .unwrap();
+    assert!(!shared());
+    assert_eq!(task.join().unwrap().unwrap_err().code(), "NOT_AVAILABLE");
+    fault::configure(None);
+    assert!(path.is_file());
+    assert_eq!(
+        conn.call(
+            "hello",
+            serde_json::json!({}),
+            vec![],
+            Priority::Control,
+            Duration::from_secs(1)
+        )
+        .unwrap()
+        .header["device"],
+        worker.ctx.device
+    );
+    assert_eq!(
+        conn.call(
+            wire::LEGACY_READ,
+            header,
+            vec![],
+            Priority::Control,
+            Duration::from_secs(1)
+        )
+        .unwrap_err()
+        .code(),
+        "NOT_AVAILABLE"
+    );
+    println!(
+        "WAVE6_HASH {}",
+        serde_json::json!({"scenario":"sharing_withdrawn_during_hash",
+        "bytes":bytes.len(),"bytes_served":0,"io_stall_ms":250,"worker_session_usable":true,
+        "typed_activation":false})
+    );
+    conn.close();
+}
