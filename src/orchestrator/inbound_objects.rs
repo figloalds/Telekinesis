@@ -125,17 +125,17 @@
 //! completed here; `objects_up` is 0, only the dialer knows what it
 //! installed); `ObjectError` for objects a push failed here, `Resolved` for
 //! every source's errors of an object a push installed.
+mod ownership;
 use super::{
     inbound::{
         Finished, deadline_error, invalid_request, peer_error, record_finished, resolve,
         status_lane, worker_deadline,
     },
     objects::{
-        KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, RELEASE_DEADLINE, Sink,
-        SinkEvent, SinkOptions, SinkResult, allot, blocked_objects, covered, is_failure,
-        object_blocked, object_failed, object_installed, object_key, object_unserved,
-        outcome_error, push_lease, read_outcome, read_ranges, release_leases, size_unknown,
-        want_excluding, wire_pieces,
+        KEEPALIVE, ObjectKey, PUSH_BUDGET_BYTES, PUSH_BUFFERED_BYTES, Sink, SinkEvent, SinkOptions,
+        SinkResult, allot, blocked_objects, covered, is_failure, object_blocked, object_failed,
+        object_installed, object_key, object_unserved, outcome_error, push_lease, read_outcome,
+        read_ranges, release_leases, size_unknown, want_excluding, wire_pieces,
     },
     worker_client::{self, ReadFlow, SessionWorkerClient},
 };
@@ -159,13 +159,14 @@ use crate::{
     session::{self, Responder},
     util::{cancel::Cancel, lock::lock},
 };
+use ownership::Owner;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::RandomState},
     hash::BuildHasher,
     sync::{
-        Arc, Condvar, Mutex, OnceLock, PoisonError,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::RecvTimeoutError,
     },
@@ -180,6 +181,15 @@ const HEADER_REPLY_MAX: usize = protocol::frame::MAX_HEADER - 1024;
 const POLL: Duration = Duration::from_millis(100);
 
 pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
+    handle_owned(ctx, peer, None, req);
+}
+
+pub(crate) fn handle_owned(
+    ctx: &Arc<Ctx>,
+    peer: &session::AcceptedPeer,
+    owner: Option<&Arc<super::lease_clock::PushSession>>,
+    req: session::Incoming,
+) {
     if peer.role != protocol::LaneRole::Bulk {
         let error = ErrorWire::coded(
             "BULK_ON_CONTROL_LANE",
@@ -198,8 +208,8 @@ pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incomi
     }
     match req.op.as_str() {
         ops::OBJECTS_PULL => pull(ctx, peer, req),
-        ops::OBJECTS_WANTS => wants(ctx, peer, req),
-        ops::OBJECTS_PUSH => push(ctx, peer, req),
+        ops::OBJECTS_WANTS => wants(ctx, peer, owner, req),
+        ops::OBJECTS_PUSH => push(ctx, peer, owner, req),
         ops::OBJECTS_REPORT => report(ctx, peer, req),
         _ => {
             let session::Incoming { op, responder, .. } = req;
@@ -539,6 +549,7 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
 /// What we offered a dialer's lane in its last `objects.wants`, until its
 /// push (or its next `objects.wants`) shows what it moved.
 struct Offer {
+    owner: Owner,
     /// The bulk session it was offered on.
     session: String,
     at: Instant,
@@ -565,27 +576,21 @@ struct Offered {
 #[derive(Default)]
 struct OfferMap {
     offers: HashMap<String, Offer>,
-    /// Keys being reaped ([`reap_offers`]); [`take_offer`] waits for them.
-    reaping: HashSet<String>,
 }
 
 struct Offers {
     map: Mutex<OfferMap>,
-    /// Notified when a reap of a key ends.
-    reaped: Condvar,
 }
 
 fn offers() -> &'static Offers {
     static OFFERS: OnceLock<Offers> = OnceLock::new();
     OFFERS.get_or_init(|| Offers {
         map: Mutex::new(OfferMap::default()),
-        reaped: Condvar::new(),
     })
 }
 
 /// How long an exchange waits at most for a reap of its offer's leases
 /// (one `objects.release` of at most `MAX_RELEASE_ITEMS`).
-const REAP_WAIT: Duration = Duration::from_secs(RELEASE_DEADLINE.as_secs() + 1);
 
 /// Offers remembered at most, and for at most this long.
 const MAX_OFFERS: usize = 4096;
@@ -598,36 +603,39 @@ fn offer_key(instance: &str, lease: &str) -> String {
 /// Takes the offer of `key`. A reap of its leases in progress ends first
 /// (at most [`REAP_WAIT`]): its release, by the lane's lease id, must not
 /// end the leases the caller's exchange takes next under that same id.
-fn take_offer(key: &str) -> Option<Offer> {
-    let offers = offers();
-    let until = Instant::now() + REAP_WAIT;
-    let mut map = lock(&offers.map);
-    while map.reaping.contains(key) {
-        let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            break;
+fn take_offer(key: &str, owner: &Owner, prior: bool) -> Option<Offer> {
+    let mut map = lock(&offers().map);
+    let matches = map.offers.get(key).is_some_and(|offer| {
+        if prior {
+            offer.owner.order() < owner.order()
+        } else {
+            offer.owner.order() == owner.order()
         }
-        map = offers
-            .reaped
-            .wait_timeout(map, left)
-            .unwrap_or_else(PoisonError::into_inner)
-            .0;
-    }
-    map.offers.remove(key)
+    });
+    matches.then(|| map.offers.remove(key)).flatten()
 }
 
-fn put_offer(key: String, offer: Offer) {
+fn put_offer(key: String, offer: Offer) -> bool {
     {
         let mut map = lock(&offers().map);
-        if map.offers.len() >= MAX_OFFERS {
+        if !offer.owner.current()
+            || map
+                .offers
+                .get(&key)
+                .is_some_and(|new| new.owner.order() > offer.owner.order())
+        {
+            return false;
+        }
+        if !map.offers.contains_key(&key) && map.offers.len() >= MAX_OFFERS {
             map.offers.retain(|_, offer| offer.at.elapsed() < OFFER_AGE);
             if map.offers.len() >= MAX_OFFERS {
-                return;
+                return false;
             }
         }
         map.offers.insert(key, offer);
     }
     start_reaper();
+    true
 }
 
 /// An offer whose session sent no `objects.*` request since the offer for
@@ -736,11 +744,9 @@ fn reap_where(gone: impl Fn(&Offer, &HashMap<String, Instant>) -> bool) -> usize
         let gone = {
             let seen = lock(sessions_seen());
             let mut map = lock(&offers().map);
-            let OfferMap { offers, reaping } = &mut *map;
-            match offers.get_mut(&key) {
+            match map.offers.get_mut(&key) {
                 Some(offer) if !offer.released && gone(offer, &seen) => {
                     offer.released = true;
-                    reaping.insert(key.clone());
                     Some((
                         offer.client.clone(),
                         offer.route.clone(),
@@ -759,8 +765,6 @@ fn reap_where(gone: impl Fn(&Offer, &HashMap<String, Instant>) -> bool) -> usize
             continue;
         };
         release_leases(&client, &route, &lease, hashes);
-        lock(&offers().map).reaping.remove(&key);
-        offers().reaped.notify_all();
         count += 1;
     }
     count
@@ -773,25 +777,36 @@ struct Source<'a> {
     peer: &'a str,
     repo: &'a str,
     lane: LaneSpec,
-    instance: String,
+    offer_key: String,
     lease: String,
+    owner: Owner,
 }
 
 impl<'a> Source<'a> {
     fn new(
-        ctx: &'a Ctx,
+        ctx: &'a Arc<Ctx>,
         peer: &'a session::AcceptedPeer,
         repo: &'a str,
         bound: &Bound,
-    ) -> Source<'a> {
-        Source {
+        session: Option<&Arc<super::lease_clock::PushSession>>,
+        advance: bool,
+    ) -> Result<Source<'a>, ErrorWire> {
+        let session = session.ok_or_else(|| {
+            ErrorWire::coded("CONTENT_CANCELLED", "unregistered inbound push session")
+        })?;
+        let base = push_lease(&peer.installation, bound.lane);
+        let offer_key = offer_key(&bound.client.endpoint().instance, &base);
+        let owner = Owner::begin(ctx, session, &offer_key, advance)?;
+        let lease = owner.lease(&base)?;
+        Ok(Source {
             ctx,
             peer: &peer.installation,
             repo,
             lane: bound.lane,
-            instance: bound.client.endpoint().instance.clone(),
-            lease: push_lease(&peer.installation, bound.lane),
-        }
+            offer_key,
+            lease,
+            owner,
+        })
     }
 
     fn key(&self, hash: &str) -> ObjectKey {
@@ -819,7 +834,9 @@ impl<'a> Source<'a> {
     /// or it backs it off): no error here, but a backoff for this source
     /// (its lease is given up by the caller).
     fn not_served(&self, hash: &str) {
-        object_unserved(&self.key(hash));
+        let _ = self
+            .owner
+            .while_current(|| object_unserved(&self.key(hash)));
     }
 
     /// An offer the dialer's next request settles: `pushed` (what its push
@@ -842,7 +859,12 @@ impl<'a> Source<'a> {
 /// `objects.wants`: what our worker wants of the dialer, leased to the
 /// dialer's lane ([`push_lease`]) for its next push, without what that lane
 /// cannot serve now (module docs, "Leases given up").
-fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
+fn wants(
+    ctx: &Arc<Ctx>,
+    peer: &session::AcceptedPeer,
+    owner: Option<&Arc<super::lease_clock::PushSession>>,
+    req: session::Incoming,
+) {
     let op = ops::OBJECTS_WANTS;
     let session::Incoming {
         header,
@@ -869,13 +891,16 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     if worker_deadline(deadline, worker_client::deadlines::WANT).is_none() {
         return responder.error(deadline_error(op));
     }
-    let source = Source::new(ctx, peer, &request.repo, &bound);
-    let key = offer_key(&source.instance, &source.lease);
+    let source = match Source::new(ctx, peer, &request.repo, &bound, owner, true) {
+        Ok(source) => source,
+        Err(error) => return responder.error(error),
+    };
+    let key = source.offer_key.clone();
     // The last offer on this session was followed by no push: the dialer
     // took none of it. Its objects back off for this dialer, and the want
     // below excludes them first, which gives up their leases.
     let mut exclude = Vec::new();
-    if let Some(offer) = take_offer(&key)
+    if let Some(offer) = take_offer(&key, &source.owner, true)
         && offer.session == peer.session
     {
         exclude = source.settle_unpushed(&offer, &HashSet::new());
@@ -942,6 +967,7 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
     }
     let spans = allot(&offered, PUSH_BUDGET_BYTES);
     let offer = Offer {
+        owner: source.owner.clone(),
         session: peer.session.clone(),
         at: Instant::now(),
         items: offered
@@ -958,7 +984,28 @@ fn wants(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         released: false,
     };
     if !offer.items.is_empty() {
-        put_offer(key, offer);
+        if !put_offer(key, offer) {
+            release_leases(
+                &bound.client,
+                &bound.route,
+                &source.lease,
+                offered.iter().map(|item| item.hash.clone()).collect(),
+            );
+            return responder.error(ErrorWire::coded(
+                if source.owner.current() {
+                    "CONTENT_RESOURCE_LIMIT"
+                } else {
+                    "IN_FLIGHT_ELSEWHERE"
+                },
+                "inbound offer not retained",
+            ));
+        }
+    }
+    if !source.owner.current() {
+        return responder.error(ErrorWire::coded(
+            "IN_FLIGHT_ELSEWHERE",
+            "inbound offer superseded",
+        ));
     }
     reply_json(responder, &ObjectsWantsReply { items: offered });
 }
@@ -975,7 +1022,12 @@ struct Share {
 }
 
 /// `objects.push` (module docs, "Push").
-fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
+fn push(
+    ctx: &Arc<Ctx>,
+    peer: &session::AcceptedPeer,
+    owner: Option<&Arc<super::lease_clock::PushSession>>,
+    req: session::Incoming,
+) {
     let began = Instant::now();
     let op = ops::OBJECTS_PUSH;
     let session::Incoming {
@@ -1009,9 +1061,12 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         Err(error) => return responder.error(error),
     };
     started(ctx, peer, &request.repo, op);
-    let source = Source::new(ctx, peer, &request.repo, &bound);
+    let source = match Source::new(ctx, peer, &request.repo, &bound, owner, false) {
+        Ok(source) => source,
+        Err(error) => return responder.error(error),
+    };
     // What we offered this lane on this session.
-    let offer = take_offer(&offer_key(&source.instance, &source.lease))
+    let offer = take_offer(&source.offer_key, &source.owner, false)
         .filter(|offer| offer.session == peer.session);
     let offered: HashMap<&str, &Offered> = offer
         .iter()
@@ -1078,7 +1133,7 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         // PROGRESS after writes (and every KEEPALIVE): the dialer's idle
         // deadline then measures our progress.
         scope.spawn(|| keepalive(&responder, &done, Some(&wrote)));
-        let stop = || responder.cancelled();
+        let stop = || responder.cancelled() || !source.owner.current();
         let mut last: Option<String> = None;
         loop {
             if stop() {
@@ -1113,6 +1168,12 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        if !source.owner.current() {
+            failure = Some(ErrorWire::coded(
+                "IN_FLIGHT_ELSEWHERE",
+                "inbound push offer superseded",
+            ));
         }
         // What arrived is valid and contiguous: written even when the
         // dialer went away, so its next push resumes after it.
@@ -1164,39 +1225,43 @@ fn push(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         // `OBJECT_ON_WRONG_LANE`) is answered in the result alone, with
         // neither a backoff nor an `ObjectError`, so a peer cannot fill our
         // status or our backoff table with hashes of its choosing.
-        let ours = offered.contains_key(item.hash.as_str());
+        let ours = source.owner.current() && offered.contains_key(item.hash.as_str());
         match &outcome {
             ObjectOutcome::Completed => {
-                objects_down += 1;
-                // Installed: the errors of every source of it are resolved
-                // (one that could not serve it may have given it up).
-                for code in object_installed(&source.key(&item.hash)) {
-                    ctx.status.record(StatusEvent::Resolved {
-                        scope: Scope::Object {
-                            state: bound.state.clone(),
-                            hash: item.hash.clone(),
-                        },
-                        code,
-                    });
-                }
+                source.owner.while_current(|| {
+                    objects_down += 1;
+                    // Installed: the errors of every source of it are resolved
+                    // (one that could not serve it may have given it up).
+                    for code in object_installed(&source.key(&item.hash)) {
+                        ctx.status.record(StatusEvent::Resolved {
+                            scope: Scope::Object {
+                                state: bound.state.clone(),
+                                hash: item.hash.clone(),
+                            },
+                            code,
+                        });
+                    }
+                });
             }
             other if is_failure(other) && !call && ours => {
-                let detail = format!("pushed by peer {}", peer.installation);
-                if let Some(mut error) = outcome_error(&item.hash, other, &detail) {
-                    let delay = object_failed(&source.key(&item.hash), &error.code);
-                    error.retry_after_ms =
-                        Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
-                    ctx.status.record(StatusEvent::ObjectError {
-                        state: bound.state.clone(),
-                        hash: item.hash.clone(),
-                        error,
-                        source: Some(ObjectSource {
-                            installation: peer.installation.clone(),
-                            lane: status_lane(peer),
-                            direction: Direction::Inbound,
-                        }),
-                    });
-                }
+                source.owner.while_current(|| {
+                    let detail = format!("pushed by peer {}", peer.installation);
+                    if let Some(mut error) = outcome_error(&item.hash, other, &detail) {
+                        let delay = object_failed(&source.key(&item.hash), &error.code);
+                        error.retry_after_ms =
+                            Some(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX));
+                        ctx.status.record(StatusEvent::ObjectError {
+                            state: bound.state.clone(),
+                            hash: item.hash.clone(),
+                            error,
+                            source: Some(ObjectSource {
+                                installation: peer.installation.clone(),
+                                lane: status_lane(peer),
+                                direction: Direction::Inbound,
+                            }),
+                        });
+                    }
+                });
             }
             _ => {}
         }

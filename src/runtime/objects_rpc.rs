@@ -208,8 +208,10 @@ fn run_current(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'
             && state.lease_runs.get(o.scope).is_none_or(|g| {
                 g.generation.incarnation < o.generation.incarnation
                     || (g.generation.incarnation == o.generation.incarnation
-                        && (g.layout != o.layout || g.generation < o.generation
-                            || (g.generation == o.generation && (!o.family.starts_with("push:") || g.frame<=o.frame))))
+                        && (g.layout != o.layout
+                            || g.generation < o.generation
+                            || (g.generation == o.generation
+                                && (!o.family.starts_with("push:") || g.frame <= o.frame))))
             })
     })
 }
@@ -292,12 +294,19 @@ fn pool_generation(owned: &crate::model::lease::Owned<'_>) -> crate::model::leas
 }
 
 fn fence_frame(owned: &crate::model::lease::Owned<'_>) -> Option<u64> {
-    owned.family.starts_with("push:").then_some(owned.frame).flatten()
+    owned
+        .family
+        .starts_with("push:")
+        .then_some(owned.frame)
+        .flatten()
 }
 
 fn superseded_lease(state: &ObjectsState, held: &ObjectLease, session: &str, now: u64) -> bool {
-    crate::model::lease::parse_transfer(&held.session).ok().flatten()
-        .is_some_and(|owned| !run_current(state,Some(&owned))) || superseded(held,session,now)
+    crate::model::lease::parse_transfer(&held.session)
+        .ok()
+        .flatten()
+        .is_some_and(|owned| !run_current(state, Some(&owned)))
+        || superseded(held, session, now)
 }
 
 fn wire(error: anyhow::Error) -> ErrorWire {
@@ -617,7 +626,7 @@ fn want_selected(
         let (mine, others): (Vec<_>, Vec<_>) = state
             .leases
             .iter()
-            .filter(|(_, lease)| !superseded_lease(&state,lease, session, now))
+            .filter(|(_, lease)| !superseded_lease(&state, lease, session, now))
             .partition(|(_, lease)| lease.session == session);
         let (mine, others) = (
             mine.into_iter().map(|(hash, _)| hash.clone()).collect(),
@@ -672,7 +681,7 @@ fn want_selected(
         items.retain_mut(|item| {
             let held = state.leases.get(&item.hash).cloned();
             match held {
-                Some(lease) if superseded_lease(&state,&lease, session, now) => {
+                Some(lease) if superseded_lease(&state, &lease, session, now) => {
                     let offset = lease.offset.max(item.offset);
                     item.offset = offset;
                     grant(&mut state, (&item.hash, session, source, offset), now);
@@ -871,7 +880,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         for hash in &hashes {
             let held = state.leases.get(*hash).cloned();
             match held {
-                Some(lease) if superseded_lease(&state,&lease, &session, now) => {
+                Some(lease) if superseded_lease(&state, &lease, &session, now) => {
                     let offset = committed.get(hash).copied().unwrap_or(lease.offset);
                     grant(&mut state, (hash, &session, source, offset), now);
                 }

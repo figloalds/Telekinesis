@@ -77,9 +77,15 @@ pub fn qualify_pull(base: &str, run: PullRun) -> Result<String, ErrorWire> {
 }
 
 pub fn qualify_push(base: &str, run: PushRun, frame: u64) -> Result<String, ErrorWire> {
-    let session = format!("{}.{:016x}",qualify(&format!("{base}:c{frame:016x}"),run.generation)?,run.layout);
-    let owned=parse(&session)?.ok_or_else(invalid)?;
-    if !owned.family.starts_with("push:") {return Err(invalid());}
+    let session = format!(
+        "{}.{:016x}",
+        qualify(&format!("{base}:c{frame:016x}"), run.generation)?,
+        run.layout
+    );
+    let owned = parse(&session)?.ok_or_else(invalid)?;
+    if !owned.family.starts_with("push:") {
+        return Err(invalid());
+    }
     Ok(session)
 }
 
@@ -142,7 +148,7 @@ fn parse_base(
     if !spec.is_valid() || lane != format!("{}/{}", spec.index, spec.count) {
         return Err(invalid());
     }
-    let mut frame=None;
+    let mut frame = None;
     let scope = match kind {
         "pull" => {
             let slot = parts.next().ok_or_else(invalid)?;
@@ -157,9 +163,13 @@ fn parse_base(
         }
         "push" => match parts.next() {
             None => base,
-            Some(slot) if slot.len()==17 && slot.starts_with('c') && hex(&slot[1..]).is_ok_and(|n|n>0) => {
-                frame=Some(hex(&slot[1..])?);
-                &base[..base.len()-slot.len()-1]
+            Some(slot)
+                if slot.len() == 17
+                    && slot.starts_with('c')
+                    && hex(&slot[1..]).is_ok_and(|n| n > 0) =>
+            {
+                frame = Some(hex(&slot[1..])?);
+                &base[..base.len() - slot.len() - 1]
             }
             _ => return Err(invalid()),
         },
