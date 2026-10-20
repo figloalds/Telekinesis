@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod bulk_sync;
+pub mod content;
 pub mod core;
 pub mod model;
 #[cfg(windows)]

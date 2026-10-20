@@ -2120,6 +2120,8 @@ fn classify_matches_the_section_8_table() {
 /// `TKFS_*` and `CARGO_*` environment variable names are skipped by prefix
 /// (`CARGO_`: CCR-WP1.2-1, CCR-WP1.4-3, CCR-WP1.11-3).
 const NOT_CODES: &[&str] = &[
+    "TKFC", // Wave 6 descriptor binary magic
+    "TKFM", // Wave 6 manifest binary magic
     "ALTER",
     "BEGIN",
     "COMMIT",
@@ -2144,6 +2146,24 @@ const NOT_CODES: &[&str] = &[
     "UNSUPPORTED",
     "CODE",
 ];
+
+#[test]
+fn wave6_error_scopes_extend_the_historical_table() {
+    let mut seen = BTreeSet::new();
+    for (code, class) in errors::WAVE6_CODES {
+        assert!(seen.insert(*code));
+        assert_eq!(classify(code), *class);
+        assert_eq!(errors::explicit_class(code), Some(*class));
+    }
+    assert!(!classify("CONTENT_CANCELLED").counts_as_failure());
+    assert!(!classify("STALE_ADMISSION_GENERATION").counts_as_failure());
+    assert_eq!(classify("CORRUPT_CONTENT"), ErrorClass::Transient);
+    assert_eq!(classify("MANIFEST_COVERAGE"), ErrorClass::Fatal);
+    assert_eq!(
+        classify("UNSUPPORTED_CONTENT_DESCRIPTOR"),
+        ErrorClass::Incompatible
+    );
+}
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap() {
@@ -2453,6 +2473,29 @@ fn model_helpers_follow_the_spec() {
     assert_eq!(protocol::PEER_HMAC_V1, "peer-hmac-v1");
     assert_eq!(protocol::max_body(protocol::ops::OBJECTS_PULL), 1 << 20);
     assert_eq!(protocol::max_body(protocol::ops::PING), 1 << 20);
+    assert_eq!(protocol::max_body(tkfs::model::content_wire::READ), 65_536);
+    assert_eq!(
+        protocol::max_body(tkfs::model::content_wire::COMPLETE),
+        65_536
+    );
+    assert_eq!(protocol::max_body(tkfs::model::content_wire::POLL), 0);
+    assert_eq!(protocol::max_body(tkfs::model::content_wire::ACK), 0);
+    assert_eq!(
+        protocol::max_body(tkfs::model::content_wire::LEGACY_PREPARE),
+        0
+    );
+    assert_eq!(
+        protocol::max_body(tkfs::model::content_wire::LEGACY_BEGIN),
+        0
+    );
+    assert_eq!(
+        protocol::max_body(tkfs::model::content_wire::LEGACY_READ),
+        65_536
+    );
+    assert_eq!(
+        protocol::max_body(tkfs::model::content_wire::LEGACY_PULL),
+        262_144
+    );
     assert_eq!(
         protocol::op_deadline(protocol::ops::META_EXCHANGE),
         Some(Duration::from_secs(30))

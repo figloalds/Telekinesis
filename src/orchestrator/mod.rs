@@ -14,6 +14,8 @@ mod run;
 // its owner in its first line.
 pub mod catalog;
 pub mod compat;
+pub mod content_dispatch;
+pub mod content_transport;
 pub mod ctx;
 pub mod diagnostics;
 pub mod folder;
@@ -21,6 +23,8 @@ pub mod hub;
 pub mod hub_rules;
 pub mod inbound;
 pub mod inbound_objects;
+pub mod lease_clock;
+pub mod legacy_demand;
 pub mod manage;
 pub mod manage_v2;
 pub mod meta_exchange;

@@ -14,6 +14,7 @@ use std::{
 };
 
 pub mod content;
+pub mod content_rpc;
 pub mod control;
 pub mod ctx;
 pub mod engine;

@@ -240,6 +240,9 @@ pub fn build_with(config: Config, options: BuildOptions) -> Result<Daemon> {
         extensions: OnceLock::new(),
     });
     let _ = extras(&ctx).hub.set(hub.clone());
+    let _ = extras(&ctx)
+        .lease_clock
+        .set(super::lease_clock::Clock::new(catalog.lease_incarnation()));
     hub.set_daemon(DaemonStatus {
         installation,
         version: crate::worker::version().to_owned(),
@@ -454,6 +457,8 @@ impl WorkerLauncher for DaemonLauncher {
 /// extension slot (`Ctx::extensions`).
 #[derive(Default)]
 pub struct Extras {
+    pub(crate) lease_clock: OnceLock<super::lease_clock::Clock>,
+    pub(crate) content: Mutex<Option<Arc<super::content_transport::ContentDaemon>>>,
     hub: OnceLock<Arc<StatusHub>>,
     pub(crate) shutdown: shutdown::Latch,
     /// A management write recorded a daemon-level `CATALOG_UNAVAILABLE`

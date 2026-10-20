@@ -8,6 +8,7 @@
 !/test-evidence/lab/
 !/test-evidence/build-sync-20261019/
 !/test-evidence/wave-5-handoff/
+!/test-evidence/wave-6/
 # Legacy report locations (current harnesses use the directories above).
 /VALIDATION.json
 /*-VALIDATION.json

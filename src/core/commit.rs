@@ -494,6 +494,8 @@ const BUSY_FAULT: &str = "core.commit.busy";
 pub(super) struct Checked {
     payload: String,
     objects: BTreeSet<String>,
+    /// Journal generation from which the projection will be prepared.
+    base_seq: i64,
 }
 
 /// Result of `check_commit`.
@@ -623,6 +625,7 @@ impl Store {
     }
     /// Every validation of the commit path that needs no projection.
     pub(super) fn check_commit(&self, event: &Event, local: bool) -> Result<Check> {
+        self.check_content_capability(event)?;
         ensure!(event.repo == self.repo, "REPOSITORY_MISMATCH");
         ensure!(
             event.id.len() <= 128 && !event.id.is_empty() && event.device.len() <= 128,
@@ -703,7 +706,14 @@ impl Store {
                     "INVALID_KIND"
                 ),
                 "alive" => ensure!(change.value.is_boolean(), "INVALID_ALIVE"),
-                "content" => ensure!(change.value.is_string(), "INVALID_CONTENT"),
+                "content" => {
+                    if !change.value.is_string() {
+                        let reference: crate::model::content::FileContentRef =
+                            serde_json::from_value(change.value.clone())
+                                .context("INVALID_CONTENT")?;
+                        reference.validate()?;
+                    }
+                }
                 "basic" => serde_json::from_value::<BasicInfo>(change.value.clone())?.validate()?,
                 _ => {}
             }
@@ -711,7 +721,11 @@ impl Store {
         if let Ok(b) = self.branch(&event.branch.id) {
             ensure!(b == event.branch, "BRANCH_DESCRIPTOR_CHANGED");
         }
-        Ok(Check::Ready(Checked { payload, objects }))
+        Ok(Check::Ready(Checked {
+            payload,
+            objects,
+            base_seq: frontier_seq(&self.db, &event.branch.id)?,
+        }))
     }
     /// `check_commit`'s verification of newly authored bytes (WP5.1 task 5,
     /// CCR-WP4.INT-5's re-hash): skipped when this process verified the
@@ -1272,9 +1286,13 @@ impl Store {
         local: bool,
         checked: Checked,
         plan: Plan,
-        view_base: Option<i64>,
+        _view_base: Option<i64>,
     ) -> Result<()> {
-        let Checked { payload, objects } = checked;
+        let Checked {
+            payload,
+            objects,
+            base_seq,
+        } = checked;
         let incremental = matches!(plan, Plan::Fast(_));
         let branch = event.branch.id.clone();
         // Never patch (or seal) a view that holds a rolled-back commit.
@@ -1282,15 +1300,6 @@ impl Store {
         // Other connections' commits that changed no projection row keep the
         // view (WP3.INT).
         self.adopt_foreign_commits();
-        // A fast commit patches the view if no other connection committed
-        // since it was loaded (I6).
-        let patchable = incremental && {
-            let data_version = self.data_version().ok();
-            self.view_cache
-                .borrow()
-                .as_ref()
-                .is_some_and(|v| v.branch == branch && Some(v.data_version) == data_version)
-        };
         fault("before_sql");
         let tx = self.db.savepoint()?;
         for object in &objects {
@@ -1321,10 +1330,24 @@ impl Store {
             "INSERT OR IGNORE INTO branches VALUES(?,?,?)",
             params![event.branch.id, event.branch.name, event.branch.shared],
         )?;
+        // The first write acquired SQLite's writer. No other connection can
+        // now change this branch before publication. Reject stale preparation
+        // rather than overwrite a projection prepared from an older history.
+        ensure!(
+            frontier_seq(&tx, &branch)? == base_seq,
+            "STALE_METADATA_PREPARATION"
+        );
+        let projection_base = snapshot::projection_version(&tx);
+        let patchable = incremental
+            && projection_base.is_some()
+            && self.view_cache.borrow().as_ref().is_some_and(|view| {
+                view.branch == branch && view.projection_version == projection_base
+            });
         tx.execute(
             "INSERT INTO events VALUES(?,?,?)",
             params![event.id, event.branch.id, payload],
         )?;
+        admission::append_event(&tx, &event, local)?;
         // The event's journal row (the `journal_sequence` trigger) is the
         // journal's newest, so its sequence is the branch's new tip: the
         // cursor of a seal in this commit.
@@ -1472,13 +1495,19 @@ impl Store {
         tx.commit()?;
         self.caches.commit.epoch.set(epoch);
         self.count_commit(&event.id, incremental);
-        // Patch the view only if no other connection committed since it was
-        // loaded (I6); otherwise drop it. Never fail after the commit.
+        #[cfg(test)]
+        tests::after_commit();
+        // Read data_version before the projection counter: a later metadata
+        // commit either changes the counter below or invalidates this token on
+        // the next lookup. Object bookkeeping alone need not reload the view.
         let data_version = self.data_version().ok();
+        let unchanged = projection_version.is_some()
+            && snapshot::projection_version(&self.db) == projection_version;
         let mut cache = self.view_cache.borrow_mut();
         match plan {
             Plan::Fast(_) if patched => match cache.as_mut() {
-                Some(view) if Some(view.data_version) == data_version => {
+                Some(view) if data_version.is_some() && unchanged => {
+                    view.data_version = data_version.unwrap();
                     view.changes = self.db.total_changes();
                     view.transactional = !self.db.is_autocommit();
                     view.projection_version = projection_version;
@@ -1487,7 +1516,7 @@ impl Store {
             },
             Plan::Fast(delta)
                 if cache.as_ref().is_some_and(|v| {
-                    v.branch == branch && Some(v.data_version) == data_version
+                    v.branch == branch && patchable && data_version.is_some() && unchanged
                 }) =>
             {
                 let view = cache.as_mut().unwrap();
@@ -1497,10 +1526,11 @@ impl Store {
                     view.changes = self.db.total_changes();
                     view.transactional = !self.db.is_autocommit();
                     view.projection_version = projection_version;
+                    view.data_version = data_version.unwrap();
                 }
             }
             Plan::Slow(slow) => {
-                *cache = match view_base.filter(|base| Some(*base) == data_version) {
+                *cache = match data_version.filter(|_| unchanged) {
                     // A slow commit stored exactly `projection`, and no other
                     // connection committed since its history was read: it is
                     // the fresh view, so the next reader does not load and
@@ -2073,7 +2103,7 @@ impl Store {
                 .revisions
                 .insert(change.field.clone(), event.id.clone());
             if change.field == "content" {
-                entry.content = change.value.as_str().map(str::to_owned);
+                entry.set_content_value(&change.value)?;
             } else if change.field == "basic" {
                 entry.basic = Some(serde_json::from_value(change.value.clone())?);
             }
@@ -2178,7 +2208,7 @@ impl Store {
                 .revisions
                 .insert(change.field.clone(), event.id.clone());
             if change.field == "content" {
-                entry.content = change.value.as_str().map(str::to_owned);
+                entry.set_content_value(&change.value)?;
             }
             if change.field == "basic" {
                 entry.basic = Some(serde_json::from_value(change.value.clone())?);
@@ -2430,6 +2460,114 @@ fn injected_busy() -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        static AFTER_COMMIT: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn after_commit() {
+        let hook = AFTER_COMMIT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn content_event(store: &Store, entity: &str, object: &str) -> Event {
+        store.event(
+            &store.branch(&store.active).unwrap(),
+            vec![
+                store
+                    .current_change(entity, "content", json!(object))
+                    .unwrap(),
+            ],
+        )
+    }
+
+    #[test]
+    fn an_overlapping_object_commit_keeps_the_patched_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), None).unwrap();
+        let file = store.create("file", "file").unwrap();
+        let object = store.put_object(b"new content").unwrap();
+        let event = content_event(&store, &file.id, &object);
+        let root = store.root.clone();
+        let repo = store.repo.clone();
+        let device = store.device.clone();
+        let key = object.clone();
+        AFTER_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let other = Store::open_secondary(&root, &repo, &device).unwrap();
+                other
+                    .db
+                    .execute(
+                        "INSERT OR REPLACE INTO object_requests VALUES(?,?)",
+                        params![key, time()],
+                    )
+                    .unwrap();
+            }))
+        });
+        let loads = store.view_loads();
+        store.commit(event, true).unwrap();
+        assert_eq!(store.lookup("file").unwrap().content, Some(object));
+        assert_eq!(
+            store.view_loads(),
+            loads,
+            "bookkeeping forced a projection reload"
+        );
+        assert!(store.verify_derived_state().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_overlapping_metadata_commit_is_never_hidden_by_a_new_freshness_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), None).unwrap();
+        let a = store.create("a", "file").unwrap();
+        let b = store.create("b", "file").unwrap();
+        let local = store.put_object(b"local").unwrap();
+        let foreign = store.put_object(b"foreign").unwrap();
+        let event = content_event(&store, &a.id, &local);
+        let second = content_event(&store, &b.id, &foreign);
+        let root = store.root.clone();
+        let repo = store.repo.clone();
+        let device = store.device.clone();
+        AFTER_COMMIT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let mut other = Store::open_secondary(&root, &repo, &device).unwrap();
+                other.commit(second, true).unwrap();
+            }))
+        });
+        store.commit(event, true).unwrap();
+        assert_eq!(store.lookup("a").unwrap().content, Some(local));
+        assert_eq!(store.lookup("b").unwrap().content, Some(foreign));
+        assert!(store.verify_derived_state().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_foreign_commit_after_preparation_rejects_the_stale_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path(), None).unwrap();
+        let a = store.create("a", "file").unwrap();
+        let b = store.create("b", "file").unwrap();
+        let local = store.put_object(b"local").unwrap();
+        let foreign = store.put_object(b"foreign").unwrap();
+        let event = content_event(&store, &a.id, &local);
+        let Check::Ready(checked) = store.check_commit(&event, true).unwrap() else {
+            panic!()
+        };
+        let fast = store.fast_successor(&event, true).unwrap();
+        let second = content_event(&store, &b.id, &foreign);
+        let mut other = Store::open_secondary(&store.root, &store.repo, &store.device).unwrap();
+        other.commit(second, true).unwrap();
+        let error = store
+            .commit_checked(event.clone(), true, checked, fast)
+            .unwrap_err();
+        assert!(error.to_string().contains("STALE_METADATA_PREPARATION"));
+        assert!(!store.events().unwrap().iter().any(|old| old.id == event.id));
+        store.commit(event, true).unwrap();
+        assert_eq!(store.lookup("a").unwrap().content, Some(local));
+        assert_eq!(store.lookup("b").unwrap().content, Some(foreign));
+        assert!(store.verify_derived_state().unwrap().is_empty());
+    }
 
     /// WP5.1 task 5: a local commit of bytes this process has just stored
     /// (`put_object`, `put_stream`) does not hash them again; bytes that

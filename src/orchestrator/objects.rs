@@ -47,7 +47,8 @@
 //! 1. Worker `objects.want{route, lane, max_items 256, max_bytes 16 MiB,
 //!    session, exclude}`: wanted objects owned by the lane, with their
 //!    durable spool offsets. The lease session is one of two ids per lane and
-//!    repository ([`pull_lease`]), both stable across reconnects. A want
+//!    repository ([`pull_lease`]), qualified with this lane run's ordered
+//!    generation (CCR-WP6.3-4). A want
 //!    issued while a pull is in flight uses the id the previous want did not,
 //!    so it never returns that pull's objects again (the worker hides
 //!    objects leased to another session). A want with no pull in flight asks
@@ -487,7 +488,8 @@ pub fn size_unknown(item: &WantItem) -> bool {
 }
 
 /// The lease session of a dialer's pulls on `lane` of `peer` (`slot` 0 or
-/// 1): stable across reconnects, so a resumed transfer finds its own lease.
+/// 1). This stable base is qualified with an ordered run generation at use;
+/// a newer run takes the durable offset over without inheriting old cleanup.
 pub fn pull_lease(peer: &str, lane: LaneSpec, slot: u64) -> String {
     format!(
         "pull:{peer}:{}/{}:{}",
@@ -2067,8 +2069,48 @@ pub fn run_lane_with(
     }
     // Either direction's end (cancel, session gone) ends the other.
     let token = cancel.child();
+    let leases = (|| -> Result<_, ErrorWire> {
+        let generation = super::lease_clock::next(&ctx)?;
+        Ok((
+            generation,
+            [
+                crate::model::lease::qualify(&pull_lease(&peer.installation, lane, 0), generation)?,
+                crate::model::lease::qualify(&pull_lease(&peer.installation, lane, 1), generation)?,
+            ],
+        ))
+    })();
+    let (generation, leases) = match leases {
+        Ok(leases) => leases,
+        Err(error) => {
+            refuse(
+                &ctx,
+                &peer,
+                &conn,
+                &cancel,
+                status,
+                error,
+                &options.download,
+            );
+            return;
+        }
+    };
+    let _content = match super::content_dispatch::register_with_legacy(
+        &ctx,
+        peer.clone(),
+        lane,
+        conn.clone(),
+        &token,
+        Some(generation),
+    ) {
+        Ok(registration) => Some(registration),
+        Err(error) => {
+            crate::util::log::event!(warn, CONTENT_RESOURCE_LIMIT, {"site":"content.dispatch.start","message":format!("{error:#}")});
+            None
+        }
+    };
     let stats = options.stats.clone().unwrap_or_default();
     let run = Arc::new(LaneRun {
+        leases,
         ctx: ctx.clone(),
         peer: peer.clone(),
         conn: conn.clone(),
@@ -2135,7 +2177,7 @@ pub fn run_lane_with(
 /// meanwhile ([`hold_key`]): no round of it, of this runner or of the next
 /// session's, overlaps the release; a round still running settles its own.
 /// Not while the daemon stops (an adopted worker's leases are continued by
-/// the restarted lanes under the same ids, or lapse).
+/// restarted lanes take them over under a newer generation, or they lapse).
 fn release_kept(lane: &LaneRun) {
     if lane.ctx.stopping.load(Ordering::Relaxed) {
         return;
@@ -2213,6 +2255,7 @@ pub fn status_lane(lane: LaneSpec) -> u32 {
 
 /// What both directions of a lane share.
 struct LaneRun {
+    leases: [String; 2],
     ctx: Arc<Ctx>,
     peer: Arc<PeerContext>,
     conn: session::Conn,
@@ -2352,7 +2395,7 @@ impl LaneRun {
     }
 
     fn lease(&self, slot: usize) -> String {
-        pull_lease(&self.peer.installation, self.spec, slot as u64)
+        self.leases[slot % 2].clone()
     }
 
     fn stop_error(&self) -> ExchangeError {
@@ -3310,7 +3353,7 @@ fn settle_leases(
     }
     if lane.ctx.stopping.load(Ordering::Relaxed) {
         // The daemon stops: a worker it leaves running for adoption keeps
-        // them, and the restarted lanes continue under the same ids (or
+        // them; restarted lanes take over under a newer generation (or
         // they lapse).
         return;
     }
@@ -3419,14 +3462,19 @@ fn want_more(
         // it could (the list is bounded): given up at once.
         let mut refused = Vec::new();
         for item in items {
+            // A want can regrant an object after an earlier want's exclude
+            // released it. If this round already began it, ignoring that
+            // duplicate before checking backoff would orphan the new lease:
+            // settlement remembers the originally planned slot. Give every
+            // returned backed-off lease up under the slot that just got it.
+            if blocked(&item.hash) {
+                refused.push(item.hash);
+                continue;
+            }
             if !lane.spec.owns(&item.hash) || state.planned_or_begun(&item.hash) {
                 if state.begun.contains(&item.hash) {
                     state.leftovers = true;
                 }
-                continue;
-            }
-            if blocked(&item.hash) {
-                refused.push(item.hash);
                 continue;
             }
             fresh += 1;

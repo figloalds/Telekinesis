@@ -124,6 +124,9 @@ fn run(ctx: &WorkerCtx) {
         next_scrub: None,
         next_log_check: None,
         store: None,
+        admission: None,
+        content: None,
+        receipts: None,
     };
     let mut errors = crate::util::backoff::Backoff::inbox();
     while !ctx.stopping.load(Ordering::Relaxed) {
@@ -172,14 +175,35 @@ struct Maintenance {
     /// objects whenever that connection's cache was cold). Dropped after an
     /// error and opened again at the next refresh.
     store: Option<crate::core::Store>,
+    /// Independent root consumer; never takes the semantic engine lock and
+    /// never waits for SQLite's writer. Durable replay replaces notifications.
+    admission: Option<crate::core::Store>,
+    content: Option<crate::content::LocalContent>,
+    receipts: Option<crate::content::receipt::ReceiptRecovery>,
 }
 
 impl Maintenance {
     fn tick(&mut self, ctx: &WorkerCtx, now: Instant) {
+        crate::runtime::content_rpc::reap(ctx);
         // Fault point `worker.maintenance.tick.<repo>` (tests: a panicking
         // tick is contained; the repo keeps it to one in-process worker).
         let _ = crate::util::fault::trigger(&format!("worker.maintenance.tick.{}", ctx.repo));
         self.pending_saves(ctx, now);
+        if let Err(error) = self.reconcile_admission(ctx) {
+            // Writer contention is expected: replay resumes at the same cursor
+            // next tick. Other errors retain roots and remain visible.
+            if crate::model::errors::code_of(&error) != "SQLITE_BUSY" {
+                log("worker.maintenance.admission", &error);
+            }
+        }
+        if let Err(error) = self.local_objects(ctx)
+            && !matches!(
+                crate::model::errors::code_of(&error).as_str(),
+                "CONTENT_UNAVAILABLE" | "CONTENT_DEADLINE" | "CONTENT_CANCELLED" | "SQLITE_BUSY"
+            )
+        {
+            log("worker.maintenance.content", &error);
+        }
         // While a backlog drains, the activator checkpoints between its own
         // slices; a checkpoint here would flush the disk concurrently with
         // an engine commit.
@@ -216,6 +240,65 @@ impl Maintenance {
                 log("worker.maintenance.log", &error.into());
             }
         }
+    }
+
+    fn reconcile_admission(&mut self, ctx: &WorkerCtx) -> anyhow::Result<()> {
+        if self.admission.is_none() {
+            let store = ctx.sync_stores.open_dedicated()?;
+            store.db.busy_timeout(Duration::ZERO)?;
+            self.admission = Some(store);
+        }
+        let store = self.admission.as_mut().expect("opened above");
+        let cursor = store.content_admission_cursor("objects-v1")?;
+        let pending: bool = store.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_root_outbox WHERE seq>?)",
+            [cursor],
+            |row| row.get(0),
+        )?;
+        if pending {
+            store
+                .consume_content_admission("objects-v1", crate::core::admission::ADMISSION_PAGE)?;
+        }
+        Ok(())
+    }
+
+    fn local_objects(&mut self, ctx: &WorkerCtx) -> anyhow::Result<()> {
+        let Some(store) = self.admission.as_mut() else {
+            return Ok(());
+        };
+        let has_roots: bool = store.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_root_metadata)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_roots || ctx.stopping.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        store.reconcile_content_roots(32)?;
+        if self.content.is_none() {
+            self.content = Some(crate::content::LocalContent::open(&ctx.root)?);
+        }
+        let provider = self.content.as_ref().expect("opened above");
+        let context = crate::content::ReadContext {
+            deadline: Instant::now() + Duration::from_millis(50),
+            cancel: crate::util::Cancel::new(),
+        };
+        if self.receipts.is_none() {
+            self.receipts = crate::content::receipt::ReceiptRecovery::open(provider)?;
+        }
+        if let Some(recovery) = self.receipts.as_mut() {
+            let (_, done) = recovery.step(store, provider, 16, &context)?;
+            if done {
+                self.receipts = None;
+            }
+        }
+        if let Some(item) = store.content_candidates(1, true)?.into_iter().next()
+            && let Err(error) = store.expand_content_edge(provider, &item, &context)
+        {
+            store.defer_content_edge(&item, &error, 1000)?;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The status cell's full refresh on this thread's own connection

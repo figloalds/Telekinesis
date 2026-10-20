@@ -95,6 +95,76 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    /// Foreground selection is one indexed identity lookup, independent of
+    /// the background want cache or current-tree/history cardinality.
+    pub fn demanded_object(&self, hash: &str, lane: LaneSpec) -> Result<Option<WantItem>> {
+        valid_object(hash)?;
+        if !lane.is_valid() || !lane.owns(hash) {
+            return Ok(None);
+        }
+        let row = self
+            .db
+            .prepare_cached(
+                "SELECT z.size,a.state,
+            EXISTS(SELECT 1 FROM published_objects p WHERE p.hash=q.hash)
+              OR EXISTS(SELECT 1 FROM received_shared_objects r WHERE r.hash=q.hash),
+            sp.durable,sp.total,e.retry_at_ms,e.code
+            FROM object_requests q LEFT JOIN object_sizes z ON z.hash=q.hash
+            LEFT JOIN object_availability a ON a.hash=q.hash
+            LEFT JOIN spool_state sp ON sp.hash=q.hash
+            LEFT JOIN object_error_state e ON e.hash=q.hash
+            WHERE q.hash=?1 AND q.requested_ms>=?2 AND (
+              EXISTS(SELECT 1 FROM event_objects o WHERE o.hash=q.hash AND o.shared=1)
+              OR EXISTS(SELECT 1 FROM staged_objects s JOIN incoming_events i ON i.id=s.event
+                WHERE s.hash=q.hash AND i.error IS NULL))",
+            )?
+            .query_row(
+                params![hash, time().saturating_sub(DEMAND_TTL_MS) as i64],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<u64>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, Option<u64>>(3)?,
+                        r.get::<_, Option<u64>>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((size, state, shareable, durable, total, retry, code)) = row else {
+            return Ok(None);
+        };
+        if (shareable && state == Some(super::objects::AVAILABLE))
+            || (retry.is_some_and(|at| at > time() as i64)
+                && code.as_deref() != Some("CORRUPT_OBJECT"))
+        {
+            return Ok(None);
+        }
+        let size = match size {
+            Some(n) => n,
+            None => self
+                .expected_object_sizes(hash)?
+                .first()
+                .copied()
+                .unwrap_or(total.unwrap_or(0)),
+        };
+        let durable = durable
+            .filter(|d| *d <= size && total.is_none_or(|n| n == size))
+            .unwrap_or(0);
+        Ok(Some(WantItem {
+            hash: hash.to_owned(),
+            size,
+            offset: if durable == size && size > 0 {
+                size - 1
+            } else {
+                durable
+            },
+            priority: WantPriority::Demand,
+        }))
+    }
     pub fn peer_requests(&self, peer: &str) -> Result<BTreeSet<String>> {
         Ok(self
             .db

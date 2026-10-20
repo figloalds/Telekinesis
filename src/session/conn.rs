@@ -1134,6 +1134,17 @@ impl Shared {
         frames: Vec<(Lane, Vec<u8>)>,
         space_until: Instant,
     ) -> Result<(), CallError> {
+        self.submit_cancellable(id, slot, frames, space_until, None)
+    }
+
+    fn submit_cancellable(
+        &self,
+        id: u64,
+        slot: &Arc<Slot>,
+        frames: Vec<(Lane, Vec<u8>)>,
+        space_until: Instant,
+        cancelled: Option<&dyn Fn() -> bool>,
+    ) -> Result<(), CallError> {
         let control: usize = frames
             .iter()
             .filter(|(lane, _)| *lane == Lane::Control)
@@ -1141,6 +1152,9 @@ impl Shared {
             .sum();
         let state = self.lock();
         let stop = |state: &State| {
+            if cancelled.is_some_and(|stop| stop()) {
+                return Some(CallError::Cancelled);
+            }
             if let Some(reason) = state.refusal() {
                 return Some(CallError::Unavailable(reason));
             }
@@ -1151,7 +1165,13 @@ impl Shared {
             }
             None
         };
-        let (mut state, room) = self.wait_room(state, &frames, stop, || space_until);
+        let (mut state, room) = self.wait_room(state, &frames, stop, || {
+            if cancelled.is_some() {
+                space_until.min(Instant::now() + Duration::from_millis(20))
+            } else {
+                space_until
+            }
+        });
         match room {
             Room::Ready => {}
             Room::Stopped(error) => return Err(error),
@@ -1257,6 +1277,7 @@ impl Shared {
     }
 
     /// Waits for the outcome of call `id`.
+    #[allow(clippy::too_many_arguments)]
     fn await_reply(
         &self,
         id: u64,
@@ -1265,6 +1286,7 @@ impl Shared {
         until: Option<Instant>,
         idle: Option<Duration>,
         on_chunk: &mut OnChunk<'_>,
+        cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<Reply, CallError> {
         let mut guard = PendingGuard {
             shared: self,
@@ -1276,14 +1298,26 @@ impl Shared {
         let mut ended = false;
         let mut seen = slot.progress();
         loop {
+            if cancelled.is_some_and(|stop| stop()) {
+                guard.abandon();
+                return Err(CallError::Cancelled);
+            }
             let idle_at = idle.map(|idle| after(active, idle));
             let wait = if ended {
                 None
             } else {
                 earliest(until, idle_at)
             };
-            let Some(event) = slot.next(wait, &mut seen) else {
+            let polled = if cancelled.is_some() {
+                earliest(wait, Some(Instant::now() + Duration::from_millis(20)))
+            } else {
+                wait
+            };
+            let Some(event) = slot.next(polled, &mut seen) else {
                 let now = Instant::now();
+                if cancelled.is_some() && wait.is_none_or(|until| now < until) {
+                    continue;
+                }
                 if idle_at.is_some_and(|at| now >= at)
                     && until.is_none_or(|until| now < until)
                     && (self.rx_paused.load(Ordering::Acquire) || self.lock().queues.holds(id))
@@ -1357,9 +1391,13 @@ impl Shared {
         deadline: Option<Duration>,
         idle: Option<Duration>,
         on_chunk: &mut OnChunk<'_>,
+        cancelled: Option<&dyn Fn() -> bool>,
     ) -> Result<Reply, CallError> {
         let started = Instant::now();
         self.ensure_client()?;
+        if cancelled.is_some_and(|stop| stop()) {
+            return Err(CallError::Cancelled);
+        }
         let limit = self.body_limit(op);
         if body.len() > limit {
             return Err(CallError::Remote(ErrorWire::coded(
@@ -1375,8 +1413,8 @@ impl Shared {
         let space_until = until
             .or_else(|| idle.map(|idle| after(started, idle)))
             .unwrap_or_else(|| after(started, FAR));
-        self.submit(id, &slot, frames, space_until)?;
-        self.await_reply(id, &slot, started, until, idle, on_chunk)
+        self.submit_cancellable(id, &slot, frames, space_until, cancelled)?;
+        self.await_reply(id, &slot, started, until, idle, on_chunk, cancelled)
     }
 }
 
@@ -1474,6 +1512,36 @@ impl Conn {
             Some(deadline),
             None,
             &mut unexpected,
+            None,
+        )
+    }
+
+    /// The predicate must be nonblocking; cancellation abandons only this call
+    /// and preserves unrelated exchanges on the same connection.
+    pub(crate) fn call_cancellable(
+        &self,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+        prio: Priority,
+        deadline: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Reply, CallError> {
+        let mut unexpected = |_: ChunkHeader, _: &[u8]| {
+            Err(ErrorWire::coded(
+                "PROTOCOL_VIOLATION",
+                "unexpected stream chunk",
+            ))
+        };
+        self.inner.request(
+            op,
+            header,
+            body,
+            prio,
+            Some(deadline),
+            None,
+            &mut unexpected,
+            Some(cancelled),
         )
     }
 
@@ -1500,7 +1568,33 @@ impl Conn {
         on_chunk: &mut OnChunk<'_>,
     ) -> Result<Reply, CallError> {
         self.inner
-            .request(op, header, body, prio, deadline, Some(idle), on_chunk)
+            .request(op, header, body, prio, deadline, Some(idle), on_chunk, None)
+    }
+
+    /// Cancels only this stream, including while no chunks arrive. Used to
+    /// yield legacy bulk capacity without tearing down a shared connection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call_streaming_cancellable(
+        &self,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+        prio: Priority,
+        deadline: Option<Duration>,
+        idle: Duration,
+        on_chunk: &mut OnChunk<'_>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Reply, CallError> {
+        self.inner.request(
+            op,
+            header,
+            body,
+            prio,
+            deadline,
+            Some(idle),
+            on_chunk,
+            Some(cancelled),
+        )
     }
 
     /// Starts a request whose body is streamed with [`Upload::chunk`]. The
@@ -1795,6 +1889,7 @@ impl Upload {
             None,
             Some(self.idle),
             &mut ignore,
+            None,
         )
     }
 }
@@ -1844,6 +1939,13 @@ pub struct Responder {
 }
 
 impl Responder {
+    /// Internal bounded protocols retain a connection fence until the peer
+    /// ACKs queued bytes. Closing it purges queues before returning credit.
+    pub(crate) fn connection(&self) -> Conn {
+        Conn {
+            inner: self.shared.clone(),
+        }
+    }
     pub(crate) fn new(shared: Arc<Shared>, id: u64, cancel: Arc<AtomicBool>, limit: usize) -> Self {
         Self {
             id,

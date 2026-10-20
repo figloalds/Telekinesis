@@ -84,6 +84,13 @@ pub struct ObjectLease {
 /// the store root, shared by every in-process worker of a test binary).
 #[derive(Debug, Default)]
 pub struct ObjectsState {
+    pub legacy_cancel: crate::util::Cancel,
+    /// Latest ordered run per owned legacy lane scope. Never evict a fence
+    /// while delayed requests may still exist in this worker incarnation.
+    pub lease_runs: BTreeMap<String, crate::model::lease::Generation>,
+    /// Content-v1 state is separate from legacy hash leases and initialized
+    /// only for an explicitly enabled isolated content store (CCR-WP6.3-2).
+    pub content: Option<Arc<super::content_rpc::ContentWorker>>,
     /// Leases by hash.
     pub leases: BTreeMap<String, ObjectLease>,
     /// Who was granted each lease: hash → `(session, source replica)` (a

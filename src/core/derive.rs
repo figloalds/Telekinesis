@@ -5329,7 +5329,7 @@ fn project_refs(branch: &str, events: &[&Event]) -> Result<Projection> {
                 entry.name = winner.value["name"].as_str().unwrap().into();
             }
             "alive" => entry.alive = winner.value.as_bool().unwrap(),
-            "content" => entry.content = winner.value.as_str().map(str::to_owned),
+            "content" => entry.set_content_value(&winner.value)?,
             "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
             _ => {}
         }
@@ -5686,7 +5686,7 @@ pub(super) fn project_append_or_base(
                     entry.name = winner.value["name"].as_str().unwrap().into();
                 }
                 "alive" => entry.alive = winner.value.as_bool().unwrap(),
-                "content" => entry.content = winner.value.as_str().map(str::to_owned),
+                "content" => entry.set_content_value(&winner.value)?,
                 _ => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
             }
         }
@@ -6209,7 +6209,7 @@ fn project_refs_reference(branch: &str, events: &[&Event]) -> Result<Projection>
                 entry.name = winner.value["name"].as_str().unwrap().into();
             }
             "alive" => entry.alive = winner.value.as_bool().unwrap(),
-            "content" => entry.content = winner.value.as_str().map(str::to_owned),
+            "content" => entry.set_content_value(&winner.value)?,
             "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
             _ => {}
         }
@@ -8700,7 +8700,7 @@ mod tests {
                         entry.name = winner.value["name"].as_str().unwrap().into();
                     }
                     "alive" => entry.alive = winner.value.as_bool().unwrap(),
-                    "content" => entry.content = winner.value.as_str().map(str::to_owned),
+                    "content" => entry.set_content_value(&winner.value)?,
                     "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
                     _ => {}
                 }
@@ -9302,7 +9302,7 @@ mod tests {
                         entry.name = winner.value["name"].as_str().unwrap().into();
                     }
                     "alive" => entry.alive = winner.value.as_bool().unwrap(),
-                    "content" => entry.content = winner.value.as_str().map(str::to_owned),
+                    "content" => entry.set_content_value(&winner.value)?,
                     "basic" => entry.basic = Some(serde_json::from_value(winner.value.clone())?),
                     _ => {}
                 }
