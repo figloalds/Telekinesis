@@ -2875,7 +2875,10 @@ fn full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_s
             state.lease_runs.insert(
                 format!("pull:capacity-{n}:0/1"),
                 tkfs::model::lease::RunFence {
-                    generation: Generation { incarnation: 1, run: 1 },
+                    generation: Generation {
+                        incarnation: 1,
+                        run: 1,
+                    },
                     layout: None,
                 },
             );
@@ -3027,4 +3030,182 @@ fn foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_t
         prepare(3).1.is_empty(),
         "verified shared receipt retires demand"
     );
+}
+
+#[test]
+fn pool_layouts_fence_late_requests_across_lane_counts_and_when_an_old_count_returns() {
+    use tkfs::model::{
+        lease::{self, Generation, PullRun},
+        protocol::LaneSpec,
+    };
+    let bytes = vec![81; 100_000];
+    let w = worker(|a| {
+        file(a, "layout", &bytes);
+    });
+    let hash = tkfs::core::hash(&bytes);
+    let spec = |count| {
+        (0..count)
+            .map(|index| LaneSpec::new(index, count))
+            .find(|lane| lane.owns(&hash))
+            .unwrap()
+    };
+    let session = |lane: LaneSpec, incarnation, run, layout| {
+        lease::qualify_pull(
+            &format!("pull:peer-a:{}/{}:a", lane.index, lane.count),
+            PullRun {
+                generation: Generation { incarnation, run },
+                layout,
+            },
+        )
+        .unwrap()
+    };
+    let want = |lane, session: &str| {
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":w.route_b,"lane":lane,"session":session,"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[],
+        )
+    };
+    // All pool identities can be registered before a delayed old lane's run
+    // number is allocated. Pool order, rather than run number, must win.
+    let old = session(spec(3), 30, 100, 1);
+    assert_eq!(
+        want(spec(3), &old).unwrap().0["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        write_op(&w, &w.route_b, &old, &hash, 0, 100_000, &bytes[..65536])["durable_offset"],
+        65536
+    );
+    let new = session(spec(2), 30, 5, 2);
+    let started = Instant::now();
+    assert_eq!(want(spec(2), &new).unwrap().0["items"][0]["offset"], 65536);
+    assert!(started.elapsed() < Duration::from_millis(250));
+    let before = lease(&w, &hash);
+    for stale in [
+        &old,
+        &owned_session(0, 30, 101),
+        &format!("pull:peer-a:{}/3:a", spec(3).index),
+    ] {
+        let stale_lane = lease::parse_transfer(stale).unwrap().unwrap().lane;
+        assert_eq!(
+            want(stale_lane, stale).unwrap_err().code,
+            "IN_FLIGHT_ELSEWHERE"
+        );
+        let (reply, _) = op(
+            &w.ctx,
+            "objects.release",
+            json!({"route":w.route_b,"session":stale,"hashes":[hash],"hold_ms":60_000}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(reply["released"], 0);
+        assert_eq!(lease(&w, &hash), before);
+    }
+    // A different old-layout scope that never touched this worker also
+    // cannot acquire a free object or write bytes under a later run number.
+    let unseen_lane = LaneSpec::new((spec(3).index + 1) % 3, 3);
+    let unseen = session(unseen_lane, 30, 101, 1);
+    assert_eq!(
+        want(unseen_lane, &unseen).unwrap_err().code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    assert_eq!(op(&w.ctx,"objects.write",json!({"route":w.route_b,"session":unseen,"items":[{"hash":hash,"offset":65536,"total":100_000,"len":1,"last":false}]}),&[81]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
+    assert!(
+        objects_rpc::source_retry_at(&w.ctx, w.route_b["remote_replica"].as_str().unwrap(), &hash)
+            .is_none()
+    );
+    let returned = session(spec(3), 30, 6, 4);
+    assert_eq!(
+        want(spec(3), &returned).unwrap().0["items"][0]["offset"],
+        65536
+    );
+    assert_eq!(lease(&w, &hash).session, returned);
+    assert_eq!(want(spec(2), &new).unwrap_err().code, "IN_FLIGHT_ELSEWHERE");
+    let restarted = session(spec(3), 31, 1, 1);
+    assert_eq!(
+        want(spec(3), &restarted).unwrap().0["items"][0]["offset"],
+        65536
+    );
+    assert_eq!(
+        want(spec(3), &returned).unwrap_err().code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    assert_eq!(
+        write_op(
+            &w,
+            &w.route_b,
+            &restarted,
+            &hash,
+            65536,
+            100_000,
+            &bytes[65536..]
+        )["outcome"],
+        "completed"
+    );
+}
+
+#[test]
+fn full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_pool_owners() {
+    use tkfs::model::{
+        lease::{self, Generation, MAX_RUN_FENCES, PullRun},
+        protocol::LaneSpec,
+    };
+    let w = worker(|a| {
+        file(a, "bounded-layout", &vec![82; 100_000]);
+    });
+    let session = |layout| {
+        lease::qualify_pull(
+            "pull:peer-a:0/1:a",
+            PullRun {
+                generation: Generation {
+                    incarnation: 40,
+                    run: layout + 1,
+                },
+                layout,
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(want_op(&w, &w.route_b, &session(1)).len(), 1);
+    {
+        let mut state = w.ctx.inflight_objects.lock().unwrap();
+        for n in 1..MAX_RUN_FENCES {
+            state.lease_layouts.insert(
+                format!("pull:capacity-{n}"),
+                (
+                    Generation {
+                        incarnation: 1,
+                        run: 1,
+                    },
+                    1,
+                ),
+            );
+        }
+        assert_eq!(state.lease_layouts.len(), MAX_RUN_FENCES);
+    }
+    let mut route = w.route_b.clone();
+    route["peer"] = json!("new-peer");
+    let new = lease::qualify_pull(
+        "pull:new-peer:0/1:a",
+        PullRun {
+            generation: Generation {
+                incarnation: 40,
+                run: 2,
+            },
+            layout: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(op(&w.ctx,"objects.want",json!({"route":route,"lane":LaneSpec::new(0,1),"session":new,"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap_err().code,"BUSY");
+    assert_eq!(want_op(&w, &w.route_b, &session(3)).len(), 1);
+    assert_eq!(
+        w.ctx.inflight_objects.lock().unwrap().lease_layouts.len(),
+        MAX_RUN_FENCES
+    );
+    assert_eq!(op(&w.ctx,"objects.want",json!({"route":w.route_b,"lane":lane(),"session":session(1),"max_items":256,"max_bytes":PULL_BUDGET_BYTES}),&[]).unwrap_err().code,"IN_FLIGHT_ELSEWHERE");
 }
