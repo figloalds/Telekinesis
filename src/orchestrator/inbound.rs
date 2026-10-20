@@ -1901,9 +1901,6 @@ pub(crate) fn record_finished(ctx: &Ctx, finished: Finished<'_>) {
     });
 }
 
-/// `objects.*`: the role is checked already; [`super::inbound_objects`]
-/// does the rest.
-
 /// `peer.enroll` (WP4.1): the dialer's sealed secret, opened with this
 /// verifier's key, becomes its inbound credential `K_peer`. The session must
 /// still be under the current verifier generation (a rotation since the

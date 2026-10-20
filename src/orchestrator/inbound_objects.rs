@@ -589,9 +589,6 @@ fn offers() -> &'static Offers {
     })
 }
 
-/// How long an exchange waits at most for a reap of its offer's leases
-/// (one `objects.release` of at most `MAX_RELEASE_ITEMS`).
-
 /// Offers remembered at most, and for at most this long.
 const MAX_OFFERS: usize = 4096;
 const OFFER_AGE: Duration = Duration::from_secs(600);
@@ -600,9 +597,8 @@ fn offer_key(instance: &str, lease: &str) -> String {
     format!("{instance}\u{1f}{lease}")
 }
 
-/// Takes the offer of `key`. A reap of its leases in progress ends first
-/// (at most [`REAP_WAIT`]): its release, by the lane's lease id, must not
-/// end the leases the caller's exchange takes next under that same id.
+/// Takes only an offer compatible with this owner. Reaper RPCs use exact
+/// generation/frame IDs, so they need not block a replacement offer.
 fn take_offer(key: &str, owner: &Owner, prior: bool) -> Option<Offer> {
     let mut map = lock(&offers().map);
     let matches = map.offers.get(key).is_some_and(|offer| {
@@ -983,23 +979,21 @@ fn wants(
         lease: source.lease.clone(),
         released: false,
     };
-    if !offer.items.is_empty() {
-        if !put_offer(key, offer) {
-            release_leases(
-                &bound.client,
-                &bound.route,
-                &source.lease,
-                offered.iter().map(|item| item.hash.clone()).collect(),
-            );
-            return responder.error(ErrorWire::coded(
-                if source.owner.current() {
-                    "CONTENT_RESOURCE_LIMIT"
-                } else {
-                    "IN_FLIGHT_ELSEWHERE"
-                },
-                "inbound offer not retained",
-            ));
-        }
+    if !offer.items.is_empty() && !put_offer(key, offer) {
+        release_leases(
+            &bound.client,
+            &bound.route,
+            &source.lease,
+            offered.iter().map(|item| item.hash.clone()).collect(),
+        );
+        return responder.error(ErrorWire::coded(
+            if source.owner.current() {
+                "CONTENT_RESOURCE_LIMIT"
+            } else {
+                "IN_FLIGHT_ELSEWHERE"
+            },
+            "inbound offer not retained",
+        ));
     }
     if !source.owner.current() {
         return responder.error(ErrorWire::coded(
