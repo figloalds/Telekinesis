@@ -584,8 +584,9 @@ legacy peer message formats are unchanged. The three-argument standalone
 `inbound_objects::handle` keeps its function seam for read/report routing;
 network wants/pushes use the registered session owner. An unregistered direct
 wants/push call has no worker authority. Existing close-release helper fanout,
-complete legacy job/byte/spool budgets, cancellation within first-serve hashing,
-final fairness and platform qualification remain separate outstanding work.
+complete legacy job/byte/spool budgets, final fairness and platform qualification
+remain separate outstanding work. CCR-WP6.3-8 below adds cancellation within
+first-serve hashing.
 
 ## CCR-WP6.3-8: interruptible legacy first-serve verification
 
@@ -593,10 +594,11 @@ Legacy `objects.read` and the reserved foreground `content-v1` legacy-read
 operation keep whole-file SHA-256 verification before first serve. Their
 loopback request deadline, cancellation/disconnect and worker shutdown now
 reach the hash loop. Verification checks its caller before and after each
-64 KiB read, including EOF, and before publishing trust. Cancellation does
-not supply a partial digest, quarantine good bytes, publish a verified marker
-or create an object retry. Individual blocking filesystem calls remain
-OS-bound; cancellation takes effect when the current bounded call returns.
+64 KiB read, including EOF, and before publishing trust. An incomplete or
+cancelled hash does not supply a partial digest, quarantine good bytes,
+publish a verified marker or create an object retry. Individual blocking
+filesystem calls remain OS-bound; cancellation takes effect when the current
+bounded call returns.
 
 The existing `Store::read_object_range` seam remains. The checked variant
 accepts a synchronous caller-owned predicate and checks it around bounded
@@ -606,6 +608,16 @@ helper thread survives a completed request. The reserved operation retains its
 64 KiB frame limit and five-second maximum; ordinary legacy reads retain the
 1 MiB reply limit and use their actual loopback request deadline. Direct worker
 dispatch uses a 60-second fallback for ordinary reads.
+
+The existing ordered `SessionWorkerClient::read_stream` seam remains. Stopping
+its consumer now cancels its remaining requests. The cancellable variant also
+polls its caller while the result window is empty; retained background push
+and inbound pull pass their lane/session/daemon stop condition through it.
+Only refusals that ran nothing are retried, within the original deadline and
+with interruptible backoff. Cancelling one call sends its request CANCEL and
+keeps the shared worker connection usable. The existing bounded read-window
+threads remain; connection dialing itself and the full retained legacy
+thread/byte budgets are not qualified by this change.
 
 After potentially long first-serve verification, the reader rechecks the
 committed-shared-reference/shareable triad before reading the frame. This

@@ -584,3 +584,37 @@ close-release helper fanout bounds. Those, hash cancellation, sustained fairness
 mounted range reads, recoverable private saves, caching/change journal,
 capability/deployment fencing and final Windows/FUSE/build/load qualification
 remain pending. Ordinary typed-content activation remains off.
+
+## Legacy read cancellation (WP6.3, in progress)
+
+CCR-WP6.3-8 makes legacy first-serve SHA-256 verification interruptible between
+64 KiB reads. Ordinary loopback object reads and the reserved foreground legacy
+read borrow the request's deadline and cancellation/disconnect signal and also
+observe worker shutdown. Foreground permit waits check the same request. The
+checked Store range seam checks around bounded byte reads and rechecks the
+committed shared reference/shareable triad after potentially long verification.
+An interrupted hash does not become trusted, quarantine a good file or create
+an object retry. The current filesystem call itself remains OS-bound.
+
+Retained background push and inbound pull now pass their stop condition into
+the ordered worker read stream. An empty result window wakes to check it, and
+stopping the consumer cancels other pending calls. The existing read-window
+threads remain bounded by their caller's configured window. Refusals that ran
+nothing retain their historical retry, within the original deadline, with
+interruptible backoff. Request cancellation preserves unrelated users of the
+shared loopback connection. Dial cancellation and the complete retained legacy
+thread/byte/spool budget remain unqualified.
+
+The first source stage passed 174 checks: library 85, provider 12, authenticated
+transport 23 and native worker 54. Its six actual worker cancellation scenarios
+use a 3,145,741-byte untrusted file, ordinary/reserved reads, deadline expiry,
+disconnect and force stop. Each entered the actual hash before cancellation;
+the tests observed handler/permit return after the injected 250 ms I/O stall,
+unchanged availability markers, no object retry/quarantine, and a subsequent
+read still requiring verification. That stage preceded the background stream
+bridge and sharing-withdrawal scenarios; final qualification is recorded below.
+
+Full legacy budgets, bounded close-release work, durable local-failure error
+projection, mounted range demand, recoverable saves, the change journal/cache,
+compatibility/retention/activation and final platform/build/load gates remain
+pending. Ordinary typed-content activation remains off.

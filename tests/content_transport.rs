@@ -2685,10 +2685,12 @@ fn native_legacy_read_rechecks_sharing_after_first_serve_verification() {
         thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(fault::fired(), 1);
-    let shared = || -> bool { probe.db.query_row(
+    let shared = || -> bool {
+        probe.db.query_row(
         "SELECT EXISTS(SELECT 1 FROM published_objects WHERE hash=?1 UNION ALL SELECT 1 FROM received_shared_objects WHERE hash=?1)",
         [&hash], |row|row.get(0),
-    ).unwrap() };
+    ).unwrap()
+    };
     assert!(shared());
     probe
         .db
