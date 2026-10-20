@@ -213,6 +213,25 @@ fn push_frame_ids_remain_local_bounded_and_preserve_the_stable_lane_scope() {
         .is_err()
     );
 }
+
+#[test]
+fn inbound_pool_capacity_does_not_forget_old_authenticated_pool_identities() {
+    let clock = Clock::new(62);
+    let old = clock.accept_push("peer-a", 3).unwrap();
+    for n in 1..lease::MAX_RUN_FENCES {
+        clock.accept_push(&format!("peer-{n}"), 3).unwrap();
+    }
+    assert_eq!(
+        clock.accept_push("overflow-peer", 3).err().unwrap().code,
+        "CONTENT_RESOURCE_LIMIT"
+    );
+    let reconnect = clock.accept_push("peer-a", 3).unwrap();
+    assert_eq!(old.run.layout, reconnect.run.layout);
+    assert!(old.current());
+    let replaced = clock.accept_push("peer-a", 2).unwrap();
+    assert!(replaced.current());
+    assert!(!old.current() && !reconnect.current());
+}
 #[test]
 fn ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base() {
     let g = Generation {

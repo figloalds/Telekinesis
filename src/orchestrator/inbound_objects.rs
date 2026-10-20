@@ -106,14 +106,12 @@
 //! writes (a free lease is taken by the write) unless another session took
 //! it meanwhile (then `IN_FLIGHT_ELSEWHERE`: never two owners, invariant
 //! 19). A dialer that comes back on a new session is offered them again at
-//! once. Lease ids are per dialer lane, so a new session of the same lane
-//! shares the dead one's: the reaper decides and marks an offer under the
-//! offers' lock, and while it gives the leases up, an exchange of that lane
-//! (`objects.wants`, `objects.push`) waits for it before it takes the offer
-//! (at most [`RELEASE_DEADLINE`] + 1 s), so a release never ends the leases
-//! a new session's want has just taken (the WP5.3 review's minor). An offer
-//! an exchange took or replaced first is not reaped: its leases are that
-//! exchange's.
+//! once. CCR-WP6.3-7 qualifies local lease IDs by authenticated session and
+//! offer frame. A replacement does not wait for old reaper RPCs: those RPCs
+//! can release only their exact earlier owner. Pool-count changes retire
+//! the prior authenticated pool, and stale replies cannot replace a newer
+//! offer. The shared offer slot guards backoff/status mutations against
+//! replacement. Peer object messages and whole-file identities stay unchanged.
 //!
 //! **Report.** A report makes our worker re-read a whole object, so it is
 //! taken only for an object of the session's lane (`OBJECT_ON_WRONG_LANE`)
@@ -571,8 +569,7 @@ struct Offered {
     covered: bool,
 }
 
-/// Offers per (worker instance, dialer lane's lease), and the offers whose
-/// leases the reaper is giving up right now.
+/// Offers per worker instance and dialer lane, carrying their exact owner.
 #[derive(Default)]
 struct OfferMap {
     offers: HashMap<String, Offer>,
@@ -614,11 +611,10 @@ fn take_offer(key: &str, owner: &Owner, prior: bool) -> Option<Offer> {
 fn put_offer(key: String, offer: Offer) -> bool {
     {
         let mut map = lock(&offers().map);
-        if !offer.owner.current()
-            || map
-                .offers
-                .get(&key)
-                .is_some_and(|new| new.owner.order() > offer.owner.order())
+        if map
+            .offers
+            .get(&key)
+            .is_some_and(|new| new.owner.order() > offer.owner.order())
         {
             return false;
         }
@@ -628,14 +624,22 @@ fn put_offer(key: String, offer: Offer) -> bool {
                 return false;
             }
         }
-        map.offers.insert(key, offer);
+        let owner = offer.owner.clone();
+        if owner
+            .while_current(|| map.offers.insert(key, offer))
+            .is_none()
+        {
+            return false;
+        }
     }
     start_reaper();
     true
 }
 
 fn prune_expired_offers() {
-    lock(&offers().map).offers.retain(|_,offer|offer.at.elapsed()<OFFER_AGE);
+    lock(&offers().map)
+        .offers
+        .retain(|_, offer| offer.at.elapsed() < OFFER_AGE);
 }
 
 /// An offer whose session sent no `objects.*` request since the offer for
@@ -690,9 +694,8 @@ fn start_reaper() {
 /// Gives up the leases of every offer whose session went away (module
 /// docs): the offer and its session both silent for [`OFFER_GRACE`]. The
 /// offer stays (marked), for a dialer that is still there. Each offer is
-/// judged and marked under the offers' lock right before its release, and
-/// its key stays marked as reaping until the release ends ([`take_offer`]
-/// waits for it). Returns how many offers it gave up (tests).
+/// judged and marked under the offers' lock right before releasing its
+/// unique lease ID. Returns how many offers it gave up (tests).
 pub fn reap_offers(now: Instant) -> usize {
     let silent = |at: Instant| now.saturating_duration_since(at) >= OFFER_GRACE;
     reap_where(|offer, seen| {
@@ -704,8 +707,8 @@ pub fn reap_offers(now: Instant) -> usize {
 /// server calls this from the session's close path): the leases of the
 /// offers made on it are given up now, instead of after [`OFFER_GRACE`] of
 /// silence, by the reaper's rules (each offer judged and marked under the
-/// offers' lock, an exchange of the lane's next session waiting for the
-/// release). On a thread of its own: the close path never waits for a
+/// offers' lock; replacement offers never wait for the old release).
+/// On a thread of its own: the close path never waits for a
 /// worker. Without one (it could not start) the periodic reaper still
 /// gives them up, the session no longer counting as seen.
 pub fn session_closed(peer: &session::AcceptedPeer) {
@@ -715,18 +718,21 @@ pub fn session_closed(peer: &session::AcceptedPeer) {
     let session = peer.session.clone();
     lock(sessions_seen()).remove(&session);
     let offered = {
-        let mut map=lock(&offers().map);
-        map.offers.retain(|_,offer|!(offer.released && offer.session==session));
-        map.offers.values().any(|offer|offer.session==session)
+        let mut map = lock(&offers().map);
+        map.offers
+            .retain(|_, offer| !(offer.released && offer.session == session));
+        map.offers.values().any(|offer| offer.session == session)
     };
     if offered {
         let _ = thread::Builder::new()
             .name("offer-release".into())
             .spawn(move || {
-                reap_where(|offer,_|offer.session==session);
+                reap_where(|offer, _| offer.session == session);
                 // Remove only this closed session's offers; a newer session
                 // may already have replaced the same logical table key.
-                lock(&offers().map).offers.retain(|_,offer|offer.session!=session);
+                lock(&offers().map)
+                    .offers
+                    .retain(|_, offer| offer.session != session);
             });
     }
 }
@@ -917,8 +923,7 @@ fn wants(
         }
     }
     exclude.truncate(MAX_RELEASE_ITEMS);
-    // `take_offer` may have waited for a reap of this lane's offer: the
-    // worker gets what is left of the dialer's deadline.
+    // Preparation may have consumed part of the dialer's deadline.
     let Some(wait) = worker_deadline(deadline, worker_client::deadlines::WANT) else {
         if !exclude.is_empty() {
             release_leases(&bound.client, &bound.route, &source.lease, exclude);

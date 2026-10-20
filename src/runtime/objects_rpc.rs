@@ -622,7 +622,21 @@ fn want_selected(
         let mut state = lock(&ctx.inflight_objects);
         claim_run(&mut state, owned.as_ref())?;
         sweep_lapsed(&mut state, now);
+        // A fresh offer frame also retires excluded predecessor leases.
+        let retired: Vec<_> = exclude
+            .iter()
+            .filter_map(|hash| {
+                state
+                    .leases
+                    .get(hash)
+                    .filter(|lease| superseded_lease(&state, lease, session, now))
+                    .map(|lease| (hash.clone(), lease.session.clone()))
+            })
+            .collect();
         give_up(&mut state, session, &exclude);
+        for (hash, prior) in retired {
+            give_up(&mut state, &prior, &[hash]);
+        }
         let (mine, others): (Vec<_>, Vec<_>) = state
             .leases
             .iter()
