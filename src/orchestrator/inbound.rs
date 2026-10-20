@@ -808,9 +808,22 @@ impl Inner {
         drop(policy);
         let (id, revocation_epoch) = self.register(&conn, &peer, address, reserved, per_peer_epoch);
         let registered = Registered { inner: &self, id };
+        let push_owner = if let Some(lane) = peer.lane.filter(|_| peer.role == LaneRole::Bulk) {
+            match super::lease_clock::accept_push(&self.ctx, &peer.installation, lane.count) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    event!(warn, CONTENT_RESOURCE_LIMIT, {"site":"inbound.push_owner", "message":error.to_string()});
+                    conn.close();
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         conn.serve(Arc::new(SessionHandler {
             inner: self.clone(),
             peer: peer.clone(),
+            push_owner,
             revocation_epoch,
             exchanges: Arc::new(AtomicUsize::new(0)),
             content_exchanges: Arc::new(AtomicUsize::new(0)),
@@ -1372,6 +1385,7 @@ pub fn exchange_slots(role: LaneRole) -> usize {
 struct SessionHandler {
     inner: Arc<Inner>,
     peer: AcceptedPeer,
+    push_owner: Option<Arc<super::lease_clock::PushSession>>,
     /// The installation's revocation epoch when this session registered
     /// (WP4.1): a `peer.enroll` after a revocation of it is refused.
     revocation_epoch: u64,
@@ -1419,7 +1433,14 @@ impl Handler for SessionHandler {
                     super::content_transport::handle(&ctx, &peer, req)
                 });
             }
-            op if op.starts_with("objects.") => self.exchange(req, objects),
+            op if op.starts_with("objects.") => {
+                let ctx = self.inner.ctx.clone();
+                let peer = self.peer.clone();
+                let owner = self.push_owner.clone();
+                self.job(req, move |req| {
+                    super::inbound_objects::handle_owned(&ctx, &peer, owner.as_ref(), req)
+                });
+            }
             peer_auth::ops::PEER_ENROLL | peer_auth::ops::PEER_REVOKE
                 if self.inner.ctx.catalog.credentials().is_some() =>
             {
@@ -1882,9 +1903,6 @@ pub(crate) fn record_finished(ctx: &Ctx, finished: Finished<'_>) {
 
 /// `objects.*`: the role is checked already; [`super::inbound_objects`]
 /// does the rest.
-fn objects(ctx: &Arc<Ctx>, peer: &AcceptedPeer, req: Incoming) {
-    super::inbound_objects::handle(ctx, peer, req);
-}
 
 /// `peer.enroll` (WP4.1): the dialer's sealed secret, opened with this
 /// verifier's key, becomes its inbound credential `K_peer`. The session must

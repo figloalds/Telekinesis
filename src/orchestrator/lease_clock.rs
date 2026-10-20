@@ -17,15 +17,21 @@ pub struct Clock {
     incarnation: u64,
     next: AtomicU64,
     pools: Mutex<BTreeMap<usize, (Weak<PeerContext>, Generation)>>,
-    inbound: Mutex<BTreeMap<String, (u32, Arc<AtomicU64>)>>,
+    inbound: Mutex<BTreeMap<String, (u32, Arc<Mutex<u64>>)>>,
 }
 
 pub struct PushSession {
     pub run: PushRun,
-    current_pool: Arc<AtomicU64>,
+    current_pool: Arc<Mutex<u64>>,
 }
 impl PushSession {
-    pub fn current(&self) -> bool { self.current_pool.load(Ordering::Acquire)==self.run.layout }
+    pub fn current(&self) -> bool {
+        *lock(&self.current_pool) == self.run.layout
+    }
+    pub(crate) fn while_current<T>(&self, apply: impl FnOnce() -> T) -> Option<T> {
+        let current = lock(&self.current_pool);
+        (*current == self.run.layout).then(apply)
+    }
 }
 impl Clock {
     pub fn new(incarnation: u64) -> Self {
@@ -100,31 +106,51 @@ impl Clock {
 
     /// Allocated only after an authenticated bulk handshake, before requests.
     pub fn accept_push(&self, peer: &str, count: u32) -> Result<Arc<PushSession>, ErrorWire> {
-        if peer.is_empty() || peer.len()>128 || !(1..=15).contains(&count) {
-            return Err(ErrorWire::coded("INVALID_REQUEST","inbound pool identity"));
+        if peer.is_empty() || peer.len() > 128 || !(1..=15).contains(&count) {
+            return Err(ErrorWire::coded("INVALID_REQUEST", "inbound pool identity"));
         }
-        let mut inbound=lock(&self.inbound);
-        if !inbound.contains_key(peer) && inbound.len()>=crate::model::lease::MAX_RUN_FENCES {
-            return Err(ErrorWire::coded("CONTENT_RESOURCE_LIMIT","inbound pool identity capacity"));
+        let mut inbound = lock(&self.inbound);
+        if !inbound.contains_key(peer) && inbound.len() >= crate::model::lease::MAX_RUN_FENCES {
+            return Err(ErrorWire::coded(
+                "CONTENT_RESOURCE_LIMIT",
+                "inbound pool identity capacity",
+            ));
         }
-        let pool=match inbound.get_mut(peer) {
-            Some((prior,pool)) => {
-                if *prior!=count { pool.store(self.next()?.run,Ordering::Release);*prior=count; }
+        let pool = match inbound.get_mut(peer) {
+            Some((prior, pool)) => {
+                if *prior != count {
+                    *lock(pool) = self.next()?.run;
+                    *prior = count;
+                }
                 pool.clone()
             }
             None => {
-                let pool=Arc::new(AtomicU64::new(self.next()?.run));
-                inbound.insert(peer.to_owned(),(count,pool.clone()));
+                let pool = Arc::new(Mutex::new(self.next()?.run));
+                inbound.insert(peer.to_owned(), (count, pool.clone()));
                 pool
             }
         };
-        let generation=self.next()?;
-        Ok(Arc::new(PushSession {run:PushRun {generation,layout:pool.load(Ordering::Acquire)},current_pool:pool}))
+        let generation = self.next()?;
+        let layout = *lock(&pool);
+        Ok(Arc::new(PushSession {
+            run: PushRun {
+                generation,
+                layout,
+            },
+            current_pool: pool,
+        }))
     }
 }
 
-pub(crate) fn accept_push(ctx: &Arc<Ctx>, peer: &str, count: u32) -> Result<Arc<PushSession>,ErrorWire> {
-    super::ctx::extras(ctx).lease_clock.get_or_init(||Clock::new(0)).accept_push(peer,count)
+pub(crate) fn accept_push(
+    ctx: &Arc<Ctx>,
+    peer: &str,
+    count: u32,
+) -> Result<Arc<PushSession>, ErrorWire> {
+    super::ctx::extras(ctx)
+        .lease_clock
+        .get_or_init(|| Clock::new(0))
+        .accept_push(peer, count)
 }
 pub fn next(ctx: &Arc<Ctx>) -> Result<Generation, ErrorWire> {
     super::ctx::extras(ctx)
