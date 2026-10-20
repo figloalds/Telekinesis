@@ -529,3 +529,54 @@ session strings keep their old meaning; launcher/version and adopted-worker
 fencing still require WP6.6. These checks cover retained pull layouts. Inbound
 push-offer ownership and its authenticated session/pool lifecycle still require
 separate work; the local pull-pool registry is not an inbound ownership source.
+
+## CCR-WP6.3-7: authenticated inbound push and offer ownership
+
+After an authenticated bulk handshake, the acceptor assigns one immutable
+session generation before serving requests. Sessions joining the same received
+lane count share the acceptor's current pool identity; a newly authenticated
+different count starts a new pool and retires the earlier sessions' push
+authority. Returning to an earlier count assigns a newer identity. This is the
+acceptor's ordering of authenticated connections, not a claim that the legacy
+hello carries a persistent sender pool epoch. Control and probe sessions do not
+allocate push ownership.
+
+Every local offer receives a fresh `c<16 hexadecimal digits>` frame. The worker
+ID is `push:<peer>:<index>/<count>:c<frame>~w6.<incarnation>.<session>.<pool>`,
+within the existing 128-byte limit. The stable base still identifies the logical
+lane. These IDs are generated locally, not accepted from peer object messages.
+The local worker must implement this ownership extension; adopted-worker and
+deployment capability fences remain part of WP6.6.
+
+The worker orders pool, session and offer frame before admitting wants/writes
+or changing lease state. It retains the latest push frame even after that
+offer's object lease is released. A late old want cannot regain free work;
+late writes, cleanup and hold requests cannot modify the replacement. Existing
+per-lane and family fence bounds apply. Exclusions on a fresh want retire only
+predecessor leases already superseded by its claimed owner; a current other
+source's lease is untouched. Another source can acquire work left by an older
+offer even when the newer offer selected a different object.
+
+The daemon coordinates publication and status/backoff mutations through shared
+ownership slots. The latest session/frame order survives while any offer or
+handler holds the slot. Old replies cannot overwrite or consume a newer offer,
+including when the newer offer was already consumed. Pool retirement and those
+short memory mutations are serialized. No ownership lock spans worker RPC,
+byte verification, socket streaming or durable I/O. Reaper releases use exact
+IDs, so a replacement no longer waits for the old release RPC.
+
+The slot registry has at most 4,096 weak entries, reuses live slots at capacity,
+and refuses new live scopes rather than evicting an owner. Reclamation rechecks
+the key after dropping the registry lock, preserving one slot under concurrent
+creation. Expired offers can be pruned before capacity checks; closed-session
+cleanup removes only that session's table entries. The acceptor pool registry
+has at most 16,384 peer identities, retains their ordering until daemon restart
+and permits an existing peer to reconnect/change count at capacity.
+
+Whole-file hashes, staged/shared authorization, private spool verification and
+legacy peer message formats are unchanged. The three-argument standalone
+`inbound_objects::handle` keeps its function seam for read/report routing;
+network wants/pushes use the registered session owner. An unregistered direct
+wants/push call has no worker authority. Existing close-release helper fanout,
+complete legacy job/byte/spool budgets, cancellation within first-serve hashing,
+final fairness and platform qualification remain separate outstanding work.
