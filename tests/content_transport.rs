@@ -623,6 +623,225 @@ impl Drop for LegacyPushReceiver {
 }
 
 #[test]
+fn native_closed_offer_cleanup_is_bounded_during_connection_churn_and_drains_queued_work() {
+    use tkfs::{
+        orchestrator::inbound_objects,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![117; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let hash = p.root.digest.to_string();
+    let mut config = FaultConfig::new("worker.rpc.objects.release", FaultAction::Hang);
+    config.ms = Some(1500);
+    config.count = Some(2);
+    fault::configure(Some(config));
+    // Occupy both fixed release workers in actual native loopback handlers.
+    for expected in 1..=2 {
+        let conn = receiver.dial();
+        assert!(receiver.wants(&conn).iter().any(|item| item.hash == hash));
+        conn.close();
+        let until = Instant::now() + Duration::from_secs(1);
+        while fault::fired() < expected && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fault::fired(), expected);
+    }
+    let began = Instant::now();
+    let mut admission_peak = Duration::ZERO;
+    for _ in 0..20 {
+        let conn = receiver.dial();
+        let started = Instant::now();
+        assert!(receiver.wants(&conn).iter().any(|item| item.hash == hash));
+        admission_peak = admission_peak.max(started.elapsed());
+        conn.close();
+        let view = inbound_objects::offer_cleanup_view();
+        assert_eq!(view.worker_threads, inbound_objects::OFFER_RELEASE_WORKERS);
+        assert!(view.active <= 2 && view.peak <= 2, "{view:?}");
+    }
+    let churn = began.elapsed();
+    let until = Instant::now() + Duration::from_millis(250);
+    while receiver.server.stats().sessions != 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let saturated = inbound_objects::offer_cleanup_view();
+    assert_eq!(
+        saturated.active, 2,
+        "release workers were not still blocked: {saturated:?}"
+    );
+    assert!(
+        saturated.closed_pending > 0,
+        "pending close was lost: {saturated:?}"
+    );
+    assert!(
+        p.b.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash)
+    );
+    // Manual sweeps share the same bound; they cannot add another RPC.
+    assert_eq!(inbound_objects::reap_offers(Instant::now()), 0);
+    assert_eq!(inbound_objects::offer_cleanup_view().active, 2);
+    let drain = Instant::now();
+    let until = Instant::now() + Duration::from_secs(3);
+    while (p
+        .b
+        .ctx
+        .inflight_objects
+        .lock()
+        .unwrap()
+        .leases
+        .contains_key(&hash)
+        || inbound_objects::offer_cleanup_view().active != 0
+        || inbound_objects::offer_cleanup_view().closed_pending != 0)
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    let drained = inbound_objects::offer_cleanup_view();
+    assert_eq!(drained.active, 0, "{drained:?}");
+    assert_eq!(drained.closed_pending, 0, "{drained:?}");
+    assert!(
+        !p.b.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash)
+    );
+    assert!(runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.a.ctx.device, &hash).is_none());
+    fault::configure(None);
+    let conn = receiver.dial();
+    let item = receiver
+        .wants(&conn)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    receiver.push(&conn, item, &bytes);
+    conn.close();
+    let mut out = vec![0; bytes.len()];
+    p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    assert_eq!(out, bytes);
+    assert!(
+        churn < Duration::from_secs(1),
+        "close churn waited {churn:?}"
+    );
+    assert!(admission_peak < Duration::from_millis(250));
+    println!(
+        "WAVE6_CLEANUP {}",
+        serde_json::json!({"scenario":"native_close_churn",
+        "connections":22,"stalled_release_ms":1500,"stalled_releases":2,
+        "worker_threads":drained.worker_threads,"peak_active":drained.peak,
+        "queued_while_saturated":saturated.closed_pending,"churn_ms":churn.as_secs_f64()*1000.0,
+        "admission_peak_ms":admission_peak.as_secs_f64()*1000.0,"admission_bound_ms":250,
+        "drain_ms":drain.elapsed().as_secs_f64()*1000.0,"typed_activation":false})
+    );
+}
+
+#[test]
+fn native_closed_session_cannot_publish_an_offer_after_its_close_cleanup_ran() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![119; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let conn = receiver.dial();
+    let hash = p.root.digest.to_string();
+    let mut config = FaultConfig::new("inbound.objects.before_offer_publish", FaultAction::Hang);
+    config.ms = Some(1500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (request, payload) = (conn.clone(), receiver.wants_header());
+    let running = thread::spawn(move || {
+        request.call(
+            "objects.wants",
+            payload,
+            vec![],
+            Priority::Control,
+            Duration::from_secs(3),
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    assert!(
+        p.b.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash)
+    );
+    let began = Instant::now();
+    conn.close();
+    assert!(running.join().unwrap().is_err());
+    let until = Instant::now() + Duration::from_secs(1);
+    while receiver.server.stats().sessions != 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(receiver.server.stats().sessions, 0);
+    // No replacement session exists to supersede the old frame for us.
+    // The close itself must prevent the late publication and release its lease.
+    let until = Instant::now() + Duration::from_secs(3);
+    while (receiver.server.stats().exchanges != 0
+        || p.b
+            .ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash))
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(receiver.server.stats().exchanges, 0);
+    assert!(
+        !p.b.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .contains_key(&hash),
+        "late closed offer kept its lease"
+    );
+    assert!(began.elapsed() < tkfs::orchestrator::inbound_objects::OFFER_GRACE);
+    fault::configure(None);
+    let new = receiver.dial();
+    let item = receiver
+        .wants(&new)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    receiver.push(&new, item, &bytes);
+    new.close();
+    println!(
+        "WAVE6_CLEANUP {}",
+        serde_json::json!({"scenario":"late_offer_after_close",
+        "publication_stall_ms":1500,"replacement_before_cleanup":false,
+        "close_to_drain_ms":began.elapsed().as_secs_f64()*1000.0,"typed_activation":false})
+    );
+}
+
+#[test]
 fn native_legacy_push_reconnect_admits_before_old_release_and_late_cleanup_cannot_release_it() {
     use tkfs::util::fault::{self, FaultAction, FaultConfig};
     struct Reset;

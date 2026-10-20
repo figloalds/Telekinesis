@@ -807,7 +807,11 @@ impl Inner {
         let per_peer_epoch = policy.per_peer_epoch();
         drop(policy);
         let (id, revocation_epoch) = self.register(&conn, &peer, address, reserved, per_peer_epoch);
-        let registered = Registered { inner: &self, id };
+        let mut registered = Registered {
+            inner: &self,
+            id,
+            push_owner: None,
+        };
         let push_owner = if let Some(lane) = peer.lane.filter(|_| peer.role == LaneRole::Bulk) {
             match super::lease_clock::accept_push(&self.ctx, &peer.installation, lane.count) {
                 Ok(owner) => Some(owner),
@@ -820,6 +824,7 @@ impl Inner {
         } else {
             None
         };
+        registered.push_owner = push_owner.clone();
         conn.serve(Arc::new(SessionHandler {
             inner: self.clone(),
             peer: peer.clone(),
@@ -1134,10 +1139,14 @@ impl Drop for PreauthSlot<'_> {
 struct Registered<'a> {
     inner: &'a Inner,
     id: u64,
+    push_owner: Option<Arc<super::lease_clock::PushSession>>,
 }
 
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
+        if let Some(owner) = &self.push_owner {
+            owner.close();
+        }
         self.inner.unregister(self.id);
     }
 }
