@@ -36,6 +36,9 @@ impl Owner {
                 slot
             } else {
                 if slots.len() >= MAX_SLOTS {
+                    drop(slots);
+                    super::prune_expired_offers();
+                    slots=lock(&SLOTS);
                     slots.retain(|_, slot| slot.strong_count() > 0);
                     if slots.len() >= MAX_SLOTS {
                         return Err(ErrorWire::coded(
