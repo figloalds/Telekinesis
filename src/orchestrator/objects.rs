@@ -4006,11 +4006,12 @@ fn push(
     let mut through_end: HashSet<String> = HashSet::new();
     // A first read of an object may verify it whole (verify-on-first-serve).
     let largest = sizes.values().copied().max().unwrap_or(0);
-    client.read_stream(
+    client.read_stream_cancellable(
         route,
         &ranges,
         lane.options.reads,
         worker_client::deadlines::with_verify(worker_client::deadlines::READ, largest),
+        &|| lane.stopped(),
         &mut |range, result| {
             if lane.stopped() {
                 failure = Some(lane.stop_error());
@@ -4047,6 +4048,9 @@ fn push(
             }
         },
     );
+    if failure.is_none() && lane.stopped() {
+        failure = Some(lane.stop_error());
+    }
     bump(&lane.stats.bytes_pushed, sent);
     let result = match failure {
         Some(error) => {

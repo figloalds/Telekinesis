@@ -827,18 +827,87 @@ impl SessionWorkerClient {
         Ok((head.total, reply.body))
     }
 
+    // Preserve the historical retry of refusals that ran nothing. Cancelling
+    // a read stream must also interrupt this backoff, without replaying an
+    // uncertain read or extending its deadline.
+    fn read_cancellable(
+        &self,
+        header: &ReadHeader,
+        deadline: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<(u64, Vec<u8>), CallError> {
+        let started = Instant::now();
+        let header = to_header(header)?;
+        let mut pause = REFUSED_RETRY_FIRST;
+        loop {
+            if cancelled() {
+                return Err(CallError::Cancelled);
+            }
+            let left = deadline.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(CallError::Timeout {
+                    after_ms: deadline.as_millis().min(u64::MAX as u128) as u64,
+                });
+            }
+            let reply = self.request_cancellable(
+                wire::ops::READ,
+                header.clone(),
+                Vec::new(),
+                left,
+                cancelled,
+            );
+            match reply {
+                Err(error) if refused(&error) => {
+                    if deadline.saturating_sub(started.elapsed()) <= pause {
+                        return Err(error);
+                    }
+                    let until = Instant::now() + pause;
+                    while Instant::now() < until {
+                        if cancelled() {
+                            return Err(CallError::Cancelled);
+                        }
+                        thread::sleep(until.saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(20)));
+                    }
+                    pause = (pause * 2).min(REFUSED_RETRY_CAP);
+                }
+                other => {
+                    let reply = other?;
+                    let head: ReadReply = serde_json::from_value(reply.header)
+                        .map_err(|error| invalid_reply(wire::ops::READ, &error))?;
+                    return Ok((head.total, reply.body));
+                }
+            }
+        }
+    }
+
     /// Reads `ranges` with at most `inflight` `objects.read` calls in flight
     /// and hands each outcome to `consume` **in range order** (at most
     /// `inflight` results are held at once). `consume` sees `(total, bytes)`
     /// or the call's error, and decides what follows. Returns when every
-    /// range was consumed or skipped, or `consume` stopped the stream (reads
-    /// in flight then end on their own, within `deadline`).
+    /// range was consumed or skipped, or `consume` stopped the stream (calls
+    /// in flight are cancelled without closing the shared worker connection).
     pub fn read_stream(
         &self,
         route: &SyncRoute,
         ranges: &[ReadRange],
         inflight: usize,
         deadline: Duration,
+        consume: &mut ReadConsumer<'_>,
+    ) {
+        self.read_stream_cancellable(route, ranges, inflight, deadline, &|| false, consume);
+    }
+
+    /// As `read_stream`, also stopping during pending reads or an empty
+    /// result window. The predicate must be nonblocking and safe to share
+    /// between the bounded readers. No thread is created per cancellation.
+    pub fn read_stream_cancellable(
+        &self,
+        route: &SyncRoute,
+        ranges: &[ReadRange],
+        inflight: usize,
+        deadline: Duration,
+        cancelled: &(dyn Fn() -> bool + Sync),
         consume: &mut ReadConsumer<'_>,
     ) {
         if ranges.is_empty() {
@@ -851,25 +920,31 @@ impl SessionWorkerClient {
         };
         thread::scope(|scope| {
             for _ in 0..inflight {
-                scope.spawn(|| read_loop(self, route, ranges, inflight, deadline, &shared));
+                scope.spawn(|| {
+                    read_loop(self, route, ranges, inflight, deadline, &shared, cancelled)
+                });
             }
             // Ends the readers however the consumer leaves (a panic too):
             // the scope joins them, and one waiting for the window to move
             // would otherwise wait forever.
             let _stop = StopReaders(&shared);
             let mut index = 0;
-            while index < ranges.len() {
+            'consume: while index < ranges.len() {
                 let outcome = {
                     let mut state = lock(&shared.state);
                     loop {
+                        if cancelled() {
+                            break 'consume;
+                        }
                         if let Some(outcome) = state.results.remove(&index) {
                             state.consumed = index + 1;
                             break outcome;
                         }
                         state = shared
                             .changed
-                            .wait(state)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            .wait_timeout(state, Duration::from_millis(20))
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
                     }
                 };
                 shared.changed.notify_all();
@@ -1078,12 +1153,13 @@ fn read_loop(
     window: usize,
     deadline: Duration,
     shared: &ReadShared,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) {
     loop {
         let (index, skip) = {
             let mut state = lock(&shared.state);
             loop {
-                if state.stop || state.next >= ranges.len() {
+                if cancelled() || state.stop || state.next >= ranges.len() {
                     return;
                 }
                 if state.next < state.consumed + window {
@@ -1111,7 +1187,12 @@ fn read_loop(
             // A panicking read is an error result, so the consumer, which
             // waits for this range, is never left waiting.
             let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                client.read(&header, deadline)
+                client.read_cancellable(&header, deadline, &|| {
+                        cancelled() || {
+                            let state = lock(&shared.state);
+                            state.stop || state.skipped.contains(&range.hash)
+                        }
+                    })
             }));
             Some(read.unwrap_or_else(|_| {
                 Err(CallError::Remote(ErrorWire::coded(

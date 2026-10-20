@@ -423,11 +423,12 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         worker_client::deadlines::with_verify(worker_client::deadlines::READ, largest);
     thread::scope(|scope| {
         scope.spawn(|| keepalive(&responder, &done, None));
-        bound.client.read_stream(
+        bound.client.read_stream_cancellable(
             &bound.route,
             &ranges,
             INFLIGHT_READS,
             read_deadline,
+            &|| responder.cancelled() || ctx.shutdown.is_cancelled(),
             &mut |range, result| {
                 if responder.cancelled() {
                     return ReadFlow::Stop;
@@ -478,7 +479,7 @@ fn pull(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incoming) {
         );
         done.cancel();
     });
-    if failure.is_none() && responder.cancelled() {
+    if failure.is_none() && (responder.cancelled() || ctx.shutdown.is_cancelled()) {
         failure = Some(ErrorWire::coded(
             "CANCELLED",
             "the dialer cancelled the objects.pull",
