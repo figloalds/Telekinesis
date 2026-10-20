@@ -1015,6 +1015,15 @@ impl Store {
     /// Open and fully verify an object. Read paths heal the index: a missing
     /// file marks an available row missing, a hash mismatch marks it corrupt.
     pub fn open_object(&self, object: &str) -> Result<fs::File> {
+        self.open_object_checked(object, &mut || Ok(()))
+    }
+
+    fn open_object_checked(
+        &self,
+        object: &str,
+        check: &mut impl FnMut() -> Result<()>,
+    ) -> Result<fs::File> {
+        check()?;
         valid_object(object)?;
         let mut file = match fs::File::open(self.root.join("objects").join(object)) {
             Ok(file) => file,
@@ -1028,7 +1037,9 @@ impl Store {
         let len = file.metadata()?.len();
         ensure!(len <= MAX_CONTENT, "FILE_TOO_LARGE");
         self.count_hash();
-        if stream_hash(&mut file)? != object {
+        let digest = stream_hash_checked(&mut file, check)?;
+        check()?;
+        if digest != object {
             self.note_corrupt(object, len);
             bail!("CORRUPT_OBJECT: {object}");
         }
@@ -1295,6 +1306,20 @@ impl Store {
         offset: u64,
         len: usize,
     ) -> std::result::Result<(u64, Vec<u8>), ErrorWire> {
+        self.read_object_range_checked(object, offset, len, || Ok(()))
+    }
+
+    /// The legacy range/authorization contract with a caller-owned lifetime.
+    /// Checks surround 64 KiB hash/read work and precede trust publication.
+    /// Cancellation is not corruption and does not change availability/backoff.
+    pub fn read_object_range_checked(
+        &self,
+        object: &str,
+        offset: u64,
+        len: usize,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> std::result::Result<(u64, Vec<u8>), ErrorWire> {
+        check().map_err(|error| ErrorWire::from_error(&error))?;
         if !canonical_object(object) {
             return Err(ErrorWire::coded("INVALID_OBJECT_ID", object));
         }
@@ -1355,8 +1380,9 @@ impl Store {
             || (row.is_none_or(|row| row.state == AVAILABLE)
                 && served().get(&key) == Some(&(total, mtime)));
         if !trusted {
-            match self.verify_object(object) {
-                Ok(()) => {
+            match self.open_object_checked(object, &mut check) {
+                Ok(_) => {
+                    check().map_err(wire)?;
                     self.set_availability(object, total as i64, AVAILABLE, mtime, time() as i64)
                         .map_err(wire)?;
                     let _ = self
@@ -1376,6 +1402,10 @@ impl Store {
                     ));
                 }
                 Err(error) => {
+                    let code = crate::model::errors::code_of(&error);
+                    if matches!(code.as_str(), "CONTENT_CANCELLED" | "CONTENT_DEADLINE") {
+                        return Err(wire(error));
+                    }
                     return Err(ErrorWire::coded("NOT_AVAILABLE", format!("{error:#}")));
                 }
             }
@@ -1386,17 +1416,35 @@ impl Store {
                 format!("offset {offset} beyond {total} bytes of {object}"),
             ));
         }
+        check().map_err(wire)?;
+        // Verification can take long enough for metadata to withdraw the
+        // reference. Recheck the same triad before issuing this frame.
+        if !self.objects_referenced_committed(object).map_err(wire)? {
+            return Err(ErrorWire::coded("NOT_PERMITTED", object));
+        }
+        if !self.object_shareable(object).map_err(wire)? {
+            return Err(ErrorWire::coded("NOT_AVAILABLE", object));
+        }
         let count = (total - offset).min(len as u64) as usize;
         let read = (|| -> Result<Vec<u8>> {
             let mut file = fs::File::open(&path).map_err(object_error)?;
             file.seek(std::io::SeekFrom::Start(offset))?;
             let mut bytes = vec![0; count];
-            file.read_exact(&mut bytes).map_err(object_error)?;
+            for chunk in bytes.chunks_mut(64 * 1024) {
+                check()?;
+                file.read_exact(chunk).map_err(object_error)?;
+                check()?;
+            }
+            check()?;
             Ok(bytes)
         })();
         match read {
             Ok(bytes) => Ok((total, bytes)),
             Err(error) => {
+                let code = crate::model::errors::code_of(&error);
+                if matches!(code.as_str(), "CONTENT_CANCELLED" | "CONTENT_DEADLINE") {
+                    return Err(wire(error));
+                }
                 self.object_available_checked(object);
                 Err(ErrorWire::coded("NOT_AVAILABLE", format!("{error:#}")))
             }

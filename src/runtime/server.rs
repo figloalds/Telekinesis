@@ -674,12 +674,27 @@ impl Core {
         op: &str,
         header: Value,
         body: Vec<u8>,
+        deadline: Instant,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(Value, Vec<u8>), ErrorWire> {
         let wire = |error: anyhow::Error| ErrorWire::from_error(&error);
         if op.starts_with(ops::OBJECTS_PREFIX) {
             // The JSON ops below reach `worker.rpc.<op>` in `route`, once,
             // as over the JSON RPC.
             fault::trigger(&format!("worker.rpc.{op}")).map_err(wire)?;
+            if matches!(
+                op,
+                crate::model::protocol::objects::ops::READ
+                    | crate::model::content_wire::LEGACY_READ
+            ) {
+                if !body.is_empty() {
+                    return Err(ErrorWire::coded(
+                        "INVALID_REQUEST",
+                        "read body must be empty",
+                    ));
+                }
+                return objects_rpc::read_request(&self.ctx, op, &header, deadline, cancelled);
+            }
             return objects_rpc::dispatch(&self.ctx, op, &header, &body);
         }
         if op == ops::STOP {
@@ -1181,6 +1196,7 @@ impl Handler for LoopbackHandler {
             header,
             body,
             chunks,
+            deadline,
             responder,
             ..
         } = req;
@@ -1192,7 +1208,8 @@ impl Handler for LoopbackHandler {
             return;
         }
         let outcome = catch_unwind(AssertUnwindSafe(|| {
-            self.core.session_request(&op, header, body)
+            self.core
+                .session_request(&op, header, body, deadline, &|| responder.cancelled())
         }));
         match outcome {
             Ok(Ok((header, body))) => responder.reply(header, body),

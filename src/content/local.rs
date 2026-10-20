@@ -183,8 +183,19 @@ impl LocalContent {
         buffers: usize,
         class: BufferClass,
     ) -> Result<BufferPermit<'_>> {
+        self.permit_checked(context, buffers, class, &|| Ok(()))
+    }
+
+    fn permit_checked(
+        &self,
+        context: &ReadContext,
+        buffers: usize,
+        class: BufferClass,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<BufferPermit<'_>> {
         loop {
             context.check()?;
+            check()?;
             {
                 let mut state = lock(&self.owner.buffers);
                 let total = state.foreground + state.background;
@@ -230,8 +241,12 @@ impl LocalContent {
         )
     }
 
-    pub(crate) fn foreground_permit(&self, context: &ReadContext) -> Result<BufferPermit<'_>> {
-        self.permit(context, 2, BufferClass::Foreground)
+    pub(crate) fn foreground_permit_checked(
+        &self,
+        context: &ReadContext,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<BufferPermit<'_>> {
+        self.permit_checked(context, 2, BufferClass::Foreground, check)
     }
 
     /// Authenticate an indexed locator against the immutable root. At most one

@@ -2332,3 +2332,143 @@ fn legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack()
     }
     assert_eq!(state.scheduler.usage().0, 0);
 }
+
+#[test]
+fn native_legacy_hashing_stops_on_request_deadline_disconnect_and_worker_shutdown() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![67; 3 * 1024 * 1024 + 13];
+    let hash = tkfs::core::hash(&bytes);
+    for op in ["objects.read", wire::LEGACY_READ] {
+        for stop in ["deadline", "disconnect", "shutdown"] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = tkfs::core::id();
+            let mut s = Store::initialize(dir.path(), &repo, &tkfs::core::id()).unwrap();
+            let entry = s.create("large", "file").unwrap();
+            s.write_revision(&entry.id, entry.revisions.get("content").cloned(), &bytes)
+                .unwrap();
+            let route = serde_json::json!({"peer":"remote", "repo":repo,
+                "local_replica":s.device, "remote_replica":"source"});
+            let path = dir.path().join("objects").join(&hash);
+            // Installed objects have trusted markers. Change the actual file's
+            // mtime so this request must enter whole-file verification.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+                .unwrap();
+            let marker =
+                |store: &Store| -> (i64, i64, i64) {
+                    store.db.query_row(
+                    "SELECT state,mtime_ns,verified_ms FROM object_availability WHERE hash=?",
+                    [&hash], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+                ).unwrap()
+                };
+            let before = marker(&s);
+            let worker = Worker::new(s);
+            let conn = session::dial_loopback(
+                &worker.endpoint.address,
+                worker.endpoint.token.as_deref(),
+                ConnOptions::default(),
+            )
+            .unwrap();
+            let header = serde_json::json!({"route":route,"hash":hash,"offset":0,"len":65536});
+            let mut config = FaultConfig::new("core.hash.after_chunk", FaultAction::Hang);
+            config.ms = Some(250);
+            config.count = Some(1);
+            fault::configure(Some(config));
+            let (request, payload) = (conn.clone(), header.clone());
+            let running = thread::spawn(move || {
+                request.call(
+                    op,
+                    payload,
+                    vec![],
+                    Priority::Control,
+                    if stop == "deadline" {
+                        Duration::from_millis(80)
+                    } else {
+                        Duration::from_secs(2)
+                    },
+                )
+            });
+            let until = Instant::now() + Duration::from_secs(1);
+            while fault::fired() == 0 && Instant::now() < until {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(fault::fired(), 1, "{op}/{stop} did not enter hash I/O");
+            let began = Instant::now();
+            match stop {
+                "disconnect" => conn.close(),
+                "shutdown" => {
+                    worker.server.stop(StopMode::Force).unwrap();
+                }
+                _ => {}
+            }
+            assert!(
+                running.join().unwrap().is_err(),
+                "{op}/{stop} served cancelled bytes"
+            );
+            // A returned caller alone does not prove the hash worker stopped.
+            // Observe its checked-out connection and foreground buffers return.
+            let until = Instant::now() + Duration::from_secs(1);
+            while worker.ctx.sync_stores.idle() == 0 && Instant::now() < until {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                worker.ctx.sync_stores.idle() > 0,
+                "hash handler did not drain"
+            );
+            assert_eq!(LocalContent::open(dir.path()).unwrap().buffer_usage().0, 0);
+            let elapsed = began.elapsed();
+            fault::configure(None);
+            let probe =
+                Store::open_secondary(dir.path(), &worker.ctx.repo, &worker.ctx.device).unwrap();
+            assert_eq!(marker(&probe), before, "partial hash became trusted");
+            assert!(path.is_file(), "cancellation quarantined a good object");
+            let errors: u64 = probe
+                .db
+                .query_row(
+                    "SELECT count(*) FROM object_error_state WHERE hash=?",
+                    [&hash],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(errors, 0, "cancellation created an object retry");
+            // A fresh reader must still verify. Fail inside that next hash,
+            // then retry normally: neither SQL nor the process cache was trusted.
+            let mut config = FaultConfig::new("core.hash.after_chunk", FaultAction::Fail);
+            config.count = Some(1);
+            fault::configure(Some(config));
+            assert_eq!(
+                probe.read_object_range(&hash, 0, 65536).unwrap_err().code,
+                "NOT_AVAILABLE"
+            );
+            assert_eq!(
+                fault::fired(),
+                1,
+                "cancelled hash populated a trusted cache"
+            );
+            fault::configure(None);
+            assert_eq!(
+                probe.read_object_range(&hash, 0, 65536).unwrap().1,
+                bytes[..65536]
+            );
+            assert!(elapsed < Duration::from_secs(1));
+            println!(
+                "WAVE6_HASH {}",
+                serde_json::json!({"scenario":stop,"op":op,
+                "bytes":bytes.len(),"cancel_to_drain_ms":elapsed.as_secs_f64()*1000.0,
+                "io_stall_ms":250,"bound_ms":1000,"typed_activation":false,
+                "partial_verification_trusted":false})
+            );
+            conn.close();
+        }
+    }
+}

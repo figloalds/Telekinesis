@@ -148,17 +148,103 @@ fn object_error(error: std::io::Error) -> anyhow::Error {
     anyhow::Error::new(error).context(label)
 }
 pub(crate) fn stream_hash(reader: &mut impl Read) -> Result<String> {
+    stream_hash_checked(reader, &mut || Ok(()))
+}
+
+/// Check a caller's lifetime between bounded reads, including the last read.
+/// A cancelled verification never yields a digest that could become trusted.
+pub(crate) fn stream_hash_checked(
+    reader: &mut impl Read,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<String> {
     let mut digest = Sha256::new();
     let mut bytes = [0; 64 * 1024];
     loop {
+        check()?;
         let count = reader.read(&mut bytes)?;
+        if count > 0 {
+            crate::util::fault::trigger("core.hash.after_chunk")?;
+        }
+        check()?;
         if count == 0 {
             break;
         }
         digest.update(&bytes[..count]);
         crate::startup::progress("verifying objects");
     }
+    check()?;
     Ok(hex::encode(digest.finalize()))
+}
+
+#[cfg(test)]
+mod bounded_hash_tests {
+    use super::*;
+    use crate::{content::ReadContext, util::Cancel};
+    use std::time::{Duration, Instant};
+
+    struct InterruptingReader {
+        context: ReadContext,
+        reads: usize,
+        largest: usize,
+        eof: bool,
+    }
+    impl Read for InterruptingReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.largest = self.largest.max(bytes.len());
+            bytes.fill(7);
+            self.context.cancel.cancel();
+            Ok(if self.eof { 0 } else { bytes.len() })
+        }
+    }
+
+    #[test]
+    fn cancellation_during_hash_read_or_eof_never_returns_a_digest() {
+        for eof in [false, true] {
+            let mut reader = InterruptingReader {
+                context: ReadContext {
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cancel: Cancel::new(),
+                },
+                reads: 0,
+                largest: 0,
+                eof,
+            };
+            let context = ReadContext {
+                deadline: reader.context.deadline,
+                cancel: reader.context.cancel.clone(),
+            };
+            let error = stream_hash_checked(&mut reader, &mut || context.check()).unwrap_err();
+            assert_eq!(crate::model::errors::code_of(&error), "CONTENT_CANCELLED");
+            assert_eq!(reader.reads, 1, "read again after cancellation");
+            assert_eq!(reader.largest, 65536, "unbounded verification buffer");
+        }
+    }
+
+    #[test]
+    fn expired_hash_request_reads_nothing_and_live_request_keeps_whole_file_identity() {
+        let mut reader = InterruptingReader {
+            context: ReadContext {
+                deadline: Instant::now(),
+                cancel: Cancel::new(),
+            },
+            reads: 0,
+            largest: 0,
+            eof: false,
+        };
+        let context = ReadContext {
+            deadline: reader.context.deadline,
+            cancel: reader.context.cancel.clone(),
+        };
+        let error = stream_hash_checked(&mut reader, &mut || context.check()).unwrap_err();
+        assert_eq!(crate::model::errors::code_of(&error), "CONTENT_DEADLINE");
+        assert_eq!(reader.reads, 0);
+        let bytes = vec![11; 200_013];
+        assert_eq!(
+            stream_hash_checked(&mut &bytes[..], &mut || Ok(())).unwrap(),
+            hash(&bytes)
+        );
+    }
 }
 pub fn time() -> u64 {
     std::time::SystemTime::now()
