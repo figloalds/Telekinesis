@@ -560,6 +560,25 @@ their lease tables and release logs; only historical peer/lane assertions
 normalize their view. The delayed-reap regression now asserts prompt admission
 and that the old release finds no ownership of the replacement.
 
+The native worker also rechecks ownership at the source-backoff mutation after
+an old corrupt-push verdict. A two-second pause after collecting that verdict
+allows a replacement to install verified bytes first; the old result then
+cannot recreate its memory retry. The replacement completed in 5.43 ms in the
+final sample. Durable local-failure SQL projection and same-run foreground
+error interleavings still need the full legacy audit.
+
+The complete ownership invocation passed 319 checks. After adding that final
+mutation guard and its native regression, the four affected targets passed
+127 checks; there are 320 distinct checks across both source stages. Both
+stages passed strict Clippy. The evidence retains separate manifests and
+executables in `test-evidence/wave-6/push-generations-checks.json`, rather than
+claiming the earlier library/lane/supervisor executables contain the last guard.
+Final source-set SHA-256:
+`a9a0154c02a2829eb2e6dd0d74138452f14ff2e058a22b1f1551466de501166b`.
+The 20 ignored checks (18 long legacy lane scenarios and two library probes)
+and one filtered, previously qualified 10,000-object worker case remain
+explicitly recorded. This is not the final platform/load/build gate.
+
 This work does not establish the remaining full legacy job/byte/spool budget or
 close-release helper fanout bounds. Those, hash cancellation, sustained fairness,
 mounted range reads, recoverable private saves, caching/change journal,
