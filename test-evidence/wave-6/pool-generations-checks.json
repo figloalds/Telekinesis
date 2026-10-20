@@ -1,0 +1,479 @@
+{
+  "date": "2026-10-20",
+  "host": "Windows-11-10.0.26300-SP0",
+  "target": "x86_64-pc-windows-msvc",
+  "scope": "WP6.3 CCR-WP6.3-6 retained pull ownership across peer-pool/lane-count replacement; full Wave 6 remains in progress and ordinary typed-content activation stays off",
+  "source_revision": "5711b88621c51af487a586fb6e363502a4fe6779",
+  "working_tree_source_sha256": "5a8d0d6e83be3efa7d207f77bef8bb0d4078929754d68b81f36724177eca2353",
+  "source_files_sha256": {
+    "build.rs": "70dbed753d54e99544840af6b172da5915f5d3bf68a761fe4b324a10039d9f1a",
+    "Cargo.lock": "a4bc80a508b334c1b142d540cff312ddc0da9503ab23b239b0ddd04e5fea84b5",
+    "Cargo.toml": "4e57ac04c7ac26b8727572504c773f8be2c8c2ba8fb5145f42ea3bf6efa2b119",
+    "src/backend.rs": "4ef24f0d6d9a4b752b1188aace8230f11f92f88f06dce3f15d660aedd9c895c3",
+    "src/bulk_sync.rs": "bbe702d832c7b3354c5e414d1da5931d91cf05741a7bb4810fd5bc05c6905594",
+    "src/content/local.rs": "eac5825b729b27ba94896715f4cb784f4423f910519e5aa1de134ccc47ba9f9d",
+    "src/content/mod.rs": "1628df4290430d5f0ee7118999b184a13bf29c1f174976732dddf92c041040b1",
+    "src/content/provider.rs": "ee193232475409431c8d34b9f8a3223ac150ee292e29bb410790b5072861f1c9",
+    "src/content/receipt.rs": "e52221c624af4d98e9f1bb5a111b80384a6248f081dd567fd50d17fab9c19e03",
+    "src/content/scheduler.rs": "179f4e7ba85f6c206b89f345e9ae52f559769bbb33ebfb6cb9e0bf56c09361da",
+    "src/content/walk.rs": "00f24d730acf47e2796496fee2bea63eab05de21527c0f8d3113779e84cbb2d0",
+    "src/content/work.rs": "193a4b1667fbc2536ab1e44569979085c5e6ca6b249c02bff3997d4525515b1a",
+    "src/core/admission.rs": "57c575a9cb688cd6567b23e536235b50fe591974f8e4fb8fa1053af8cab1487d",
+    "src/core/commit.rs": "91a3e2226b1617a0a8549ac4592a8ea6c5cfa043b24aa06bf3c833479ad688c4",
+    "src/core/content_objects/graph.rs": "69cc9c3a27a6beb60ad6faade0d3715148cb1f176464ce050c1d428146dfe380",
+    "src/core/content_objects.rs": "022a08d8b41ec3edc0c2ccae7464504e768f0f4ad1f75fae6643a245f710873e",
+    "src/core/demand.rs": "99f500ad6c59dc708b3a88fb6ecb29e7d9000baaf0b63ac93264a76897e3a263",
+    "src/core/derive.rs": "9c52d5abebe02ee7a0c27e8a800cdb08a73637751d9358932d9db8d9c66e8e7f",
+    "src/core/inbox.rs": "caba15a380bf0d43575ea8a02eb27ab3d2598f8207da2bfe8ac5cc3abb67fc49",
+    "src/core/objects.rs": "51b0189a97a7a4edd3de14689f0ef23e1f2465d379304b69e92d465b4d7284ee",
+    "src/core/sharing.rs": "9612e63a7b58284126d1a19a644966d2d8f63a1492daec2177381b5809a4b69a",
+    "src/core/snapshot.rs": "a398d1a5f27b8cff97a193387f6751c90add2d144a6322a1854db9a46740e393",
+    "src/core/status.rs": "5cacf0ada3d5f163a518462621de038e91f72aaec48510c986ff94538fc299cf",
+    "src/core/transfer.rs": "f717b14b56f30651b3247c0c70ad639af3723002a5eacaea4ec03c9b23008d03",
+    "src/core/verify.rs": "36adc98314b94e1832ffa492cc0073dcf3b5a26a1bc18973cce4889b25966838",
+    "src/core.rs": "24b3776d630cf4b55ab3a2559b9e96495bd1dbceb1fc1a07c6170ece236d9310",
+    "src/fuse_linux.rs": "c66f4407cb1da627aa73dff9e778ae6af22e7d9a42b15b1ff950d6853f334a0a",
+    "src/gui.rs": "1d8533767a48fb7352bcb918dbb6701dde328cd31667e760ed581c1d80e466a5",
+    "src/lib.rs": "68fb16e1b199d58813c08949b9973bc2a6be10f0ed833ab92b784427c542f1de",
+    "src/main.rs": "b23ecf6b85e007fa3ece8d3a7cee48e6ebbf0223a6202d71682f72378848688b",
+    "src/model/content.rs": "ac7a1e366df167bb7e3b64f67571a5797b79371bc8f1c9f57a6ad162586c75d0",
+    "src/model/content_wire.rs": "d5eda545a36541917edcedb0d335733658a05357805d1e7eb02c953bfa13c2f9",
+    "src/model/errors.rs": "6e317a050dc3a29d01f35b4af092f34b77fd4bb2a2c3e375ac4b2d79d0c7ab65",
+    "src/model/health.rs": "ab6dd44f6bda8f39219c6460cd8c3cf6c733f38dd853ff2600ffbddf2b1f2be0",
+    "src/model/ipc.rs": "dda59a06ac3fe5a7ee0f2ae33938a5079f6d281a516e9341b0f86804fe4f2b91",
+    "src/model/lease.rs": "139cb8890fad7c3f1174b93e3d6faa8a1671c1dad7609da3093ebd2e0271f1bc",
+    "src/model/mod.rs": "16be4777d746aa91b51d47f9c242cb5c477bfdf1024fdc6ed494e8deafde6671",
+    "src/model/orchestrator.rs": "262f199c058ed2f154eda34cebfc3a375097b4108e2183de13f3892b92881866",
+    "src/model/protocol.rs": "362a616834b6508f19678d9c9d34370a6297ff5e3821a5f879ceef60e161608b",
+    "src/model/status.rs": "9a7a46d09f136e5278984f364c348144366dceb29b3e5b50c0092247d5e5d2ab",
+    "src/model/workspace.rs": "53cc631a80f1a1605189ba31a27e667551ef86b6bb41abcaab46cb87642442e9",
+    "src/mount.rs": "9891e8b92707803bbb8941fbcc1be177aa8880c36682867420bfb3faf9ce564d",
+    "src/orchestrator/api.rs": "cd7ee3dd72f885abc64858b74a21ed098e25c6872dd29a96c7a3e84110729fb0",
+    "src/orchestrator/catalog.rs": "2ffd61b6279a56cd79b73a91ca10dd5242ba83d4ed5ebafa20635c104332c30d",
+    "src/orchestrator/compat.rs": "8e27b4eb849e6330c37b0d8bb163b2506226b1b3568deaeef1721413bae5a76c",
+    "src/orchestrator/config.rs": "6269219da980a0bbc3ed684d6399e42b89d635258dd2dc5d01a2d749278f48fd",
+    "src/orchestrator/content_dispatch.rs": "dd7c416e35f24ca5e396bda1db79bc8fe1857df0b2d6f77defdd8bbbabddc02f",
+    "src/orchestrator/content_transport.rs": "fe302c9fba3bd52f008aec2b7b31d4e0a6695768fc2ac5b2847339492d352922",
+    "src/orchestrator/ctx.rs": "ffc54886d544c433a2b16031030e30cc364e0d2e332e39dd2fe2e74c0fb812b0",
+    "src/orchestrator/diagnostics.rs": "22431e1902bbbb66ead6254faa8a673ffe588d29a565b0223ee882b472080ada",
+    "src/orchestrator/folder.rs": "3903243bd9231f7b3a739872659540fa5a609186b9b914926b1b1f62b367bdac",
+    "src/orchestrator/hub.rs": "396691e312abd7682cf37de7a9988682a1410b0054828c2142a540c0daa5514a",
+    "src/orchestrator/hub_rules.rs": "5bb82444a904b53c6bc2220761d945f2193954a94f1c7e399581f565accaf802",
+    "src/orchestrator/inbound.rs": "5a75c1d89a5283a4a51ef6a155021dc79431044519365ed3e51a0e7b7037d4eb",
+    "src/orchestrator/inbound_objects.rs": "6cdaa9a694bfcc809b0cf0bf6475485115ac467e8a97c111dbb3fd7ade6213ed",
+    "src/orchestrator/lease_clock.rs": "fd407f0948d10e49f77f3968fecb19fe36f746ed09fce31e7ceda531a350d2cf",
+    "src/orchestrator/legacy_demand.rs": "312bca9829710474e6a24ca6c54bdc52e5f00d908e7316a2c63fe74d139e6608",
+    "src/orchestrator/manage.rs": "65154b11e94336120596ceb62eb7c87ec963975d7d71d337c7a592c5cf01c91f",
+    "src/orchestrator/manage_v2.rs": "6cb65cc28e806919d5d04c59c47dd4be027e913acb9fa5c4ad35b4f2f1dd2082",
+    "src/orchestrator/meta_exchange.rs": "ac90586fd1c7c8cba67ac235a6fac20365d7204d12876274165791aff01c916e",
+    "src/orchestrator/mod.rs": "6556e8a141f4e2d974c06db6525c6d8fa6340a5eec0050130abb3e19b16c3d25",
+    "src/orchestrator/objects.rs": "86902f17d5489e62691464489edd75ec9380f7a94ab85bdb0667a5486a66ec04",
+    "src/orchestrator/peer.rs": "bf71d8045f10af4b33ee28a3f07111057ca761b46372a1433906df798946251e",
+    "src/orchestrator/process.rs": "30efdd5db1283f5c90f5b5994be61d22fba9af00a9a7b872e83a90437096d421",
+    "src/orchestrator/published.rs": "41b29eea0c48e6b167619aeaaddd42210a02d819bf2a5f8bf97f9398342eb364",
+    "src/orchestrator/registry.rs": "23f9167a85f550f199eb7d7b911f621ba0c0156a98e3655dbe3d4a292c053618",
+    "src/orchestrator/run.rs": "83fd1c261d2ef1e17f258b650ba6c000ac82b1b0c8bd9090ea2a299e26e730b1",
+    "src/orchestrator/scheduler.rs": "16335b944b87b10f81bec1ebed31600b1d9b6eeb39e7ec981efcb8def3c0b4a5",
+    "src/orchestrator/shutdown.rs": "451d48388fd425a991cb2e6f08bbff79223af3ff19f961a0ac8930328bfd1ab5",
+    "src/orchestrator/worker_client.rs": "19f42985155cbfa1d0979f708d319245ea84757fb2db4d3e537fb4346b7fbc1c",
+    "src/paired_sync.rs": "d9d23722db191ca2b9096a3ce67b936e1205d3aec435a12b8d714ba08ae45b56",
+    "src/pairing_code.rs": "15e92303767dfff4b75177960ef48c01fd73cac105b6b30cf80c5a26d2f74691",
+    "src/runtime/content.rs": "2f050d15602ba9674b158739dd23b2ef5f33fdd3ef4a04737c35830f72626103",
+    "src/runtime/content_rpc.rs": "dd7661fdc387f934742b7242816da5239b874e7e80e3a77b3fb8d8c183e06f98",
+    "src/runtime/control.rs": "875d2272a56f3b6fdbb38bda0a1a0c15d5aef9275226f8ff4ddb595d859c87d2",
+    "src/runtime/ctx.rs": "85eef507ff1443379dc88dc150def4bfd370552ce54a144ccdf434ff502a6f28",
+    "src/runtime/engine.rs": "10bb6d7009e2d2decedca91393de998ee89303c00dd47a8dfd6245118a33e212",
+    "src/runtime/export.rs": "265057ab699a30749a3f099b1cd2556edcc4e27ca87375b69b551a4bc98c5d0e",
+    "src/runtime/mod.rs": "ebccf25c15f040a31fbd08206a34ada641daad22151208e0f8983f528286c2c3",
+    "src/runtime/notify.rs": "5f69457ce29a3ed055b345ee8cd88ba283f14ac969a4f049fc85b3cda7e671d7",
+    "src/runtime/objects_rpc.rs": "d5cc3dce6ead45480ed8c46bed886e301355e8c7786ff6150f007b7017bf39d0",
+    "src/runtime/published.rs": "9ad7cdd40191b239486788d390f452d88f85dbc9ab366b14eaa7e1bbacb3840f",
+    "src/runtime/server.rs": "88ca3903894444e27116fdd013e879b9e7e8b22c0ec95a5f6214d03cc5212295",
+    "src/runtime/sync_rpc.rs": "f392691573dc3b5db0b2ddaf63991d39b15fffffb7bf5e08a7a275e540b4b3ff",
+    "src/session/auth.rs": "688543b36e3f36d233ec0c5c301ef112ecdab2ba3649cb8f2d923bfd9489ad6c",
+    "src/session/conn.rs": "56193e7251b9c056d883f7176fe609b80f187c87af01e28a4d46e16625c5154b",
+    "src/session/frame.rs": "3ed6238885ae5eabf57d6556ef44be837ed26f5b4a8ed546705b05e694354c26",
+    "src/session/handshake.rs": "884cab66c0df463b534aeea623ad0201dd1fed119254b5ec9c4210fed7c5517a",
+    "src/session/io.rs": "cabdb2aafa103ed36372c6fec8c2285d94f4869da2c6b4f04e571531de88f0c3",
+    "src/session/mod.rs": "a62631a8f264404bddc9ef06924d13c00c9d13af7cee6a8dfa821ee135ef1f98",
+    "src/staging.rs": "8b3b963a6b133a5744abcb5452fa7b00699a84cb4196b197cd521451ef982819",
+    "src/startup.rs": "bb375d5d3d2eee00cb404dfc5fc1b264419b451293eaa780ff4b16c428de7b57",
+    "src/ui_model.rs": "aee8988b21018f8506d506e06204ffeece0f42716a05969c70b41b97ec61c830",
+    "src/util/backoff.rs": "069294f2ee76e33910ff68bcb44cb5397807c8ae46b2a9a7cc6a7523b41a954f",
+    "src/util/cancel.rs": "8ed07385f548ceedda00ea20d0787395533dc9b5f98ed92890b22a7d5e8848aa",
+    "src/util/fault.rs": "1371796dd14fb237d53ee577b625683aa523dcb6e720e2fb7747bd76d94ac644",
+    "src/util/hmac.rs": "80be00c209b438b9e0369a05958bfce61588f489cde4d89fbe80b2c00afb6043",
+    "src/util/lock.rs": "38172ce4dcded00f9257a667f48f7e53575b9fe54c04062aa0866e97bc8f1055",
+    "src/util/log.rs": "224cf2e6acc65b5297cdbb539a91badf5f4542a4b12ea982ad6acde29d422a65",
+    "src/util/mod.rs": "c092ec6d43e77cb0aa0fed21e62dfaddce2466094a0ded5c1d9bc4c9b8e72a37",
+    "src/util/notify.rs": "2208bc8488c89caf788c7964482b441ea19c99dd219406cd83011996a6ce28c9",
+    "src/util/phases.rs": "f846d6846a8c794f97bce97421f573d7131cd4d8e206fab4065ec7400dc69458",
+    "src/util/snapshot.rs": "3e8fa488a13885fe07cb836b22c33aad01475183005a5f834185861fa3afdb18",
+    "src/util/time.rs": "d9708704100f9d4c408551c480d8f1d1c8c28102df18d48bb86a2eef980ac8b4",
+    "src/wire.rs": "8d80dce0906f5f2ec573fe11ccad945c97d57dae4b4062857bc59b599b2ce2d5",
+    "src/worker/activator.rs": "89d57596656a31813893d38a622d0a087f7a4dc9e563854b2d4490250864984a",
+    "src/worker/heartbeat.rs": "61caa9a8bd3188936886c440079edbd4fb58e580bbf7448601fe5f0805c1d028",
+    "src/worker/maintenance.rs": "8785eb4341826d36615e27371db5b9af6f62570030faa3391380804edcb91059",
+    "src/worker/mod.rs": "f79368de962ce857b755b22236f3464d3bd08cd05ef0e9c8827e4772c4d66f3a",
+    "src/worker/mount_ctl.rs": "78f2ef60a54b6a39f4cd5b7c80c436f768e60824e9ca271d7a3688eab9a121ab",
+    "src/worker/record.rs": "6786613df74a9933a19dbed3fdf305ee01e35e7656abb72b9257a7d74a242e4c",
+    "src/worker/status_cell.rs": "86f9e8e08347bebcc4da7273f38bc131d6b5cb71a1b978b39efe136f619d7c8c",
+    "src/ws.rs": "34c5d2cca8310aecb8cca832f01fe4a247e47556747ae5bb0ed8918bde86ddce",
+    "tests/content_transport.rs": "a18f9b5e55fcff53d66456afcfd94c5680704ae687c9fb3f122f08be6721e39c",
+    "tests/contracts.rs": "0a642a6e7cedda81a719161925e1034b49ad043b0876e2a06cc9ccf9b990da93",
+    "tests/lease_generations.rs": "63058d13291950f4d9aab97d2a15e67c9e59345dd24361cd54e0c1ca0ed09d17",
+    "tests/objects_v3_lanes.rs": "d723ef6274e29fae382879eae79cf5164c2d548f6148bcdcc7330ad53db59e81",
+    "tests/objects_v3_worker.rs": "19ff6f345ad8f42ea8963361e8d294622d79c4879467ad5c07066f26ab28d8e6",
+    "tests/peer_supervisor.rs": "dafe60ec589e82dcdfbb786badbcd05192de4078436ef78eee8339dd17f33d4c"
+  },
+  "executables": [
+    {
+      "name": "content_transport-45a007033282eb55.exe",
+      "sha256": "54f7b09e909e80828354bfc79bb6fa943d09de58670a372635d23fb503d9e723",
+      "stage": "final source"
+    },
+    {
+      "name": "contracts-299e0621d4b830f3.exe",
+      "sha256": "83eedd157bbab8d0134203e119bc9eb736ee86c322812f0bc39461e5035af476",
+      "stage": "final source"
+    },
+    {
+      "name": "lease_generations-7c9e057918b7ca6c.exe",
+      "sha256": "ba2c26ae64a55a61680dc60161c0cde22ef17127f75abd775c060122bc6ca6ff",
+      "stage": "final source"
+    },
+    {
+      "name": "objects_v3_worker-5c6601c542723b58.exe",
+      "sha256": "c9f075d273d8e0d91183bc0d3f2420a48f273697d20a7dde340be747d8810669",
+      "stage": "final source"
+    },
+    {
+      "name": "objects_v3_lanes-1e7d56d13c6245d0.exe",
+      "sha256": "e21999e021c1a590acdd400e4962a6bb5fd8a61eaf1cc8dae2032baee716bdc7",
+      "stage": "broader pre-incarnation-guard source; not rebuilt afterward"
+    },
+    {
+      "name": "peer_supervisor-0eef28311ccb16c9.exe",
+      "sha256": "370ba6443cbdf13fe15175a2159c3e085145278d67d50c4c1a4fc1dd25229ace",
+      "stage": "broader pre-incarnation-guard source; not rebuilt afterward"
+    },
+    {
+      "name": "tkfs.exe",
+      "sha256": "ec2822b9158daff4e6d979d8a61a84b13696db1ae3b45d00462d840530294cd6",
+      "stage": "final source",
+      "version_output": "tkfs 0.1.0"
+    }
+  ],
+  "checks": [
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test lease_generations --test objects_v3_worker --test content_transport --test objects_v3_lanes --test peer_supervisor --test contracts -- --test-threads=1 --skip tiny_objects_one_data_fsync_per_object_and_one_registration_per_batch --nocapture",
+      "exit_code": 0,
+      "results": {
+        "content_transport": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 28.78
+        },
+        "contracts": {
+          "passed": 41,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 5.49
+        },
+        "lease_generations": {
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 0.09
+        },
+        "objects_v3_lanes": {
+          "passed": 53,
+          "failed": 0,
+          "ignored": 18,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 94.03
+        },
+        "objects_v3_worker": {
+          "passed": 49,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 1,
+          "elapsed_seconds": 19.39
+        },
+        "peer_supervisor": {
+          "passed": 30,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 72.14
+        }
+      },
+      "samples": [
+        {
+          "available_ms": 115.1382,
+          "bound_ms": 1000,
+          "new_lane_count": 1,
+          "new_layout": 3,
+          "old_lane_count": 1,
+          "old_layout": 1,
+          "old_source_stall_ms": 2000,
+          "scenario": "native_legacy_reconnect"
+        },
+        {
+          "available_ms": 9.2515,
+          "bound_ms": 1000,
+          "new_lane_count": 2,
+          "new_layout": 7,
+          "old_lane_count": 1,
+          "old_layout": 5,
+          "old_source_stall_ms": 2000,
+          "scenario": "native_legacy_pool_resize"
+        },
+        {
+          "available": true,
+          "available_ms": 50.1188,
+          "bound_ms": 1000,
+          "foreground_completions": 0,
+          "scenario": "background_while_foreground_stalled"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 59.2062,
+          "drained": true,
+          "scenario": "lane_cancel"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 28.0899,
+          "drained": true,
+          "scenario": "daemon_cancel"
+        },
+        {
+          "admission_ms": 42.2328,
+          "admitted": true,
+          "bound_ms": 250,
+          "scenario": "foreground_behind_two_stalled_repositories",
+          "stalled_background_completions": 0
+        },
+        {
+          "admission_bound_ms": 250,
+          "admission_ms": 33.5979,
+          "availability_bound_ms": 1000,
+          "availability_ms": 225.5251,
+          "background_stall_ms": 2000,
+          "bytes": 1048599,
+          "foreground_frames_completed": 5,
+          "heartbeat_changed": false,
+          "typed_activation": false
+        },
+        {
+          "available": true,
+          "available_ms": 36.345299999999995,
+          "bound_ms": 1000,
+          "scenario": "replace_stalled_lane"
+        }
+      ],
+      "stage": "198 checks before the final cross-format incarnation comparison and its extra native test"
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test lease_generations --test objects_v3_worker --test content_transport --test contracts -- --test-threads=1 --skip tiny_objects_one_data_fsync_per_object_and_one_registration_per_batch --nocapture",
+      "exit_code": 0,
+      "results": {
+        "content_transport": {
+          "passed": 18,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 28.51
+        },
+        "contracts": {
+          "passed": 41,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 5.45
+        },
+        "lease_generations": {
+          "passed": 7,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 0,
+          "elapsed_seconds": 0.09
+        },
+        "objects_v3_worker": {
+          "passed": 50,
+          "failed": 0,
+          "ignored": 0,
+          "measured": 0,
+          "filtered": 1,
+          "elapsed_seconds": 18.54
+        }
+      },
+      "samples": [
+        {
+          "available_ms": 117.62400000000001,
+          "bound_ms": 1000,
+          "new_lane_count": 1,
+          "new_layout": 3,
+          "old_lane_count": 1,
+          "old_layout": 1,
+          "old_source_stall_ms": 2000,
+          "scenario": "native_legacy_reconnect"
+        },
+        {
+          "available_ms": 14.3608,
+          "bound_ms": 1000,
+          "new_lane_count": 2,
+          "new_layout": 7,
+          "old_lane_count": 1,
+          "old_layout": 5,
+          "old_source_stall_ms": 2000,
+          "scenario": "native_legacy_pool_resize"
+        },
+        {
+          "available": true,
+          "available_ms": 32.317400000000006,
+          "bound_ms": 1000,
+          "foreground_completions": 0,
+          "scenario": "background_while_foreground_stalled"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 55.289199999999994,
+          "drained": true,
+          "scenario": "lane_cancel"
+        },
+        {
+          "bound_ms": 250,
+          "drain_ms": 30.154899999999998,
+          "drained": true,
+          "scenario": "daemon_cancel"
+        },
+        {
+          "admission_ms": 22.711100000000002,
+          "admitted": true,
+          "bound_ms": 250,
+          "scenario": "foreground_behind_two_stalled_repositories",
+          "stalled_background_completions": 0
+        },
+        {
+          "admission_bound_ms": 250,
+          "admission_ms": 20.3731,
+          "availability_bound_ms": 1000,
+          "availability_ms": 219.22549999999998,
+          "background_stall_ms": 2000,
+          "bytes": 1048599,
+          "foreground_frames_completed": 5,
+          "heartbeat_changed": false,
+          "typed_activation": false
+        },
+        {
+          "available": true,
+          "available_ms": 47.5521,
+          "bound_ms": 1000,
+          "scenario": "replace_stalled_lane"
+        }
+      ],
+      "stage": "116 checks on final source, including cross-format incarnation dominance"
+    },
+    {
+      "command": "cargo clippy --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib --test lease_generations --test objects_v3_worker --test content_transport --test objects_v3_lanes --test peer_supervisor --test contracts -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --all --check; git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "unique_package_checks_passed": 199,
+  "final_source_focused_checks_passed": 116,
+  "source_identity_note": "Only the final four targets are claimed to use the recorded final source hash. Lane (53) and supervisor (30) regressions passed in the preceding broader invocation. Their retained executable hashes are staged separately. The final changes affect native worker incarnation comparisons, not the supervisor pool allocator. The complete older working-tree source snapshot was not retained, so no precise full source-set hash is asserted for that earlier invocation. Counts never add repeated checks.",
+  "fault_configuration": [
+    {
+      "point": "worker.rpc.objects.read",
+      "action": "hang",
+      "ms": 2000,
+      "count": 1,
+      "purpose": "real nonempty file source read; fixture has verified empty-history receipt; assert file missing and leased before actual authenticated reconnect / pool resize"
+    },
+    {
+      "point": "objects.want.before_grant",
+      "action": "hang",
+      "ms": 300,
+      "count": 1,
+      "purpose": "existing native late-want revalidation regression"
+    },
+    {
+      "point": "objects.write.before_lease_completion",
+      "action": "hang",
+      "ms": 300,
+      "count": 1,
+      "purpose": "existing native late-write completion regression"
+    },
+    {
+      "seed": null,
+      "note": "named deterministic native interleavings and explicit worker-state expiry/capacity setup; peer supervisor tests use real catalog/hub and fake remote v3 server as documented by their test module"
+    }
+  ],
+  "failed_development_stages": [
+    {
+      "log": "pool-generations-focused.log",
+      "exit_code": 101,
+      "reason": "new canonical classic-ID recognition initially applied strict lane binding to historical opaque IDs; native legacy-count regression caught it. Strict lane binding remains for genuinely qualified IDs; historical behavior was restored."
+    },
+    {
+      "log": "pool-generations-qualified.log",
+      "exit_code": 101,
+      "reason": "Windows LNK1104: native worker test executable was still running in the preceding broader test invocation. Both tool handles were observed terminal before serial retry; not a source/test failure and no pass claimed."
+    }
+  ],
+  "limits": {
+    "live_daemon_pool_contexts": 16384,
+    "worker_family_fences": 16384,
+    "worker_lane_run_fences": 16384,
+    "local_lease_id_bytes": 128
+  },
+  "not_qualified": [
+    "18 existing long legacy lane qualifications remain ignored; no waiver inferred",
+    "previously passed 10,000-object worker case filtered; not claimed again",
+    "inbound legacy push-offer/session/pool generation lifecycle; local pull PeerContext is not authenticated remote push-pool identity",
+    "complete retained legacy job/spool/lease budgets, legacy first-serve hash cancellation and sustained fairness",
+    "final adopted-worker/catalog-restore/downgrade fences and descriptor capability negotiation",
+    "mounted range demand, recoverable private saves, cache/change journal, final build matrix, Windows/FUSE and 30-minute saturation/recovery qualification"
+  ],
+  "retained_outputs": {
+    "pool-generations-focused.log": {
+      "sha256": "bcbd3d09290896d30c06f5cd96aae50deb28478d0820bbeaa1e1a8c68d8ee607",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 1m 43s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 17 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":112.8079,\"bound_ms\":1000,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":44.8751,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":57.276399999999995,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":25.246000000000002,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":26.450499999999998,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":12.8828,\"availability_bound_ms\":1000,\"availability_ms\":192.52169999999998,\"background_stall_ms\":2000,\"bytes\":1048599,\"foreground_frames_completed\":5,\"heartbeat_changed\":false,\"typed_activation\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":62.6447,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.53s\n\n     Running tests\\lease_generations.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\lease_generations-7c9e057918b7ca6c.exe)\n\nrunning 6 tests\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... \nrunning 1 test\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... ok\ntest a_pool_layout_is_assigned_before_lanes_and_late_old_lanes_cannot_get_a_new_layout ... ok\ntest a_run_clock_is_monotonic_under_concurrent_lane_creation ... ok\ntest corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch ... ok\ntest ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base ... ok\ntest pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_recognizable ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s\n\n     Running tests\\objects_v3_worker.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe)\n\nrunning 48 tests\ntest a_busy_writer_fails_the_registration_once_not_per_object ... ok\ntest a_committed_object_not_yet_received_is_not_available ... ok\n{\"at_ms\":1792491795997,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.write\",\"hash\":\"915d3c02390ff83c51d44ed628cea5a48fa4481363ad7b4f9f1aa7736204356d\",\"source\":\"a3cd6192-8904-48fd-ba5f-099a4a222e61\",\"retry_at_ms\":1792491825997}\ntest a_corrupt_source_is_backed_off_for_that_source_only ... ok\ntest a_corrupt_verdict_outranks_an_earlier_serve ... ok\n\nthread 'a_new_lane_count_takes_over_the_old_lanes_leases' (47828) panicked at tests\\objects_v3_worker.rs:1150:6:\ncalled `Result::unwrap()` on an `Err` value: ErrorWire { code: \"INVALID_BULK_LANE\", class: Transient, message: \"INVALID_BULK_LANE: lease generation lane does not match want\", retry_after_ms: None }\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest a_new_lane_count_takes_over_the_old_lanes_leases ... FAILED\ntest a_release_with_a_hold_hides_the_objects_from_their_source ... ok\ntest a_released_lease_moves_the_object_to_another_source_at_once ... ok\ntest a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open ... ok\n{\"at_ms\":1792491796835,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"s1\",\"source\":\"9c8d6b40-bcb1-4af5-be01-857ba4335e66\",\"retry_at_ms\":1792491856835}\n{\"at_ms\":1792491796835,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"37403058a25f1eab9350bd10a3feb7df32e9b0bf424aa8df0b8574a8c796f38a\",\"session\":\"s1\",\"source\":\"9c8d6b40-bcb1-4af5-be01-857ba4335e66\",\"retry_at_ms\":1792491856835}\n{\"at_ms\":1792491796846,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"c1\",\"source\":\"replica-c\",\"retry_at_ms\":1792491856846}\ntest a_stalled_lease_moves_the_object_to_another_source ... ok\ntest a_verified_read_quarantines_corrupt_bytes_through_the_store ... ok\ntest a_want_that_excludes_gives_its_leases_up ... ok\ntest an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects ... ok\ntest an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease ... ok\ntest corrupt_spool_never_installed ... ok\ntest crash_between_install_and_register_retransfers ... ok\ntest crash_mid_object_resumes_from_durable ... ok\ntest duplicate_sessions_transfer_once ... ok\n{\"at_ms\":1792491799747,\"level\":\"warn\",\"code\":\"SIZE_MISMATCH\",\"site\":\"worker.objects.write\",\"hash\":\"7596d22592aebe69b1aca3e9f5543dc13281f1cb7464106536f462ea66451b5b\",\"source\":\"2256f67c-b4fb-4471-a415-86ca21122ee2\",\"retry_at_ms\":1792491829747}\ntest failed_writes_back_their_object_off ... ok\ntest foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame ... ok\ntest full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes ... ok\ntest full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_pool_owners ... ok\ntest hash_only_request_not_permitted ... ok\ntest json_ops_over_a_session_fire_their_fault_point_once ... ok\ntest kill_mid_object_resumes_from_durable ... ok\ntest legacy_receive_path_keeps_spool_state ... ok\nStartup snapshot fallback for b008f62d255d6454ebe571b5ec42461b3ad97990604456269c53b81188d3a950: SNAPSHOT_VERSION_OR_IDENTITY: missing field `journal_state` at line 1 column 13336\ntest legacy_spool_is_adopted_once ... ok\n{\"at_ms\":1792491804326,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.report\",\"hash\":\"c1f3f2c7f73413791c760de4f2566edac16cd4f6cdc5431d71625e7211112263\",\"reporter\":\"38b03619-27c4-4f2a-ab47-9cdf497e38d7\",\"action\":\"verified_ok\"}\ntest loopback_sessions_serve_objects_and_json_ops_next_to_the_json_rpc ... ok\n{\"at_ms\":1792491804460,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"353fa51965fa99ca44d6185f24a0fc973486d5c73ab1a8b1544115d4dc173878\",\"session\":\"dialer-session\",\"source\":\"491b101c-a64b-4182-82be-6219fab8e434\",\"retry_at_ms\":1792491864460}\ntest mutual_pairing_transfers_once_and_leases_expire ... ok\ntest newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them ... ok\ntest objects_demand_lists_what_readers_wait_for_and_leases_nothing ... ok\ntest objects_state_belongs_to_its_worker_context ... ok\ntest objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete ... ok\ntest out_of_order_writes_wait_for_their_turn ... ok\ntest overlapping_parts_are_verified_and_resume_where_durable ... ok\ntest pool_layouts_fence_late_requests_across_lane_counts_and_when_an_old_count_returns ... ok\ntest private_present_object_is_retransferred_verified_then_registered ... ok\ntest report_of_a_good_copy_keeps_it ... ok\ntest report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read ... ok\ntest staged_objects_without_a_size_descriptor_complete ... ok\ntest staged_only_objects_are_wanted_received_but_not_served ... ok\ntest startup_truncates_spools_to_durable ... ok\ntest tampered_spool_never_installed ... ok\ntest unsolicited_write_rejected ... ok\ntest want_lists_interleave_a_large_object_fairly ... ok\ntest want_lists_shard_by_lane ... ok\ntest want_never_renews_a_lease_only_progress_does ... ok\ntest want_ordering_is_demand_then_current_then_history_smaller_first ... ok\ntest worker_ops_check_routes_and_requests ... ok\n\nfailures:\n\nfailures:\n    a_new_lane_count_takes_over_the_old_lanes_leases\n\ntest result: FAILED. 47 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.15s\n\nerror: test failed, to rerun pass `--test objects_v3_worker`\n"
+    },
+    "pool-generations-final.log": {
+      "sha256": "ab98f6d4e17f60a244b967546f1de71a538ae9f85d3514f23188d017b8d79e64",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 1m 44s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 18 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":115.1382,\"bound_ms\":1000,\"new_lane_count\":1,\"new_layout\":3,\"old_lane_count\":1,\"old_layout\":1,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest a_real_legacy_pool_resize_resumes_before_old_io_and_fences_old_pool_cleanup ... WAVE6_LEASE {\"available_ms\":9.2515,\"bound_ms\":1000,\"new_lane_count\":2,\"new_layout\":7,\"old_lane_count\":1,\"old_layout\":5,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_pool_resize\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":50.1188,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":59.2062,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":28.0899,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":42.2328,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":33.5979,\"availability_bound_ms\":1000,\"availability_ms\":225.5251,\"background_stall_ms\":2000,\"bytes\":1048599,\"foreground_frames_completed\":5,\"heartbeat_changed\":false,\"typed_activation\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":36.345299999999995,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.78s\n\n     Running tests\\contracts.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\contracts-299e0621d4b830f3.exe)\n\nrunning 41 tests\ntest backoff_resets_only_after_a_healthy_period ... ok\ntest backoff_sanitizes_a_jitter_set_through_the_field ... ok\ntest backoff_stays_within_bounds_over_10000_samples ... ok\ntest call_errors_are_classified_and_uncertainty_is_explicit ... ok\n\nthread 'cancel_hooks_run_once_and_children_follow_their_parent' (42644) panicked at tests\\contracts.rs:3156:33:\na panicking killer is contained\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest cancel_hooks_run_once_and_children_follow_their_parent ... ok\ntest cancel_runs_children_before_the_parents_hooks ... ok\ntest cancel_sleep_returns_within_50ms_of_cancel ... ok\ntest classify_covers_every_code_literal_in_src ... ok\ntest classify_matches_the_section_8_table ... ok\ntest clocks_tell_time ... ok\ntest code_of_finds_the_first_code_in_the_chain ... ok\ntest ctx_reports_network_not_ready_until_set ... ok\ntest error_records_count_and_resolve ... ok\ntest event_identifier_codes_are_scanned ... ok\ntest every_fixture_file_is_covered ... ok\ntest fault_environment_variables_arm_a_point_in_a_child_process ... ok\n\nthread 'fault_points_match_by_name_scope_and_count' (49048) panicked at src\\util\\fault.rs:218:31:\nFAULT_INJECTED: contracts.panic\ntest fault_points_match_by_name_scope_and_count ... ok\ntest feed_digest_is_the_first_16_hex_of_sha256 ... ok\ntest golden_fixtures_round_trip_byte_for_byte ... ok\ntest heartbeat_without_mount_errors_parses ... ok\ntest hmac_matches_rfc_4231_cases_1_to_7 ... ok\ntest lane_spec_owns_exactly_like_the_legacy_bulk_lane ... ok\n\nthread '<unnamed>' (60080) panicked at tests\\contracts.rs:3299:9:\npoison the mutex\n\nthread 'lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy' (57836) panicked at src\\util\\lock.rs:76:17:\nLOCK_POISONED: a thread panicked while holding this lock\ntest lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy ... ok\ntest lock_or_exit_runs_the_hook_then_exits_70_under_exit_policy ... ok\ntest log_events_are_json_lines_rate_limited_per_code ... ok\ntest log_rate_windows_are_bounded ... ok\ntest model_helpers_follow_the_spec ... ok\ntest need_budget_fits_the_meta_exchange_body ... ok\ntest notify_wakes_within_10ms_and_never_loses_pokes ... ok\ntest op_allowed_follows_the_op_table ... ok\ntest pairing_secrets_are_never_serialized_or_debug_printed ... ok\ntest session_entry_points_fail_closed ... ok\ntest shared_handles_are_send_and_sync ... ok\ntest snapshot_wait_newer_wakes_within_10ms ... ok\ntest spec_examples_parse_into_the_frozen_types ... ok\ntest status_events_without_the_wave_2_members_parse ... ok\ntest tracked_reports_after_release_and_log_writes_after_unlock ... ok\ntest tracked_reports_holds_longer_than_50ms ... ok\ntest tracked_violation_is_logged_in_debug_builds ... ok\ntest upgrade_kind_reads_the_sync_header ... ok\ntest wave6_error_scopes_extend_the_historical_table ... ok\n\ntest result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.49s\n\n     Running tests\\lease_generations.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\lease_generations-7c9e057918b7ca6c.exe)\n\nrunning 7 tests\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... \nrunning 1 test\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... ok\ntest a_pool_layout_is_assigned_before_lanes_and_late_old_lanes_cannot_get_a_new_layout ... ok\ntest a_run_clock_is_monotonic_under_concurrent_lane_creation ... ok\ntest corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch ... ok\ntest ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base ... ok\ntest pool_identity_capacity_retains_live_owners_and_only_reclaims_dead_contexts ... ok\ntest pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_recognizable ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\n     Running tests\\objects_v3_lanes.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_lanes-1e7d56d13c6245d0.exe)\n\nrunning 71 tests\ntest a_busy_database_is_no_failure_of_the_objects ... ok\ntest a_connection_loss_resumes_from_the_durable_offset ... ok\ntest a_corrupt_push_is_reported_to_our_worker_and_backs_off ... ok\ntest a_demanded_object_gets_the_next_pull_of_a_busy_lane ... ok\ntest a_failed_worker_call_fails_the_push_not_its_objects ... ok\ntest a_failing_repository_never_stalls_the_others_on_its_lane ... ok\ntest a_grown_demand_queue_starts_an_idle_lanes_round ... ok\ntest a_holder_that_goes_away_hands_the_pulled_object_on ... ok\ntest a_holder_that_goes_away_hands_the_pushed_object_on ... ok\ntest a_large_object_never_idles_between_rounds ... ok\ntest a_lost_session_gives_up_every_lease_its_rounds_kept ... ok\ntest a_peer_reply_counts_only_for_the_objects_it_was_asked_for ... ok\ntest a_peer_without_objects_v3_fails_its_key_without_an_interim_exchange ... ok\ntest a_pull_never_carries_more_items_than_the_acceptor_takes ... ok\ntest a_pull_stream_must_start_each_object_at_its_span ... ok\ntest a_push_of_objects_never_offered_records_no_errors ... ok\ntest a_push_of_partial_objects_never_stalls_the_acceptor ... ok\ntest a_push_outside_its_shares_is_refused ... ok\ntest a_reap_never_ends_the_lease_of_the_lanes_next_session ... ok\ntest a_replica_change_moves_the_key_to_the_new_route ... ok\ntest a_resume_point_resynchronizes_the_object_without_a_backoff ... ok\ntest a_saturating_push_does_not_delay_pulls_on_a_slow_uplink ... ok\ntest a_settled_object_is_not_pulled_again_in_its_round ... ok\ntest a_source_that_cannot_serve_hands_its_pull_lease_on ... ok\ntest a_source_that_cannot_serve_hands_its_push_lease_on ... ok\ntest a_source_whose_content_grows_is_asked_again_at_once ... ok\ntest a_stalled_push_does_not_block_pulls_on_the_same_lane ... ok\ntest a_stalled_source_leaves_the_window_to_other_repositories ... ok\ntest a_worker_without_loopback_sessions_is_remembered ... ok\ntest an_inbound_only_peer_that_unpairs_is_recorded_gone ... ok\ntest an_object_a_dialer_lacked_is_offered_again_soon ... ok\ntest an_object_no_longer_wanted_settles_without_an_error ... ok\ntest an_object_of_unknown_size_is_handed_on_after_partial_progress ... ok\ntest an_object_of_unknown_size_pushed_in_part_is_handed_on ... ok\ntest an_offer_whose_session_went_away_gives_up_its_leases ... ok\ntest at_most_16_mib_in_flight_per_lane ... ok\ntest at_most_two_repositories_share_a_lane ... ok\ntest both_directions_complete_with_per_object_results ... ok\ntest control_carries_no_object_bytes ... ok\ntest empty_chunks_cannot_hold_a_pull ... ok\ntest every_shared_repository_runs_on_the_lane_with_its_own_route ... ok\ntest inbound_checks_keep_their_codes ... ok\ntest inbound_routes_name_the_authenticated_installation ... ok\ntest objects_of_unknown_size_travel_both_ways ... ok\ntest one_stalled_push_leaves_a_third_repository_its_turn ... ok\ntest qual_large_object_loopback ... ignored, WP3.3 qualification (release)\ntest qual_large_object_loopback_memory ... ignored, WP3.3 qualification (release)\ntest qual_large_object_rtt50 ... ignored, WP3.3 qualification (release)\ntest qual_large_object_rtt50_100mbit ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_loopback ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_loopback_memory ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_rtt50 ... ignored, WP3.3 qualification (release)\ntest qual_tiny_files_10k_rtt50_100mbit ... ignored, WP3.3 qualification (release)\ntest qual_wp4_5_both_directions_loopback ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_both_directions_loopback_memory ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_both_directions_rtt50_20mib ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_both_directions_rtt50_20mib_memory ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_control_latency_under_a_saturated_lane ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_large_object_rtt50_20mib ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_large_object_rtt50_20mib_disk ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_session_server ... ignored, WP4.5 qualification (release; a measurement helper)\ntest qual_wp4_5_session_throughput_loopback ... ignored, WP4.5 qualification (release)\ntest qual_wp4_5_session_throughput_remote ... ignored, WP4.5 qualification (release; needs a remote server)\ntest socket_buffers_are_tuned_on_loopback_only ... ok\ntest staging_alone_starts_a_download ... ok\ntest stalled_pushes_of_two_repositories_leave_a_slot_to_pulls ... ok\ntest the_session_client_dials_without_its_lock ... ok\ntest the_session_client_retries_refusals_and_never_replays_uncertain_calls ... ok\ntest two_stalled_pushes_leave_a_third_repository_its_turn ... ok\ntest wants_for_objects_we_cannot_serve_record_no_errors ... ok\ntest zero_size_objects_travel_both_ways ... ok\n\ntest result: ok. 53 passed; 0 failed; 18 ignored; 0 measured; 0 filtered out; finished in 94.03s\n\n     Running tests\\objects_v3_worker.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe)\n\nrunning 49 tests\ntest a_busy_writer_fails_the_registration_once_not_per_object ... ok\ntest a_committed_object_not_yet_received_is_not_available ... ok\n{\"at_ms\":1792492179222,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.write\",\"hash\":\"915d3c02390ff83c51d44ed628cea5a48fa4481363ad7b4f9f1aa7736204356d\",\"source\":\"0091d4d0-92f0-4dce-b785-dc0aa9d51172\",\"retry_at_ms\":1792492209222}\ntest a_corrupt_source_is_backed_off_for_that_source_only ... ok\ntest a_corrupt_verdict_outranks_an_earlier_serve ... ok\ntest a_new_lane_count_takes_over_the_old_lanes_leases ... ok\ntest a_release_with_a_hold_hides_the_objects_from_their_source ... ok\ntest a_released_lease_moves_the_object_to_another_source_at_once ... ok\ntest a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open ... ok\n{\"at_ms\":1792492180176,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"s1\",\"source\":\"88d5a240-fc77-4211-a769-dc95ee18e12f\",\"retry_at_ms\":1792492240176}\n{\"at_ms\":1792492180176,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"37403058a25f1eab9350bd10a3feb7df32e9b0bf424aa8df0b8574a8c796f38a\",\"session\":\"s1\",\"source\":\"88d5a240-fc77-4211-a769-dc95ee18e12f\",\"retry_at_ms\":1792492240176}\n{\"at_ms\":1792492180188,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"c1\",\"source\":\"replica-c\",\"retry_at_ms\":1792492240188}\ntest a_stalled_lease_moves_the_object_to_another_source ... ok\ntest a_verified_read_quarantines_corrupt_bytes_through_the_store ... ok\ntest a_want_that_excludes_gives_its_leases_up ... ok\ntest an_expired_predecessor_lease_does_not_back_off_its_replacement_pool ... ok\ntest an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects ... ok\ntest an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease ... ok\ntest corrupt_spool_never_installed ... ok\ntest crash_between_install_and_register_retransfers ... ok\ntest crash_mid_object_resumes_from_durable ... ok\ntest duplicate_sessions_transfer_once ... ok\n{\"at_ms\":1792492183295,\"level\":\"warn\",\"code\":\"SIZE_MISMATCH\",\"site\":\"worker.objects.write\",\"hash\":\"7596d22592aebe69b1aca3e9f5543dc13281f1cb7464106536f462ea66451b5b\",\"source\":\"45761066-d056-4050-b203-663ceb0dc23c\",\"retry_at_ms\":1792492213295}\ntest failed_writes_back_their_object_off ... ok\ntest foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame ... ok\ntest full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes ... ok\ntest full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_pool_owners ... ok\ntest hash_only_request_not_permitted ... ok\ntest json_ops_over_a_session_fire_their_fault_point_once ... ok\ntest kill_mid_object_resumes_from_durable ... ok\ntest legacy_receive_path_keeps_spool_state ... ok\nStartup snapshot fallback for b008f62d255d6454ebe571b5ec42461b3ad97990604456269c53b81188d3a950: SNAPSHOT_VERSION_OR_IDENTITY: missing field `journal_state` at line 1 column 13336\ntest legacy_spool_is_adopted_once ... ok\n{\"at_ms\":1792492188397,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.report\",\"hash\":\"c1f3f2c7f73413791c760de4f2566edac16cd4f6cdc5431d71625e7211112263\",\"reporter\":\"16f5abb5-37d1-4975-adad-e6c7a9de949d\",\"action\":\"verified_ok\"}\ntest loopback_sessions_serve_objects_and_json_ops_next_to_the_json_rpc ... ok\n{\"at_ms\":1792492188528,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"353fa51965fa99ca44d6185f24a0fc973486d5c73ab1a8b1544115d4dc173878\",\"session\":\"dialer-session\",\"source\":\"87862a46-0643-4702-89f5-f243f892dd17\",\"retry_at_ms\":1792492248528}\ntest mutual_pairing_transfers_once_and_leases_expire ... ok\ntest newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them ... ok\ntest objects_demand_lists_what_readers_wait_for_and_leases_nothing ... ok\ntest objects_state_belongs_to_its_worker_context ... ok\ntest objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete ... ok\ntest out_of_order_writes_wait_for_their_turn ... ok\ntest overlapping_parts_are_verified_and_resume_where_durable ... ok\ntest pool_layouts_fence_late_requests_across_lane_counts_and_when_an_old_count_returns ... ok\ntest private_present_object_is_retransferred_verified_then_registered ... ok\ntest report_of_a_good_copy_keeps_it ... ok\ntest report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read ... ok\ntest staged_objects_without_a_size_descriptor_complete ... ok\ntest staged_only_objects_are_wanted_received_but_not_served ... ok\ntest startup_truncates_spools_to_durable ... ok\ntest tampered_spool_never_installed ... ok\ntest unsolicited_write_rejected ... ok\ntest want_lists_interleave_a_large_object_fairly ... ok\ntest want_lists_shard_by_lane ... ok\ntest want_never_renews_a_lease_only_progress_does ... ok\ntest want_ordering_is_demand_then_current_then_history_smaller_first ... ok\ntest worker_ops_check_routes_and_requests ... ok\n\ntest result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 19.39s\n\n     Running tests\\peer_supervisor.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\peer_supervisor-0eef28311ccb16c9.exe)\n\nrunning 30 tests\n{\"at_ms\":1792492194134,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: TRANSPORT_DEAD: no frame received for 1002 ms\"}\n{\"at_ms\":1792492194145,\"level\":\"info\",\"code\":\"TRANSPORT_DEAD\",\"peer\":\"peer-server-installation\",\"lane\":0,\"detail\":\"a healthy session was lost by the transport: the peer's lanes redial on one cadence until one connects\",\"message\":\"TRANSPORT_DEAD: no frame received for 1002 ms\"}\n{\"at_ms\":1792492197898,\"level\":\"info\",\"code\":\"TRANSPORT_DEAD\",\"peer\":\"peer-server-installation\",\"lane\":3,\"detail\":\"the peer is reachable again: its network loss ended\",\"down_ms\":3752,\"redials\":4}\n{\"at_ms\":1792492197911,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest a_dial_into_a_silent_link_is_interrupted_when_a_sibling_connects ... ok\ntest a_down_peers_redial_spacing_follows_the_outage_age ... ok\n{\"at_ms\":1792492198646,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492199135,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492199774,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492200876,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492202894,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492206683,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\ntest a_flapping_peer_keeps_escalating_over_a_slow_link ... ok\ntest a_lane_inside_a_dial_is_interrupted_and_reports_nothing_after_peer_removed ... ok\n{\"at_ms\":1792492215363,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57056\",\"state\":\"incompatible\",\"recheck_ms\":1000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57056 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\n{\"at_ms\":1792492215363,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57056\",\"state\":\"incompatible\",\"recheck_ms\":1000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57056 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\n\nthread 'peer-peer-server-installation' (52692) panicked at tests\\peer_supervisor.rs:66:13:\ninjected: the status sink panics on a Dialing lane\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n{\"at_ms\":1792492216377,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57056\",\"state\":\"incompatible\",\"recheck_ms\":1000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57056 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\n{\"at_ms\":1792492217384,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57056\",\"state\":\"incompatible\",\"recheck_ms\":1000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57056 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\ntest a_lane_that_dies_holding_the_probe_hands_it_on ... ok\n{\"at_ms\":1792492218725,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"lane\":0,\"detail\":\"a healthy session was lost by the transport: the peer's lanes redial on one cadence until one connects\",\"message\":\"CONNECTION_LOST: connection reset by peer\"}\n{\"at_ms\":1792492218933,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492222704,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"lane\":3,\"detail\":\"the peer is reachable again: its network loss ended\",\"down_ms\":3978,\"redials\":23}\n{\"at_ms\":1792492222707,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest a_lost_peer_redials_on_one_cadence_and_is_back_within_a_spacing ... ok\n{\"at_ms\":1792492223251,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57102\",\"detail\":\"no per-peer credential was enrolled while pairing; the pairing code is used\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492230773,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest a_respawn_is_not_overwritten_by_the_old_supervisors_late_lanes ... ok\n{\"at_ms\":1792492231030,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-b-holding\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest a_slow_supervisor_does_not_take_another_ones_stop_time ... ok\ntest a_wedged_catalog_write_never_holds_a_lane ... ok\n{\"at_ms\":1792492234746,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest all_lanes_reach_ready_with_their_roles_and_lanes ... ok\n{\"at_ms\":1792492235167,\"level\":\"info\",\"code\":\"CONNECTION_LOST\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"CONNECTION_LOST: WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492235167,\"level\":\"error\",\"code\":\"CONTENT_CANCELLED\",\"peer\":\"peer-server-installation\",\"lane\":1,\"message\":\"CONTENT_CANCELLED: pull run cancelled\"}\n{\"at_ms\":1792492236659,\"level\":\"info\",\"code\":\"WS_CLOSED\",\"peer\":\"peer-server-installation\",\"lane\":0,\"detail\":\"a healthy session was lost by the transport: the peer's lanes redial on one cadence until one connects\",\"message\":\"WS_CLOSED: the peer closed the connection\"}\n{\"at_ms\":1792492236856,\"level\":\"info\",\"code\":\"WS_CLOSED\",\"peer\":\"peer-server-installation\",\"lane\":0,\"detail\":\"the peer is reachable again: its network loss ended\",\"down_ms\":196,\"redials\":1}\n{\"at_ms\":1792492236867,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest backoff_resets_after_a_healthy_session ... ok\n{\"at_ms\":1792492237410,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492237514,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-other-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest catalog_changes_respawn_or_stop_supervisors ... ok\n{\"at_ms\":1792492238825,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest catalog_client_polls_and_survives_a_control_reconnect ... ok\ntest catalog_replies_parse_from_the_body_or_the_header ... ok\ntest concurrent_pairs_of_one_installation_keep_one_record ... ok\n{\"at_ms\":1792492242969,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest lanes_in_backoff_redial_at_once_when_a_sibling_connects ... ok\n{\"at_ms\":1792492243476,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57229\",\"state\":\"incompatible\",\"recheck_ms\":2000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57229 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\n{\"at_ms\":1792492243486,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57229\",\"state\":\"incompatible\",\"recheck_ms\":2000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57229 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\n{\"at_ms\":1792492245498,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57229\",\"state\":\"incompatible\",\"recheck_ms\":2000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57229 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\n{\"at_ms\":1792492245915,\"level\":\"warn\",\"code\":\"PEER_NEEDS_UPGRADE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:57229\",\"state\":\"incompatible\",\"recheck_ms\":2000,\"message\":\"PEER_NEEDS_UPGRADE: ws://127.0.0.1:57229 runs the legacy peer protocol (no X-Tkfs-Sync echo); upgrade the remote orchestrator. The pairing code was not sent\"}\ntest legacy_peer_is_incompatible_without_redial_before_the_recheck ... ok\n{\"at_ms\":1792492246580,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:61927\",\"detail\":\"no per-peer credential was enrolled while pairing; the pairing code is used\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492246604,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:61927\",\"detail\":\"no per-peer credential was enrolled while pairing; the pairing code is used\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492246606,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492246704,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:61935\",\"detail\":\"no per-peer credential was enrolled while pairing; the pairing code is used\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492246707,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492246787,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest pair_probes_stores_a_new_revision_and_supervises ... ok\ntest pair_refusals_store_nothing ... ok\ntest reconnect_backoff_stays_within_jitter_bounds ... ok\n{\"at_ms\":1792492251081,\"level\":\"warn\",\"code\":\"PEER_INSTALLATION_CHANGED\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:61967\",\"state\":\"unauthorized\",\"recheck_ms\":1500,\"message\":\"PEER_INSTALLATION_CHANGED: ws://127.0.0.1:61967 is installation someone-else, the catalog expects peer-server-installation\"}\n{\"at_ms\":1792492251103,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest remote_list_lists_the_catalog_and_checks_the_installation ... ok\n{\"at_ms\":1792492251607,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:61975\",\"state\":\"unauthorized\",\"recheck_ms\":1500,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492251622,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:61975\",\"state\":\"unauthorized\",\"recheck_ms\":1500,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492251625,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest rotation_goaway_closes_sessions_and_the_peer_becomes_unauthorized ... ok\ntest shutdown_accepts_an_unbounded_deadline ... ok\ntest shutdown_also_stops_a_peer_an_unpair_is_stopping ... ok\ntest shutdown_of_the_daemon_token_stops_every_lane ... ok\ntest shutdown_sends_goaway_and_joins_every_peer ... ok\ntest the_default_policy_matches_section_3_7 ... ok\ntest unpair_cancels_and_joins_every_lane_within_5s ... ok\ntest unpair_joins_within_5s_while_the_peer_holds_a_request ... ok\n{\"at_ms\":1792492260664,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"state\":\"unauthorized\",\"recheck_ms\":1000,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492260664,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"state\":\"unauthorized\",\"recheck_ms\":1000,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492260664,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"state\":\"unauthorized\",\"recheck_ms\":1000,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492261676,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"state\":\"unauthorized\",\"recheck_ms\":1000,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492262678,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"state\":\"unauthorized\",\"recheck_ms\":1000,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492263696,\"level\":\"warn\",\"code\":\"INVALID_PAIRING_CODE\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"state\":\"unauthorized\",\"recheck_ms\":1000,\"message\":\"INVALID_PAIRING_CODE: the pairing code was not accepted\"}\n{\"at_ms\":1792492264191,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"suppressed\":6}\n{\"at_ms\":1792492264191,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"endpoint\":\"ws://127.0.0.1:62064\",\"detail\":\"no per-peer credential was enrolled while pairing; the pairing code is used\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\n{\"at_ms\":1792492264213,\"level\":\"info\",\"code\":\"UNKNOWN_PEER_OPERATION\",\"peer\":\"peer-server-installation\",\"detail\":\"no per-peer credential was enrolled; the pairing code stays in use\",\"message\":\"UNKNOWN_PEER_OPERATION: the fake peer does not serve peer.enroll\"}\ntest wrong_code_is_unauthorized_without_a_tight_retry_loop ... ok\n\ntest result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 72.14s\n\n"
+    },
+    "pool-generations-qualified.log": {
+      "sha256": "eb17ac80e086e8e9983ed0140e67c4ce731f1b858b5e91bbc80a5b5c0a5f6818",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\nerror: linking with `link.exe` failed: exit code: 1104\n  |\n  = note: \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Insiders\\\\VC\\\\Tools\\\\MSVC\\\\14.52.37025\\\\bin\\\\HostX64\\\\x64\\\\link.exe\" \"/NOLOGO\" \"C:\\\\Users\\\\felyp\\\\Desktop\\\\Projetos\\\\Telekinesis\\\\target/build-cache/windows\\\\x86_64-pc-windows-msvc\\\\release\\\\deps\\\\rustc2Hx18w\\\\symbols.o\" \"<17 object files omitted>\" \"kernel32.lib\" \"C:\\\\Users\\\\felyp\\\\Desktop\\\\Projetos\\\\Telekinesis\\\\target\\\\build-cache\\\\windows\\\\x86_64-pc-windows-msvc\\\\release\\\\deps/{libtempfile-edd09b8663a1abe9,libfastrand-a4e465f064c95f3b,libonce_cell-f9195d155bbd0d64,libportable_atomic-7dc457288dfa6c38}.rlib\" \"<sysroot>\\\\lib\\\\rustlib\\\\x86_64-pc-windows-msvc\\\\lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib\" \"C:\\\\Users\\\\felyp\\\\Desktop\\\\Projetos\\\\Telekinesis\\\\target\\\\build-cache\\\\windows\\\\x86_64-pc-windows-msvc\\\\release\\\\deps/{libtkfs-3118fac4a3440c46,libtoml-c7a2e2152d42f791,libtoml_writer-c609bc00c4f2ae67,libwinnow-1c316602569fcc79,libtoml_parser-c414fdeac4ca9799,libwinnow-0cdae6de9d2dc36d,libserde_spanned-05f703d84761a839,libtoml_datetime-e532145875705d34,libhex-5afae1b7c9523e2b,libflate2-c1a7e810d0229812,libminiz_oxide-b46712c8ecb4d6a0,libsimd_adler32-fe7c4b2a1b3e36f8,libcrc32fast-91960b8a8d98e052,libpolling-23f57a5d493c0d68,libconcurrent_queue-0200ee543967dfc0,libcrossbeam_utils-510fe7026f8d3596,libpin_project_lite-40eb2e676ba124b8,libtungstenite-0398334f3dc16cc3,libdata_encoding-19a9f40e252bae16,librand-de7209a8088c57d5,librand_chacha-7bf83ff91e861a41,librand_core-e5abbd5a302d2542,libgetrandom-5de7137e55d1c483,libnative_tls-b8bff2636f429992,libschannel-57bc89e9373d0299,libwindows_sys-0634e690935677e2,libwindows_link-7bc14ebf2c475e92,libutf8-19eaed8e01dc7701,libsha1-32f732b798064c88,libhttparse-ec555f61c89b2bb9,libthiserror-c33cfbf26c06d3d3,liblog-3daba3bde2878c6c,libhttp-ff7257c36e86d15a,libbytes-9ed848dd35dfd260,libunicode_normalization-4ef54dbed4175dcb,libtinyvec-6c8806f899d38beb,libtinyvec_macros-75fb8a2d2d51d730,librusqlite-03bb7c41dea8831f,libbitflags-4c7a34423b898bc1,libsmallvec-dd80e692bb6517c2,libhashlink-f092a182b679193a,libhashbrown-0077bfa635036664,libfoldhash-35c34b2fb1f95f33,liblibsqlite3_sys-6bec9156d1287184,libfallible_streaming_iterator-2ad3fea3e005b87a,libfallible_iterator-90623edd5e205fa4,libuuid-1012ba66351ff418,libgetrandom-33b7ae0b09ac186c,libserde-c991010b41050d16,libsha2-d1aa9318f8ccd282,libcpufeatures-17c32ea41025aea2,libdigest-56ded7cf7196630f,libblock_buffer-db37fbae3eb5c5de,libcrypto_common-022e9a5d15db0582,libgeneric_array-0b82678fc309f19c,libtypenum-8d5c53bd43055c6c,libserde_json-80630d126b24aaf2,libmemchr-175c538ccb8765d0,libitoa-3713a5c94c44b5b7,libzmij-b40413f755d5624d,libserde_core-efea65dd4fffedc9,librand-e3e650fc724e1d94,librand_chacha-9a501067aaa32592,libppv_lite86-9a09d50b93da44fc,libzerocopy-734f346411d4a0e2,librand_core-a544d75ddf589dd6,libgetrandom-c66facaa65dc47b5,libcfg_if-67e875d804d36f7a,libanyhow-f2e6caf31959755e}.rlib\" \"<sysroot>\\\\lib\\\\rustlib\\\\x86_64-pc-windows-msvc\\\\lib/{libstd-*,libpanic_unwind-*,libcfg_if-*,libwindows_link-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libunwind-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib\" \"kernel32.lib\" \"kernel32.lib\" \"ntdll.lib\" \"kernel32.lib\" \"ws2_32.lib\" \"kernel32.lib\" \"C:/Program Files (x86)/WinFsp/lib\\\\winfsp-x64.lib\" \"advapi32.lib\" \"delayimp.lib\" \"bcrypt.lib\" \"advapi32.lib\" \"kernel32.lib\" \"kernel32.lib\" \"kernel32.lib\" \"ntdll.lib\" \"userenv.lib\" \"ws2_32.lib\" \"dbghelp.lib\" \"/defaultlib:msvcrt\" \"/NXCOMPAT\" \"/LIBPATH:C:\\\\Users\\\\felyp\\\\Desktop\\\\Projetos\\\\Telekinesis\\\\target/build-cache/windows\\\\x86_64-pc-windows-msvc\\\\release\\\\build\\\\tkfs-f2d0fe67757c3700\\\\out\" \"/LIBPATH:C:\\\\Users\\\\felyp\\\\Desktop\\\\Projetos\\\\Telekinesis\\\\target/build-cache/windows\\\\x86_64-pc-windows-msvc\\\\release\\\\build\\\\libsqlite3-sys-33ecd0f3ce476a8f\\\\out\" \"/LIBPATH:C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Insiders\\\\VC\\\\Tools\\\\MSVC\\\\14.52.37025\\\\atlmfc\\\\lib\\\\x64\" \"/LIBPATH:C:/Program Files (x86)/WinFsp/lib\" \"/LIBPATH:C:\\\\Users\\\\felyp\\\\.cargo\\\\registry\\\\src\\\\index.crates.io-1949cf8c6b5b557f\\\\windows_x86_64_msvc-0.52.6\\\\lib\" \"/OUT:C:\\\\Users\\\\felyp\\\\Desktop\\\\Projetos\\\\Telekinesis\\\\target/build-cache/windows\\\\x86_64-pc-windows-msvc\\\\release\\\\deps\\\\objects_v3_worker-5c6601c542723b58.exe\" \"/OPT:REF,ICF\" \"/DEBUG\" \"/PDBALTPATH:%_PDB%\" \"/NATVIS:<sysroot>\\\\lib\\\\rustlib\\\\etc\\\\intrinsic.natvis\" \"/NATVIS:<sysroot>\\\\lib\\\\rustlib\\\\etc\\\\liballoc.natvis\" \"/NATVIS:<sysroot>\\\\lib\\\\rustlib\\\\etc\\\\libcore.natvis\" \"/NATVIS:<sysroot>\\\\lib\\\\rustlib\\\\etc\\\\libstd.natvis\" \"/DELAYLOAD:winfsp-x64.dll\"\n  = note: some arguments are omitted. use `--verbose` to show all linker arguments\n  = note: LINK : fatal error LNK1104: n\u00e3o \u00e9 poss\u00edvel abrir o arquivo 'C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis\\target\\build-cache\\windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe'\n          \n\nerror: could not compile `tkfs` (test \"objects_v3_worker\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\n"
+    },
+    "pool-generations-qualified-final.log": {
+      "sha256": "38512ea7d029f069d63be0cd1715c4509ce406d3b6c2207c92a69835c2a9d92a",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 7.71s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 18 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":117.62400000000001,\"bound_ms\":1000,\"new_lane_count\":1,\"new_layout\":3,\"old_lane_count\":1,\"old_layout\":1,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest a_real_legacy_pool_resize_resumes_before_old_io_and_fences_old_pool_cleanup ... WAVE6_LEASE {\"available_ms\":14.3608,\"bound_ms\":1000,\"new_lane_count\":2,\"new_layout\":7,\"old_lane_count\":1,\"old_layout\":5,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_pool_resize\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":32.317400000000006,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":55.289199999999994,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":30.154899999999998,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":22.711100000000002,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":20.3731,\"availability_bound_ms\":1000,\"availability_ms\":219.22549999999998,\"background_stall_ms\":2000,\"bytes\":1048599,\"foreground_frames_completed\":5,\"heartbeat_changed\":false,\"typed_activation\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":47.5521,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.51s\n\n     Running tests\\contracts.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\contracts-299e0621d4b830f3.exe)\n\nrunning 41 tests\ntest backoff_resets_only_after_a_healthy_period ... ok\ntest backoff_sanitizes_a_jitter_set_through_the_field ... ok\ntest backoff_stays_within_bounds_over_10000_samples ... ok\ntest call_errors_are_classified_and_uncertainty_is_explicit ... ok\n\nthread 'cancel_hooks_run_once_and_children_follow_their_parent' (74788) panicked at tests\\contracts.rs:3156:33:\na panicking killer is contained\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest cancel_hooks_run_once_and_children_follow_their_parent ... ok\ntest cancel_runs_children_before_the_parents_hooks ... ok\ntest cancel_sleep_returns_within_50ms_of_cancel ... ok\ntest classify_covers_every_code_literal_in_src ... ok\ntest classify_matches_the_section_8_table ... ok\ntest clocks_tell_time ... ok\ntest code_of_finds_the_first_code_in_the_chain ... ok\ntest ctx_reports_network_not_ready_until_set ... ok\ntest error_records_count_and_resolve ... ok\ntest event_identifier_codes_are_scanned ... ok\ntest every_fixture_file_is_covered ... ok\ntest fault_environment_variables_arm_a_point_in_a_child_process ... ok\n\nthread 'fault_points_match_by_name_scope_and_count' (13296) panicked at src\\util\\fault.rs:218:31:\nFAULT_INJECTED: contracts.panic\ntest fault_points_match_by_name_scope_and_count ... ok\ntest feed_digest_is_the_first_16_hex_of_sha256 ... ok\ntest golden_fixtures_round_trip_byte_for_byte ... ok\ntest heartbeat_without_mount_errors_parses ... ok\ntest hmac_matches_rfc_4231_cases_1_to_7 ... ok\ntest lane_spec_owns_exactly_like_the_legacy_bulk_lane ... ok\n\nthread '<unnamed>' (69108) panicked at tests\\contracts.rs:3299:9:\npoison the mutex\n\nthread 'lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy' (72832) panicked at src\\util\\lock.rs:76:17:\nLOCK_POISONED: a thread panicked while holding this lock\ntest lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy ... ok\ntest lock_or_exit_runs_the_hook_then_exits_70_under_exit_policy ... ok\ntest log_events_are_json_lines_rate_limited_per_code ... ok\ntest log_rate_windows_are_bounded ... ok\ntest model_helpers_follow_the_spec ... ok\ntest need_budget_fits_the_meta_exchange_body ... ok\ntest notify_wakes_within_10ms_and_never_loses_pokes ... ok\ntest op_allowed_follows_the_op_table ... ok\ntest pairing_secrets_are_never_serialized_or_debug_printed ... ok\ntest session_entry_points_fail_closed ... ok\ntest shared_handles_are_send_and_sync ... ok\ntest snapshot_wait_newer_wakes_within_10ms ... ok\ntest spec_examples_parse_into_the_frozen_types ... ok\ntest status_events_without_the_wave_2_members_parse ... ok\ntest tracked_reports_after_release_and_log_writes_after_unlock ... ok\ntest tracked_reports_holds_longer_than_50ms ... ok\ntest tracked_violation_is_logged_in_debug_builds ... ok\ntest upgrade_kind_reads_the_sync_header ... ok\ntest wave6_error_scopes_extend_the_historical_table ... ok\n\ntest result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.45s\n\n     Running tests\\lease_generations.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\lease_generations-7c9e057918b7ca6c.exe)\n\nrunning 7 tests\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... \nrunning 1 test\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... ok\ntest a_pool_layout_is_assigned_before_lanes_and_late_old_lanes_cannot_get_a_new_layout ... ok\ntest a_run_clock_is_monotonic_under_concurrent_lane_creation ... ok\ntest corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch ... ok\ntest ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base ... ok\ntest pool_identity_capacity_retains_live_owners_and_only_reclaims_dead_contexts ... ok\ntest pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_recognizable ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\n     Running tests\\objects_v3_worker.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe)\n\nrunning 50 tests\ntest a_busy_writer_fails_the_registration_once_not_per_object ... ok\ntest a_committed_object_not_yet_received_is_not_available ... ok\n{\"at_ms\":1792492346763,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.write\",\"hash\":\"915d3c02390ff83c51d44ed628cea5a48fa4481363ad7b4f9f1aa7736204356d\",\"source\":\"bf50453a-93cf-4b2c-adc4-56e15e152e90\",\"retry_at_ms\":1792492376763}\ntest a_corrupt_source_is_backed_off_for_that_source_only ... ok\ntest a_corrupt_verdict_outranks_an_earlier_serve ... ok\ntest a_new_lane_count_takes_over_the_old_lanes_leases ... ok\ntest a_release_with_a_hold_hides_the_objects_from_their_source ... ok\ntest a_released_lease_moves_the_object_to_another_source_at_once ... ok\ntest a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open ... ok\n{\"at_ms\":1792492347662,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"s1\",\"source\":\"da8bda1b-5cb4-46cf-ad8e-bef654dba1a5\",\"retry_at_ms\":1792492407662}\n{\"at_ms\":1792492347662,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"37403058a25f1eab9350bd10a3feb7df32e9b0bf424aa8df0b8574a8c796f38a\",\"session\":\"s1\",\"source\":\"da8bda1b-5cb4-46cf-ad8e-bef654dba1a5\",\"retry_at_ms\":1792492407662}\n{\"at_ms\":1792492347672,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"c1\",\"source\":\"replica-c\",\"retry_at_ms\":1792492407672}\ntest a_stalled_lease_moves_the_object_to_another_source ... ok\ntest a_verified_read_quarantines_corrupt_bytes_through_the_store ... ok\ntest a_want_that_excludes_gives_its_leases_up ... ok\ntest an_expired_predecessor_lease_does_not_back_off_its_replacement_pool ... ok\ntest an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects ... ok\ntest an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease ... ok\ntest corrupt_spool_never_installed ... ok\ntest crash_between_install_and_register_retransfers ... ok\ntest crash_mid_object_resumes_from_durable ... ok\ntest daemon_incarnations_dominate_pool_numbers_and_the_previous_qualified_id_format ... ok\ntest duplicate_sessions_transfer_once ... ok\n{\"at_ms\":1792492350682,\"level\":\"warn\",\"code\":\"SIZE_MISMATCH\",\"site\":\"worker.objects.write\",\"hash\":\"7596d22592aebe69b1aca3e9f5543dc13281f1cb7464106536f462ea66451b5b\",\"source\":\"779c596a-9c89-46bf-ab61-de2671b57196\",\"retry_at_ms\":1792492380682}\ntest failed_writes_back_their_object_off ... ok\ntest foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame ... ok\ntest full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes ... ok\ntest full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_pool_owners ... ok\ntest hash_only_request_not_permitted ... ok\ntest json_ops_over_a_session_fire_their_fault_point_once ... ok\ntest kill_mid_object_resumes_from_durable ... ok\ntest legacy_receive_path_keeps_spool_state ... ok\nStartup snapshot fallback for b008f62d255d6454ebe571b5ec42461b3ad97990604456269c53b81188d3a950: SNAPSHOT_VERSION_OR_IDENTITY: missing field `journal_state` at line 1 column 13336\ntest legacy_spool_is_adopted_once ... ok\n{\"at_ms\":1792492355522,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.report\",\"hash\":\"c1f3f2c7f73413791c760de4f2566edac16cd4f6cdc5431d71625e7211112263\",\"reporter\":\"6e7f978d-2c22-4278-ad68-1a4135654b22\",\"action\":\"verified_ok\"}\ntest loopback_sessions_serve_objects_and_json_ops_next_to_the_json_rpc ... ok\n{\"at_ms\":1792492355655,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"353fa51965fa99ca44d6185f24a0fc973486d5c73ab1a8b1544115d4dc173878\",\"session\":\"dialer-session\",\"source\":\"f35338c3-d8cf-4bbd-81f3-eccf6c2ead9f\",\"retry_at_ms\":1792492415655}\ntest mutual_pairing_transfers_once_and_leases_expire ... ok\ntest newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them ... ok\ntest objects_demand_lists_what_readers_wait_for_and_leases_nothing ... ok\ntest objects_state_belongs_to_its_worker_context ... ok\ntest objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete ... ok\ntest out_of_order_writes_wait_for_their_turn ... ok\ntest overlapping_parts_are_verified_and_resume_where_durable ... ok\ntest pool_layouts_fence_late_requests_across_lane_counts_and_when_an_old_count_returns ... ok\ntest private_present_object_is_retransferred_verified_then_registered ... ok\ntest report_of_a_good_copy_keeps_it ... ok\ntest report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read ... ok\ntest staged_objects_without_a_size_descriptor_complete ... ok\ntest staged_only_objects_are_wanted_received_but_not_served ... ok\ntest startup_truncates_spools_to_durable ... ok\ntest tampered_spool_never_installed ... ok\ntest unsolicited_write_rejected ... ok\ntest want_lists_interleave_a_large_object_fairly ... ok\ntest want_lists_shard_by_lane ... ok\ntest want_never_renews_a_lease_only_progress_does ... ok\ntest want_ordering_is_demand_then_current_then_history_smaller_first ... ok\ntest worker_ops_check_routes_and_requests ... ok\n\ntest result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.54s\n\n"
+    },
+    "pool-generations-clippy-final.log": {
+      "sha256": "5319418175455d02a1110c757baa15263d9be91392ad9d9f03b3f016f02c5198",
+      "text": "    Checking tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 13.47s\n"
+    }
+  }
+}
