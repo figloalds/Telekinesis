@@ -614,6 +614,32 @@ unchanged availability markers, no object retry/quarantine, and a subsequent
 read still requiring verification. That stage preceded the background stream
 bridge and sharing-withdrawal scenarios; final qualification is recorded below.
 
+The final source passed 337 checks: library 85, provider 12, authenticated
+transport 25, contracts 41, inbound 20, generations 10, retained lanes 53,
+native worker 54, peer supervisors 30 and seams 7. All nine new native hash
+scenarios passed, as did strict Clippy for all test targets and formatting/diff
+checks. External background cancellation and consumer stop returned
+in 30.30/35.55 ms while actual hash I/O was paused for 400 ms; the slow handler
+was observed returning separately. The six ordinary/reserved deadline,
+disconnect and shutdown cases drained in 250.39–252.95 ms with a 250 ms injected
+storage stall. Sharing withdrawn during first-serve verification returned no
+bytes. Cancellation remains cooperative across individual storage calls.
+
+The unchanged-heartbeat legacy foreground scenario still admitted within
+40.35 ms and made all five frames available within 237.30 ms while two other
+repositories stalled for two seconds, with typed activation disabled. These
+are single controlled samples under the retained bounds, not sustained fairness
+or final performance qualification. The 21 ignored checks (18 long legacy lane
+scenarios, two library probes and a large provider experiment) and one filtered,
+previously qualified 10,000-object worker case remain outstanding.
+
+`test-evidence/wave-6/legacy-hash-checks.json` retains command results, fault
+configuration, native samples, source/executable manifests and raw development
+failures. Its 364-file manifest includes src/tests/native/ui and Cargo/build
+inputs, and therefore differs in coverage from earlier checkpoint
+manifests. Source-set SHA-256:
+`1324fe18e7a6d400b7e6a56e48d3c3c5290b9606a0d20cb7b3ebbcc0bfc35958`.
+
 Full legacy budgets, bounded close-release work, durable local-failure error
 projection, mounted range demand, recoverable saves, the change journal/cache,
 compatibility/retention/activation and final platform/build/load gates remain
