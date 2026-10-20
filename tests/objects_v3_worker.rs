@@ -2880,6 +2880,7 @@ fn full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_s
                         run: 1,
                     },
                     layout: None,
+                    frame: None,
                 },
             );
         }

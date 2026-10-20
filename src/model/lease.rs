@@ -19,9 +19,16 @@ pub struct PullRun {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PushRun {
+    pub generation: Generation,
+    pub layout: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunFence {
     pub generation: Generation,
     pub layout: Option<u64>,
+    pub frame: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -66,6 +73,13 @@ pub fn qualify_pull(base: &str, run: PullRun) -> Result<String, ErrorWire> {
     if !owned.family.starts_with("pull:") {
         return Err(invalid());
     }
+    Ok(session)
+}
+
+pub fn qualify_push(base: &str, run: PushRun, frame: u64) -> Result<String, ErrorWire> {
+    let session = format!("{}.{:016x}",qualify(&format!("{base}:c{frame:016x}"),run.generation)?,run.layout);
+    let owned=parse(&session)?.ok_or_else(invalid)?;
+    if !owned.family.starts_with("push:") {return Err(invalid());}
     Ok(session)
 }
 
@@ -128,6 +142,7 @@ fn parse_base(
     if !spec.is_valid() || lane != format!("{}/{}", spec.index, spec.count) {
         return Err(invalid());
     }
+    let mut frame=None;
     let scope = match kind {
         "pull" => {
             let slot = parts.next().ok_or_else(invalid)?;
@@ -140,7 +155,14 @@ fn parse_base(
             }
             &base[..base.len() - slot.len() - 1]
         }
-        "push" => base,
+        "push" => match parts.next() {
+            None => base,
+            Some(slot) if slot.len()==17 && slot.starts_with('c') && hex(&slot[1..]).is_ok_and(|n|n>0) => {
+                frame=Some(hex(&slot[1..])?);
+                &base[..base.len()-slot.len()-1]
+            }
+            _ => return Err(invalid()),
+        },
         _ => return Err(invalid()),
     };
     if parts.next().is_some() {
@@ -158,7 +180,7 @@ fn parse_base(
                 .map(|s| hex(&s[1..]))
                 .transpose()?
         } else {
-            None
+            frame
         },
         generation,
         layout,
