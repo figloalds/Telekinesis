@@ -87,7 +87,9 @@ pub struct ObjectsState {
     pub legacy_cancel: crate::util::Cancel,
     /// Latest ordered run per owned legacy lane scope. Never evict a fence
     /// while delayed requests may still exist in this worker incarnation.
-    pub lease_runs: BTreeMap<String, crate::model::lease::Generation>,
+    pub lease_runs: BTreeMap<String, crate::model::lease::RunFence>,
+    /// Latest pool layout per direction/peer, across all lane counts.
+    pub lease_layouts: BTreeMap<String, (crate::model::lease::Generation, u32)>,
     /// Content-v1 state is separate from legacy hash leases and initialized
     /// only for an explicitly enabled isolated content store (CCR-WP6.3-2).
     pub content: Option<Arc<super::content_rpc::ContentWorker>>,

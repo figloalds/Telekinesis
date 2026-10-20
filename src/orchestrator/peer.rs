@@ -1441,6 +1441,9 @@ impl Supervisor {
             pool,
             catalog: Snapshot::from_arc(catalog.unwrap_or_default()),
         });
+        if let Err(error) = super::lease_clock::register_peer(&ctx, &context) {
+            event!(warn, CONTENT_RESOURCE_LIMIT, {"site":"peer.pool_generation", "message":error.to_string()});
+        }
         let now_ms = ctx.clock.now_ms();
         let lanes = (0..pool)
             .map(|lane| LaneView {

@@ -11,7 +11,7 @@ use crate::{
         content::{Digest, ObjectKey, ObjectKind},
         content_wire as wire,
         errors::ErrorWire,
-        lease::Generation,
+        lease::PullRun,
         orchestrator::{CallError, Ctx, WorkerEndpoint},
         protocol::{
             frame::ChunkHeader,
@@ -40,7 +40,7 @@ pub(crate) struct Target {
     pub conn: Conn,
     pub route: SyncRoute,
     pub scope: wire::PeerScope,
-    pub generation: Generation,
+    pub generation: PullRun,
     pub cancel: Cancel,
 }
 pub(crate) struct Task {
@@ -130,7 +130,7 @@ pub(crate) fn prepare(target: Target, hash: &str) -> std::result::Result<Option<
         return Ok(None);
     };
     let frame = super::lease_clock::next(&target.ctx)?.run;
-    let session = crate::model::lease::qualify(
+    let session = crate::model::lease::qualify_pull(
         &format!(
             "{}:c{frame:016x}",
             objects::pull_holder(&target.route.peer, target.scope.lane)

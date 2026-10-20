@@ -2874,9 +2874,9 @@ fn full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_s
         for n in 1..MAX_RUN_FENCES {
             state.lease_runs.insert(
                 format!("pull:capacity-{n}:0/1"),
-                Generation {
-                    incarnation: 1,
-                    run: 1,
+                tkfs::model::lease::RunFence {
+                    generation: Generation { incarnation: 1, run: 1 },
+                    layout: None,
                 },
             );
         }
