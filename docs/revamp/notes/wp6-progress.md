@@ -476,7 +476,9 @@ Canonical classic IDs and the previous qualified form remain recognizable;
 after a newer family is claimed, they cannot release its leases or change its
 source backoff. The historical opaque session behavior, including its loose
 lane-name interpretation, remains for classic requests before a new family
-fence is established. New qualified requests retain strict lane validation.
+fence is established. A classic opaque name resembling another peer's lane is
+still opaque, as it was previously. New qualified requests retain strict peer
+and lane validation.
 
 Both worker family/run tables and the daemon context registry have explicit
 16,384-entry bounds. Worker fences are never evicted for capacity. Existing
@@ -493,6 +495,25 @@ one-to-two-lane resize. The first resize sample restored 150,000 verified bytes
 in 9.25 ms while the predecessor's two-second read was still in flight. The
 tests retain the one-second limit, verify the newer worker fence after old
 cleanup, and exercise the existing foreground-demand regression as well.
+
+Final-source checks passed: authenticated transport 18, native worker 51,
+generation/parser/catalog-crash 7 and contracts 41 (117 total), plus strict
+Clippy and formatting/diff checks. The latest actual pool-resize availability
+was 8.55 ms; unchanged-heartbeat foreground admission/availability was
+21.87/214.98 ms for five frames with typed activation disabled. The preceding
+broader invocation passed 198 checks, including retained lanes 53 and peer
+supervisors 30. Across both stages there are 200 distinct passed checks; the
+evidence explicitly separates the earlier lane/supervisor executables from the
+final four targets. The 18 long lane qualifications remain ignored, and the
+already-passed 10,000-object worker case was filtered. These do not constitute
+the final platform/load/build gate.
+
+`test-evidence/wave-6/pool-generations-checks.json` retains commands, raw outputs,
+samples, source/executable hashes and stage limitations. It also records the
+caught classic-lane compatibility regression and the failed concurrent Windows
+link attempt; that attempt was retried only after both earlier tool processes
+were observed terminal. Final source-set SHA-256:
+`82483906af8734f7a0a8c9649480bbbd93b3d216a2cbbc0659b45afcc546eb1f`.
 
 This is retained pull ownership, not completion of the inbound push audit.
 Inbound push offers still use stable per-lane worker IDs and a reaper wait;

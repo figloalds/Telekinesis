@@ -3,8 +3,8 @@
   "host": "Windows-11-10.0.26300-SP0",
   "target": "x86_64-pc-windows-msvc",
   "scope": "WP6.3 CCR-WP6.3-6 retained pull ownership across peer-pool/lane-count replacement; full Wave 6 remains in progress and ordinary typed-content activation stays off",
-  "source_revision": "5711b88621c51af487a586fb6e363502a4fe6779",
-  "working_tree_source_sha256": "5a8d0d6e83be3efa7d207f77bef8bb0d4078929754d68b81f36724177eca2353",
+  "source_revision": "798730866a846aa9580a29e772e7cfa1fb692009",
+  "working_tree_source_sha256": "82483906af8734f7a0a8c9649480bbbd93b3d216a2cbbc0659b45afcc546eb1f",
   "source_files_sha256": {
     "build.rs": "70dbed753d54e99544840af6b172da5915f5d3bf68a761fe4b324a10039d9f1a",
     "Cargo.lock": "a4bc80a508b334c1b142d540cff312ddc0da9503ab23b239b0ddd04e5fea84b5",
@@ -86,7 +86,7 @@
     "src/runtime/export.rs": "265057ab699a30749a3f099b1cd2556edcc4e27ca87375b69b551a4bc98c5d0e",
     "src/runtime/mod.rs": "ebccf25c15f040a31fbd08206a34ada641daad22151208e0f8983f528286c2c3",
     "src/runtime/notify.rs": "5f69457ce29a3ed055b345ee8cd88ba283f14ac969a4f049fc85b3cda7e671d7",
-    "src/runtime/objects_rpc.rs": "d5cc3dce6ead45480ed8c46bed886e301355e8c7786ff6150f007b7017bf39d0",
+    "src/runtime/objects_rpc.rs": "4db83db2ebbf5a48c571778c19cc8e91e4bb66ad115568a4909b31512bc4e440",
     "src/runtime/published.rs": "9ad7cdd40191b239486788d390f452d88f85dbc9ab366b14eaa7e1bbacb3840f",
     "src/runtime/server.rs": "88ca3903894444e27116fdd013e879b9e7e8b22c0ec95a5f6214d03cc5212295",
     "src/runtime/sync_rpc.rs": "f392691573dc3b5db0b2ddaf63991d39b15fffffb7bf5e08a7a275e540b4b3ff",
@@ -123,28 +123,28 @@
     "tests/contracts.rs": "0a642a6e7cedda81a719161925e1034b49ad043b0876e2a06cc9ccf9b990da93",
     "tests/lease_generations.rs": "63058d13291950f4d9aab97d2a15e67c9e59345dd24361cd54e0c1ca0ed09d17",
     "tests/objects_v3_lanes.rs": "d723ef6274e29fae382879eae79cf5164c2d548f6148bcdcc7330ad53db59e81",
-    "tests/objects_v3_worker.rs": "19ff6f345ad8f42ea8963361e8d294622d79c4879467ad5c07066f26ab28d8e6",
+    "tests/objects_v3_worker.rs": "5ceccbde4293e56c3f03d7f9622520bcf18d303e5e0832efb7d9817ea06df6a7",
     "tests/peer_supervisor.rs": "dafe60ec589e82dcdfbb786badbcd05192de4078436ef78eee8339dd17f33d4c"
   },
   "executables": [
     {
       "name": "content_transport-45a007033282eb55.exe",
-      "sha256": "54f7b09e909e80828354bfc79bb6fa943d09de58670a372635d23fb503d9e723",
+      "sha256": "5ef66ff9214d51f1b0b15b7586eb1e0c7d2976d9fd3069bcaf07ce0a2af8dafe",
       "stage": "final source"
     },
     {
       "name": "contracts-299e0621d4b830f3.exe",
-      "sha256": "83eedd157bbab8d0134203e119bc9eb736ee86c322812f0bc39461e5035af476",
+      "sha256": "02059d9decd9d679d7e9696344346304b9e4d16770cc7ed7fff8ec695dd3ab52",
       "stage": "final source"
     },
     {
       "name": "lease_generations-7c9e057918b7ca6c.exe",
-      "sha256": "ba2c26ae64a55a61680dc60161c0cde22ef17127f75abd775c060122bc6ca6ff",
+      "sha256": "ea474d1ee6725766cc2c99a016677c8f392424411f777f658562d702c7df02d5",
       "stage": "final source"
     },
     {
       "name": "objects_v3_worker-5c6601c542723b58.exe",
-      "sha256": "c9f075d273d8e0d91183bc0d3f2420a48f273697d20a7dde340be747d8810669",
+      "sha256": "8bd6652cd9a834dce1961bc6835030c599b37270a161fdbae7b68264b5e1e87f",
       "stage": "final source"
     },
     {
@@ -159,7 +159,7 @@
     },
     {
       "name": "tkfs.exe",
-      "sha256": "ec2822b9158daff4e6d979d8a61a84b13696db1ae3b45d00462d840530294cd6",
+      "sha256": "f424b977de6911bb913a077199638eea2ed91cc2b4da31ee13664e8a8dcc4f1a",
       "stage": "final source",
       "version_output": "tkfs 0.1.0"
     }
@@ -283,7 +283,7 @@
           "scenario": "replace_stalled_lane"
         }
       ],
-      "stage": "198 checks before the final cross-format incarnation comparison and its extra native test"
+      "stage": "198 checks before the final cross-format incarnation and opaque-name corrections and their two additional native tests"
     },
     {
       "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test lease_generations --test objects_v3_worker --test content_transport --test contracts -- --test-threads=1 --skip tiny_objects_one_data_fsync_per_object_and_one_registration_per_batch --nocapture",
@@ -295,7 +295,7 @@
           "ignored": 0,
           "measured": 0,
           "filtered": 0,
-          "elapsed_seconds": 28.51
+          "elapsed_seconds": 28.4
         },
         "contracts": {
           "passed": 41,
@@ -314,17 +314,17 @@
           "elapsed_seconds": 0.09
         },
         "objects_v3_worker": {
-          "passed": 50,
+          "passed": 51,
           "failed": 0,
           "ignored": 0,
           "measured": 0,
           "filtered": 1,
-          "elapsed_seconds": 18.54
+          "elapsed_seconds": 18.66
         }
       },
       "samples": [
         {
-          "available_ms": 117.62400000000001,
+          "available_ms": 116.6961,
           "bound_ms": 1000,
           "new_lane_count": 1,
           "new_layout": 3,
@@ -334,7 +334,7 @@
           "scenario": "native_legacy_reconnect"
         },
         {
-          "available_ms": 14.3608,
+          "available_ms": 8.5475,
           "bound_ms": 1000,
           "new_lane_count": 2,
           "new_layout": 7,
@@ -345,25 +345,25 @@
         },
         {
           "available": true,
-          "available_ms": 32.317400000000006,
+          "available_ms": 32.2801,
           "bound_ms": 1000,
           "foreground_completions": 0,
           "scenario": "background_while_foreground_stalled"
         },
         {
           "bound_ms": 250,
-          "drain_ms": 55.289199999999994,
+          "drain_ms": 55.2532,
           "drained": true,
           "scenario": "lane_cancel"
         },
         {
           "bound_ms": 250,
-          "drain_ms": 30.154899999999998,
+          "drain_ms": 33.0687,
           "drained": true,
           "scenario": "daemon_cancel"
         },
         {
-          "admission_ms": 22.711100000000002,
+          "admission_ms": 26.3012,
           "admitted": true,
           "bound_ms": 250,
           "scenario": "foreground_behind_two_stalled_repositories",
@@ -371,9 +371,9 @@
         },
         {
           "admission_bound_ms": 250,
-          "admission_ms": 20.3731,
+          "admission_ms": 21.8745,
           "availability_bound_ms": 1000,
-          "availability_ms": 219.22549999999998,
+          "availability_ms": 214.9779,
           "background_stall_ms": 2000,
           "bytes": 1048599,
           "foreground_frames_completed": 5,
@@ -382,12 +382,12 @@
         },
         {
           "available": true,
-          "available_ms": 47.5521,
+          "available_ms": 34.1824,
           "bound_ms": 1000,
           "scenario": "replace_stalled_lane"
         }
       ],
-      "stage": "116 checks on final source, including cross-format incarnation dominance"
+      "stage": "117 checks on final source, including cross-format incarnation dominance and historical opaque peer-name compatibility"
     },
     {
       "command": "cargo clippy --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib --test lease_generations --test objects_v3_worker --test content_transport --test objects_v3_lanes --test peer_supervisor --test contracts -- -D warnings",
@@ -398,9 +398,9 @@
       "exit_code": 0
     }
   ],
-  "unique_package_checks_passed": 199,
-  "final_source_focused_checks_passed": 116,
-  "source_identity_note": "Only the final four targets are claimed to use the recorded final source hash. Lane (53) and supervisor (30) regressions passed in the preceding broader invocation. Their retained executable hashes are staged separately. The final changes affect native worker incarnation comparisons, not the supervisor pool allocator. The complete older working-tree source snapshot was not retained, so no precise full source-set hash is asserted for that earlier invocation. Counts never add repeated checks.",
+  "unique_package_checks_passed": 200,
+  "final_source_focused_checks_passed": 117,
+  "source_identity_note": "Only the final four targets are claimed to use the recorded final source hash. Lane (53) and supervisor (30) regressions passed in the preceding broader invocation. Their retained executable hashes are staged separately. The final changes affect native worker incarnation comparisons and opaque-name compatibility, not the supervisor pool allocator. The complete older working-tree source snapshot was not retained, so no precise full source-set hash is asserted for that earlier invocation. Counts never add repeated checks.",
   "fault_configuration": [
     {
       "point": "worker.rpc.objects.read",
@@ -471,9 +471,13 @@
       "sha256": "38512ea7d029f069d63be0cd1715c4509ce406d3b6c2207c92a69835c2a9d92a",
       "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 7.71s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 18 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":117.62400000000001,\"bound_ms\":1000,\"new_lane_count\":1,\"new_layout\":3,\"old_lane_count\":1,\"old_layout\":1,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest a_real_legacy_pool_resize_resumes_before_old_io_and_fences_old_pool_cleanup ... WAVE6_LEASE {\"available_ms\":14.3608,\"bound_ms\":1000,\"new_lane_count\":2,\"new_layout\":7,\"old_lane_count\":1,\"old_layout\":5,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_pool_resize\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":32.317400000000006,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":55.289199999999994,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":30.154899999999998,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":22.711100000000002,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":20.3731,\"availability_bound_ms\":1000,\"availability_ms\":219.22549999999998,\"background_stall_ms\":2000,\"bytes\":1048599,\"foreground_frames_completed\":5,\"heartbeat_changed\":false,\"typed_activation\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":47.5521,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.51s\n\n     Running tests\\contracts.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\contracts-299e0621d4b830f3.exe)\n\nrunning 41 tests\ntest backoff_resets_only_after_a_healthy_period ... ok\ntest backoff_sanitizes_a_jitter_set_through_the_field ... ok\ntest backoff_stays_within_bounds_over_10000_samples ... ok\ntest call_errors_are_classified_and_uncertainty_is_explicit ... ok\n\nthread 'cancel_hooks_run_once_and_children_follow_their_parent' (74788) panicked at tests\\contracts.rs:3156:33:\na panicking killer is contained\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest cancel_hooks_run_once_and_children_follow_their_parent ... ok\ntest cancel_runs_children_before_the_parents_hooks ... ok\ntest cancel_sleep_returns_within_50ms_of_cancel ... ok\ntest classify_covers_every_code_literal_in_src ... ok\ntest classify_matches_the_section_8_table ... ok\ntest clocks_tell_time ... ok\ntest code_of_finds_the_first_code_in_the_chain ... ok\ntest ctx_reports_network_not_ready_until_set ... ok\ntest error_records_count_and_resolve ... ok\ntest event_identifier_codes_are_scanned ... ok\ntest every_fixture_file_is_covered ... ok\ntest fault_environment_variables_arm_a_point_in_a_child_process ... ok\n\nthread 'fault_points_match_by_name_scope_and_count' (13296) panicked at src\\util\\fault.rs:218:31:\nFAULT_INJECTED: contracts.panic\ntest fault_points_match_by_name_scope_and_count ... ok\ntest feed_digest_is_the_first_16_hex_of_sha256 ... ok\ntest golden_fixtures_round_trip_byte_for_byte ... ok\ntest heartbeat_without_mount_errors_parses ... ok\ntest hmac_matches_rfc_4231_cases_1_to_7 ... ok\ntest lane_spec_owns_exactly_like_the_legacy_bulk_lane ... ok\n\nthread '<unnamed>' (69108) panicked at tests\\contracts.rs:3299:9:\npoison the mutex\n\nthread 'lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy' (72832) panicked at src\\util\\lock.rs:76:17:\nLOCK_POISONED: a thread panicked while holding this lock\ntest lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy ... ok\ntest lock_or_exit_runs_the_hook_then_exits_70_under_exit_policy ... ok\ntest log_events_are_json_lines_rate_limited_per_code ... ok\ntest log_rate_windows_are_bounded ... ok\ntest model_helpers_follow_the_spec ... ok\ntest need_budget_fits_the_meta_exchange_body ... ok\ntest notify_wakes_within_10ms_and_never_loses_pokes ... ok\ntest op_allowed_follows_the_op_table ... ok\ntest pairing_secrets_are_never_serialized_or_debug_printed ... ok\ntest session_entry_points_fail_closed ... ok\ntest shared_handles_are_send_and_sync ... ok\ntest snapshot_wait_newer_wakes_within_10ms ... ok\ntest spec_examples_parse_into_the_frozen_types ... ok\ntest status_events_without_the_wave_2_members_parse ... ok\ntest tracked_reports_after_release_and_log_writes_after_unlock ... ok\ntest tracked_reports_holds_longer_than_50ms ... ok\ntest tracked_violation_is_logged_in_debug_builds ... ok\ntest upgrade_kind_reads_the_sync_header ... ok\ntest wave6_error_scopes_extend_the_historical_table ... ok\n\ntest result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.45s\n\n     Running tests\\lease_generations.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\lease_generations-7c9e057918b7ca6c.exe)\n\nrunning 7 tests\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... \nrunning 1 test\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... ok\ntest a_pool_layout_is_assigned_before_lanes_and_late_old_lanes_cannot_get_a_new_layout ... ok\ntest a_run_clock_is_monotonic_under_concurrent_lane_creation ... ok\ntest corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch ... ok\ntest ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base ... ok\ntest pool_identity_capacity_retains_live_owners_and_only_reclaims_dead_contexts ... ok\ntest pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_recognizable ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\n     Running tests\\objects_v3_worker.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe)\n\nrunning 50 tests\ntest a_busy_writer_fails_the_registration_once_not_per_object ... ok\ntest a_committed_object_not_yet_received_is_not_available ... ok\n{\"at_ms\":1792492346763,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.write\",\"hash\":\"915d3c02390ff83c51d44ed628cea5a48fa4481363ad7b4f9f1aa7736204356d\",\"source\":\"bf50453a-93cf-4b2c-adc4-56e15e152e90\",\"retry_at_ms\":1792492376763}\ntest a_corrupt_source_is_backed_off_for_that_source_only ... ok\ntest a_corrupt_verdict_outranks_an_earlier_serve ... ok\ntest a_new_lane_count_takes_over_the_old_lanes_leases ... ok\ntest a_release_with_a_hold_hides_the_objects_from_their_source ... ok\ntest a_released_lease_moves_the_object_to_another_source_at_once ... ok\ntest a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open ... ok\n{\"at_ms\":1792492347662,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"s1\",\"source\":\"da8bda1b-5cb4-46cf-ad8e-bef654dba1a5\",\"retry_at_ms\":1792492407662}\n{\"at_ms\":1792492347662,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"37403058a25f1eab9350bd10a3feb7df32e9b0bf424aa8df0b8574a8c796f38a\",\"session\":\"s1\",\"source\":\"da8bda1b-5cb4-46cf-ad8e-bef654dba1a5\",\"retry_at_ms\":1792492407662}\n{\"at_ms\":1792492347672,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"c1\",\"source\":\"replica-c\",\"retry_at_ms\":1792492407672}\ntest a_stalled_lease_moves_the_object_to_another_source ... ok\ntest a_verified_read_quarantines_corrupt_bytes_through_the_store ... ok\ntest a_want_that_excludes_gives_its_leases_up ... ok\ntest an_expired_predecessor_lease_does_not_back_off_its_replacement_pool ... ok\ntest an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects ... ok\ntest an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease ... ok\ntest corrupt_spool_never_installed ... ok\ntest crash_between_install_and_register_retransfers ... ok\ntest crash_mid_object_resumes_from_durable ... ok\ntest daemon_incarnations_dominate_pool_numbers_and_the_previous_qualified_id_format ... ok\ntest duplicate_sessions_transfer_once ... ok\n{\"at_ms\":1792492350682,\"level\":\"warn\",\"code\":\"SIZE_MISMATCH\",\"site\":\"worker.objects.write\",\"hash\":\"7596d22592aebe69b1aca3e9f5543dc13281f1cb7464106536f462ea66451b5b\",\"source\":\"779c596a-9c89-46bf-ab61-de2671b57196\",\"retry_at_ms\":1792492380682}\ntest failed_writes_back_their_object_off ... ok\ntest foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame ... ok\ntest full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes ... ok\ntest full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_pool_owners ... ok\ntest hash_only_request_not_permitted ... ok\ntest json_ops_over_a_session_fire_their_fault_point_once ... ok\ntest kill_mid_object_resumes_from_durable ... ok\ntest legacy_receive_path_keeps_spool_state ... ok\nStartup snapshot fallback for b008f62d255d6454ebe571b5ec42461b3ad97990604456269c53b81188d3a950: SNAPSHOT_VERSION_OR_IDENTITY: missing field `journal_state` at line 1 column 13336\ntest legacy_spool_is_adopted_once ... ok\n{\"at_ms\":1792492355522,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.report\",\"hash\":\"c1f3f2c7f73413791c760de4f2566edac16cd4f6cdc5431d71625e7211112263\",\"reporter\":\"6e7f978d-2c22-4278-ad68-1a4135654b22\",\"action\":\"verified_ok\"}\ntest loopback_sessions_serve_objects_and_json_ops_next_to_the_json_rpc ... ok\n{\"at_ms\":1792492355655,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"353fa51965fa99ca44d6185f24a0fc973486d5c73ab1a8b1544115d4dc173878\",\"session\":\"dialer-session\",\"source\":\"f35338c3-d8cf-4bbd-81f3-eccf6c2ead9f\",\"retry_at_ms\":1792492415655}\ntest mutual_pairing_transfers_once_and_leases_expire ... ok\ntest newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them ... ok\ntest objects_demand_lists_what_readers_wait_for_and_leases_nothing ... ok\ntest objects_state_belongs_to_its_worker_context ... ok\ntest objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete ... ok\ntest out_of_order_writes_wait_for_their_turn ... ok\ntest overlapping_parts_are_verified_and_resume_where_durable ... ok\ntest pool_layouts_fence_late_requests_across_lane_counts_and_when_an_old_count_returns ... ok\ntest private_present_object_is_retransferred_verified_then_registered ... ok\ntest report_of_a_good_copy_keeps_it ... ok\ntest report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read ... ok\ntest staged_objects_without_a_size_descriptor_complete ... ok\ntest staged_only_objects_are_wanted_received_but_not_served ... ok\ntest startup_truncates_spools_to_durable ... ok\ntest tampered_spool_never_installed ... ok\ntest unsolicited_write_rejected ... ok\ntest want_lists_interleave_a_large_object_fairly ... ok\ntest want_lists_shard_by_lane ... ok\ntest want_never_renews_a_lease_only_progress_does ... ok\ntest want_ordering_is_demand_then_current_then_history_smaller_first ... ok\ntest worker_ops_check_routes_and_requests ... ok\n\ntest result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.54s\n\n"
     },
-    "pool-generations-clippy-final.log": {
-      "sha256": "5319418175455d02a1110c757baa15263d9be91392ad9d9f03b3f016f02c5198",
-      "text": "    Checking tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 13.47s\n"
+    "pool-generations-compatible.log": {
+      "sha256": "7607231a3d6dc481df6db297c295d041e57d915e547fd4fdea0a9c5129fb8bde",
+      "text": "   Compiling tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 1m 43s\n     Running tests\\content_transport.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\content_transport-45a007033282eb55.exe)\n\nrunning 18 tests\ntest a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_finishes ... WAVE6_LEASE {\"available_ms\":116.6961,\"bound_ms\":1000,\"new_lane_count\":1,\"new_layout\":3,\"old_lane_count\":1,\"old_layout\":1,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_reconnect\"}\nok\ntest a_real_legacy_pool_resize_resumes_before_old_io_and_fences_old_pool_cleanup ... WAVE6_LEASE {\"available_ms\":8.5475,\"bound_ms\":1000,\"new_lane_count\":2,\"new_layout\":7,\"old_lane_count\":1,\"old_layout\":5,\"old_source_stall_ms\":2000,\"scenario\":\"native_legacy_pool_resize\"}\nok\ntest ack_ownership_and_session_close_preserve_newer_frame_credit ... ok\ntest background_dispatch_progresses_while_a_foreground_source_is_stalled ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":32.2801,\"bound_ms\":1000,\"foreground_completions\":0,\"scenario\":\"background_while_foreground_stalled\"}\nok\ntest bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks ... ok\ntest bulk_runner_automatically_dispatches_typed_content ... ok\ntest cancellation_releases_inflight_dispatch_without_waiting_for_stalled_source_io ... WAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":55.2532,\"drained\":true,\"scenario\":\"lane_cancel\"}\nWAVE6_DISPATCH {\"bound_ms\":250,\"drain_ms\":33.0687,\"drained\":true,\"scenario\":\"daemon_cancel\"}\nok\ntest capability_and_membership_are_checked_before_any_private_bytes_are_sent ... ok\ntest foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled ... WAVE6_DISPATCH {\"admission_ms\":26.3012,\"admitted\":true,\"bound_ms\":250,\"scenario\":\"foreground_behind_two_stalled_repositories\",\"stalled_background_completions\":0}\nok\ntest foreground_peer_frame_uses_the_buffer_reserve_while_save_producers_are_stalled ... ok\ntest legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat ... WAVE6_LEGACY_DEMAND {\"admission_bound_ms\":250,\"admission_ms\":21.8745,\"availability_bound_ms\":1000,\"availability_ms\":214.9779,\"background_stall_ms\":2000,\"bytes\":1048599,\"foreground_frames_completed\":5,\"heartbeat_changed\":false,\"typed_activation\":false}\nok\ntest legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack ... ok\ntest object_worker_writer_contention_returns_promptly_and_preserves_metadata_progress ... ok\ntest outbound_background_cannot_take_foreground_or_inbound_service_capacity ... ok\ntest replacing_a_lane_fences_old_work_and_late_registration_drop ... WAVE6_DISPATCH {\"available\":true,\"available_ms\":34.1824,\"bound_ms\":1000,\"scenario\":\"replace_stalled_lane\"}\nok\ntest stale_worker_offer_cannot_release_or_complete_a_new_owner ... ok\ntest stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available ... ok\ntest unacknowledged_frame_expiry_closes_the_session_before_returning_byte_credit ... ok\n\ntest result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 28.40s\n\n     Running tests\\contracts.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\contracts-299e0621d4b830f3.exe)\n\nrunning 41 tests\ntest backoff_resets_only_after_a_healthy_period ... ok\ntest backoff_sanitizes_a_jitter_set_through_the_field ... ok\ntest backoff_stays_within_bounds_over_10000_samples ... ok\ntest call_errors_are_classified_and_uncertainty_is_explicit ... ok\n\nthread 'cancel_hooks_run_once_and_children_follow_their_parent' (46924) panicked at tests\\contracts.rs:3156:33:\na panicking killer is contained\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\ntest cancel_hooks_run_once_and_children_follow_their_parent ... ok\ntest cancel_runs_children_before_the_parents_hooks ... ok\ntest cancel_sleep_returns_within_50ms_of_cancel ... ok\ntest classify_covers_every_code_literal_in_src ... ok\ntest classify_matches_the_section_8_table ... ok\ntest clocks_tell_time ... ok\ntest code_of_finds_the_first_code_in_the_chain ... ok\ntest ctx_reports_network_not_ready_until_set ... ok\ntest error_records_count_and_resolve ... ok\ntest event_identifier_codes_are_scanned ... ok\ntest every_fixture_file_is_covered ... ok\ntest fault_environment_variables_arm_a_point_in_a_child_process ... ok\n\nthread 'fault_points_match_by_name_scope_and_count' (72828) panicked at src\\util\\fault.rs:218:31:\nFAULT_INJECTED: contracts.panic\ntest fault_points_match_by_name_scope_and_count ... ok\ntest feed_digest_is_the_first_16_hex_of_sha256 ... ok\ntest golden_fixtures_round_trip_byte_for_byte ... ok\ntest heartbeat_without_mount_errors_parses ... ok\ntest hmac_matches_rfc_4231_cases_1_to_7 ... ok\ntest lane_spec_owns_exactly_like_the_legacy_bulk_lane ... ok\n\nthread '<unnamed>' (48428) panicked at tests\\contracts.rs:3299:9:\npoison the mutex\n\nthread 'lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy' (41688) panicked at src\\util\\lock.rs:76:17:\nLOCK_POISONED: a thread panicked while holding this lock\ntest lock_is_poison_tolerant_and_lock_or_exit_panics_under_panic_policy ... ok\ntest lock_or_exit_runs_the_hook_then_exits_70_under_exit_policy ... ok\ntest log_events_are_json_lines_rate_limited_per_code ... ok\ntest log_rate_windows_are_bounded ... ok\ntest model_helpers_follow_the_spec ... ok\ntest need_budget_fits_the_meta_exchange_body ... ok\ntest notify_wakes_within_10ms_and_never_loses_pokes ... ok\ntest op_allowed_follows_the_op_table ... ok\ntest pairing_secrets_are_never_serialized_or_debug_printed ... ok\ntest session_entry_points_fail_closed ... ok\ntest shared_handles_are_send_and_sync ... ok\ntest snapshot_wait_newer_wakes_within_10ms ... ok\ntest spec_examples_parse_into_the_frozen_types ... ok\ntest status_events_without_the_wave_2_members_parse ... ok\ntest tracked_reports_after_release_and_log_writes_after_unlock ... ok\ntest tracked_reports_holds_longer_than_50ms ... ok\ntest tracked_violation_is_logged_in_debug_builds ... ok\ntest upgrade_kind_reads_the_sync_header ... ok\ntest wave6_error_scopes_extend_the_historical_table ... ok\n\ntest result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.45s\n\n     Running tests\\lease_generations.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\lease_generations-7c9e057918b7ca6c.exe)\n\nrunning 7 tests\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... \nrunning 1 test\ntest a_catalog_crash_after_epoch_commit_does_not_reuse_the_incarnation ... ok\ntest a_pool_layout_is_assigned_before_lanes_and_late_old_lanes_cannot_get_a_new_layout ... ok\ntest a_run_clock_is_monotonic_under_concurrent_lane_creation ... ok\ntest corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch ... ok\ntest ordered_session_extension_is_bounded_canonical_and_preserves_the_classic_base ... ok\ntest pool_identity_capacity_retains_live_owners_and_only_reclaims_dead_contexts ... ok\ntest pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_recognizable ... ok\n\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\n     Running tests\\objects_v3_worker.rs (target/build-cache/windows\\x86_64-pc-windows-msvc\\release\\deps\\objects_v3_worker-5c6601c542723b58.exe)\n\nrunning 51 tests\ntest a_busy_writer_fails_the_registration_once_not_per_object ... ok\ntest a_classic_opaque_session_that_resembles_another_peers_lane_keeps_its_old_meaning ... ok\ntest a_committed_object_not_yet_received_is_not_available ... ok\n{\"at_ms\":1792492668975,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.write\",\"hash\":\"915d3c02390ff83c51d44ed628cea5a48fa4481363ad7b4f9f1aa7736204356d\",\"source\":\"d8b14f68-472d-4d2d-99c3-08d0794373ed\",\"retry_at_ms\":1792492698975}\ntest a_corrupt_source_is_backed_off_for_that_source_only ... ok\ntest a_corrupt_verdict_outranks_an_earlier_serve ... ok\ntest a_new_lane_count_takes_over_the_old_lanes_leases ... ok\ntest a_release_with_a_hold_hides_the_objects_from_their_source ... ok\ntest a_released_lease_moves_the_object_to_another_source_at_once ... ok\ntest a_spool_no_longer_wanted_is_not_counted_and_dropped_on_open ... ok\n{\"at_ms\":1792492669952,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"s1\",\"source\":\"900195dd-4a46-41e6-95ed-dcd75f959a11\",\"retry_at_ms\":1792492729952}\n{\"at_ms\":1792492669952,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"37403058a25f1eab9350bd10a3feb7df32e9b0bf424aa8df0b8574a8c796f38a\",\"session\":\"s1\",\"source\":\"900195dd-4a46-41e6-95ed-dcd75f959a11\",\"retry_at_ms\":1792492729952}\n{\"at_ms\":1792492669963,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"2f209236cbfc1feddfaece34639dfd1686d3920f8978f853d6494d4a49848be8\",\"session\":\"c1\",\"source\":\"replica-c\",\"retry_at_ms\":1792492729963}\ntest a_stalled_lease_moves_the_object_to_another_source ... ok\ntest a_verified_read_quarantines_corrupt_bytes_through_the_store ... ok\ntest a_want_that_excludes_gives_its_leases_up ... ok\ntest an_expired_predecessor_lease_does_not_back_off_its_replacement_pool ... ok\ntest an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects ... ok\ntest an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease ... ok\ntest corrupt_spool_never_installed ... ok\ntest crash_between_install_and_register_retransfers ... ok\ntest crash_mid_object_resumes_from_durable ... ok\ntest daemon_incarnations_dominate_pool_numbers_and_the_previous_qualified_id_format ... ok\ntest duplicate_sessions_transfer_once ... ok\n{\"at_ms\":1792492672912,\"level\":\"warn\",\"code\":\"SIZE_MISMATCH\",\"site\":\"worker.objects.write\",\"hash\":\"7596d22592aebe69b1aca3e9f5543dc13281f1cb7464106536f462ea66451b5b\",\"source\":\"40c68532-925f-4835-845b-f0b650b3140a\",\"retry_at_ms\":1792492702912}\ntest failed_writes_back_their_object_off ... ok\ntest foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame ... ok\ntest full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes ... ok\ntest full_pool_fence_capacity_refuses_new_families_without_forgetting_existing_pool_owners ... ok\ntest hash_only_request_not_permitted ... ok\ntest json_ops_over_a_session_fire_their_fault_point_once ... ok\ntest kill_mid_object_resumes_from_durable ... ok\ntest legacy_receive_path_keeps_spool_state ... ok\nStartup snapshot fallback for b008f62d255d6454ebe571b5ec42461b3ad97990604456269c53b81188d3a950: SNAPSHOT_VERSION_OR_IDENTITY: missing field `journal_state` at line 1 column 13336\ntest legacy_spool_is_adopted_once ... ok\n{\"at_ms\":1792492677519,\"level\":\"warn\",\"code\":\"CORRUPT_AT_SOURCE\",\"site\":\"worker.objects.report\",\"hash\":\"c1f3f2c7f73413791c760de4f2566edac16cd4f6cdc5431d71625e7211112263\",\"reporter\":\"481c0a5a-dd46-4da6-b766-b0bf86468089\",\"action\":\"verified_ok\"}\ntest loopback_sessions_serve_objects_and_json_ops_next_to_the_json_rpc ... ok\n{\"at_ms\":1792492677664,\"level\":\"info\",\"code\":\"NOT_AVAILABLE\",\"site\":\"worker.objects.lease_lapsed\",\"hash\":\"353fa51965fa99ca44d6185f24a0fc973486d5c73ab1a8b1544115d4dc173878\",\"session\":\"dialer-session\",\"source\":\"dddd8b7c-d4a7-4f50-8057-ae52c3cfc55f\",\"retry_at_ms\":1792492737664}\ntest mutual_pairing_transfers_once_and_leases_expire ... ok\ntest newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them ... ok\ntest objects_demand_lists_what_readers_wait_for_and_leases_nothing ... ok\ntest objects_state_belongs_to_its_worker_context ... ok\ntest objects_without_a_size_descriptor_are_wanted_with_size_zero_and_complete ... ok\ntest out_of_order_writes_wait_for_their_turn ... ok\ntest overlapping_parts_are_verified_and_resume_where_durable ... ok\ntest pool_layouts_fence_late_requests_across_lane_counts_and_when_an_old_count_returns ... ok\ntest private_present_object_is_retransferred_verified_then_registered ... ok\ntest report_of_a_good_copy_keeps_it ... ok\ntest report_quarantines_the_sender_copy_and_a_restored_file_heals_on_read ... ok\ntest staged_objects_without_a_size_descriptor_complete ... ok\ntest staged_only_objects_are_wanted_received_but_not_served ... ok\ntest startup_truncates_spools_to_durable ... ok\ntest tampered_spool_never_installed ... ok\ntest unsolicited_write_rejected ... ok\ntest want_lists_interleave_a_large_object_fairly ... ok\ntest want_lists_shard_by_lane ... ok\ntest want_never_renews_a_lease_only_progress_does ... ok\ntest want_ordering_is_demand_then_current_then_history_smaller_first ... ok\ntest worker_ops_check_routes_and_requests ... ok\n\ntest result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 18.66s\n\n"
+    },
+    "pool-generations-clippy-compatible.log": {
+      "sha256": "c22a3f13afe5bb029c631f1ed6a67f2f1b999e58c8e28a3264a619fe6622d87c",
+      "text": "    Checking tkfs v0.1.0 (C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis)\n    Finished `release` profile [optimized] target(s) in 13.07s\n"
     }
   }
 }

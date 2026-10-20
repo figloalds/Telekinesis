@@ -186,6 +186,14 @@ fn owned_run<'a>(
     route: &SyncRoute,
 ) -> Result<Option<crate::model::lease::Owned<'a>>, ErrorWire> {
     let owned = crate::model::lease::parse_transfer(session)?;
+    // Before the extension, every valid string was opaque. Recognize only
+    // the classic IDs actually belonging to this route for old-run fencing.
+    if owned
+        .as_ref()
+        .is_some_and(|o| o.generation.run == 0 && o.peer != route.peer)
+    {
+        return Ok(None);
+    }
     if owned.as_ref().is_some_and(|o| o.peer != route.peer) {
         return Err(ErrorWire::coded(
             "INVALID_REQUEST",
