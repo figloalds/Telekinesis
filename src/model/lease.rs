@@ -11,18 +11,44 @@ pub struct Generation {
     pub run: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PullRun {
+    pub generation: Generation,
+    /// Counter allocated when the peer pool is constructed, before its lanes.
+    pub layout: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RunFence {
+    pub generation: Generation,
+    pub layout: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct Owned<'a> {
     /// Pull slots a/b share a fence, while retaining distinct lease IDs.
     pub scope: &'a str,
+    pub family: &'a str,
     pub peer: &'a str,
     pub lane: LaneSpec,
     pub frame: Option<u64>,
+    pub layout: Option<u64>,
     pub generation: Generation,
 }
 
 fn invalid() -> ErrorWire {
     ErrorWire::coded("INVALID_REQUEST", "malformed local lease generation")
+}
+
+fn hex(part: &str) -> Result<u64, ErrorWire> {
+    if part.len() != 16
+        || !part
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(invalid());
+    }
+    u64::from_str_radix(part, 16).map_err(|_| invalid())
 }
 
 pub fn qualify(base: &str, generation: Generation) -> Result<String, ErrorWire> {
@@ -34,29 +60,59 @@ pub fn qualify(base: &str, generation: Generation) -> Result<String, ErrorWire> 
     Ok(session)
 }
 
+pub fn qualify_pull(base: &str, run: PullRun) -> Result<String, ErrorWire> {
+    let session = format!("{}.{:016x}", qualify(base, run.generation)?, run.layout);
+    let owned = parse(&session)?.ok_or_else(invalid)?;
+    if !owned.family.starts_with("pull:") {
+        return Err(invalid());
+    }
+    Ok(session)
+}
+
 pub fn parse(session: &str) -> Result<Option<Owned<'_>>, ErrorWire> {
     let Some((base, suffix)) = session.split_once(MARKER) else {
         return Ok(None);
     };
-    if session.len() > 128 || suffix.len() != 33 || suffix.as_bytes()[16] != b'.' {
+    if session.len() > 128 {
         return Err(invalid());
     }
-    let hex = |part: &str| -> Result<u64, ErrorWire> {
-        if !part
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(invalid());
-        }
-        u64::from_str_radix(part, 16).map_err(|_| invalid())
-    };
+    let mut numbers = suffix.split('.');
     let generation = Generation {
-        incarnation: hex(&suffix[..16])?,
-        run: hex(&suffix[17..])?,
+        incarnation: hex(numbers.next().ok_or_else(invalid)?)?,
+        run: hex(numbers.next().ok_or_else(invalid)?)?,
     };
+    let layout = numbers.next().map(hex).transpose()?;
+    if numbers.next().is_some() || layout.is_some_and(|n| n == 0 || n > generation.run) {
+        return Err(invalid());
+    }
     if generation.run == 0 {
         return Err(invalid());
     }
+    parse_base(base, generation, layout).map(Some)
+}
+
+/// Recognize canonical old transfer IDs for fencing after an upgraded pool
+/// has claimed this worker. Arbitrary historical opaque sessions stay opaque.
+pub fn parse_transfer(session: &str) -> Result<Option<Owned<'_>>, ErrorWire> {
+    if session.contains(MARKER) {
+        return parse(session);
+    }
+    Ok(parse_base(
+        session,
+        Generation {
+            incarnation: 0,
+            run: 0,
+        },
+        None,
+    )
+    .ok())
+}
+
+fn parse_base(
+    base: &str,
+    generation: Generation,
+    layout: Option<u64>,
+) -> Result<Owned<'_>, ErrorWire> {
     let mut parts = base.split(':');
     let kind = parts.next().ok_or_else(invalid)?;
     let peer = parts
@@ -90,8 +146,9 @@ pub fn parse(session: &str) -> Result<Option<Owned<'_>>, ErrorWire> {
     if parts.next().is_some() {
         return Err(invalid());
     }
-    Ok(Some(Owned {
+    Ok(Owned {
         scope,
+        family: &base[..kind.len() + 1 + peer.len()],
         peer,
         lane: spec,
         frame: if kind == "pull" {
@@ -104,5 +161,6 @@ pub fn parse(session: &str) -> Result<Option<Owned<'_>>, ErrorWire> {
             None
         },
         generation,
-    }))
+        layout,
+    })
 }

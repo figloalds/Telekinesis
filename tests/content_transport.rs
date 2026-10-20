@@ -1461,7 +1461,7 @@ fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_fin
             .unwrap()
             .lease_runs
             .get(old_owned.scope)
-            .copied();
+            .map(|fence| fence.generation);
     old_cancel.cancel();
     new_cancel.cancel();
     old.join().unwrap();
@@ -1479,7 +1479,7 @@ fn a_real_legacy_bulk_reconnect_resumes_under_a_new_generation_before_old_io_fin
             .unwrap()
             .lease_runs
             .get(old_owned.scope)
-            .copied(),
+            .map(|fence| fence.generation),
         generation,
         "old runner cleanup changed the newer run's fence"
     );

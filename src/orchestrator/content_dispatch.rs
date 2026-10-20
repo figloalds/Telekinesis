@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 type LaneKey = (String, u32, u32);
 struct Binding {
-    legacy: Option<crate::model::lease::Generation>,
+    legacy: Option<crate::model::lease::PullRun>,
     id: Uuid,
     peer: Arc<PeerContext>,
     lane: LaneSpec,
@@ -715,7 +715,7 @@ pub(crate) fn register_with_legacy(
     lane: LaneSpec,
     conn: Conn,
     cancel: &Cancel,
-    legacy: Option<crate::model::lease::Generation>,
+    legacy: Option<crate::model::lease::PullRun>,
 ) -> anyhow::Result<Registration> {
     super::scheduler::check_session(
         &peer,

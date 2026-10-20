@@ -185,7 +185,7 @@ fn owned_run<'a>(
     session: &'a str,
     route: &SyncRoute,
 ) -> Result<Option<crate::model::lease::Owned<'a>>, ErrorWire> {
-    let owned = crate::model::lease::parse(session)?;
+    let owned = crate::model::lease::parse_transfer(session)?;
     if owned.as_ref().is_some_and(|o| o.peer != route.peer) {
         return Err(ErrorWire::coded(
             "INVALID_REQUEST",
@@ -196,14 +196,43 @@ fn owned_run<'a>(
 }
 fn run_current(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
     owned.is_none_or(|o| {
-        state
-            .lease_runs
-            .get(o.scope)
-            .is_none_or(|g| *g <= o.generation)
+        layout_current(state, o)
+            && state
+                .lease_runs
+                .get(o.scope)
+                .is_none_or(|g| g.layout != o.layout || g.generation <= o.generation)
     })
 }
+
+fn layout_current(state: &ObjectsState, owned: &crate::model::lease::Owned<'_>) -> bool {
+    state
+        .lease_layouts
+        .get(owned.family)
+        .is_none_or(|(seen, count)| {
+            owned.layout.is_some_and(|run| {
+                let incoming = crate::model::lease::Generation {
+                    incarnation: owned.generation.incarnation,
+                    run,
+                };
+                incoming > *seen || (incoming == *seen && owned.lane.count == *count)
+            })
+        })
+}
 fn run_owns(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
-    owned.is_none_or(|o| state.lease_runs.get(o.scope) == Some(&o.generation))
+    owned.is_none_or(|o| {
+        layout_current(state, o)
+            && state.lease_runs.get(o.scope) == Some(&crate::model::lease::RunFence {generation:o.generation,layout:o.layout})
+            && o.layout.is_none_or(|run| {
+                state.lease_layouts.get(o.family)
+                    == Some(&(
+                        crate::model::lease::Generation {
+                            incarnation: o.generation.incarnation,
+                            run,
+                        },
+                        o.lane.count,
+                    ))
+            })
+    })
 }
 fn claim_run(
     state: &mut ObjectsState,
@@ -224,7 +253,28 @@ fn claim_run(
                 "object lease generation fence capacity",
             ));
         }
-        state.lease_runs.insert(o.scope.to_owned(), o.generation);
+        if o.layout.is_some()
+            && !state.lease_layouts.contains_key(o.family)
+            && state.lease_layouts.len() >= crate::model::lease::MAX_RUN_FENCES
+        {
+            return Err(ErrorWire::coded(
+                "BUSY",
+                "object lease layout fence capacity",
+            ));
+        }
+        if let Some(run) = o.layout {
+            state.lease_layouts.insert(
+                o.family.to_owned(),
+                (
+                    crate::model::lease::Generation {
+                        incarnation: o.generation.incarnation,
+                        run,
+                    },
+                    o.lane.count,
+                ),
+            );
+        }
+        state.lease_runs.insert(o.scope.to_owned(), crate::model::lease::RunFence {generation:o.generation,layout:o.layout});
     }
     Ok(())
 }
@@ -375,13 +425,35 @@ const SUPERSEDE_IDLE: Duration = Duration::from_secs(15);
 /// quarter of a TTL (an old lane still moving it during the switch keeps it).
 fn superseded(held: &ObjectLease, session: &str, now: u64) -> bool {
     if let (Ok(Some(old)), Ok(Some(new))) = (
-        crate::model::lease::parse(&held.session),
-        crate::model::lease::parse(session),
-    ) && old.scope == new.scope
-        && (old.generation < new.generation
-            || (old.generation == new.generation && new.frame.is_some() && old.frame < new.frame))
-    {
-        return true;
+        crate::model::lease::parse_transfer(&held.session),
+        crate::model::lease::parse_transfer(session),
+    ) {
+        if old.family == new.family {
+            let layout = |o: &crate::model::lease::Owned<'_>| {
+                o.layout.map(|run| crate::model::lease::Generation {
+                    incarnation: o.generation.incarnation,
+                    run,
+                })
+            };
+            if layout(&old) < layout(&new) {
+                return true;
+            }
+            if layout(&old) > layout(&new) {
+                return false;
+            }
+            if old.scope == new.scope
+                && (old.generation < new.generation
+                    || (old.generation == new.generation
+                        && new.frame.is_some()
+                        && old.frame < new.frame))
+            {
+                return true;
+            }
+        }
+        // Qualified layouts never use the historical idle-time heuristic.
+        if old.layout.is_some() || new.layout.is_some() {
+            return false;
+        }
     }
     let idle_since = held.expires_ms.saturating_sub(LEASE_TTL.as_millis() as u64);
     now.saturating_sub(idle_since) >= SUPERSEDE_IDLE.as_millis() as u64

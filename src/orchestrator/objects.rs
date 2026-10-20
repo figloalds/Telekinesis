@@ -2070,12 +2070,18 @@ pub fn run_lane_with(
     // Either direction's end (cancel, session gone) ends the other.
     let token = cancel.child();
     let leases = (|| -> Result<_, ErrorWire> {
-        let generation = super::lease_clock::next(&ctx)?;
+        let generation = super::lease_clock::pull(&ctx, &peer, &token)?;
         Ok((
             generation,
             [
-                crate::model::lease::qualify(&pull_lease(&peer.installation, lane, 0), generation)?,
-                crate::model::lease::qualify(&pull_lease(&peer.installation, lane, 1), generation)?,
+                crate::model::lease::qualify_pull(
+                    &pull_lease(&peer.installation, lane, 0),
+                    generation,
+                )?,
+                crate::model::lease::qualify_pull(
+                    &pull_lease(&peer.installation, lane, 1),
+                    generation,
+                )?,
             ],
         ))
     })();
