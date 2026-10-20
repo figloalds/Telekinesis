@@ -199,6 +199,7 @@ pub mod faults {
 /// `settings` keys owned by the catalog.
 mod keys {
     pub const INSTALLATION: &str = "installation";
+    pub const OBJECTS_INCARNATION: &str = "objects_incarnation";
     pub const PAIRING: &str = "pairing";
     pub const CATALOG_SCHEMA: &str = "catalog_schema";
     pub const VERIFIER_GENERATION: &str = "verifier_generation";
@@ -305,6 +306,7 @@ struct Request {
 /// while the thread **or** the handle is alive, so a thread that died leaves
 /// the data directory owned by the running daemon (invariant 23).
 pub struct Catalog {
+    lease_incarnation: u64,
     data_directory: PathBuf,
     cell: Arc<Snapshot<CatalogSnapshot>>,
     mailbox: Tracked<Option<Sender<Request>>>,
@@ -339,7 +341,7 @@ impl Catalog {
         let exit = Arc::new(Exit::default());
         let busy_since_ms = Arc::new(AtomicU64::new(0));
         let (mailbox, requests) = mpsc::channel::<Request>();
-        let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<Arc<File>>>(1);
+        let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<(Arc<File>, u64)>>(1);
         let thread = {
             let data = data_directory.clone();
             let cell = cell.clone();
@@ -360,15 +362,16 @@ impl Catalog {
                             return;
                         }
                     };
-                    let _ = opened_tx.send(Ok(actor.lock.clone()));
+                    let _ = opened_tx.send(Ok((actor.lock.clone(), actor.lease_incarnation)));
                     drop(opened_tx);
                     actor.run(requests, &busy);
                 })
                 .context("CATALOG_UNAVAILABLE: cannot spawn the catalog thread")?
         };
         match opened_rx.recv() {
-            Ok(Ok(lock)) => {
+            Ok(Ok((lock, lease_incarnation))) => {
                 let catalog = Arc::new(Catalog {
+                    lease_incarnation,
                     data_directory,
                     cell,
                     mailbox: Tracked::new("catalog.mailbox", Some(mailbox)),
@@ -393,6 +396,12 @@ impl Catalog {
     /// The data directory whose `folders.sqlite` this catalog owns.
     pub fn data_directory(&self) -> &Path {
         &self.data_directory
+    }
+
+    /// Committed with synchronous=FULL before any lane can be started. A
+    /// skipped incarnation after a startup crash is harmless; reuse is not.
+    pub fn lease_incarnation(&self) -> u64 {
+        self.lease_incarnation
     }
 
     /// The per-peer credentials (WP4.1): an O(1) load of what the actor last
@@ -666,6 +675,7 @@ impl Drop for ExitGuard {
 // The actor
 
 struct Actor {
+    lease_incarnation: u64,
     // Field order is drop order: the connection closes before the actor's
     // share of the lock is dropped (the handle holds the other share).
     conn: Connection,
@@ -696,12 +706,28 @@ impl Actor {
             conn.execute(sql::INSERT_INSTALLATION, [id()])?;
             migrate(&mut conn, now_ms())
         })?;
+        let lease_incarnation = with_busy_retries(|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let old = get_setting(&tx, keys::OBJECTS_INCARNATION)?
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .context("CATALOG_UNAVAILABLE: malformed object lease incarnation")?
+                .unwrap_or(0);
+            let next = old
+                .checked_add(1)
+                .context("CATALOG_UNAVAILABLE: object lease incarnation exhausted")?;
+            set_setting(&tx, keys::OBJECTS_INCARNATION, &next.to_string())?;
+            tx.commit()?;
+            Ok(next)
+        })?;
+        fault::trigger("catalog.lease_incarnation_committed")?;
         let first = Arc::new(load_snapshot(&conn, cell.generation() + 1)?);
         let credentials = Arc::new(load_credentials(&conn)?);
         credentials_cell.store_arc(credentials.clone());
         let published = cell.store_arc(first.clone());
         debug_assert_eq!(published, first.generation);
         Ok(Actor {
+            lease_incarnation,
             conn,
             cell,
             current: first,

@@ -1,0 +1,49 @@
+{
+  "date": "2026-10-20",
+  "scope": "WP6.0 format and WP6.1 library foundation; no runtime activation",
+  "source_revision": "02a6f9d0e303a3cf710aaafc19043902f246b289",
+  "source_files_sha256": {
+    "src/lib.rs": "68fb16e1b199d58813c08949b9973bc2a6be10f0ed833ab92b784427c542f1de",
+    "src/model/mod.rs": "391606942cc6c41fb7092ba760f8d08b3597ba523b7d81b527ce3caf9281543a",
+    "src/util/mod.rs": "c092ec6d43e77cb0aa0fed21e62dfaddce2466094a0ded5c1d9bc4c9b8e72a37",
+    "src/model/content.rs": "9a2d4458c5ee8db1c5cf2ae2430507eded239f621ece5d36a75e3495952efd9d",
+    "src/model/workspace.rs": "1f69177006e3e4d70a83d7469b04940f6e2d204498cb2db14019b5ee84e8505b",
+    "src/util/phases.rs": "f846d6846a8c794f97bce97421f573d7131cd4d8e206fab4065ec7400dc69458",
+    "src/content/local.rs": "37b4e7b30ffc8e682710db08235e8350ee5b75ae13b63909a30e3e84d539b214",
+    "src/content/mod.rs": "9ad4482bdd8c02bd9bf7a0ec25e35f29966ce7a25a9c8177e576bfa7daa0016c",
+    "src/content/provider.rs": "ee193232475409431c8d34b9f8a3223ac150ee292e29bb410790b5072861f1c9",
+    "tests/content_format.rs": "0c7b53e708d3b2f8f16d889a225fc5284d94f5c211f7aacf2a56ec4c349a7eed",
+    "tests/content_provider.rs": "5bcda7291ed5a8cf4b0963748c1fae291f63d95e36ba442102261f220b3f7505",
+    "tests/fixtures/content_v1/vectors.json": "3dda04f1ab55c19aee0dedc997603a95a4751342f281f39faf9fa5a9cd506c8a"
+  },
+  "checks": [
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_format --test content_provider -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 15,
+      "ignored": 1
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_provider one_gib_contained_and_cross_boundary_overwrite -- --ignored --exact --test-threads=1",
+      "exit_code": 0,
+      "passed": 1,
+      "ignored": 0,
+      "test_elapsed_s": 3.17
+    },
+    {
+      "command": "cargo clippy --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib --test content_format --test content_provider -- -D warnings",
+      "exit_code": 0
+    }
+  ],
+  "executables_sha256": {
+    "content_format-5ec756c1dcdd9daa.exe": "619970ad7dd2b3d2ffeba945347038accd00eeaa1be27b207fddac29589578d3",
+    "content_provider-dd0e5f7bc806baae.exe": "06dd44cd1113cfba439eecfdc5cc779a5f03608d7e6686848b3152c0ab8db4a5"
+  },
+  "limitations": [
+    "No mounted Wave 6 save path yet",
+    "No GC deletion or durable admission yet",
+    "No full Windows/WSL or integration qualification yet",
+    "Phase counters apply to content foundation only; counters include attempted bytes on failed I/O",
+    "1 GiB source repeats one chunk; tests distinguish logical chunk edits and actual unique CAS writes"
+  ]
+}

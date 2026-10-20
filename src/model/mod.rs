@@ -10,11 +10,15 @@
 //! and `retry_after_ms` and the WP4.1 `token` fields are omitted when `None`.
 //! Golden fixtures for every wire, IPC and status shape live in
 //! `tests/fixtures/contracts/` and are checked by `tests/contracts.rs`.
+pub mod content;
+pub mod content_wire;
 pub mod errors;
 pub mod health;
 pub mod ipc;
+pub mod lease;
 pub mod orchestrator;
 pub mod protocol;
 pub mod status;
+pub mod workspace;
 
 pub use errors::{ErrorClass, ErrorRecord, ErrorWire, Scope, classify, code_of};

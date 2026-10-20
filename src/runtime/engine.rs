@@ -1643,6 +1643,7 @@ impl Engine {
             parent: dir.id.clone(),
             name,
             content: Some(hash(b"")),
+            content_ref: None,
             alive: true,
             revisions: BTreeMap::new(),
             modified_ms: now,

@@ -193,6 +193,9 @@ pub fn handle(ctx: &Arc<Ctx>, peer: &session::AcceptedPeer, req: session::Incomi
         return;
     }
     seen_session(&peer.session);
+    if req.op.starts_with(crate::model::content_wire::PREFIX) {
+        return super::content_transport::handle(ctx, peer, req);
+    }
     match req.op.as_str() {
         ops::OBJECTS_PULL => pull(ctx, peer, req),
         ops::OBJECTS_WANTS => wants(ctx, peer, req),

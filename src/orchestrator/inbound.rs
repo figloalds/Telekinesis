@@ -306,6 +306,7 @@ pub fn start_with(
         counters: Counters::default(),
         next_session: AtomicU64::new(1),
         exchanges: AtomicUsize::new(0),
+        content_exchanges: AtomicUsize::new(0),
         ctx,
     });
     if let Some(poller) = &poller {
@@ -387,7 +388,8 @@ impl InboundServer {
                 let state = inner.state.lock();
                 (state.sessions.len() + state.reserved, state.preauth)
             };
-            let exchanges = inner.exchanges.load(Ordering::Acquire);
+            let exchanges = inner.exchanges.load(Ordering::Acquire)
+                + inner.content_exchanges.load(Ordering::Acquire);
             if sessions == 0 && preauth == 0 && exchanges == 0 {
                 return;
             }
@@ -435,7 +437,8 @@ impl InboundServer {
             sessions_opened: load(&c.sessions_opened),
             rotation_goaways: load(&c.rotation_goaways),
             busy_refusals: load(&c.busy_refusals),
-            exchanges: self.inner.exchanges.load(Ordering::Acquire),
+            exchanges: self.inner.exchanges.load(Ordering::Acquire)
+                + self.inner.content_exchanges.load(Ordering::Acquire),
             sessions,
             preauth,
             preauth_peak: c.preauth_peak.load(Ordering::Relaxed),
@@ -491,6 +494,9 @@ struct Inner {
     next_session: AtomicU64,
     /// Worker-bound exchanges running now, server-wide.
     exchanges: AtomicUsize,
+    /// Bounded v1 frames use their own handler reserve, so stalled legacy
+    /// object streams cannot consume all foreground/completion service.
+    content_exchanges: AtomicUsize,
 }
 
 struct State {
@@ -807,6 +813,7 @@ impl Inner {
             peer: peer.clone(),
             revocation_epoch,
             exchanges: Arc::new(AtomicUsize::new(0)),
+            content_exchanges: Arc::new(AtomicUsize::new(0)),
             exchange_slots: self.exchange_slots(peer.role),
             credential_jobs: Arc::new(AtomicUsize::new(0)),
         }));
@@ -818,6 +825,7 @@ impl Inner {
         drop(registered);
         // The leases of the session's offers end now (CCR-WP5.3-2).
         super::inbound_objects::session_closed(&peer);
+        super::content_transport::session_closed(&self.ctx, &peer.session);
         // The peer unpaired us (its GOAWAY explains the close). A peer we do
         // not dial ourselves shared nothing with us but through these
         // sessions: it is gone, not offline (WP3.INT re-review; the hub
@@ -1369,6 +1377,7 @@ struct SessionHandler {
     revocation_epoch: u64,
     /// Exchanges of this session running now.
     exchanges: Arc<AtomicUsize>,
+    content_exchanges: Arc<AtomicUsize>,
     /// At most this many at once ([`exchange_slots`]).
     exchange_slots: usize,
     /// `peer.enroll` / `peer.revoke` jobs of this session running now (at
@@ -1400,6 +1409,16 @@ impl Handler for SessionHandler {
             ops::PING => req.responder.reply(json!({ "alive": true }), Vec::new()),
             ops::CATALOG_LIST => catalog_list(&self.inner.ctx, req),
             ops::META_EXCHANGE => self.exchange(req, meta_exchange),
+            crate::model::content_wire::ACK => {
+                super::content_transport::handle(&self.inner.ctx, &self.peer, req)
+            }
+            op if op.starts_with(crate::model::content_wire::PREFIX) => {
+                let ctx = self.inner.ctx.clone();
+                let peer = self.peer.clone();
+                self.job_slots(req, true, move |req| {
+                    super::content_transport::handle(&ctx, &peer, req)
+                });
+            }
             op if op.starts_with("objects.") => self.exchange(req, objects),
             peer_auth::ops::PEER_ENROLL | peer_auth::ops::PEER_REVOKE
                 if self.inner.ctx.catalog.credentials().is_some() =>
@@ -1458,7 +1477,16 @@ impl SessionHandler {
     /// Runs `run` on a thread of its own, holding an exchange slot of the
     /// session and of the server (`BUSY` when either is full).
     fn job(&self, req: Incoming, run: impl FnOnce(Incoming) + Send + 'static) {
-        let guard = match SlotGuard::take(&self.inner, &self.exchanges, self.exchange_slots) {
+        self.job_slots(req, false, run);
+    }
+
+    fn job_slots(&self, req: Incoming, content: bool, run: impl FnOnce(Incoming) + Send + 'static) {
+        let counter = if content {
+            &self.content_exchanges
+        } else {
+            &self.exchanges
+        };
+        let guard = match SlotGuard::take(&self.inner, counter, self.exchange_slots, content) {
             Ok(guard) => guard,
             Err(detail) => {
                 self.inner
@@ -1557,6 +1585,7 @@ impl SessionHandler {
 struct SlotGuard {
     inner: Arc<Inner>,
     session: Arc<AtomicUsize>,
+    content: bool,
 }
 
 impl SlotGuard {
@@ -1565,6 +1594,7 @@ impl SlotGuard {
         inner: &Arc<Inner>,
         session: &Arc<AtomicUsize>,
         session_slots: usize,
+        content: bool,
     ) -> Result<SlotGuard, String> {
         if session.fetch_add(1, Ordering::AcqRel) >= session_slots {
             session.fetch_sub(1, Ordering::AcqRel);
@@ -1572,9 +1602,13 @@ impl SlotGuard {
                 "{session_slots} exchanges of this session are already running"
             ));
         }
-        let limit = inner.options.max_exchanges;
-        if inner.exchanges.fetch_add(1, Ordering::AcqRel) >= limit {
-            inner.exchanges.fetch_sub(1, Ordering::AcqRel);
+        let (counter, limit) = if content {
+            (&inner.content_exchanges, 8)
+        } else {
+            (&inner.exchanges, inner.options.max_exchanges)
+        };
+        if counter.fetch_add(1, Ordering::AcqRel) >= limit {
+            counter.fetch_sub(1, Ordering::AcqRel);
             session.fetch_sub(1, Ordering::AcqRel);
             return Err(format!(
                 "{limit} exchanges are already running on this orchestrator"
@@ -1583,6 +1617,7 @@ impl SlotGuard {
         Ok(SlotGuard {
             inner: inner.clone(),
             session: session.clone(),
+            content,
         })
     }
 }
@@ -1590,7 +1625,12 @@ impl SlotGuard {
 impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.session.fetch_sub(1, Ordering::AcqRel);
-        self.inner.exchanges.fetch_sub(1, Ordering::AcqRel);
+        let counter = if self.content {
+            &self.inner.content_exchanges
+        } else {
+            &self.inner.exchanges
+        };
+        counter.fetch_sub(1, Ordering::AcqRel);
         self.inner.changed.poke();
     }
 }

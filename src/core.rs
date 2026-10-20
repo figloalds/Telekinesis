@@ -22,7 +22,9 @@ use std::{
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+pub mod admission;
 pub mod commit;
+pub mod content_objects;
 pub mod demand;
 pub mod derive;
 pub mod inbox;
@@ -228,6 +230,8 @@ pub struct Entry {
     pub parent: String,
     pub name: String,
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_ref: Option<crate::model::content::FileContentRef>,
     pub alive: bool,
     pub revisions: BTreeMap<String, String>,
     pub modified_ms: u64,
@@ -237,6 +241,29 @@ pub struct Entry {
     pub basic: Option<BasicInfo>,
 }
 impl Entry {
+    /// Keep the old string field's meaning unchanged. Typed descriptors have a
+    /// separate projection field and never masquerade as whole-file hashes.
+    pub(crate) fn set_content_value(&mut self, value: &Value) -> Result<()> {
+        if let Some(object) = value.as_str() {
+            self.content = Some(object.to_owned());
+            self.content_ref = None;
+        } else {
+            let reference: crate::model::content::FileContentRef =
+                serde_json::from_value(value.clone()).context("INVALID_CONTENT")?;
+            reference.validate()?;
+            self.content = None;
+            self.content_ref = Some(reference);
+        }
+        Ok(())
+    }
+
+    pub fn content_value(&self) -> Option<Value> {
+        self.content_ref
+            .as_ref()
+            .map(|reference| json!(reference))
+            .or_else(|| self.content.as_ref().map(|object| json!(object)))
+    }
+
     pub fn basic_info(&self) -> BasicInfo {
         let mut basic = self.basic.unwrap_or(BasicInfo {
             posix_mode: None,
@@ -415,6 +442,8 @@ impl Store {
         objects::ensure_schema(&mut store)?;
         inbox::ensure_schema(&mut store)?;
         sharing::ensure_schema(&mut store)?;
+        admission::ensure_schema(&store.db)?;
+        content_objects::ensure_schema(&store.db)?;
         objects::startup_object_check(&mut store, options.verify)?;
         crate::startup::progress("validating journal");
         store.evacuate_unvalidated_journal()?;
@@ -1134,12 +1163,12 @@ impl Store {
                     value,
                 });
             }
-            if let Some(h) = &entry.content {
+            if let Some(value) = entry.content_value() {
                 changes.push(Change {
                     entity: entry.id.clone(),
                     field: "content".into(),
                     parents: vec![],
-                    value: json!(h),
+                    value,
                 });
             }
         }
@@ -1377,12 +1406,12 @@ impl Store {
                     value,
                 });
             }
-            if let Some(h) = &entry.content {
+            if let Some(value) = entry.content_value() {
                 changes.push(Change {
                     entity: entry.id.clone(),
                     field: "content".into(),
                     parents: vec![],
-                    value: json!(h),
+                    value,
                 });
             }
         }

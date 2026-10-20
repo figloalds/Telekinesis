@@ -1,0 +1,940 @@
+{
+  "label": "native-wave6-baseline",
+  "passed": true,
+  "host": "FIGLOALDS",
+  "platform": "Windows-11-10.0.26300-SP0",
+  "cpu_count": 32,
+  "source_revision": "02a6f9d0e303a3cf710aaafc19043902f246b289",
+  "source_diff_sha256": "0becbe9b011987a34f5b68019d804688c525e5349713f99ea5085834983f7239",
+  "harness_sha256": "99d95f601a09e739d2209884f0879086d958599eeb10342c26db747f67f969ad",
+  "dotnet": ".NET SDK:\n Version:           11.0.100-rc.2.26504.105\n Commit:            820230c386\n Workload version:  11.0.100-manifests.939e2b91\n MSBuild version:   18.12.0-1.26504.105+820230c38\n\nRuntime Environment:\n OS Name:     Windows\n OS Version:  10.0.26300\n OS Platform: Windows\n RID:         win-x64\n Base Path:   C:\\Program Files\\dotnet\\sdk\\11.0.100-rc.2.26504.105\n\n.NET workloads installed:\nN\u00e3o h\u00e1 cargas de trabalho instaladas para exibir.\nConfigurado para\u00a0usar workload sets ao instalar novos manifestos.\nNenhum conjunto de\u00a0cargas de trabalho est\u00e1 instalado. Execute \"dotnet workload restore\" para instalar um conjunto de\u00a0cargas de trabalho.\n\nHost:\n  Version:      11.0.0-rc.2.26504.105\n  Architecture: x64\n  Commit:       820230c386\n\n.NET SDKs installed:\n  6.0.428 [C:\\Program Files\\dotnet\\sdk]\n  10.0.303 [C:\\Program Files\\dotnet\\sdk]\n  11.0.100-rc.2.26504.105 [C:\\Program Files\\dotnet\\sdk]\n\n.NET runtimes installed:\n  Microsoft.AspNetCore.All 2.1.30 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.All]\n  Microsoft.AspNetCore.App 2.1.30 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 3.1.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 6.0.36 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 8.0.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 10.0.11 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 10.0.12 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 10.0.13 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.AspNetCore.App 11.0.0-rc.2.26504.105 [C:\\Program Files\\dotnet\\shared\\Microsoft.AspNetCore.App]\n  Microsoft.NETCore.App 2.1.30 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 3.1.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 6.0.23 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 6.0.36 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 8.0.31 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 8.0.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 10.0.11 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 10.0.12 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 10.0.13 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.NETCore.App 11.0.0-rc.2.26504.105 [C:\\Program Files\\dotnet\\shared\\Microsoft.NETCore.App]\n  Microsoft.WindowsDesktop.App 3.1.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 6.0.23 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 6.0.36 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 8.0.31 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 8.0.32 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 10.0.11 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 10.0.12 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 10.0.13 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n  Microsoft.WindowsDesktop.App 11.0.0-rc.2.26504.105 [C:\\Program Files\\dotnet\\shared\\Microsoft.WindowsDesktop.App]\n\nOther architectures found:\n  x86   [C:\\Program Files (x86)\\dotnet]\n    registered at [HKLM\\SOFTWARE\\dotnet\\Setup\\InstalledVersions\\x86\\InstallLocation]\n\nEnvironment variables:\n  Not set\n\nglobal.json file:\n  Not found\n\nLearn more:\n  https://aka.ms/dotnet/info\n\nDownload .NET:\n  https://aka.ms/dotnet/download",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "run": "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis\\test-runs\\wave6-build\\f48441c6-a883-40f7-81f6-78853bd4c1eb",
+  "configuration": {
+    "label": "native-wave6-baseline",
+    "exe": "None",
+    "output": "C:\\Users\\felyp\\Desktop\\Projetos\\Telekinesis\\test-runs\\wave6-build",
+    "runs": 5,
+    "projects": 8,
+    "files": 128,
+    "jobs": 4,
+    "framework": "net10.0",
+    "antivirus_policy": "Host policy unchanged; no exclusions added",
+    "fence_probe": false
+  },
+  "cache": "warm; OS cache not flushed",
+  "sync": "none",
+  "durability": "default TKFS FULL SQLite, native close may be weaker; no explicit fsync",
+  "not_measured": [
+    "cold cache",
+    "explicit fsync workload",
+    "sync load",
+    "user real solution",
+    "IDE/watch",
+    "interrupted build"
+  ],
+  "samples": [
+    {
+      "scenario": "clean",
+      "repetition": 0,
+      "warmup": true,
+      "elapsed_ms": 4315.136799996253,
+      "changed_targets": [
+        "App/obj/Release/net10.0/App.dll",
+        "Lib0/obj/Release/net10.0/Lib0.dll",
+        "Lib1/obj/Release/net10.0/Lib1.dll",
+        "Lib2/obj/Release/net10.0/Lib2.dll",
+        "Lib3/obj/Release/net10.0/Lib3.dll",
+        "Lib4/obj/Release/net10.0/Lib4.dll",
+        "Lib5/obj/Release/net10.0/Lib5.dll",
+        "Lib6/obj/Release/net10.0/Lib6.dll",
+        "Lib7/obj/Release/net10.0/Lib7.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471764376035400,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471761484017100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471761474517900,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471761474517900,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471761474517900,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471762514672500,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471763482342800,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471762561188600,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471762504672500,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "clean",
+      "repetition": 1,
+      "warmup": false,
+      "elapsed_ms": 4347.596499996143,
+      "changed_targets": [
+        "App/obj/Release/net10.0/App.dll",
+        "Lib0/obj/Release/net10.0/Lib0.dll",
+        "Lib1/obj/Release/net10.0/Lib1.dll",
+        "Lib2/obj/Release/net10.0/Lib2.dll",
+        "Lib3/obj/Release/net10.0/Lib3.dll",
+        "Lib4/obj/Release/net10.0/Lib4.dll",
+        "Lib5/obj/Release/net10.0/Lib5.dll",
+        "Lib6/obj/Release/net10.0/Lib6.dll",
+        "Lib7/obj/Release/net10.0/Lib7.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471769144056300,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471766235668000,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471766215167200,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471766256669500,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471766234668200,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471767243805800,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471768192940600,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471767260313500,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471767250802700,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "clean",
+      "repetition": 2,
+      "warmup": false,
+      "elapsed_ms": 4297.337700001663,
+      "changed_targets": [
+        "App/obj/Release/net10.0/App.dll",
+        "Lib0/obj/Release/net10.0/Lib0.dll",
+        "Lib1/obj/Release/net10.0/Lib1.dll",
+        "Lib2/obj/Release/net10.0/Lib2.dll",
+        "Lib3/obj/Release/net10.0/Lib3.dll",
+        "Lib4/obj/Release/net10.0/Lib4.dll",
+        "Lib5/obj/Release/net10.0/Lib5.dll",
+        "Lib6/obj/Release/net10.0/Lib6.dll",
+        "Lib7/obj/Release/net10.0/Lib7.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471773871567800,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471771003715300,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471770987715400,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471771001216400,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471771000215500,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471772015319000,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471772962979400,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471772003318900,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471772018319000,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "clean",
+      "repetition": 3,
+      "warmup": false,
+      "elapsed_ms": 4331.6878999976325,
+      "changed_targets": [
+        "App/obj/Release/net10.0/App.dll",
+        "Lib0/obj/Release/net10.0/Lib0.dll",
+        "Lib1/obj/Release/net10.0/Lib1.dll",
+        "Lib2/obj/Release/net10.0/Lib2.dll",
+        "Lib3/obj/Release/net10.0/Lib3.dll",
+        "Lib4/obj/Release/net10.0/Lib4.dll",
+        "Lib5/obj/Release/net10.0/Lib5.dll",
+        "Lib6/obj/Release/net10.0/Lib6.dll",
+        "Lib7/obj/Release/net10.0/Lib7.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471778632412500,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471775728050800,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471775739068500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471775732550500,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471775756583500,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471776758705900,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471777704301300,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471776798714400,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471776807715200,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "clean",
+      "repetition": 4,
+      "warmup": false,
+      "elapsed_ms": 4363.486300004297,
+      "changed_targets": [
+        "App/obj/Release/net10.0/App.dll",
+        "Lib0/obj/Release/net10.0/Lib0.dll",
+        "Lib1/obj/Release/net10.0/Lib1.dll",
+        "Lib2/obj/Release/net10.0/Lib2.dll",
+        "Lib3/obj/Release/net10.0/Lib3.dll",
+        "Lib4/obj/Release/net10.0/Lib4.dll",
+        "Lib5/obj/Release/net10.0/Lib5.dll",
+        "Lib6/obj/Release/net10.0/Lib6.dll",
+        "Lib7/obj/Release/net10.0/Lib7.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471783371127700,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471780434171600,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471780437171500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471780436671800,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471780433171900,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471781488926800,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471782446041500,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471781492425500,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471781484925000,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "clean",
+      "repetition": 5,
+      "warmup": false,
+      "elapsed_ms": 4299.189500001376,
+      "changed_targets": [
+        "App/obj/Release/net10.0/App.dll",
+        "Lib0/obj/Release/net10.0/Lib0.dll",
+        "Lib1/obj/Release/net10.0/Lib1.dll",
+        "Lib2/obj/Release/net10.0/Lib2.dll",
+        "Lib3/obj/Release/net10.0/Lib3.dll",
+        "Lib4/obj/Release/net10.0/Lib4.dll",
+        "Lib5/obj/Release/net10.0/Lib5.dll",
+        "Lib6/obj/Release/net10.0/Lib6.dll",
+        "Lib7/obj/Release/net10.0/Lib7.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "noop",
+      "repetition": 0,
+      "warmup": true,
+      "elapsed_ms": 447.3597000032896,
+      "changed_targets": [],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "noop",
+      "repetition": 1,
+      "warmup": false,
+      "elapsed_ms": 452.0544999977574,
+      "changed_targets": [],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "noop",
+      "repetition": 2,
+      "warmup": false,
+      "elapsed_ms": 443.92290000541834,
+      "changed_targets": [],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "noop",
+      "repetition": 3,
+      "warmup": false,
+      "elapsed_ms": 433.0351000025985,
+      "changed_targets": [],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "noop",
+      "repetition": 4,
+      "warmup": false,
+      "elapsed_ms": 428.71979999472387,
+      "changed_targets": [],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "noop",
+      "repetition": 5,
+      "warmup": false,
+      "elapsed_ms": 427.92690000351286,
+      "changed_targets": [],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471785230098100,
+          "sha256": "f761c00feb48d0cb52fd9f5f75b3d2498b02d3985270e8b6cdff1e2ca545c391"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "incremental",
+      "repetition": 0,
+      "warmup": true,
+      "elapsed_ms": 1359.0866000013193,
+      "changed_targets": [
+        "Lib0/obj/Release/net10.0/Lib0.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471793526149700,
+          "sha256": "a6a06a6ef5128a5f82bf14af3bc8c5d20d46899aa6d779ae0b77ebbc698088bb"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "incremental",
+      "repetition": 1,
+      "warmup": false,
+      "elapsed_ms": 1337.3751000035554,
+      "changed_targets": [
+        "Lib0/obj/Release/net10.0/Lib0.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471794931549800,
+          "sha256": "30e64aa324d204cb6c65a96f4fec2ef1ede8ec13aa46d148a1aa2239199e803b"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "incremental",
+      "repetition": 2,
+      "warmup": false,
+      "elapsed_ms": 1340.3345999977319,
+      "changed_targets": [
+        "Lib0/obj/Release/net10.0/Lib0.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471796373290800,
+          "sha256": "c8c8766214d04836588c49b6ffa39232c5c686c10068ef4c654c44e90bb56630"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "incremental",
+      "repetition": 3,
+      "warmup": false,
+      "elapsed_ms": 1340.219400000933,
+      "changed_targets": [
+        "Lib0/obj/Release/net10.0/Lib0.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471797812314200,
+          "sha256": "6ca45685f573239b3fb409de81973885592e75acaaa69492391d52795b01236c"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "incremental",
+      "repetition": 4,
+      "warmup": false,
+      "elapsed_ms": 1331.5098000020953,
+      "changed_targets": [
+        "Lib0/obj/Release/net10.0/Lib0.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471799237628700,
+          "sha256": "918dae9324814b2bd86bdba698bcac180367d5eb421fa00da91d21f1181d6fdc"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    },
+    {
+      "scenario": "incremental",
+      "repetition": 5,
+      "warmup": false,
+      "elapsed_ms": 1342.6145999983419,
+      "changed_targets": [
+        "Lib0/obj/Release/net10.0/Lib0.dll"
+      ],
+      "outputs": {
+        "App/obj/Release/net10.0/App.dll": {
+          "mtime_ns": 1792471788120503900,
+          "sha256": "8a9a64b026685c85e7bbbf29c768e33bf6c1c73feb798889749def89e02c0c7f"
+        },
+        "Lib0/obj/Release/net10.0/Lib0.dll": {
+          "mtime_ns": 1792471800674595500,
+          "sha256": "ec39203e63a1ec03f539acbb34185296a053115dbeaec9423cef4068f4e3cf14"
+        },
+        "Lib1/obj/Release/net10.0/Lib1.dll": {
+          "mtime_ns": 1792471785208097500,
+          "sha256": "0ed2efa9d1fa5d8b944abcb6a183dc7d22aa2f5629baf551720c524693cd2469"
+        },
+        "Lib2/obj/Release/net10.0/Lib2.dll": {
+          "mtime_ns": 1792471785226097700,
+          "sha256": "0984124a0c73597889d58d86d409ea5bf354319b5fe548debec2fa65d1894137"
+        },
+        "Lib3/obj/Release/net10.0/Lib3.dll": {
+          "mtime_ns": 1792471785205098100,
+          "sha256": "7de390e3b46edb822906752f4c32cdae236ea84df8792614549a99cc48ad455e"
+        },
+        "Lib4/obj/Release/net10.0/Lib4.dll": {
+          "mtime_ns": 1792471786221787400,
+          "sha256": "8e3b4f123cd13d2575de812ba2f3550b4a9731f4498ae97f458f875476949779"
+        },
+        "Lib5/obj/Release/net10.0/Lib5.dll": {
+          "mtime_ns": 1792471787185894000,
+          "sha256": "96389630ed31464060a5ed386558901e532c71486f029360b8c3b55bf13d1437"
+        },
+        "Lib6/obj/Release/net10.0/Lib6.dll": {
+          "mtime_ns": 1792471786208287800,
+          "sha256": "8cad61ec1020bfa4c33daef4100c056425686410cadeec0095880fda8b3883eb"
+        },
+        "Lib7/obj/Release/net10.0/Lib7.dll": {
+          "mtime_ns": 1792471786219787300,
+          "sha256": "3595ab9d60b736d0708c268043b436a8392c815d437eca27571f877ed8cfa298"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "clean": {
+      "median_ms": 4331.6878999976325,
+      "min_ms": 4297.337700001663,
+      "max_ms": 4363.486300004297,
+      "samples": 5
+    },
+    "noop": {
+      "median_ms": 433.0351000025985,
+      "min_ms": 427.92690000351286,
+      "max_ms": 452.0544999977574,
+      "samples": 5
+    },
+    "incremental": {
+      "median_ms": 1340.219400000933,
+      "min_ms": 1331.5098000020953,
+      "max_ms": 1342.6145999983419,
+      "samples": 5
+    }
+  }
+}

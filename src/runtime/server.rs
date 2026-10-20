@@ -964,6 +964,7 @@ impl Core {
             };
         }
         self.ctx.stopping.store(true, Ordering::SeqCst);
+        super::content_rpc::stop(&self.ctx);
         self.stop.poke();
         Ok(reply)
     }

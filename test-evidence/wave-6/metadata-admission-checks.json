@@ -1,0 +1,85 @@
+{
+  "date": "2026-10-20",
+  "source_revision": "02a6f9d0e303a3cf710aaafc19043902f246b289",
+  "working_tree_source_sha256": "0dd67c4adfc9116847784cdd76b10bfe9ecfd8f514d79c3d101a5a35a6d36026",
+  "source_files_sha256": {
+    "src/content/walk.rs": "d3ca087fea83ad6b89f31816b454ed4b744ac6304cd259e3ca08dacb077d8a2c",
+    "src/core/admission.rs": "b3787f53d83e5f86955f137957948ba5fdd8d6f644c21a521825a88039e0eba7",
+    "src/core/commit.rs": "91a3e2226b1617a0a8549ac4592a8ea6c5cfa043b24aa06bf3c833479ad688c4",
+    "src/core/derive.rs": "9c52d5abebe02ee7a0c27e8a800cdb08a73637751d9358932d9db8d9c66e8e7f",
+    "src/core/inbox.rs": "caba15a380bf0d43575ea8a02eb27ab3d2598f8207da2bfe8ac5cc3abb67fc49",
+    "src/core.rs": "2dc2752b376b13be796cc123cdceb7af3520086a90cbb262bf232f517eb8ca4c",
+    "src/model/content.rs": "f6f546df867af1a8d0a39f6e6f8f189aaf2b044b4f765a8cec08ff2b5a286965",
+    "src/model/errors.rs": "badb2c3323b85232606ba65dd9eec571cffce758eab1ed36990aba6335a92871",
+    "src/model/workspace.rs": "5fbde4e1450c2ae5f5acee67fed148a8f1b43e776a9e9785c986a84d23ec76d4",
+    "src/worker/maintenance.rs": "1856dac89ebadd9616a8476bd149e2ba1a09a4eefdafea24adc8c8b1cbe6771b"
+  },
+  "scope": "WP6.1 traversal and WP6.2 metadata/admission checkpoint; full Wave 6 incomplete",
+  "checks": [
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_admission --test content_provider --test content_format --test availability_index --test offlock_commit --test activation_inbox --test contracts --test startup_snapshots -- --test-threads=1",
+      "exit_code": 1,
+      "reason": "Initial contract registry audit: new content codes not registered and historical row count changed. Corrected with an explicit Wave 6 extension; the historical table is preserved. Cargo stopped before offlock/startup targets."
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test contracts --test offlock_commit --test startup_snapshots --test content_admission --test content_format -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 83,
+      "ignored": 1
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_provider -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 11,
+      "ignored": 1
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib core::commit::tests -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 7,
+      "ignored": 0
+    },
+    {
+      "command": "cargo clippy --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib --test contracts --test content_admission --test content_format --test content_provider -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --all --check; git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "latest_successful_test_counts": {
+    "activation_inbox": 22,
+    "availability_index": 23,
+    "content_admission": 8,
+    "content_format": 6,
+    "content_provider": 11,
+    "contracts": 41,
+    "offlock_commit": 20,
+    "startup_snapshots": 8
+  },
+  "unique_integration_tests_passed": 139,
+  "commit_unit_tests_passed": 7,
+  "ignored": [
+    "offlock_commit::prepared_commits_300_seeds_release",
+    "content_provider::one_gib_contained_and_cross_boundary_overwrite (separate earlier foundation run passed; not rerun at this checkpoint)"
+  ],
+  "source_identity_note": "Source manifest collected after checks. Activation/availability passed in the initial invocation before the error catalog extension; remaining targets and provider were run again afterward. Core storage/derivation behavior was unchanged by that classification-only fix. This is package evidence, not a final all-source integration qualification.",
+  "executables_sha256": {
+    "activation_inbox-f9563928aadfdadb.exe": "d2cfc9b2d52138e0c566270f32a1f3e1160613223b17601faf5d3d2e89494635",
+    "availability_index-5c7591491a7b7792.exe": "b60f75310f477d129e0d806dcedc30143f1b6ffad9cb7ca630ae316e7cce9f85",
+    "content_admission-57d7985a4febfeb7.exe": "320c55c9ebaf102e51d5a76583b67b8a930f9db7be0e6e1b524e1c3584f5a45a",
+    "content_format-5ec756c1dcdd9daa.exe": "866561434e7578aa124dd5332dd1b1f0045beeb9df9025ed626fd79003d47e31",
+    "content_provider-dd0e5f7bc806baae.exe": "24a09bef1e642c325f773b8ab08931a4c3649231fbc6a830ccb11bb86aaae3c4",
+    "contracts-299e0621d4b830f3.exe": "3afb6b07230cc42e581144fd8f283721b0cc63c7ef536a846ca8f30b29144867",
+    "offlock_commit-06045d8df989ebd0.exe": "751dcf10a82e696e5a3148e258aafdfec25c1fe2de6928a267fe6065f708cae3",
+    "startup_snapshots-3b1c66dccddea106.exe": "4a01fbc47f0f166da9988b8c0f878dcb66751523e7e8150ab4e5a02c7cb5d042"
+  },
+  "limits": [
+    "New-format metadata is fixture-gated; no activation CLI or peer capability negotiation yet",
+    "No mounted v1 write-session path or save recovery yet",
+    "No new typed object transport or foreground demand scheduler yet",
+    "GC/deletion is not exposed; durable roots are retained conservatively",
+    "Full Windows/WSL release and performance gates remain outstanding"
+  ]
+}

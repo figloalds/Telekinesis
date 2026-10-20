@@ -1,0 +1,240 @@
+{
+  "seed": 600,
+  "input_bytes": 8388608,
+  "input_sha256": "b4a07de3586079d546577ce8ccea2268add3fc188626d23cda2d7d11adda411f",
+  "selected_chunk_size": 65536,
+  "kind": "deterministic representation simulation",
+  "results": [
+    {
+      "chunk_size": 16384,
+      "workload": "aligned_overwrite_4k",
+      "old_chunks": 512,
+      "new_chunks": 512,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 16384,
+      "reused_chunks": 511,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 16384,
+      "workload": "boundary_overwrite_4k",
+      "old_chunks": 512,
+      "new_chunks": 512,
+      "new_unique_chunks": 2,
+      "new_unique_data_bytes": 32768,
+      "reused_chunks": 510,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 16384,
+      "workload": "beginning_insertion_4k",
+      "old_chunks": 512,
+      "new_chunks": 513,
+      "new_unique_chunks": 513,
+      "new_unique_data_bytes": 8392704,
+      "reused_chunks": 0,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 16384,
+      "workload": "middle_insertion_4k",
+      "old_chunks": 512,
+      "new_chunks": 513,
+      "new_unique_chunks": 257,
+      "new_unique_data_bytes": 4198400,
+      "reused_chunks": 256,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 16384,
+      "workload": "append_4k",
+      "old_chunks": 512,
+      "new_chunks": 513,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 4096,
+      "reused_chunks": 512,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 16384,
+      "workload": "truncate_4k",
+      "old_chunks": 512,
+      "new_chunks": 512,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 12288,
+      "reused_chunks": 511,
+      "full_reimport_hash_bytes": 8384512,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 16384,
+      "workload": "atomic_replace_identical",
+      "old_chunks": 512,
+      "new_chunks": 512,
+      "new_unique_chunks": 0,
+      "new_unique_data_bytes": 0,
+      "reused_chunks": 512,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "aligned_overwrite_4k",
+      "old_chunks": 128,
+      "new_chunks": 128,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 65536,
+      "reused_chunks": 127,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "boundary_overwrite_4k",
+      "old_chunks": 128,
+      "new_chunks": 128,
+      "new_unique_chunks": 2,
+      "new_unique_data_bytes": 131072,
+      "reused_chunks": 126,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "beginning_insertion_4k",
+      "old_chunks": 128,
+      "new_chunks": 129,
+      "new_unique_chunks": 129,
+      "new_unique_data_bytes": 8392704,
+      "reused_chunks": 0,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "middle_insertion_4k",
+      "old_chunks": 128,
+      "new_chunks": 129,
+      "new_unique_chunks": 65,
+      "new_unique_data_bytes": 4198400,
+      "reused_chunks": 64,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "append_4k",
+      "old_chunks": 128,
+      "new_chunks": 129,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 4096,
+      "reused_chunks": 128,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "truncate_4k",
+      "old_chunks": 128,
+      "new_chunks": 128,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 61440,
+      "reused_chunks": 127,
+      "full_reimport_hash_bytes": 8384512,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 65536,
+      "workload": "atomic_replace_identical",
+      "old_chunks": 128,
+      "new_chunks": 128,
+      "new_unique_chunks": 0,
+      "new_unique_data_bytes": 0,
+      "reused_chunks": 128,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "aligned_overwrite_4k",
+      "old_chunks": 32,
+      "new_chunks": 32,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 262144,
+      "reused_chunks": 31,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "boundary_overwrite_4k",
+      "old_chunks": 32,
+      "new_chunks": 32,
+      "new_unique_chunks": 2,
+      "new_unique_data_bytes": 524288,
+      "reused_chunks": 30,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "beginning_insertion_4k",
+      "old_chunks": 32,
+      "new_chunks": 33,
+      "new_unique_chunks": 33,
+      "new_unique_data_bytes": 8392704,
+      "reused_chunks": 0,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "middle_insertion_4k",
+      "old_chunks": 32,
+      "new_chunks": 33,
+      "new_unique_chunks": 17,
+      "new_unique_data_bytes": 4198400,
+      "reused_chunks": 16,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "append_4k",
+      "old_chunks": 32,
+      "new_chunks": 33,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 4096,
+      "reused_chunks": 32,
+      "full_reimport_hash_bytes": 8392704,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "truncate_4k",
+      "old_chunks": 32,
+      "new_chunks": 32,
+      "new_unique_chunks": 1,
+      "new_unique_data_bytes": 258048,
+      "reused_chunks": 31,
+      "full_reimport_hash_bytes": 8384512,
+      "manifest_bytes": "not simulated"
+    },
+    {
+      "chunk_size": 262144,
+      "workload": "atomic_replace_identical",
+      "old_chunks": 32,
+      "new_chunks": 32,
+      "new_unique_chunks": 0,
+      "new_unique_data_bytes": 0,
+      "reused_chunks": 32,
+      "full_reimport_hash_bytes": 8388608,
+      "manifest_bytes": "not simulated"
+    }
+  ]
+}

@@ -593,6 +593,11 @@ impl Store {
         allowed: &BTreeSet<String>,
         strict: bool,
     ) -> Result<StageOutcome> {
+        // Unsupported valid content stays unacknowledged at the sender. Do not
+        // stage it into the corruption/quarantine state machine.
+        for item in &events {
+            self.check_content_capability(&item.event)?;
+        }
         let view = self.keep_view();
         // A large page is staged with a page cache sized for the inbox's
         // random-key indexes, for this call only (CCR-WP2.5-6): with SQLite's
@@ -988,6 +993,16 @@ impl Store {
     }
     /// Classify a failure of row `id`: transient → `retry`, else quarantine.
     fn fail(&mut self, id: &str, error: anyhow::Error) -> Result<Attempt> {
+        if ErrorWire::from_error(&error).class == ErrorClass::Incompatible {
+            // A valid unsupported representation is retained without an
+            // acknowledgement or a corruption verdict. Retry slowly so an
+            // explicit upgrade/activation can release it later.
+            let wire = ErrorWire::from_error(&error).with_retry_after(60_000);
+            self.db.execute("UPDATE incoming_events SET state='retry',attempts=coalesce(attempts,0)+1,
+                retry_at_ms=?,code=?,error_class='incompatible',error=NULL,blocked_on=NULL WHERE id=?",
+                params![time() as i64 + 60_000,wire.code,id])?;
+            return Ok(Attempt::Retried(wire));
+        }
         if is_transient(&error) {
             return self.retry(id, &error);
         }
@@ -1468,7 +1483,11 @@ impl Store {
     /// (CCR-WP0.INT-5: no deferred read-then-write upgrade that fails with
     /// `SQLITE_BUSY` when another connection writes), else a savepoint inside
     /// the caller's transaction. Any failure rolls back and drops the view.
-    fn with_write<T>(&mut self, name: &str, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+    pub(super) fn with_write<T>(
+        &mut self,
+        name: &str,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         // A view still holding a commit rolled back around the store is not
         // kept (`commit` module docs, "Rolled-back commits and the view").
         self.drop_rolled_back_view();
@@ -2089,6 +2108,9 @@ fn check_link(
 /// I/O, full, out-of-memory and cannot-open errors, and any `std::io` error.
 /// Everything else (validation, malformed payloads) is a quarantine.
 fn is_transient(error: &anyhow::Error) -> bool {
+    if code_of(error) == "STALE_METADATA_PREPARATION" {
+        return true;
+    }
     error.chain().any(|cause| {
         if let Some(rusqlite::Error::SqliteFailure(failure, _)) = cause.downcast_ref() {
             return matches!(

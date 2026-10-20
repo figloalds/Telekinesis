@@ -4937,7 +4937,31 @@ fn a_pull_never_carries_more_items_than_the_acceptor_takes() {
         })
         .collect();
     assert!(refused.is_empty(), "{refused:?}");
-    assert!(done, "never installed");
+    if !done {
+        // Preserve bounded state for an intermittent cross-source handoff
+        // failure; a later isolated pass does not explain the failed run.
+        let missing: Vec<_> = hashes
+            .iter()
+            .filter(|hash| !to_b.worker.has(hash))
+            .collect();
+        let mut held_by = BTreeMap::<String, usize>::new();
+        let state = to_b.worker.state.lock().unwrap();
+        for (owner, _) in state.leases.values() {
+            *held_by.entry(owner.clone()).or_default() += 1;
+        }
+        let mut errors = BTreeMap::<String, usize>::new();
+        for fin in to_c.world.finished() {
+            if let Some(error) = fin.error {
+                *errors.entry(error.code).or_default() += 1;
+            }
+        }
+        panic!(
+            "never installed: missing={}, sample={:?}, leased_by={held_by:?}, exchange_errors={errors:?}, want_calls={}",
+            missing.len(),
+            missing.iter().take(8).collect::<Vec<_>>(),
+            to_b.worker.want_calls.load(Ordering::Relaxed)
+        );
+    }
     assert!(
         took < Duration::from_secs(15),
         "installed only after {took:?}"

@@ -171,7 +171,18 @@ pub fn op_allowed(op: &str, role: LaneRole) -> bool {
 /// `objects.exchange` had 16 MiB too until its removal (CCR-WP4.5-1: an
 /// acceptor reassembled up to 16 MiB of a request it then refused).
 pub fn max_body(op: &str) -> usize {
-    if op == ops::META_EXCHANGE {
+    if matches!(
+        op,
+        super::content_wire::READ
+            | super::content_wire::COMPLETE
+            | super::content_wire::LEGACY_READ
+    ) {
+        super::content_wire::FRAME_BYTES
+    } else if op == super::content_wire::LEGACY_PULL {
+        super::content_wire::LEGACY_BYTES
+    } else if op.starts_with(super::content_wire::PREFIX) {
+        0
+    } else if op == ops::META_EXCHANGE {
         frame::MAX_BODY_META
     } else {
         frame::MAX_CHUNK

@@ -777,6 +777,21 @@ impl SessionWorkerClient {
         }
     }
 
+    pub(crate) fn request_cancellable(
+        &self,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+        deadline: Duration,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SessionReply, CallError> {
+        if cancelled() {
+            return Err(CallError::Cancelled);
+        }
+        let conn = self.conn()?;
+        conn.call_cancellable(op, header, body, Priority::Control, deadline, cancelled)
+    }
+
     /// Worker `objects.want`.
     pub fn want(
         &self,

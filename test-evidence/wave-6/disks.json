@@ -1,0 +1,32 @@
+[
+  {
+    "FriendlyName": "KINGSTON SEDC600M1920G",
+    "MediaType": "SSD",
+    "BusType": "SATA",
+    "Size": 1920383410176
+  },
+  {
+    "FriendlyName": "Samsung SSD 9100 PRO with Heatsink 2TB",
+    "MediaType": "SSD",
+    "BusType": "NVMe",
+    "Size": 2000398934016
+  },
+  {
+    "FriendlyName": "Novation Onboarding Drive",
+    "MediaType": "Unspecified",
+    "BusType": "USB",
+    "Size": 196608
+  },
+  {
+    "FriendlyName": "KINGSTON SV300S37A240G",
+    "MediaType": "SSD",
+    "BusType": "SATA",
+    "Size": 240057409536
+  },
+  {
+    "FriendlyName": "ST8000VN004-2M2101",
+    "MediaType": "HDD",
+    "BusType": "SATA",
+    "Size": 8001563222016
+  }
+]

@@ -471,17 +471,19 @@ fn hash_only_request_not_permitted() {
     };
     let conn = session::dial_loopback(&info.address, None, ConnOptions::default()).unwrap();
     let route = json!({"peer": "p", "repo": repo, "local_replica": device, "remote_replica": "r"});
-    for (hash, code) in [(&secret, "NOT_AVAILABLE"), (&unknown, "NOT_PERMITTED")] {
-        let error = conn
-            .call(
-                "objects.read",
-                json!({"route": route, "hash": hash, "offset": 0, "len": 1024}),
-                vec![],
-                Priority::Control,
-                Duration::from_secs(10),
-            )
-            .unwrap_err();
-        assert_eq!(error.code(), code, "{error:?}");
+    for read in ["objects.read", tkfs::model::content_wire::LEGACY_READ] {
+        for (hash, code) in [(&secret, "NOT_AVAILABLE"), (&unknown, "NOT_PERMITTED")] {
+            let error = conn
+                .call(
+                    read,
+                    json!({"route": route, "hash": hash, "offset": 0, "len": 1024}),
+                    vec![],
+                    Priority::Control,
+                    Duration::from_secs(10),
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), code, "{read}: {error:?}");
+        }
     }
     let reply = conn
         .call(
@@ -2641,4 +2643,388 @@ fn objects_demand_lists_what_readers_wait_for_and_leases_nothing() {
     )
     .unwrap_err();
     assert_eq!(refused.code, "INVALID_BULK_LANE");
+}
+
+fn owned_session(slot: u64, incarnation: u64, run: u64) -> String {
+    tkfs::model::lease::qualify(
+        &tkfs::orchestrator::objects::pull_lease("peer-a", lane(), slot),
+        tkfs::model::lease::Generation { incarnation, run },
+    )
+    .unwrap()
+}
+
+#[test]
+fn newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them() {
+    let bytes = vec![31; 100_000];
+    let w = worker(|a| {
+        file(a, "first", &bytes);
+        file(a, "second", &vec![32; 100_000]);
+    });
+    let first = tkfs::core::hash(&bytes);
+    let old_a = owned_session(0, 7, 1);
+    let old_b = owned_session(1, 7, 1);
+    let (items, _) = op(
+        &w.ctx,
+        "objects.want",
+        json!({
+            "route":w.route_b, "lane":lane(), "max_items":1,
+            "max_bytes":PULL_BUDGET_BYTES, "session":old_a
+        }),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(items["items"].as_array().unwrap().len(), 1);
+    assert_eq!(want_op(&w, &w.route_b, &old_b).len(), 1);
+    let holder = lease(&w, &first).session;
+    assert_eq!(
+        write_op(&w, &w.route_b, &holder, &first, 0, 100_000, &bytes[..65536])["durable_offset"],
+        65536
+    );
+    let new = owned_session(0, 7, 2);
+    let started = Instant::now();
+    let resumed = want_op(&w, &w.route_b, &new);
+    assert!(started.elapsed() < Duration::from_millis(250));
+    assert_eq!(
+        resumed.len(),
+        2,
+        "both old pull slots must hand off immediately"
+    );
+    assert_eq!(offered(&resumed, &first).unwrap()["offset"], 65536);
+    let current = lease(&w, &first);
+    for old in [&old_a, &old_b] {
+        let (reply, _) = op(
+            &w.ctx,
+            "objects.release",
+            json!({"route":w.route_b,
+            "session":old,"hashes":[first],"hold_ms":60_000}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(reply["released"], 0);
+        assert_eq!(lease(&w, &first).session, new);
+        assert_eq!(lease(&w, &first).expires_ms, current.expires_ms);
+        assert!(
+            objects_rpc::source_retry_at(
+                &w.ctx,
+                w.route_b["remote_replica"].as_str().unwrap(),
+                &first
+            )
+            .is_none()
+        );
+        assert_eq!(
+            op(
+                &w.ctx,
+                "objects.want",
+                json!({"route":w.route_b,"lane":lane(),
+            "max_items":256,"max_bytes":PULL_BUDGET_BYTES,"session":old}),
+                &[]
+            )
+            .unwrap_err()
+            .code,
+            "IN_FLIGHT_ELSEWHERE"
+        );
+        assert_eq!(
+            op(
+                &w.ctx,
+                "objects.write",
+                json!({"route":w.route_b,"session":old,
+            "items":[{"hash":first,"offset":65536,"total":100_000,"len":1,"last":false}]}),
+                &[31]
+            )
+            .unwrap_err()
+            .code,
+            "IN_FLIGHT_ELSEWHERE"
+        );
+    }
+    let restarted = owned_session(1, 8, 1);
+    assert_eq!(want_op(&w, &w.route_b, &restarted).len(), 2);
+    assert_eq!(lease(&w, &first).session, restarted);
+    assert_eq!(
+        offered(&want_op(&w, &w.route_b, &restarted), &first).unwrap()["offset"],
+        65536
+    );
+    // An unregistered future release owns nothing, including its hold/backoff.
+    let (reply, _) = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route":w.route_b,
+        "session":owned_session(0,9,1),"hashes":[first],"hold_ms":60_000}),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(reply["released"], 0);
+    assert_eq!(lease(&w, &first).session, restarted);
+}
+
+#[test]
+fn an_old_want_that_finishes_after_a_new_run_cannot_reclaim_its_objects() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let w = worker(|a| {
+        file(a, "pending", &vec![41; 100_000]);
+    });
+    let hash = tkfs::core::hash(&vec![41; 100_000]);
+    let mut config = FaultConfig::new("objects.want.before_grant", FaultAction::Hang);
+    config.ms = Some(300);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let _reset = Reset;
+    let ctx = w.ctx.clone();
+    let route = w.route_b.clone();
+    let old = thread::spawn(move || {
+        op(
+            &ctx,
+            "objects.want",
+            json!({"route":route,"lane":lane(),
+        "max_items":256,"max_bytes":PULL_BUDGET_BYTES,"session":owned_session(0,9,1)}),
+            &[],
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let new = owned_session(1, 9, 2);
+    assert_eq!(want_op(&w, &w.route_b, &new).len(), 1);
+    let error = old.join().unwrap().unwrap_err();
+    assert_eq!(error.code, "IN_FLIGHT_ELSEWHERE");
+    assert!(
+        !error.class.counts_as_failure(),
+        "supersession must not trip a failure breaker"
+    );
+    assert_eq!(lease(&w, &hash).session, new);
+}
+
+#[test]
+fn an_old_write_completion_cannot_release_or_renew_a_new_runs_resumed_lease() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let w = worker(|a| {
+        file(a, "partial", &vec![51; 100_000]);
+    });
+    let hash = tkfs::core::hash(&vec![51; 100_000]);
+    let old = owned_session(0, 12, 1);
+    assert_eq!(want_op(&w, &w.route_b, &old).len(), 1);
+    let mut config = FaultConfig::new("objects.write.before_lease_completion", FaultAction::Hang);
+    config.ms = Some(300);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let _reset = Reset;
+    let ctx = w.ctx.clone();
+    let route = w.route_b.clone();
+    let h = hash.clone();
+    let pending = thread::spawn(move || {
+        op(
+            &ctx,
+            "objects.write",
+            json!({"route":route,"session":old,
+        "items":[{"hash":h,"offset":0,"total":100_000,"len":65536,"last":false}]}),
+            &vec![51; 65536],
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let new = owned_session(1, 12, 2);
+    let resumed = want_op(&w, &w.route_b, &new);
+    assert_eq!(offered(&resumed, &hash).unwrap()["offset"], 65536);
+    let before = lease(&w, &hash);
+    let (reply, _) = pending.join().unwrap().unwrap();
+    assert_eq!(reply["results"][0]["outcome"], "in_flight_elsewhere");
+    assert_eq!(lease(&w, &hash).session, new);
+    assert_eq!(lease(&w, &hash).expires_ms, before.expires_ms);
+    assert_eq!(lease(&w, &hash).offset, before.offset);
+    assert_eq!(
+        write_op(
+            &w,
+            &w.route_b,
+            &new,
+            &hash,
+            65536,
+            100_000,
+            &vec![51; 100_000 - 65536]
+        )["outcome"],
+        "completed"
+    );
+}
+
+#[test]
+fn full_legacy_run_fence_capacity_preserves_existing_ownership_and_refuses_new_scopes() {
+    use tkfs::model::lease::{Generation, MAX_RUN_FENCES};
+    let w = worker(|a| {
+        file(a, "fenced", &vec![61; 100_000]);
+    });
+    let old = owned_session(0, 14, 1);
+    assert_eq!(want_op(&w, &w.route_b, &old).len(), 1);
+    {
+        let mut state = w.ctx.inflight_objects.lock().unwrap();
+        for n in 1..MAX_RUN_FENCES {
+            state.lease_runs.insert(
+                format!("pull:capacity-{n}:0/1"),
+                Generation {
+                    incarnation: 1,
+                    run: 1,
+                },
+            );
+        }
+        assert_eq!(state.lease_runs.len(), MAX_RUN_FENCES);
+    }
+    let route = json!({"peer":"new-peer", "repo":w.route_b["repo"],
+        "local_replica":w.route_b["local_replica"],"remote_replica":w.route_b["remote_replica"]});
+    let session = tkfs::model::lease::qualify(
+        "pull:new-peer:0/1:a",
+        Generation {
+            incarnation: 14,
+            run: 1,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":route,"lane":lane(),"session":session,
+        "max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "BUSY"
+    );
+    assert_eq!(
+        w.ctx.inflight_objects.lock().unwrap().lease_runs.len(),
+        MAX_RUN_FENCES
+    );
+    assert_eq!(want_op(&w, &w.route_b, &owned_session(1, 14, 2)).len(), 1);
+    assert_eq!(
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":w.route_b,"lane":lane(),"session":old,
+        "max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+}
+
+#[test]
+fn foreground_frames_promote_only_the_demand_and_stale_cleanup_cannot_back_off_the_new_frame() {
+    use tkfs::{
+        model::{
+            content_wire as wire,
+            lease::{self, Generation},
+        },
+        runtime::content_rpc,
+    };
+    let bytes = vec![71; 300_000];
+    let w = worker(|a| {
+        file(a, "demand", &bytes);
+        file(a, "background", &vec![72; 100_000]);
+    });
+    let hash = tkfs::core::hash(&bytes);
+    let background = tkfs::core::hash(&vec![72; 100_000]);
+    let parent = owned_session(0, 20, 1);
+    assert_eq!(want_op(&w, &w.route_b, &parent).len(), 2);
+    w.ctx
+        .sync_stores
+        .checkout()
+        .unwrap()
+        .request_object(&hash)
+        .unwrap();
+    let prepare = |frame| {
+        let session = lease::qualify(
+            &format!("pull:peer-a:0/1:c{frame:016x}"),
+            Generation {
+                incarnation: 20,
+                run: 1,
+            },
+        )
+        .unwrap();
+        let (reply, _) = content_rpc::dispatch(
+            &w.ctx,
+            wire::LEGACY_PREPARE,
+            &json!({
+                "route":w.route_b,"lane":lane(),"session":session,"hash":hash
+            }),
+            &[],
+        )
+        .unwrap();
+        (session, reply["items"].as_array().unwrap().clone())
+    };
+    let (first, items) = prepare(1);
+    assert_eq!(items.len(), 1);
+    assert_eq!(lease(&w, &background).session, parent);
+    assert_eq!(
+        write_op(&w, &w.route_b, &first, &hash, 0, 300_000, &bytes[..65536])["durable_offset"],
+        65536
+    );
+    let (second, items) = prepare(2);
+    assert_eq!(items[0]["offset"], 65536);
+    assert!(
+        prepare(1).1.is_empty(),
+        "older frame must not reclaim the newer active frame"
+    );
+    let before = lease(&w, &hash);
+    for old in [&first, &parent] {
+        let (reply, _) = op(
+            &w.ctx,
+            "objects.release",
+            json!({
+                "route":w.route_b,"session":old,"hashes":[hash],"hold_ms":60_000
+            }),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(reply["released"], 0);
+    }
+    assert_eq!(lease(&w, &hash).session, second);
+    assert_eq!(lease(&w, &hash).expires_ms, before.expires_ms);
+    assert!(
+        objects_rpc::source_retry_at(&w.ctx, w.route_b["remote_replica"].as_str().unwrap(), &hash)
+            .is_none()
+    );
+    assert_eq!(
+        write_op(
+            &w,
+            &w.route_b,
+            &first,
+            &hash,
+            65536,
+            300_000,
+            &bytes[65536..131072]
+        )["outcome"],
+        "in_flight_elsewhere"
+    );
+    assert_eq!(
+        write_op(
+            &w,
+            &w.route_b,
+            &second,
+            &hash,
+            65536,
+            300_000,
+            &bytes[65536..]
+        )["outcome"],
+        "completed"
+    );
+    assert!(
+        prepare(3).1.is_empty(),
+        "verified shared receipt retires demand"
+    );
 }

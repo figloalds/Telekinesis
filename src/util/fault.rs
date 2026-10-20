@@ -138,6 +138,11 @@ pub fn current() -> Option<FaultConfig> {
     state().config.clone()
 }
 
+/// Diagnostic count of injections actually fired, without triggering one.
+pub fn fired() -> u64 {
+    state().fired
+}
+
 /// Sets this process's scope string (workers use their state path).
 pub fn set_scope(scope: &str) {
     state().scope = scope.to_owned();

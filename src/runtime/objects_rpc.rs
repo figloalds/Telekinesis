@@ -122,6 +122,9 @@ pub fn dispatch(
     header: &Value,
     body: &[u8],
 ) -> Result<(Value, Vec<u8>), ErrorWire> {
+    if op.starts_with(crate::model::content_wire::PREFIX) {
+        return super::content_rpc::dispatch(ctx, op, header, body);
+    }
     match op {
         ops::WANT => want(ctx, parse(op, header)?),
         ops::READ => read(ctx, parse(op, header)?),
@@ -143,7 +146,7 @@ fn parse<T: DeserializeOwned>(op: &str, header: &Value) -> Result<T, ErrorWire> 
 }
 
 /// The route must name this worker (`paired_sync::binding`'s codes).
-fn bind(ctx: &WorkerCtx, route: &SyncRoute) -> Result<(), ErrorWire> {
+pub(super) fn bind(ctx: &WorkerCtx, route: &SyncRoute) -> Result<(), ErrorWire> {
     if route.repo != ctx.repo {
         return Err(ErrorWire::coded(
             "REPOSITORY_MISMATCH",
@@ -171,6 +174,57 @@ fn session_id(session: &str) -> Result<(), ErrorWire> {
             "INVALID_REQUEST",
             "session must be 1..=128 bytes without control characters",
         ));
+    }
+    Ok(())
+}
+
+/// A newer daemon/run fences both slots of an owned lane, including delayed
+/// wants/writes/releases on still-open pooled loopback sessions. The worker
+/// never evicts a fence to make an old run admissible again.
+fn owned_run<'a>(
+    session: &'a str,
+    route: &SyncRoute,
+) -> Result<Option<crate::model::lease::Owned<'a>>, ErrorWire> {
+    let owned = crate::model::lease::parse(session)?;
+    if owned.as_ref().is_some_and(|o| o.peer != route.peer) {
+        return Err(ErrorWire::coded(
+            "INVALID_REQUEST",
+            "lease generation peer does not match route",
+        ));
+    }
+    Ok(owned)
+}
+fn run_current(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
+    owned.is_none_or(|o| {
+        state
+            .lease_runs
+            .get(o.scope)
+            .is_none_or(|g| *g <= o.generation)
+    })
+}
+fn run_owns(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
+    owned.is_none_or(|o| state.lease_runs.get(o.scope) == Some(&o.generation))
+}
+fn claim_run(
+    state: &mut ObjectsState,
+    owned: Option<&crate::model::lease::Owned<'_>>,
+) -> Result<(), ErrorWire> {
+    if !run_current(state, owned) {
+        return Err(ErrorWire::coded(
+            "IN_FLIGHT_ELSEWHERE",
+            "object lease run superseded",
+        ));
+    }
+    if let Some(o) = owned {
+        if !state.lease_runs.contains_key(o.scope)
+            && state.lease_runs.len() >= crate::model::lease::MAX_RUN_FENCES
+        {
+            return Err(ErrorWire::coded(
+                "BUSY",
+                "object lease generation fence capacity",
+            ));
+        }
+        state.lease_runs.insert(o.scope.to_owned(), o.generation);
     }
     Ok(())
 }
@@ -320,6 +374,15 @@ const SUPERSEDE_IDLE: Duration = Duration::from_secs(15);
 /// takes such a lease over, without a stall backoff, once it has been idle a
 /// quarter of a TTL (an old lane still moving it during the switch keeps it).
 fn superseded(held: &ObjectLease, session: &str, now: u64) -> bool {
+    if let (Ok(Some(old)), Ok(Some(new))) = (
+        crate::model::lease::parse(&held.session),
+        crate::model::lease::parse(session),
+    ) && old.scope == new.scope
+        && (old.generation < new.generation
+            || (old.generation == new.generation && new.frame.is_some() && old.frame < new.frame))
+    {
+        return true;
+    }
     let idle_since = held.expires_ms.saturating_sub(LEASE_TTL.as_millis() as u64);
     now.saturating_sub(idle_since) >= SUPERSEDE_IDLE.as_millis() as u64
         && matches!(
@@ -364,9 +427,74 @@ fn sweep_lapsed(state: &mut ObjectsState, now: u64) {
 /// progress renews it, module docs). `exclude` (CCR-WP3.3-4, WP4.5): those
 /// hashes are left out, and the leases `session` holds on them end.
 fn want(ctx: &WorkerCtx, request: WantRequest) -> Result<(Value, Vec<u8>), ErrorWire> {
+    want_selected(ctx, request, None)
+}
+
+pub(super) fn legacy_prepare(
+    ctx: &WorkerCtx,
+    header: &Value,
+) -> Result<(Value, Vec<u8>), ErrorWire> {
+    let request: crate::model::content_wire::LegacyPrepare = parse("legacy-prepare", header)?;
+    crate::model::content::Digest::parse(&request.hash).map_err(wire)?;
+    if crate::model::lease::parse(&request.session)?.is_none_or(|o| o.frame.is_none()) {
+        return Err(ErrorWire::coded(
+            "INVALID_REQUEST",
+            "foreground lease frame required",
+        ));
+    }
+    want_selected(
+        ctx,
+        WantRequest {
+            header: crate::model::protocol::objects::WantHeader {
+                route: request.route,
+                lane: request.lane,
+                max_items: 1,
+                max_bytes: crate::model::content_wire::LEGACY_BYTES as u64,
+                session: request.session,
+            },
+            exclude: vec![],
+        },
+        Some(&request.hash),
+    )
+}
+
+pub(super) fn legacy_read(ctx: &WorkerCtx, header: &Value) -> Result<(Value, Vec<u8>), ErrorWire> {
+    let header: ReadHeader = parse("legacy-read", header)?;
+    bind(ctx, &header.route)?;
+    if header.len > crate::model::content_wire::FRAME_BYTES as u64 {
+        return Err(ErrorWire::coded(
+            "CONTENT_BUFFER_LIMIT",
+            "legacy foreground read",
+        ));
+    }
+    let context = crate::content::ReadContext {
+        deadline: Instant::now() + Duration::from_secs(5),
+        cancel: lock(&ctx.inflight_objects).legacy_cancel.child(),
+    };
+    let provider = crate::content::LocalContent::open(&ctx.root).map_err(wire)?;
+    let _buffers = provider.foreground_permit(&context).map_err(wire)?;
+    let store = super::content_rpc::connection(ctx).map_err(wire)?;
+    let (total, bytes) =
+        store.read_object_range(&header.hash, header.offset, header.len as usize)?;
+    context.check().map_err(wire)?;
+    Ok((json!(ReadReply { total }), bytes))
+}
+
+fn want_selected(
+    ctx: &WorkerCtx,
+    request: WantRequest,
+    only: Option<&str>,
+) -> Result<(Value, Vec<u8>), ErrorWire> {
     let WantRequest { header, exclude } = request;
     bind(ctx, &header.route)?;
     session_id(&header.session)?;
+    let owned = owned_run(&header.session, &header.route)?;
+    if owned.as_ref().is_some_and(|o| o.lane != header.lane) {
+        return Err(ErrorWire::coded(
+            "INVALID_BULK_LANE",
+            "lease generation lane does not match want",
+        ));
+    }
     release_list(ops::WANT, &exclude)?;
     if !header.lane.is_valid() {
         return Err(ErrorWire::coded(
@@ -384,6 +512,7 @@ fn want(ctx: &WorkerCtx, request: WantRequest) -> Result<(Value, Vec<u8>), Error
     // session holds, and the ones backed off for this source.
     let (leased, mine, backed_off): (HashSet<String>, HashSet<String>, HashSet<String>) = {
         let mut state = lock(&ctx.inflight_objects);
+        claim_run(&mut state, owned.as_ref())?;
         sweep_lapsed(&mut state, now);
         give_up(&mut state, session, &exclude);
         let (mine, others): (Vec<_>, Vec<_>) = state
@@ -406,27 +535,47 @@ fn want(ctx: &WorkerCtx, request: WantRequest) -> Result<(Value, Vec<u8>), Error
             .collect();
         (others, mine, backed_off)
     };
-    let mut items = store(ctx)?
-        .want_objects(
-            header.lane,
-            (header.max_items as usize).min(MAX_WANT_ITEMS),
-            header.max_bytes,
-            &|hash| {
-                excluded.contains(hash)
-                    || leased.contains(hash)
-                    || (backed_off.contains(hash) && !mine.contains(hash))
-            },
-        )
-        .map_err(wire)?;
+    let mut items = if let Some(hash) = only {
+        if excluded.contains(hash)
+            || leased.contains(hash)
+            || (backed_off.contains(hash) && !mine.contains(hash))
+        {
+            vec![]
+        } else {
+            super::content_rpc::connection(ctx)
+                .map_err(wire)?
+                .demanded_object(hash, header.lane)
+                .map_err(wire)?
+                .into_iter()
+                .collect()
+        }
+    } else {
+        store(ctx)?
+            .want_objects(
+                header.lane,
+                (header.max_items as usize).min(MAX_WANT_ITEMS),
+                header.max_bytes,
+                &|hash| {
+                    only.is_some_and(|selected| selected != hash)
+                        || excluded.contains(hash)
+                        || leased.contains(hash)
+                        || (backed_off.contains(hash) && !mine.contains(hash))
+                },
+            )
+            .map_err(wire)?
+    };
+    crate::util::fault::trigger("objects.want.before_grant").map_err(wire)?;
     {
         let now = now_ms();
         let mut state = lock(&ctx.inflight_objects);
+        claim_run(&mut state, owned.as_ref())?;
         sweep_lapsed(&mut state, now);
-        items.retain(|item| {
+        items.retain_mut(|item| {
             let held = state.leases.get(&item.hash).cloned();
             match held {
                 Some(lease) if superseded(&lease, session, now) => {
                     let offset = lease.offset.max(item.offset);
+                    item.offset = offset;
                     grant(&mut state, (&item.hash, session, source, offset), now);
                     true
                 }
@@ -491,11 +640,26 @@ fn demand(ctx: &WorkerCtx, header: DemandHeader) -> Result<(Value, Vec<u8>), Err
 fn release_op(ctx: &WorkerCtx, header: ReleaseHeader) -> Result<(Value, Vec<u8>), ErrorWire> {
     bind(ctx, &header.route)?;
     session_id(&header.session)?;
+    let owned = owned_run(&header.session, &header.route)?;
     release_list(ops::RELEASE, &header.hashes)?;
     let released = {
         let mut state = lock(&ctx.inflight_objects);
+        if !run_owns(&state, owned.as_ref()) {
+            return Ok((json!(ReleaseReply { released: 0 }), vec![]));
+        }
         let now = now_ms();
         sweep_lapsed(&mut state, now);
+        let held: HashSet<_> = header
+            .hashes
+            .iter()
+            .filter(|hash| {
+                state
+                    .leases
+                    .get(*hash)
+                    .is_some_and(|lease| lease.session == header.session)
+            })
+            .cloned()
+            .collect();
         let released = give_up(&mut state, &header.session, &header.hashes);
         // The dialer's own backoff for this source, kept here so later wants
         // of this source leave them out whatever its exclusion list holds
@@ -503,6 +667,9 @@ fn release_op(ctx: &WorkerCtx, header: ReleaseHeader) -> Result<(Value, Vec<u8>)
         if let Some(hold) = header.hold_ms.filter(|hold| *hold > 0) {
             let source = header.route.remote_replica.as_str();
             for hash in &header.hashes {
+                if owned.is_some() && !held.contains(hash) {
+                    continue;
+                }
                 let entry = source_entry(&mut state, source, hash, now);
                 entry.1 = entry.1.max(now.saturating_add(hold));
             }
@@ -565,6 +732,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         session,
         items,
     } = header;
+    let owned = owned_run(&session, &route)?;
     let described = items
         .iter()
         .try_fold(0u64, |sum, item| sum.checked_add(item.len));
@@ -597,6 +765,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
     {
         let now = now_ms();
         let mut state = lock(&ctx.inflight_objects);
+        claim_run(&mut state, owned.as_ref())?;
         // A lapsed lease (ours too) backs its object off for its source and
         // frees it (module docs).
         sweep_lapsed(&mut state, now);
@@ -628,6 +797,12 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         first.entry(item.hash.as_str()).or_insert(item.offset);
     }
     wait_for_order(ctx, &session, &first);
+    if !run_current(&lock(&ctx.inflight_objects), owned.as_ref()) {
+        return Err(ErrorWire::coded(
+            "IN_FLIGHT_ELSEWHERE",
+            "object lease run superseded",
+        ));
+    }
 
     // The items to write, and their bytes (copied only when some are refused).
     let mut accepted: Vec<WriteItem> = Vec::with_capacity(items.len());
@@ -656,6 +831,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
             .map_err(wire)?
     };
     drop(store);
+    crate::util::fault::trigger("objects.write.before_lease_completion").map_err(wire)?;
 
     // Merge back in item order; update leases (only progress renews one);
     // back off sources and record local failures (module docs).
@@ -668,6 +844,21 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
     {
         let now = now_ms();
         let mut state = lock(&ctx.inflight_objects);
+        if !run_owns(&state, owned.as_ref()) {
+            return Ok((
+                json!(WriteReply {
+                    results: items
+                        .iter()
+                        .map(|item| WriteResult {
+                            hash: item.hash.clone(),
+                            outcome: ObjectOutcome::InFlightElsewhere,
+                            durable_offset: 0,
+                        })
+                        .collect()
+                }),
+                vec![],
+            ));
+        }
         for item in &items {
             if refused.contains(item.hash.as_str()) {
                 results.push(WriteResult {
@@ -682,6 +873,14 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                 .leases
                 .get(&result.hash)
                 .is_some_and(|lease| lease.session == session);
+            if owned.is_some() && !ours {
+                results.push(WriteResult {
+                    hash: result.hash.clone(),
+                    outcome: ObjectOutcome::InFlightElsewhere,
+                    durable_offset: result.durable_offset,
+                });
+                continue;
+            }
             match &result.outcome {
                 ObjectOutcome::Progressed { durable_offset } => {
                     if let Some(lease) = state.leases.get_mut(&result.hash).filter(|_| ours) {

@@ -372,6 +372,54 @@ pub const TRANSIENT_DEFAULT_CODES: &[&str] = &[
 /// The code [`code_of`] returns when an error chain carries none.
 pub const UNKNOWN_CODE: &str = "UNKNOWN_ERROR";
 
+/// CCR-WP6.2-1: content and admission scopes extend the historical §8 table.
+/// Cancellation/stale ownership are readiness outcomes; malformed authenticated
+/// content is fatal only to its object/reference, not unrelated engine work.
+pub const WAVE6_CODES: &[(&str, ErrorClass)] = &[
+    ("CONTENT_RESOURCE_LIMIT", ErrorClass::Contention),
+    ("DEMAND_ID_REUSED", ErrorClass::Fatal),
+    ("INVALID_CONTENT_EDGE", ErrorClass::Fatal),
+    ("CORRUPT_CONTENT_RECEIPT", ErrorClass::Fatal),
+    ("CONTENT_CANCELLED", ErrorClass::Contention),
+    ("STALE_ADMISSION_GENERATION", ErrorClass::Contention),
+    ("CONTENT_DEADLINE", ErrorClass::Transient),
+    ("CORRUPT_CONTENT", ErrorClass::Transient),
+    ("STALE_METADATA_PREPARATION", ErrorClass::Transient),
+    ("LEGACY_CONVERSION_REQUIRED", ErrorClass::Incompatible),
+    ("UNSUPPORTED_CONTENT_DESCRIPTOR", ErrorClass::Incompatible),
+    ("UNSUPPORTED_CONTENT_KIND", ErrorClass::Incompatible),
+    ("ADMISSION_OUTSIDE_METADATA_TRANSACTION", ErrorClass::Fatal),
+    ("ADMISSION_PAGE_LIMIT", ErrorClass::Fatal),
+    ("CONTENT_BUFFER_LIMIT", ErrorClass::Fatal),
+    ("CONTENT_LOCK_POISONED", ErrorClass::Fatal),
+    ("CONTENT_PROVIDER_MISMATCH", ErrorClass::Fatal),
+    ("CONTENT_STORE_NOT_INITIALIZED", ErrorClass::Fatal),
+    ("EXPECTED_MANIFEST", ErrorClass::Fatal),
+    ("EXPECTED_MANIFEST_LEVEL", ErrorClass::Fatal),
+    ("INVALID_ADMISSION_ACTION", ErrorClass::Fatal),
+    ("INVALID_ADMISSION_CONSUMER", ErrorClass::Fatal),
+    ("INVALID_ADMISSION_CURSOR", ErrorClass::Fatal),
+    ("INVALID_ADMISSION_GENERATION", ErrorClass::Fatal),
+    ("INVALID_CONTENT_DIGEST", ErrorClass::Fatal),
+    ("INVALID_DEMAND_SCOPE", ErrorClass::Fatal),
+    ("INVALID_DIRECT_DESCRIPTOR", ErrorClass::Fatal),
+    ("INVALID_LEGACY_DESCRIPTOR", ErrorClass::Fatal),
+    ("INVALID_MANIFEST_DESCRIPTOR", ErrorClass::Fatal),
+    ("INVALID_MANIFEST_ENCODING", ErrorClass::Fatal),
+    ("MANIFEST_CHILD_KIND", ErrorClass::Fatal),
+    ("MANIFEST_COVERAGE", ErrorClass::Fatal),
+    ("MANIFEST_DEPTH", ErrorClass::Fatal),
+    ("MANIFEST_FANOUT", ErrorClass::Fatal),
+    ("MANIFEST_FRONTIER_LIMIT", ErrorClass::Fatal),
+    ("MANIFEST_LENGTH", ErrorClass::Fatal),
+    ("MANIFEST_OVERFLOW", ErrorClass::Fatal),
+    ("MANIFEST_RANGE", ErrorClass::Fatal),
+    ("MANIFEST_ROOT_MISMATCH", ErrorClass::Fatal),
+    ("NONCANONICAL_EMPTY_CONTENT", ErrorClass::Fatal),
+    ("RANGE_OUT_OF_BOUNDS", ErrorClass::Fatal),
+    ("RANGE_OVERFLOW", ErrorClass::Fatal),
+];
+
 /// The class of `code` (§8). Codes outside the table are Transient.
 pub fn classify(code: &str) -> ErrorClass {
     explicit_class(code).unwrap_or(ErrorClass::Transient)
@@ -388,6 +436,11 @@ pub fn explicit_class(code: &str) -> Option<ErrorClass> {
     ]
     .into_iter()
     .find_map(|(codes, class)| codes.contains(&code).then_some(class))
+    .or_else(|| {
+        WAVE6_CODES
+            .iter()
+            .find_map(|(known, class)| (*known == code).then_some(*class))
+    })
 }
 
 /// Whether `code` is in the §8 table or acknowledged as Transient-default.

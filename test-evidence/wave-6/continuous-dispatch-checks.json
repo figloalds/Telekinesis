@@ -1,0 +1,335 @@
+{
+  "date": "2026-10-20",
+  "source_revision": "02a6f9d0e303a3cf710aaafc19043902f246b289",
+  "scope": "WP6.3 continuous typed-content dispatcher, cancellation and legacy duplicate-lease cleanup checkpoint; full Wave 6 is incomplete; normal activation remains off",
+  "host": "Windows-11-10.0.26300-SP0",
+  "target": "x86_64-pc-windows-msvc",
+  "working_tree_source_sha256": "486d55353b03077d332d848ff9f20e1c5f1af3799f58f166cb1d9a6f3c10fb64",
+  "source_files_sha256": {
+    "build.rs": "70dbed753d54e99544840af6b172da5915f5d3bf68a761fe4b324a10039d9f1a",
+    "Cargo.lock": "a4bc80a508b334c1b142d540cff312ddc0da9503ab23b239b0ddd04e5fea84b5",
+    "Cargo.toml": "4e57ac04c7ac26b8727572504c773f8be2c8c2ba8fb5145f42ea3bf6efa2b119",
+    "src/backend.rs": "4ef24f0d6d9a4b752b1188aace8230f11f92f88f06dce3f15d660aedd9c895c3",
+    "src/bulk_sync.rs": "bbe702d832c7b3354c5e414d1da5931d91cf05741a7bb4810fd5bc05c6905594",
+    "src/content/local.rs": "7d74565ee6c532147d4c7aae04d12d6f0f245c22ba8d972edd222c8fc7d77e98",
+    "src/content/mod.rs": "1628df4290430d5f0ee7118999b184a13bf29c1f174976732dddf92c041040b1",
+    "src/content/provider.rs": "ee193232475409431c8d34b9f8a3223ac150ee292e29bb410790b5072861f1c9",
+    "src/content/receipt.rs": "e52221c624af4d98e9f1bb5a111b80384a6248f081dd567fd50d17fab9c19e03",
+    "src/content/scheduler.rs": "179f4e7ba85f6c206b89f345e9ae52f559769bbb33ebfb6cb9e0bf56c09361da",
+    "src/content/walk.rs": "00f24d730acf47e2796496fee2bea63eab05de21527c0f8d3113779e84cbb2d0",
+    "src/content/work.rs": "193a4b1667fbc2536ab1e44569979085c5e6ca6b249c02bff3997d4525515b1a",
+    "src/core/admission.rs": "57c575a9cb688cd6567b23e536235b50fe591974f8e4fb8fa1053af8cab1487d",
+    "src/core/commit.rs": "91a3e2226b1617a0a8549ac4592a8ea6c5cfa043b24aa06bf3c833479ad688c4",
+    "src/core/content_objects/graph.rs": "69cc9c3a27a6beb60ad6faade0d3715148cb1f176464ce050c1d428146dfe380",
+    "src/core/content_objects.rs": "022a08d8b41ec3edc0c2ccae7464504e768f0f4ad1f75fae6643a245f710873e",
+    "src/core/demand.rs": "bbf4ec1547413214f5a79effdd1f0a2d3191eac8648c34309ba96b5690d92097",
+    "src/core/derive.rs": "9c52d5abebe02ee7a0c27e8a800cdb08a73637751d9358932d9db8d9c66e8e7f",
+    "src/core/inbox.rs": "caba15a380bf0d43575ea8a02eb27ab3d2598f8207da2bfe8ac5cc3abb67fc49",
+    "src/core/objects.rs": "51b0189a97a7a4edd3de14689f0ef23e1f2465d379304b69e92d465b4d7284ee",
+    "src/core/sharing.rs": "9612e63a7b58284126d1a19a644966d2d8f63a1492daec2177381b5809a4b69a",
+    "src/core/snapshot.rs": "a398d1a5f27b8cff97a193387f6751c90add2d144a6322a1854db9a46740e393",
+    "src/core/status.rs": "5cacf0ada3d5f163a518462621de038e91f72aaec48510c986ff94538fc299cf",
+    "src/core/transfer.rs": "f717b14b56f30651b3247c0c70ad639af3723002a5eacaea4ec03c9b23008d03",
+    "src/core/verify.rs": "36adc98314b94e1832ffa492cc0073dcf3b5a26a1bc18973cce4889b25966838",
+    "src/core.rs": "24b3776d630cf4b55ab3a2559b9e96495bd1dbceb1fc1a07c6170ece236d9310",
+    "src/fuse_linux.rs": "c66f4407cb1da627aa73dff9e778ae6af22e7d9a42b15b1ff950d6853f334a0a",
+    "src/gui.rs": "1d8533767a48fb7352bcb918dbb6701dde328cd31667e760ed581c1d80e466a5",
+    "src/lib.rs": "68fb16e1b199d58813c08949b9973bc2a6be10f0ed833ab92b784427c542f1de",
+    "src/main.rs": "b23ecf6b85e007fa3ece8d3a7cee48e6ebbf0223a6202d71682f72378848688b",
+    "src/model/content.rs": "ac7a1e366df167bb7e3b64f67571a5797b79371bc8f1c9f57a6ad162586c75d0",
+    "src/model/content_wire.rs": "ce2b8dc973dc1879c24e52edff0544d7cba83ac8861bf3cc3096125a56884571",
+    "src/model/errors.rs": "6e317a050dc3a29d01f35b4af092f34b77fd4bb2a2c3e375ac4b2d79d0c7ab65",
+    "src/model/health.rs": "ab6dd44f6bda8f39219c6460cd8c3cf6c733f38dd853ff2600ffbddf2b1f2be0",
+    "src/model/ipc.rs": "dda59a06ac3fe5a7ee0f2ae33938a5079f6d281a516e9341b0f86804fe4f2b91",
+    "src/model/mod.rs": "7e22ffb929518b0bafdaa418b92f6ea6151deac28ed43cd20a4bef54221d3af1",
+    "src/model/orchestrator.rs": "262f199c058ed2f154eda34cebfc3a375097b4108e2183de13f3892b92881866",
+    "src/model/protocol.rs": "81b31a8844853c2d1b7784072dd562de6cdd92e29a3825a963681539774edf47",
+    "src/model/status.rs": "9a7a46d09f136e5278984f364c348144366dceb29b3e5b50c0092247d5e5d2ab",
+    "src/model/workspace.rs": "53cc631a80f1a1605189ba31a27e667551ef86b6bb41abcaab46cb87642442e9",
+    "src/mount.rs": "9891e8b92707803bbb8941fbcc1be177aa8880c36682867420bfb3faf9ce564d",
+    "src/orchestrator/api.rs": "cd7ee3dd72f885abc64858b74a21ed098e25c6872dd29a96c7a3e84110729fb0",
+    "src/orchestrator/catalog.rs": "d06dda5e9f263d9309517e54e11921dc0997d7bf78b6a1a0eb2720d9443a38d8",
+    "src/orchestrator/compat.rs": "8e27b4eb849e6330c37b0d8bb163b2506226b1b3568deaeef1721413bae5a76c",
+    "src/orchestrator/config.rs": "6269219da980a0bbc3ed684d6399e42b89d635258dd2dc5d01a2d749278f48fd",
+    "src/orchestrator/content_dispatch.rs": "6e5a851f7ba5f7aabd393dccedd7a3ddbe565fc32415ae4adae9622a6021d8a8",
+    "src/orchestrator/content_transport.rs": "ff8b4b5517e81ecc7c032f2d0dfef3b46153e339477e578d43be5238ef77a644",
+    "src/orchestrator/ctx.rs": "514dc805196a2cc69d1c3283435940a9878624807a0030be1a3b58fc3655d253",
+    "src/orchestrator/diagnostics.rs": "22431e1902bbbb66ead6254faa8a673ffe588d29a565b0223ee882b472080ada",
+    "src/orchestrator/folder.rs": "3903243bd9231f7b3a739872659540fa5a609186b9b914926b1b1f62b367bdac",
+    "src/orchestrator/hub.rs": "396691e312abd7682cf37de7a9988682a1410b0054828c2142a540c0daa5514a",
+    "src/orchestrator/hub_rules.rs": "5bb82444a904b53c6bc2220761d945f2193954a94f1c7e399581f565accaf802",
+    "src/orchestrator/inbound.rs": "5a75c1d89a5283a4a51ef6a155021dc79431044519365ed3e51a0e7b7037d4eb",
+    "src/orchestrator/inbound_objects.rs": "6cdaa9a694bfcc809b0cf0bf6475485115ac467e8a97c111dbb3fd7ade6213ed",
+    "src/orchestrator/manage.rs": "65154b11e94336120596ceb62eb7c87ec963975d7d71d337c7a592c5cf01c91f",
+    "src/orchestrator/manage_v2.rs": "6cb65cc28e806919d5d04c59c47dd4be027e913acb9fa5c4ad35b4f2f1dd2082",
+    "src/orchestrator/meta_exchange.rs": "ac90586fd1c7c8cba67ac235a6fac20365d7204d12876274165791aff01c916e",
+    "src/orchestrator/mod.rs": "b352e650d55515c1ae91a9b6040d55fa690cacf782b1eb2b8d14c7077c3d5eda",
+    "src/orchestrator/objects.rs": "0ff973163e20a381cbc4d59f90241aaa6a05cc680dbd4a983742fcc8797b229c",
+    "src/orchestrator/peer.rs": "860c9231104bec47b931012df42bd68480256589c0482d5dc30aeed7294c8174",
+    "src/orchestrator/process.rs": "30efdd5db1283f5c90f5b5994be61d22fba9af00a9a7b872e83a90437096d421",
+    "src/orchestrator/published.rs": "41b29eea0c48e6b167619aeaaddd42210a02d819bf2a5f8bf97f9398342eb364",
+    "src/orchestrator/registry.rs": "23f9167a85f550f199eb7d7b911f621ba0c0156a98e3655dbe3d4a292c053618",
+    "src/orchestrator/run.rs": "83fd1c261d2ef1e17f258b650ba6c000ac82b1b0c8bd9090ea2a299e26e730b1",
+    "src/orchestrator/scheduler.rs": "16335b944b87b10f81bec1ebed31600b1d9b6eeb39e7ec981efcb8def3c0b4a5",
+    "src/orchestrator/shutdown.rs": "451d48388fd425a991cb2e6f08bbff79223af3ff19f961a0ac8930328bfd1ab5",
+    "src/orchestrator/worker_client.rs": "19f42985155cbfa1d0979f708d319245ea84757fb2db4d3e537fb4346b7fbc1c",
+    "src/paired_sync.rs": "d9d23722db191ca2b9096a3ce67b936e1205d3aec435a12b8d714ba08ae45b56",
+    "src/pairing_code.rs": "15e92303767dfff4b75177960ef48c01fd73cac105b6b30cf80c5a26d2f74691",
+    "src/runtime/content.rs": "2f050d15602ba9674b158739dd23b2ef5f33fdd3ef4a04737c35830f72626103",
+    "src/runtime/content_rpc.rs": "4e491a54098d2dd33420c5672d6ad5210fa0da569ca3d12839b888b7bc1e73e5",
+    "src/runtime/control.rs": "875d2272a56f3b6fdbb38bda0a1a0c15d5aef9275226f8ff4ddb595d859c87d2",
+    "src/runtime/ctx.rs": "fe1b293dfca12f11297bbe40aa7dd71605146ebe1a825fba9bff0de44455813d",
+    "src/runtime/engine.rs": "10bb6d7009e2d2decedca91393de998ee89303c00dd47a8dfd6245118a33e212",
+    "src/runtime/export.rs": "265057ab699a30749a3f099b1cd2556edcc4e27ca87375b69b551a4bc98c5d0e",
+    "src/runtime/mod.rs": "ebccf25c15f040a31fbd08206a34ada641daad22151208e0f8983f528286c2c3",
+    "src/runtime/notify.rs": "5f69457ce29a3ed055b345ee8cd88ba283f14ac969a4f049fc85b3cda7e671d7",
+    "src/runtime/objects_rpc.rs": "d8e804a2d3f21257573bd51e2b6daf35ef303a3968c331d192410ecf11e0077c",
+    "src/runtime/published.rs": "9ad7cdd40191b239486788d390f452d88f85dbc9ab366b14eaa7e1bbacb3840f",
+    "src/runtime/server.rs": "88ca3903894444e27116fdd013e879b9e7e8b22c0ec95a5f6214d03cc5212295",
+    "src/runtime/sync_rpc.rs": "f392691573dc3b5db0b2ddaf63991d39b15fffffb7bf5e08a7a275e540b4b3ff",
+    "src/session/auth.rs": "688543b36e3f36d233ec0c5c301ef112ecdab2ba3649cb8f2d923bfd9489ad6c",
+    "src/session/conn.rs": "501d3ba349ca6f3bfd665120652b0e52ddd3e025fe040d49d38923cc12e73758",
+    "src/session/frame.rs": "3ed6238885ae5eabf57d6556ef44be837ed26f5b4a8ed546705b05e694354c26",
+    "src/session/handshake.rs": "884cab66c0df463b534aeea623ad0201dd1fed119254b5ec9c4210fed7c5517a",
+    "src/session/io.rs": "cabdb2aafa103ed36372c6fec8c2285d94f4869da2c6b4f04e571531de88f0c3",
+    "src/session/mod.rs": "a62631a8f264404bddc9ef06924d13c00c9d13af7cee6a8dfa821ee135ef1f98",
+    "src/staging.rs": "8b3b963a6b133a5744abcb5452fa7b00699a84cb4196b197cd521451ef982819",
+    "src/startup.rs": "bb375d5d3d2eee00cb404dfc5fc1b264419b451293eaa780ff4b16c428de7b57",
+    "src/ui_model.rs": "aee8988b21018f8506d506e06204ffeece0f42716a05969c70b41b97ec61c830",
+    "src/util/backoff.rs": "069294f2ee76e33910ff68bcb44cb5397807c8ae46b2a9a7cc6a7523b41a954f",
+    "src/util/cancel.rs": "8ed07385f548ceedda00ea20d0787395533dc9b5f98ed92890b22a7d5e8848aa",
+    "src/util/fault.rs": "1371796dd14fb237d53ee577b625683aa523dcb6e720e2fb7747bd76d94ac644",
+    "src/util/hmac.rs": "80be00c209b438b9e0369a05958bfce61588f489cde4d89fbe80b2c00afb6043",
+    "src/util/lock.rs": "38172ce4dcded00f9257a667f48f7e53575b9fe54c04062aa0866e97bc8f1055",
+    "src/util/log.rs": "224cf2e6acc65b5297cdbb539a91badf5f4542a4b12ea982ad6acde29d422a65",
+    "src/util/mod.rs": "c092ec6d43e77cb0aa0fed21e62dfaddce2466094a0ded5c1d9bc4c9b8e72a37",
+    "src/util/notify.rs": "2208bc8488c89caf788c7964482b441ea19c99dd219406cd83011996a6ce28c9",
+    "src/util/phases.rs": "f846d6846a8c794f97bce97421f573d7131cd4d8e206fab4065ec7400dc69458",
+    "src/util/snapshot.rs": "3e8fa488a13885fe07cb836b22c33aad01475183005a5f834185861fa3afdb18",
+    "src/util/time.rs": "d9708704100f9d4c408551c480d8f1d1c8c28102df18d48bb86a2eef980ac8b4",
+    "src/wire.rs": "8d80dce0906f5f2ec573fe11ccad945c97d57dae4b4062857bc59b599b2ce2d5",
+    "src/worker/activator.rs": "89d57596656a31813893d38a622d0a087f7a4dc9e563854b2d4490250864984a",
+    "src/worker/heartbeat.rs": "61caa9a8bd3188936886c440079edbd4fb58e580bbf7448601fe5f0805c1d028",
+    "src/worker/maintenance.rs": "8785eb4341826d36615e27371db5b9af6f62570030faa3391380804edcb91059",
+    "src/worker/mod.rs": "f79368de962ce857b755b22236f3464d3bd08cd05ef0e9c8827e4772c4d66f3a",
+    "src/worker/mount_ctl.rs": "78f2ef60a54b6a39f4cd5b7c80c436f768e60824e9ca271d7a3688eab9a121ab",
+    "src/worker/record.rs": "6786613df74a9933a19dbed3fdf305ee01e35e7656abb72b9257a7d74a242e4c",
+    "src/worker/status_cell.rs": "86f9e8e08347bebcc4da7273f38bc131d6b5cb71a1b978b39efe136f619d7c8c",
+    "src/ws.rs": "34c5d2cca8310aecb8cca832f01fe4a247e47556747ae5bb0ed8918bde86ddce",
+    "tests/content_admission.rs": "021ecdaba3bdf49383d1f545eb90aac21cfeb9c0e3ea56571725ae0233af0b11",
+    "tests/content_objects.rs": "e204738b76f5bc4c3e7e4c68178bb46ac76372e1709dcb8db46aec46d1dec488",
+    "tests/content_provider.rs": "79af30fb0b5b5ec25fe8ee1705674ad803fa40ba38d910f919b6ae9983984501",
+    "tests/content_scheduler.rs": "35b38ebbed47c69190f1489d082cad2dc2e00c99b47d1aa80afb398a2c38aa42",
+    "tests/content_transport.rs": "326fd040eb40663e5859762ab390a416230a46c3fd9769a2c891928655d4589f",
+    "tests/contracts.rs": "9e19972e2c67fcca4b6dd7fb444b50e316141be0ab7fa2372c314b9498a68510",
+    "tests/inbound_v3.rs": "040a9192383ded806862f72dde8f2113a51443d7a599b7dc0abaab083e3c182d",
+    "tests/objects_v3_lanes.rs": "d723ef6274e29fae382879eae79cf5164c2d548f6148bcdcc7330ad53db59e81",
+    "tests/seam_stubs.rs": "949892ea0741a9d50441f34e88ee1b54a1623b6d754f6d8b18bde66d14bb880d",
+    "tests/session_core.rs": "fe0621cf49eaa8d5228174761f864627c64b775f9c5c3fcf3fcad102d3e9686d"
+  },
+  "executables_sha256": {
+    "content_admission-57d7985a4febfeb7.exe": "200c1954d5d1b905ce6a294773cc3c6e3c62a79130998b782463ffbc081fa034",
+    "content_objects-598189102fff108b.exe": "33bf328ca63d48ce73e0b84712aea2e8756b4c0f154abd26e5fe3bff58c72c7e",
+    "content_provider-dd0e5f7bc806baae.exe": "e450019583a15687a81ed089fe1abc75ce026cdc3ebae8140be22c4f02411b30",
+    "content_scheduler-02e6e25c7dc8103c.exe": "f65ce1b6cb3f021d51a04f4d06d10ae082b017e32ef50ea1f7c6cd3f1a7d9276",
+    "content_transport-45a007033282eb55.exe": "3d743220f5541aaa7c066a37752ca88caacb360813354adb1e965deb45391133",
+    "contracts-299e0621d4b830f3.exe": "4d06e804416c5cea10deb8ce4d57904a7696fe287c026ab1224673dfa9cecc72",
+    "seam_stubs-6215f96bad66f299.exe": "ade260bf9f519c5082372a676b058e9d4dad43c0560ce7470dd723aab032daaf",
+    "session_core-ca9282992a234916.exe": "1ab9fb0f0c15efecef3fa4f23c66ce76cd19bf61a7c7676e5f0c20d74646906a",
+    "inbound_v3-95b035c145e6c518.exe": "5567de2b06c4454425e0bbd1be944c78a8780a4bcc5f45afe69b93f47e2c8418",
+    "objects_v3_lanes-1e7d56d13c6245d0.exe": "434439b258ebcf9a009d1790a6e2bd2ba9335fbedf3c658a4fb19fc502a0140f"
+  },
+  "earlier_artifact_stages": [
+    "session_core: before final legacy duplicate cleanup",
+    "inbound_v3: before final legacy duplicate cleanup"
+  ],
+  "source_identity_note": "Final focused 104-test invocation and final legacy lane suite use the final library source. Session_core and inbound_v3 passed earlier in this checkpoint, before the last objects.rs backoff-before-duplicate correction; their source tests/session implementation were unchanged afterward. Those earlier executable identities are retained separately rather than claimed as final full-suite qualification.",
+  "checks": [
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_transport --test content_objects --test content_scheduler --test content_provider --test content_admission --test contracts --test seam_stubs -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 102,
+      "ignored": 1,
+      "stage": "before outbound cancellation/drain cases and legacy duplicate cleanup"
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_objects --test content_scheduler --test content_provider --test content_admission --test contracts --test seam_stubs --test content_transport -- --test-threads=1 --nocapture",
+      "exit_code": 0,
+      "passed": 104,
+      "ignored": 1,
+      "stage": "final source"
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test session_core -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 59,
+      "elapsed_seconds": 54.23,
+      "stage": "session cancellation implementation; before final legacy backoff cleanup"
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test content_transport --test inbound_v3 --test objects_v3_lanes -- --test-threads=1",
+      "exit_code": 1,
+      "per_target": {
+        "content_transport": {
+          "passed": 14
+        },
+        "inbound_v3": {
+          "passed": 20,
+          "elapsed_seconds": 15.93
+        },
+        "objects_v3_lanes": {
+          "passed": 52,
+          "failed": 1,
+          "ignored": 18,
+          "elapsed_seconds": 133.45
+        }
+      },
+      "failure": "a_pull_never_carries_more_items_than_the_acceptor_takes: never installed within 40 seconds"
+    },
+    {
+      "command": "objects_v3_lanes-1e7d56d13c6245d0.exe a_pull_never_carries_more_items_than_the_acceptor_takes --exact --test-threads=1",
+      "exit_code": 0,
+      "passed": 1,
+      "elapsed_seconds": 0.81,
+      "stage": "isolated retry before legacy cleanup; not treated as a fix"
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test objects_v3_lanes -- --test-threads=1",
+      "exit_code": 1,
+      "passed": 52,
+      "failed": 1,
+      "ignored": 18,
+      "elapsed_seconds": 138.51,
+      "stage": "added failure diagnostics, before cleanup fix",
+      "failure_evidence": {
+        "missing": 139,
+        "lease_holders": {
+          "old_source_pull_slot_a": 16,
+          "old_source_pull_slot_b": 123
+        },
+        "exchange_errors": {},
+        "want_calls": 18
+      }
+    },
+    {
+      "command": "cargo test --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --test objects_v3_lanes -- --test-threads=1",
+      "stage": "final source after backoff-before-duplicate correction",
+      "exit_code": 0,
+      "passed": 53,
+      "ignored": 18,
+      "elapsed_seconds": 88.91
+    },
+    {
+      "command": "content_provider-dd0e5f7bc806baae.exe one_gib_contained_and_cross_boundary_overwrite --exact --ignored --test-threads=1",
+      "exit_code": 0,
+      "passed": 1,
+      "elapsed_seconds": 1.92,
+      "stage": "final source and current artifact; separately requested ignored qualification"
+    },
+    {
+      "command": "cargo clippy --release --locked --offline --target x86_64-pc-windows-msvc --target-dir target/build-cache/windows --lib --test content_transport --test content_objects --test content_scheduler --test content_provider --test content_admission --test contracts --test seam_stubs --test session_core --test objects_v3_lanes -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --all --check; git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "diagnostic_fixes": [
+    {
+      "problem": "A two-second old source worker read retained its transfer slot after peer session closure, so replacement missed the original one-second availability gate.",
+      "fix": "Per-request peer-to-worker cancellation bridge; unrelated shared-session calls remain open. Exact regression passed in 0.30 seconds and in subsequent full transport runs. The timing gate was not loosened."
+    },
+    {
+      "problem": "Large Preparation::Ready enum failed strict Clippy large_enum_variant.",
+      "fix": "Box the LocalOffer variant; final strict Clippy result recorded above."
+    },
+    {
+      "problem": "Two serial legacy lane runs left regranted failed objects leased to the old source; isolated retry alone passed.",
+      "fix": "Check source backoff before suppressing already-begun duplicates, releasing every returned backed-off lease under the slot that received it. Original 40-second availability and 15-second completion bounds retained."
+    }
+  ],
+  "latest_focused_test_counts": {
+    "content_admission": 8,
+    "content_objects": 17,
+    "content_provider": 12,
+    "content_scheduler": 5,
+    "content_transport": 14,
+    "contracts": 41,
+    "seam_stubs": 7
+  },
+  "unique_focused_tests_passed": 104,
+  "dispatch_samples": [
+    {
+      "available": true,
+      "available_ms": 61.8127,
+      "bound_ms": 1000,
+      "foreground_completions": 0,
+      "scenario": "background_while_foreground_stalled"
+    },
+    {
+      "bound_ms": 250,
+      "drain_ms": 57.840799999999994,
+      "drained": true,
+      "scenario": "lane_cancel"
+    },
+    {
+      "bound_ms": 250,
+      "drain_ms": 27.7407,
+      "drained": true,
+      "scenario": "daemon_cancel"
+    },
+    {
+      "admission_ms": 29.5375,
+      "admitted": true,
+      "bound_ms": 250,
+      "scenario": "foreground_behind_two_stalled_repositories",
+      "stalled_background_completions": 0
+    },
+    {
+      "available": true,
+      "available_ms": 97.8087,
+      "bound_ms": 1000,
+      "scenario": "replace_stalled_lane"
+    }
+  ],
+  "configuration": {
+    "preparation_threads": {
+      "foreground": 2,
+      "structural": 1,
+      "background": 1
+    },
+    "network_threads": 4,
+    "queued_frames": 4,
+    "lane_bindings": 256,
+    "working_repository_groups": 512,
+    "source_poll_candidates": 32,
+    "worker_cache_per_kind": 64,
+    "outgoing_capability_cache": 4096,
+    "frame_bytes": 65536,
+    "global_jobs": 8,
+    "global_charged_bytes": 8388608,
+    "outgoing_turns": 4,
+    "peer_and_repository_jobs": 4,
+    "cancel_poll_ms": 20,
+    "known_ack_and_offer_cleanup_ms": 250,
+    "normal_activation": false
+  },
+  "evidence": [
+    "Automatic hydration through objects::run_bulk_lane with actual authenticated peers and Store/CAS workers.",
+    "Foreground actual admission under 250 ms while two other repositories really stall background source reads; bytes arrive before their completion.",
+    "Background bytes arrive while foreground source read remains stalled.",
+    "Lane and daemon cancellation release real source/destination transfer ownership under 250 ms with registration held alive, avoiding hidden socket-drop cleanup.",
+    "Replacing an in-flight lane fences old work and late old-registration Drop.",
+    "An unaligned 1 MiB demand reaches its seventeenth chunk; observed missing final leaf and root page refetch correctly after derived availability invalidation.",
+    "Status observation does not initialize content state; v1 per-op body bounds are asserted while historical limits remain fixed."
+  ],
+  "limits": [
+    "Metadata descriptor negotiation, isolated migration and actual old-executable launcher fencing are still required; fixtures are the only activated stores.",
+    "Retained legacy cross-repository foreground admission and stable-run lease generation issues CCR-WP5.INT-1/-2 remain open; duplicate-lease cleanup is not their complete resolution.",
+    "Mounted range demand, private dirty-range sessions/recoverable close and fsync, cache/change journal, retention/GC and final user-visible status remain pending.",
+    "No final Windows/WSL suite, matched build matrix or 30-minute mixed-load campaign at this checkpoint; old ignored long floors remain outstanding.",
+    "Short controlled timing samples are package evidence, not sustained-load qualification. Large working-set latency and idle dispatcher overhead remain to be measured.",
+    "Intermediate failed executables were rebuilt during diagnosis; this executable manifest records the final artifacts and the explicitly identified earlier session/inbound artifacts."
+  ]
+}

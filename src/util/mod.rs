@@ -19,6 +19,7 @@ pub mod hmac;
 pub mod lock;
 pub mod log;
 pub mod notify;
+pub mod phases;
 pub mod snapshot;
 pub mod time;
 
