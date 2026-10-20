@@ -465,6 +465,269 @@ impl Drop for Pair {
     }
 }
 
+// An authenticated inbound receiver backed by the actual metadata/CAS worker.
+// Pair's original direction has its bytes at A; these tests push them to B.
+struct LegacyPushReceiver {
+    ctx: Arc<Ctx>,
+    server: Arc<InboundServer>,
+    address: String,
+    code: String,
+    installation: String,
+    scope: wire::PeerScope,
+}
+impl LegacyPushReceiver {
+    fn new(p: &Pair) -> Self {
+        for worker in [&p.a, &p.b] {
+            worker
+                .ctx
+                .sync_stores
+                .checkout()
+                .unwrap()
+                .db
+                .execute(
+                    "UPDATE config SET value='0' WHERE key='fixture:content_v1'",
+                    [],
+                )
+                .unwrap();
+        }
+        let (code, verifier) = Verifier::generate();
+        let ctx = World::new(&p.b, Some(verifier)).ctx();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let server = inbound::start_with(ctx.clone(), listener, InboundOptions::default());
+        Self {
+            ctx,
+            server,
+            address,
+            code,
+            installation: p.source.installation.clone(),
+            scope: wire::PeerScope {
+                repo: p.scope.repo.clone(),
+                sender: p.a.ctx.device.clone(),
+                receiver: p.b.ctx.device.clone(),
+                lane: LANE,
+            },
+        }
+    }
+    fn dial(&self) -> Conn {
+        session::dial(
+            &self.address,
+            session::client_hello(&self.installation, LaneRole::Bulk, Some(LANE), 2),
+            &CodeAuth {
+                code: self.code.clone(),
+            },
+            None,
+            ConnOptions::for_role(LaneRole::Bulk),
+        )
+        .unwrap()
+        .0
+    }
+    fn wants_header(&self) -> Value {
+        serde_json::json!({"repo":self.scope.repo,"sender":self.scope.sender,"receiver":self.scope.receiver,"lane":LANE,"max_items":256,"max_bytes":16*1024*1024})
+    }
+    fn wants(&self, conn: &Conn) -> Vec<tkfs::model::protocol::objects::WantItem> {
+        let reply = conn
+            .call(
+                "objects.wants",
+                self.wants_header(),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let reply: tkfs::model::protocol::objects::ObjectsWantsReply = if reply.body.is_empty() {
+            serde_json::from_value(reply.header).unwrap()
+        } else {
+            serde_json::from_slice(&reply.body).unwrap()
+        };
+        reply.items
+    }
+    fn push(&self, conn: &Conn, item: tkfs::model::protocol::objects::WantItem, bytes: &[u8]) {
+        use tkfs::model::protocol::{
+            frame::ChunkHeader,
+            objects::{ObjectOutcome, ObjectsPush, ObjectsResult},
+        };
+        let request = ObjectsPush {
+            repo: self.scope.repo.clone(),
+            sender: self.scope.sender.clone(),
+            receiver: self.scope.receiver.clone(),
+            lane: LANE,
+            items: vec![item.clone()],
+        };
+        let mut upload = conn
+            .upload(
+                "objects.push",
+                serde_json::to_value(request).unwrap(),
+                Priority::Control,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        for (index, chunk) in bytes[item.offset as usize..].chunks(65536).enumerate() {
+            let offset = item.offset + (index * 65536) as u64;
+            upload
+                .chunk(
+                    ChunkHeader {
+                        id: 0,
+                        hash: Some(item.hash.clone()),
+                        offset,
+                        total: bytes.len() as u64,
+                        last: offset + chunk.len() as u64 == bytes.len() as u64,
+                    },
+                    chunk,
+                )
+                .unwrap();
+        }
+        let reply = upload.finish().unwrap();
+        let reply: ObjectsResult = if reply.body.is_empty() {
+            serde_json::from_value(reply.header).unwrap()
+        } else {
+            serde_json::from_slice(&reply.body).unwrap()
+        };
+        assert_eq!(reply.results.len(), 1);
+        assert_eq!(reply.results[0].outcome, ObjectOutcome::Completed);
+    }
+}
+impl Drop for LegacyPushReceiver {
+    fn drop(&mut self) {
+        self.ctx.shutdown.cancel();
+        self.server.shutdown(Duration::from_secs(2));
+    }
+}
+
+#[test]
+fn native_legacy_push_reconnect_admits_before_old_release_and_late_cleanup_cannot_release_it() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let bytes = vec![101; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let old = receiver.dial();
+    let hash = p.root.digest.to_string();
+    assert!(receiver.wants(&old).iter().any(|item| item.hash == hash));
+    let old_id = p.b.ctx.inflight_objects.lock().unwrap().leases[&hash]
+        .session
+        .clone();
+    let mut config = FaultConfig::new("worker.rpc.objects.release", FaultAction::Hang);
+    config.ms = Some(2000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let _reset = Reset;
+    old.close();
+    let until = Instant::now() + Duration::from_secs(3);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1, "actual old release must be stalled");
+    let new = receiver.dial();
+    let started = Instant::now();
+    let item = receiver
+        .wants(&new)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    let admission = started.elapsed();
+    let lease = p.b.ctx.inflight_objects.lock().unwrap().leases[&hash].clone();
+    let old_owner = tkfs::model::lease::parse(&old_id).unwrap().unwrap();
+    let new_owner = tkfs::model::lease::parse(&lease.session).unwrap().unwrap();
+    assert!(new_owner.generation > old_owner.generation);
+    assert_eq!(old_owner.layout, new_owner.layout);
+    thread::sleep(Duration::from_millis(2150));
+    let after = p.b.ctx.inflight_objects.lock().unwrap().leases[&hash].clone();
+    let no_backoff =
+        runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.a.ctx.device, &hash).is_none();
+    receiver.push(&new, item, &bytes);
+    let mut out = vec![0; bytes.len()];
+    p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    new.close();
+    assert!(
+        admission < Duration::from_millis(250),
+        "replacement waited {admission:?}"
+    );
+    assert_eq!(after, lease);
+    assert!(no_backoff);
+    assert_eq!(out, bytes);
+    println!(
+        "WAVE6_PUSH {}",
+        serde_json::json!({"scenario":"native_reconnect_behind_old_release","admission_ms":admission.as_secs_f64()*1000.0,"bound_ms":250,"old_release_stall_ms":2000,"typed_activation":false})
+    );
+}
+
+#[test]
+fn native_late_push_offer_reply_cannot_replace_a_newer_offer_on_the_same_session() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let bytes = vec![102; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let conn = receiver.dial();
+    let mut config = FaultConfig::new("inbound.objects.before_offer_publish", FaultAction::Hang);
+    config.ms = Some(2000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let _reset = Reset;
+    let old_conn = conn.clone();
+    let header = receiver.wants_header();
+    let old = thread::spawn(move || {
+        old_conn.call(
+            "objects.wants",
+            header,
+            vec![],
+            Priority::Control,
+            Duration::from_secs(5),
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(3);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let started = Instant::now();
+    let hash = p.root.digest.to_string();
+    let item = receiver
+        .wants(&conn)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    let admission = started.elapsed();
+    let owner = p.b.ctx.inflight_objects.lock().unwrap().leases[&hash]
+        .session
+        .clone();
+    assert_eq!(
+        old.join().unwrap().unwrap_err().code(),
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    assert_eq!(
+        p.b.ctx.inflight_objects.lock().unwrap().leases[&hash].session,
+        owner
+    );
+    assert!(runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.a.ctx.device, &hash).is_none());
+    receiver.push(&conn, item, &bytes);
+    let mut out = vec![0; bytes.len()];
+    p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    conn.close();
+    assert!(
+        admission < Duration::from_millis(250),
+        "new offer waited {admission:?}"
+    );
+    assert_eq!(out, bytes);
+    println!(
+        "WAVE6_PUSH {}",
+        serde_json::json!({"scenario":"native_late_offer_publication","admission_ms":admission.as_secs_f64()*1000.0,"bound_ms":250,"old_offer_stall_ms":2000,"typed_activation":false})
+    );
+}
+
 #[test]
 fn bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks() {
     let bytes: Vec<u8> = (0..150_000)
