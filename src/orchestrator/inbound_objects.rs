@@ -164,7 +164,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::RandomState},
     hash::BuildHasher,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::RecvTimeoutError,
     },
@@ -559,6 +559,7 @@ struct Offer {
     route: SyncRoute,
     lease: String,
     released: bool,
+    closed: bool,
 }
 
 #[derive(Clone)]
@@ -574,16 +575,21 @@ struct Offered {
 #[derive(Default)]
 struct OfferMap {
     offers: HashMap<String, Offer>,
+    active_cleanup: usize,
+    cleanup_peak: usize,
+    cleanup_attempts: u64,
 }
 
 struct Offers {
     map: Mutex<OfferMap>,
+    changed: Condvar,
 }
 
 fn offers() -> &'static Offers {
     static OFFERS: OnceLock<Offers> = OnceLock::new();
     OFFERS.get_or_init(|| Offers {
         map: Mutex::new(OfferMap::default()),
+        changed: Condvar::new(),
     })
 }
 
@@ -610,6 +616,9 @@ fn take_offer(key: &str, owner: &Owner, prior: bool) -> Option<Offer> {
 }
 
 fn put_offer(key: String, offer: Offer) -> bool {
+    if !start_reaper() {
+        return false;
+    }
     {
         let mut map = lock(&offers().map);
         if map
@@ -633,7 +642,6 @@ fn put_offer(key: String, offer: Offer) -> bool {
             return false;
         }
     }
-    start_reaper();
     true
 }
 
@@ -676,20 +684,58 @@ fn seen_session(session: &str) {
     seen.insert(session.to_owned(), now);
 }
 
-/// The process's offer reaper, started with the first offer.
-fn start_reaper() {
-    static STARTED: OnceLock<bool> = OnceLock::new();
-    STARTED.get_or_init(|| {
-        thread::Builder::new()
-            .name("offer-reaper".into())
-            .spawn(|| {
-                loop {
-                    thread::sleep(REAP_EVERY);
-                    reap_offers(Instant::now());
-                }
+/// Fixed process-wide release workers, shared across every daemon fixture,
+/// peer and repository. Pending work stays in the bounded offer registry.
+pub const OFFER_RELEASE_WORKERS: usize = 2;
+static RELEASE_STARTED: OnceLock<usize> = OnceLock::new();
+
+fn start_reaper() -> bool {
+    *RELEASE_STARTED.get_or_init(|| {
+        (0..OFFER_RELEASE_WORKERS)
+            .filter(|index| {
+                thread::Builder::new()
+                    .name(format!("offer-release-{index}"))
+                    .spawn(|| loop {
+                        let result = std::panic::catch_unwind(|| reap_offers(Instant::now()));
+                        if result.is_err() {
+                            crate::util::log::event!(error, UNKNOWN_ERROR, {
+                                "site":"inbound.offer_cleanup", "detail":"release attempt panicked; cleanup worker continues",
+                            });
+                        }
+                        let _ = offers()
+                            .changed
+                            .wait_timeout(lock(&offers().map), REAP_EVERY)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    })
+                    .is_ok()
             })
-            .is_ok()
-    });
+            .count()
+    }) > 0
+}
+
+#[derive(Clone, Debug)]
+pub struct OfferCleanupView {
+    pub worker_threads: usize,
+    pub active: usize,
+    pub peak: usize,
+    pub attempts_completed: u64,
+    pub retained_offers: usize,
+    pub closed_pending: usize,
+}
+pub fn offer_cleanup_view() -> OfferCleanupView {
+    let map = lock(&offers().map);
+    OfferCleanupView {
+        worker_threads: RELEASE_STARTED.get().copied().unwrap_or(0),
+        active: map.active_cleanup,
+        peak: map.cleanup_peak,
+        attempts_completed: map.cleanup_attempts,
+        retained_offers: map.offers.len(),
+        closed_pending: map
+            .offers
+            .values()
+            .filter(|offer| !offer.released && (offer.closed || offer.owner.closed()))
+            .count(),
+    }
 }
 
 /// Gives up the leases of every offer whose session went away (module
@@ -700,7 +746,9 @@ fn start_reaper() {
 pub fn reap_offers(now: Instant) -> usize {
     let silent = |at: Instant| now.saturating_duration_since(at) >= OFFER_GRACE;
     reap_where(|offer, seen| {
-        silent(offer.at) && seen.get(&offer.session).is_none_or(|last| silent(*last))
+        offer.closed
+            || offer.owner.closed()
+            || (silent(offer.at) && seen.get(&offer.session).is_none_or(|last| silent(*last)))
     })
 }
 
@@ -709,75 +757,90 @@ pub fn reap_offers(now: Instant) -> usize {
 /// offers made on it are given up now, instead of after [`OFFER_GRACE`] of
 /// silence, by the reaper's rules (each offer judged and marked under the
 /// offers' lock; replacement offers never wait for the old release).
-/// On a thread of its own: the close path never waits for a
-/// worker. Without one (it could not start) the periodic reaper still
-/// gives them up, the session no longer counting as seen.
+/// The close path only marks the bounded registry and wakes fixed workers;
+/// it never spawns a thread, queues a copied release batch or waits for RPC.
 pub fn session_closed(peer: &session::AcceptedPeer) {
     if peer.role != protocol::LaneRole::Bulk {
         return;
     }
     let session = peer.session.clone();
     lock(sessions_seen()).remove(&session);
-    let offered = {
+    {
         let mut map = lock(&offers().map);
         map.offers
             .retain(|_, offer| !(offer.released && offer.session == session));
-        map.offers.values().any(|offer| offer.session == session)
-    };
-    if offered {
-        let _ = thread::Builder::new()
-            .name("offer-release".into())
-            .spawn(move || {
-                reap_where(|offer, _| offer.session == session);
-                // Remove only this closed session's offers; a newer session
-                // may already have replaced the same logical table key.
-                lock(&offers().map)
-                    .offers
-                    .retain(|_, offer| offer.session != session);
-            });
+        for offer in map
+            .offers
+            .values_mut()
+            .filter(|offer| offer.session == session)
+        {
+            offer.closed = true;
+        }
     }
+    offers().changed.notify_all();
+}
+
+struct CleanupJob {
+    client: Arc<SessionWorkerClient>,
+    route: SyncRoute,
+    lease: String,
+    hashes: Vec<String>,
+}
+struct CleanupGuard;
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        let mut map = lock(&offers().map);
+        map.active_cleanup -= 1;
+        map.cleanup_attempts = map.cleanup_attempts.saturating_add(1);
+        drop(map);
+        offers().changed.notify_all();
+    }
+}
+
+fn claim_cleanup(
+    gone: &impl Fn(&Offer, &HashMap<String, Instant>) -> bool,
+) -> Option<(CleanupJob, CleanupGuard)> {
+    let seen = lock(sessions_seen());
+    let mut map = lock(&offers().map);
+    if map.active_cleanup >= OFFER_RELEASE_WORKERS {
+        return None;
+    }
+    let key = map
+        .offers
+        .iter()
+        .filter(|(_, offer)| !offer.released && gone(offer, &seen))
+        .min_by_key(|(_, offer)| offer.at)
+        .map(|(key, _)| key.clone())?;
+    let offer = map.offers.get_mut(&key)?;
+    let job = CleanupJob {
+        client: offer.client.clone(),
+        route: offer.route.clone(),
+        lease: offer.lease.clone(),
+        hashes: offer
+            .items
+            .iter()
+            .map(|item| item.item.hash.clone())
+            .collect(),
+    };
+    if offer.closed || offer.owner.closed() {
+        map.offers.remove(&key);
+    } else {
+        offer.released = true;
+    }
+    map.active_cleanup += 1;
+    map.cleanup_peak = map.cleanup_peak.max(map.active_cleanup);
+    Some((job, CleanupGuard))
 }
 
 /// Gives up the leases of every unreleased offer `gone` picks (with when
 /// each session was last seen), as [`reap_offers`] describes.
 fn reap_where(gone: impl Fn(&Offer, &HashMap<String, Instant>) -> bool) -> usize {
-    let keys: Vec<String> = {
-        let seen = lock(sessions_seen());
-        lock(&offers().map)
-            .offers
-            .iter()
-            .filter(|(_, offer)| !offer.released && gone(offer, &seen))
-            .map(|(key, _)| key.clone())
-            .collect()
-    };
     let mut count = 0;
-    for key in keys {
-        // Judged again now: an exchange of a new session may have taken or
-        // replaced the offer since (its leases are that exchange's then).
-        let gone = {
-            let seen = lock(sessions_seen());
-            let mut map = lock(&offers().map);
-            match map.offers.get_mut(&key) {
-                Some(offer) if !offer.released && gone(offer, &seen) => {
-                    offer.released = true;
-                    Some((
-                        offer.client.clone(),
-                        offer.route.clone(),
-                        offer.lease.clone(),
-                        offer
-                            .items
-                            .iter()
-                            .map(|offered| offered.item.hash.clone())
-                            .collect::<Vec<_>>(),
-                    ))
-                }
-                _ => None,
-            }
+    for _ in 0..MAX_OFFERS {
+        let Some((job, _running)) = claim_cleanup(&gone) else {
+            break;
         };
-        let Some((client, route, lease, hashes)) = gone else {
-            continue;
-        };
-        release_leases(&client, &route, &lease, hashes);
+        release_leases(&job.client, &job.route, &job.lease, job.hashes);
         count += 1;
     }
     count
@@ -1003,6 +1066,7 @@ fn wants(
         route: bound.route.clone(),
         lease: source.lease.clone(),
         released: false,
+        closed: false,
     };
     if !offer.items.is_empty() && !put_offer(key, offer) {
         release_leases(
@@ -1188,7 +1252,7 @@ fn push(
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        if !source.owner.current() {
+        if !source.owner.lineage_current() {
             failure = Some(ErrorWire::coded(
                 "IN_FLIGHT_ELSEWHERE",
                 "inbound push offer superseded",
@@ -1297,7 +1361,12 @@ fn push(
         });
     }
     if let Some(offer) = &offer {
-        if whole {
+        if source.owner.closed() {
+            // A close retires publication/backoff authority, but the valid
+            // received prefix was drained above. Clean up only this exact
+            // lease; a replacement frame cannot be released by this ID.
+            give_up.extend(offer.items.iter().map(|offered| offered.item.hash.clone()));
+        } else if whole {
             give_up.extend(source.settle_unpushed(offer, &pushed));
         } else {
             // The push failed or the dialer went away: what we offered it and

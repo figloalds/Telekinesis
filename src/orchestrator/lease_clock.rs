@@ -10,7 +10,7 @@ use crate::{
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 type InboundPool = (u32, Arc<Mutex<u64>>);
@@ -24,14 +24,27 @@ pub struct Clock {
 pub struct PushSession {
     pub run: PushRun,
     current_pool: Arc<Mutex<u64>>,
+    closed: AtomicBool,
 }
 impl PushSession {
     pub fn current(&self) -> bool {
+        !self.is_closed() && *lock(&self.current_pool) == self.run.layout
+    }
+    pub(crate) fn pool_current(&self) -> bool {
         *lock(&self.current_pool) == self.run.layout
     }
     pub(crate) fn while_current<T>(&self, apply: impl FnOnce() -> T) -> Option<T> {
         let current = lock(&self.current_pool);
-        (*current == self.run.layout).then(apply)
+        (!self.is_closed() && *current == self.run.layout).then(apply)
+    }
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+    /// Retire this session under the same short gate as guarded publication.
+    /// Reconnects in its pool remain independent; no new identity is allocated.
+    pub fn close(&self) {
+        let _current = lock(&self.current_pool);
+        self.closed.store(true, Ordering::Release);
     }
 }
 impl Clock {
@@ -136,6 +149,7 @@ impl Clock {
         Ok(Arc::new(PushSession {
             run: PushRun { generation, layout },
             current_pool: pool,
+            closed: AtomicBool::new(false),
         }))
     }
 }

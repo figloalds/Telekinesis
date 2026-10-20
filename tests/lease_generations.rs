@@ -187,6 +187,25 @@ fn inbound_sessions_retain_their_authenticated_pool_and_get_distinct_session_roo
 }
 
 #[test]
+fn closing_an_inbound_session_retires_its_aliases_without_retiring_its_pool() {
+    let clock = Clock::new(63);
+    let a = clock.accept_push("peer-a", 3).unwrap();
+    let alias = a.clone();
+    let sibling = clock.accept_push("peer-a", 3).unwrap();
+    let other = clock.accept_push("peer-b", 1).unwrap();
+    a.close();
+    a.close();
+    assert!(a.is_closed() && alias.is_closed());
+    assert!(!a.current() && !alias.current());
+    assert!(!sibling.is_closed() && sibling.current());
+    assert!(other.current());
+    let reconnect = clock.accept_push("peer-a", 3).unwrap();
+    assert_eq!(reconnect.run.layout, sibling.run.layout);
+    assert!(reconnect.current() && sibling.current());
+    assert!(!alias.current());
+}
+
+#[test]
 fn push_frame_ids_remain_local_bounded_and_preserve_the_stable_lane_scope() {
     let run = lease::PushRun {
         generation: Generation {

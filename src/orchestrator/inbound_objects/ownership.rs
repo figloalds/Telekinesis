@@ -56,6 +56,9 @@ pub(super) struct Owner {
     frame: u64,
 }
 impl Owner {
+    pub(super) fn closed(&self) -> bool {
+        self.session.is_closed()
+    }
     pub(super) fn begin(
         ctx: &Arc<Ctx>,
         session: &Arc<PushSession>,
@@ -103,6 +106,11 @@ impl Owner {
     }
     pub(super) fn current(&self) -> bool {
         self.session.current() && *lock(&self.slot.latest) == Some(self.order())
+    }
+    /// A disconnected sender's already-admitted contiguous prefix may still
+    /// become durable, until an actual newer owner supersedes this frame.
+    pub(super) fn lineage_current(&self) -> bool {
+        self.session.pool_current() && *lock(&self.slot.latest) == Some(self.order())
     }
     pub(super) fn while_current<T>(&self, apply: impl FnOnce() -> T) -> Option<T> {
         let latest = lock(&self.slot.latest);
