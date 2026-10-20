@@ -565,6 +565,12 @@ short memory mutations are serialized. No ownership lock spans worker RPC,
 byte verification, socket streaming or durable I/O. Reaper releases use exact
 IDs, so a replacement no longer waits for the old release RPC.
 
+After a write verdict is collected, the native worker rechecks the owner under
+the same short state guard that mutates source backoff. A superseded corrupt
+verdict cannot apply a memory retry after a replacement installed good bytes.
+Durable local-failure SQL projection and same-run foreground error interleavings
+remain part of the full legacy audit; this memory guard does not qualify them.
+
 The slot registry has at most 4,096 weak entries, reuses live slots at capacity,
 and refuses new live scopes rather than evicting an owner. Reclamation rechecks
 the key after dropping the registry lock, preserving one slot under concurrent
