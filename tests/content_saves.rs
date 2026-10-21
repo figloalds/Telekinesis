@@ -43,6 +43,12 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_selection(true)
+    }
+    fn unselected() -> Self {
+        Self::with_selection(false)
+    }
+    fn with_selection(select: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut store = Store::initialize(dir.path(), "content-save-publication", &id()).unwrap();
         store
@@ -59,9 +65,11 @@ impl Fixture {
             .unwrap();
         let checkpoint = session.checkpoint(&context()).unwrap().unwrap();
         let prepared = session.prepare(&local, &checkpoint, &context()).unwrap();
-        store
-            .select_content_checkpoint(&checkpoint, &context())
-            .unwrap();
+        if select {
+            store
+                .select_content_checkpoint(&checkpoint, &context())
+                .unwrap();
+        }
         Self {
             dir,
             store,
@@ -93,6 +101,465 @@ impl Fixture {
     }
     fn oracle(&mut self) {
         assert!(self.store.verify_derived_state().unwrap().is_empty());
+    }
+}
+
+fn owned_basic(store: &Store, entity: &str) -> tkfs::core::BasicInfo {
+    let mut basic = store.entry(entity).unwrap().basic_info();
+    basic.posix_mode = Some(0o640);
+    basic.write_time = 101;
+    basic.change_time = 202;
+    basic
+}
+
+#[test]
+fn owned_basic_rebases_metadata_without_replacing_private_bytes_or_content_parents() {
+    let mut f = Fixture::unselected();
+    let before = f.store.entry(&f.entity).unwrap();
+    let intent = f.checkpoint.intent.clone();
+    let mutation = Uuid::new_v4();
+    let basic = owned_basic(&f.store, &f.entity);
+    let receipt = f
+        .store
+        .apply_content_save_basic(
+            &intent,
+            mutation,
+            basic,
+            f.checkpoint.sequence,
+            6,
+            &context(),
+        )
+        .unwrap();
+    assert_eq!(receipt.operation, intent.operation);
+    assert_eq!(f.store.entry(&f.entity).unwrap().content, before.content);
+    assert_eq!(
+        f.store.entry(&f.entity).unwrap().content_ref,
+        before.content_ref
+    );
+    assert_eq!(f.store.entry(&f.entity).unwrap().basic_info(), basic);
+    assert_eq!(
+        f.journal.pending(None, 64, &context()).unwrap(),
+        vec![f.checkpoint.clone()]
+    );
+    assert_eq!(read_view(&f.session, 19), b"durable local bytes");
+    assert_eq!(
+        f.store
+            .apply_content_save_basic(
+                &intent,
+                mutation,
+                basic,
+                f.checkpoint.sequence,
+                6,
+                &context()
+            )
+            .unwrap(),
+        receipt
+    );
+    f.store
+        .select_content_checkpoint(&f.checkpoint, &context())
+        .unwrap();
+    let saved = f
+        .store
+        .publish_content_save(&f.prepared, &context())
+        .unwrap();
+    let event = f
+        .store
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.id == saved.event())
+        .unwrap();
+    assert_eq!(
+        event.changes[0].parents,
+        intent.content_parent.into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        event.changes[1].parents,
+        intent.alive_parent.into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(event.changes[2].parents, vec![receipt.event]);
+    assert_eq!(f.store.entry(&f.entity).unwrap().basic_info(), basic);
+    f.oracle();
+    println!(
+        "WAVE6_OWNED_BASIC {}",
+        serde_json::json!({"scenario":"metadata_only_then_save","stable_operation":true,"content_unchanged_before_publication":true,"journal_saved_unchanged":true,"private_bytes_equal":true,"timestamps_preserved":true})
+    );
+}
+
+#[test]
+fn owned_basic_time_retention_expires_after_new_bytes_even_when_selection_is_superseded() {
+    for select_first in [false, true] {
+        let mut f = Fixture::unselected();
+        let basic = owned_basic(&f.store, &f.entity);
+        f.store
+            .apply_content_save_basic(
+                &f.checkpoint.intent,
+                Uuid::new_v4(),
+                basic,
+                f.checkpoint.sequence,
+                6,
+                &context(),
+            )
+            .unwrap();
+        if select_first {
+            f.store
+                .select_content_checkpoint(&f.checkpoint, &context())
+                .unwrap();
+        }
+        f.session.write_at(0, b"new", &context()).unwrap();
+        let newer = f.session.checkpoint(&context()).unwrap().unwrap();
+        let prepared = f.session.prepare(&f.local, &newer, &context()).unwrap();
+        f.store
+            .select_content_checkpoint(&newer, &context())
+            .unwrap();
+        error(
+            f.store.publish_content_save(&f.prepared, &context()),
+            "STALE_WRITE_CHECKPOINT",
+        );
+        f.store.publish_content_save(&prepared, &context()).unwrap();
+        let actual = f.store.entry(&f.entity).unwrap().basic_info();
+        assert!(actual.write_time > basic.write_time && actual.change_time > basic.change_time);
+        assert_eq!(actual.posix_mode, basic.posix_mode);
+        f.oracle();
+    }
+}
+
+#[test]
+fn owned_basic_rejects_selected_capture_and_ordinary_metadata_still_fences_ownership() {
+    let mut f = Fixture::new();
+    let basic = owned_basic(&f.store, &f.entity);
+    let mutation = Uuid::new_v4();
+    error(
+        f.store.apply_content_save_basic(
+            &f.checkpoint.intent,
+            mutation,
+            basic,
+            f.checkpoint.sequence,
+            6,
+            &context(),
+        ),
+        "CONTENT_METADATA_SAVE_IN_PROGRESS",
+    );
+    let count: u64 = f
+        .store
+        .db
+        .query_row(
+            "SELECT count(*) FROM content_save_metadata_changes",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+    f.store.set_basic(&f.entity, basic).unwrap();
+    error(
+        f.store.apply_content_save_basic(
+            &f.checkpoint.intent,
+            mutation,
+            basic,
+            f.checkpoint.sequence,
+            6,
+            &context(),
+        ),
+        "STALE_CONTENT_SAVE",
+    );
+    error(
+        f.store.publish_content_save(&f.prepared, &context()),
+        "STALE_CONTENT_SAVE",
+    );
+    f.pending();
+    f.oracle();
+}
+
+#[test]
+fn owned_basic_newer_private_sequence_cannot_be_overwritten_by_an_older_checkpoint() {
+    let mut f = Fixture::unselected();
+    f.session.write_at(0, b"new", &context()).unwrap();
+    let newer = f.session.checkpoint(&context()).unwrap().unwrap();
+    let basic = owned_basic(&f.store, &f.entity);
+    f.store
+        .apply_content_save_basic(
+            &newer.intent,
+            Uuid::new_v4(),
+            basic,
+            newer.sequence,
+            6,
+            &context(),
+        )
+        .unwrap();
+    error(
+        f.store.select_content_checkpoint(&f.checkpoint, &context()),
+        "STALE_WRITE_CHECKPOINT",
+    );
+    assert_eq!(f.store.entry(&f.entity).unwrap().basic_info(), basic);
+    let prepared = f.session.prepare(&f.local, &newer, &context()).unwrap();
+    f.store
+        .select_content_checkpoint(&newer, &context())
+        .unwrap();
+    f.store.publish_content_save(&prepared, &context()).unwrap();
+    assert_eq!(f.store.entry(&f.entity).unwrap().basic_info(), basic);
+    f.oracle();
+}
+
+#[test]
+fn owned_basic_successor_replay_and_lost_reply_survive_later_publication() {
+    let mut f = Fixture::new();
+    f.store
+        .publish_content_save(&f.prepared, &context())
+        .unwrap();
+    let handoff = f
+        .store
+        .continue_content_save(&f.checkpoint, &context())
+        .unwrap();
+    let session = f
+        .session
+        .adopt_continuation(&handoff, f.local.clone(), &context())
+        .unwrap();
+    session.write_at(0, b"next", &context()).unwrap();
+    let checkpoint = session.checkpoint(&context()).unwrap().unwrap();
+    let basic = owned_basic(&f.store, &f.entity);
+    let mutation = Uuid::new_v4();
+    let receipt = f
+        .store
+        .apply_content_save_basic(
+            &checkpoint.intent,
+            mutation,
+            basic,
+            checkpoint.sequence,
+            6,
+            &context(),
+        )
+        .unwrap();
+    assert_eq!(
+        f.store
+            .continue_content_save(&f.checkpoint, &context())
+            .unwrap()
+            .intent(),
+        handoff.intent()
+    );
+    assert!(
+        f.session
+            .adopt_continuation(&handoff, f.local.clone(), &context())
+            .unwrap()
+            .adoption_work()
+            .unwrap()
+            .replay
+    );
+    let prepared = session.prepare(&f.local, &checkpoint, &context()).unwrap();
+    f.store
+        .select_content_checkpoint(&checkpoint, &context())
+        .unwrap();
+    // Selecting timestamps must also preserve historical successor lookup.
+    assert_eq!(
+        f.store
+            .continue_content_save(&f.checkpoint, &context())
+            .unwrap()
+            .intent(),
+        handoff.intent()
+    );
+    f.store.publish_content_save(&prepared, &context()).unwrap();
+    let next = f
+        .store
+        .continue_content_save(&checkpoint, &context())
+        .unwrap();
+    session
+        .adopt_continuation(&next, f.local.clone(), &context())
+        .unwrap();
+    assert_eq!(
+        f.store
+            .apply_content_save_basic(
+                &checkpoint.intent,
+                mutation,
+                basic,
+                checkpoint.sequence,
+                6,
+                &context()
+            )
+            .unwrap(),
+        receipt
+    );
+    error(
+        f.store.apply_content_save_basic(
+            &checkpoint.intent,
+            mutation,
+            basic,
+            checkpoint.sequence + 1,
+            6,
+            &context(),
+        ),
+        "CONTENT_METADATA_MUTATION_REUSED",
+    );
+    assert_eq!(f.store.entry(&f.entity).unwrap().basic_info(), basic);
+    f.oracle();
+}
+
+#[test]
+fn owned_basic_metadata_event_cannot_reuse_the_unpublished_byte_event_identity() {
+    let mut f = Fixture::unselected();
+    let basic = owned_basic(&f.store, &f.entity);
+    error(
+        f.store.apply_content_save_basic(
+            &f.checkpoint.intent,
+            f.session.operation(),
+            basic,
+            f.checkpoint.sequence,
+            6,
+            &context(),
+        ),
+        "CONTENT_METADATA_OWNER_MISMATCH",
+    );
+    assert_eq!(f.event_count(), 0);
+    f.store
+        .select_content_checkpoint(&f.checkpoint, &context())
+        .unwrap();
+    f.store
+        .publish_content_save(&f.prepared, &context())
+        .unwrap();
+    f.oracle();
+}
+
+#[test]
+fn owned_basic_rebase_preserves_a_remote_content_competitor() {
+    let mut f = Fixture::unselected();
+    let root = FileContentRef::new(
+        ContentKind::Direct,
+        Digest::bytes(b"absent remote bytes"),
+        19,
+    )
+    .unwrap();
+    let mut remote = f.store.event(
+        &f.store.branch(&f.store.active).unwrap(),
+        vec![Change {
+            entity: f.entity.clone(),
+            field: "content".into(),
+            parents: f
+                .checkpoint
+                .intent
+                .content_parent
+                .clone()
+                .into_iter()
+                .collect(),
+            value: serde_json::json!(root),
+        }],
+    );
+    remote.device = "remote-peer".into();
+    let remote_id = remote.id.clone();
+    f.store.commit(remote, false).unwrap();
+    let basic = owned_basic(&f.store, &f.entity);
+    f.store
+        .apply_content_save_basic(
+            &f.checkpoint.intent,
+            Uuid::new_v4(),
+            basic,
+            f.checkpoint.sequence,
+            6,
+            &context(),
+        )
+        .unwrap();
+    f.store
+        .select_content_checkpoint(&f.checkpoint, &context())
+        .unwrap();
+    let receipt = f
+        .store
+        .publish_content_save(&f.prepared, &context())
+        .unwrap();
+    let local = f
+        .store
+        .events()
+        .unwrap()
+        .into_iter()
+        .find(|e| e.id == receipt.event())
+        .unwrap();
+    assert!(!local.changes[0].parents.contains(&remote_id));
+    assert!(
+        f.store
+            .conflicts()
+            .unwrap()
+            .iter()
+            .any(|c| c.field == "content"
+                && c.alternatives.iter().any(|a| a.revision == remote_id)
+                && c.alternatives.iter().any(|a| a.revision == receipt.event()))
+    );
+    f.oracle();
+}
+
+#[test]
+fn owned_basic_process_exit_keeps_event_capture_and_idempotent_receipt_atomic() {
+    for point in [
+        "content.save.before_basic",
+        "content.save.basic_written",
+        "content.save.basic_committed",
+    ] {
+        let f = Fixture::unselected();
+        let mutation = Uuid::new_v4();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_process_publication",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TKFS_SAVE_CHILD_ROOT", f.dir.path())
+            .env(
+                "TKFS_SAVE_CHILD_OPERATION",
+                f.session.operation().to_string(),
+            )
+            .env("TKFS_SAVE_CHILD_POINT", point)
+            .env("TKFS_SAVE_CHILD_CONTINUE", "3")
+            .env(
+                "TKFS_SAVE_CHILD_BASIC_INTENT",
+                serde_json::to_string(&f.checkpoint.intent).unwrap(),
+            )
+            .env("TKFS_SAVE_CHILD_MUTATION", mutation.to_string())
+            .env(
+                "TKFS_SAVE_CHILD_SEQUENCE",
+                f.checkpoint.sequence.to_string(),
+            )
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(86), "{point}");
+        let mut recovered = Store::open_existing(f.dir.path()).unwrap();
+        let count: u64 = recovered
+            .db
+            .query_row(
+                "SELECT count(*) FROM content_save_metadata_changes",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, u64::from(point == "content.save.basic_committed"));
+        let basic = owned_basic(&recovered, &f.entity);
+        let receipt = recovered
+            .apply_content_save_basic(
+                &f.checkpoint.intent,
+                mutation,
+                basic,
+                f.checkpoint.sequence,
+                6,
+                &context(),
+            )
+            .unwrap();
+        assert_eq!(
+            recovered
+                .apply_content_save_basic(
+                    &f.checkpoint.intent,
+                    mutation,
+                    basic,
+                    f.checkpoint.sequence,
+                    6,
+                    &context()
+                )
+                .unwrap(),
+            receipt
+        );
+        recovered
+            .select_content_checkpoint(&f.checkpoint, &context())
+            .unwrap();
+        recovered
+            .publish_content_save(&f.prepared, &context())
+            .unwrap();
+        assert_eq!(recovered.entry(&f.entity).unwrap().basic_info(), basic);
+        assert!(recovered.verify_derived_state().unwrap().is_empty());
+        f.pending();
     }
 }
 
@@ -2636,6 +3103,27 @@ fn child_process_publication() {
     let root = std::path::PathBuf::from(std::env::var_os("TKFS_SAVE_CHILD_ROOT").unwrap());
     let operation = Uuid::parse_str(&std::env::var("TKFS_SAVE_CHILD_OPERATION").unwrap()).unwrap();
     let mut store = Store::open_existing(&root).unwrap();
+    if std::env::var("TKFS_SAVE_CHILD_CONTINUE").as_deref() == Ok("3") {
+        let intent = serde_json::from_str::<tkfs::content::write::SaveIntent>(
+            &std::env::var("TKFS_SAVE_CHILD_BASIC_INTENT").unwrap(),
+        )
+        .unwrap();
+        let mutation =
+            Uuid::parse_str(&std::env::var("TKFS_SAVE_CHILD_MUTATION").unwrap()).unwrap();
+        let sequence = std::env::var("TKFS_SAVE_CHILD_SEQUENCE")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let basic = owned_basic(&store, &intent.base.entity);
+        fault::configure(Some(FaultConfig::new(
+            &std::env::var("TKFS_SAVE_CHILD_POINT").unwrap(),
+            FaultAction::Exit,
+        )));
+        store
+            .apply_content_save_basic(&intent, mutation, basic, sequence, 6, &context())
+            .unwrap();
+        panic!("owned basic mutation did not hit requested process exit");
+    }
     let local = Arc::new(LocalContent::open(&root).unwrap());
     let journal = WriteJournal::open(&root).unwrap();
     let session = journal
