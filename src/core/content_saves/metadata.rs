@@ -154,10 +154,25 @@ impl Store {
                 request: request.clone(),
                 event,
             };
-            store.db.execute(
+            let raw = encode("metadata:v1", &record)?;
+            let changed = store.db.execute(
                 "INSERT INTO content_save_metadata_changes(mutation,record) VALUES(?,?)",
-                params![mutation.to_string(), encode("metadata:v1", &record)?],
+                params![mutation.to_string(), &raw],
             )?;
+            let stored = record_sql(
+                store
+                    .db
+                    .query_row(
+                        "SELECT record FROM content_save_metadata_changes WHERE mutation=?",
+                        [mutation.to_string()],
+                        |r| blob(r, 0),
+                    )
+                    .optional(),
+            )?;
+            ensure!(
+                changed == 1 && stored.as_ref() == Some(&raw),
+                "CONTENT_METADATA_RECEIPT_LOST"
+            );
             current(store, &next)?;
             let receipt = store.verify_metadata_record(&record)?;
             crate::util::fault::trigger("content.save.basic_written")?;
@@ -229,6 +244,15 @@ impl Store {
                 params![encode("successor:v1", next)?, previous.intent.operation.to_string(), key, encode("successor:v1", previous)?],
             )?;
             ensure!(changed == 1, "CONTENT_METADATA_CONTINUATION_LOST");
+            let raw = record_sql(self.db.query_row(
+                "SELECT capture FROM content_save_successors WHERE operation=? AND checkpoint=?",
+                params![previous.intent.operation.to_string(), key],
+                |r| blob(r, 0),
+            ))?;
+            ensure!(
+                decode::<Capture>("successor:v1", &raw)? == *next,
+                "CONTENT_METADATA_CONTINUATION_LOST"
+            );
         }
         let changed = self.db.execute(
             "UPDATE content_save_operations SET capture=? WHERE operation=? AND capture=? AND selected IS ? AND receipt IS NULL",
@@ -236,6 +260,11 @@ impl Store {
                 selected.map(|s| encode("selection:v1", s)).transpose()?],
         )?;
         ensure!(changed == 1, "CONTENT_METADATA_CONTINUATION_LOST");
+        let (stored, selection, receipt) = load(&self.db, previous.intent.operation)?;
+        ensure!(
+            stored == *next && selection.as_ref() == selected && receipt.is_none(),
+            "CONTENT_METADATA_CONTINUATION_LOST"
+        );
         Ok(())
     }
 }
