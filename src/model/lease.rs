@@ -33,12 +33,16 @@ pub struct RunFence {
 
 #[derive(Debug)]
 pub struct Owned<'a> {
-    /// Pull slots a/b share a fence, while retaining distinct lease IDs.
+    /// Pull slots share a parent fence and retain independent round floors.
     pub scope: &'a str,
     pub family: &'a str,
     pub peer: &'a str,
     pub lane: LaneSpec,
+    /// Push/foreground frame or background round nonce. Counters from
+    /// different pull slots are never compared for background takeover.
     pub frame: Option<u64>,
+    /// Background a/b slot; foreground c and push frames have no round slot.
+    pub round_slot: Option<usize>,
     pub layout: Option<u64>,
     pub generation: Generation,
 }
@@ -87,6 +91,14 @@ pub fn qualify_push(base: &str, run: PushRun, frame: u64) -> Result<String, Erro
         return Err(invalid());
     }
     Ok(session)
+}
+
+/// Two stable IDs within one download round, distinct from every later round.
+pub fn qualify_pull_round(base: &str, run: PullRun, round: u64) -> Result<String, ErrorWire> {
+    if round == 0 || !matches!(base.rsplit(':').next(), Some("a" | "b")) {
+        return Err(invalid());
+    }
+    qualify_pull(&format!("{base}{round:016x}"), run)
 }
 
 pub fn parse(session: &str) -> Result<Option<Owned<'_>>, ErrorWire> {
@@ -149,14 +161,23 @@ fn parse_base(
         return Err(invalid());
     }
     let mut frame = None;
+    let mut round_slot = None;
     let scope = match kind {
         "pull" => {
             let slot = parts.next().ok_or_else(invalid)?;
-            if !(matches!(slot, "a" | "b")
-                || (slot.len() == 17
-                    && slot.starts_with('c')
-                    && hex(&slot[1..]).is_ok_and(|n| n > 0)))
+            round_slot = match slot.as_bytes().first() {
+                Some(b'a') => Some(0),
+                Some(b'b') => Some(1),
+                _ => None,
+            };
+            if matches!(slot, "a" | "b") {
+                // Historical slots have no per-round nonce.
+            } else if slot.len() == 17
+                && matches!(slot.as_bytes()[0], b'a' | b'b' | b'c')
+                && hex(&slot[1..]).is_ok_and(|n| n > 0)
             {
+                frame = Some(hex(&slot[1..])?);
+            } else {
                 return Err(invalid());
             }
             &base[..base.len() - slot.len() - 1]
@@ -183,15 +204,8 @@ fn parse_base(
         family: &base[..kind.len() + 1 + peer.len()],
         peer,
         lane: spec,
-        frame: if kind == "pull" {
-            base.rsplit(':')
-                .next()
-                .filter(|s| s.starts_with('c'))
-                .map(|s| hex(&s[1..]))
-                .transpose()?
-        } else {
-            frame
-        },
+        frame,
+        round_slot,
         generation,
         layout,
     })

@@ -92,14 +92,29 @@ pub fn capabilities(store: &crate::core::Store) -> Result<wire::Capabilities> {
 
 pub fn state(ctx: &WorkerCtx) -> Result<Arc<ContentWorker>> {
     ensure!(
+        !ctx.stopping.load(std::sync::atomic::Ordering::Acquire),
+        "CONTENT_CANCELLED"
+    );
+    state_for_read(ctx, &*connection(ctx)?)
+}
+
+/// A foreground reader has already acquired a zero-wait connection under its
+/// own context. Do not make it check out another connection with a 5s timeout.
+pub(super) fn state_for_read(
+    ctx: &WorkerCtx,
+    store: &crate::core::Store,
+) -> Result<Arc<ContentWorker>> {
+    ensure!(
         !ctx.stopping.load(std::sync::atomic::Ordering::Relaxed),
         "CONTENT_CANCELLED"
     );
-    ensure!(
-        capabilities(&*connection(ctx)?)?.active,
-        "PEER_NEEDS_UPGRADE"
-    );
-    if let Some(state) = lock(&ctx.inflight_objects).content.clone() {
+    ensure!(capabilities(store)?.active, "PEER_NEEDS_UPGRADE");
+    let cached = {
+        let objects = lock(&ctx.inflight_objects);
+        ensure!(!objects.legacy_cancel.is_cancelled(), "CONTENT_CANCELLED");
+        objects.content.clone()
+    };
+    if let Some(state) = cached {
         return Ok(state);
     }
     // Opening the immutable provider can touch disk; do not hold ctx's lock.
@@ -109,10 +124,13 @@ pub fn state(ctx: &WorkerCtx) -> Result<Arc<ContentWorker>> {
         pending: Mutex::new(BTreeMap::new()),
         cancel: Cancel::new(),
     });
-    Ok(lock(&ctx.inflight_objects)
-        .content
-        .get_or_insert(created)
-        .clone())
+    let mut objects = lock(&ctx.inflight_objects);
+    ensure!(
+        !ctx.stopping.load(std::sync::atomic::Ordering::Acquire)
+            && !objects.legacy_cancel.is_cancelled(),
+        "CONTENT_CANCELLED"
+    );
+    Ok(objects.content.get_or_insert(created).clone())
 }
 
 pub fn demand(ctx: &WorkerCtx, demand: Demand, context: &ReadContext) -> Result<DemandLease> {
@@ -145,7 +163,8 @@ pub fn reap(ctx: &WorkerCtx) {
 }
 
 pub fn stop(ctx: &WorkerCtx) {
-    lock(&ctx.inflight_objects).legacy_cancel.cancel();
+    let cancel = lock(&ctx.inflight_objects).legacy_cancel.clone();
+    cancel.cancel();
     let state = lock(&ctx.inflight_objects).content.clone();
     if let Some(state) = state {
         state.cancel.cancel();
@@ -199,6 +218,18 @@ fn dispatch_inner(
     ensure!(body.len() <= wire::FRAME_BYTES, "CONTENT_BUFFER_LIMIT");
     ensure!(op == wire::COMPLETE || body.is_empty(), "INVALID_REQUEST");
     match op {
+        wire::LEGACY_CAPS => {
+            let req: wire::WorkerCaps = parse(header)?;
+            super::objects_rpc::bind(ctx, &req.route).map_err(anyhow::Error::new)?;
+            ensure!(req.version == wire::VERSION, "PEER_NEEDS_UPGRADE");
+            Ok((
+                serde_json::to_value(wire::LegacyCapabilities {
+                    version: wire::VERSION,
+                    round_fences: true,
+                })?,
+                vec![],
+            ))
+        }
         wire::LEGACY_READ => {
             super::objects_rpc::legacy_read(ctx, header).map_err(anyhow::Error::new)
         }

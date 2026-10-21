@@ -349,6 +349,113 @@ pub unsafe extern "C" fn tk_call(
         let engine = &engine;
         let h = unsafe { *token };
         let path = unsafe { string(name) };
+        if [11, 12].contains(&op) {
+            let context = crate::runtime::content_reads::request_context(engine, content_wait())?;
+            ensure!(
+                crate::runtime::content_writes::file(engine, h, &context)?.is_none(),
+                "UNSUPPORTED_FS_OPERATION: native open-handle namespace integration pending"
+            );
+        }
+        if op == 5 {
+            let bytes = if length == 0 {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(buffer, length as usize) }
+            };
+            if let Some(count) = crate::runtime::content_writes::write(
+                engine,
+                h,
+                offset,
+                bytes,
+                flags & 1 != 0,
+                flags & 2 != 0,
+                content_wait(),
+            )? {
+                let e = lock_engine(engine);
+                if !info.is_null() {
+                    let s = e.session(h)?;
+                    let mut out = Info::default();
+                    fill(&mut out, &s.entry, s.bytes.len());
+                    unsafe { *info = out };
+                }
+                if !transferred.is_null() {
+                    unsafe { *transferred = count as u32 };
+                }
+                return Ok(0);
+            }
+        }
+        if op == 6
+            && crate::runtime::content_writes::truncate(
+                engine,
+                h,
+                offset,
+                flags & 1 != 0,
+                content_wait(),
+            )?
+        {
+            let e = lock_engine(engine);
+            if !info.is_null() {
+                let s = e.session(h)?;
+                let mut out = Info::default();
+                fill(&mut out, &s.entry, s.bytes.len());
+                unsafe { *info = out };
+            }
+            return Ok(0);
+        }
+        if [7, 9].contains(&op) && h != 0 {
+            let context = crate::runtime::content_reads::request_context(engine, content_wait())?;
+            if crate::runtime::content_writes::file(engine, h, &context)?.is_some() {
+                ensure!(
+                    op != 9 || flags & 1 == 0,
+                    "UNSUPPORTED_FS_OPERATION: native delete-on-close requires namespace integration"
+                );
+                crate::runtime::engine::save_handle(engine, h)?;
+                let mut e = lock_engine(engine);
+                if op == 9 {
+                    e.cleanup_unsaved(h)?;
+                }
+                if !info.is_null() {
+                    let s = e.session(h)?;
+                    let mut out = Info::default();
+                    fill(&mut out, &s.entry, s.bytes.len());
+                    unsafe { *info = out };
+                }
+                return Ok(0);
+            }
+        }
+        if op == 4 {
+            if !transferred.is_null() {
+                unsafe { *transferred = 0 };
+            }
+            if let Some(result) = crate::runtime::content_reads::read_mount_range(
+                engine,
+                h,
+                offset,
+                if length == 0 {
+                    &mut []
+                } else {
+                    unsafe { std::slice::from_raw_parts_mut(buffer, length as usize) }
+                },
+                content_wait(),
+            )? {
+                if !transferred.is_null() {
+                    unsafe { *transferred = result.count as u32 };
+                }
+                return Ok(if result.count == 0 && offset >= result.length {
+                    0xc0000011
+                } else {
+                    0
+                });
+            }
+            if length == 0 {
+                let e = lock_engine(engine);
+                return Ok(if offset >= e.session(h)?.bytes.len() as u64 {
+                    0xc0000011
+                } else {
+                    0
+                });
+            }
+        }
         // Work that needs no engine lock comes first (WP5.2): waiting for
         // content, the writable copy of a large file, and the hashing and
         // copying of a save. Each phase that needs the engine takes it
@@ -470,7 +577,11 @@ pub unsafe extern "C" fn tk_call(
                 count = e.write(h, offset, bytes, flags & 1 != 0, flags & 2 != 0)? as u32;
             }
             6 => e.truncate(h, offset, flags & 1 != 0)?,
-            7 => e.flush(h)?,
+            7 => {
+                if e.native_writes.is_none() {
+                    e.flush(h)?;
+                }
+            }
             8 => {}
             9 => e.cleanup(h, flags & 1 != 0)?,
             // Closed before the lock (`close_handle`).
@@ -547,6 +658,19 @@ pub unsafe extern "C" fn tk_call(
             unsafe { *transferred = count };
         }
         e.publish_observation();
+        if [2, 3].contains(&op) {
+            let opened = unsafe { *token };
+            let descriptor = e.session(opened)?.bytes.content_selection().is_some();
+            drop(e);
+            if descriptor
+                && let Err(error) =
+                    crate::runtime::content_reads::prepare_open(engine, opened, content_wait())
+            {
+                let _ = lock_engine(engine).release_handle(opened);
+                unsafe { *token = 0 };
+                return Err(error);
+            }
+        }
         Ok(0)
     });
     match run {

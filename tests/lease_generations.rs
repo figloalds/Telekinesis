@@ -64,6 +64,41 @@ fn a_pool_layout_is_assigned_before_lanes_and_late_old_lanes_cannot_get_a_new_la
 }
 
 #[test]
+fn download_round_ids_are_canonical_bounded_and_keep_separate_slots() {
+    let run = lease::PullRun {
+        generation: Generation {
+            incarnation: 7,
+            run: 100,
+        },
+        layout: 3,
+    };
+    let peer = uuid::Uuid::new_v4();
+    for (slot, index) in [("a", 0), ("b", 1)] {
+        let base = format!("pull:{peer}:14/15:{slot}");
+        let old = lease::qualify_pull_round(&base, run, 101).unwrap();
+        let new = lease::qualify_pull_round(&base, run, 102).unwrap();
+        assert_ne!(old, new);
+        assert!(new.len() <= 128);
+        let parsed = lease::parse(&new).unwrap().unwrap();
+        assert_eq!(parsed.round_slot, Some(index));
+        assert_eq!(parsed.frame, Some(102));
+        assert_eq!(parsed.generation, run.generation);
+        assert_eq!(parsed.scope, format!("pull:{peer}:14/15"));
+        assert!(lease::qualify_pull_round(&base, run, 0).is_err());
+    }
+    for slot in [
+        "a0000000000000000",
+        "b000000000000000A",
+        "a000000000000001",
+        "aé00000000000000",
+    ] {
+        assert!(lease::qualify_pull(&format!("pull:p:0/1:{slot}"), run).is_err());
+    }
+    assert!(lease::qualify_pull_round("pull:p:0/1:c0000000000000001", run, 2).is_err());
+    assert!(lease::qualify_pull_round(&format!("pull:{}:0/1:a", "p".repeat(100)), run, 2).is_err());
+}
+
+#[test]
 fn pool_qualified_sessions_are_bounded_canonical_and_classic_transfers_remain_recognizable() {
     let run = lease::PullRun {
         generation: Generation {

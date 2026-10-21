@@ -1004,6 +1004,12 @@ impl Filesystem {
                 let old = name(names)?;
                 let new = name(names.get(old.len() + 1..).context("INVALID_PARAMETER")?)?;
                 let source = e.store.lookup(&self.child(e, inode, old)?)?;
+                ensure!(
+                    e.sessions
+                        .get(&source.id)
+                        .is_none_or(|s| s.bytes.cow_file().is_none()),
+                    "UNSUPPORTED_FS_OPERATION: native open-handle rename integration pending"
+                );
                 let target = self.child(e, newdir, new)?;
                 if let Ok(replaced) = e.store.lookup(&target) {
                     ensure!(
@@ -1032,11 +1038,13 @@ impl Filesystem {
                     None,
                     !directory && flags & libc::O_ACCMODE as u32 != 0,
                 )?;
-                if flags & libc::O_TRUNC as u32 != 0 && !directory {
-                    if let Err(error) = e.truncate(h, 0, false).and_then(|()| e.flush(h)) {
-                        let _ = e.close(h);
-                        return Err(error);
-                    }
+                if flags & libc::O_TRUNC as u32 != 0
+                    && !directory
+                    && !(entry.content_ref.is_some() && e.native_writes.is_some())
+                    && let Err(error) = e.truncate(h, 0, false).and_then(|()| e.flush(h))
+                {
+                    let _ = e.close(h);
+                    return Err(error);
                 }
                 Ok(Self::open_out(h, directory))
             }
@@ -1128,7 +1136,15 @@ fn counted(op: u32, error: &anyhow::Error) -> bool {
 /// engine lock (a content wait, a writable copy, a save) may take long.
 /// `body` is the request after its header.
 fn runs_threaded(op: u32, body: &[u8]) -> bool {
-    [FUSE_READ, FUSE_WRITE, FUSE_FSYNC, FUSE_FLUSH].contains(&op)
+    [
+        14,
+        FUSE_READ,
+        FUSE_WRITE,
+        FUSE_FSYNC,
+        FUSE_FLUSH,
+        FUSE_RELEASE,
+    ]
+    .contains(&op)
         || op == FUSE_SETATTR && u32_at(body, 0).is_ok_and(|valid| valid & (1 << 3) != 0)
 }
 /// Why the dispatch loop stopped.
@@ -1418,8 +1434,65 @@ fn threaded(
     // detach or checkout stops every request but the few `dispatch` exempts.
     fenced(engine)?;
     match op {
+        14 => {
+            let result = {
+                let mut e = lock_engine(engine);
+                let result = lock(fs).dispatch(&mut e, op, inode, body)?;
+                e.publish_observation();
+                result
+            };
+            let handle = u64_at(&result, 0)?;
+            if let Err(error) =
+                crate::runtime::content_reads::prepare_open(engine, handle, content_wait())
+            {
+                let _ = lock_engine(engine).release_handle(handle);
+                return Err(error);
+            }
+            if u32_at(body, 0)? & libc::O_TRUNC as u32 != 0
+                && crate::runtime::content_writes::truncate(
+                    engine,
+                    handle,
+                    0,
+                    false,
+                    content_wait(),
+                )?
+            {
+                save_handle(engine, handle)?;
+            }
+            Ok(result)
+        }
         FUSE_READ | FUSE_WRITE => {
             let handle = u64_at(body, 0)?;
+            if op == FUSE_WRITE {
+                let size = u32_at(body, 16)? as usize;
+                ensure!(size <= MAX_IO, "INVALID_PARAMETER");
+                let bytes = body.get(40..40 + size).context("INVALID_PARAMETER")?;
+                if let Some(count) = crate::runtime::content_writes::write(
+                    engine,
+                    handle,
+                    u64_at(body, 8)?,
+                    bytes,
+                    u32_at(body, 32)? & libc::O_APPEND as u32 != 0,
+                    false,
+                    content_wait(),
+                )? {
+                    let mut out = Vec::new();
+                    push32(&mut out, count as u32);
+                    push32(&mut out, 0);
+                    return Ok(out);
+                }
+            }
+            if op == FUSE_READ
+                && let Some(bytes) = crate::runtime::content_reads::read_mount_vec(
+                    engine,
+                    handle,
+                    u64_at(body, 8)?,
+                    (u32_at(body, 16)? as usize).min(MAX_IO),
+                    content_wait(),
+                )?
+            {
+                return Ok(bytes);
+            }
             content::prepare_content_waiting(engine, handle, content_wait())?;
             if op == FUSE_WRITE {
                 content::prepare_writable(engine, handle, None)?;
@@ -1439,7 +1512,12 @@ fn threaded(
         // a close queued or a saver runs included (`save_handle` saves it
         // itself, or waits for that save and saves what came after it).
         FUSE_FSYNC => {
-            save_handle(engine, u64_at(body, 0)?)?;
+            let handle = u64_at(body, 0)?;
+            save_handle(engine, handle)?;
+            let context = crate::runtime::content_writes::default_context(engine)?;
+            if crate::runtime::content_writes::file(engine, handle, &context)?.is_some() {
+                return Ok(vec![]);
+            }
             let mut e = lock_engine(engine);
             let result = lock(fs).dispatch(&mut e, op, inode, body);
             e.publish_observation();
@@ -1459,6 +1537,11 @@ fn threaded(
             Ok(vec![])
         }
         FUSE_SETATTR => setattr_size(engine, fs, inode, body),
+        FUSE_RELEASE => {
+            crate::runtime::engine::close_handle(engine, u64_at(body, 0)?)?;
+            crate::util::fault::fail("fs.close")?;
+            Ok(vec![])
+        }
         _ => bail!("UNSUPPORTED_FUSE_OPCODE: {op}"),
     }
 }
@@ -1530,6 +1613,10 @@ fn setattr_size(
         (e.open(&path, None, true)?.0, true)
     };
     let truncated = (|| {
+        crate::runtime::content_reads::prepare_open(engine, handle, content_wait())?;
+        if crate::runtime::content_writes::truncate(engine, handle, size, false, content_wait())? {
+            return crate::runtime::engine::save_handle(engine, handle);
+        }
         if size != 0 {
             crate::runtime::content::prepare_content_waiting(engine, handle, content_wait())?;
         }
@@ -1564,10 +1651,10 @@ fn write_reply(
     push32(&mut reply, error as u32);
     push64(&mut reply, unique);
     reply.extend(body);
-    if let Err(error) = lock(writer).write_all(&reply) {
-        if ![Some(libc::ENOENT), Some(libc::ENODEV)].contains(&error.raw_os_error()) {
-            return Err(error.into());
-        }
+    if let Err(error) = lock(writer).write_all(&reply)
+        && ![Some(libc::ENOENT), Some(libc::ENODEV)].contains(&error.raw_os_error())
+    {
+        return Err(error.into());
     }
     Ok(())
 }
@@ -1601,7 +1688,14 @@ mod tests {
         // write-behind during a burst of closes).
         assert_eq!((FUSE_FSYNC, FUSE_FLUSH), (20, 25));
         assert_eq!((FUSE_RELEASE, FUSE_RELEASEDIR), (18, 29));
-        for op in [FUSE_READ, FUSE_WRITE, FUSE_FSYNC, FUSE_FLUSH] {
+        for op in [
+            14,
+            FUSE_READ,
+            FUSE_WRITE,
+            FUSE_FSYNC,
+            FUSE_FLUSH,
+            FUSE_RELEASE,
+        ] {
             assert!(runs_threaded(op, &[0; 64]), "opcode {op}");
         }
         // A setattr runs threaded only when it changes the size.
@@ -1609,8 +1703,8 @@ mod tests {
         assert!(!runs_threaded(FUSE_SETATTR, &setattr));
         setattr[..4].copy_from_slice(&(1u32 << 3).to_ne_bytes());
         assert!(runs_threaded(FUSE_SETATTR, &setattr));
-        // Lookups, releases and directory fsyncs stay on the dispatch thread.
-        for op in [1, 3, FUSE_RELEASE, FUSE_RELEASEDIR, 30] {
+        // Lookups, directory releases and directory fsyncs stay on dispatch.
+        for op in [1, 3, FUSE_RELEASEDIR, 30] {
             assert!(!runs_threaded(op, &[0; 64]), "opcode {op}");
         }
     }

@@ -2654,6 +2654,312 @@ fn owned_session(slot: u64, incarnation: u64, run: u64) -> String {
 }
 
 #[test]
+fn full_live_lease_capacity_refuses_want_and_write_without_io_or_source_blame() {
+    let bytes = vec![95; 100_000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "live-capacity", &bytes);
+    });
+    {
+        let mut state = w.ctx.inflight_objects.lock().unwrap();
+        for n in 0..65_536 {
+            let hash = format!("{n:064x}");
+            let session = format!("live-owner-{n}");
+            state.leases.insert(
+                hash.clone(),
+                runtime::ctx::ObjectLease {
+                    session: session.clone(),
+                    expires_ms: u64::MAX,
+                    offset: 0,
+                },
+            );
+            state
+                .holders
+                .insert(hash, (session, format!("live-source-{n}")));
+        }
+    }
+    assert_eq!(
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":w.route_b,"lane":lane(),"session":"new-owner",
+        "max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "CONTENT_RESOURCE_LIMIT"
+    );
+    let reply = write_op(
+        &w,
+        &w.route_b,
+        "new-owner",
+        &hash,
+        0,
+        bytes.len() as u64,
+        &bytes,
+    );
+    assert_eq!(reply["outcome"]["failed"]["code"], "CONTENT_RESOURCE_LIMIT");
+    assert_eq!(spool_len(&w.ctx.root, &hash), None);
+    assert!(
+        objects_rpc::source_retry_at(&w.ctx, w.route_b["remote_replica"].as_str().unwrap(), &hash)
+            .is_none()
+    );
+    let store = Store::open_secondary(&w.ctx.root, &w.ctx.repo, &w.ctx.device).unwrap();
+    let errors: u64 = store
+        .db
+        .query_row(
+            "SELECT COUNT(*) FROM object_error_state WHERE hash=?",
+            [&hash],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(errors, 0);
+    let state = w.ctx.inflight_objects.lock().unwrap();
+    assert_eq!(state.leases.len(), 65_536);
+    assert_eq!(state.holders.len(), 65_536);
+    assert_eq!(
+        state.holders.get(&format!("{:064x}", 65_535)),
+        Some(&("live-owner-65535".into(), "live-source-65535".into()))
+    );
+    println!(
+        "WAVE6_CAPACITY {}",
+        json!({"scenario":"worker-rpc-live-capacity","entries":65536,"new_want_refused":true,"new_write_refused":true,
+        "spool_created":false,"source_backoff_added":false,"local_retry_added":false})
+    );
+}
+
+#[test]
+fn local_round_capabilities_validate_route_and_version_without_activating_typed_content() {
+    use tkfs::model::content_wire as wire;
+    let w = worker(|a| {
+        file(a, "capabilities", b"legacy");
+    });
+    let reply = op(
+        &w.ctx,
+        wire::LEGACY_CAPS,
+        json!({"route":w.route_b,"version":wire::VERSION}),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(reply.0, json!({"version":1,"round_fences":true}));
+    assert!(reply.1.is_empty());
+    let mut wrong = w.route_b.clone();
+    wrong["local_replica"] = json!("wrong");
+    assert_eq!(
+        op(
+            &w.ctx,
+            wire::LEGACY_CAPS,
+            json!({"route":wrong,"version":wire::VERSION}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "LOCAL_REPLICA_BINDING_MISMATCH"
+    );
+    assert_eq!(
+        op(
+            &w.ctx,
+            wire::LEGACY_CAPS,
+            json!({"route":w.route_b,"version":2}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "PEER_NEEDS_UPGRADE"
+    );
+    assert!(
+        op(
+            &w.ctx,
+            wire::LEGACY_CAPS,
+            json!({"route":w.route_b,"version":1}),
+            &[1]
+        )
+        .is_err()
+    );
+    let state = w.ctx.inflight_objects.lock().unwrap();
+    assert!(state.content.is_none());
+    assert!(state.lease_runs.is_empty());
+    assert!(state.lease_rounds.is_empty());
+}
+
+#[test]
+fn pull_round_floors_fence_stale_cleanup_and_preserve_the_other_slot_and_foreground() {
+    use tkfs::model::lease::{self, Generation, PullRun};
+    let w = worker(|a| {
+        for n in 91..94 {
+            file(a, &format!("slot-{n}"), &vec![n; 100_000]);
+        }
+    });
+    let run = PullRun {
+        generation: Generation {
+            incarnation: 81,
+            run: 2,
+        },
+        layout: 1,
+    };
+    let id = |slot, round| {
+        lease::qualify_pull_round(&format!("pull:peer-a:0/1:{slot}"), run, round).unwrap()
+    };
+    let want = |session: &str| {
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":w.route_b,
+        "lane":lane(),"session":session,"max_items":1,"max_bytes":PULL_BUDGET_BYTES}),
+            &[],
+        )
+    };
+    let a1 = id("a", 9000);
+    let b1 = id("b", 9000);
+    let c = lease::qualify_pull("pull:peer-a:0/1:c0000000000000003", run).unwrap();
+    let ha = want(&a1).unwrap().0["items"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hb = want(&b1).unwrap().0["items"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(ha, hb, "b must not take a's in-flight work");
+    // Foreground may promote background despite its smaller frame counter.
+    let hc = want(&c).unwrap().0["items"][0]["hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let a2 = id("a", 9001);
+    let resumed = want(&a2).unwrap();
+    assert_ne!(resumed.0["items"][0]["hash"], hc);
+    assert_eq!(lease(&w, &hc).session, c, "background took foreground work");
+    assert!(want(&b1).is_ok(), "a's floor retired b's round");
+    // Foreground might have promoted a or b; any slot it left alone remains current.
+    for (hash, prior) in [(&ha, &a1), (&hb, &b1)] {
+        if hash != &hc && prior == &b1 {
+            assert_eq!(lease(&w, hash).session, b1);
+        }
+    }
+    let current_hash = resumed.0["items"][0]["hash"].as_str().unwrap();
+    let current = lease(&w, current_hash);
+    let stale_release = op(
+        &w.ctx,
+        "objects.release",
+        json!({"route":w.route_b,
+        "session":a1,"hashes":[current_hash],"hold_ms":60_000}),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(stale_release.0["released"], 0);
+    assert_eq!(lease(&w, current_hash), current);
+    assert!(
+        objects_rpc::source_retry_at(
+            &w.ctx,
+            w.route_b["remote_replica"].as_str().unwrap(),
+            current_hash
+        )
+        .is_none()
+    );
+    assert_eq!(want(&a1).unwrap_err().code, "IN_FLIGHT_ELSEWHERE");
+    assert_eq!(
+        op(
+            &w.ctx,
+            "objects.write",
+            json!({"route":w.route_b,"session":a1,
+        "items":[{"hash":current_hash,"offset":0,"total":100_000,"len":1,"last":false}]}),
+            &[91]
+        )
+        .unwrap_err()
+        .code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    assert_eq!(release_op(&w, &w.route_b, &a2, &[current_hash]), 1);
+    assert_eq!(
+        want(&a1).unwrap_err().code,
+        "IN_FLIGHT_ELSEWHERE",
+        "released floor was forgotten"
+    );
+    assert_eq!(
+        want(&lease::qualify_pull("pull:peer-a:0/1:a", run).unwrap())
+            .unwrap_err()
+            .code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    assert!(
+        !want(&id("a", 9002)).unwrap().0["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn full_pull_round_fence_capacity_refuses_new_scopes_without_forgetting_old_floors() {
+    use tkfs::model::lease::{self, Generation, MAX_RUN_FENCES, PullRun, RunFence};
+    let w = worker(|a| {
+        file(a, "round-capacity", &vec![94; 100_000]);
+    });
+    let run = PullRun {
+        generation: Generation {
+            incarnation: 82,
+            run: 2,
+        },
+        layout: 1,
+    };
+    let id = |peer: &str, round| {
+        lease::qualify_pull_round(&format!("pull:{peer}:0/1:a"), run, round).unwrap()
+    };
+    let old = id("peer-a", 3);
+    assert_eq!(want_op(&w, &w.route_b, &old).len(), 1);
+    {
+        let mut state = w.ctx.inflight_objects.lock().unwrap();
+        for n in 1..MAX_RUN_FENCES {
+            state.lease_rounds.insert(
+                format!("pull:capacity-{n}:0/1"),
+                [
+                    Some(RunFence {
+                        generation: run.generation,
+                        layout: Some(1),
+                        frame: Some(3),
+                    }),
+                    None,
+                ],
+            );
+        }
+    }
+    let mut route = w.route_b.clone();
+    route["peer"] = json!("new-peer");
+    let new = id("new-peer", 4);
+    assert_eq!(
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":route,"lane":lane(),"session":new,
+        "max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "CONTENT_RESOURCE_LIMIT"
+    );
+    assert_eq!(want_op(&w, &w.route_b, &id("peer-a", 4)).len(), 1);
+    assert_eq!(
+        op(
+            &w.ctx,
+            "objects.want",
+            json!({"route":w.route_b,"lane":lane(),"session":old,
+        "max_items":256,"max_bytes":PULL_BUDGET_BYTES}),
+            &[]
+        )
+        .unwrap_err()
+        .code,
+        "IN_FLIGHT_ELSEWHERE"
+    );
+    let state = w.ctx.inflight_objects.lock().unwrap();
+    assert_eq!(state.lease_rounds.len(), MAX_RUN_FENCES);
+    assert!(!state.lease_runs.contains_key("pull:new-peer:0/1"));
+    assert!(!state.lease_layouts.contains_key("pull:new-peer"));
+}
+
+#[test]
 fn newer_legacy_runs_resume_immediately_and_stale_messages_cannot_take_or_release_them() {
     let bytes = vec![31; 100_000];
     let w = worker(|a| {
@@ -3472,5 +3778,425 @@ fn fresh_push_offer_exclusions_retire_only_superseded_owners() {
     assert_eq!(
         write_op(&w, &route, "source-b", &hash, 0, 100_000, &bytes)["outcome"],
         "completed"
+    );
+}
+
+fn effect_frame(peer: &str, run: u64, frame: u64) -> String {
+    tkfs::model::lease::qualify_pull(
+        &format!("pull:{peer}:0/1:c{frame:016x}"),
+        tkfs::model::lease::PullRun {
+            generation: tkfs::model::lease::Generation {
+                incarnation: 72,
+                run,
+            },
+            layout: 1,
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn local_failure_projection_cannot_follow_a_replacement_even_with_the_same_session_or_parent_run() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    for scenario in [
+        "same-session",
+        "foreground-frame",
+        "other-source",
+        "verified-install",
+        "cancel",
+    ] {
+        let bytes = vec![133; 5000];
+        let hash = tkfs::core::hash(&bytes);
+        let w = worker(|a| {
+            file(a, "local-error", &bytes);
+        });
+        let old = if scenario == "same-session" {
+            "same-session".into()
+        } else {
+            effect_frame("peer-a", 1, 1)
+        };
+        let new = if scenario == "same-session" {
+            old.clone()
+        } else if scenario == "other-source" {
+            effect_frame("peer-c", 1, 1)
+        } else {
+            effect_frame("peer-a", 1, 2)
+        };
+        assert!(offered(&want_op(&w, &w.route_b, &old), &hash).is_some());
+        let spool = w.ctx.root.join("incoming-objects").join(&hash);
+        fs::create_dir_all(&spool).unwrap();
+        let mut config = FaultConfig::new("objects.write.before_local_backoff", FaultAction::Hang);
+        config.ms = Some(1000);
+        config.count = Some(1);
+        fault::configure(Some(config));
+        let (ctx, route, session, h, body) = (
+            w.ctx.clone(),
+            w.route_b.clone(),
+            old.clone(),
+            hash.clone(),
+            bytes.clone(),
+        );
+        let pending = thread::spawn(move || {
+            op(
+                &ctx,
+                "objects.write",
+                json!({"route":route,"session":session,
+            "items":[{"hash":h,"offset":0,"total":body.len(),"len":body.len(),"last":true}]}),
+                &body,
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fault::fired(),
+            1,
+            "actual local failure did not reach projection"
+        );
+        assert!(
+            !w.ctx
+                .inflight_objects
+                .lock()
+                .unwrap()
+                .leases
+                .contains_key(&hash)
+        );
+        fs::remove_dir(&spool).unwrap();
+        let began = Instant::now();
+        if scenario == "cancel" {
+            op(
+                &w.ctx,
+                "objects.release",
+                json!({"route":w.route_b,"session":old,"hashes":[hash]}),
+                &[],
+            )
+            .unwrap();
+        } else if scenario == "verified-install" {
+            assert_eq!(
+                w.ctx
+                    .sync_stores
+                    .checkout()
+                    .unwrap()
+                    .put_object(&bytes)
+                    .unwrap(),
+                hash
+            );
+        } else {
+            let route = if scenario == "other-source" {
+                route_c(&w)
+            } else {
+                w.route_b.clone()
+            };
+            assert!(offered(&want_op(&w, &route, &new), &hash).is_some());
+            assert_eq!(
+                write_op(&w, &route, &new, &hash, 0, bytes.len() as u64, &bytes)["outcome"],
+                "completed"
+            );
+        }
+        let replacement = began.elapsed();
+        let reply = pending.join().unwrap().unwrap().0;
+        assert!(
+            reply["results"][0]["outcome"]["failed"]["code"].is_string(),
+            "{reply}"
+        );
+        let probe = w.ctx.sync_stores.checkout().unwrap();
+        assert!(
+            probe.object_backoff(&hash).unwrap().is_none(),
+            "stale SQL failure for {scenario}"
+        );
+        if scenario != "cancel" {
+            assert_eq!(probe.read_object(&hash).unwrap(), bytes);
+        }
+        assert!(replacement < Duration::from_millis(250));
+        println!(
+            "WAVE6_EFFECT {}",
+            json!({"scenario":scenario,"projection_stall_ms":1000,
+            "replacement_ms":replacement.as_secs_f64()*1000.0,"bound_ms":250,"stale_sql_retry":false})
+        );
+        fault::configure(None);
+    }
+}
+
+#[test]
+fn same_parent_foreground_source_verdict_cannot_recreate_backoff_after_its_replacement_completes() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![135; 5000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "source-error", &bytes);
+    });
+    let old = effect_frame("peer-a", 1, 1);
+    let new = effect_frame("peer-a", 1, 2);
+    assert!(offered(&want_op(&w, &w.route_b, &old), &hash).is_some());
+    let mut config = FaultConfig::new("objects.write.before_source_backoff", FaultAction::Hang);
+    config.ms = Some(1000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (ctx, route, h) = (w.ctx.clone(), w.route_b.clone(), hash.clone());
+    let pending = thread::spawn(move || {
+        op(
+            &ctx,
+            "objects.write",
+            json!({"route":route,"session":old,
+        "items":[{"hash":h,"offset":0,"total":5000,"len":5000,"last":true}]}),
+            &vec![136; 5000],
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let began = Instant::now();
+    assert!(offered(&want_op(&w, &w.route_b, &new), &hash).is_some());
+    assert_eq!(
+        write_op(&w, &w.route_b, &new, &hash, 0, 5000, &bytes)["outcome"],
+        "completed"
+    );
+    let replacement = began.elapsed();
+    pending.join().unwrap().unwrap();
+    assert!(
+        objects_rpc::source_retry_at(&w.ctx, w.route_b["remote_replica"].as_str().unwrap(), &hash)
+            .is_none()
+    );
+    assert!(replacement < Duration::from_millis(250));
+    println!(
+        "WAVE6_EFFECT {}",
+        json!({"scenario":"same-parent-source-verdict","replacement_ms":replacement.as_secs_f64()*1000.0,
+        "bound_ms":250,"projection_stall_ms":1000,"stale_source_retry":false})
+    );
+}
+
+#[test]
+fn a_prepared_local_failure_commit_defers_new_claims_without_holding_the_shared_worker_lock() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![137; 5000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "commit-error", &bytes);
+    });
+    let old = effect_frame("peer-a", 1, 1);
+    let new = effect_frame("peer-a", 2, 1);
+    want_op(&w, &w.route_b, &old);
+    fs::create_dir_all(w.ctx.root.join("incoming-objects").join(&hash)).unwrap();
+    let mut config = FaultConfig::new("objects.failure.before_commit", FaultAction::Hang);
+    config.ms = Some(1000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (ctx, route, h) = (w.ctx.clone(), w.route_b.clone(), hash.clone());
+    let pending = thread::spawn(move || {
+        op(
+            &ctx,
+            "objects.write",
+            json!({"route":route,"session":old,
+        "items":[{"hash":h,"offset":0,"total":5000,"len":5000,"last":true}]}),
+            &bytes,
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    assert!(w.ctx.inflight_objects.try_lock().is_ok());
+    assert!(w.ctx.engine.try_lock().is_ok());
+    let began = Instant::now();
+    let error = op(
+        &w.ctx,
+        "objects.want",
+        json!({"route":w.route_b,"lane":lane(),"session":new,"max_items":1,"max_bytes":MIB}),
+        &[],
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "WORKER_BUSY");
+    op(
+        &w.ctx,
+        "objects.demand",
+        json!({"route":w.route_b,"max_items":1}),
+        &[],
+    )
+    .unwrap();
+    let probe = w.ctx.sync_stores.checkout().unwrap();
+    assert!(
+        probe.object_backoff(&hash).unwrap().is_none(),
+        "uncommitted error visible through WAL"
+    );
+    let service = began.elapsed();
+    assert!(service < Duration::from_millis(50));
+    pending.join().unwrap().unwrap();
+    assert!(probe.object_backoff(&hash).unwrap().is_some());
+    println!(
+        "WAVE6_EFFECT {}",
+        json!({"scenario":"prepared-sql-effect","service_ms":service.as_secs_f64()*1000.0,
+        "bound_ms":50,"commit_stall_ms":1000,"shared_worker_lock_held":false,"wal_read_progress":true})
+    );
+}
+
+#[test]
+fn a_reused_session_claim_keeps_its_lease_and_no_retry_even_before_replacement_bytes_arrive() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![143; 5000];
+    let hash = tkfs::core::hash(&bytes);
+    let w = worker(|a| {
+        file(a, "claim-only", &bytes);
+    });
+    let session = "same-session";
+    want_op(&w, &w.route_b, session);
+    let spool = w.ctx.root.join("incoming-objects").join(&hash);
+    fs::create_dir_all(&spool).unwrap();
+    let mut config = FaultConfig::new("objects.write.before_local_backoff", FaultAction::Hang);
+    config.ms = Some(1000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (ctx, route, h, body) = (
+        w.ctx.clone(),
+        w.route_b.clone(),
+        hash.clone(),
+        bytes.clone(),
+    );
+    let pending = thread::spawn(move || {
+        op(
+            &ctx,
+            "objects.write",
+            json!({"route":route,"session":session,
+        "items":[{"hash":h,"offset":0,"total":body.len(),"len":body.len(),"last":true}]}),
+            &body,
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    fs::remove_dir(&spool).unwrap();
+    let began = Instant::now();
+    assert!(offered(&want_op(&w, &w.route_b, session), &hash).is_some());
+    let admission = began.elapsed();
+    let held = lease(&w, &hash);
+    assert!(!w.ctx.root.join("objects").join(&hash).exists());
+    pending.join().unwrap().unwrap();
+    // The available-copy shortcut cannot help: no replacement bytes yet.
+    assert!(!w.ctx.root.join("objects").join(&hash).exists());
+    assert_eq!(lease(&w, &hash), held);
+    assert!(
+        w.ctx
+            .sync_stores
+            .checkout()
+            .unwrap()
+            .object_backoff(&hash)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        write_op(&w, &w.route_b, session, &hash, 0, 5000, &bytes)["outcome"],
+        "completed"
+    );
+    assert!(admission < Duration::from_millis(250));
+    println!(
+        "WAVE6_EFFECT {}",
+        json!({"scenario":"same-session-claim-without-copy","admission_ms":admission.as_secs_f64()*1000.0,
+        "bound_ms":250,"projection_stall_ms":1000,"replacement_bytes_before_old_projection":0,"stale_sql_retry":false})
+    );
+}
+
+#[test]
+fn a_prepared_failure_fences_the_same_object_from_another_source_but_allows_other_objects() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![145; 5000];
+    let hash = tkfs::core::hash(&bytes);
+    let other = tkfs::core::hash(&vec![146; 6000]);
+    let w = worker(|a| {
+        file(a, "commit-a", &bytes);
+        file(a, "commit-b", &vec![146; 6000]);
+    });
+    let old = effect_frame("peer-a", 1, 1);
+    want_op(&w, &w.route_b, &old);
+    // Keep the second object free for the other source's independent claim.
+    op(
+        &w.ctx,
+        "objects.release",
+        json!({"route":w.route_b,"session":old,"hashes":[other]}),
+        &[],
+    )
+    .unwrap();
+    fs::create_dir_all(w.ctx.root.join("incoming-objects").join(&hash)).unwrap();
+    let mut config = FaultConfig::new("objects.failure.before_commit", FaultAction::Hang);
+    config.ms = Some(1000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (ctx, route, h) = (w.ctx.clone(), w.route_b.clone(), hash.clone());
+    let pending = thread::spawn(move || {
+        op(
+            &ctx,
+            "objects.write",
+            json!({"route":route,"session":old,
+        "items":[{"hash":h,"offset":0,"total":5000,"len":5000,"last":true}]}),
+            &bytes,
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let route = route_c(&w);
+    let session = effect_frame("peer-c", 1, 1);
+    let began = Instant::now();
+    let request =
+        json!({"route":route,"session":session,"lane":lane(),"max_items":1,"max_bytes":MIB});
+    assert_eq!(
+        op(&w.ctx, "objects.want", request.clone(), &[])
+            .unwrap_err()
+            .code,
+        "WORKER_BUSY"
+    );
+    let mut independent = request;
+    independent["exclude"] = json!([hash]);
+    let (reply, _) = op(&w.ctx, "objects.want", independent, &[]).unwrap();
+    assert_eq!(reply["items"][0]["hash"], other);
+    assert!(w.ctx.inflight_objects.try_lock().is_ok());
+    let service = began.elapsed();
+    assert!(service < Duration::from_millis(50));
+    pending.join().unwrap().unwrap();
+    println!(
+        "WAVE6_EFFECT {}",
+        json!({"scenario":"cross-source-object-commit-gate","service_ms":service.as_secs_f64()*1000.0,
+        "bound_ms":50,"commit_stall_ms":1000,"same_object_deferred":true,"other_object_claimed":true})
     );
 }

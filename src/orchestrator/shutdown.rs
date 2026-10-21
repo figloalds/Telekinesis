@@ -430,8 +430,8 @@ mod platform {
         // SAFETY: installs a handler that only performs an async-signal-safe
         // write(2).
         unsafe {
-            libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
+            libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         }
     }
 

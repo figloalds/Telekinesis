@@ -52,16 +52,28 @@ pub(crate) struct Task {
     budget: Option<TransferLease>,
     turn: Option<Outgoing>,
     hold_ms: Option<u64>,
+    work: objects::ObjectWork,
+    _daemon_cancel: Cancel,
 }
 impl Drop for Task {
     fn drop(&mut self) {
+        let hold_ms = if self.work.current()
+            && !self.target.cancel.is_cancelled()
+            && !self.target.state.cancel.is_cancelled()
+        {
+            self.hold_ms
+        } else {
+            None
+        };
+        self.work.cancel();
         // A unique, ordered c-frame identity makes even an uncertain delayed
-        // release harmless to the next frame, while a/b keep their run IDs.
+        // release harmless to the next frame. It cannot impose a source hold
+        // after this attempt was cancelled or a verified install retired it.
         if let Ok(header) = serde_json::to_value(ReleaseHeader {
             route: self.target.route.clone(),
             session: self.session.clone(),
             hashes: vec![self.hash.clone()],
-            hold_ms: self.hold_ms,
+            hold_ms,
         }) {
             let _ = self.client.request(
                 "objects.release",
@@ -138,6 +150,10 @@ pub(crate) fn prepare(target: Target, hash: &str) -> std::result::Result<Option<
         target.generation,
     )?;
     let client = target.state.planner(&target.endpoint)?;
+    let work = objects::object_work(&key)?;
+    work.on_cancel(&target.cancel);
+    let daemon_cancel = target.state.cancel.child();
+    work.on_cancel(&daemon_cancel);
     let mut task = Task {
         hash: hash.to_owned(),
         session,
@@ -147,6 +163,8 @@ pub(crate) fn prepare(target: Target, hash: &str) -> std::result::Result<Option<
         budget: Some(budget),
         turn: Some(turn),
         hold_ms: None,
+        work,
+        _daemon_cancel: daemon_cancel,
     };
     let reply = task.client.request_cancellable(
         wire::LEGACY_PREPARE,
@@ -171,10 +189,22 @@ pub(crate) fn prepare(target: Target, hash: &str) -> std::result::Result<Option<
         return Err(coded("INVALID_REPLY", "legacy foreground selection"));
     }
     task.item = wanted.items.into_iter().next();
+    task.check()?;
     Ok(Some(task))
 }
 impl Task {
+    fn check(&self) -> std::result::Result<(), CallError> {
+        if self.target.cancel.is_cancelled()
+            || self.target.state.cancel.is_cancelled()
+            || self.target.conn.closed().is_some()
+            || !self.work.current()
+        {
+            return Err(CallError::Cancelled);
+        }
+        Ok(())
+    }
     pub(crate) fn perform(mut self) -> std::result::Result<bool, CallError> {
+        self.check()?;
         let item = self
             .item
             .take()
@@ -217,6 +247,7 @@ impl Task {
         };
         let mut next = start;
         let mut chunks = 0;
+        let mut verified_install = false;
         let mut consume = |chunk: ChunkHeader,
                            bytes: &[u8]|
          -> std::result::Result<(), ErrorWire> {
@@ -224,6 +255,7 @@ impl Task {
                 .offset
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| ErrorWire::coded("INVALID_REPLY", "legacy range overflow"))?;
+            self.check().map_err(|error| error.to_wire())?;
             if chunk.hash.as_deref() != Some(&self.hash)
                 || chunk.offset != next
                 || bytes.len() > wire::FRAME_BYTES
@@ -263,9 +295,10 @@ impl Task {
                 return Err(ErrorWire::coded("INVALID_REPLY", "legacy write receipt"));
             }
             match &reply.results[0].outcome {
-                ObjectOutcome::Progressed { .. }
-                | ObjectOutcome::Completed
-                | ObjectOutcome::Skipped => {}
+                ObjectOutcome::Progressed { .. } => {}
+                ObjectOutcome::Completed | ObjectOutcome::Skipped => {
+                    verified_install = true;
+                }
                 ObjectOutcome::Failed(e) => return Err(e.clone()),
                 other => {
                     return Err(ErrorWire::coded(
@@ -301,6 +334,7 @@ impl Task {
             &|| self.target.cancel.is_cancelled() || self.target.state.cancel.is_cancelled(),
         );
         let reply = read?;
+        self.check()?;
         let result: ObjectsResult = if fallback {
             decode(reply.header)?
         } else {
@@ -325,6 +359,9 @@ impl Task {
             | ObjectOutcome::Progressed { .. }
             | ObjectOutcome::Skipped => {}
             outcome => {
+                crate::util::fault::trigger("legacy.foreground.before_source_backoff")
+                    .map_err(|error| CallError::Remote(ErrorWire::from_error(&error)))?;
+                self.check()?;
                 let code = outcome.code().unwrap_or("NOT_AVAILABLE");
                 let key = objects::object_key(
                     &self.target.ctx.installation,
@@ -333,13 +370,17 @@ impl Task {
                     false,
                     &self.hash,
                 );
-                let delay = if matches!(
+                let unserved = matches!(
                     outcome,
                     ObjectOutcome::NotAvailable | ObjectOutcome::NotPermitted
-                ) {
-                    objects::object_unserved(&key)
-                } else {
-                    objects::object_failed(&key, code)
+                );
+                let Some(delay) = objects::object_failed_work(
+                    &key,
+                    &self.work,
+                    if unserved { "" } else { code },
+                    unserved,
+                ) else {
+                    return Err(CallError::Cancelled);
                 };
                 self.hold_ms = Some(delay.as_millis().min(u64::MAX as u128) as u64);
                 return Err(coded(code, "legacy source outcome"));
@@ -348,13 +389,23 @@ impl Task {
         if chunks == 0 || (!unknown && next != end) {
             return Err(coded("INVALID_REPLY", "legacy foreground short stream"));
         }
-        objects::object_installed(&objects::object_key(
-            &self.target.ctx.installation,
-            &self.target.route.peer,
-            &self.target.route.repo,
-            false,
-            &self.hash,
-        ));
+        crate::util::fault::trigger("legacy.foreground.before_success")
+            .map_err(|error| CallError::Remote(ErrorWire::from_error(&error)))?;
+        self.check()?;
+        if verified_install
+            && !objects::object_installed_work(
+                &objects::object_key(
+                    &self.target.ctx.installation,
+                    &self.target.route.peer,
+                    &self.target.route.repo,
+                    false,
+                    &self.hash,
+                ),
+                &self.work,
+            )
+        {
+            return Err(CallError::Cancelled);
+        }
         Ok(true)
     }
 }

@@ -97,7 +97,106 @@ pub struct LocalContent {
     pub counters: Arc<PhaseCounters>,
 }
 
+/// Private save preparation. The caller retains and revalidates the selected
+/// checkpoint; these classifications confer neither publication nor permission.
+pub(crate) enum EditSpan {
+    Unchanged,
+    Zero,
+    Changed,
+}
+pub(crate) trait EditSource {
+    fn check(&self, context: &ReadContext) -> Result<()>;
+    fn span(&mut self, offset: u64, len: u64, context: &ReadContext) -> Result<EditSpan>;
+    fn read(&mut self, offset: u64, out: &mut [u8], context: &ReadContext) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct RebuildRange(ByteRange);
+impl std::fmt::Display for RebuildRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "immutable base path at {}", self.0.offset)
+    }
+}
+impl std::error::Error for RebuildRange {}
+
+/// One authenticated path, not a cache proportional to the base file. Repeated
+/// sequential lookups keep one page at each level, including on depth changes.
+struct BaseCursor<'a> {
+    provider: &'a LocalContent,
+    root: Option<ContentEdge>,
+    pages: Vec<Option<(ContentEdge, ManifestNode)>>,
+}
+impl BaseCursor<'_> {
+    fn find(
+        &mut self,
+        offset: u64,
+        level: Option<u8>,
+        context: &ReadContext,
+    ) -> Result<Option<ContentEdge>> {
+        let Some(mut edge) = self.root.clone() else {
+            return Ok(None);
+        };
+        if offset >= edge.len {
+            return Ok(None);
+        }
+        loop {
+            context.check()?;
+            if edge.level == level {
+                return Ok((edge.offset == offset).then_some(edge));
+            }
+            if edge.level < level {
+                return Ok(None);
+            }
+            let old_level = edge.level.context("INVALID_MANIFEST_ENCODING")?;
+            let slot = &mut self.pages[old_level as usize];
+            if slot.as_ref().is_none_or(|(cached, _)| cached != &edge) {
+                let node = self
+                    .provider
+                    .node(edge.key.digest, edge.len, old_level, context)
+                    .map_err(|error| error.context(RebuildRange(ByteRange { offset, len: 1 })))?;
+                *slot = Some((edge.clone(), node));
+            }
+            let node = &slot.as_ref().unwrap().1;
+            let capacity = ManifestNode::child_capacity(old_level)?;
+            let index = ((offset - edge.offset) / capacity) as usize;
+            let child = node.children.get(index).context("MANIFEST_COVERAGE")?;
+            edge = ContentEdge {
+                key: ObjectKey {
+                    kind: if old_level == 0 {
+                        ObjectKind::Bytes
+                    } else {
+                        ObjectKind::Manifest
+                    },
+                    digest: child.digest,
+                },
+                offset: edge.offset + index as u64 * capacity,
+                len: child.len,
+                level: old_level.checked_sub(1),
+            };
+        }
+    }
+}
+
+struct LegacyInput<'a> {
+    file: File,
+    hash: Sha256,
+    context: &'a ReadContext,
+    check: &'a dyn Fn() -> Result<()>,
+}
+impl Read for LegacyInput<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.context.check().map_err(std::io::Error::other)?;
+        (self.check)().map_err(std::io::Error::other)?;
+        let count = self.file.read(out)?;
+        self.hash.update(&out[..count]);
+        Ok(count)
+    }
+}
+
 impl LocalContent {
+    pub(crate) fn rebuild_range(error: &anyhow::Error) -> Option<ByteRange> {
+        error.downcast_ref::<RebuildRange>().map(|range| range.0)
+    }
     pub fn unavailable_key(error: &anyhow::Error) -> Option<ObjectKey> {
         error
             .chain()
@@ -517,6 +616,16 @@ impl LocalContent {
         context.check()?;
         ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
         let _permit = self.permit(context, 3, BufferClass::Background)?;
+        self.import_inner(reader, len, context)
+    }
+    fn import_inner(
+        &self,
+        reader: &mut dyn Read,
+        len: u64,
+        context: &ReadContext,
+    ) -> Result<FileContentRef> {
+        context.check()?;
+        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
         if len <= CHUNK_SIZE {
             let mut bytes = vec![0; len as usize];
             reader.read_exact(&mut bytes)?;
@@ -758,6 +867,284 @@ impl LocalContent {
             ContentError::Corrupt(key)
         );
         Ok(())
+    }
+
+    /// A legacy base that is needed by a save is verified and converted in one
+    /// sequential source pass. The original identity remains untouched. No
+    /// descriptor is returned when the final whole-file hash fails.
+    pub(crate) fn convert_legacy(
+        &self,
+        base: &FileContentRef,
+        context: &ReadContext,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<PinnedContent> {
+        context.check()?;
+        ensure!(
+            base.kind == ContentKind::Legacy,
+            "LEGACY_CONVERSION_REQUIRED"
+        );
+        base.validate()?;
+        let _permit = self.permit_checked(context, 3, BufferClass::Background, check)?;
+        let _base_pin = self.pin(base)?;
+        let key = ObjectKey::root(base);
+        let file = File::open(self.path(key)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::Error::new(ContentError::Missing(key))
+            } else {
+                error.into()
+            }
+        })?;
+        ensure!(
+            file.metadata()?.len() == base.total_len,
+            ContentError::Corrupt(key)
+        );
+        let _read = self.counters.begin(Phase::Read, base.total_len);
+        let _hash = self.counters.begin(Phase::Hash, base.total_len);
+        let mut reader = LegacyInput {
+            file,
+            hash: Sha256::new(),
+            context,
+            check,
+        };
+        let converted = self.import_inner(&mut reader, base.total_len, context)?;
+        context.check()?;
+        ensure!(
+            reader.read(&mut [0])? == 0 && Digest(reader.hash.finalize().into()) == base.digest,
+            ContentError::Corrupt(key)
+        );
+        context.check()?;
+        self.pin(&converted)
+    }
+
+    /// Canonical rebuilding walks only changed paths and shape boundaries.
+    /// Unchanged data can remain absent. Structural pages needed for reuse must
+    /// be locally verified; absence never falls back to a whole-file copy.
+    pub(crate) fn rebuild(
+        &self,
+        base: Option<&FileContentRef>,
+        len: u64,
+        source: &mut dyn EditSource,
+        context: &ReadContext,
+    ) -> Result<FileContentRef> {
+        context.check()?;
+        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
+        let base_pin = base.map(|r| self.pin(r)).transpose()?;
+        let mut cursor = BaseCursor {
+            provider: self,
+            root: base_pin.as_ref().map(ContentEdge::root).transpose()?,
+            pages: (0..MAX_DEPTH).map(|_| None).collect(),
+        };
+        ensure!(
+            base.is_none_or(|r| r.kind != ContentKind::Legacy),
+            "LEGACY_CONVERSION_REQUIRED"
+        );
+        let _permit = self.permit_checked(context, 3, BufferClass::Background, &|| {
+            source.check(context)
+        })?;
+        let mut zeros = BTreeMap::new();
+        let level = if len <= CHUNK_SIZE {
+            None
+        } else {
+            Some(ManifestNode::root_level(len)?)
+        };
+        let digest = self.rebuild_part(0, len, level, source, &mut cursor, &mut zeros, context)?;
+        context.check()?;
+        FileContentRef::new(
+            if level.is_some() {
+                ContentKind::Manifest
+            } else {
+                ContentKind::Direct
+            },
+            digest,
+            len,
+        )
+    }
+    /// Read-only mutation preflight. Existing inputs are verified, but no new
+    /// content hashes, CAS installation or durability boundary are introduced.
+    /// Errors leave this stack (and its permits) before
+    /// the coordinator is allowed to wait for an immutable base object.
+    pub(crate) fn preflight(
+        &self,
+        base: &FileContentRef,
+        len: u64,
+        source: &mut dyn EditSource,
+        context: &ReadContext,
+    ) -> Result<()> {
+        context.check()?;
+        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
+        if len == 0 {
+            return source.check(context);
+        }
+        ensure!(
+            base.kind != ContentKind::Legacy,
+            "LEGACY_CONVERSION_REQUIRED"
+        );
+        let pin = self.pin(base)?;
+        let mut cursor = BaseCursor {
+            provider: self,
+            root: Some(ContentEdge::root(&pin)?),
+            pages: (0..MAX_DEPTH).map(|_| None).collect(),
+        };
+        let _permit = self.permit_checked(context, 3, BufferClass::Background, &|| {
+            source.check(context)
+        })?;
+        let level = if len <= CHUNK_SIZE {
+            None
+        } else {
+            Some(ManifestNode::root_level(len)?)
+        };
+        Self::preflight_part(0, len, level, source, &mut cursor, context)?;
+        source.check(context)
+    }
+    fn preflight_part(
+        offset: u64,
+        len: u64,
+        level: Option<u8>,
+        source: &mut dyn EditSource,
+        cursor: &mut BaseCursor<'_>,
+        context: &ReadContext,
+    ) -> Result<()> {
+        context.check()?;
+        match source.span(offset, len, context)? {
+            EditSpan::Unchanged => {
+                if let Some(edge) = cursor.find(offset, level, context)?
+                    && edge.len == len
+                {
+                    return Ok(());
+                }
+            }
+            EditSpan::Zero => return Ok(()),
+            EditSpan::Changed => {}
+        }
+        if let Some(level) = level {
+            let capacity = ManifestNode::child_capacity(level)?;
+            let mut position = 0;
+            while position < len {
+                let child = capacity.min(len - position);
+                Self::preflight_part(
+                    offset + position,
+                    child,
+                    level.checked_sub(1),
+                    source,
+                    cursor,
+                    context,
+                )?;
+                position += child;
+            }
+            Ok(())
+        } else {
+            let mut scratch = vec![0; len as usize];
+            source
+                .read(offset, &mut scratch, context)
+                .map_err(|error| error.context(RebuildRange(ByteRange { offset, len })))
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_part(
+        &self,
+        offset: u64,
+        len: u64,
+        level: Option<u8>,
+        source: &mut dyn EditSource,
+        cursor: &mut BaseCursor<'_>,
+        zeros: &mut BTreeMap<(Option<u8>, u64), Digest>,
+        context: &ReadContext,
+    ) -> Result<Digest> {
+        context.check()?;
+        match source.span(offset, len, context)? {
+            EditSpan::Unchanged => {
+                if let Some(edge) = cursor.find(offset, level, context)?
+                    && edge.len == len
+                {
+                    return Ok(edge.key.digest);
+                }
+            }
+            EditSpan::Zero => return self.zero_part(len, level, zeros, context),
+            EditSpan::Changed => {}
+        }
+        if let Some(level) = level {
+            let capacity = ManifestNode::child_capacity(level)?;
+            let mut node = ManifestNode {
+                level,
+                total_len: len,
+                children: Vec::new(),
+            };
+            let mut position = 0;
+            while position < len {
+                context.check()?;
+                let child_len = capacity.min(len - position);
+                let digest = self.rebuild_part(
+                    offset + position,
+                    child_len,
+                    level.checked_sub(1),
+                    source,
+                    cursor,
+                    zeros,
+                    context,
+                )?;
+                node.children.push(ManifestChild {
+                    kind: if level == 0 {
+                        ChildKind::Chunk
+                    } else {
+                        ChildKind::Node
+                    },
+                    len: child_len,
+                    digest,
+                });
+                position += child_len;
+            }
+            self.put_node(&node, context)
+        } else {
+            let mut bytes = vec![0; len as usize];
+            source.read(offset, &mut bytes, context)?;
+            context.check()?;
+            self.put_bytes(&bytes, context)
+        }
+    }
+    fn zero_part(
+        &self,
+        len: u64,
+        level: Option<u8>,
+        cache: &mut BTreeMap<(Option<u8>, u64), Digest>,
+        context: &ReadContext,
+    ) -> Result<Digest> {
+        context.check()?;
+        if let Some(digest) = cache.get(&(level, len)) {
+            return Ok(*digest);
+        }
+        let digest = if let Some(level) = level {
+            let capacity = ManifestNode::child_capacity(level)?;
+            let mut node = ManifestNode {
+                level,
+                total_len: len,
+                children: Vec::new(),
+            };
+            let mut remaining = len;
+            while remaining > 0 {
+                context.check()?;
+                let child_len = remaining.min(capacity);
+                let digest = self.zero_part(child_len, level.checked_sub(1), cache, context)?;
+                node.children.push(ManifestChild {
+                    kind: if level == 0 {
+                        ChildKind::Chunk
+                    } else {
+                        ChildKind::Node
+                    },
+                    len: child_len,
+                    digest,
+                });
+                remaining -= child_len;
+            }
+            self.put_node(&node, context)?
+        } else {
+            self.put_bytes(&vec![0; len as usize], context)?
+        };
+        ensure!(
+            cache.len() < 2 * MAX_DEPTH as usize + 2,
+            "CONTENT_BUFFER_LIMIT"
+        );
+        cache.insert((level, len), digest);
+        Ok(digest)
     }
 
     /// Constant-length aligned-chunk COW update. Unchanged subtrees retain their

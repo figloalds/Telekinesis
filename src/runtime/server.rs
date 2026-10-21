@@ -682,6 +682,26 @@ impl Core {
             // The JSON ops below reach `worker.rpc.<op>` in `route`, once,
             // as over the JSON RPC.
             fault::trigger(&format!("worker.rpc.{op}")).map_err(wire)?;
+            if op == crate::model::protocol::objects::ops::WANT {
+                if !body.is_empty() {
+                    return Err(ErrorWire::coded(
+                        "INVALID_REQUEST",
+                        "want body must be empty",
+                    ));
+                }
+                return objects_rpc::want_request(&self.ctx, &header, deadline, cancelled);
+            }
+            if op == crate::model::content_wire::LEGACY_PREPARE {
+                if !body.is_empty() {
+                    return Err(ErrorWire::coded(
+                        "INVALID_REQUEST",
+                        "prepare body must be empty",
+                    ));
+                }
+                return objects_rpc::legacy_prepare_request(
+                    &self.ctx, &header, deadline, cancelled,
+                );
+            }
             if matches!(
                 op,
                 crate::model::protocol::objects::ops::READ
@@ -957,6 +977,19 @@ impl Core {
                     let mut e = engine()?;
                     let fenced = e.switching;
                     e.switching = true;
+                    drop(e);
+                    let native = super::content_writes::retain_dirty(
+                        &self.ctx.engine,
+                        &crate::content::ReadContext {
+                            deadline: Instant::now() + super::engine::QUIET_SAVES_WAIT,
+                            cancel: crate::util::Cancel::new(),
+                        },
+                    );
+                    let mut e = engine()?;
+                    if let Err(error) = native {
+                        e.switching = fenced;
+                        return Err(error);
+                    }
                     match e.retain_all_dirty() {
                         Ok(persisted) => persisted,
                         Err(error) => {

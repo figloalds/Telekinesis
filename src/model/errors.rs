@@ -376,6 +376,40 @@ pub const UNKNOWN_CODE: &str = "UNKNOWN_ERROR";
 /// Cancellation/stale ownership are readiness outcomes; malformed authenticated
 /// content is fatal only to its object/reference, not unrelated engine work.
 pub const WAVE6_CODES: &[(&str, ErrorClass)] = &[
+    // CCR-WP6.4-3: superseded save work is readiness, not engine failure.
+    ("STALE_WRITE_SESSION", ErrorClass::Contention),
+    ("STALE_WRITE_CHECKPOINT", ErrorClass::Contention),
+    ("STALE_CONTENT_SAVE", ErrorClass::Contention),
+    ("STALE_CONTENT_VIEW", ErrorClass::Contention),
+    ("STALE_CONTENT_WORKSPACE", ErrorClass::Contention),
+    ("CONTENT_SAVE_ALREADY_COMMITTED", ErrorClass::Contention),
+    // A stable capture/sequence bound cannot be cured by retrying this intent.
+    ("CONTENT_SAVE_CAPTURE_LIMIT", ErrorClass::NeedsUserAction),
+    ("WRITE_GENERATION_EXHAUSTED", ErrorClass::NeedsUserAction),
+    ("WRITE_JOURNAL_NEEDS_UPGRADE", ErrorClass::Incompatible),
+    // These apply to the pending save/journal (or broken connection), never to
+    // another engine's network/readiness state. Retain recovery bytes on error.
+    ("CORRUPT_WRITE_JOURNAL", ErrorClass::Fatal),
+    ("CORRUPT_CONTENT_SAVE", ErrorClass::Fatal),
+    ("WRITE_JOURNAL_POISONED", ErrorClass::Fatal),
+    ("WRITE_CONVERSION_POISONED", ErrorClass::Fatal),
+    ("INVALID_WRITE_INTENT", ErrorClass::Fatal),
+    ("MISSING_CONTENT_DESCRIPTOR", ErrorClass::Fatal),
+    ("CONTENT_SAVE_INTENT_MISMATCH", ErrorClass::Fatal),
+    ("CONTENT_SAVE_PREPARATION_MISMATCH", ErrorClass::Fatal),
+    ("CONTENT_SAVE_RECEIPT_MISMATCH", ErrorClass::Fatal),
+    ("CONTENT_SAVE_SELECTION_LOST", ErrorClass::Fatal),
+    ("CONTENT_SAVE_PUBLICATION_LOST", ErrorClass::Fatal),
+    ("CONTENT_SAVE_WRONG_STORE", ErrorClass::Fatal),
+    ("CONTENT_SAVE_REQUIRES_FULL_WAL", ErrorClass::Fatal),
+    ("CONTENT_SAVE_REQUIRES_OUTER_TRANSACTION", ErrorClass::Fatal),
+    ("CONTENT_SAVE_REQUIRES_OFFLOCK_RETAIN", ErrorClass::Fatal),
+    ("CONTENT_SAVE_ROLLBACK_FAILED", ErrorClass::Fatal),
+    ("CONTENT_SAVE_CONNECTION_FAILED", ErrorClass::Fatal),
+    ("CONTENT_SAVE_CONTINUATION_LOST", ErrorClass::Fatal),
+    ("CONTENT_SAVE_NOT_COMMITTED", ErrorClass::Contention),
+    ("WRITE_JOURNAL_TRANSACTION_REQUIRED", ErrorClass::Fatal),
+    ("WRITE_JOURNAL_CONNECTION_FAILED", ErrorClass::Fatal),
     ("CONTENT_RESOURCE_LIMIT", ErrorClass::Contention),
     ("DEMAND_ID_REUSED", ErrorClass::Fatal),
     ("INVALID_CONTENT_EDGE", ErrorClass::Fatal),

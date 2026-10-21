@@ -17,9 +17,9 @@ use crate::{
 };
 use std::{
     array,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc, Condvar, Mutex, Weak,
+        Arc, Condvar, Mutex, TryLockError, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
@@ -28,6 +28,8 @@ use std::{
 use uuid::Uuid;
 
 type LaneKey = (String, u32, u32);
+const GROUP_PAGE: usize = 512;
+const GROUP_OWNERS: usize = 1024;
 struct Binding {
     legacy: Option<crate::model::lease::PullRun>,
     id: Uuid,
@@ -59,6 +61,8 @@ struct PollCache {
     candidates: Vec<String>,
 }
 struct GroupState {
+    cancel: Cancel,
+    effects: Mutex<()>,
     busy: [AtomicBool; 3],
     due: [Mutex<Instant>; 3],
     source: [AtomicUsize; 3],
@@ -70,8 +74,10 @@ struct GroupState {
     last_error: Mutex<Option<ErrorWire>>,
 }
 impl GroupState {
-    fn new() -> Self {
-        Self {
+    fn new(cancel: Cancel) -> Arc<Self> {
+        let state = Arc::new(Self {
+            cancel,
+            effects: Mutex::new(()),
             busy: array::from_fn(|_| AtomicBool::new(false)),
             due: array::from_fn(|_| Mutex::new(Instant::now())),
             source: array::from_fn(|_| AtomicUsize::new(0)),
@@ -81,7 +87,49 @@ impl GroupState {
             poll_turn: AtomicUsize::new(0),
             legacy_turn: AtomicUsize::new(0),
             last_error: Mutex::new(None),
+        });
+        let weak = Arc::downgrade(&state);
+        state.cancel.on_cancel(Box::new(move || {
+            if let Some(state) = weak.upgrade() {
+                // Cancellation returning is a barrier for the short counter/
+                // error projections, never for network or cleanup I/O.
+                let _effects = lock(&state.effects);
+            }
+        }));
+        state
+    }
+}
+
+#[derive(Default)]
+struct GroupRegistry {
+    owners: Vec<Weak<Group>>,
+}
+impl GroupRegistry {
+    fn live(&mut self, valid: impl Fn(&Group) -> bool) -> Vec<Arc<Group>> {
+        let mut live = Vec::new();
+        self.owners.retain(|weak| {
+            let Some(group) = weak.upgrade() else {
+                return false;
+            };
+            if group.state.cancel.is_cancelled() {
+                return false;
+            }
+            if !valid(&group) {
+                group.state.cancel.cancel();
+                return false;
+            }
+            live.push(group);
+            true
+        });
+        live
+    }
+
+    fn retain(&mut self, group: &Arc<Group>) -> bool {
+        if self.owners.len() >= GROUP_OWNERS {
+            return false;
         }
+        self.owners.push(Arc::downgrade(group));
+        true
     }
 }
 struct Job {
@@ -108,6 +156,8 @@ pub struct Dispatcher {
     cancel: Cancel,
     lanes: Mutex<BTreeMap<LaneKey, Arc<Binding>>>,
     groups: Mutex<Arc<Vec<Arc<Group>>>>,
+    group_owners: Mutex<GroupRegistry>,
+    refreshing: Mutex<()>,
     refresh_at: Mutex<Instant>,
     group_turn: AtomicUsize,
     deferred: AtomicUsize,
@@ -118,9 +168,20 @@ pub struct Dispatcher {
     running: AtomicUsize,
     peak_queue: AtomicUsize,
     admitted: [AtomicU64; 3],
+    started: [AtomicU64; 3],
     completed: [AtomicU64; 3],
     failed: [AtomicU64; 3],
     retried: [AtomicU64; 3],
+}
+
+#[derive(Clone, Debug)]
+pub struct DispatchIdle {
+    pub repo: String,
+    pub device: String,
+    /// Consecutive empty preparations, capped at seven for diagnostics.
+    pub polls: [usize; 3],
+    /// Remaining delay at this snapshot; not an admission guarantee.
+    pub due_ms: [u64; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -134,9 +195,12 @@ pub struct DispatchView {
     pub peak_queue: usize,
     /// Foreground, structural, background. Admission is before remote I/O.
     pub admitted: [u64; 3],
+    /// A network executor accepted the job, separately from queue admission.
+    pub started: [u64; 3],
     pub completed: [u64; 3],
     pub failed: [u64; 3],
     pub retried: [u64; 3],
+    pub idle: Vec<DispatchIdle>,
     pub errors: Vec<(String, ErrorWire)>,
 }
 
@@ -148,6 +212,8 @@ impl Dispatcher {
             cancel: transport.cancel.child(),
             lanes: Mutex::new(BTreeMap::new()),
             groups: Mutex::new(Arc::new(vec![])),
+            group_owners: Mutex::new(GroupRegistry::default()),
+            refreshing: Mutex::new(()),
             refresh_at: Mutex::new(Instant::now()),
             group_turn: AtomicUsize::new(0),
             deferred: AtomicUsize::new(0),
@@ -158,6 +224,7 @@ impl Dispatcher {
             running: AtomicUsize::new(0),
             peak_queue: AtomicUsize::new(0),
             admitted: array::from_fn(|_| AtomicU64::new(0)),
+            started: array::from_fn(|_| AtomicU64::new(0)),
             completed: array::from_fn(|_| AtomicU64::new(0)),
             failed: array::from_fn(|_| AtomicU64::new(0)),
             retried: array::from_fn(|_| AtomicU64::new(0)),
@@ -222,16 +289,22 @@ impl Dispatcher {
                             queue.pop_front()
                         };
                         if let Some(job) = job {
+                            if !state.start_job(&job.group, job.class) {
+                                drop(job);
+                                continue;
+                            }
                             state.running.fetch_add(1, Ordering::Relaxed);
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     job.task.perform()
                                 }));
                             state.running.fetch_sub(1, Ordering::Relaxed);
+                            if job.group.state.cancel.is_cancelled() {
+                                continue;
+                            }
                             match result {
                                 Ok(Ok(_)) => {
-                                    state.completed[job.class].fetch_add(1, Ordering::Relaxed);
-                                    *lock(&job.group.state.last_error) = None;
+                                    state.finish(&job.group, job.class);
                                 }
                                 Ok(Err(e)) => state.error(&job.group, job.class, &e),
                                 Err(_) => state.error(
@@ -256,6 +329,7 @@ impl Dispatcher {
 
     pub fn view(&self) -> DispatchView {
         let groups = lock(&self.groups).clone();
+        let now = Instant::now();
         DispatchView {
             lanes: lock(&self.lanes).len(),
             groups: groups.len(),
@@ -265,9 +339,24 @@ impl Dispatcher {
             running: self.running.load(Ordering::Relaxed),
             peak_queue: self.peak_queue.load(Ordering::Relaxed),
             admitted: array::from_fn(|i| self.admitted[i].load(Ordering::Relaxed)),
+            started: array::from_fn(|i| self.started[i].load(Ordering::Relaxed)),
             completed: array::from_fn(|i| self.completed[i].load(Ordering::Relaxed)),
             failed: array::from_fn(|i| self.failed[i].load(Ordering::Relaxed)),
             retried: array::from_fn(|i| self.retried[i].load(Ordering::Relaxed)),
+            idle: groups
+                .iter()
+                .map(|g| DispatchIdle {
+                    repo: g.repo.clone(),
+                    device: g.device.clone(),
+                    polls: array::from_fn(|i| g.state.empty[i].load(Ordering::Relaxed).min(7)),
+                    due_ms: array::from_fn(|i| {
+                        lock(&g.state.due[i])
+                            .saturating_duration_since(now)
+                            .as_millis()
+                            .min(u64::MAX as u128) as u64
+                    }),
+                })
+                .collect(),
             errors: groups
                 .iter()
                 .filter_map(|g| {
@@ -280,6 +369,13 @@ impl Dispatcher {
     }
 
     fn refresh(&self) {
+        // Only one snapshot builder may publish at once. Other preparers keep
+        // using their current page instead of waiting behind catalog work.
+        let _refreshing = match self.refreshing.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
         {
             let mut due = lock(&self.refresh_at);
             if Instant::now() < *due {
@@ -291,30 +387,33 @@ impl Dispatcher {
             self.cancel.cancel();
             return;
         };
-        let old = lock(&self.groups).clone();
-        let old: BTreeMap<_, _> = old
-            .iter()
-            .map(|g| ((g.repo.clone(), g.endpoint.instance.clone()), g.clone()))
-            .collect();
-        let mut folders: BTreeMap<_, _> = ctx
+        // Weakly retain groups still owned by queued/running/preparing work,
+        // including groups outside this rotation page. Absence from the page
+        // is not withdrawal. Validate against the complete folder snapshot.
+        let tracked = lock(&self.group_owners).live(|_| true);
+        let folders: BTreeMap<_, _> = ctx
             .folders
             .all()
             .into_iter()
             .map(|f| (f.record.repo.clone(), f))
             .collect();
-        self.deferred
-            .store(folders.len().saturating_sub(512), Ordering::Relaxed);
-        if folders.len() > 512 {
-            let first = self.group_turn.fetch_add(512, Ordering::Relaxed) % folders.len();
-            let keys: std::collections::BTreeSet<_> = folders
-                .keys()
-                .cycle()
-                .skip(first)
-                .take(512)
-                .cloned()
-                .collect();
-            folders.retain(|key, _| keys.contains(key));
-        }
+        let first = if folders.len() > GROUP_PAGE {
+            self.group_turn.fetch_add(GROUP_PAGE, Ordering::Relaxed) % folders.len()
+        } else {
+            0
+        };
+        let selected: BTreeSet<_> = folders
+            .keys()
+            .cycle()
+            .skip(first)
+            .take(folders.len().min(GROUP_PAGE))
+            .cloned()
+            .collect();
+        let wanted: BTreeSet<_> = selected
+            .iter()
+            .cloned()
+            .chain(tracked.iter().map(|g| g.repo.clone()))
+            .collect();
         let bindings: Vec<_> = lock(&self.lanes)
             .values()
             .filter(|l| l.live())
@@ -327,9 +426,12 @@ impl Dispatcher {
                 .or_default()
                 .push(binding);
         }
-        let mut groups: BTreeMap<String, Group> = BTreeMap::new();
+        let mut sources: BTreeMap<String, Vec<Source>> = BTreeMap::new();
         for (peer, lanes) in peers {
             for remote in &lanes[0].peer.catalog.load().entries {
+                if !wanted.contains(&remote.repo) {
+                    continue;
+                }
                 let Some(folder) = folders.get(&remote.repo) else {
                     continue;
                 };
@@ -338,21 +440,9 @@ impl Dispatcher {
                 {
                     continue;
                 }
-                let Some(endpoint) = folder.worker.clone() else {
-                    continue;
-                };
-                let g = groups.entry(remote.repo.clone()).or_insert_with(|| Group {
-                    repo: remote.repo.clone(),
-                    device: folder.record.device.clone(),
-                    state: old
-                        .get(&(remote.repo.clone(), endpoint.instance.clone()))
-                        .map(|g| g.state.clone())
-                        .unwrap_or_else(|| Arc::new(GroupState::new())),
-                    endpoint,
-                    sources: vec![],
-                });
-                if !g.sources.iter().any(|s| s.peer == peer) {
-                    g.sources.push(Source {
+                let entries = sources.entry(remote.repo.clone()).or_default();
+                if !entries.iter().any(|s| s.peer == peer) {
+                    entries.push(Source {
                         peer: peer.clone(),
                         replica: remote.replica.clone(),
                         lanes: lanes.clone(),
@@ -360,19 +450,49 @@ impl Dispatcher {
                 }
             }
         }
-        *lock(&self.groups) = Arc::new(
-            groups
-                .into_values()
-                .map(|mut g| {
-                    if let Some(previous) = old.get(&(g.repo.clone(), g.endpoint.instance.clone()))
-                        && !same_sources(&previous.sources, &g.sources)
-                    {
-                        g.state = Arc::new(GroupState::new());
-                    }
-                    Arc::new(g)
-                })
-                .collect(),
+        let mut registry = lock(&self.group_owners);
+        let current = registry.live(|group| {
+            folders.get(&group.repo).is_some_and(|folder| {
+                folder.record.device == group.device
+                    && folder.worker.as_ref() == Some(&group.endpoint)
+                    && sources
+                        .get(&group.repo)
+                        .is_some_and(|sources| same_sources(&group.sources, sources))
+            })
+        });
+        // The first upgrade only pins the validation candidates through this
+        // snapshot; it must not make otherwise dead owners permanent.
+        drop(tracked);
+        let mut page = Vec::new();
+        let mut refused = 0;
+        for repo in selected {
+            let Some(entries) = sources.remove(&repo) else {
+                continue;
+            };
+            if let Some(previous) = current.iter().find(|g| g.repo == repo) {
+                page.push(previous.clone());
+                continue;
+            }
+            let folder = &folders[&repo];
+            let group = Arc::new(Group {
+                repo,
+                device: folder.record.device.clone(),
+                endpoint: folder.worker.clone().unwrap(), // Ready above
+                sources: entries,
+                state: GroupState::new(self.cancel.child()),
+            });
+            if registry.retain(&group) {
+                page.push(group);
+            } else {
+                refused += 1;
+            }
+        }
+        drop(registry);
+        self.deferred.store(
+            folders.len().saturating_sub(GROUP_PAGE) + refused,
+            Ordering::Relaxed,
         );
+        *lock(&self.groups) = Arc::new(page);
     }
 
     fn activity(
@@ -426,6 +546,9 @@ impl Dispatcher {
         } else {
             Duration::from_secs(2)
         };
+        if group.state.cancel.is_cancelled() {
+            return Err(CallError::Cancelled);
+        }
         *lock(&group.state.poll) = Some(PollCache {
             until: Instant::now() + ttl,
             activity: activity.clone(),
@@ -436,13 +559,15 @@ impl Dispatcher {
 
     fn prepare(&self, class: usize) -> bool {
         self.refresh();
-        let groups = lock(&self.groups).clone();
-        if groups.is_empty() {
-            return false;
-        }
-        let group =
-            groups[self.cursor[class].fetch_add(1, Ordering::Relaxed) % groups.len()].clone();
-        if Instant::now() < *lock(&group.state.due[class])
+        let group = {
+            let groups = lock(&self.groups);
+            if groups.is_empty() {
+                return false;
+            }
+            groups[self.cursor[class].fetch_add(1, Ordering::Relaxed) % groups.len()].clone()
+        };
+        if group.state.cancel.is_cancelled()
+            || Instant::now() < *lock(&group.state.due[class])
             || group.state.busy[class].swap(true, Ordering::AcqRel)
         {
             return false;
@@ -458,6 +583,9 @@ impl Dispatcher {
             let Some(activity) = self.activity(&group, &transport)? else {
                 return Ok(false);
             };
+            if group.state.cancel.is_cancelled() {
+                return Err(CallError::Cancelled);
+            }
             if class == 0
                 && let Some(hashes) = activity.legacy_demands.as_ref().filter(|h| !h.is_empty())
             {
@@ -481,7 +609,7 @@ impl Dispatcher {
                             state: transport.clone(),
                             endpoint: group.endpoint.clone(),
                             conn: lane.conn.clone(),
-                            cancel: lane.cancel.child(),
+                            cancel: lane.cancel.linked(&group.state.cancel),
                             generation: lane.legacy.unwrap(),
                             route: SyncRoute {
                                 peer: source.peer.clone(),
@@ -556,10 +684,14 @@ impl Dispatcher {
                         .fetch_add(1, Ordering::Relaxed)
                         .min(6);
                     *lock(&group.state.due[class]) = Instant::now()
-                        + Duration::from_millis(if class == 0 {
-                            10
-                        } else {
-                            (10_u64 << empty).min(1000)
+                        + Duration::from_millis(match class {
+                            0 => 10,
+                            // A missing COW page can introduce new structural
+                            // demand after background traversal is already idle.
+                            // Preserve its reserved admission latency without
+                            // accelerating background byte polling.
+                            1 => 50,
+                            _ => (10_u64 << empty).min(1000),
                         });
                     Ok(false)
                 }
@@ -580,7 +712,7 @@ impl Dispatcher {
                         *local,
                         lane.conn.clone(),
                         scope,
-                        lane.cancel.child(),
+                        lane.cancel.linked(&group.state.cancel),
                     )?
                     else {
                         return Ok(false);
@@ -604,9 +736,12 @@ impl Dispatcher {
     }
 
     fn enqueue(&self, group: Arc<Group>, class: usize, task: Task) -> bool {
+        let owner = group.state.clone();
+        let effects = lock(&owner.effects);
         let mut queue = lock(&self.queue);
-        if queue.len() >= 4 || self.cancel.is_cancelled() {
+        if queue.len() >= 4 || self.cancel.is_cancelled() || group.state.cancel.is_cancelled() {
             drop(queue);
+            drop(effects);
             drop(task);
             return false;
         }
@@ -614,15 +749,26 @@ impl Dispatcher {
         self.peak_queue.fetch_max(queue.len(), Ordering::Relaxed);
         self.admitted[class].fetch_add(1, Ordering::Relaxed);
         drop(queue);
+        drop(effects);
         self.ready.notify_one();
         true
     }
 
     fn error(&self, group: &Group, class: usize, error: &CallError) {
-        if matches!(error, CallError::Cancelled | CallError::ConnectionLost(_)) {
+        let _effects = lock(&group.state.effects);
+        if group.state.cancel.is_cancelled()
+            || matches!(error, CallError::Cancelled | CallError::ConnectionLost(_))
+        {
             return;
         }
-        let wire = error.to_wire();
+        let mut wire = error.to_wire();
+        // This object-engine slice uses a zero-wait SQLite connection. A
+        // refused writer is readiness, including receipt indexing after CAS
+        // installation; it does not count as a source or dispatch failure.
+        // Keep the historical global/wire SQLITE_BUSY classification intact.
+        if wire.code == "SQLITE_BUSY" {
+            wire.class = crate::model::errors::ErrorClass::Contention;
+        }
         let ms = match wire.code.as_str() {
             "CONTENT_CANCELLED"
             | "CANCELLED"
@@ -650,6 +796,23 @@ impl Dispatcher {
             self.retried[class].fetch_add(1, Ordering::Relaxed);
         }
         *lock(&group.state.last_error) = Some(wire);
+    }
+
+    fn finish(&self, group: &Group, class: usize) {
+        let _effects = lock(&group.state.effects);
+        if !group.state.cancel.is_cancelled() {
+            self.completed[class].fetch_add(1, Ordering::Relaxed);
+            *lock(&group.state.last_error) = None;
+        }
+    }
+
+    fn start_job(&self, group: &Group, class: usize) -> bool {
+        let _effects = lock(&group.state.effects);
+        if group.state.cancel.is_cancelled() {
+            return false;
+        }
+        self.started[class].fetch_add(1, Ordering::Relaxed);
+        true
     }
 }
 
@@ -766,4 +929,98 @@ pub fn view(ctx: &Arc<Ctx>) -> Option<DispatchView> {
     let transport = lock(&extras.content).clone()?;
     let state = lock(&transport.dispatch).clone()?;
     Some(state.view())
+}
+
+#[cfg(test)]
+mod group_lifetime_tests {
+    use super::*;
+
+    fn group(repo: usize) -> Arc<Group> {
+        Arc::new(Group {
+            repo: repo.to_string(),
+            device: "local".into(),
+            endpoint: WorkerEndpoint::default(),
+            sources: vec![],
+            state: GroupState::new(Cancel::new()),
+        })
+    }
+
+    #[test]
+    fn a_deferred_live_group_keeps_its_owner_until_authority_is_withdrawn() {
+        let mut registry = GroupRegistry::default();
+        let old = group(0);
+        assert!(registry.retain(&old));
+        let lane = Cancel::new();
+        let task = lane.linked(&old.state.cancel);
+        // Several complete page rotations cannot retire work merely because
+        // its repository is not selected. Only the authority predicate may.
+        for page in 1..5 {
+            let selected = group(page);
+            assert!(registry.retain(&selected));
+            assert!(registry.live(|_| true).iter().any(|g| Arc::ptr_eq(g, &old)));
+            assert!(!task.is_cancelled());
+        }
+        let remaining = registry.live(|g| g.repo != old.repo);
+        assert!(remaining.is_empty());
+        assert!(task.is_cancelled() && old.state.cancel.is_cancelled());
+        assert!(!lane.is_cancelled());
+        let replacement = group(0);
+        assert!(registry.retain(&replacement));
+        assert!(!replacement.state.cancel.is_cancelled());
+        assert_eq!(registry.live(|_| true).len(), 1);
+        assert!(task.is_cancelled());
+    }
+
+    #[test]
+    fn group_registry_does_not_retain_completed_work_or_dead_pages() {
+        let mut registry = GroupRegistry::default();
+        for repo in 0..GROUP_PAGE {
+            assert!(registry.retain(&group(repo)));
+        }
+        assert!(registry.live(|_| true).is_empty());
+        assert!(registry.owners.is_empty());
+    }
+
+    #[test]
+    fn group_cancellation_waits_for_the_short_effect_projection_barrier() {
+        let state = GroupState::new(Cancel::new());
+        let projection = lock(&state.effects);
+        let (sent, returned) = std::sync::mpsc::channel();
+        let token = state.cancel.clone();
+        let cancelling = thread::spawn(move || {
+            token.cancel();
+            sent.send(()).unwrap();
+        });
+        let until = Instant::now() + Duration::from_secs(1);
+        while !state.cancel.is_cancelled() && Instant::now() < until {
+            thread::yield_now();
+        }
+        assert!(state.cancel.is_cancelled());
+        assert_eq!(
+            returned.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        drop(projection);
+        returned.recv_timeout(Duration::from_secs(1)).unwrap();
+        cancelling.join().unwrap();
+    }
+
+    #[test]
+    fn full_group_registry_refuses_new_owners_without_evicting_live_tasks() {
+        let mut registry = GroupRegistry::default();
+        let mut owners: Vec<_> = (0..GROUP_OWNERS).map(group).collect();
+        for owner in &owners {
+            assert!(registry.retain(owner));
+        }
+        assert!(!registry.retain(&group(GROUP_OWNERS)));
+        assert!(owners.iter().all(|g| !g.state.cancel.is_cancelled()));
+        // A withdrawn owner can be untracked while its cancelled Task drains.
+        let draining = owners.pop().unwrap();
+        let live = registry.live(|g| g.repo != draining.repo);
+        assert_eq!(live.len(), GROUP_OWNERS - 1);
+        assert!(draining.state.cancel.is_cancelled());
+        assert!(owners.iter().all(|g| !g.state.cancel.is_cancelled()));
+        assert!(registry.retain(&group(GROUP_OWNERS)));
+        assert_eq!(registry.owners.len(), GROUP_OWNERS);
+    }
 }

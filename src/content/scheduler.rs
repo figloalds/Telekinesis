@@ -55,6 +55,7 @@ struct Waiter {
 struct State {
     generation: u64,
     active: BTreeMap<TransferKey, Active>,
+    streams: BTreeMap<Uuid, Active>,
     waiters: BTreeMap<Uuid, Waiter>,
     waiter_bytes: usize,
     waiter_turn: BTreeMap<Uuid, usize>,
@@ -70,6 +71,27 @@ pub struct TransferLease {
     scheduler: Weak<ContentScheduler>,
     key: TransferKey,
     token: LeaseToken,
+}
+
+/// A bounded batch/stream has no single joined object identity. It shares all
+/// job/byte/class/scope limits with joined transfers and owns only this token.
+pub struct StreamLease {
+    scheduler: Weak<ContentScheduler>,
+    token: LeaseToken,
+}
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        if let Some(scheduler) = self.scheduler.upgrade() {
+            let mut state = lock(&scheduler.state);
+            if state
+                .streams
+                .get(&self.token.owner)
+                .is_some_and(|entry| entry.token == self.token)
+            {
+                state.streams.remove(&self.token.owner);
+            }
+        }
+    }
 }
 impl TransferLease {
     pub fn token(&self) -> LeaseToken {
@@ -293,6 +315,67 @@ impl ContentScheduler {
         count < max.saturating_sub(reserved)
     }
 
+    fn available(state: &State, repository: &str, peer: &str, priority: DemandPriority) -> bool {
+        let all = || state.active.values().chain(state.streams.values());
+        Self::capacity(all(), limits::TRANSFER_JOBS, priority)
+            && Self::capacity(
+                all().filter(|work| work.repository == repository),
+                limits::REPOSITORY_JOBS,
+                priority,
+            )
+            && Self::capacity(
+                all().filter(|work| work.peer == peer),
+                limits::PEER_JOBS,
+                priority,
+            )
+    }
+
+    /// Reserve an unjoined batch in the same global/peer/repository class pool.
+    /// The caller must retain it through the stream and all staged consumer
+    /// work, including work that outlives logical cancellation or lane exit.
+    pub fn try_reserve_stream(
+        self: &Arc<Self>,
+        repository: &str,
+        peer: &str,
+        priority: DemandPriority,
+        bytes: usize,
+    ) -> Result<Option<StreamLease>> {
+        ensure!(
+            !repository.is_empty()
+                && repository.len() <= 128
+                && !peer.is_empty()
+                && peer.len() <= 128,
+            "INVALID_DEMAND_SCOPE"
+        );
+        ensure!(bytes <= limits::READ_BYTES, "CONTENT_BUFFER_LIMIT");
+        let mut state = lock(&self.state);
+        if !Self::available(&state, repository, peer, priority) {
+            return Ok(None);
+        }
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("CONTENT_RESOURCE_LIMIT"))?;
+        let token = LeaseToken {
+            owner: Uuid::new_v4(),
+            generation: state.generation,
+        };
+        state.streams.insert(
+            token.owner,
+            Active {
+                token,
+                repository: repository.into(),
+                peer: peer.into(),
+                priority,
+                bytes,
+            },
+        );
+        Ok(Some(StreamLease {
+            scheduler: Arc::downgrade(self),
+            token,
+        }))
+    }
+
     /// None joins an existing installation or waits for bounded capacity. A
     /// caller's independent demand remains registered while another owner works.
     pub fn try_acquire(
@@ -312,22 +395,7 @@ impl ContentScheduler {
         );
         ensure!(bytes <= limits::READ_BYTES, "CONTENT_BUFFER_LIMIT");
         let mut state = lock(&self.state);
-        if state.active.contains_key(&key)
-            || !Self::capacity(state.active.values(), limits::TRANSFER_JOBS, priority)
-            || !Self::capacity(
-                state
-                    .active
-                    .values()
-                    .filter(|work| work.repository == repository),
-                limits::REPOSITORY_JOBS,
-                priority,
-            )
-            || !Self::capacity(
-                state.active.values().filter(|work| work.peer == peer),
-                limits::PEER_JOBS,
-                priority,
-            )
-        {
+        if state.active.contains_key(&key) || !Self::available(&state, repository, peer, priority) {
             return Ok(None);
         }
         state.generation = state
@@ -380,10 +448,32 @@ impl ContentScheduler {
         let mut state = lock(&self.state);
         Self::prune(&mut state, Instant::now());
         (
-            state.active.len(),
-            state.active.values().map(|work| work.bytes).sum(),
+            state.active.len() + state.streams.len(),
+            state
+                .active
+                .values()
+                .chain(state.streams.values())
+                .map(|work| work.bytes)
+                .sum(),
             state.waiters.len(),
             state.waiter_bytes,
+        )
+    }
+
+    /// Joined object jobs only; `usage` also includes batch/stream reservations.
+    pub fn joined_usage(&self) -> (usize, usize) {
+        let state = lock(&self.state);
+        (
+            state.active.len(),
+            state.active.values().map(|work| work.bytes).sum(),
+        )
+    }
+
+    pub fn stream_usage(&self) -> (usize, usize) {
+        let state = lock(&self.state);
+        (
+            state.streams.len(),
+            state.streams.values().map(|work| work.bytes).sum(),
         )
     }
 }

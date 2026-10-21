@@ -517,6 +517,111 @@ fn range_work_admits_under_cross_repository_saturation_and_retries_another_sourc
 }
 
 #[test]
+fn structural_range_demand_uses_reserved_class_without_fetching_its_data_chunk() {
+    use tkfs::{
+        content::{
+            scheduler::ContentScheduler,
+            work::{TransferSelection, prepare_transfer_scoped},
+        },
+        model::{
+            content_wire::PrepareMode,
+            protocol::LaneSpec,
+            workspace::{ByteRange, Demand, DemandPriority, FileRevision, WorkspaceId},
+        },
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let (mut a, ap) = store(&temp.path().join("a"));
+    let (mut b, bp) = store(&temp.path().join("b"));
+    let (reference, root) = publish(&mut a, &ap, "file", &vec![75; 3 * 65536]);
+    metadata(&a, &mut b);
+    let entity: String =
+        b.db.query_row(
+            "SELECT entity FROM content_root_metadata WHERE reference=?",
+            [&reference],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let scheduler = Arc::new(ContentScheduler::default());
+    let mut demand = Demand {
+        waiter: uuid::Uuid::new_v4(),
+        reference: reference.clone(),
+        revision: FileRevision {
+            workspace: WorkspaceId {
+                repository: b.repo.clone(),
+                workspace: uuid::Uuid::new_v4(),
+            },
+            entity,
+            generation: 1,
+            content: root.clone(),
+        },
+        range: ByteRange {
+            offset: 65536,
+            len: 1,
+        },
+        priority: DemandPriority::Structural,
+        eligible_peers: vec![],
+    };
+    let lease = scheduler
+        .demand_on(bp.identity(), demand.clone(), &context())
+        .unwrap();
+    let foreground = TransferSelection {
+        mode: PrepareMode::Foreground,
+        lane: LaneSpec::new(0, 1),
+    };
+    let structural = TransferSelection {
+        mode: PrepareMode::Structural,
+        lane: LaneSpec::new(0, 1),
+    };
+    assert!(
+        prepare_transfer_scoped(&mut b, &bp, &scheduler, &a.device, &foreground, &context())
+            .unwrap()
+            .is_none()
+    );
+    let transfer =
+        prepare_transfer_scoped(&mut b, &bp, &scheduler, &a.device, &structural, &context())
+            .unwrap()
+            .unwrap();
+    assert_eq!(transfer.priority, DemandPriority::Structural);
+    assert_eq!(transfer.item.edge.key.kind, ObjectKind::Manifest);
+    let body = a
+        .read_content_frame(&ap, &reference, transfer.item.edge.key, &context())
+        .unwrap()
+        .1;
+    transfer.complete(&mut b, &bp, &body, &context()).unwrap();
+    for _ in 0..4 {
+        assert!(
+            prepare_transfer_scoped(&mut b, &bp, &scheduler, &a.device, &structural, &context())
+                .unwrap()
+                .is_none()
+        );
+    }
+    let data = ObjectKey {
+        kind: ObjectKind::Bytes,
+        digest: tkfs::model::content::Digest::bytes(&vec![75; 65536]),
+    };
+    assert!(!b.content_object_verified(data).unwrap());
+    drop(lease);
+    demand.waiter = uuid::Uuid::new_v4();
+    demand.priority = DemandPriority::Foreground;
+    let lease = scheduler
+        .demand_on(bp.identity(), demand, &context())
+        .unwrap();
+    let transfer =
+        prepare_transfer_scoped(&mut b, &bp, &scheduler, &a.device, &foreground, &context())
+            .unwrap()
+            .unwrap();
+    assert_eq!(transfer.priority, DemandPriority::Foreground);
+    assert_eq!(transfer.item.edge.key, data);
+    let body = a
+        .read_content_frame(&ap, &reference, data, &context())
+        .unwrap()
+        .1;
+    transfer.complete(&mut b, &bp, &body, &context()).unwrap();
+    drop(lease);
+    assert_eq!(scheduler.usage().0, 0);
+}
+
+#[test]
 fn receipt_recovery_never_serves_corruption_and_verified_repair_preserves_evidence() {
     let temp = tempfile::tempdir().unwrap();
     let (mut a, ap) = store(&temp.path().join("a"));

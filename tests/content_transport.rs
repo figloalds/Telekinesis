@@ -1237,6 +1237,84 @@ fn native_push_backoff_is_fenced_at_mutation_after_a_superseding_transfer_comple
 }
 
 #[test]
+fn native_local_failure_cannot_recreate_sql_retry_after_a_replacement_push_completes() {
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![141; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let receiver = LegacyPushReceiver::new(&p);
+    let old = receiver.dial();
+    let hash = p.root.digest.to_string();
+    let item = receiver
+        .wants(&old)
+        .into_iter()
+        .find(|item| item.hash == hash)
+        .unwrap();
+    let spool = p.b.ctx.root.join("incoming-objects").join(&hash);
+    std::fs::create_dir_all(&spool).unwrap();
+    let mut config = FaultConfig::new("objects.write.before_local_backoff", FaultAction::Hang);
+    config.ms = Some(2000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    thread::scope(|scope| {
+        let pending = scope.spawn(|| receiver.send_lane(&old, item, &bytes, LANE));
+        let until = Instant::now() + Duration::from_secs(3);
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fault::fired(),
+            1,
+            "actual native local failure did not reach SQL projection"
+        );
+        std::fs::remove_dir(&spool).unwrap();
+        let new = receiver.dial();
+        let began = Instant::now();
+        let item = receiver
+            .wants(&new)
+            .into_iter()
+            .find(|item| item.hash == hash)
+            .unwrap();
+        receiver.push(&new, item, &bytes);
+        let availability = began.elapsed();
+        let _ = pending.join().unwrap();
+        let probe = p.b.ctx.sync_stores.checkout().unwrap();
+        assert!(probe.object_backoff(&hash).unwrap().is_none());
+        let rows: u64 = probe
+            .db
+            .query_row(
+                "SELECT count(*) FROM object_error_state WHERE hash=?",
+                [&hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "old native failure recreated retry after good install"
+        );
+        let mut out = vec![0; bytes.len()];
+        p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .unwrap();
+        assert_eq!(out, bytes);
+        assert!(availability < Duration::from_secs(1));
+        new.close();
+        println!(
+            "WAVE6_EFFECT {}",
+            serde_json::json!({"scenario":"native-local-retry-after-replacement",
+            "availability_ms":availability.as_secs_f64()*1000.0,"bound_ms":1000,"projection_stall_ms":2000,
+            "verified_bytes":bytes.len(),"stale_sql_retry":false,"typed_activation":false})
+        );
+    });
+    old.close();
+}
+
+#[test]
 fn bounded_frames_hydrate_through_real_peer_and_workers_without_semantic_engine_locks() {
     let bytes: Vec<u8> = (0..150_000)
         .map(|i| ((i / 65536) * 71 + i % 251) as u8)
@@ -1736,9 +1814,36 @@ fn stalled_legacy_bulk_handlers_leave_v1_frame_and_ack_service_available() {
 
 #[test]
 fn bulk_runner_automatically_dispatches_typed_content() {
+    automatic_typed_dispatch(false);
+}
+
+#[test]
+fn bulk_runner_recovers_a_receipt_rejected_after_verified_cas_installation() {
+    automatic_typed_dispatch(true);
+}
+
+fn automatic_typed_dispatch(force_receipt_contention: bool) {
+    use tkfs::content::receipt::ReceiptRecovery;
+    use tkfs::model::workspace::ByteRange;
     use tkfs::orchestrator::{content_dispatch, objects};
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
     let bytes = vec![4; 150_000];
     let p = Pair::new(&bytes);
+    let mut probe = Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device).unwrap();
+    probe.db.busy_timeout(Duration::ZERO).unwrap();
+    if force_receipt_contention {
+        let mut config = FaultConfig::new("content.receipt.installed", FaultAction::Hang);
+        config.count = Some(1);
+        config.ms = Some(300);
+        fault::configure(Some(config));
+    }
     let cancel = Cancel::new();
     let token = cancel.clone();
     let (ctx, peer, conn) = (p.dest.clone(), p.peer(&p.dest), p.conn.clone());
@@ -1746,12 +1851,85 @@ fn bulk_runner_automatically_dispatches_typed_content() {
     let until = Instant::now() + Duration::from_secs(5);
     let mut out = vec![0; bytes.len()];
     let mut available = false;
+    let mut recovered = 0;
+    let mut contended = false;
+    if force_receipt_contention {
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fault::fired(), 1);
+        // The first manifest is installed, but its receipt index has not been
+        // written. Hold the real WAL writer until that COMPLETE fails BUSY.
+        loop {
+            match probe.db.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => break,
+                Err(error) => {
+                    let error = anyhow::Error::new(error);
+                    assert!(
+                        tkfs::model::errors::code_of(&error) == "SQLITE_BUSY"
+                            && Instant::now() < until,
+                        "receipt contention setup: {error:#}"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        while Instant::now() < until {
+            let view = content_dispatch::view(&p.dest).unwrap();
+            if view.running == 0 && view.retried[1] > 0 {
+                contended = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        probe.db.execute_batch("ROLLBACK").unwrap();
+        fault::configure(None);
+    }
+    let range = ByteRange {
+        offset: 0,
+        len: bytes.len() as u64,
+    };
+    let mut durable = false;
     while Instant::now() < until {
-        if p.bp
-            .read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
-            .is_ok()
+        if !available
+            && p.bp
+                .read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+                .is_ok()
         {
             available = true;
+        }
+        let Some(view) = content_dispatch::view(&p.dest) else {
+            thread::sleep(Duration::from_millis(5));
+            continue;
+        };
+        // This in-process RPC fixture does not spawn worker maintenance.
+        // Drive its same bounded recovery component while no frame is running.
+        // CAS publication can precede a BUSY receipt-index write; callback
+        // success counters alone therefore cannot prove logical completion.
+        if view.running == 0
+            && view.queued == 0
+            && let Some(mut recovery) = ReceiptRecovery::open(&p.bp).unwrap()
+        {
+            match recovery.step(
+                &mut probe,
+                &p.bp,
+                16,
+                &ReadContext {
+                    deadline: until,
+                    cancel: Cancel::new(),
+                },
+            ) {
+                Ok((count, _)) => recovered += count,
+                Err(error) if tkfs::model::errors::code_of(&error) == "SQLITE_BUSY" => {}
+                Err(error) => panic!("receipt recovery: {error:#}"),
+            }
+        }
+        let all_receipts:bool=probe.db.query_row("SELECT count(*)>=3 AND NOT EXISTS(
+            SELECT 1 FROM content_object_jobs j LEFT JOIN content_public_receipts r
+            ON j.kind=r.kind AND j.digest=r.digest
+            WHERE j.verified=0 OR r.digest IS NULL OR (j.kind=1 AND j.expanded=0)) FROM content_object_jobs",[],|row|row.get(0)).unwrap();
+        durable = all_receipts && probe.content_range_indexed(&p.reference, range).unwrap();
+        if available && durable && view.admitted[1] >= 1 && view.admitted[2] >= 1 {
             break;
         }
         thread::sleep(Duration::from_millis(5));
@@ -1761,17 +1939,38 @@ fn bulk_runner_automatically_dispatches_typed_content() {
     running.join().unwrap();
     assert!(available, "automatic content did not hydrate: {view:?}");
     assert_eq!(out, bytes);
-    assert!(view.completed[1] >= 1 && view.completed[2] >= 1);
+    assert!(
+        durable,
+        "automatic content lacks verified receipt/index evidence: {view:?}"
+    );
+    assert!(view.admitted[1] >= 1 && view.admitted[2] >= 1, "{view:?}");
+    if force_receipt_contention {
+        assert!(contended);
+        assert!(recovered >= 1);
+        assert!(
+            view.retried[1] >= 1,
+            "receipt contention was not observed: {view:?}"
+        );
+        assert_eq!(
+            view.failed, [0; 3],
+            "SQLite readiness counted as a failure: {view:?}"
+        );
+    }
     assert!(view.peak_queue <= 4);
+    println!(
+        "WAVE6_DISPATCH {}",
+        serde_json::json!({"scenario":if force_receipt_contention {"automatic_receipt_busy_recovery"}else{"automatic_typed_bootstrap"},
+        "bytes_verified":bytes.len(),"durable_receipts":durable,"recovered_receipts":recovered,"forced_contention":contended,
+        "admitted":view.admitted,"rpc_completed":view.completed,"failed":view.failed,"retried":view.retried,"bound_ms":5000})
+    );
 }
 
 #[test]
 fn foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stalled() {
     use tkfs::{
-        model::workspace::{
-            AdmissionAction, ByteRange, Demand, DemandPriority, FileRevision, WorkspaceId,
-        },
+        model::workspace::AdmissionAction,
         orchestrator::content_dispatch,
+        runtime::{content::ContentWait, content_reads},
         util::fault::{self, FaultAction, FaultConfig},
     };
     struct Reset;
@@ -1817,39 +2016,23 @@ fn foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stal
     metadata
         .set_content_admission(&c.reference, 2, AdmissionAction::Grant)
         .unwrap();
-    let entity: String = metadata
-        .db
-        .query_row(
-            "SELECT entity FROM content_root_metadata WHERE reference=?1",
-            [&c.reference],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let shared = c.b.ctx.engine.clone();
+    let h = runtime::lock_engine(&shared)
+        .open("file", None, false)
+        .unwrap()
+        .0;
+    content_reads::prepare_open(&shared, h, ContentWait::fixed(Duration::from_secs(1))).unwrap();
+    let len = c.root.total_len as usize;
     let started = Instant::now();
-    let guard = runtime::content_rpc::demand(
-        &c.b.ctx,
-        Demand {
-            waiter: Uuid::new_v4(),
-            reference: c.reference.clone(),
-            revision: FileRevision {
-                workspace: WorkspaceId {
-                    repository: c.scope.repo.clone(),
-                    workspace: Uuid::new_v4(),
-                },
-                entity,
-                generation: 1,
-                content: c.root.clone(),
-            },
-            range: ByteRange {
-                offset: 0,
-                len: c.root.total_len,
-            },
-            priority: DemandPriority::Foreground,
-            eligible_peers: vec![c.a.ctx.device.clone()],
-        },
-        &context(),
-    )
-    .unwrap();
+    let read = thread::spawn(move || {
+        content_reads::read_mount_vec(
+            &shared,
+            h,
+            0,
+            len,
+            ContentWait::fixed(Duration::from_secs(1)),
+        )
+    });
     let mut admitted = false;
     while started.elapsed() < Duration::from_millis(250) {
         if content_dispatch::view(&dest).unwrap().admitted[0] > before.admitted[0] {
@@ -1867,6 +2050,7 @@ fn foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stal
             "admission_ms": elapsed.as_secs_f64() * 1000.0,
             "admitted": admitted, "stalled_background_completions": view.completed[2],
             "bound_ms": 250,
+            "adapter_read": true,
         })
     );
     let mut out = vec![0; c.root.total_len as usize];
@@ -1882,7 +2066,8 @@ fn foreground_dispatch_admits_within_250ms_while_two_other_repositories_are_stal
         }
         thread::sleep(Duration::from_millis(2));
     }
-    drop(guard);
+    assert_eq!(read.join().unwrap().unwrap().unwrap(), b"foreground");
+    runtime::engine::close_handle(&c.b.ctx.engine, h).unwrap();
     token.cancel();
     drop(registrations);
     dest.shutdown.cancel();
@@ -2310,6 +2495,1494 @@ fn legacy_reconnect(new_count: u32, scenario: &str) {
 }
 
 #[test]
+fn native_timed_out_release_cannot_release_or_hold_the_next_pull_round() {
+    use tkfs::{
+        model::lease::{self, Generation, PullRun},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![121; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let conn = session::dial_loopback(
+        &p.b.endpoint.address,
+        p.b.endpoint.token.as_deref(),
+        ConnOptions::default(),
+    )
+    .unwrap();
+    let run = PullRun {
+        generation: Generation {
+            incarnation: 91,
+            run: 2,
+        },
+        layout: 1,
+    };
+    let id = |round| {
+        lease::qualify_pull_round(&format!("pull:{}:0/1:a", p.route.peer), run, round).unwrap()
+    };
+    let old = id(3);
+    let new = id(4);
+    let hash = p.root.digest.to_string();
+    let want = |session: &str| {
+        conn.call(
+            "objects.want",
+            serde_json::json!({"route":p.route,"lane":LANE,
+        "session":session,"max_items":256,"max_bytes":1024*1024}),
+            vec![],
+            Priority::Control,
+            Duration::from_secs(2),
+        )
+        .unwrap()
+    };
+    assert!(
+        want(&old).header["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["hash"] == hash)
+    );
+    let mut config = FaultConfig::new("worker.rpc.objects.release", FaultAction::Hang);
+    config.ms = Some(2500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (request, header) = (
+        conn.clone(),
+        serde_json::json!({"route":p.route,"session":old,"hashes":[hash],"hold_ms":60_000}),
+    );
+    let release = thread::spawn(move || {
+        request.call(
+            "objects.release",
+            header,
+            vec![],
+            Priority::Control,
+            Duration::from_secs(2),
+        )
+    });
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    assert!(
+        release.join().unwrap().is_err(),
+        "the original cleanup did not time out"
+    );
+    let began = Instant::now();
+    assert!(
+        want(&new).header["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["hash"] == hash)
+    );
+    let admission = began.elapsed();
+    assert!(admission < Duration::from_millis(250));
+    let before =
+        p.b.ctx
+            .inflight_objects
+            .lock()
+            .unwrap()
+            .leases
+            .get(&hash)
+            .unwrap()
+            .clone();
+    let mut config = FaultConfig::new("objects.release.stale", FaultAction::Hang);
+    config.ms = Some(0);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fault::fired(),
+        1,
+        "timed-out handler did not reject stale release authorization"
+    );
+    // The hook runs after the stale verdict, with the state mutex released.
+    // A synchronous stale release also gives us its completed result.
+    assert_eq!(
+        conn.call(
+            "objects.release",
+            serde_json::json!({"route":p.route,"session":old,"hashes":[hash],"hold_ms":60_000}),
+            vec![],
+            Priority::Control,
+            Duration::from_secs(1)
+        )
+        .unwrap()
+        .header["released"],
+        0
+    );
+    assert_eq!(
+        p.b.ctx.inflight_objects.lock().unwrap().leases.get(&hash),
+        Some(&before)
+    );
+    assert!(
+        runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.route.remote_replica, &hash).is_none()
+    );
+    let write = conn
+        .call(
+            "objects.write",
+            serde_json::json!({"route":p.route,"session":new,
+        "items":[{"hash":hash,"offset":0,"total":bytes.len(),"len":bytes.len(),"last":true}]}),
+            bytes.clone(),
+            Priority::Control,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    assert_eq!(write.header["results"][0]["outcome"], "completed");
+    println!(
+        "WAVE6_ROUND {}",
+        serde_json::json!({"scenario":"native_timed_out_release","release_deadline_ms":2000,"handler_stall_ms":2500,
+        "next_round_admission_ms":admission.as_secs_f64()*1000.0,"old_release_reached_effect_check":true,"new_lease_preserved":true,"source_backoff_added":false,"bytes_verified":bytes.len()})
+    );
+    conn.close();
+}
+
+#[test]
+fn native_download_rounds_use_fresh_ids_and_resume_without_an_idle_interval() {
+    use tkfs::{
+        orchestrator::objects,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![122; 300_000];
+    let p = Pair::with_legacy(&bytes, true);
+    runtime::objects_rpc::dispatch(
+        &p.b.ctx,
+        "objects.write",
+        &serde_json::json!({"route":p.route,"session":"fixture-empty",
+        "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+        &[],
+    )
+    .unwrap();
+    let mut config = FaultConfig::new("worker.rpc.objects.read", FaultAction::Hang);
+    config.ms = Some(30);
+    config.count = Some(10);
+    fault::configure(Some(config));
+    let cancel = Cancel::new();
+    let stats = Arc::new(objects::LaneStats::default());
+    let mut options = objects::LaneOptions::for_config(&p.dest.config);
+    options.round = Duration::from_millis(20);
+    options.window_bytes = 128 * 1024;
+    options.stats = Some(stats.clone());
+    options.download.interval = Duration::from_secs(60);
+    let (ctx, peer, conn, token) = (
+        p.dest.clone(),
+        p.peer(&p.dest),
+        p.conn.clone(),
+        cancel.clone(),
+    );
+    let runner =
+        thread::spawn(move || objects::run_lane_with(ctx, peer, LANE, conn, token, options));
+    let mut ids = BTreeSet::new();
+    let hash = p.root.digest.to_string();
+    let mut out = vec![0; bytes.len()];
+    let began = Instant::now();
+    let mut available = false;
+    while began.elapsed() < Duration::from_secs(5) {
+        if let Some(held) = p.b.ctx.inflight_objects.lock().unwrap().leases.get(&hash) {
+            ids.insert(held.session.clone());
+        }
+        if p.bp
+            .read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .is_ok()
+        {
+            available = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let elapsed = began.elapsed();
+    cancel.cancel();
+    runner.join().unwrap();
+    assert!(available, "short rounds waited for the 60-second heartbeat");
+    assert_eq!(out, bytes);
+    assert!(
+        ids.len() >= 2,
+        "no actual round identity transition was observed: {ids:?}"
+    );
+    let mut parents = BTreeSet::new();
+    let mut nonces = BTreeSet::new();
+    for id in &ids {
+        let owned = tkfs::model::lease::parse(id).unwrap().unwrap();
+        assert!(owned.round_slot.is_some());
+        parents.insert((owned.generation, owned.layout));
+        nonces.insert(owned.frame);
+    }
+    assert_eq!(
+        parents.len(),
+        1,
+        "a reconnect substituted for the round transition"
+    );
+    assert!(nonces.len() >= 2);
+    assert!(objects::LaneStats::get(&stats.v3_rounds) >= 2);
+    assert!(
+        runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.route.remote_replica, &hash).is_none()
+    );
+    println!(
+        "WAVE6_ROUND {}",
+        serde_json::json!({"scenario":"native_short_download_rounds","bytes_verified":bytes.len(),"round_ids_observed":ids,
+        "parent_runs":parents.len(),"available_ms":elapsed.as_secs_f64()*1000.0,"heartbeat_ms":60000,"source_backoff_added":false})
+    );
+}
+
+#[test]
+fn native_cancelled_foreground_verdict_cannot_back_off_a_replacement_copy() {
+    use tkfs::{
+        orchestrator::{content_dispatch, objects},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![137; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let hash = p.root.digest.to_string();
+    runtime::objects_rpc::dispatch(
+        &p.b.ctx,
+        "objects.write",
+        &serde_json::json!({"route":p.route,"session":"fixture-empty",
+        "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+        &[],
+    )
+    .unwrap();
+    let mut config = FaultConfig::new("worker.rpc.objects.read", FaultAction::Hang);
+    config.ms = Some(2500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let old_cancel = Cancel::new();
+    let (ctx, peer, conn, token) = (
+        p.dest.clone(),
+        p.peer(&p.dest),
+        p.conn.clone(),
+        old_cancel.clone(),
+    );
+    let old = thread::spawn(move || objects::run_bulk_lane(ctx, peer, LANE, conn, token));
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let path = p.a.ctx.root.join("objects").join(&hash);
+    std::fs::remove_file(&path).unwrap();
+    let mut config = FaultConfig::new("legacy.foreground.before_source_backoff", FaultAction::Hang);
+    config.ms = Some(1500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device)
+        .unwrap()
+        .request_object(&hash)
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fault::fired(),
+        1,
+        "foreground source verdict was not pending"
+    );
+    assert!(content_dispatch::view(&p.dest).unwrap().running >= 1);
+    assert!(
+        objects::object_backoff_for(
+            &p.dest.installation,
+            &p.source.installation,
+            &p.route.repo,
+            false,
+            &hash
+        )
+        .is_none()
+    );
+    old_cancel.cancel();
+    std::fs::write(&path, &bytes).unwrap();
+    let source = Store::open_secondary(&p.a.ctx.root, &p.a.ctx.repo, &p.a.ctx.device).unwrap();
+    assert_eq!(source.read_object_range(&hash, 0, 1).unwrap().1, bytes[..1]);
+    let conn = session::dial(
+        &p.address,
+        session::client_hello(&p.dest.installation, LaneRole::Bulk, Some(LANE), 2),
+        &CodeAuth {
+            code: p.code.clone(),
+        },
+        None,
+        ConnOptions::for_role(LaneRole::Bulk),
+    )
+    .unwrap()
+    .0;
+    let new_cancel = Cancel::new();
+    let (ctx, peer, token) = (p.dest.clone(), p.peer(&p.dest), new_cancel.clone());
+    let began = Instant::now();
+    let new = thread::spawn(move || objects::run_bulk_lane(ctx, peer, LANE, conn, token));
+    let mut out = vec![0; bytes.len()];
+    let mut available = false;
+    while began.elapsed() < Duration::from_secs(1) {
+        if p.bp
+            .read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .is_ok()
+        {
+            available = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let availability = began.elapsed();
+    assert!(
+        available,
+        "replacement waited for obsolete foreground verdict"
+    );
+    assert_eq!(out, bytes);
+    let state = content_transport::daemon(&p.dest).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    while state.scheduler.usage().0 != 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        state.scheduler.usage().0,
+        0,
+        "obsolete foreground task did not retire"
+    );
+    assert!(
+        objects::object_backoff_for(
+            &p.dest.installation,
+            &p.source.installation,
+            &p.route.repo,
+            false,
+            &hash
+        )
+        .is_none()
+    );
+    assert!(
+        runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.route.remote_replica, &hash).is_none()
+    );
+    new_cancel.cancel();
+    old.join().unwrap();
+    new.join().unwrap();
+    println!(
+        "WAVE6_FOREGROUND {}",
+        serde_json::json!({"scenario":"cancelled_verdict_after_replacement","verdict_stall_ms":1500,"replacement_ms":availability.as_secs_f64()*1000.0,
+        "replacement_bound_ms":1000,"bytes_verified":bytes.len(),"daemon_backoff_added":false,"worker_backoff_added":false,"foreground_budget_drained":true})
+    );
+}
+
+#[test]
+fn native_catalog_withdrawal_cancels_a_legacy_verdict_without_closing_its_lane() {
+    use tkfs::{
+        orchestrator::{content_dispatch, objects},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![129; 150_000];
+    let p = Pair::with_legacy(&bytes, true);
+    let hash = p.root.digest.to_string();
+    runtime::objects_rpc::dispatch(
+        &p.b.ctx,
+        "objects.write",
+        &serde_json::json!({"route":p.route,"session":"fixture-empty",
+        "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+        &[],
+    )
+    .unwrap();
+    let peer = p.peer(&p.dest);
+    let original = peer.catalog.load();
+    let cancel = Cancel::new();
+    let mut config = FaultConfig::new("worker.rpc.objects.read", FaultAction::Hang);
+    config.ms = Some(1500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (ctx, remote, conn, token) = (p.dest.clone(), peer.clone(), p.conn.clone(), cancel.clone());
+    let lane = thread::spawn(move || objects::run_bulk_lane(ctx, remote, LANE, conn, token));
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let path = p.a.ctx.root.join("objects").join(&hash);
+    std::fs::remove_file(&path).unwrap();
+    let mut config = FaultConfig::new("legacy.foreground.before_source_backoff", FaultAction::Hang);
+    config.ms = Some(1000);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device)
+        .unwrap()
+        .request_object(&hash)
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fault::fired(),
+        1,
+        "actual foreground verdict must be pending"
+    );
+    let state = content_transport::daemon(&p.dest).unwrap();
+    assert_eq!(state.scheduler.joined_usage().0, 1);
+    peer.catalog.store(RemoteCatalog {
+        generation: 2,
+        at_ms: 2,
+        entries: vec![],
+    });
+    let began = Instant::now();
+    while began.elapsed() < Duration::from_millis(250)
+        && content_dispatch::view(&p.dest).unwrap().groups != 0
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let withdraw_ms = began.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(content_dispatch::view(&p.dest).unwrap().groups, 0);
+    assert!(withdraw_ms < 250.0);
+    assert!(p.conn.closed().is_none() && !cancel.is_cancelled());
+    // A synthetic disk stall is not interruptible. Its reservation must stay
+    // held until that old Task actually unwinds, even though its group is gone.
+    assert_eq!(state.scheduler.joined_usage().0, 1);
+    let until = Instant::now() + Duration::from_secs(2);
+    while state.scheduler.joined_usage().0 != 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(state.scheduler.joined_usage().0, 0);
+    let old = content_dispatch::view(&p.dest).unwrap();
+    assert_eq!(old.failed[0], 0);
+    assert_eq!(old.completed[0], 0);
+    assert!(
+        objects::object_backoff_for(
+            &p.dest.installation,
+            &p.source.installation,
+            &p.route.repo,
+            false,
+            &hash
+        )
+        .is_none()
+    );
+    assert!(
+        runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.route.remote_replica, &hash).is_none()
+    );
+    std::fs::write(&path, &bytes).unwrap();
+    Store::open_secondary(&p.a.ctx.root, &p.a.ctx.repo, &p.a.ctx.device)
+        .unwrap()
+        .read_object_range(&hash, 0, 1)
+        .unwrap();
+    peer.catalog.store_arc(original);
+    let began = Instant::now();
+    let mut out = vec![0; bytes.len()];
+    let mut available = false;
+    while began.elapsed() < Duration::from_secs(1) {
+        if p.bp
+            .read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .is_ok()
+        {
+            available = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let replacement_ms = began.elapsed().as_secs_f64() * 1000.0;
+    assert!(available, "restored catalog waited for stale source hold");
+    assert_eq!(out, bytes);
+    assert!(p.conn.closed().is_none());
+    cancel.cancel();
+    lane.join().unwrap();
+    println!(
+        "WAVE6_GROUP {}",
+        serde_json::json!({"scenario":"legacy_catalog_withdrawal",
+        "withdraw_ms":withdraw_ms,"withdraw_bound_ms":250,"old_verdict_stall_ms":1000,
+        "replacement_ms":replacement_ms,"replacement_bound_ms":1000,"bytes_verified":bytes.len(),
+        "connection_preserved":true,"cancelled_task_failed":false,"cancelled_task_completed":false,
+        "source_backoff_added":false,"budget_retained_until_task_unwind":true})
+    );
+}
+
+#[test]
+fn native_catalog_withdrawal_cancels_typed_work_and_reuses_the_same_connection() {
+    use tkfs::{
+        orchestrator::content_dispatch,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = b"same connection after group replacement";
+    let p = Pair::new(bytes);
+    let peer = p.peer(&p.dest);
+    let original = peer.catalog.load();
+    let cancel = Cancel::new();
+    let mut config = FaultConfig::new("content.read.background", FaultAction::Hang);
+    config.ms = Some(1500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let registration =
+        content_dispatch::register(&p.dest, peer.clone(), LANE, p.conn.clone(), &cancel).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let state = content_transport::daemon(&p.dest).unwrap();
+    assert_eq!(state.scheduler.usage().0, 1);
+    peer.catalog.store(RemoteCatalog {
+        generation: 2,
+        at_ms: 2,
+        entries: vec![],
+    });
+    let began = Instant::now();
+    let mut drained = false;
+    while began.elapsed() < Duration::from_millis(250) {
+        let view = content_dispatch::view(&p.dest).unwrap();
+        if view.groups == 0
+            && view.running == 0
+            && view.queued == 0
+            && state.scheduler.usage().0 == 0
+            && runtime::content_rpc::state(&p.b.ctx)
+                .unwrap()
+                .scheduler
+                .usage()
+                .0
+                == 0
+        {
+            drained = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let drain_ms = began.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        drained,
+        "withdrawal retained typed work: {:?}",
+        content_dispatch::view(&p.dest)
+    );
+    let old = content_dispatch::view(&p.dest).unwrap();
+    assert_eq!(old.failed, [0; 3]);
+    assert_eq!(old.completed, [0; 3]);
+    assert!(p.conn.closed().is_none() && !cancel.is_cancelled());
+    peer.catalog.store_arc(original);
+    let began = Instant::now();
+    let mut out = vec![0; bytes.len()];
+    let mut available = false;
+    while began.elapsed() < Duration::from_secs(1) {
+        if p.bp
+            .read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .is_ok()
+        {
+            available = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let replacement_ms = began.elapsed().as_secs_f64() * 1000.0;
+    assert!(available, "new group could not use the original connection");
+    assert_eq!(out, bytes);
+    assert!(p.conn.closed().is_none());
+    cancel.cancel();
+    drop(registration);
+    println!(
+        "WAVE6_GROUP {}",
+        serde_json::json!({"scenario":"typed_catalog_withdrawal",
+        "drain_ms":drain_ms,"drain_bound_ms":250,"old_source_stall_ms":1500,
+        "replacement_ms":replacement_ms,"replacement_bound_ms":1000,"bytes_verified":bytes.len(),
+        "connection_preserved":true,"cancelled_task_failed":false,"cancelled_task_completed":false})
+    );
+}
+
+#[test]
+fn native_legacy_streams_share_global_capacity_and_leave_foreground_service() {
+    use tkfs::{
+        model::workspace::{ByteRange, Demand, DemandPriority, FileRevision, WorkspaceId},
+        orchestrator::{content_dispatch, objects},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let background: Vec<_> = (0..6)
+        .map(|i| Pair::with_legacy(&vec![150 + i; 300_000], true))
+        .collect();
+    for p in &background {
+        runtime::objects_rpc::dispatch(
+            &p.b.ctx,
+            "objects.write",
+            &serde_json::json!({"route":p.route,"session":"fixture-empty",
+            "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+            &[],
+        )
+        .unwrap();
+    }
+    let foreground = Pair::new(b"foreground through the shared stream budget");
+    let workers: Vec<_> = background
+        .iter()
+        .map(|p| &p.b)
+        .chain(std::iter::once(&foreground.b))
+        .collect();
+    let dest = World::from_workers(&workers, None).ctx();
+    let token = Cancel::new();
+    let mut config = FaultConfig::new("worker.rpc.objects.read", FaultAction::Hang);
+    config.ms = Some(1500);
+    fault::configure(Some(config));
+    let lanes: Vec<_> = background
+        .iter()
+        .map(|p| {
+            let (ctx, peer, conn, cancel) = (
+                dest.clone(),
+                p.peer(&dest),
+                p.dial_for(&dest),
+                token.clone(),
+            );
+            thread::spawn(move || objects::run_bulk_lane(ctx, peer, LANE, conn, cancel))
+        })
+        .collect();
+    let state = content_transport::daemon(&dest).unwrap();
+    let began = Instant::now();
+    let mut peak_jobs = 0;
+    let mut peak_bytes = 0;
+    while began.elapsed() < Duration::from_secs(1) {
+        let (jobs, bytes, _, _) = state.scheduler.usage();
+        peak_jobs = peak_jobs.max(jobs);
+        peak_bytes = peak_bytes.max(bytes);
+        assert!(jobs <= 8 && bytes <= 8 * 1024 * 1024);
+        assert!(state.scheduler.stream_usage().0 <= 6);
+        if fault::fired() >= 6 && state.scheduler.stream_usage().0 == 6 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(state.scheduler.stream_usage(), (6, 6 * 1024 * 1024));
+    assert_eq!(
+        fault::fired(),
+        6,
+        "only globally admitted streams may reach the source"
+    );
+    let store = Store::open_secondary(
+        &foreground.b.ctx.root,
+        &foreground.b.ctx.repo,
+        &foreground.b.ctx.device,
+    )
+    .unwrap();
+    let entity = store
+        .db
+        .query_row(
+            "SELECT entity FROM content_root_metadata WHERE reference=?1",
+            [&foreground.reference],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap();
+    let demand = runtime::content_rpc::demand(
+        &foreground.b.ctx,
+        Demand {
+            waiter: Uuid::new_v4(),
+            reference: foreground.reference.clone(),
+            revision: FileRevision {
+                workspace: WorkspaceId {
+                    repository: foreground.scope.repo.clone(),
+                    workspace: Uuid::new_v4(),
+                },
+                entity,
+                generation: 1,
+                content: foreground.root.clone(),
+            },
+            range: ByteRange {
+                offset: 0,
+                len: foreground.root.total_len,
+            },
+            priority: DemandPriority::Foreground,
+            eligible_peers: vec![foreground.a.ctx.device.clone()],
+        },
+        &context(),
+    )
+    .unwrap();
+    let began = Instant::now();
+    let registration = content_dispatch::register(
+        &dest,
+        foreground.peer(&dest),
+        LANE,
+        foreground.dial_for(&dest),
+        &token,
+    )
+    .unwrap();
+    let mut execution_ms = None;
+    let mut out = vec![0; foreground.root.total_len as usize];
+    let mut available = false;
+    while began.elapsed() < Duration::from_millis(250) {
+        let (jobs, bytes, _, _) = state.scheduler.usage();
+        peak_jobs = peak_jobs.max(jobs);
+        peak_bytes = peak_bytes.max(bytes);
+        assert!(jobs <= 8 && bytes <= 8 * 1024 * 1024);
+        if content_dispatch::view(&dest).is_some_and(|v| v.started[0] > 0) && execution_ms.is_none()
+        {
+            execution_ms = Some(began.elapsed().as_secs_f64() * 1000.0);
+        }
+        if foreground
+            .bp
+            .read_range(
+                &foreground.bp.pin(&foreground.root).unwrap(),
+                0,
+                &mut out,
+                &context(),
+            )
+            .is_ok()
+        {
+            available = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let available_ms = began.elapsed().as_secs_f64() * 1000.0;
+    assert!(
+        available,
+        "foreground lacked actual service: {:?}",
+        content_dispatch::view(&dest)
+    );
+    assert!(execution_ms.is_some());
+    assert_eq!(out, b"foreground through the shared stream budget");
+    assert_eq!(
+        fault::fired(),
+        6,
+        "new background streams borrowed a reserved class slot"
+    );
+    drop(demand);
+    token.cancel();
+    drop(registration);
+    for lane in lanes {
+        lane.join().unwrap();
+    }
+    dest.shutdown.cancel();
+    assert_eq!(state.scheduler.usage().0, 0);
+    println!(
+        "WAVE6_STREAM {}",
+        serde_json::json!({"scenario":"native_global_legacy_budget","stalled_streams":6,
+        "source_stall_ms":1500,"execution_ms":execution_ms,"available_ms":available_ms,"bound_ms":250,
+        "peak_jobs":peak_jobs,"peak_reserved_bytes":peak_bytes,"foreground_bytes_verified":out.len(),"all_reservations_drained":true})
+    );
+}
+
+#[test]
+fn native_pending_legacy_writes_continue_the_same_download_round() {
+    native_legacy_drain(false);
+}
+
+#[test]
+fn native_empty_legacy_pull_finishes_only_after_its_actual_local_write() {
+    use tkfs::{
+        orchestrator::objects,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    #[derive(Default)]
+    struct Events(Mutex<Vec<StatusEvent>>);
+    impl StatusSink for Events {
+        fn record(&self, event: StatusEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let _reset = Reset;
+    let mut p = Pair::with_legacy(&[], true);
+    let events = Arc::new(Events::default());
+    Arc::get_mut(&mut p.dest).unwrap().status = events.clone();
+    let token = Cancel::new();
+    let stats = Arc::new(objects::LaneStats::default());
+    let mut options = objects::LaneOptions::for_config(&p.dest.config);
+    options.stats = Some(stats.clone());
+    let mut config = FaultConfig::new("worker.rpc.objects.write", FaultAction::Hang);
+    config.ms = Some(600);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let (ctx, peer, conn, cancel) = (
+        p.dest.clone(),
+        p.peer(&p.dest),
+        p.conn.clone(),
+        token.clone(),
+    );
+    let lane =
+        thread::spawn(move || objects::run_lane_with(ctx, peer, LANE, conn, cancel, options));
+    let finished = || {
+        events
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                StatusEvent::ExchangeFinished {
+                    op,
+                    ok,
+                    bytes_down,
+                    objects_down,
+                    ..
+                } if op == "objects.pull" => Some((*ok, *bytes_down, *objects_down)),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < until
+        && (fault::fired() == 0 || objects::LaneStats::get(&stats.pulls_in_flight) != 0)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    assert_eq!(objects::LaneStats::get(&stats.pulls_in_flight), 0);
+    thread::sleep(Duration::from_millis(40));
+    let premature = finished();
+    let until = Instant::now() + Duration::from_secs(2);
+    while finished().is_empty() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    token.cancel();
+    lane.join().unwrap();
+    let outcomes = finished();
+    assert!(
+        premature.is_empty(),
+        "empty stream reported completion before its write: {premature:?}"
+    );
+    assert_eq!(outcomes, vec![(true, 0, 1)]);
+    assert_eq!(objects::LaneStats::get(&stats.objects_down), 1);
+    println!(
+        "WAVE6_BOOKKEEPING {}",
+        serde_json::json!({"scenario":"native_empty_pull_completion","write_stall_ms":600,
+        "premature_completions":premature.len(),"final_completions":outcomes.len(),"objects_completed":outcomes[0].2,"bytes_completed":outcomes[0].1})
+    );
+}
+
+#[test]
+fn native_pending_legacy_credit_retirement_continues_the_same_download_round() {
+    native_legacy_drain(true);
+}
+
+fn native_legacy_drain(credit: bool) {
+    native_legacy_drain_with_race(credit, false, false);
+}
+
+#[test]
+fn native_capacity_return_between_refusal_and_pending_snapshot_keeps_round_authority() {
+    native_legacy_drain_with_race(true, true, false);
+}
+
+#[test]
+fn native_local_family_effect_wait_preserves_the_same_download_round() {
+    native_legacy_drain_with_race(false, false, true);
+}
+
+fn native_legacy_drain_with_race(credit: bool, race: bool, family: bool) {
+    use tkfs::{
+        orchestrator::objects,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![
+        151;
+        if credit {
+            1024 * 1024 + 7
+        } else {
+            4 * 1024 * 1024
+        }
+    ];
+    #[derive(Default)]
+    struct Events(Mutex<Vec<StatusEvent>>);
+    impl StatusSink for Events {
+        fn record(&self, event: StatusEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    let mut p = Pair::with_legacy(&bytes, true);
+    let events = Arc::new(Events::default());
+    Arc::get_mut(&mut p.dest).unwrap().status = events.clone();
+    let hash = p.root.digest.to_string();
+    runtime::objects_rpc::dispatch(
+        &p.b.ctx,
+        "objects.write",
+        &serde_json::json!({"route":p.route,"session":"fixture-empty",
+        "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+        &[],
+    )
+    .unwrap();
+    let stall_ms = if family {
+        200
+    } else if race {
+        600
+    } else if credit {
+        150
+    } else {
+        250
+    };
+    let mut config = FaultConfig::new(
+        if credit {
+            "legacy.sink.before_capacity_return"
+        } else {
+            "worker.rpc.objects.write"
+        },
+        FaultAction::Hang,
+    );
+    config.ms = Some(stall_ms);
+    config.count = if race {
+        Some(2)
+    } else if credit {
+        None
+    } else {
+        Some(1)
+    };
+    fault::configure(Some(config));
+    let cancel = Cancel::new();
+    let stats = Arc::new(objects::LaneStats::default());
+    let mut options = objects::LaneOptions::for_config(&p.dest.config);
+    options.stats = Some(stats.clone());
+    options.download.interval = Duration::from_secs(60);
+    let (ctx, peer, conn, token) = (
+        p.dest.clone(),
+        p.peer(&p.dest),
+        p.conn.clone(),
+        cancel.clone(),
+    );
+    let lane = thread::spawn(move || objects::run_lane_with(ctx, peer, LANE, conn, token, options));
+    let family_want = if family {
+        let until = Instant::now() + Duration::from_secs(3);
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fault::fired(), 1, "the actual write must reach admission");
+        let session =
+            p.b.ctx
+                .inflight_objects
+                .lock()
+                .unwrap()
+                .leases
+                .get(&hash)
+                .unwrap()
+                .session
+                .clone();
+        let mut held = FaultConfig::new("objects.want.family_effect_held", FaultAction::Hang);
+        held.ms = Some(350);
+        held.count = Some(1);
+        fault::configure(Some(held));
+        let ctx = p.b.ctx.clone();
+        let route = p.route.clone();
+        let wanting = thread::spawn(move || {
+            runtime::objects_rpc::dispatch(
+                &ctx,
+                "objects.want",
+                &serde_json::json!({"route":route,"session":session,"lane":LANE,"max_items":256,"max_bytes":4*1024*1024,"exclude":[]}),
+                &[],
+            )
+        });
+        let until = Instant::now() + Duration::from_secs(3);
+        while fault::fired() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fault::fired(), 1, "the real want must own the family gate");
+        let mut waiting = FaultConfig::new("objects.write.family_waiting", FaultAction::Hang);
+        waiting.ms = Some(0);
+        waiting.count = Some(1);
+        fault::configure(Some(waiting));
+        Some(wanting)
+    } else {
+        None
+    };
+    if race {
+        let until = Instant::now() + Duration::from_secs(3);
+        while fault::fired() < 2 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            fault::fired(),
+            2,
+            "both native credits must actually be retiring"
+        );
+        let mut refused = FaultConfig::new("legacy.round.capacity_refused", FaultAction::Hang);
+        refused.ms = Some(850);
+        refused.count = Some(1);
+        fault::configure(Some(refused));
+    }
+    let began = Instant::now();
+    let mut nonces = BTreeSet::new();
+    let mut out = vec![0; bytes.len()];
+    let pin = p.bp.pin(&p.root).unwrap();
+    let mut available = false;
+    while began.elapsed() < Duration::from_secs(5) {
+        if let Some(held) = p.b.ctx.inflight_objects.lock().unwrap().leases.get(&hash) {
+            let owner = tkfs::model::lease::parse(&held.session).unwrap().unwrap();
+            assert!(owner.round_slot.is_some());
+            nonces.insert(owner.frame);
+        }
+        if out.chunks_mut(1024 * 1024).enumerate().all(|(i, chunk)| {
+            p.bp.read_range(&pin, (i * 1024 * 1024) as u64, chunk, &context())
+                .is_ok()
+        }) {
+            available = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let elapsed = began.elapsed();
+    let stalled = fault::fired();
+    cancel.cancel();
+    lane.join().unwrap();
+    if let Some(wanting) = family_want
+        && let Err(error) = wanting.join().unwrap()
+    {
+        assert_eq!(error.code, "WORKER_BUSY");
+    }
+    if race {
+        assert_eq!(stalled, 1, "the refusal-to-pending race was not forced");
+    } else if credit {
+        assert!(stalled >= 2);
+    } else {
+        assert_eq!(stalled, 1);
+    }
+    assert!(available, "local-write pressure waited for the heartbeat");
+    assert_eq!(out, bytes);
+    let exchanges:Vec<_>=events.0.lock().unwrap().iter().filter_map(|event|match event {
+        StatusEvent::ExchangeFinished {op,ok,bytes_down,objects_down,error,..} if op=="objects.pull" =>Some(serde_json::json!({"ok":ok,"bytes":bytes_down,"objects":objects_down,"error":error})),_=>None,
+    }).collect();
+    assert_eq!(
+        nonces.len(),
+        1,
+        "own pending writes churned round authority: {nonces:?}; exchanges={exchanges:?}; pulls={}; rounds={}; bytes_written={}",
+        objects::LaneStats::get(&stats.pulls),
+        objects::LaneStats::get(&stats.v3_rounds),
+        objects::LaneStats::get(&stats.bytes_written)
+    );
+    assert!(
+        runtime::objects_rpc::source_retry_at(&p.b.ctx, &p.route.remote_replica, &hash).is_none()
+    );
+    println!(
+        "WAVE6_DRAIN {}",
+        serde_json::json!({"scenario":if family {"native_family_gate_same_round"}else if race {"native_credit_return_race_same_round"}else if credit {"native_credit_retirement_same_round"}else{"native_pending_writes_same_round"},"bytes_verified":bytes.len(),
+        "available_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":5000,"stall_ms":stall_ms,"stall_hits":stalled,"round_nonces":nonces,
+        "capacity_refusal_stall_ms":if race {850}else{0},
+        "family_gate_stall_ms":if family {350}else{0},
+        "rounds_observed":objects::LaneStats::get(&stats.v3_rounds),"heartbeat_ms":60000,"source_backoff_added":false})
+    );
+}
+
+#[test]
+fn native_legacy_stream_budget_survives_stream_end_and_cancel_until_worker_write_returns() {
+    use tkfs::{
+        orchestrator::objects,
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    // Include canonical empty data: zero payload still owns an actual write.
+    for bytes in [vec![], vec![127; 16000]] {
+        let p = Pair::with_legacy(&bytes, true);
+        if !bytes.is_empty() {
+            runtime::objects_rpc::dispatch(
+                &p.b.ctx,
+                "objects.write",
+                &serde_json::json!({"route":p.route,"session":"fixture-empty",
+                "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+                &[],
+            )
+            .unwrap();
+        }
+        let token = Cancel::new();
+        let stats = Arc::new(objects::LaneStats::default());
+        let mut options = objects::LaneOptions::for_config(&p.dest.config);
+        options.stats = Some(stats.clone());
+        let mut config = FaultConfig::new("worker.rpc.objects.write", FaultAction::Hang);
+        config.ms = Some(750);
+        config.count = Some(1);
+        fault::configure(Some(config));
+        let (ctx, peer, conn, cancel) = (
+            p.dest.clone(),
+            p.peer(&p.dest),
+            p.conn.clone(),
+            token.clone(),
+        );
+        let lane =
+            thread::spawn(move || objects::run_lane_with(ctx, peer, LANE, conn, cancel, options));
+        let state = content_transport::daemon(&p.dest).unwrap();
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_secs(1)
+            && (fault::fired() == 0 || objects::LaneStats::get(&stats.pulls_in_flight) != 0)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(fault::fired(), 1);
+        assert_eq!(objects::LaneStats::get(&stats.pulls_in_flight), 0);
+        assert_eq!(
+            state.scheduler.stream_usage(),
+            (1, 1024 * 1024),
+            "ended stream lent out a pending write's budget"
+        );
+        token.cancel();
+        thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            state.scheduler.stream_usage().0,
+            1,
+            "cancel lent out a still-running write's budget"
+        );
+        lane.join().unwrap();
+        let retained_after_lane_join = state.scheduler.stream_usage().0 != 0;
+        // The historical runner has a 500 ms exit wait; its still-running
+        // round may outlive join. That is precisely when the stream proof
+        // must remain retained. Observe physical retirement separately.
+        let until = Instant::now() + Duration::from_secs(2);
+        while state.scheduler.stream_usage().0 != 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(state.scheduler.stream_usage().0, 0);
+        println!(
+            "WAVE6_STREAM {}",
+            serde_json::json!({"scenario":"native_pending_legacy_write","bytes":bytes.len(),"write_stall_ms":750,
+            "stream_ended_before_write":true,"reservation_held_after_cancel":true,
+            "retained_after_lane_join":retained_after_lane_join,"all_reservations_drained":true})
+        );
+        fault::configure(None);
+    }
+}
+
+#[test]
+fn native_partial_foreground_receipt_preserves_source_history_until_whole_file_verification() {
+    use tkfs::{
+        orchestrator::{content_dispatch, objects},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let bytes = vec![139; wire::LEGACY_BYTES * 2 + 17];
+    let p = Pair::with_legacy(&bytes, true);
+    let hash = p.root.digest.to_string();
+    runtime::objects_rpc::dispatch(
+        &p.b.ctx,
+        "objects.write",
+        &serde_json::json!({"route":p.route,"session":"fixture-empty",
+        "items":[{"hash":tkfs::core::hash(&[]),"offset":0,"total":0,"len":0,"last":true}]}),
+        &[],
+    )
+    .unwrap();
+    let mut config = FaultConfig::new("worker.rpc.objects.read", FaultAction::Hang);
+    config.ms = Some(1500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let cancel = Cancel::new();
+    let (ctx, peer, conn, token) = (
+        p.dest.clone(),
+        p.peer(&p.dest),
+        p.conn.clone(),
+        cancel.clone(),
+    );
+    let lane = thread::spawn(move || objects::run_bulk_lane(ctx, peer, LANE, conn, token));
+    let until = Instant::now() + Duration::from_secs(2);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fault::fired(), 1);
+    let mut config = FaultConfig::new("legacy.foreground.before_success", FaultAction::Hang);
+    config.ms = Some(2500);
+    config.count = Some(1);
+    fault::configure(Some(config));
+    let probe = Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device).unwrap();
+    probe.request_object(&hash).unwrap();
+    let until = Instant::now() + Duration::from_secs(1);
+    while fault::fired() == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fault::fired(),
+        1,
+        "foreground fragment did not finish before source loss"
+    );
+    let durable: u64 = probe
+        .db
+        .query_row(
+            "SELECT durable FROM spool_state WHERE hash=?",
+            [&hash],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(durable, wire::LEGACY_BYTES as u64);
+    std::fs::remove_file(p.a.ctx.root.join("objects").join(&hash)).unwrap();
+    let until = Instant::now() + Duration::from_secs(2);
+    while objects::object_backoff_for(
+        &p.dest.installation,
+        &p.source.installation,
+        &p.route.repo,
+        false,
+        &hash,
+    )
+    .is_none()
+        && Instant::now() < until
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        objects::object_backoff_for(
+            &p.dest.installation,
+            &p.source.installation,
+            &p.route.repo,
+            false,
+            &hash
+        )
+        .is_some(),
+        "background source failure was not recorded"
+    );
+    let until = Instant::now() + Duration::from_secs(2);
+    while content_dispatch::view(&p.dest).unwrap().completed[0] == 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(content_dispatch::view(&p.dest).unwrap().completed[0] >= 1);
+    assert!(
+        objects::object_backoff_for(
+            &p.dest.installation,
+            &p.source.installation,
+            &p.route.repo,
+            false,
+            &hash
+        )
+        .is_some(),
+        "unverified prefix cleared whole-file source history"
+    );
+    let mut out = vec![0; bytes.len()];
+    assert!(
+        p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+            .is_err()
+    );
+    cancel.cancel();
+    lane.join().unwrap();
+    println!(
+        "WAVE6_FOREGROUND {}",
+        serde_json::json!({"scenario":"partial_receipt_retains_history","durable_prefix_bytes":durable,"whole_file_bytes":bytes.len(),
+        "source_history_preserved":true,"whole_file_available":false,"completion_stall_ms":2500})
+    );
+}
+
+#[test]
+fn native_legacy_offers_check_deadline_disconnect_and_shutdown_before_late_grants() {
+    use tkfs::{
+        model::lease::{self, Generation, PullRun},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    for replacement in [false, true] {
+        for operation in ["objects.want", wire::LEGACY_PREPARE] {
+            for phase in ["entry", "grant"] {
+                for stop in ["deadline", "disconnect", "shutdown"] {
+                    let p = Pair::with_legacy(&vec![131; 100_000], true);
+                    let hash = p.root.digest.to_string();
+                    let probe =
+                        Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device)
+                            .unwrap();
+                    probe.request_object(&hash).unwrap();
+                    let dial = || {
+                        session::dial_loopback(
+                            &p.b.endpoint.address,
+                            p.b.endpoint.token.as_deref(),
+                            ConnOptions::default(),
+                        )
+                        .unwrap()
+                    };
+                    let conn = dial();
+                    let run = PullRun {
+                        generation: Generation {
+                            incarnation: 91,
+                            run: 2,
+                        },
+                        layout: 1,
+                    };
+                    let id = |n| {
+                        if operation == "objects.want" {
+                            lease::qualify_pull_round(
+                                &format!("pull:{}:0/1:a", p.route.peer),
+                                run,
+                                n,
+                            )
+                            .unwrap()
+                        } else {
+                            lease::qualify_pull(
+                                &format!("pull:{}:0/1:c{n:016x}", p.route.peer),
+                                run,
+                            )
+                            .unwrap()
+                        }
+                    };
+                    let old = id(3);
+                    let new = id(4);
+                    let offer = |session: &str| {
+                        if operation == "objects.want" {
+                            serde_json::json!({"route":p.route,"lane":LANE,"session":session,
+                            "max_items":1,"max_bytes":wire::LEGACY_BYTES})
+                        } else {
+                            serde_json::json!({"route":p.route,"lane":LANE,"session":session,"hash":hash})
+                        }
+                    };
+                    let point = if phase == "entry" {
+                        format!("worker.rpc.{operation}")
+                    } else {
+                        "objects.want.before_grant".into()
+                    };
+                    let mut config = FaultConfig::new(&point, FaultAction::Hang);
+                    config.count = Some(1);
+                    config.ms = Some(500);
+                    fault::configure(Some(config));
+                    let (request, payload) = (conn.clone(), offer(&old));
+                    let running = thread::spawn(move || {
+                        request.call(
+                            operation,
+                            payload,
+                            vec![],
+                            Priority::Control,
+                            if stop == "deadline" {
+                                Duration::from_millis(200)
+                            } else {
+                                Duration::from_secs(2)
+                            },
+                        )
+                    });
+                    let until = Instant::now() + Duration::from_secs(1);
+                    while fault::fired() == 0 && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(
+                        fault::fired(),
+                        1,
+                        "{operation}/{phase}/{stop} did not enter the stall"
+                    );
+                    let mut config = FaultConfig::new(
+                        if operation == "objects.want" {
+                            "objects.want.stopped"
+                        } else {
+                            "legacy.prepare.stopped"
+                        },
+                        FaultAction::Hang,
+                    );
+                    config.count = None;
+                    config.ms = Some(0);
+                    fault::configure(Some(config));
+                    let began = Instant::now();
+                    match stop {
+                        "disconnect" => conn.close(),
+                        "shutdown" => {
+                            p.b.server.stop(StopMode::Force).unwrap();
+                        }
+                        _ => {}
+                    }
+                    assert!(
+                        running.join().unwrap().is_err(),
+                        "{phase}/{stop} returned a live offer"
+                    );
+                    let current = if replacement && stop != "shutdown" {
+                        let current = dial();
+                        let released = current
+                            .call(
+                                "objects.release",
+                                serde_json::json!({"route":p.route,"session":old,"hashes":[hash]}),
+                                vec![],
+                                Priority::Control,
+                                Duration::from_secs(1),
+                            )
+                            .unwrap();
+                        assert_eq!(released.header["released"], 0);
+                        let reply = current
+                            .call(
+                                operation,
+                                offer(&new),
+                                vec![],
+                                Priority::Control,
+                                Duration::from_secs(1),
+                            )
+                            .unwrap();
+                        assert_eq!(reply.header["items"].as_array().unwrap().len(), 1);
+                        Some((
+                            current,
+                            p.b.ctx
+                                .inflight_objects
+                                .lock()
+                                .unwrap()
+                                .leases
+                                .get(&hash)
+                                .unwrap()
+                                .clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    let until = Instant::now() + Duration::from_secs(1);
+                    while fault::fired() == 0 && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(fault::fired(), 1, "{phase}/{stop} handler did not retire");
+                    let elapsed = began.elapsed();
+                    {
+                        let state = p.b.ctx.inflight_objects.lock().unwrap();
+                        if let Some((_, expected)) = &current {
+                            assert_eq!(state.leases.get(&hash), Some(expected));
+                        } else {
+                            assert!(!state.leases.contains_key(&hash));
+                        }
+                        assert!(state.source_backoff.is_empty());
+                        assert!(!state.leases.values().any(|held| held.session == old));
+                    }
+                    assert!(elapsed < Duration::from_secs(1));
+                    println!(
+                        "WAVE6_FOREGROUND {}",
+                        serde_json::json!({"scenario":"cancelled_offer","operation":operation,"phase":phase,"stop":stop,"replacement_requested":replacement,
+                "stall_ms":500,"drain_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":1000,"late_old_lease":false,
+                "replacement_preserved":current.is_some(),"source_backoff_added":false})
+                    );
+                    if let Some((current, _)) = current {
+                        current.close();
+                    }
+                    conn.close();
+                    fault::configure(None);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a_heartbeat() {
     use tkfs::{
         orchestrator::objects,
@@ -2493,7 +4166,17 @@ fn legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a
         }
     }
     let availability = started.elapsed();
-    let dispatch = tkfs::orchestrator::content_dispatch::view(&dest);
+    // Installed bytes become readable before the final frame's job records
+    // its completion. Observe that acknowledgement separately, within the
+    // same overall bound, before cancelling the dispatcher.
+    let mut dispatch = tkfs::orchestrator::content_dispatch::view(&dest);
+    while started.elapsed() < Duration::from_secs(1)
+        && dispatch.as_ref().is_none_or(|d| d.completed[0] < 5)
+    {
+        thread::sleep(Duration::from_millis(1));
+        dispatch = tkfs::orchestrator::content_dispatch::view(&dest);
+    }
+    let completion = started.elapsed();
     let spool = metadata.spool_state(&c.root.digest.to_string()).unwrap();
     token.cancel();
     conn.close();
@@ -2522,6 +4205,7 @@ fn legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a
         "WAVE6_LEGACY_DEMAND {}",
         serde_json::json!({"admission_ms":admission.as_secs_f64()*1000.0,
         "availability_ms":availability.as_secs_f64()*1000.0,"admission_bound_ms":250,"availability_bound_ms":1000,
+        "completion_ms":completion.as_secs_f64()*1000.0,"completion_bound_ms":1000,
         "background_stall_ms":2000,"heartbeat_changed":false,"typed_activation":false,"bytes":c_bytes.len(),
         "foreground_frames_completed":dispatch.unwrap().completed[0]})
     );
@@ -3063,4 +4747,1098 @@ fn native_legacy_read_rechecks_sharing_after_first_serve_verification() {
         "typed_activation":false})
     );
     conn.close();
+}
+
+fn partial_source() -> (Pair, Vec<u8>) {
+    let bytes: Vec<_> = (0..3 * tkfs::model::content::CHUNK_SIZE as usize)
+        .map(|i| ((i / 65_536) * 71 + i % 251) as u8)
+        .collect();
+    let p = Pair::new(&bytes);
+    std::fs::remove_file(
+        p.a.ctx
+            .root
+            .join("objects")
+            .join(Digest::bytes(&bytes[131_072..]).to_string()),
+    )
+    .unwrap();
+    (p, bytes)
+}
+fn wait_for_mounted_demand(p: &Pair) -> tkfs::content::scheduler::DemandSnapshot {
+    let state = runtime::content_rpc::state(&p.b.ctx).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(demand) = state
+            .scheduler
+            .snapshots(state.provider.identity(), &p.scope.repo)
+            .into_iter()
+            .next()
+        {
+            return demand;
+        }
+        assert!(
+            Instant::now() < until,
+            "mounted read did not register demand"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn native_writer(p: &Pair) -> (Arc<runtime::content_writes::NativeWrites>, u64) {
+    let shared = &p.b.ctx.engine;
+    let writes = runtime::content_writes::NativeWrites::install(shared, &context()).unwrap();
+    let h = runtime::lock_engine(shared)
+        .open("file", None, true)
+        .unwrap()
+        .0;
+    runtime::content_reads::prepare_open(
+        shared,
+        h,
+        runtime::content::ContentWait::fixed(Duration::from_secs(5)),
+    )
+    .unwrap();
+    (writes, h)
+}
+fn register_native_source(
+    p: &Pair,
+    cancel: &Cancel,
+) -> tkfs::orchestrator::content_dispatch::Registration {
+    tkfs::orchestrator::content_dispatch::register(
+        &p.dest,
+        p.peer(&p.dest),
+        LANE,
+        p.conn.clone(),
+        cancel,
+    )
+    .unwrap()
+}
+fn local_native_structure(p: &Pair) {
+    let key = ObjectKey::root(&p.root);
+    p.bp.install(
+        key,
+        &p.ap.read_blob(key, None, &context()).unwrap(),
+        &context(),
+    )
+    .unwrap();
+}
+fn native_private_file(p: &Pair, h: u64) -> Arc<runtime::content_saves::SaveFile> {
+    match &runtime::lock_engine(&p.b.ctx.engine)
+        .session(h)
+        .unwrap()
+        .bytes
+    {
+        tkfs::staging::Staged::Cow(file) => file.clone(),
+        _ => panic!("native file missing"),
+    }
+}
+fn native_saved_fixture(p: &Pair, h: u64) {
+    // A preexisting Saved overlay (including earlier-format sessions) is not
+    // proof that its required base bytes are already available in this process.
+    runtime::content_writes::write(
+        &p.b.ctx.engine,
+        h,
+        0,
+        &[],
+        false,
+        false,
+        runtime::content::ContentWait::fixed(Duration::from_secs(1)),
+    )
+    .unwrap();
+    native_private_file(p, h)
+        .write_at(13, b"changed", &context())
+        .unwrap();
+    runtime::content_writes::retain_dirty(&p.b.ctx.engine, &context()).unwrap();
+}
+
+#[test]
+fn native_cow_structural_repair_admits_within_250ms_after_idle_behind_stalled_background() {
+    use tkfs::{
+        orchestrator::content_dispatch,
+        runtime::{content::ContentWait, content_writes},
+        util::fault::{self, FaultAction, FaultConfig},
+    };
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let a = Pair::new(b"stalled background one");
+    let b = Pair::new(b"stalled background two");
+    let c = Pair::new(&vec![37; 3 * 65536]);
+    let (writes, h) = native_writer(&c);
+    let dest = World::from_workers(&[&a.b, &b.b, &c.b], None).ctx();
+    let token = Cancel::new();
+    let mut config = FaultConfig::new("content.read.background", FaultAction::Hang);
+    config.ms = Some(4000);
+    config.count = Some(2);
+    fault::configure(Some(config));
+    let _reset = Reset;
+    let mut registrations: Vec<_> = [&a, &b]
+        .iter()
+        .map(|p| {
+            content_dispatch::register(&dest, p.peer(&dest), LANE, p.dial_for(&dest), &token)
+                .unwrap()
+        })
+        .collect();
+    let until = Instant::now() + Duration::from_secs(3);
+    while fault::fired() < 2 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        fault::fired(),
+        2,
+        "two actual background source reads must stall"
+    );
+    registrations.push(
+        content_dispatch::register(&dest, c.peer(&dest), LANE, c.dial_for(&dest), &token).unwrap(),
+    );
+    // Observe this repository's actual empty structural preparations; neither
+    // elapsed sleep nor another repository's counter proves its idle phase.
+    let until = Instant::now() + Duration::from_secs(3);
+    let idle = loop {
+        let view = content_dispatch::view(&dest).unwrap();
+        if let Some(idle) = view.idle.into_iter().find(|i| i.repo == c.scope.repo)
+            && idle.polls[1] >= 7
+        {
+            break idle;
+        }
+        assert!(
+            Instant::now() < until,
+            "structural dispatcher never became idle"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    let key = ObjectKey::root(&c.root);
+    assert_eq!(key.kind, ObjectKind::Manifest);
+    c.bp.read_blob(key, None, &context()).unwrap();
+    // Repair an actually lost local page, retaining the authenticated revision.
+    std::fs::remove_file(
+        c.b.ctx
+            .root
+            .join("manifests-v1")
+            .join(key.digest.to_string()),
+    )
+    .unwrap();
+    let before = content_dispatch::view(&dest).unwrap();
+    let shared = c.b.ctx.engine.clone();
+    let began = Instant::now();
+    let writer = thread::spawn(move || {
+        content_writes::write(
+            &shared,
+            h,
+            13,
+            b"changed",
+            false,
+            false,
+            ContentWait::fixed(Duration::from_secs(2)),
+        )
+    });
+    let mut admitted = false;
+    while began.elapsed() < Duration::from_millis(250) {
+        if content_dispatch::view(&dest).unwrap().admitted[1] > before.admitted[1] {
+            admitted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let admission = began.elapsed();
+    let measured = content_dispatch::view(&dest).unwrap();
+    let result = writer.join().unwrap();
+    let write_elapsed = began.elapsed();
+    token.cancel();
+    drop(registrations);
+    dest.shutdown.cancel();
+    assert_eq!(result.unwrap(), Some(7));
+    content_writes::flush(
+        &c.b.ctx.engine,
+        h,
+        ContentWait::fixed(Duration::from_secs(2)),
+    )
+    .unwrap();
+    let mut out = [0; 7];
+    native_private_file(&c, h)
+        .read_range(13, &mut out, &context())
+        .unwrap();
+    assert_eq!(&out, b"changed");
+    runtime::engine::close_handle(&c.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_STRUCTURAL_IDLE {}",
+        serde_json::json!({"scenario":"native_cow_repair_after_idle_behind_two_stalled_repositories",
+            "idle_polls":idle.polls[1],"idle_due_ms":idle.due_ms[1],
+            "admitted":admitted,"admission_ms":admission.as_secs_f64()*1000.0,"bound_ms":250,
+            "write_ms":write_elapsed.as_secs_f64()*1000.0,"background_stall_ms":4000,
+            "background_completions_before":before.completed[2],"background_completions_after":measured.completed[2],
+            "lost_page_repaired":true,"private_bytes_equal":true,"local_fsync":true})
+    );
+    assert_eq!(
+        measured.completed[2], before.completed[2],
+        "background completed before admission"
+    );
+    assert!(
+        admitted,
+        "new structural demand missed the original 250ms gate: {admission:?}; {idle:?}"
+    );
+}
+
+#[test]
+fn native_cow_read_hydrates_only_the_needed_base_range_from_an_authenticated_peer() {
+    use runtime::{content::ContentWait, content_reads, content_writes};
+    let (p, bytes) = partial_source();
+    local_native_structure(&p);
+    let (writes, h) = native_writer(&p);
+    content_writes::write(
+        &p.b.ctx.engine,
+        h,
+        65536,
+        &vec![177; 65536],
+        false,
+        false,
+        ContentWait::fixed(Duration::from_secs(5)),
+    )
+    .unwrap();
+    let shared = p.b.ctx.engine.clone();
+    let read = thread::spawn(move || {
+        content_reads::read_mount_vec(
+            &shared,
+            h,
+            13,
+            257,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    let demand = wait_for_mounted_demand(&p).demand;
+    assert_eq!(demand.reference, p.reference);
+    assert_eq!(
+        demand.range,
+        tkfs::model::workspace::ByteRange {
+            offset: 13,
+            len: 257
+        }
+    );
+    let began = Instant::now();
+    assert!(
+        runtime::lock_engine(&p.b.ctx.engine)
+            .store
+            .lookup("file")
+            .is_ok()
+    );
+    assert!(began.elapsed() < Duration::from_millis(300));
+    let cancel = Cancel::new();
+    let registration = register_native_source(&p, &cancel);
+    assert_eq!(read.join().unwrap().unwrap().unwrap(), bytes[13..270]);
+    assert!(
+        p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 131072, &mut [0; 1], &context())
+            .is_err()
+    );
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    cancel.cancel();
+    drop(registration);
+    println!(
+        "WAVE6_COW_BASE {}",
+        serde_json::json!({"scenario":"native_range", "authenticated_peer":true,"range_bytes":257,"unrelated_source_chunk_absent":true,"engine_available_during_wait":true})
+    );
+}
+
+#[test]
+fn native_cow_partial_write_prepares_base_then_fsync_succeeds_without_a_peer() {
+    use runtime::{content::ContentWait, content_writes};
+    let (p, mut bytes) = partial_source();
+    let (writes, h) = native_writer(&p);
+    bytes[13..20].copy_from_slice(b"changed");
+    let shared = p.b.ctx.engine.clone();
+    let writer = thread::spawn(move || {
+        content_writes::write(
+            &shared,
+            h,
+            13,
+            b"changed",
+            false,
+            false,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    assert_eq!(wait_for_mounted_demand(&p).demand.reference, p.reference);
+    let independent = ReadContext {
+        deadline: Instant::now() + Duration::from_millis(300),
+        cancel: Cancel::new(),
+    };
+    let began = Instant::now();
+    assert_eq!(
+        native_private_file(&p, h).len(&independent).unwrap(),
+        bytes.len() as u64
+    );
+    assert!(
+        p.bp.buffer_usage().0 <= 1,
+        "preflight retained builder buffers while waiting"
+    );
+    p.bp.import(&mut &[17; 1024][..], 1024, &independent)
+        .unwrap();
+    let independent_ms = began.elapsed().as_secs_f64() * 1000.0;
+    let cancel = Cancel::new();
+    let registration = register_native_source(&p, &cancel);
+    assert_eq!(writer.join().unwrap().unwrap(), Some(7));
+    assert!(
+        tkfs::content::write::WriteJournal::open(&p.b.ctx.root)
+            .unwrap()
+            .pending(None, 64, &context())
+            .unwrap()
+            .is_empty(),
+        "ordinary write forced Saved"
+    );
+    cancel.cancel();
+    drop(registration);
+    p.conn.close();
+    assert!(
+        content_writes::flush(
+            &p.b.ctx.engine,
+            h,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    let reference = runtime::lock_engine(&p.b.ctx.engine)
+        .store
+        .lookup("file")
+        .unwrap()
+        .content_ref
+        .unwrap();
+    let mut actual = vec![0; 65536];
+    p.bp.read_range(&p.bp.pin(&reference).unwrap(), 0, &mut actual, &context())
+        .unwrap();
+    assert_eq!(actual, bytes[..65536]);
+    assert!(
+        p.bp.read_range(
+            &p.bp.pin(&reference).unwrap(),
+            131072,
+            &mut [0; 1],
+            &context()
+        )
+        .is_err()
+    );
+    assert!(
+        runtime::lock_engine(&p.b.ctx.engine)
+            .store
+            .verify_derived_state()
+            .unwrap()
+            .is_empty()
+    );
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_COW_BASE {}",
+        serde_json::json!({"scenario":"native_partial_flush","authenticated_peer":true,"changed_bytes":7,"verified_chunk_bytes":65536,"unrelated_source_chunk_absent":true,"peer_closed_before_fsync":true,"ordinary_write_without_full_checkpoint":true,"independent_preparation_ms":independent_ms,"independent_bound_ms":300,"file_state_and_journal_available":true})
+    );
+}
+
+#[test]
+fn native_cow_full_chunk_write_prepares_only_structure_then_fsync_is_local() {
+    use runtime::{content::ContentWait, content_writes};
+    let (p, bytes) = partial_source();
+    std::fs::remove_file(
+        p.a.ctx
+            .root
+            .join("objects")
+            .join(Digest::bytes(&bytes[..65536]).to_string()),
+    )
+    .unwrap();
+    let (writes, h) = native_writer(&p);
+    let shared = p.b.ctx.engine.clone();
+    let writer = thread::spawn(move || {
+        content_writes::write(
+            &shared,
+            h,
+            0,
+            &vec![178; 65536],
+            false,
+            false,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    let demand = wait_for_mounted_demand(&p).demand;
+    assert_eq!(demand.reference, p.reference);
+    assert_eq!(
+        demand.priority,
+        tkfs::model::workspace::DemandPriority::Structural
+    );
+    assert_eq!(demand.range.len, 1);
+    let cancel = Cancel::new();
+    let registration = register_native_source(&p, &cancel);
+    assert_eq!(writer.join().unwrap().unwrap(), Some(65536));
+    cancel.cancel();
+    drop(registration);
+    p.conn.close();
+    assert!(
+        content_writes::flush(
+            &p.b.ctx.engine,
+            h,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    let reference = runtime::lock_engine(&p.b.ctx.engine)
+        .store
+        .lookup("file")
+        .unwrap()
+        .content_ref
+        .unwrap();
+    let mut actual = vec![0; 65536];
+    p.bp.read_range(&p.bp.pin(&reference).unwrap(), 0, &mut actual, &context())
+        .unwrap();
+    assert_eq!(actual, vec![178; 65536]);
+    assert!(
+        !p.b.ctx
+            .root
+            .join("objects")
+            .join(Digest::bytes(&bytes[..65536]).to_string())
+            .exists()
+    );
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_COW_BASE {}",
+        serde_json::json!({"scenario":"native_full_overwrite","authenticated_peer":true,"changed_bytes":65536,"structural_demand_bytes":1,"overwritten_base_absent_at_both_peers":true,"peer_closed_before_fsync":true})
+    );
+}
+
+#[test]
+fn native_cow_base_wait_deadline_withdrawal_and_stop_keep_saved_bytes_and_release_demand() {
+    use runtime::{content::ContentWait, content_writes};
+    for outcome in ["deadline", "withdraw", "regrant", "stop", "cancel"] {
+        let (p, _) = partial_source();
+        let (writes, h) = native_writer(&p);
+        native_saved_fixture(&p, h);
+        let shared = p.b.ctx.engine.clone();
+        let writer = thread::spawn(move || {
+            content_writes::write(
+                &shared,
+                h,
+                13,
+                b"NOPE",
+                false,
+                false,
+                ContentWait::fixed(Duration::from_millis(500)),
+            )
+        });
+        wait_for_mounted_demand(&p);
+        let state = runtime::content_rpc::state(&p.b.ctx).unwrap();
+        let began = Instant::now();
+        if outcome == "withdraw" || outcome == "regrant" {
+            let mut store = Store::open_existing(&p.b.ctx.root).unwrap();
+            store
+                .set_content_admission(
+                    &p.reference,
+                    1,
+                    tkfs::model::workspace::AdmissionAction::Withdraw,
+                )
+                .unwrap();
+            if outcome == "regrant" {
+                store
+                    .set_content_admission(
+                        &p.reference,
+                        2,
+                        tkfs::model::workspace::AdmissionAction::Grant,
+                    )
+                    .unwrap();
+            }
+        } else if outcome == "stop" {
+            p.b.ctx
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else if outcome == "cancel" {
+            p.b.ctx
+                .inflight_objects
+                .lock()
+                .unwrap()
+                .legacy_cancel
+                .cancel();
+        }
+        let error = writer.join().unwrap().unwrap_err();
+        let expected = match outcome {
+            "deadline" => "CONTENT_DEADLINE",
+            "withdraw" | "regrant" => "STALE_ADMISSION_GENERATION",
+            _ => "CONTENT_CANCELLED",
+        };
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{outcome}: {error:#}"
+        );
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert!(
+            state
+                .scheduler
+                .snapshots(state.provider.identity(), &p.scope.repo)
+                .is_empty()
+        );
+        let journal = tkfs::content::write::WriteJournal::open(&p.b.ctx.root).unwrap();
+        assert_eq!(journal.pending(None, 64, &context()).unwrap().len(), 1);
+        let file = match &runtime::lock_engine(&p.b.ctx.engine)
+            .session(h)
+            .unwrap()
+            .bytes
+        {
+            tkfs::staging::Staged::Cow(file) => file.clone(),
+            _ => panic!("native session lost its private file"),
+        };
+        let mut private = [0; 7];
+        file.read_range(13, &mut private, &context()).unwrap();
+        assert_eq!(&private, b"changed");
+        writes.shutdown(&context()).unwrap();
+        println!(
+            "WAVE6_COW_BASE {}",
+            serde_json::json!({"scenario":outcome,"saved_retained":true,"private_bytes_visible":true,"waiter_released":true,"unacknowledged_mutation_not_applied":true})
+        );
+    }
+}
+
+#[test]
+fn native_cow_saved_reopen_restores_authenticated_base_hydration() {
+    use runtime::{content::ContentWait, content_writes};
+    let (mut p, mut bytes) = partial_source();
+    let (writes, h) = native_writer(&p);
+    native_saved_fixture(&p, h);
+    let error = content_writes::flush(
+        &p.b.ctx.engine,
+        h,
+        ContentWait::fixed(Duration::from_millis(100)),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("CONTENT_UNAVAILABLE"));
+    writes.shutdown(&context()).unwrap();
+    drop(writes);
+    p.conn.close();
+    p.dest.shutdown.cancel();
+    let root = p.b.ctx.root.clone();
+    p.b = Worker::new(Store::open_existing(&root).unwrap());
+    p.dest = World::new(&p.b, None).ctx();
+    p.conn = p.dial_for(&p.dest);
+    let (writes, h) = native_writer(&p);
+    assert_eq!(
+        runtime::content_reads::read_mount_vec(
+            &p.b.ctx.engine,
+            h,
+            13,
+            7,
+            ContentWait::fixed(Duration::from_secs(1))
+        )
+        .unwrap()
+        .unwrap(),
+        b"changed"
+    );
+    let shared = p.b.ctx.engine.clone();
+    let writer = thread::spawn(move || {
+        content_writes::write(
+            &shared,
+            h,
+            65536,
+            &vec![187; 65536],
+            false,
+            false,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    assert_eq!(wait_for_mounted_demand(&p).demand.reference, p.reference);
+    let cancel = Cancel::new();
+    let registration = register_native_source(&p, &cancel);
+    assert_eq!(writer.join().unwrap().unwrap(), Some(65536));
+    cancel.cancel();
+    drop(registration);
+    p.conn.close();
+    assert!(
+        content_writes::flush(
+            &p.b.ctx.engine,
+            h,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    bytes[13..20].copy_from_slice(b"changed");
+    let mut engine = runtime::lock_engine(&p.b.ctx.engine);
+    let reference = engine.store.lookup("file").unwrap().content_ref.unwrap();
+    assert_eq!(
+        engine
+            .store
+            .db
+            .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                .get::<_, usize>(0))
+            .unwrap(),
+        1
+    );
+    assert!(engine.store.verify_derived_state().unwrap().is_empty());
+    drop(engine);
+    let mut out = vec![0; 65536];
+    p.bp.read_range(&p.bp.pin(&reference).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    assert_eq!(out, bytes[..65536]);
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_COW_BASE {}",
+        serde_json::json!({"scenario":"saved_reopen","authenticated_peer":true,"private_bytes_visible_before_retry":true,"publications":1,"peer_closed_before_fsync":true})
+    );
+}
+
+#[test]
+#[ignore = "explicit real kernel COW flush plus authenticated peer; isolated stores only"]
+fn isolated_kernel_cow_write_prepares_base_then_fsync_succeeds_offline() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    if let Some(result_root) = std::env::var_os("TKFS_COW_BASE_KERNEL_CHILD") {
+        let (p, mut bytes) = partial_source();
+        let writes =
+            runtime::content_writes::NativeWrites::install(&p.b.ctx.engine, &context()).unwrap();
+        let point = p._dir.path().join("cow-base-mount");
+        tkfs::mount::bind(&p.b.ctx.engine).unwrap();
+        tkfs::mount::attach(&point).unwrap();
+        struct Mounted;
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let _ = tkfs::mount::detach(true);
+            }
+        }
+        let mounted = Mounted;
+        let path = point.join("file");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let writer = thread::spawn(move || {
+            file.seek(SeekFrom::Start(13)).unwrap();
+            file.write_all(b"changed").unwrap();
+            file
+        });
+        assert_eq!(wait_for_mounted_demand(&p).demand.reference, p.reference);
+        let cancel = Cancel::new();
+        let registration = register_native_source(&p, &cancel);
+        let mut file = writer.join().unwrap();
+        cancel.cancel();
+        drop(registration);
+        p.conn.close();
+        file.sync_all().unwrap();
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        bytes[13..20].copy_from_slice(b"changed");
+        let mut out = vec![0; 65536];
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut out).unwrap();
+        assert_eq!(out, bytes[..65536]);
+        drop(file);
+        let mut reopened = std::fs::File::open(&path).unwrap();
+        reopened.read_exact(&mut out).unwrap();
+        assert_eq!(out, bytes[..65536]);
+        drop(reopened);
+        assert!(
+            p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 131072, &mut [0; 1], &context())
+                .is_err()
+        );
+        assert!(
+            runtime::lock_engine(&p.b.ctx.engine)
+                .store
+                .verify_derived_state()
+                .unwrap()
+                .is_empty()
+        );
+        tkfs::mount::detach(false).unwrap();
+        drop(mounted);
+        writes.shutdown(&context()).unwrap();
+        let result = serde_json::json!({"scenario":"kernel_cow_partial_flush","platform":std::env::consts::OS,"real_kernel_mount":true,"authenticated_peer":true,"changed_bytes":7,"verified_range_bytes":65536,"unrelated_source_chunk_absent":true,"reopen_equal":true,"peer_closed_before_fsync":true});
+        std::fs::write(
+            std::path::PathBuf::from(result_root).join("result.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+        return;
+    }
+    let result = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "isolated_kernel_cow_write_prepares_base_then_fsync_succeeds_offline",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("TKFS_COW_BASE_KERNEL_CHILD", result.path())
+        .env("TKFS_CONTENT_STALL_MS", "1000")
+        .env("TKFS_CONTENT_BOUND_MS", "5000")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{:?}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value =
+        serde_json::from_slice(&std::fs::read(result.path().join("result.json")).unwrap()).unwrap();
+    println!("WAVE6_COW_BASE_KERNEL {value}");
+}
+
+#[test]
+fn native_cow_fsync_missing_local_base_never_demands_and_retains_saved() {
+    use runtime::{content::ContentWait, content_writes};
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
+    let (p, bytes) = partial_source();
+    local_native_structure(&p);
+    let key = ObjectKey {
+        kind: ObjectKind::Bytes,
+        digest: Digest::bytes(&bytes[..65536]),
+    };
+    let body = p.ap.read_blob(key, None, &context()).unwrap();
+    p.bp.install(key, &body, &context()).unwrap();
+    let (writes, h) = native_writer(&p);
+    content_writes::write(
+        &p.b.ctx.engine,
+        h,
+        13,
+        b"changed",
+        false,
+        false,
+        ContentWait::fixed(Duration::from_secs(2)),
+    )
+    .unwrap();
+    std::fs::remove_file(p.b.ctx.root.join("objects").join(key.digest.to_string())).unwrap();
+    let mut config = FaultConfig::new("content.base.before_demand", FaultAction::Hang);
+    config.ms = Some(0);
+    config.count = None;
+    fault::configure(Some(config));
+    let began = Instant::now();
+    let error = content_writes::flush(
+        &p.b.ctx.engine,
+        h,
+        ContentWait::fixed(Duration::from_secs(5)),
+    )
+    .unwrap_err();
+    let elapsed = began.elapsed();
+    assert!(
+        format!("{error:#}").contains("CONTENT_UNAVAILABLE"),
+        "{error:#}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(300),
+        "local failure waited for a peer: {elapsed:?}"
+    );
+    assert_eq!(fault::fired(), 0, "fsync invoked remote base recovery");
+    let state = runtime::content_rpc::state(&p.b.ctx).unwrap();
+    assert!(
+        state
+            .scheduler
+            .snapshots(state.provider.identity(), &p.scope.repo)
+            .is_empty()
+    );
+    assert_eq!(
+        tkfs::content::write::WriteJournal::open(&p.b.ctx.root)
+            .unwrap()
+            .pending(None, 64, &context())
+            .unwrap()
+            .len(),
+        1
+    );
+    let mut private = [0; 7];
+    native_private_file(&p, h)
+        .read_range(13, &mut private, &context())
+        .unwrap();
+    assert_eq!(&private, b"changed");
+    // The authenticated peer is still live; it was deliberately not asked.
+    p.caps(&p.conn);
+    p.bp.install(key, &body, &context()).unwrap();
+    assert!(
+        content_writes::flush(
+            &p.b.ctx.engine,
+            h,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    assert_eq!(fault::fired(), 0);
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_LOCAL_FSYNC {}",
+        serde_json::json!({"scenario":"missing_local_base","failure_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":300,"demand_calls":0,"saved_retained":true,"private_bytes_visible":true,"retry_local_after_restore":true})
+    );
+}
+
+#[test]
+fn native_cow_stale_preflight_never_overwrites_a_concurrent_private_mutation() {
+    use runtime::{content::ContentWait, content_writes};
+    let (p, _) = partial_source();
+    let (writes, h) = native_writer(&p);
+    let shared = p.b.ctx.engine.clone();
+    let writer = thread::spawn(move || {
+        content_writes::write(
+            &shared,
+            h,
+            13,
+            b"stale!!",
+            false,
+            false,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    wait_for_mounted_demand(&p);
+    native_private_file(&p, h)
+        .write_at(0, &vec![188; 65536], &context())
+        .unwrap();
+    let cancel = Cancel::new();
+    let registration = register_native_source(&p, &cancel);
+    let error = writer.join().unwrap().unwrap_err();
+    assert!(
+        format!("{error:#}").contains("STALE_WRITE_CHECKPOINT"),
+        "{error:#}"
+    );
+    let mut private = [0; 7];
+    native_private_file(&p, h)
+        .read_range(13, &mut private, &context())
+        .unwrap();
+    assert_eq!(private, [188; 7]);
+    cancel.cancel();
+    drop(registration);
+    p.conn.close();
+    assert!(
+        content_writes::flush(
+            &p.b.ctx.engine,
+            h,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_LOCAL_FSYNC {}",
+        serde_json::json!({"scenario":"stale_preflight","stale_bytes_applied":false,"concurrent_bytes_preserved":true,"local_fsync":true})
+    );
+}
+
+#[test]
+fn native_cow_shrink_grow_preflight_preserves_zeroes_and_fsync_is_local() {
+    use runtime::{content::ContentWait, content_reads, content_writes};
+    let (p, bytes) = partial_source();
+    let (writes, h) = native_writer(&p);
+    let shared = p.b.ctx.engine.clone();
+    let resize = thread::spawn(move || {
+        content_writes::truncate(
+            &shared,
+            h,
+            65537,
+            false,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    assert_eq!(wait_for_mounted_demand(&p).demand.reference, p.reference);
+    let cancel = Cancel::new();
+    let registration = register_native_source(&p, &cancel);
+    assert!(resize.join().unwrap().unwrap());
+    assert_eq!(native_private_file(&p, h).len(&context()).unwrap(), 65537);
+    cancel.cancel();
+    drop(registration);
+    p.conn.close();
+    assert!(
+        content_writes::truncate(
+            &p.b.ctx.engine,
+            h,
+            200000,
+            false,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    assert!(
+        tkfs::content::write::WriteJournal::open(&p.b.ctx.root)
+            .unwrap()
+            .pending(None, 64, &context())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        content_writes::flush(
+            &p.b.ctx.engine,
+            h,
+            ContentWait::fixed(Duration::from_secs(2))
+        )
+        .unwrap()
+    );
+    let out = content_reads::read_mount_vec(
+        &p.b.ctx.engine,
+        h,
+        65536,
+        200000 - 65536,
+        ContentWait::fixed(Duration::from_secs(2)),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(out.len(), 200000 - 65536);
+    assert_eq!(out[0], bytes[65536]);
+    assert!(out[1..].iter().all(|b| *b == 0));
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    writes.shutdown(&context()).unwrap();
+    println!(
+        "WAVE6_LOCAL_FSYNC {}",
+        serde_json::json!({"scenario":"shrink_grow","shrink_bytes":65537,"grow_bytes":200000,"retained_tail_byte":true,"gap_zero":true,"peer_closed_before_grow_and_fsync":true,"ordinary_resize_without_full_checkpoint":true})
+    );
+}
+#[test]
+fn adapter_range_read_fetches_real_peer_data_without_an_unrelated_source_chunk() {
+    use tkfs::runtime::{content::ContentWait, content_reads};
+    let (p, bytes) = partial_source();
+    let shared = p.b.ctx.engine.clone();
+    let h = runtime::lock_engine(&shared)
+        .open("file", None, false)
+        .unwrap()
+        .0;
+    content_reads::prepare_open(&shared, h, ContentWait::fixed(Duration::from_secs(5))).unwrap();
+    let read = thread::spawn(move || {
+        content_reads::read_mount_vec(
+            &shared,
+            h,
+            13,
+            257,
+            ContentWait::fixed(Duration::from_secs(5)),
+        )
+    });
+    let demand = wait_for_mounted_demand(&p).demand;
+    assert_eq!(demand.reference, p.reference);
+    assert_eq!(
+        demand.range,
+        tkfs::model::workspace::ByteRange {
+            offset: 13,
+            len: 257
+        }
+    );
+    let cancel = Cancel::new();
+    let began = Instant::now();
+    let registration = tkfs::orchestrator::content_dispatch::register(
+        &p.dest,
+        p.peer(&p.dest),
+        LANE,
+        p.conn.clone(),
+        &cancel,
+    )
+    .unwrap();
+    let mut admitted = false;
+    while began.elapsed() < Duration::from_millis(250) {
+        if tkfs::orchestrator::content_dispatch::view(&p.dest)
+            .unwrap()
+            .admitted[0]
+            > 0
+        {
+            admitted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let admission_ms = began.elapsed().as_secs_f64() * 1000.0;
+    let out = read.join().unwrap().unwrap().unwrap();
+    assert_eq!(out, bytes[13..270]);
+    assert!(admitted, "range demand was not admitted within 250ms");
+    assert!(
+        p.bp.read_range(
+            &p.bp.pin(&p.root).unwrap(),
+            131_072,
+            &mut [0; 1],
+            &context()
+        )
+        .is_err()
+    );
+    runtime::engine::close_handle(&p.b.ctx.engine, h).unwrap();
+    cancel.cancel();
+    drop(registration);
+    println!(
+        "WAVE6_MOUNT_DEMAND {}",
+        serde_json::json!({"scenario":"real_peer_adapter_range", "bytes":out.len(),"admission_ms":admission_ms,"admission_bound_ms":250,"unrelated_chunk_absent_at_source":true,"real_kernel_mount":false})
+    );
+}
+
+#[test]
+#[ignore = "explicit real kernel mount plus authenticated peer qualification; isolated stores only"]
+fn isolated_kernel_mount_fetches_a_missing_range_from_a_real_peer() {
+    use std::io::{Read, Seek, SeekFrom};
+    if let Some(result_root) = std::env::var_os("TKFS_DEMAND_MOUNT_CHILD") {
+        let (p, bytes) = partial_source();
+        let point = p._dir.path().join("kernel-mount");
+        tkfs::mount::bind(&p.b.ctx.engine).unwrap();
+        tkfs::mount::attach(&point).unwrap();
+        struct Mounted;
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let _ = tkfs::mount::detach(true);
+            }
+        }
+        let mounted = Mounted;
+        let mut file = std::fs::File::open(point.join("file")).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        let read = thread::spawn(move || {
+            file.seek(SeekFrom::Start(13)).unwrap();
+            let mut out = [0; 257];
+            file.read_exact(&mut out).unwrap();
+            (file, out)
+        });
+        let demand = wait_for_mounted_demand(&p).demand;
+        assert_eq!(demand.reference, p.reference);
+        let cancel = Cancel::new();
+        let registration = tkfs::orchestrator::content_dispatch::register(
+            &p.dest,
+            p.peer(&p.dest),
+            LANE,
+            p.conn.clone(),
+            &cancel,
+        )
+        .unwrap();
+        let (file, out) = read.join().unwrap();
+        assert_eq!(out.as_slice(), &bytes[13..270]);
+        assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+        assert!(
+            p.bp.read_range(
+                &p.bp.pin(&p.root).unwrap(),
+                131_072,
+                &mut [0; 1],
+                &context()
+            )
+            .is_err()
+        );
+        drop(file);
+        cancel.cancel();
+        drop(registration);
+        assert!(runtime::lock_engine(&p.b.ctx.engine).health.is_none());
+        tkfs::mount::detach(false).unwrap();
+        drop(mounted);
+        let result = serde_json::json!({"scenario":"real_peer_kernel_range","platform":std::env::consts::OS,"real_kernel_mount":true,"authenticated_peer":true,"descriptor_bytes":bytes.len(),"ready_range_bytes":out.len(),"unrelated_chunk_absent_at_source":true,"typed_activation":"isolated fixture only"});
+        std::fs::write(
+            std::path::PathBuf::from(result_root).join("result.json"),
+            serde_json::to_vec(&result).unwrap(),
+        )
+        .unwrap();
+        return;
+    }
+    let result = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "isolated_kernel_mount_fetches_a_missing_range_from_a_real_peer",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("TKFS_DEMAND_MOUNT_CHILD", result.path())
+        .env("TKFS_CONTENT_STALL_MS", "1000")
+        .env("TKFS_CONTENT_BOUND_MS", "5000")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "kernel peer child failed {:?}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result.path().join("result.json")).unwrap()).unwrap();
+    println!("WAVE6_MOUNT_DEMAND {result}");
 }

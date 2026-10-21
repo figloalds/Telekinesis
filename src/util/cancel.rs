@@ -109,15 +109,28 @@ impl Cancel {
     /// cancel the parent.
     pub fn child(&self) -> Cancel {
         let child = Cancel::new();
+        self.attach_child(&child);
+        child
+    }
+
+    /// A child of both parents. Either parent cancels it; cancelling the child
+    /// affects neither parent. Parents retain only weak links, without hooks
+    /// that accumulate across completed requests.
+    pub fn linked(&self, other: &Cancel) -> Cancel {
+        let child = self.child();
+        other.attach_child(&child);
+        child
+    }
+
+    fn attach_child(&self, child: &Cancel) {
         let mut state = self.lock();
         if self.is_cancelled() {
             drop(state);
             child.cancel();
-            return child;
+            return;
         }
         state.children.retain(|weak| weak.strong_count() > 0);
         state.children.push(Arc::downgrade(&child.inner));
-        child
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -158,5 +171,77 @@ impl fmt::Debug for Cancel {
         f.debug_struct("Cancel")
             .field("cancelled", &self.is_cancelled())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::Barrier, thread};
+
+    #[test]
+    fn linked_cancellation_has_two_weak_parents_and_independent_siblings() {
+        for first in [true, false] {
+            let a = Cancel::new();
+            let b = Cancel::new();
+            let sibling = a.child();
+            let child = a.linked(&b);
+            let grandchild = child.child();
+            if first {
+                a.cancel();
+            } else {
+                b.cancel();
+            }
+            assert!(child.is_cancelled() && grandchild.is_cancelled());
+            assert_eq!(sibling.is_cancelled(), first);
+            assert_eq!(a.is_cancelled(), first);
+            assert_eq!(b.is_cancelled(), !first);
+        }
+        let a = Cancel::new();
+        let b = Cancel::new();
+        a.linked(&b).cancel();
+        assert!(!a.is_cancelled() && !b.is_cancelled());
+        b.cancel();
+        assert!(a.linked(&b).is_cancelled());
+        assert!(b.linked(&a).is_cancelled());
+        let parent = Cancel::new();
+        let child = parent.linked(&parent);
+        parent.cancel();
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn completed_linked_requests_leave_no_hooks_or_strong_parent_links() {
+        let a = Cancel::new();
+        let b = Cancel::new();
+        for _ in 0..4096 {
+            drop(a.linked(&b));
+        }
+        for parent in [&a, &b] {
+            let state = parent.lock();
+            assert!(state.hooks.is_empty());
+            assert_eq!(state.children.len(), 1);
+            assert_eq!(state.children[0].strong_count(), 0);
+            assert_eq!(Arc::strong_count(&parent.inner), 1);
+        }
+    }
+
+    #[test]
+    fn linking_races_cancellation_without_missing_either_parent() {
+        for index in 0..64 {
+            let a = Cancel::new();
+            let b = Cancel::new();
+            let barrier = Arc::new(Barrier::new(2));
+            let parent = if index % 2 == 0 { a.clone() } else { b.clone() };
+            let start = barrier.clone();
+            let cancelling = thread::spawn(move || {
+                start.wait();
+                parent.cancel();
+            });
+            barrier.wait();
+            let child = a.linked(&b);
+            cancelling.join().unwrap();
+            assert!(child.is_cancelled());
+        }
     }
 }

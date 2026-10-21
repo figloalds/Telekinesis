@@ -17,6 +17,8 @@
   notes.
 - [Wave 6 implementation plan](revamp/WAVE_6_PLAN.md):
   64 KiB content, independent engines, Git-ready seams, durability and build-performance gates.
+- [Next-wave transfer planner direction](revamp/NEXT_WAVE_TRANSPORT.md):
+  file-aware and peer-aware strategy experiments; initial strategies and gates remain open.
 - [Wave 6 investigation: metadata/object engines](revamp/notes/wp6-build-sync-juicefs-study.md):
   mounted-build stall evidence, JuiceFS source study, per-reference admission,
   demand scheduling, error handling and the concurrency/Tokio decision study.

@@ -78,6 +78,7 @@
 //! `OBJECT_PART_CHANGED` are not failures of the object: they tell the
 //! writer where to resume, and keep the lease.
 use super::ctx::{ObjectLease, ObjectsState, WorkerCtx};
+use super::objects_effects::{self, Gate};
 use crate::{
     model::{
         errors::{ErrorClass, ErrorWire},
@@ -126,7 +127,12 @@ pub fn dispatch(
         return super::content_rpc::dispatch(ctx, op, header, body);
     }
     match op {
-        ops::WANT => want(ctx, parse(op, header)?),
+        ops::WANT => want_request(
+            ctx,
+            header,
+            Instant::now() + Duration::from_secs(60),
+            &|| false,
+        ),
         ops::READ => read_request(
             ctx,
             op,
@@ -208,9 +214,21 @@ fn owned_run<'a>(
     }
     Ok(owned)
 }
+
+fn effect_family(
+    ctx: &WorkerCtx,
+    owned: Option<&crate::model::lease::Owned<'_>>,
+    session: &str,
+) -> Result<Gate, ErrorWire> {
+    let key = owned
+        .map(|owner| owner.family.to_owned())
+        .unwrap_or_else(|| format!("opaque:{session}"));
+    lock(&ctx.inflight_objects).effects.family(&key)
+}
 fn run_current(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
     owned.is_none_or(|o| {
         layout_current(state, o)
+            && round_current(state, o)
             && state.lease_runs.get(o.scope).is_none_or(|g| {
                 g.generation.incarnation < o.generation.incarnation
                     || (g.generation.incarnation == o.generation.incarnation
@@ -232,9 +250,36 @@ fn layout_current(state: &ObjectsState, owned: &crate::model::lease::Owned<'_>) 
                 || (incoming == *seen && (owned.layout.is_none() || owned.lane.count == *count))
         })
 }
+fn round_fence(owned: &crate::model::lease::Owned<'_>) -> crate::model::lease::RunFence {
+    crate::model::lease::RunFence {
+        generation: owned.generation,
+        layout: owned.layout,
+        frame: owned.frame,
+    }
+}
+fn round_current(state: &ObjectsState, owned: &crate::model::lease::Owned<'_>) -> bool {
+    owned.round_slot.is_none_or(|slot| {
+        state
+            .lease_rounds
+            .get(owned.scope)
+            .and_then(|slots| slots[slot])
+            .is_none_or(|g| {
+                g.generation != owned.generation
+                    || g.layout != owned.layout
+                    || g.frame <= owned.frame
+            })
+    })
+}
 fn run_owns(state: &ObjectsState, owned: Option<&crate::model::lease::Owned<'_>>) -> bool {
     owned.is_none_or(|o| {
         layout_current(state, o)
+            && o.round_slot.is_none_or(|slot| {
+                state
+                    .lease_rounds
+                    .get(o.scope)
+                    .and_then(|slots| slots[slot])
+                    == Some(round_fence(o))
+            })
             && state.lease_runs.get(o.scope)
                 == Some(&crate::model::lease::RunFence {
                     generation: o.generation,
@@ -273,6 +318,18 @@ fn claim_run(
                 "BUSY",
                 "object lease layout fence capacity",
             ));
+        }
+        if o.round_slot.is_some()
+            && !state.lease_rounds.contains_key(o.scope)
+            && state.lease_rounds.len() >= crate::model::lease::MAX_RUN_FENCES
+        {
+            return Err(ErrorWire::coded(
+                "CONTENT_RESOURCE_LIMIT",
+                "object lease round fence capacity",
+            ));
+        }
+        if let Some(slot) = o.round_slot {
+            state.lease_rounds.entry(o.scope.to_owned()).or_default()[slot] = Some(round_fence(o));
         }
         if o.generation.run > 0 {
             state.lease_layouts.insert(
@@ -376,8 +433,36 @@ fn back_off_stalled(state: &mut ObjectsState, source: &str, hash: &str, now: u64
 }
 
 /// Grants `session` (transferring from `source`) a fresh lease on `hash`.
-fn grant(state: &mut ObjectsState, lease: (&str, &str, &str, u64), now: u64) {
+fn grant(
+    state: &mut ObjectsState,
+    lease: (&str, &str, &str, u64),
+    now: u64,
+    family: &Gate,
+) -> Result<(), ErrorWire> {
     let (hash, session, source, offset) = lease;
+    if !state.leases.contains_key(hash) && state.leases.len() >= MAX_LEASE_HOLDERS {
+        return Err(ErrorWire::coded(
+            "CONTENT_RESOURCE_LIMIT",
+            "legacy object lease capacity",
+        ));
+    }
+    if !state.holders.contains_key(hash) && state.holders.len() >= MAX_LEASE_HOLDERS {
+        let ObjectsState {
+            leases, holders, ..
+        } = &mut *state;
+        holders.retain(|hash, (session, _)| {
+            leases
+                .get(hash)
+                .is_some_and(|lease| lease.session == *session)
+        });
+        if holders.len() >= MAX_LEASE_HOLDERS {
+            return Err(ErrorWire::coded(
+                "CONTENT_RESOURCE_LIMIT",
+                "legacy source owner capacity",
+            ));
+        }
+    }
+    state.effects.grant(hash, session, family.clone())?;
     state.leases.insert(
         hash.to_owned(),
         ObjectLease {
@@ -386,18 +471,46 @@ fn grant(state: &mut ObjectsState, lease: (&str, &str, &str, u64), now: u64) {
             offset,
         },
     );
-    if state.holders.len() >= MAX_LEASE_HOLDERS {
-        let ObjectsState {
-            leases, holders, ..
-        } = &mut *state;
-        holders.retain(|hash, _| leases.contains_key(hash));
-        if holders.len() >= MAX_LEASE_HOLDERS {
-            holders.clear();
-        }
-    }
     state
         .holders
         .insert(hash.to_owned(), (session.to_owned(), source.to_owned()));
+    Ok(())
+}
+
+/// One pressure scan per bounded grant batch. Retire only leases whose ordered
+/// run/pool/frame is already fenced; opaque or current live owners are kept.
+/// Capture at most one request page of keys, not the whole lease table.
+fn reclaim_fenced_leases<'a>(state: &mut ObjectsState, candidates: impl Iterator<Item = &'a str>) {
+    let new: BTreeSet<_> = candidates
+        .filter(|hash| !state.leases.contains_key(*hash))
+        .collect();
+    let needed = state
+        .leases
+        .len()
+        .saturating_add(new.len())
+        .saturating_sub(MAX_LEASE_HOLDERS)
+        .min(MAX_WANT_ITEMS);
+    if needed == 0 {
+        return;
+    }
+    let stale: Vec<_> = state
+        .leases
+        .iter()
+        .filter(|(_, lease)| {
+            crate::model::lease::parse_transfer(&lease.session)
+                .ok()
+                .flatten()
+                .is_some_and(|owned| !run_current(state, Some(&owned)))
+        })
+        .take(needed)
+        .map(|(hash, _)| hash.clone())
+        .collect();
+    for hash in stale {
+        if let Some(lease) = state.leases.get(&hash) {
+            state.effects.cancel(&hash, &lease.session.clone());
+        }
+        release(state, &hash);
+    }
 }
 
 /// Ends the lease of `hash` (a terminal outcome, a local failure, or the
@@ -405,6 +518,7 @@ fn grant(state: &mut ObjectsState, lease: (&str, &str, &str, u64), now: u64) {
 fn release(state: &mut ObjectsState, hash: &str) {
     state.leases.remove(hash);
     state.holders.remove(hash);
+    state.effects.ended(hash);
 }
 
 /// Ends the leases `session` holds on `hashes` (module docs, "Giving a lease
@@ -412,6 +526,7 @@ fn release(state: &mut ObjectsState, hash: &str) {
 fn give_up(state: &mut ObjectsState, session: &str, hashes: &[String]) -> u32 {
     let mut released = 0;
     for hash in hashes {
+        state.effects.cancel(hash, session);
         if state
             .leases
             .get(hash)
@@ -475,11 +590,17 @@ fn superseded(held: &ObjectLease, session: &str, now: u64) -> bool {
             if pool_generation(&old) > pool_generation(&new) {
                 return false;
             }
+            // Background advances only its own slot. Foreground may promote
+            // either background slot, independently of their round counters.
+            let newer_frame = new.frame.is_some()
+                && if old.round_slot == new.round_slot {
+                    old.frame < new.frame
+                } else {
+                    new.round_slot.is_none() && new.family.starts_with("pull:")
+                };
             if old.scope == new.scope
                 && (old.generation < new.generation
-                    || (old.generation == new.generation
-                        && new.frame.is_some()
-                        && old.frame < new.frame))
+                    || (old.generation == new.generation && newer_frame))
             {
                 return true;
             }
@@ -509,6 +630,7 @@ fn sweep_lapsed(state: &mut ObjectsState, now: u64) {
         .map(|(hash, lease)| (hash.clone(), lease.session.clone()))
         .collect();
     for (hash, session) in lapsed {
+        state.effects.cancel(&hash, &session);
         state.leases.remove(&hash);
         let Some((holder, source)) = state.holders.remove(&hash) else {
             continue;
@@ -541,36 +663,114 @@ fn sweep_lapsed(state: &mut ObjectsState, now: u64) {
 /// fresh lease, one `session` holds already keeps its lease and expiry (only
 /// progress renews it, module docs). `exclude` (CCR-WP3.3-4, WP4.5): those
 /// hashes are left out, and the leases `session` holds on them end.
-fn want(ctx: &WorkerCtx, request: WantRequest) -> Result<(Value, Vec<u8>), ErrorWire> {
-    want_selected(ctx, request, None)
+pub(super) fn want_request(
+    ctx: &WorkerCtx,
+    header: &Value,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Value, Vec<u8>), ErrorWire> {
+    let stopping = lock(&ctx.inflight_objects).legacy_cancel.clone();
+    let check = || {
+        if cancelled() || stopping.is_cancelled() || ctx.stopping.load(Ordering::Relaxed) {
+            return Err(ErrorWire::coded(
+                "CONTENT_CANCELLED",
+                "objects.want cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(ErrorWire::coded(
+                "CONTENT_DEADLINE",
+                "objects.want deadline",
+            ));
+        }
+        Ok(())
+    };
+    let result = (|| {
+        check()?;
+        want_selected(ctx, parse(ops::WANT, header)?, None, &check)
+    })();
+    if result.as_ref().is_err_and(|error| {
+        matches!(
+            error.code.as_str(),
+            "CONTENT_CANCELLED" | "CONTENT_DEADLINE"
+        )
+    }) {
+        crate::util::fault::trigger("objects.want.stopped").map_err(wire)?;
+    }
+    result
 }
 
 pub(super) fn legacy_prepare(
     ctx: &WorkerCtx,
     header: &Value,
 ) -> Result<(Value, Vec<u8>), ErrorWire> {
-    let request: crate::model::content_wire::LegacyPrepare = parse("legacy-prepare", header)?;
-    crate::model::content::Digest::parse(&request.hash).map_err(wire)?;
-    if crate::model::lease::parse(&request.session)?.is_none_or(|o| o.frame.is_none()) {
-        return Err(ErrorWire::coded(
-            "INVALID_REQUEST",
-            "foreground lease frame required",
-        ));
-    }
-    want_selected(
+    legacy_prepare_request(
         ctx,
-        WantRequest {
-            header: crate::model::protocol::objects::WantHeader {
-                route: request.route,
-                lane: request.lane,
-                max_items: 1,
-                max_bytes: crate::model::content_wire::LEGACY_BYTES as u64,
-                session: request.session,
-            },
-            exclude: vec![],
-        },
-        Some(&request.hash),
+        header,
+        Instant::now() + Duration::from_secs(5),
+        &|| false,
     )
+}
+
+pub(super) fn legacy_prepare_request(
+    ctx: &WorkerCtx,
+    header: &Value,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Value, Vec<u8>), ErrorWire> {
+    let stopping = lock(&ctx.inflight_objects).legacy_cancel.clone();
+    let check = || {
+        if cancelled() || stopping.is_cancelled() {
+            return Err(ErrorWire::coded(
+                "CONTENT_CANCELLED",
+                "legacy prepare cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(ErrorWire::coded(
+                "CONTENT_DEADLINE",
+                "legacy prepare deadline",
+            ));
+        }
+        Ok(())
+    };
+    let result = (|| {
+        check()?;
+        let request: crate::model::content_wire::LegacyPrepare = parse("legacy-prepare", header)?;
+        crate::model::content::Digest::parse(&request.hash).map_err(wire)?;
+        if crate::model::lease::parse(&request.session)?.is_none_or(|o| {
+            o.frame.is_none() || o.round_slot.is_some() || !o.family.starts_with("pull:")
+        }) {
+            return Err(ErrorWire::coded(
+                "INVALID_REQUEST",
+                "foreground lease frame required",
+            ));
+        }
+        want_selected(
+            ctx,
+            WantRequest {
+                header: crate::model::protocol::objects::WantHeader {
+                    route: request.route,
+                    lane: request.lane,
+                    max_items: 1,
+                    max_bytes: crate::model::content_wire::LEGACY_BYTES as u64,
+                    session: request.session,
+                },
+                exclude: vec![],
+            },
+            Some(&request.hash),
+            &check,
+        )
+    })();
+    if result.as_ref().is_err_and(|error| {
+        matches!(
+            error.code.as_str(),
+            "CONTENT_CANCELLED" | "CONTENT_DEADLINE"
+        )
+    }) {
+        crate::util::fault::trigger("legacy.prepare.stopped").map_err(wire)?;
+    }
+    result
 }
 
 pub(super) fn legacy_read(ctx: &WorkerCtx, header: &Value) -> Result<(Value, Vec<u8>), ErrorWire> {
@@ -642,7 +842,9 @@ fn want_selected(
     ctx: &WorkerCtx,
     request: WantRequest,
     only: Option<&str>,
+    check: &dyn Fn() -> Result<(), ErrorWire>,
 ) -> Result<(Value, Vec<u8>), ErrorWire> {
+    check()?;
     let WantRequest { header, exclude } = request;
     bind(ctx, &header.route)?;
     session_id(&header.session)?;
@@ -664,6 +866,8 @@ fn want_selected(
         ));
     }
     let session = header.session.as_str();
+    let family = effect_family(ctx, owned.as_ref(), session)?;
+    let admission_deadline = Instant::now() + ORDER_WAIT;
     let source = header.route.remote_replica.as_str();
     let now = now_ms();
     let excluded: HashSet<&str> = exclude.iter().map(String::as_str).collect();
@@ -672,7 +876,17 @@ fn want_selected(
     // runs without the lock): objects other sessions hold, the ones this
     // session holds, and the ones backed off for this source.
     let (leased, mine, backed_off): (HashSet<String>, HashSet<String>, HashSet<String>) = {
+        let _effect = wait_family_gate(
+            ctx,
+            &family,
+            owned.as_ref(),
+            admission_deadline,
+            check,
+            "objects.want.family_waiting",
+        )?;
+        crate::util::fault::hang("objects.want.family_effect_held");
         let mut state = lock(&ctx.inflight_objects);
+        check()?;
         claim_run(&mut state, owned.as_ref())?;
         sweep_lapsed(&mut state, now);
         // A fresh offer frame also retires excluded predecessor leases.
@@ -742,17 +956,39 @@ fn want_selected(
     crate::util::fault::trigger("objects.want.before_grant").map_err(wire)?;
     {
         let now = now_ms();
+        let _effect = wait_family_gate(
+            ctx,
+            &family,
+            owned.as_ref(),
+            admission_deadline,
+            check,
+            "objects.want.family_waiting",
+        )?;
         let mut state = lock(&ctx.inflight_objects);
+        check()?;
         claim_run(&mut state, owned.as_ref())?;
         sweep_lapsed(&mut state, now);
+        let mut deferred = None;
+        let mut newly_granted = Vec::new();
+        reclaim_fenced_leases(&mut state, items.iter().map(|item| item.hash.as_str()));
         items.retain_mut(|item| {
             let held = state.leases.get(&item.hash).cloned();
             match held {
                 Some(lease) if superseded_lease(&state, &lease, session, now) => {
                     let offset = lease.offset.max(item.offset);
                     item.offset = offset;
-                    grant(&mut state, (&item.hash, session, source, offset), now);
-                    true
+                    let granted = grant(
+                        &mut state,
+                        (&item.hash, session, source, offset),
+                        now,
+                        &family,
+                    );
+                    if let Err(error) = &granted {
+                        deferred = Some(error.clone());
+                    } else {
+                        newly_granted.push(item.hash.clone());
+                    }
+                    granted.is_ok()
                 }
                 Some(lease) if lease.session != session => false,
                 Some(_) => {
@@ -767,11 +1003,33 @@ fn want_selected(
                 // Lapsed meanwhile (now backed off for this source), or free.
                 None if source_backoff(&state, source, &item.hash, now).is_some() => false,
                 None => {
-                    grant(&mut state, (&item.hash, session, source, item.offset), now);
-                    true
+                    let granted = grant(
+                        &mut state,
+                        (&item.hash, session, source, item.offset),
+                        now,
+                        &family,
+                    );
+                    if let Err(error) = &granted {
+                        deferred = Some(error.clone());
+                    } else {
+                        newly_granted.push(item.hash.clone());
+                    }
+                    granted.is_ok()
                 }
             }
         });
+        if let Err(error) = check() {
+            // Still under the grant lock: only this request's fresh grants
+            // may be undone. A cancelled retry must keep previously offered
+            // leases and their in-flight writers alive.
+            give_up(&mut state, session, &newly_granted);
+            return Err(error);
+        }
+        if items.is_empty()
+            && let Some(error) = deferred
+        {
+            return Err(error);
+        }
     }
     Ok((json!(WantReply { items }), vec![]))
 }
@@ -817,9 +1075,13 @@ fn release_op(ctx: &WorkerCtx, header: ReleaseHeader) -> Result<(Value, Vec<u8>)
     session_id(&header.session)?;
     let owned = owned_run(&header.session, &header.route)?;
     release_list(ops::RELEASE, &header.hashes)?;
+    let family = effect_family(ctx, owned.as_ref(), &header.session)?;
+    let _effect = objects_effects::try_gate(&family)?;
     let released = {
         let mut state = lock(&ctx.inflight_objects);
         if !run_owns(&state, owned.as_ref()) {
+            drop(state);
+            crate::util::fault::trigger("objects.release.stale").map_err(wire)?;
             return Ok((json!(ReleaseReply { released: 0 }), vec![]));
         }
         let now = now_ms();
@@ -900,6 +1162,8 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         items,
     } = header;
     let owned = owned_run(&session, &route)?;
+    let family = effect_family(ctx, owned.as_ref(), &session)?;
+    let admission_deadline = Instant::now() + ORDER_WAIT;
     let described = items
         .iter()
         .try_fold(0u64, |sum, item| sum.checked_add(item.len));
@@ -929,19 +1193,28 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         .collect();
     let source = route.remote_replica.as_str();
     let mut refused: HashSet<&str> = HashSet::new();
+    let mut admission_errors: HashMap<&str, ErrorWire> = HashMap::new();
+    let mut work = HashMap::new();
     {
+        let _effect = write_family_gate(ctx, &family, owned.as_ref(), admission_deadline)?;
         let now = now_ms();
         let mut state = lock(&ctx.inflight_objects);
         claim_run(&mut state, owned.as_ref())?;
         // A lapsed lease (ours too) backs its object off for its source and
         // frees it (module docs).
         sweep_lapsed(&mut state, now);
+        reclaim_fenced_leases(&mut state, hashes.iter().copied());
         for hash in &hashes {
             let held = state.leases.get(*hash).cloned();
             match held {
                 Some(lease) if superseded_lease(&state, &lease, &session, now) => {
                     let offset = committed.get(hash).copied().unwrap_or(lease.offset);
-                    grant(&mut state, (hash, &session, source, offset), now);
+                    if let Err(error) =
+                        grant(&mut state, (hash, &session, source, offset), now, &family)
+                    {
+                        refused.insert(hash);
+                        admission_errors.insert(hash, error);
+                    }
                 }
                 Some(lease) if lease.session != session => {
                     refused.insert(hash);
@@ -950,7 +1223,23 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                 Some(_) => {}
                 None => {
                     let offset = committed.get(hash).copied().unwrap_or(0);
-                    grant(&mut state, (hash, &session, source, offset), now);
+                    if let Err(error) =
+                        grant(&mut state, (hash, &session, source, offset), now, &family)
+                    {
+                        refused.insert(hash);
+                        admission_errors.insert(hash, error);
+                    }
+                }
+            }
+            if !refused.contains(hash) {
+                match state.effects.ensure(hash, &session, family.clone()) {
+                    Ok(owned) => {
+                        work.insert((*hash).to_owned(), owned);
+                    }
+                    Err(error) => {
+                        refused.insert(hash);
+                        admission_errors.insert(hash, error);
+                    }
                 }
             }
         }
@@ -963,7 +1252,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
     {
         first.entry(item.hash.as_str()).or_insert(item.offset);
     }
-    wait_for_order(ctx, &session, &first);
+    wait_for_order(ctx, &session, &first, admission_deadline);
     if !run_current(&lock(&ctx.inflight_objects), owned.as_ref()) {
         return Err(ErrorWire::coded(
             "IN_FLIGHT_ELSEWHERE",
@@ -1030,7 +1319,10 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
             if refused.contains(item.hash.as_str()) {
                 results.push(WriteResult {
                     hash: item.hash.clone(),
-                    outcome: ObjectOutcome::InFlightElsewhere,
+                    outcome: admission_errors
+                        .get(item.hash.as_str())
+                        .cloned()
+                        .map_or(ObjectOutcome::InFlightElsewhere, ObjectOutcome::Failed),
                     durable_offset: 0,
                 });
                 continue;
@@ -1040,7 +1332,9 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
                 .leases
                 .get(&result.hash)
                 .is_some_and(|lease| lease.session == session);
-            if owned.is_some() && !ours {
+            if work.get(&result.hash).is_none_or(|work| !work.current())
+                || (owned.is_some() && !ours)
+            {
                 results.push(WriteResult {
                     hash: result.hash.clone(),
                     outcome: ObjectOutcome::InFlightElsewhere,
@@ -1102,7 +1396,9 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
         crate::util::fault::trigger("objects.write.before_source_backoff").map_err(wire)?;
         let retry_at = {
             let mut state = lock(&ctx.inflight_objects);
-            if !run_owns(&state, owned.as_ref()) {
+            if !run_owns(&state, owned.as_ref())
+                || work.get(hash).is_none_or(|work| !work.current())
+            {
                 continue;
             }
             back_off_source_locked(&mut state, source, hash, now_ms())
@@ -1116,9 +1412,23 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
     }
     if !local.is_empty() {
         // Best effort: the outcome is answered either way.
-        if let Ok(store) = self::store(ctx) {
+        if let Ok(store) = super::content_rpc::connection(ctx) {
             for (hash, error) in &local {
-                let _ = store.record_object_failure(hash, error);
+                crate::util::fault::trigger("objects.write.before_local_backoff").map_err(wire)?;
+                let Some(work) = work.get(hash) else { continue };
+                let Ok(_family) = objects_effects::try_gate(&work.family) else {
+                    continue;
+                };
+                let Ok(_object) = work.object_gate() else {
+                    continue;
+                };
+                {
+                    let state = lock(&ctx.inflight_objects);
+                    if !run_owns(&state, owned.as_ref()) || !work.current() {
+                        continue;
+                    }
+                }
+                let _ = store.record_unavailable_object_failure(hash, error);
             }
         }
     }
@@ -1155,7 +1465,7 @@ fn failure_kind(error: &ErrorWire) -> Failure {
 /// offset of its first part in this write) has a durable offset at or past
 /// that part, per this session's lease, or the lease is gone or another
 /// session's, or the worker stops.
-fn wait_for_order(ctx: &WorkerCtx, session: &str, first: &HashMap<&str, u64>) {
+fn wait_for_order(ctx: &WorkerCtx, session: &str, first: &HashMap<&str, u64>, deadline: Instant) {
     let ahead = |state: &ObjectsState| {
         first.iter().any(|(hash, offset)| {
             state
@@ -1171,7 +1481,6 @@ fn wait_for_order(ctx: &WorkerCtx, session: &str, first: &HashMap<&str, u64>) {
         }
         state.progress.clone()
     };
-    let deadline = Instant::now() + ORDER_WAIT;
     let (generation, wake) = (&signal.generation, &signal.wake);
     let mut seen = lock(generation);
     loop {
@@ -1188,8 +1497,473 @@ fn wait_for_order(ctx: &WorkerCtx, session: &str, first: &HashMap<&str, u64>) {
     }
 }
 
+/// Short effect publication in this family is readiness, not a failed stream.
+/// Wait without Engine, the lease-state mutex or any object gate; claim_run
+/// still revalidates under the family gate before any byte work can begin.
+fn write_family_gate<'a>(
+    ctx: &WorkerCtx,
+    family: &'a Gate,
+    owned: Option<&crate::model::lease::Owned<'_>>,
+    deadline: Instant,
+) -> Result<std::sync::MutexGuard<'a, ()>, ErrorWire> {
+    wait_family_gate(
+        ctx,
+        family,
+        owned,
+        deadline,
+        &|| Ok(()),
+        "objects.write.family_waiting",
+    )
+}
+fn wait_family_gate<'a>(
+    ctx: &WorkerCtx,
+    family: &'a Gate,
+    owned: Option<&crate::model::lease::Owned<'_>>,
+    deadline: Instant,
+    check: &dyn Fn() -> Result<(), ErrorWire>,
+    point: &str,
+) -> Result<std::sync::MutexGuard<'a, ()>, ErrorWire> {
+    let cancelled = lock(&ctx.inflight_objects).legacy_cancel.clone();
+    loop {
+        if cancelled.is_cancelled() || ctx.stopping.load(Ordering::Relaxed) {
+            // Preserve the request owner's specific stop/cancel outcome before
+            // the worker-level fallback, including an uncontended admission.
+            check()?;
+            return Err(ErrorWire::coded(
+                "CANCELLED",
+                "object family admission cancelled",
+            ));
+        }
+        match objects_effects::try_gate(family) {
+            Ok(guard) => return Ok(guard),
+            Err(error) if error.code == "WORKER_BUSY" => {
+                check()?;
+                if !run_current(&lock(&ctx.inflight_objects), owned) {
+                    return Err(ErrorWire::coded(
+                        "IN_FLIGHT_ELSEWHERE",
+                        "object family run superseded",
+                    ));
+                }
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                crate::util::fault::hang(point);
+                cancelled.sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod write_admission_tests {
+    use super::*;
+    #[test]
+    fn family_wait_deadline_and_worker_stop_do_not_claim_or_mutate_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(crate::runtime::Engine::new(
+            crate::core::Store::initialize(dir.path(), "gate-wait", &crate::core::id()).unwrap(),
+        )));
+        let ctx = crate::worker::build_ctx(shared, dir.path(), false, None);
+        let family = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held = family.lock().unwrap();
+        let began = Instant::now();
+        assert_eq!(
+            write_family_gate(&ctx, &family, None, began + Duration::from_millis(35))
+                .unwrap_err()
+                .code,
+            "WORKER_BUSY"
+        );
+        assert!(began.elapsed() < Duration::from_millis(250));
+        let waiting_ctx = ctx.clone();
+        let waiting_family = family.clone();
+        let waiter = std::thread::spawn(move || {
+            write_family_gate(
+                &waiting_ctx,
+                &waiting_family,
+                None,
+                Instant::now() + ORDER_WAIT,
+            )
+            .map(drop)
+            .map_err(|e| e.code)
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        let stopped = Instant::now();
+        ctx.stopping.store(true, Ordering::Release);
+        assert_eq!(waiter.join().unwrap().unwrap_err(), "CANCELLED");
+        assert!(stopped.elapsed() < Duration::from_millis(250));
+        assert!(lock(&ctx.inflight_objects).leases.is_empty());
+        assert!(lock(&ctx.inflight_objects).lease_runs.is_empty());
+        drop(held);
+    }
+}
+
 /// The retry time of `hash` from `source`, while that source is backed off
 /// for it (`CorruptAtSource`); `None` otherwise.
 pub fn source_retry_at(ctx: &WorkerCtx, source: &str, hash: &str) -> Option<u64> {
     source_backoff(&lock(&ctx.inflight_objects), source, hash, now_ms())
+}
+
+#[cfg(test)]
+mod lease_capacity_tests {
+    use super::*;
+    #[test]
+    fn want_waits_for_both_family_phases_and_cancellation_does_not_grant_work() {
+        use crate::{
+            core::Store,
+            runtime::Engine,
+            util::fault::{self, FaultAction, FaultConfig},
+        };
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize},
+        };
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                fault::configure(None);
+            }
+        }
+        let _reset = Reset;
+        for phase in ["snapshot", "grant"] {
+            for cancel in [false, true] {
+                fault::configure(None);
+                let dir = tempfile::tempdir().unwrap();
+                let mut store =
+                    Store::initialize(dir.path(), &crate::core::id(), &crate::core::id()).unwrap();
+                let entry = store.create("file", "file").unwrap();
+                let bytes = vec![219; 100];
+                store
+                    .write_revision(&entry.id, entry.revisions.get("content").cloned(), &bytes)
+                    .unwrap();
+                let hash = crate::core::hash(&bytes);
+                std::fs::remove_file(store.root.join("objects").join(&hash)).unwrap();
+                store
+                    .db
+                    .execute("DELETE FROM published_objects WHERE hash=?", [&hash])
+                    .unwrap();
+                store
+                    .db
+                    .execute("DELETE FROM object_availability WHERE hash=?", [&hash])
+                    .unwrap();
+                let route = SyncRoute {
+                    peer: "peer".into(),
+                    repo: store.repo.clone(),
+                    local_replica: store.device.clone(),
+                    remote_replica: "remote".into(),
+                };
+                let ctx = crate::worker::build_ctx(
+                    Arc::new(Mutex::new(Engine::new(store))),
+                    dir.path(),
+                    false,
+                    None,
+                );
+                let family = effect_family(&ctx, None, "waiting-want").unwrap();
+                let mut held = if phase == "snapshot" {
+                    Some(family.lock().unwrap())
+                } else {
+                    let mut config =
+                        FaultConfig::new("objects.want.before_grant", FaultAction::Hang);
+                    config.ms = Some(200);
+                    config.count = Some(1);
+                    fault::configure(Some(config));
+                    None
+                };
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let checks = Arc::new(AtomicUsize::new(0));
+                let (worker, stop, observed) = (ctx.clone(), cancelled.clone(), checks.clone());
+                let wanting = std::thread::spawn(move || {
+                    want_selected(
+                        &worker,
+                        WantRequest {
+                            header: crate::model::protocol::objects::WantHeader {
+                                route,
+                                session: "waiting-want".into(),
+                                lane: crate::model::protocol::LaneSpec::new(0, 1),
+                                max_items: 16,
+                                max_bytes: 1024,
+                            },
+                            exclude: vec![crate::core::hash(&[])],
+                        },
+                        None,
+                        &|| {
+                            observed.fetch_add(1, Ordering::Release);
+                            if stop.load(Ordering::Acquire) {
+                                Err(ErrorWire::coded("CANCELLED", "want cancelled"))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                });
+                let until = Instant::now() + Duration::from_secs(2);
+                if phase == "grant" {
+                    while fault::fired() == 0 {
+                        assert!(Instant::now() < until);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    held = Some(family.lock().unwrap());
+                }
+                let expected = if phase == "snapshot" { 2 } else { 3 };
+                while checks.load(Ordering::Acquire) < expected {
+                    assert!(Instant::now() < until);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(lock(&ctx.inflight_objects).leases.is_empty());
+                assert!(ctx.engine.try_lock().is_ok());
+                if cancel {
+                    let began = Instant::now();
+                    cancelled.store(true, Ordering::Release);
+                    assert_eq!(wanting.join().unwrap().unwrap_err().code, "CANCELLED");
+                    assert!(began.elapsed() < Duration::from_millis(250));
+                    assert!(lock(&ctx.inflight_objects).leases.is_empty());
+                    drop(held);
+                } else {
+                    drop(held);
+                    let reply = wanting.join().unwrap().unwrap().0;
+                    assert!(
+                        reply["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|item| item["hash"] == hash)
+                    );
+                    assert_eq!(
+                        lock(&ctx.inflight_objects).leases[&hash].session,
+                        "waiting-want"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn cancelled_want_rolls_back_fresh_grants_and_keeps_preexisting_work() {
+        use crate::{core::Store, runtime::Engine};
+        use std::{
+            cell::Cell,
+            sync::{Arc, Mutex},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut store =
+            Store::initialize(dir.path(), &crate::core::id(), &crate::core::id()).unwrap();
+        let mut hashes = Vec::new();
+        for (name, bytes) in [("a", vec![21; 100]), ("b", vec![22; 200])] {
+            let entry = store.create(name, "file").unwrap();
+            store
+                .write_revision(&entry.id, entry.revisions.get("content").cloned(), &bytes)
+                .unwrap();
+            let hash = crate::core::hash(&bytes);
+            std::fs::remove_file(store.root.join("objects").join(&hash)).unwrap();
+            store
+                .db
+                .execute("DELETE FROM published_objects WHERE hash=?", [&hash])
+                .unwrap();
+            store
+                .db
+                .execute("DELETE FROM object_availability WHERE hash=?", [&hash])
+                .unwrap();
+            hashes.push(hash);
+        }
+        let route = SyncRoute {
+            peer: "peer".into(),
+            repo: store.repo.clone(),
+            local_replica: store.device.clone(),
+            remote_replica: "remote".into(),
+        };
+        let ctx = crate::worker::build_ctx(
+            Arc::new(Mutex::new(Engine::new(store))),
+            dir.path(),
+            false,
+            None,
+        );
+        let request = |max_items| WantRequest {
+            header: crate::model::protocol::objects::WantHeader {
+                route: route.clone(),
+                lane: crate::model::protocol::LaneSpec::new(0, 1),
+                max_items,
+                max_bytes: 1024,
+                session: "retained-session".into(),
+            },
+            exclude: vec![],
+        };
+        let reply = want_selected(&ctx, request(1), None, &|| Ok(())).unwrap();
+        assert_eq!(reply.0["items"].as_array().unwrap().len(), 1);
+        let (prior, ticket) = {
+            let state = lock(&ctx.inflight_objects);
+            (
+                state.leases[&hashes[0]].clone(),
+                state.effects.work(&hashes[0]).unwrap(),
+            )
+        };
+        let checks = Cell::new(0);
+        let error = want_selected(&ctx, request(2), None, &|| {
+            checks.set(checks.get() + 1);
+            // Entry, snapshot, grant lock, then post-grant under that lock.
+            if checks.get() == 4 {
+                Err(ErrorWire::coded(
+                    "CONTENT_CANCELLED",
+                    "post-grant cancellation",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "CONTENT_CANCELLED");
+        assert_eq!(checks.get(), 4);
+        let state = lock(&ctx.inflight_objects);
+        assert_eq!(state.leases.len(), 1);
+        assert_eq!(state.leases[&hashes[0]], prior);
+        assert!(
+            ticket.current(),
+            "cancelled retry retired its previous writer"
+        );
+        assert!(!state.holders.contains_key(&hashes[1]));
+        assert!(state.effects.work(&hashes[1]).is_none());
+        assert!(state.source_backoff.is_empty());
+    }
+    fn filled(session: &str) -> (ObjectsState, Gate) {
+        let mut state = ObjectsState::default();
+        let family = state.effects.family("capacity").unwrap();
+        for n in 0..MAX_LEASE_HOLDERS {
+            grant(
+                &mut state,
+                (&format!("{n:064x}"), session, "source", 0),
+                100,
+                &family,
+            )
+            .unwrap();
+        }
+        (state, family)
+    }
+    #[test]
+    fn full_lease_tables_preserve_existing_sources_and_refuse_new_live_keys() {
+        let (mut state, family) = filled("capacity");
+        let first = format!("{:064x}", 0);
+        let other = format!("{:064x}", MAX_LEASE_HOLDERS - 1);
+        let old = state.effects.work(&first).unwrap();
+        let retained = state.effects.work(&other).unwrap();
+        grant(
+            &mut state,
+            (&first, "replacement", "new-source", 23),
+            200,
+            &family,
+        )
+        .unwrap();
+        assert_eq!(state.leases.len(), MAX_LEASE_HOLDERS);
+        assert_eq!(state.holders.len(), MAX_LEASE_HOLDERS);
+        assert_eq!(state.holders[&other], ("capacity".into(), "source".into()));
+        assert!(!old.current() && retained.current());
+        let extra = format!("{:064x}", MAX_LEASE_HOLDERS);
+        let began = Instant::now();
+        reclaim_fenced_leases(&mut state, std::iter::once(extra.as_str()));
+        assert_eq!(
+            grant(&mut state, (&extra, "new", "another", 0), 200, &family)
+                .unwrap_err()
+                .code,
+            "CONTENT_RESOURCE_LIMIT"
+        );
+        let denied = began.elapsed();
+        assert_eq!(state.holders.len(), MAX_LEASE_HOLDERS);
+        assert_eq!(
+            give_up(&mut state, "replacement", std::slice::from_ref(&first)),
+            1
+        );
+        // A delayed writer still holds the old slot: do not evict that fence.
+        assert_eq!(
+            grant(&mut state, (&extra, "new", "another", 0), 200, &family)
+                .unwrap_err()
+                .code,
+            "CONTENT_RESOURCE_LIMIT"
+        );
+        drop(old);
+        grant(&mut state, (&extra, "new", "another", 0), 200, &family).unwrap();
+        assert!(retained.current());
+        assert_eq!(state.leases.len(), MAX_LEASE_HOLDERS);
+        assert_eq!(state.holders.len(), MAX_LEASE_HOLDERS);
+        println!(
+            "WAVE6_CAPACITY {}",
+            json!({"scenario":"full-live-owner-tables","entries":MAX_LEASE_HOLDERS,
+            "new_key_refused":true,"existing_sources_preserved":true,"delayed_writer_fence_preserved":true,
+            "pressure_scan_ms":denied.as_secs_f64()*1000.0})
+        );
+    }
+    #[test]
+    fn holder_pressure_removes_only_orphan_or_mismatched_provenance() {
+        let mut state = ObjectsState::default();
+        let family = state.effects.family("capacity").unwrap();
+        let live = format!("{:064x}", 0);
+        let mismatched = format!("{:064x}", 1);
+        state.leases.insert(
+            live.clone(),
+            ObjectLease {
+                session: "live".into(),
+                expires_ms: 1000,
+                offset: 0,
+            },
+        );
+        state.leases.insert(
+            mismatched.clone(),
+            ObjectLease {
+                session: "correct".into(),
+                expires_ms: 1000,
+                offset: 0,
+            },
+        );
+        for n in 0..MAX_LEASE_HOLDERS {
+            state
+                .holders
+                .insert(format!("{n:064x}"), ("orphan".into(), "wrong".into()));
+        }
+        state
+            .holders
+            .insert(live.clone(), ("live".into(), "kept-source".into()));
+        let extra = format!("{:064x}", MAX_LEASE_HOLDERS);
+        grant(&mut state, (&extra, "new", "new-source", 0), 100, &family).unwrap();
+        assert_eq!(state.holders[&live], ("live".into(), "kept-source".into()));
+        assert!(!state.holders.contains_key(&mismatched));
+        assert!(state.leases.contains_key(&mismatched));
+        assert_eq!(state.holders.len(), 2);
+        assert_eq!(state.leases.len(), 3);
+    }
+    #[test]
+    fn lease_pressure_reclaims_only_already_fenced_owners_without_source_backoff() {
+        use crate::model::lease::{self, Generation};
+        let old = lease::qualify(
+            "pull:capacity:0/1:a",
+            Generation {
+                incarnation: 1,
+                run: 1,
+            },
+        )
+        .unwrap();
+        let new = lease::qualify(
+            "pull:capacity:0/1:a",
+            Generation {
+                incarnation: 1,
+                run: 2,
+            },
+        )
+        .unwrap();
+        let (mut state, family) = filled(&old);
+        let first = format!("{:064x}", 0);
+        let delayed = state.effects.work(&first).unwrap();
+        claim_run(&mut state, lease::parse(&new).unwrap().as_ref()).unwrap();
+        let extra = format!("{:064x}", MAX_LEASE_HOLDERS);
+        let began = Instant::now();
+        reclaim_fenced_leases(&mut state, std::iter::once(extra.as_str()));
+        assert_eq!(state.leases.len(), MAX_LEASE_HOLDERS - 1);
+        assert_eq!(state.holders.len(), MAX_LEASE_HOLDERS - 1);
+        assert!(!delayed.current());
+        assert!(state.source_backoff.is_empty());
+        drop(delayed);
+        grant(&mut state, (&extra, &new, "source", 0), 200, &family).unwrap();
+        assert_eq!(state.leases.len(), MAX_LEASE_HOLDERS);
+        assert_eq!(state.holders.len(), MAX_LEASE_HOLDERS);
+        println!(
+            "WAVE6_CAPACITY {}",
+            json!({"scenario":"fenced-owner-pressure","entries":MAX_LEASE_HOLDERS,
+            "reclaimed":1,"source_backoff_added":false,"pressure_and_grant_ms":began.elapsed().as_secs_f64()*1000.0})
+        );
+    }
 }

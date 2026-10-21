@@ -128,6 +128,9 @@ fn content(seed: u64, len: usize) -> Vec<u8> {
 
 #[derive(Default)]
 struct Faults {
+    old_round_worker: bool,
+    busy_round_caps: usize,
+    round_caps_calls: usize,
     /// Every write call sleeps this long first (a slow disk).
     write_delay: Option<Duration>,
     /// Writes wait while this is set (a stalled worker).
@@ -245,19 +248,25 @@ fn lease_base(session: &str) -> String {
     tkfs::model::lease::parse_transfer(session)
         .ok()
         .flatten()
-        .filter(|owned| owned.family.starts_with("push:"))
-        .map_or_else(|| session.to_owned(), |owned| owned.scope.to_owned())
+        .map_or_else(
+            || session.to_owned(),
+            |owned| {
+                owned.round_slot.map_or_else(
+                    || owned.scope.to_owned(),
+                    |slot| format!("{}:{}", owned.scope, if slot == 0 { "a" } else { "b" }),
+                )
+            },
+        )
 }
-fn newer_push(next: &str, prior: &str) -> bool {
+fn newer_transfer(next: &str, prior: &str) -> bool {
     let (Ok(Some(next)), Ok(Some(prior))) = (
         tkfs::model::lease::parse_transfer(next),
         tkfs::model::lease::parse_transfer(prior),
     ) else {
         return false;
     };
-    next.family.starts_with("push:")
-        && next.family == prior.family
-        && (
+    next.family == prior.family
+        && ((
             next.generation.incarnation,
             next.layout.unwrap_or(0),
             next.generation.run,
@@ -267,7 +276,10 @@ fn newer_push(next: &str, prior: &str) -> bool {
             prior.layout.unwrap_or(0),
             prior.generation.run,
             prior.frame,
-        )
+        ) && (next.scope == prior.scope || next.layout != prior.layout)
+            && (next.generation != prior.generation
+                || next.layout != prior.layout
+                || next.round_slot == prior.round_slot))
 }
 
 impl FakeWorker {
@@ -523,7 +535,7 @@ impl FakeWorker {
             let mut state = self.state.lock().unwrap();
             state.leases.retain(|hash, (session, _)| {
                 !(excluded.contains(hash.as_str())
-                    && (*session == header.session || newer_push(&header.session, session)))
+                    && (*session == header.session || newer_transfer(&header.session, session)))
             });
         }
         // Spools are locked without the state lock (a completing write
@@ -542,7 +554,7 @@ impl FakeWorker {
                     state.leases.get(*hash).is_none_or(|(session, until)| {
                         *session == header.session
                             || now >= *until
-                            || newer_push(&header.session, session)
+                            || newer_transfer(&header.session, session)
                     })
                 })
                 .map(|(hash, spool)| (hash.clone(), spool.clone()))
@@ -821,7 +833,7 @@ impl FakeWorker {
             if let Some((holder, until)) = state.leases.get(&item.hash)
                 && holder != session
                 && now < *until
-                && !newer_push(session, holder)
+                && !newer_transfer(session, holder)
             {
                 return result(ObjectOutcome::InFlightElsewhere, 0);
             }
@@ -952,6 +964,18 @@ impl Handler for WorkerHandler {
         } = req;
         let worker = &self.0;
         let result = match op.as_str() {
+            tkfs::model::content_wire::LEGACY_CAPS => {
+                let mut faults = worker.faults();
+                faults.round_caps_calls += 1;
+                if faults.old_round_worker {
+                    Err(ErrorWire::coded("UNSUPPORTED_OPERATION", &op))
+                } else if faults.busy_round_caps > 0 {
+                    faults.busy_round_caps -= 1;
+                    Err(ErrorWire::coded("WORKER_BUSY", "capability probe"))
+                } else {
+                    Ok((json!({"version":1,"round_fences":true}), vec![]))
+                }
+            }
             "objects.want" => worker.op_want(header),
             "objects.read" => worker.op_read(header),
             "objects.write" => worker.op_write(header, body),
@@ -1701,6 +1725,53 @@ fn zero_size_objects_travel_both_ways() {
     }
 }
 
+#[test]
+fn download_round_bookkeeping_is_bounded_and_pages_all_wanted_objects() {
+    let (a, b) = pair(100);
+    let count = objects::ROUND_OBJECTS + 257;
+    let hashes: Vec<_> = (0..count)
+        .map(|i| {
+            let hash = b.worker.hold(content(90_000 + i as u64, 128));
+            a.worker.want(&hash, 128);
+            hash
+        })
+        .collect();
+    let conn = a.dial(&b.endpoint, &b.code, LANE);
+    let (mut options, stats) = a.options();
+    // Exercise the object boundary independently of the time quantum. The
+    // production ten-second cap remains tested by the ordinary lane suite.
+    options.round = Duration::from_secs(60);
+    let began = Instant::now();
+    let lane = a.run(conn, options);
+    let done = wait_until(Duration::from_secs(60), || {
+        hashes.iter().all(|hash| a.worker.has(hash))
+    });
+    let elapsed = began.elapsed();
+    drop(lane);
+    assert!(done, "bounded rounds lost pending objects");
+    assert_eq!(
+        LaneStats::get(&stats.round_objects_peak),
+        objects::ROUND_OBJECTS as u64
+    );
+    assert!(LaneStats::get(&stats.object_budget_yields) >= 1);
+    assert!(LaneStats::get(&stats.pull_records_peak) <= objects::ROUND_PULL_RECORDS as u64);
+    let completions: u64 = a
+        .world
+        .finished()
+        .iter()
+        .filter(|f| f.op == "objects.pull")
+        .map(|f| f.objects_down)
+        .sum();
+    assert_eq!(completions, count as u64);
+    println!(
+        "WAVE6_BOOKKEEPING {}",
+        serde_json::json!({"scenario":"paged_round_objects","objects_verified":count,
+        "round_objects_peak":LaneStats::get(&stats.round_objects_peak),"pull_records_peak":LaneStats::get(&stats.pull_records_peak),
+        "budget_yields":LaneStats::get(&stats.object_budget_yields),"completion_objects":completions,
+        "elapsed_ms":elapsed.as_secs_f64()*1000.0,"fixture":"fake worker memory spools","round_ms":60000})
+    );
+}
+
 /// A write the worker answers with a resume point (`RESUME_OFFSET_AHEAD`,
 /// `OBJECT_PART_CHANGED`) is no failure of the object (CCR-WP3.2-5): the
 /// object resumes from the durable offset the worker answered, without a
@@ -1882,6 +1953,7 @@ fn at_most_16_mib_in_flight_per_lane() {
         }
         let conn = a.dial(&proxy.endpoint(), &b.code, LANE);
         let (options, stats) = a.options();
+        let began = Instant::now();
         let lane = a.run(conn, options);
         let mut most = 0u64;
         let done = wait_until(Duration::from_secs(60), || {
@@ -1890,6 +1962,7 @@ fn at_most_16_mib_in_flight_per_lane() {
             most = most.max(read.saturating_sub(written));
             hashes.iter().all(|hash| a.worker.has(hash))
         });
+        let elapsed = began.elapsed();
         assert!(
             done,
             "the transfer did not finish (link bound: {link_bound})"
@@ -1898,7 +1971,23 @@ fn at_most_16_mib_in_flight_per_lane() {
         assert!(most <= 16 * MIB, "{most} bytes in flight");
         let peak = LaneStats::get(&stats.window_peak);
         assert!(peak <= 16 * MIB, "window peak {peak}");
-        assert!(most >= 8 * MIB, "the window was not used: {most}");
+        // Wave 6's common 8 MiB job/buffer budget supersedes the old
+        // requirement to fill at least 8 MiB of each lane's 16 MiB window.
+        // Keep the old upper bound, complete the same 24/72 MiB workload and
+        // require the new payload window to be exercised and pipelined.
+        let payload = tkfs::model::content_wire::LEGACY_BYTES as u64;
+        assert!(
+            most >= payload,
+            "the bounded payload window was not used: {most}"
+        );
+        assert!(
+            most <= 2 * payload,
+            "legacy payloads escaped common admission: {most}"
+        );
+        assert!(
+            peak <= 2 * payload,
+            "legacy lane reserved beyond its bounded pulls: {peak}"
+        );
         assert!(LaneStats::get(&stats.peer_calls_peak) <= objects::PEER_CALLS as u64);
         if link_bound {
             assert_eq!(
@@ -1907,6 +1996,16 @@ fn at_most_16_mib_in_flight_per_lane() {
                 "pulls were never pipelined"
             );
         }
+        println!(
+            "WAVE6_BULK {}",
+            serde_json::json!({
+                "scenario":if link_bound {"link_limited"}else{"write_limited"},
+                "fixture":"authenticated peer and fake worker memory spool",
+                "bytes":count*size,"elapsed_ms":elapsed.as_secs_f64()*1000.0,
+                "payload_outstanding_peak":most,"lane_window_peak":peak,
+                "pulls_peak":LaneStats::get(&stats.pulls_peak),"completed":done,
+            })
+        );
     }
 }
 
@@ -3410,6 +3509,57 @@ fn a_holder_that_goes_away_hands_the_pushed_object_on() {
 /// A large object spanning many short rounds resumes at the start of every
 /// round: no round finds it hidden under the lane's other lease id and
 /// idles for the anti-entropy interval (here 30 s).
+#[test]
+fn short_rounds_negotiate_legacy_ids_and_retry_a_transient_capability_failure() {
+    for old in [true, false] {
+        let (a, b) = pair(30_000);
+        let bytes = content(3601, 4 * MIB as usize);
+        let hash = b.worker.hold(bytes.clone());
+        a.worker.want(&hash, bytes.len() as u64);
+        {
+            let mut faults = a.worker.faults();
+            faults.write_delay = Some(Duration::from_millis(20));
+            faults.old_round_worker = old;
+            faults.busy_round_caps = usize::from(!old);
+        }
+        let conn = a.dial(&b.endpoint, &b.code, LANE);
+        let (mut options, stats) = a.options();
+        options.round = Duration::from_millis(30);
+        options.window_bytes = 1024 * 1024;
+        let began = Instant::now();
+        let lane = a.run(conn, options);
+        let done = wait_until(Duration::from_secs(10), || a.worker.has(&hash));
+        drop(lane);
+        assert!(done, "{old}: failed to resume short rounds");
+        assert_eq!(a.worker.held_bytes(&hash).unwrap(), bytes);
+        assert!(LaneStats::get(&stats.v3_rounds) >= 2);
+        let sessions: BTreeSet<_> = a
+            .worker
+            .wants()
+            .into_iter()
+            .map(|want| want.session)
+            .collect();
+        let mut nonces = BTreeSet::new();
+        for id in &sessions {
+            let owned = tkfs::model::lease::parse(id).unwrap().unwrap();
+            assert_eq!(owned.frame.is_none(), old);
+            nonces.insert(owned.frame);
+        }
+        assert!(!sessions.is_empty());
+        if old {
+            assert!(sessions.len() <= 2);
+        } else {
+            assert!(nonces.len() >= 2);
+        }
+        assert_eq!(a.worker.faults().round_caps_calls, if old { 1 } else { 2 });
+        println!(
+            "WAVE6_ROUND {}",
+            json!({"scenario":if old {"unsupported_worker_stable_ids"}else{"transient_capability_failure_retried"},
+            "bytes_verified":bytes.len(),"available_ms":began.elapsed().as_secs_f64()*1000.0,"lease_ids":sessions,"fake_worker":true})
+        );
+    }
+}
+
 #[test]
 fn a_large_object_never_idles_between_rounds() {
     let (a, b) = pair(30_000);
