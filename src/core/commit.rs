@@ -1243,6 +1243,27 @@ impl Store {
         checked: Checked,
         fast: Option<Projection>,
     ) -> Result<()> {
+        self.commit_checked_owned(event, local, checked, fast, None)
+    }
+    pub(super) fn commit_owned_metadata(
+        &mut self,
+        event: Event,
+        owner: &content_saves::MetadataOwner,
+    ) -> Result<()> {
+        let Check::Ready(checked) = self.check_commit(&event, true)? else {
+            bail!("CONTENT_METADATA_EVENT_REUSED");
+        };
+        let fast = self.fast_successor(&event, true)?;
+        self.commit_checked_owned(event, true, checked, fast, Some(owner))
+    }
+    fn commit_checked_owned(
+        &mut self,
+        event: Event,
+        local: bool,
+        checked: Checked,
+        fast: Option<Projection>,
+        owner: Option<&content_saves::MetadataOwner>,
+    ) -> Result<()> {
         let (plan, view_base) = match fast {
             Some(delta) => (Plan::Fast(delta), None),
             None => {
@@ -1255,7 +1276,7 @@ impl Store {
                 }
             }
         };
-        self.write_commit(event, local, checked, plan, view_base)
+        self.write_commit_owned(event, local, checked, plan, view_base, owner)
     }
     /// The write of a commit (WP2.4: shared by the inline and the prepared
     /// slow path; no derivation here). `view_base`: for a slow commit, the
@@ -1270,10 +1291,21 @@ impl Store {
         plan: Plan,
         view_base: Option<i64>,
     ) -> Result<()> {
+        self.write_commit_owned(event, local, checked, plan, view_base, None)
+    }
+    fn write_commit_owned(
+        &mut self,
+        event: Event,
+        local: bool,
+        checked: Checked,
+        plan: Plan,
+        view_base: Option<i64>,
+        owner: Option<&content_saves::MetadataOwner>,
+    ) -> Result<()> {
         if crate::util::fault::hit(BUSY_FAULT).is_some() {
             return Err(injected_busy().into());
         }
-        let result = self.write_commit_inner(event, local, checked, plan, view_base);
+        let result = self.write_commit_inner(event, local, checked, plan, view_base, owner);
         if result.is_err() {
             // The view may have been patched for the seal.
             self.view_cache.borrow_mut().take();
@@ -1287,6 +1319,7 @@ impl Store {
         checked: Checked,
         plan: Plan,
         _view_base: Option<i64>,
+        owner: Option<&content_saves::MetadataOwner>,
     ) -> Result<()> {
         let Checked {
             payload,
@@ -1348,7 +1381,7 @@ impl Store {
             params![event.id, event.branch.id, payload],
         )?;
         admission::append_event(&tx, &event, local)?;
-        content_saves::observe_event(&tx, &event, local)?;
+        content_saves::observe_event(&tx, &event, local, owner)?;
         // The event's journal row (the `journal_sequence` trigger) is the
         // journal's newest, so its sequence is the branch's new tip: the
         // cursor of a seal in this commit.
