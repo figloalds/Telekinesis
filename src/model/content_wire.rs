@@ -20,10 +20,19 @@ pub const RELEASE: &str = "objects.content-v1.release";
 pub const ACK: &str = "objects.content-v1.ack";
 pub const POLL: &str = "objects.content-v1.poll";
 pub const LEGACY_PREPARE: &str = "objects.content-v1.legacy-prepare";
+/// Local worker negotiation; independent of typed content activation.
+pub const LEGACY_CAPS: &str = "objects.content-v1.legacy-capabilities";
 pub const LEGACY_BEGIN: &str = "objects.content-v1.legacy-begin";
 pub const LEGACY_READ: &str = "objects.content-v1.legacy-read";
 pub const LEGACY_PULL: &str = "objects.content-v1.legacy-pull";
 pub const LEGACY_BYTES: usize = 256 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyCapabilities {
+    pub version: u8,
+    pub round_fences: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -5,6 +5,56 @@ for each decision, is `docs/revamp/REVAMP_PLAN.md`; the defects of the
 previous release it removes are mapped in `docs/revamp/ROOT_CAUSES.md`
 (RC1–RC13).
 
+The default repository path below retains legacy content writes. Wave 6 is
+being implemented in isolated stores; its complete scope and current evidence
+are in the [Wave 6 plan](revamp/WAVE_6_PLAN.md) and
+[implementation record](revamp/notes/wp6-progress.md). An internal fixture
+marker is not production activation or a compatibility fence.
+
+## Wave 6 isolated content path (in development)
+
+Typed immutable descriptors distinguish legacy whole files, direct content
+and indexed manifests with 64 KiB chunks. `content/local.rs` verifies CAS and
+manifest ranges; provider pins retain immutable lifetimes. Metadata commits
+reference admission changes with their events. The object engine expands
+authenticated manifest edges incrementally and verifies frames independently
+of causal metadata activation. Foreground and structural demand retain their
+own capacity and reference/generation authority. Empty preparation polling is
+10 ms for foreground and 50 ms for structural work; background keeps its
+exponential idle backoff. Structural repair introduced by a later COW mutation
+therefore does not inherit background's idle delay. These polling intervals
+are not global admission guarantees for arbitrary load or repository counts.
+
+Private writes use `content/write.rs` and its immutable overlay maps. Working
+bytes are buffered; FULL Saved checkpoints carry recovery intent. The bounded
+`runtime/content_saves.rs` executor constructs changed canonical paths, commits
+metadata through secondary connections and adopts the continuation on one
+stable `SaveFile`. Receipt replay prevents a lost reply publishing twice.
+Complete root reclamation and production recovery/lifecycle remain unfinished.
+
+Explicit `NativeWrites::install` before mounting/opening attaches existing
+descriptor files to this pipeline on WinFsp/FUSE. Callbacks share a per-file
+mutation gate outside Engine; metadata length uses an atomic cache. Native
+write/resize preflight verifies the required base paths and surviving bytes
+before applying and acknowledging the mutation. Missing ranges register
+authenticated demand through `runtime/content_base.rs` after releasing all
+preflight buffers, cursor and journal guards, without holding file state.
+Exact Working/session validation prevents a completed preflight from applying
+over a concurrent mutation. Full-covered old chunks and zero ranges need no
+old data; preflight creates no CAS objects or FULL checkpoint.
+
+Native close/fsync use FULL Saved checkpoints and strictly local canonical
+preparation/publication. They never invoke peer recovery. If required local
+base bytes disappear after an acknowledged write, preparation fails locally
+and retains Saved/private bytes for retry. Recovered or headlessly modified
+sessions include their existing dirty paths in the next mutation's preflight.
+Deadline, grant/checkout changes, cancellation and stop preserve private changes.
+
+This path does not yet supply durable native namespace operations, complete
+startup/status/shutdown, production activation/migration, the full retention
+audit or the Wave 6 build-performance gates. Its exact contracts and remaining
+qualifications are maintained in [WAVE_6_CONTRACTS](revamp/WAVE_6_CONTRACTS.md).
+
 ## Processes and failure domains
 
 ```text

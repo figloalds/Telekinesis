@@ -145,7 +145,17 @@ fn prepare_inner(
     for snapshot in &demands {
         let demand = &snapshot.demand;
         constrained.insert(demand.reference.clone());
-        if !matches!(selection.mode, PrepareMode::Foreground | PrepareMode::Mixed) {
+        let priority = if demand.priority == DemandPriority::Structural {
+            DemandPriority::Structural
+        } else {
+            DemandPriority::Foreground
+        };
+        let mode = if priority == DemandPriority::Structural {
+            PrepareMode::Structural
+        } else {
+            PrepareMode::Foreground
+        };
+        if selection.mode != PrepareMode::Mixed && selection.mode != mode {
             continue;
         }
         if !demand.eligible_peers.is_empty()
@@ -168,10 +178,14 @@ fn prepare_inner(
             store.seed_content_reference(&demand.reference)?;
         }
         for edge in store.content_range_candidates(&demand.reference, demand.range)? {
+            if priority == DemandPriority::Structural && edge.edge.key.kind != ObjectKind::Manifest
+            {
+                continue;
+            }
             if !selection.lane.owns(&edge.edge.key.digest.to_string()) {
                 continue;
             }
-            candidates.push((edge, DemandPriority::Foreground, vec![demand.waiter]));
+            candidates.push((edge, priority, vec![demand.waiter]));
             if candidates.len() >= 32 {
                 break;
             }

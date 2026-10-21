@@ -98,7 +98,7 @@ impl WaitSlots {
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
     }
-    fn take(&'static self) -> Option<WaitSlot> {
+    pub(super) fn take(&'static self) -> Option<WaitSlot> {
         let max = self.max.load(Ordering::Relaxed);
         self.used
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
@@ -110,7 +110,7 @@ impl WaitSlots {
 }
 
 /// One taken [`WaitSlots`] slot, given back on drop.
-struct WaitSlot(&'static WaitSlots);
+pub(super) struct WaitSlot(&'static WaitSlots);
 
 impl Drop for WaitSlot {
     fn drop(&mut self) {

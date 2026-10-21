@@ -43,6 +43,8 @@ pub enum Availability {
 
 /// Owns an immutable version and a provider-specific lease. Clones share that
 /// lease. The provider must keep its reachability pin until the last clone drops.
+/// Lease release must be bounded and perform no disk/network I/O. A provider
+/// needing asynchronous cleanup owns its bounded cleanup mechanism separately.
 #[derive(Clone)]
 pub struct PinnedContent {
     reference: FileContentRef,

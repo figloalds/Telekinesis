@@ -429,8 +429,11 @@ fn start(args: &WorkerArgs) -> Result<Running, FatalLine> {
     // not print a FatalLine after the ReadyLine.
     #[cfg(target_os = "linux")]
     unsafe {
-        libc::signal(libc::SIGINT, signal_stop as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_stop as libc::sighandler_t);
+        libc::signal(libc::SIGINT, signal_stop as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            signal_stop as *const () as libc::sighandler_t,
+        );
     }
     start_background(&ctx);
     Ok(Running {

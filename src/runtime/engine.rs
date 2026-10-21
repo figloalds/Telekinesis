@@ -172,6 +172,11 @@ struct PendingSave {
     preserve_times: u8,
 }
 pub struct Engine {
+    pub(crate) native_writes: Option<Arc<super::content_writes::NativeWrites>>,
+    pub(super) content_provider: Option<Arc<dyn crate::content::ContentProvider>>,
+    /// One bounded content executor per engine, including cancelled workers
+    /// still finishing I/O. Ordinary legacy mounts do not construct it yet.
+    pub(super) content_saver: std::sync::Weak<super::content_saves::SavePool>,
     pub store: Store,
     pub sessions: BTreeMap<String, Session>,
     pub handles: BTreeMap<u64, Handle>,
@@ -574,8 +579,28 @@ fn count_pending_saves(store: &Store, vitals: &EngineVitals) {
     }
 }
 impl Engine {
+    /// Install the worker's immutable read provider before descriptor sessions
+    /// exist. Default local-provider construction is lazy and off-lock.
+    pub fn install_content_provider(
+        &mut self,
+        provider: Arc<dyn crate::content::ContentProvider>,
+    ) -> Result<()> {
+        ensure!(
+            self.content_provider.is_none()
+                && self
+                    .sessions
+                    .values()
+                    .all(|session| session.bytes.content_selection().is_none()),
+            "CONTENT_RESOURCE_LIMIT"
+        );
+        self.content_provider = Some(provider);
+        Ok(())
+    }
     pub fn new(store: Store) -> Self {
         let mut engine = Self {
+            native_writes: None,
+            content_provider: None,
+            content_saver: std::sync::Weak::new(),
             sessions: BTreeMap::new(),
             handles: BTreeMap::new(),
             next_handle: 1,
@@ -653,6 +678,12 @@ impl Engine {
             active: self.store.active.clone(),
             branch,
         });
+    }
+    /// A fenced publication through a secondary connection has committed.
+    /// `total_changes` below sees only this connection; explicitly invalidate
+    /// the status cell even when its primary connection performed no write.
+    pub(super) fn note_secondary_commit(&self) {
+        self.vitals.store_revision.fetch_add(1, Ordering::Relaxed);
     }
     /// Copies the cheap counters into [`EngineVitals`] (no SQL: the store
     /// revision compares the connection's `total_changes`, the sync
@@ -805,7 +836,15 @@ impl Engine {
             }
             let content = entry.revisions.get("content").cloned();
             if content != session.content_base {
-                match crate::staging::Staged::from_object(&self.store, entry.content.as_deref()) {
+                if session.bytes.content_selection().is_some_and(|selection| {
+                    Some(selection.reference()) == entry.content_ref.as_ref()
+                }) {
+                    session.content_base = content;
+                    session.alive_base = entry.revisions.get("alive").cloned();
+                    session.entry = entry;
+                    continue;
+                }
+                match crate::staging::Staged::from_entry(&self.store, &entry) {
                     Ok(bytes) => {
                         session.bytes = bytes;
                         session.content_base = content;
@@ -823,6 +862,7 @@ impl Engine {
                 }
             }
             session.alive_base = entry.revisions.get("alive").cloned();
+            session.entry = entry;
         }
         if let Some(before) = &delta.before {
             self.notify_activation(before, &delta.entities, delta.namespace_changed);
@@ -1245,6 +1285,16 @@ impl Engine {
         let mut retained = 0;
         let mut failure = None;
         for entity in &dirty {
+            if let Some(file) = self.sessions[entity].bytes.cow_file() {
+                if file.recoverable() {
+                    retained += 1;
+                } else {
+                    failure.get_or_insert_with(|| {
+                        anyhow::anyhow!("CONTENT_SAVE_REQUIRES_OFFLOCK_RETAIN: {entity}")
+                    });
+                }
+                continue;
+            }
             match self.retain_pending(entity, &reason) {
                 Ok(()) => retained += 1,
                 Err(error) => {
@@ -1771,6 +1821,10 @@ impl Engine {
         if let Some(session) = self.sessions.get(&entry.id).filter(|s| s.dirty) {
             return Ok(session.bytes.len());
         }
+        if let Some(reference) = &entry.content_ref {
+            reference.validate()?;
+            return usize::try_from(reference.total_len).context("FILE_TOO_LARGE");
+        }
         Ok(entry
             .content
             .as_ref()
@@ -2026,6 +2080,10 @@ impl Engine {
             self.lookup_visible(path)?
         };
         ensure!(
+            !writable || entry.content_ref.is_none() || self.native_writes.is_some(),
+            "PEER_NEEDS_UPGRADE: content write callbacks are not enabled"
+        );
+        ensure!(
             create.is_some()
                 || !writable
                 || entry.kind == "directory"
@@ -2053,7 +2111,7 @@ impl Engine {
             let bytes = if special {
                 crate::staging::Staged::memory(self.discovery.clone())
             } else {
-                crate::staging::Staged::from_object(&self.store, entry.content.as_deref())?
+                crate::staging::Staged::from_entry(&self.store, &entry)?
             };
             self.sessions.insert(
                 entry.id.clone(),
@@ -2474,7 +2532,7 @@ impl SaveSignal {
     pub fn generation(&self) -> u64 {
         *crate::util::lock::lock(&self.generation)
     }
-    fn bump(&self) {
+    pub(super) fn bump(&self) {
         *crate::util::lock::lock(&self.generation) += 1;
         self.changed.notify_all();
     }
@@ -2823,6 +2881,10 @@ pub fn save_entity(engine: &Shared, entity: &str) -> Result<()> {
 /// leave an entity a save of which runs to that save (edits made since stay
 /// dirty for the savers' sweep, [`orphan_dirty`]).
 fn save_entity_as(engine: &Shared, entity: &str, background: bool) -> Result<()> {
+    let context = super::content_writes::default_context(engine)?;
+    if super::content_writes::save_entity(engine, entity, &context)? {
+        return Ok(());
+    }
     loop {
         if background {
             yield_to_foreground();
@@ -3202,6 +3264,10 @@ fn yield_to_foreground() {
 /// background save is retained (`pending_saves`) and retried with the
 /// pending-save backoff.
 pub fn save_handle_in_background(engine: &Shared, h: u64) -> Result<()> {
+    let context = super::content_writes::default_context(engine)?;
+    if super::content_writes::file(engine, h, &context)?.is_some() {
+        return save_handle(engine, h);
+    }
     let entity = {
         let mut e = super::lock_engine(engine);
         let Some(entity) = e.handles.get(&h).map(|handle| handle.entity.clone()) else {
@@ -3324,6 +3390,12 @@ pub fn settle_handle(engine: &Shared, h: u64) -> Result<()> {
 /// WinFsp close holds the application's `CloseHandle` until it answers
 /// (measured: a save in it cost the application the whole save).
 pub fn close_handle(engine: &Shared, h: u64) -> Result<()> {
+    let context = super::content_writes::default_context(engine)?;
+    if super::content_writes::file(engine, h, &context)?.is_some() {
+        let result = save_handle(engine, h);
+        super::lock_engine(engine).release_handle(h)?;
+        return result;
+    }
     let unsaved = {
         let mut e = super::lock_engine(engine);
         let now = Instant::now();

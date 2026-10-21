@@ -30,6 +30,18 @@ sync_interval_ms = 500
 | `network.connections` | The default pool per peer, 1–16 (default 4): lane 0 carries metadata, the other lanes file content, so the pool is at least 2. `manage pair --connections N` overrides it per peer. More lanes help many files move at once; one file always moves on one lane. |
 | `network.sync_interval_ms` | The idle **anti-entropy** interval, 50–60,000 ms (default 500): a folder that has not exchanged metadata with a peer for this long does so again. Changes do not wait for it: a local change, a remote change (its catalog tip) or newly staged events start an exchange at once, and content moves continuously while there is any. Connections stay up whatever the value (heartbeats every 5 s of silence), so a long interval costs nothing but a slower safety net. The stall threshold is `max(60 s, 20 × sync_interval_ms)`. |
 
+## Wave 6 development stores
+
+Ordinary repositories continue writing legacy content. There is currently no
+supported configuration option or activation command for chunked writes.
+`fixture:content_v1` is an internal isolated-test marker; it does not establish
+peer compatibility, migrate a user workspace or fence an older executable.
+The native COW service is installed explicitly by fixtures before mounting.
+Capability negotiation, isolated-store deployment fencing, resumable migration
+and downgrade/export guidance remain required by
+[WP6.6](revamp/WAVE_6_PLAN.md#4-compatibility-retention-and-rollout).
+The application configuration format and defaults above are unchanged.
+
 ## Environment variables
 
 Set them in the daemon's environment; workers inherit it. All are optional.

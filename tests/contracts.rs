@@ -2120,8 +2120,12 @@ fn classify_matches_the_section_8_table() {
 /// `TKFS_*` and `CARGO_*` environment variable names are skipped by prefix
 /// (`CARGO_`: CCR-WP1.2-1, CCR-WP1.4-3, CCR-WP1.11-3).
 const NOT_CODES: &[&str] = &[
-    "TKFC", // Wave 6 descriptor binary magic
-    "TKFM", // Wave 6 manifest binary magic
+    "WAVE6_CAPACITY",     // Structured unit-test measurement label, never an error.
+    "WAVE6_ROOT_JOURNAL", // Structured private-journal measurement label.
+    "WAVE6_ADOPTION",     // Structured continuation-adoption measurement label.
+    "TKFC",               // Wave 6 descriptor binary magic
+    "TKFM",               // Wave 6 manifest binary magic
+    "TKOM",               // Private immutable overlay-node binary magic
     "ALTER",
     "BEGIN",
     "COMMIT",
@@ -2157,6 +2161,44 @@ fn wave6_error_scopes_extend_the_historical_table() {
     }
     assert!(!classify("CONTENT_CANCELLED").counts_as_failure());
     assert!(!classify("STALE_ADMISSION_GENERATION").counts_as_failure());
+    for code in [
+        "STALE_WRITE_SESSION",
+        "STALE_WRITE_CHECKPOINT",
+        "STALE_CONTENT_SAVE",
+        "STALE_CONTENT_VIEW",
+        "STALE_CONTENT_WORKSPACE",
+        "CONTENT_SAVE_ALREADY_COMMITTED",
+    ] {
+        assert!(
+            !classify(code).counts_as_failure(),
+            "superseded work: {code}"
+        );
+    }
+    for code in [
+        "CORRUPT_WRITE_JOURNAL",
+        "CORRUPT_CONTENT_SAVE",
+        "CONTENT_SAVE_PUBLICATION_LOST",
+        "CONTENT_SAVE_SELECTION_LOST",
+        "CONTENT_SAVE_ROLLBACK_FAILED",
+    ] {
+        assert_eq!(classify(code), ErrorClass::Fatal);
+        assert!(
+            !classify(code).retries_automatically(),
+            "retain the failed save: {code}"
+        );
+    }
+    assert_eq!(
+        classify("CONTENT_SAVE_CAPTURE_LIMIT"),
+        ErrorClass::NeedsUserAction
+    );
+    assert_eq!(
+        classify("WRITE_GENERATION_EXHAUSTED"),
+        ErrorClass::NeedsUserAction
+    );
+    assert_eq!(
+        classify("WRITE_JOURNAL_NEEDS_UPGRADE"),
+        ErrorClass::Incompatible
+    );
     assert_eq!(classify("CORRUPT_CONTENT"), ErrorClass::Transient);
     assert_eq!(classify("MANIFEST_COVERAGE"), ErrorClass::Fatal);
     assert_eq!(

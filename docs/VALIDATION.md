@@ -18,6 +18,60 @@ omissions and continuation decisions are recorded in the
 [closure handoff](revamp/notes/wave-5-handoff.md) and
 `test-evidence/qualification-wave-5.json`.
 
+## Wave 6 development qualification
+
+Wave 6 remains in progress with production content activation off. Its
+[implementation record](revamp/notes/wp6-progress.md) distinguishes completed
+package evidence, failed attempts and outstanding release gates. Per-package
+JSON under `test-evidence/wave-6/` records source hashes, commands, actual test
+images, individual samples and omissions. These focused results do not replace
+the complete Windows/Linux matrix, matched build measurements, migration and
+retention rehearsals, two-peer outage/load qualification or 30-minute soak in
+the [Wave 6 plan](revamp/WAVE_6_PLAN.md#5-build-performance-work-and-acceptance).
+
+The isolated COW base tests use real SQLite, verified CAS and authenticated
+loopback/peer sessions. A focused ordinary run creates only temporary stores:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_transport native_cow_ -- --test-threads=1 --nocapture
+```
+
+Actual mount tests are explicit ignored opt-ins and require working WinFsp
+or FUSE. The authenticated COW fsync test runs its mount in an isolated child
+process and fails if that real mount or peer scenario cannot run:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_transport -- --exact isolated_kernel_cow_write_prepares_base_then_fsync_succeeds_offline --ignored --test-threads=1 --nocapture
+```
+
+This test requires authenticated hydration before the kernel write returns,
+disconnects the peer, then checks local fsync and reopen equality. Ordinary
+tests also remove a required local base object after an acknowledged write and
+require immediate local failure, zero demand-hook calls, retained Saved/private
+bytes and successful retry after restoring that local object. The 1 GiB
+deduplicated-tree/4 KiB edit test bounds preflight reads/pages and asserts no CAS
+installation or FULL checkpoint before fsync. Fixture seeding is excluded.
+Earlier CCR17 evidence retains its interim fsync-network and buffer-permit gaps
+as history; the current preflight/local-fsync boundary is recorded separately.
+
+The structural-idle case observes seven empty structural preparations of the
+tested repository, removes its local manifest page, then starts a native COW
+write behind two stalled background source reads. It requires admission within
+the original 250 ms bound and checks repaired bytes plus local fsync:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_transport -- --exact native_cow_structural_repair_admits_within_250ms_after_idle_behind_stalled_background --test-threads=1 --nocapture
+```
+
+The implementation record preserves the failing unmodified timing policy and
+distinguishes this scenario from the full aggregate fairness/load matrix.
+
+Use the full command/toolchain/target-cache details in the relevant evidence
+when reproducing a recorded result. A successful compile is not a test pass;
+an ignored case, an early-return child driver and a parent-invoked helper are
+not additional scenario proofs. Preserved earlier Wave 5 floors below remain
+outstanding for changed Wave 6 sources until explicitly rerun and attributed.
+
 ## The test suite
 
 ```powershell

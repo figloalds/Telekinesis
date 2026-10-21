@@ -540,12 +540,27 @@ fn orphaned_spools_are_removed_and_pending_ones_kept() {
 #[test]
 fn a_retained_save_takes_the_writer_only_for_its_commit() {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tkfs::util::fault::{self, FaultAction, FaultConfig};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            fault::configure(None);
+        }
+    }
+    let _reset = Reset;
     let dir = tempfile::tempdir().unwrap();
     let mut engine = Engine::new(Store::open(dir.path(), Some(REPO)).unwrap());
     let large: Vec<u8> = (0..32 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
     let (h, entry) = engine.open("large.bin", Some("file"), true).unwrap();
     engine.write(h, 0, &large, false, false).unwrap();
     assert_eq!(engine.retain_all_dirty().unwrap(), 1);
+    // Keep actual byte work in progress long enough to sample on fast disks.
+    // With the old writer-before-store ordering, this delay holds the writer
+    // and the existing free-slot ratio assertion still fails.
+    let mut slow_bytes = FaultConfig::new("engine.save.store", FaultAction::Hang);
+    slow_bytes.ms = Some(400);
+    slow_bytes.count = Some(1);
+    fault::configure(Some(slow_bytes));
     let flushing = Arc::new(AtomicBool::new(true));
     let probe = {
         let flushing = flushing.clone();
@@ -571,6 +586,7 @@ fn a_retained_save_takes_the_writer_only_for_its_commit() {
     engine.flush(h).unwrap();
     flushing.store(false, Ordering::Relaxed);
     let (free, held) = probe.join().unwrap();
+    assert_eq!(fault::fired(), 1, "the byte-work delay must actually run");
     assert!(!engine.sessions[&entry.id].dirty);
     assert!(pending_entities(&engine).is_empty());
     let saved = engine.store.lookup("large.bin").unwrap();

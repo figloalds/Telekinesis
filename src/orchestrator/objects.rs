@@ -48,7 +48,7 @@
 //!    session, exclude}`: wanted objects owned by the lane, with their
 //!    durable spool offsets. The lease session is one of two ids per lane and
 //!    repository ([`pull_lease`]), qualified with this lane run's ordered
-//!    generation (CCR-WP6.3-4). A want
+//!    generation and a fresh round nonce (CCR-WP6.3-11). A want
 //!    issued while a pull is in flight uses the id the previous want did not,
 //!    so it never returns that pull's objects again (the worker hides
 //!    objects leased to another session). A want with no pull in flight asks
@@ -76,6 +76,11 @@
 //!    flight: when the link is the bottleneck the next pull starts while one
 //!    still streams. A large object is split across consecutive pulls; their
 //!    chunks may interleave on the wire, and the sink orders them.
+//!    WP6.3 additionally caps each issued payload at 256 KiB and reserves
+//!    1 MiB in the daemon's common content scheduler. The lane window remains
+//!    an outer bound; it cannot multiply the global job/byte/class budgets.
+//!    The client stream, buffered pieces and active write batches retain that
+//!    reservation independently, including after the runner's exit wait.
 //! 3. Each CHUNK `{hash, offset, total, last}` goes to the [`Sink`]: at most
 //!    `INFLIGHT_WRITES` (4) worker `objects.write` calls in flight, one per
 //!    object at a time, each at the object's durable offset, ≤ 1 MiB, tiny
@@ -190,6 +195,7 @@ use super::{
     worker_client::{self, ReadFlow, ReadRange, SessionWorkerClient},
 };
 use crate::{
+    content::scheduler::StreamLease,
     model::{
         errors::{ErrorClass, ErrorWire, Scope},
         orchestrator::{CallError, Ctx, PeerContext},
@@ -215,8 +221,8 @@ use crate::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{
-        Arc, Condvar, Mutex, OnceLock, PoisonError,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex, OnceLock, PoisonError, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -270,6 +276,10 @@ const DEMAND_DEADLINE: Duration = Duration::from_secs(1);
 const KEPT_CLAIM_WAIT: Duration = Duration::from_secs(2);
 /// Kept leases remembered per repository at most (the rest lapse).
 const MAX_KEPT: usize = 4096;
+/// Metadata retained by one download round, independent of bytes moved.
+pub const ROUND_OBJECTS: usize = MAX_KEPT;
+/// Live/pending pull records. Completed records are removed after reporting.
+pub const ROUND_PULL_RECORDS: usize = 8;
 /// The SHA-256 of no bytes: the only object whose size is 0. A want item of
 /// another object with size 0 has an unknown size (an event without a size
 /// descriptor; WP3.INT re-review), and its sender's total defines it.
@@ -337,6 +347,10 @@ impl LaneOptions {
 /// What a lane did (counters only grow; `*_peak` are maxima).
 #[derive(Debug, Default)]
 pub struct LaneStats {
+    /// Max records/objects in any one round, not the sum across repositories.
+    pub pull_records_peak: AtomicU64,
+    pub round_objects_peak: AtomicU64,
+    pub object_budget_yields: AtomicU64,
     /// Download window bytes reserved now / at most.
     pub window_used: AtomicU64,
     pub window_peak: AtomicU64,
@@ -585,9 +599,131 @@ struct Held {
 struct HeldTable {
     map: HashMap<String, HashMap<String, Held>>,
     entries: usize,
+    epochs: HashMap<String, Weak<ObjectEpoch>>,
+}
+
+struct ObjectEpoch {
+    object: String,
+    current: Mutex<Weak<()>>,
+}
+struct ObjectWorkState {
+    epoch: Arc<ObjectEpoch>,
+    token: Arc<()>,
+    alive: AtomicBool,
+    source: String,
+}
+/// One source attempt in the epoch before the next verified local install.
+/// Concurrent sources share an epoch; cancellation retires only this attempt.
+pub(crate) struct ObjectWork(Arc<ObjectWorkState>);
+impl ObjectWork {
+    fn current_locked(&self, key: Option<&ObjectKey>) -> bool {
+        self.0.alive.load(Ordering::Acquire)
+            && key.is_none_or(|key| key.object == self.0.epoch.object && key.peer == self.0.source)
+            && lock(&self.0.epoch.current)
+                .upgrade()
+                .is_some_and(|token| Arc::ptr_eq(&token, &self.0.token))
+    }
+    pub(crate) fn current(&self) -> bool {
+        let _table = lock(held());
+        self.current_locked(None)
+    }
+    pub(crate) fn cancel(&self) {
+        let _table = lock(held());
+        self.0.alive.store(false, Ordering::Release);
+    }
+    pub(crate) fn on_cancel(&self, cancel: &Cancel) {
+        let weak = Arc::downgrade(&self.0);
+        cancel.on_cancel(Box::new(move || {
+            if let Some(work) = weak.upgrade() {
+                let _table = lock(held());
+                work.alive.store(false, Ordering::Release);
+            }
+        }));
+    }
+}
+
+pub(crate) fn object_work(key: &ObjectKey) -> Result<ObjectWork, ErrorWire> {
+    lock(held()).work(key)
+}
+
+pub(crate) fn object_failed_work(
+    key: &ObjectKey,
+    work: &ObjectWork,
+    code: &str,
+    unserved: bool,
+) -> Option<Duration> {
+    let mut table = lock(held());
+    if !work.current_locked(Some(key)) {
+        return None;
+    }
+    let now = Instant::now();
+    let held = table.entry(
+        key,
+        now,
+        if unserved {
+            unserved_backoff
+        } else {
+            Backoff::objects
+        },
+    );
+    let delay = held.backoff.failure(now);
+    held.until = now + delay;
+    if !code.is_empty() {
+        held.code = code.to_owned();
+    }
+    Some(delay)
+}
+
+pub(crate) fn object_installed_work(key: &ObjectKey, work: &ObjectWork) -> bool {
+    let mut table = lock(held());
+    if !work.current_locked(Some(key)) {
+        return false;
+    }
+    let removed = installed_entries(&mut table, key);
+    drop(table);
+    drop(removed);
+    true
 }
 
 impl HeldTable {
+    fn work(&mut self, key: &ObjectKey) -> Result<ObjectWork, ErrorWire> {
+        let epoch = match self.epochs.get(&key.object).and_then(Weak::upgrade) {
+            Some(epoch) => epoch,
+            None => {
+                if self.epochs.len() >= BACKOFF_MAX {
+                    self.epochs.retain(|_, epoch| epoch.strong_count() > 0);
+                    if self.epochs.len() >= BACKOFF_MAX {
+                        return Err(ErrorWire::coded(
+                            "CONTENT_RESOURCE_LIMIT",
+                            "daemon object effect capacity",
+                        ));
+                    }
+                }
+                let epoch = Arc::new(ObjectEpoch {
+                    object: key.object.clone(),
+                    current: Mutex::new(Weak::new()),
+                });
+                self.epochs
+                    .insert(key.object.clone(), Arc::downgrade(&epoch));
+                epoch
+            }
+        };
+        let token = {
+            let mut current = lock(&epoch.current);
+            current.upgrade().unwrap_or_else(|| {
+                let token = Arc::new(());
+                *current = Arc::downgrade(&token);
+                token
+            })
+        };
+        Ok(ObjectWork(Arc::new(ObjectWorkState {
+            epoch,
+            token,
+            alive: AtomicBool::new(true),
+            source: key.peer.clone(),
+        })))
+    }
+
     fn get(&self, key: &ObjectKey) -> Option<&Held> {
         self.map.get(&key.object)?.get(&key.peer)
     }
@@ -683,6 +819,17 @@ fn held() -> &'static Mutex<HeldTable> {
 /// Per-object backoffs remembered now (diagnostics and tests).
 pub fn object_backoffs() -> usize {
     lock(held()).entries
+}
+
+/// Scoped diagnostics for a remembered legacy object/source retry.
+pub fn object_backoff_for(
+    local: &str,
+    peer: &str,
+    repo: &str,
+    up: bool,
+    hash: &str,
+) -> Option<Duration> {
+    object_blocked_for(&object_key(local, peer, repo, up, hash))
 }
 
 /// A per-object backoff key: the object (local installation, repository,
@@ -798,8 +945,8 @@ pub(crate) fn object_completed(key: &ObjectKey) -> Option<String> {
 /// failures of every source of it; returns their codes, each once (to
 /// resolve in the hub).
 pub(crate) fn object_installed(key: &ObjectKey) -> Vec<String> {
-    let mut codes: Vec<String> = lock(held())
-        .remove_object(&key.object)
+    let removed = installed_entries(&mut lock(held()), key);
+    let mut codes: Vec<String> = removed
         .into_iter()
         .map(|held| held.code)
         .filter(|code| !code.is_empty())
@@ -807,6 +954,13 @@ pub(crate) fn object_installed(key: &ObjectKey) -> Vec<String> {
     codes.sort();
     codes.dedup();
     codes
+}
+
+fn installed_entries(table: &mut HeldTable, key: &ObjectKey) -> Vec<Held> {
+    if let Some(epoch) = table.epochs.get(&key.object).and_then(Weak::upgrade) {
+        *lock(&epoch.current) = Weak::new();
+    }
+    table.remove_object(&key.object)
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1395,10 @@ impl Drop for RepoTurn<'_> {
 /// the sink's lock).
 #[derive(Clone, Debug)]
 pub(crate) enum SinkEvent {
+    /// One accepted empty payload has left the sink, including a zero write.
+    EmptyReleased { tag: u64 },
+    /// Buffered stream proofs dropped after lane credits were published.
+    CreditsReturned,
     /// `bytes` offered under `tag` left the sink: written durably
     /// (`written`), or dropped.
     Released { tag: u64, bytes: u64, written: bool },
@@ -1314,6 +1472,61 @@ struct SinkInner {
     state: Mutex<SinkState>,
     changed: Condvar,
     hook: SinkHook,
+    retiring: AtomicUsize,
+    credit_epoch: AtomicU64,
+}
+
+struct RetiredStreams<'a> {
+    proofs: Vec<Arc<StreamLease>>,
+    count: &'a AtomicUsize,
+    epoch: &'a AtomicU64,
+}
+impl<'a> RetiredStreams<'a> {
+    fn new(proofs: Vec<Arc<StreamLease>>, count: &'a AtomicUsize, epoch: &'a AtomicU64) -> Self {
+        if !proofs.is_empty() {
+            count.fetch_add(1, Ordering::Release);
+        }
+        Self {
+            proofs,
+            count,
+            epoch,
+        }
+    }
+}
+impl Drop for RetiredStreams<'_> {
+    fn drop(&mut self) {
+        if !self.proofs.is_empty() {
+            drop(std::mem::take(&mut self.proofs));
+            self.epoch.fetch_add(1, Ordering::Release);
+            self.count.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+impl SinkInner {
+    fn retire<'a>(&'a self, state: &mut SinkState) -> RetiredStreams<'a> {
+        RetiredStreams::new(
+            std::mem::take(&mut state.retired_streams),
+            &self.retiring,
+            &self.credit_epoch,
+        )
+    }
+
+    fn publish(&self, events: Vec<SinkEvent>, retired: RetiredStreams<'_>) {
+        let returned = !retired.proofs.is_empty();
+        if !events.is_empty() {
+            (self.hook)(events);
+        }
+        if returned {
+            // A diagnostic stall outside every sink/scheduler lock.
+            crate::util::fault::hang("legacy.sink.before_capacity_return");
+        }
+        drop(retired);
+        // The earlier event may wake a receiver before the proof drops.
+        // Give it another readiness edge after releasing these proofs.
+        if returned {
+            (self.hook)(vec![SinkEvent::CreditsReturned]);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1324,6 +1537,15 @@ struct SinkState {
     buffered: u64,
     closing: bool,
     fatal: Option<CallError>,
+    streams: HashMap<u64, BufferedStream>,
+    /// Retain the last proof until the corresponding lane credit hook runs.
+    retired_streams: Vec<Arc<StreamLease>>,
+}
+
+struct BufferedStream {
+    lease: Arc<StreamLease>,
+    bytes: u64,
+    empty: usize,
 }
 
 struct SinkObject {
@@ -1359,17 +1581,32 @@ struct Batch {
     body: Vec<u8>,
     /// Per item: its tags (tag, bytes) in order.
     tags: Vec<Vec<(u64, u64)>>,
+    _streams: Vec<Arc<StreamLease>>,
 }
 
 impl SinkState {
     fn release(&mut self, tag: u64, bytes: u64, written: bool, events: &mut Vec<SinkEvent>) {
         self.buffered = self.buffered.saturating_sub(bytes);
+        if let Some(stream) = self.streams.get_mut(&tag) {
+            stream.bytes = stream.bytes.saturating_sub(bytes);
+            if bytes == 0 {
+                stream.empty = stream.empty.saturating_sub(1);
+            }
+            if stream.bytes == 0
+                && stream.empty == 0
+                && let Some(stream) = self.streams.remove(&tag)
+            {
+                self.retired_streams.push(stream.lease);
+            }
+        }
         if bytes > 0 {
             events.push(SinkEvent::Released {
                 tag,
                 bytes,
                 written,
             });
+        } else {
+            events.push(SinkEvent::EmptyReleased { tag });
         }
     }
 
@@ -1384,6 +1621,7 @@ impl SinkState {
             .map(|(tag, bytes)| (tag, bytes.len() as u64))
             .collect();
         object.buf_len = 0;
+        let empty = object.empty_due.then_some(object.last_tag);
         object.empty_due = false;
         let pending: Vec<(u64, u64)> = std::mem::take(&mut object.pending)
             .into_values()
@@ -1391,6 +1629,9 @@ impl SinkState {
             .collect();
         for (tag, bytes) in tags.into_iter().chain(pending) {
             self.release(tag, bytes, false, events);
+        }
+        if let Some(tag) = empty {
+            self.release(tag, 0, false, events);
         }
     }
 
@@ -1488,6 +1729,7 @@ impl SinkState {
             items: Vec::new(),
             body: Vec::new(),
             tags: Vec::new(),
+            _streams: Vec::new(),
         };
         let mut later = Vec::new();
         while let Some(hash) = self.ready.pop_front() {
@@ -1541,6 +1783,11 @@ impl SinkState {
             }
             if tags.is_empty() {
                 tags.push((object.last_tag, 0));
+            }
+            for (tag, _) in &tags {
+                if let Some(stream) = self.streams.get(tag) {
+                    batch._streams.push(stream.lease.clone());
+                }
             }
             batch.items.push(WriteItem {
                 hash: hash.clone(),
@@ -1691,6 +1938,8 @@ impl Sink {
             state: Mutex::new(SinkState::default()),
             changed: Condvar::new(),
             hook,
+            retiring: AtomicUsize::new(0),
+            credit_epoch: AtomicU64::new(0),
         });
         let writers = (0..options.writers.max(1))
             .filter_map(|index| {
@@ -1706,14 +1955,13 @@ impl Sink {
 
     fn with_state<T>(&self, f: impl FnOnce(&mut SinkState, &mut Vec<SinkEvent>) -> T) -> T {
         let mut events = Vec::new();
-        let value = {
+        let (value, retired) = {
             let mut state = lock(&self.inner.state);
-            f(&mut state, &mut events)
+            let value = f(&mut state, &mut events);
+            (value, self.inner.retire(&mut state))
         };
         self.inner.changed.notify_all();
-        if !events.is_empty() {
-            (self.inner.hook)(events);
-        }
+        self.inner.publish(events, retired);
         value
     }
 
@@ -1758,6 +2006,18 @@ impl Sink {
         bytes: &[u8],
         tag: u64,
     ) -> Result<(), ObjectOutcome> {
+        self.offer_retained(hash, offset, total, bytes, tag, None)
+    }
+
+    fn offer_retained(
+        &self,
+        hash: &str,
+        offset: u64,
+        total: u64,
+        bytes: &[u8],
+        tag: u64,
+        stream: Option<Arc<StreamLease>>,
+    ) -> Result<(), ObjectOutcome> {
         let len = bytes.len() as u64;
         let max_write = self.inner.options.max_write;
         self.with_state(|state, events| {
@@ -1800,6 +2060,17 @@ impl Sink {
                 return verdict;
             }
             state.buffered += len;
+            if let Some(lease) = stream {
+                let buffered = state.streams.entry(tag).or_insert(BufferedStream {
+                    lease,
+                    bytes: 0,
+                    empty: 0,
+                });
+                buffered.bytes += len;
+                if len == 0 {
+                    buffered.empty += 1;
+                }
+            }
             let next = state.objects.get(hash).map_or(offset, |object| object.next);
             if offset == next {
                 state.append(hash, tag, bytes.to_vec(), events);
@@ -1917,6 +2188,16 @@ impl Sink {
         lock(&self.inner.state).fatal.clone()
     }
 
+    /// Local work that can return this round's stream capacity without a new
+    /// source request. Include the short credit-publication retirement phase.
+    fn pending(&self) -> bool {
+        let state = lock(&self.inner.state);
+        state.writing != 0
+            || state.buffered != 0
+            || !state.streams.is_empty()
+            || self.inner.retiring.load(Ordering::Acquire) != 0
+    }
+
     /// Ends the sink: writes what is held (`flush`) or drops it, waits for
     /// the calls in flight, releases whatever is left, and returns every
     /// object's final state.
@@ -2017,14 +2298,13 @@ fn write_loop(inner: &SinkInner) {
         );
         batch.items = items;
         let mut events = Vec::new();
-        {
+        let retired = {
             let mut state = lock(&inner.state);
             state.apply(batch, result, &inner.options, &mut events);
-        }
+            inner.retire(&mut state)
+        };
         inner.changed.notify_all();
-        if !events.is_empty() {
-            (inner.hook)(events);
-        }
+        inner.publish(events, retired);
     }
 }
 
@@ -2071,21 +2351,17 @@ pub fn run_lane_with(
     let token = cancel.child();
     let leases = (|| -> Result<_, ErrorWire> {
         let generation = super::lease_clock::pull(&ctx, &peer, &token)?;
-        Ok((
-            generation,
-            [
-                crate::model::lease::qualify_pull(
-                    &pull_lease(&peer.installation, lane, 0),
-                    generation,
-                )?,
-                crate::model::lease::qualify_pull(
-                    &pull_lease(&peer.installation, lane, 1),
-                    generation,
-                )?,
-            ],
-        ))
+        // Validate the historical form before starting either direction;
+        // check the negotiated round form before the worker's first want.
+        for slot in 0..2 {
+            crate::model::lease::qualify_pull(
+                &pull_lease(&peer.installation, lane, slot),
+                generation,
+            )?;
+        }
+        Ok(generation)
     })();
-    let (generation, leases) = match leases {
+    let generation = match leases {
         Ok(leases) => leases,
         Err(error) => {
             refuse(
@@ -2116,7 +2392,7 @@ pub fn run_lane_with(
     };
     let stats = options.stats.clone().unwrap_or_default();
     let run = Arc::new(LaneRun {
-        leases,
+        generation,
         ctx: ctx.clone(),
         peer: peer.clone(),
         conn: conn.clone(),
@@ -2140,6 +2416,7 @@ pub fn run_lane_with(
         remote_content: Mutex::new(HashMap::new()),
         kept: Mutex::new(HashMap::new()),
         demand: Mutex::new(HashMap::new()),
+        round_workers: Mutex::new(HashMap::new()),
         options: options.clone(),
     });
     let ended = run.clone();
@@ -2219,13 +2496,8 @@ fn release_kept(lane: &LaneRun) {
             }
             continue;
         };
-        let mut by_slot: BTreeMap<usize, Vec<String>> = BTreeMap::new();
-        for (hash, (slot, _)) in kept.hashes {
-            by_slot.entry(slot).or_default().push(hash);
-        }
-        for (slot, hashes) in by_slot {
-            bump(&lane.stats.kept_released, hashes.len() as u64);
-            release_leases(&kept.client, &kept.route, &lane.lease(slot), hashes);
+        if !lane.ctx.stopping.load(Ordering::Relaxed) {
+            release_retained(lane, kept);
         }
     }
 }
@@ -2261,7 +2533,7 @@ pub fn status_lane(lane: LaneSpec) -> u32 {
 
 /// What both directions of a lane share.
 struct LaneRun {
-    leases: [String; 2],
+    generation: crate::model::lease::PullRun,
     ctx: Arc<Ctx>,
     peer: Arc<PeerContext>,
     conn: session::Conn,
@@ -2293,6 +2565,9 @@ struct LaneRun {
     /// Per worker instance: whether it answers `objects.demand` (a worker of
     /// an older build does not; WP5.3).
     demand: Mutex<HashMap<String, bool>>,
+    /// Negotiated per immutable worker instance; unsupported workers retain
+    /// the historical stable IDs, whose cleanup has no round-fence promise.
+    round_workers: Mutex<HashMap<String, RoundWorker>>,
     options: LaneOptions,
 }
 
@@ -2300,10 +2575,102 @@ struct LaneRun {
 struct Kept {
     route: SyncRoute,
     client: Arc<SessionWorkerClient>,
-    /// Hash → its lease id (`slot` of [`pull_lease`]) and when a round last
+    /// Hash → its exact round lease id and when a round last
     /// planned it (an entry no round planned again for a lease TTL is
     /// dropped: the lease lapsed, or it was never ours again).
-    hashes: BTreeMap<String, (usize, Instant)>,
+    hashes: BTreeMap<String, KeptLease>,
+}
+
+struct KeptLease {
+    slot: usize,
+    session: String,
+    at: Instant,
+}
+
+struct RoundWorker {
+    supported: bool,
+    confirmed: ConfirmedRounds,
+}
+impl RoundWorker {
+    fn new(supported: bool) -> Self {
+        Self {
+            supported,
+            confirmed: ConfirmedRounds::default(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RoundConfirmation {
+    scope: String,
+    fence: crate::model::lease::RunFence,
+}
+
+/// A successful want attests the worker's retained round floor, including an
+/// empty reply. Allocation, timeout and a refused want attest nothing. The
+/// enclosing cache key is the immutable worker instance.
+#[derive(Clone, Default)]
+struct ConfirmedRounds([Option<RoundConfirmation>; 2]);
+impl ConfirmedRounds {
+    fn confirm(&mut self, session: &str) {
+        let Ok(Some(owned)) = crate::model::lease::parse(session) else {
+            return;
+        };
+        let (Some(slot), Some(_)) = (owned.round_slot, owned.frame) else {
+            return;
+        };
+        if let Some(prior) = &self.0[slot]
+            && (prior.scope != owned.scope
+                || prior.fence.generation != owned.generation
+                || prior.fence.layout != owned.layout
+                || prior.fence.frame >= owned.frame)
+        {
+            return;
+        }
+        self.0[slot] = Some(RoundConfirmation {
+            scope: owned.scope.to_owned(),
+            fence: crate::model::lease::RunFence {
+                generation: owned.generation,
+                layout: owned.layout,
+                frame: owned.frame,
+            },
+        });
+    }
+
+    fn retires(&self, session: &str) -> bool {
+        let Ok(Some(owned)) = crate::model::lease::parse(session) else {
+            return false;
+        };
+        owned.round_slot.is_some_and(|slot| {
+            self.0[slot].as_ref().is_some_and(|floor| {
+                floor.scope == owned.scope
+                    && floor.fence.generation == owned.generation
+                    && floor.fence.layout == owned.layout
+                    && floor.fence.frame > owned.frame
+            })
+        })
+    }
+}
+
+fn retained_release_groups(
+    hashes: BTreeMap<String, KeptLease>,
+    confirmed: &ConfirmedRounds,
+) -> BTreeMap<String, Vec<String>> {
+    let mut sessions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (hash, lease) in hashes {
+        if !confirmed.retires(&lease.session) {
+            sessions.entry(lease.session).or_default().push(hash);
+        }
+    }
+    sessions
+}
+
+fn release_retained(lane: &LaneRun, kept: Kept) {
+    let confirmed = lane.confirmed_rounds(&kept.client);
+    for (session, hashes) in retained_release_groups(kept.hashes, &confirmed) {
+        bump(&lane.stats.kept_released, hashes.len() as u64);
+        release_leases(&kept.client, &kept.route, &session, hashes);
+    }
 }
 
 /// The two pull lease ids of one repository's wants (module docs, step 1).
@@ -2400,8 +2767,88 @@ impl LaneRun {
             .holding(slot, Instant::now());
     }
 
-    fn lease(&self, slot: usize) -> String {
-        self.leases[slot % 2].clone()
+    fn round_leases(
+        &self,
+        target: &Target,
+        client: &SessionWorkerClient,
+        route: &SyncRoute,
+    ) -> Result<[String; 2], ExchangeError> {
+        use crate::model::content_wire as wire;
+        let instance = target
+            .folder
+            .worker
+            .as_ref()
+            .map(|worker| worker.instance.as_str())
+            .unwrap_or_default();
+        let known = {
+            let workers = lock(&self.round_workers);
+            let known = workers.get(instance).map(|worker| worker.supported);
+            if known.is_none() && workers.len() >= crate::model::lease::MAX_RUN_FENCES {
+                return Err(ExchangeError::local(CallError::Remote(ErrorWire::coded(
+                    "CONTENT_RESOURCE_LIMIT",
+                    "legacy capability instance capacity",
+                ))));
+            }
+            known
+        };
+        let modern = match known {
+            Some(modern) => modern,
+            None => {
+                let reply = client.request(
+                    wire::LEGACY_CAPS,
+                    serde_json::json!({"route":route,"version":wire::VERSION}),
+                    vec![],
+                    Priority::Control,
+                    worker_client::deadlines::WANT,
+                );
+                let modern = match reply {
+                    Ok(reply) => {
+                        let caps: wire::LegacyCapabilities =
+                            body_of(&reply, wire::LEGACY_CAPS).map_err(ExchangeError::local)?;
+                        if caps.version != wire::VERSION {
+                            return Err(ExchangeError::local(CallError::Remote(ErrorWire::coded(
+                                "PEER_NEEDS_UPGRADE",
+                                "legacy capability version",
+                            ))));
+                        }
+                        caps.round_fences
+                    }
+                    Err(error) if error.code() == "UNSUPPORTED_OPERATION" => false,
+                    Err(error) => return Err(ExchangeError::local(error)),
+                };
+                let mut workers = lock(&self.round_workers);
+                if !workers.contains_key(instance)
+                    && workers.len() >= crate::model::lease::MAX_RUN_FENCES
+                {
+                    return Err(ExchangeError::local(CallError::Remote(ErrorWire::coded(
+                        "CONTENT_RESOURCE_LIMIT",
+                        "legacy capability instance capacity",
+                    ))));
+                }
+                workers
+                    .entry(instance.to_owned())
+                    .or_insert_with(|| RoundWorker::new(modern));
+                modern
+            }
+        };
+        let make = || -> Result<[String; 2], ErrorWire> {
+            let round = if modern {
+                Some(super::lease_clock::next(&self.ctx)?.run)
+            } else {
+                None
+            };
+            let id = |slot| {
+                let base = pull_lease(&self.peer.installation, self.spec, slot);
+                match round {
+                    Some(round) => {
+                        crate::model::lease::qualify_pull_round(&base, self.generation, round)
+                    }
+                    None => crate::model::lease::qualify_pull(&base, self.generation),
+                }
+            };
+            Ok([id(0)?, id(1)?])
+        };
+        make().map_err(|error| ExchangeError::local(CallError::Remote(error)))
     }
 
     fn stop_error(&self) -> ExchangeError {
@@ -2419,13 +2866,26 @@ impl LaneRun {
         lock(&self.remote_content).remove(repo);
     }
 
+    fn confirm_round(&self, client: &SessionWorkerClient, session: &str) {
+        if let Some(worker) = lock(&self.round_workers).get_mut(&client.endpoint().instance)
+            && worker.supported
+        {
+            worker.confirmed.confirm(session);
+        }
+    }
+
+    fn confirmed_rounds(&self, client: &SessionWorkerClient) -> ConfirmedRounds {
+        lock(&self.round_workers)
+            .get(&client.endpoint().instance)
+            .filter(|worker| worker.supported)
+            .map(|worker| worker.confirmed.clone())
+            .unwrap_or_default()
+    }
+
     /// The leases `repo`'s rounds kept so far (taken: the caller puts back
     /// what still holds).
-    fn take_kept(&self, repo: &str) -> BTreeMap<String, (usize, Instant)> {
-        lock(&self.kept)
-            .remove(repo)
-            .map(|kept| kept.hashes)
-            .unwrap_or_default()
+    fn take_kept(&self, repo: &str) -> Option<Kept> {
+        lock(&self.kept).remove(repo)
     }
 
     /// `repo`'s kept leases after a round (at most [`MAX_KEPT`]).
@@ -2434,7 +2894,7 @@ impl LaneRun {
         repo: &str,
         route: &SyncRoute,
         client: &Arc<SessionWorkerClient>,
-        mut hashes: BTreeMap<String, (usize, Instant)>,
+        mut hashes: BTreeMap<String, KeptLease>,
     ) {
         if hashes.is_empty() {
             return;
@@ -2442,7 +2902,7 @@ impl LaneRun {
         while hashes.len() > MAX_KEPT {
             let Some(oldest) = hashes
                 .iter()
-                .min_by_key(|(_, (_, at))| *at)
+                .min_by_key(|(_, lease)| lease.at)
                 .map(|(hash, _)| hash.clone())
             else {
                 break;
@@ -2785,7 +3245,7 @@ impl Job for UploadJob {
 #[derive(Clone, Debug)]
 struct Planned {
     item: WantItem,
-    /// The lane's lease id it is under (`lease` is [`LaneRun::lease`] of it).
+    /// The round's slot; `lease` retains its exact session ID for cleanup.
     slot: usize,
     lease: String,
 }
@@ -2801,12 +3261,23 @@ struct Pull {
     streamed: Arc<AtomicU64>,
     received: u64,
     released: u64,
+    empty_received: usize,
+    empty_released: usize,
     completed: u64,
     ended: Option<Result<ObjectsResult, CallError>>,
-    reported: bool,
+}
+impl Pull {
+    fn reportable(&self) -> bool {
+        self.ended.is_some()
+            && self.released >= self.received
+            && self.empty_released >= self.empty_received
+    }
 }
 
 enum RoundEvent {
+    /// A stream crossed its re-pull threshold. Wake independently of slow
+    /// worker writes and the final peer reply, including single-chunk pulls.
+    Streamed,
     /// What one sink step settled, together (a write's releases and the
     /// objects it completed arrive at once, so a pull is never reported
     /// between them).
@@ -2815,6 +3286,7 @@ enum RoundEvent {
         tag: u64,
         result: Result<ObjectsResult, CallError>,
         received: u64,
+        empty_received: usize,
         ends: HashMap<String, u64>,
         /// Objects whose size we did not know, with the total their
         /// sender's empty chunk gave ([`size_unknown`]).
@@ -2825,6 +3297,7 @@ enum RoundEvent {
 /// What a download round has seen so far.
 #[derive(Default)]
 struct RoundState {
+    leases: [String; 2],
     plan: VecDeque<Planned>,
     begun: HashSet<String>,
     /// Every object planned in this round, as first planned, with its lease
@@ -2848,18 +3321,50 @@ struct RoundState {
     session_lost: Option<CallError>,
     peer_error: Option<CallError>,
     local_error: Option<CallError>,
+    capacity: bool,
+    object_limit: bool,
 }
 
 impl RoundState {
-    fn plan(&mut self, planned: Planned) {
+    fn remember(&mut self, planned: &Planned) -> bool {
+        if self.planned.len() >= ROUND_OBJECTS && !self.planned.contains_key(&planned.item.hash) {
+            self.limit_objects();
+            return false;
+        }
         self.planned
             .entry(planned.item.hash.clone())
             .or_insert_with(|| planned.clone());
-        self.plan.push_back(planned);
+        true
+    }
+
+    fn limit_objects(&mut self) {
+        self.object_limit = true;
+        self.want_dry = true;
+    }
+
+    fn object_room(&self) -> usize {
+        ROUND_OBJECTS.saturating_sub(self.planned.len())
+    }
+
+    fn pull_room(&self) -> bool {
+        self.pulls.len() < ROUND_PULL_RECORDS
+    }
+
+    fn take_reportable(&mut self) -> Vec<Pull> {
+        let ready: Vec<_> = self
+            .pulls
+            .iter()
+            .filter(|(_, p)| p.reportable())
+            .map(|(tag, _)| *tag)
+            .collect();
+        ready
+            .into_iter()
+            .filter_map(|tag| self.pulls.remove(&tag))
+            .collect()
     }
 
     fn planned_or_begun(&self, hash: &str) -> bool {
-        self.begun.contains(hash) || self.plan.iter().any(|planned| planned.item.hash == hash)
+        self.planned.contains_key(hash)
     }
 
     fn in_flight(&self) -> usize {
@@ -2870,10 +3375,9 @@ impl RoundState {
     }
 
     fn plan_bytes(&self) -> u64 {
-        self.plan
-            .iter()
-            .map(|planned| planned.item.size.saturating_sub(planned.item.offset))
-            .sum()
+        self.plan.iter().fold(0u64, |sum, planned| {
+            sum.saturating_add(planned.item.size.saturating_sub(planned.item.offset))
+        })
     }
 
     fn failed(&self) -> bool {
@@ -2912,7 +3416,9 @@ fn download_round(
                             .iter()
                             .map(|event| match event {
                                 SinkEvent::Released { bytes, .. } => *bytes,
-                                SinkEvent::Settled { .. } => 0,
+                                SinkEvent::Settled { .. }
+                                | SinkEvent::CreditsReturned
+                                | SinkEvent::EmptyReleased { .. } => 0,
                             })
                             .sum();
                         window.release(released);
@@ -2924,7 +3430,10 @@ fn download_round(
     };
     let abort = AtomicBool::new(false);
     let started = Instant::now();
-    let mut state = RoundState::default();
+    let mut state = RoundState {
+        leases: lane.round_leases(target, client, &route)?,
+        ..RoundState::default()
+    };
     let mut probed = Instant::now();
     thread::scope(|scope| {
         loop {
@@ -2970,13 +3479,31 @@ fn download_round(
                     probed = Instant::now();
                 }
                 if !over && !state.plan.is_empty() && in_flight < lane.options.pulls.max(1) {
+                    let credit_before = sink
+                        .cell
+                        .get()
+                        .map_or(0, |s| s.inner.credit_epoch.load(Ordering::Acquire));
                     let issued =
                         issue_pull(lane, target, &route, &sink, &tx, &abort, &mut state, scope);
                     if issued {
                         continue;
                     }
-                    if in_flight == 0 {
-                        // Stopped while waiting for the window or a slot.
+                    if in_flight == 0
+                        && (!state.capacity || !sink.cell.get().is_some_and(Sink::pending))
+                    {
+                        // A proof can return between global refusal and the
+                        // pending snapshot. Retry that newly available credit
+                        // before yielding this still-unfinished round.
+                        if state.capacity
+                            && sink.cell.get().is_some_and(|s| {
+                                s.inner.credit_epoch.load(Ordering::Acquire) != credit_before
+                            })
+                        {
+                            continue;
+                        }
+                        // No own consumer can return credit. Yield for other
+                        // scopes (or stop); otherwise keep this round and wait
+                        // for its pending writes/retirement notification.
                         break;
                     }
                 }
@@ -3016,7 +3543,10 @@ fn download_round(
     let failed = state.failed() || lane.stopped();
     settle_leases(lane, target, client, &route, &state, &results, failed);
     for pull in state.pulls.values_mut() {
+        // finish joined the writers and drained their events: discarded work
+        // cannot produce another byte or empty receipt after this point.
         pull.released = pull.released.max(pull.received);
+        pull.empty_released = pull.empty_released.max(pull.empty_received);
     }
     report_pulls(lane, target, &mut state);
     send_reports(lane, target, &route, &mut state);
@@ -3039,14 +3569,21 @@ fn download_round(
         return Err(ExchangeError::peer(error));
     }
     let over = started.elapsed() >= lane.options.round;
-    let again = moved && (over || state.leftovers || !state.want_dry);
+    if state.object_limit {
+        bump(&lane.stats.object_budget_yields, 1);
+    }
+    let again = state.object_limit || (moved && (over || state.leftovers || !state.want_dry));
     let idle = !moved
         && state.offered == 0
         && !state.excluded
         && !state.leftovers
         && state.pulls.is_empty();
     Ok(Next {
-        after: again.then_some(CONTENT_YIELD),
+        after: if state.capacity {
+            Some(Duration::from_millis(25))
+        } else {
+            again.then_some(CONTENT_YIELD)
+        },
         progress: moved,
         idle,
     })
@@ -3118,6 +3655,7 @@ fn round_event(
     event: RoundEvent,
 ) {
     match event {
+        RoundEvent::Streamed => {}
         RoundEvent::Sink(events) => {
             for event in events {
                 sink_event(lane, target, state, event);
@@ -3127,6 +3665,7 @@ fn round_event(
             tag,
             result,
             received,
+            empty_received,
             ends,
             sized,
         } => {
@@ -3155,6 +3694,7 @@ fn round_event(
                 return;
             };
             pull.received = received;
+            pull.empty_received = empty_received;
             lane.window.release(pull.budget.saturating_sub(received));
             bump(&lane.stats.bytes_pulled, received);
             let mut hashes = Vec::new();
@@ -3205,6 +3745,12 @@ fn round_event(
 
 fn sink_event(lane: &LaneRun, target: &Target, state: &mut RoundState, event: SinkEvent) {
     match event {
+        SinkEvent::EmptyReleased { tag } => {
+            if let Some(pull) = state.pulls.get_mut(&tag) {
+                pull.empty_released += 1;
+            }
+        }
+        SinkEvent::CreditsReturned => {}
         SinkEvent::Released {
             tag,
             bytes,
@@ -3273,14 +3819,8 @@ fn sink_event(lane: &LaneRun, target: &Target, state: &mut RoundState, event: Si
 /// Emits `ExchangeFinished` for every pull that ended and whose bytes have
 /// all left the sink.
 fn report_pulls(lane: &LaneRun, target: &Target, state: &mut RoundState) {
-    for pull in state.pulls.values_mut() {
-        if pull.reported || pull.released < pull.received {
-            continue;
-        }
-        let Some(result) = &pull.ended else {
-            continue;
-        };
-        pull.reported = true;
+    for pull in state.take_reportable() {
+        let result = pull.ended.as_ref().unwrap(); // reportable owns an ended pull
         let error = match result {
             Ok(_) => None,
             Err(CallError::Remote(error)) if error.code == "CANCELLED" => None,
@@ -3322,18 +3862,56 @@ fn settle_leases(
     // What earlier rounds kept (planned again within a lease TTL), then
     // this round's own plan (`true`: planned now).
     let now = Instant::now();
-    let mut held: BTreeMap<String, (usize, Instant, bool)> = lane
+    let prior = lane
         .take_kept(&target.repo)
+        .map(|mut kept| {
+            let confirmed = lane.confirmed_rounds(&kept.client);
+            kept.hashes
+                .retain(|_, lease| !confirmed.retires(&lease.session));
+            if kept.client.endpoint().instance != client.endpoint().instance || kept.route != *route
+            {
+                // A worker/remote-replica replacement owns no predecessor's leases.
+                // Preserve the old endpoint and route for its exact cleanup.
+                // An unsupported worker can reuse a stable ID on a new route;
+                // a hash this round actually re-acquired settles below instead.
+                if kept.client.endpoint().instance == client.endpoint().instance {
+                    kept.hashes.retain(|hash, lease| {
+                        state
+                            .planned
+                            .get(hash)
+                            .is_none_or(|planned| planned.lease != lease.session)
+                    });
+                }
+                if !lane.ctx.stopping.load(Ordering::Relaxed) {
+                    release_retained(lane, kept);
+                }
+                BTreeMap::new()
+            } else {
+                kept.hashes
+            }
+        })
+        .unwrap_or_default();
+    let mut held: BTreeMap<String, (KeptLease, bool)> = prior
         .into_iter()
-        .filter(|(_, (_, at))| now.saturating_duration_since(*at) < LEASE_TTL)
-        .map(|(hash, (slot, at))| (hash, (slot, at, false)))
+        .filter(|(_, lease)| now.saturating_duration_since(lease.at) < LEASE_TTL)
+        .map(|(hash, lease)| (hash, (lease, false)))
         .collect();
     for (hash, planned) in &state.planned {
-        held.insert(hash.clone(), (planned.slot, now, true));
+        held.insert(
+            hash.clone(),
+            (
+                KeptLease {
+                    slot: planned.slot,
+                    session: planned.lease.clone(),
+                    at: now,
+                },
+                true,
+            ),
+        );
     }
-    let mut released: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut released: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut kept = BTreeMap::new();
-    for (hash, (slot, at, planned_now)) in held {
+    for (hash, (lease, planned_now)) in held {
         let gone = matches!(
             results
                 .get(&hash)
@@ -3349,12 +3927,12 @@ fn settle_leases(
             continue;
         }
         if state.failed.contains(&hash) || failed {
-            released.entry(slot).or_default().push(hash);
+            released.entry(lease.session).or_default().push(hash);
         } else {
             if planned_now {
-                lane.holding(&target.repo, slot);
+                lane.holding(&target.repo, lease.slot);
             }
-            kept.insert(hash, (slot, at));
+            kept.insert(hash, lease);
         }
     }
     if lane.ctx.stopping.load(Ordering::Relaxed) {
@@ -3364,8 +3942,8 @@ fn settle_leases(
         return;
     }
     lane.put_kept(&target.repo, route, client, kept);
-    for (slot, hashes) in released {
-        release_leases(client, route, &lane.lease(slot), hashes);
+    for (session, hashes) in released {
+        release_leases(client, route, &session, hashes);
     }
 }
 
@@ -3436,15 +4014,21 @@ fn want_more(
         if index > 0 && fresh > 0 {
             break;
         }
-        let lease = lane.lease(slot);
+        let room = state.object_room();
+        if room == 0 {
+            state.limit_objects();
+            break;
+        }
+        let lease = state.leases[slot].clone();
         let header = WantHeader {
             route: route.clone(),
             lane: lane.spec,
-            max_items: if demand {
+            max_items: (if demand {
                 DEMAND_WANT_ITEMS
             } else {
                 MAX_WANT_ITEMS as u32
-            },
+            })
+            .min(room as u32),
             max_bytes: lane.options.window_bytes,
             session: lease.clone(),
         };
@@ -3463,10 +4047,12 @@ fn want_more(
             }
         };
         lane.asked(&target.repo, slot, !items.is_empty());
+        lane.confirm_round(client, &lease);
         state.offered += items.len();
         // In their backoff for this source although the want excluded what
         // it could (the list is bounded): given up at once.
         let mut refused = Vec::new();
+        let mut deferred = Vec::new();
         for item in items {
             // A want can regrant an object after an earlier want's exclude
             // released it. If this round already began it, ignoring that
@@ -3483,17 +4069,24 @@ fn want_more(
                 }
                 continue;
             }
-            fresh += 1;
             let planned = Planned {
                 item,
                 slot,
                 lease: lease.clone(),
             };
+            if !state.remember(&planned) {
+                deferred.push(planned.item.hash);
+                continue;
+            }
+            fresh += 1;
             if demand && planned.item.priority == WantPriority::Demand {
                 promoted.push(planned);
             } else {
-                state.plan(planned);
+                state.plan.push_back(planned);
             }
+        }
+        if !deferred.is_empty() {
+            release_leases_holding(client, route, &lease, deferred, None);
         }
         if !refused.is_empty() {
             // Hidden from this source for the shortest of their remaining
@@ -3510,12 +4103,9 @@ fn want_more(
     // Demand first, in the worker's order (newest demand first).
     bump(&lane.stats.demand_promoted, promoted.len() as u64);
     for planned in promoted.into_iter().rev() {
-        state
-            .planned
-            .entry(planned.item.hash.clone())
-            .or_insert_with(|| planned.clone());
         state.plan.push_front(planned);
     }
+    peak(&lane.stats.round_objects_peak, state.planned.len() as u64);
     if fresh == 0 && !demand {
         state.want_dry = true;
     }
@@ -3544,14 +4134,23 @@ fn issue_pull<'scope, 'env>(
     state: &mut RoundState,
     scope: &'scope thread::Scope<'scope, 'env>,
 ) -> bool {
+    if !state.pull_room() {
+        state.capacity = true;
+        return false;
+    }
     let first = state.in_flight() == 0;
     // A pull's budget never exceeds what the acceptor honours, nor the key's
     // fair share of the window: within its share a key pipelines freely (a
     // round of small objects keeps two pulls in flight), beyond it only once
     // the pull in flight received half its budget, so a key whose source
     // stalls holds at most its share.
+    // Retained legacy downloads share the daemon's global budget. A 256 KiB
+    // payload keeps the same conservative 1 MiB reservation as foreground
+    // compatibility frames, including receive/write staging copies.
     let window = lane.window.capacity().min(PULL_BUDGET_BYTES);
-    let share = (window / lane.options.repos.max(1) as u64).max(1);
+    let share = (window / lane.options.repos.max(1) as u64)
+        .max(1)
+        .min(crate::model::content_wire::LEGACY_BYTES as u64);
     let in_flight: Vec<&Pull> = state
         .pulls
         .values()
@@ -3565,7 +4164,8 @@ fn issue_pull<'scope, 'env>(
         share
     } else {
         share.saturating_sub(reserved)
-    };
+    }
+    .min(crate::model::content_wire::LEGACY_BYTES as u64);
     if cap == 0 {
         return false;
     }
@@ -3573,6 +4173,34 @@ fn issue_pull<'scope, 'env>(
     let min = plan_bytes.min(share / 2).min(cap);
     let max = plan_bytes.min(cap);
     let stop = || lane.stopped();
+    // Global refusal must precede even the lane-window reservation. Otherwise
+    // a rejected third pull temporarily inflates that lane's byte peak.
+    let reservation = super::content_transport::daemon(&lane.ctx)
+        .map_err(|error| ErrorWire::from_error(&error))
+        .and_then(|daemon| {
+            daemon
+                .scheduler
+                .try_reserve_stream(
+                    &target.repo,
+                    &lane.peer.installation,
+                    crate::model::workspace::DemandPriority::Background,
+                    1024 * 1024,
+                )
+                .map_err(|error| ErrorWire::from_error(&error))
+        });
+    let reservation = match reservation {
+        Ok(Some(reservation)) => Arc::new(reservation),
+        Ok(None) => {
+            state.capacity = true;
+            crate::util::fault::hang("legacy.round.capacity_refused");
+            return false;
+        }
+        Err(error) => {
+            state.local_error = Some(CallError::Remote(error));
+            return false;
+        }
+    };
+    state.capacity = false;
     let budget = if first {
         lane.window.reserve(min, max, &stop)
     } else {
@@ -3650,11 +4278,13 @@ fn issue_pull<'scope, 'env>(
             streamed: streamed.clone(),
             received: 0,
             released: 0,
+            empty_received: 0,
+            empty_released: 0,
             completed: 0,
             ended: None,
-            reported: false,
         },
     );
+    peak(&lane.stats.pull_records_peak, state.pulls.len() as u64);
     bump(&lane.stats.pulls, 1);
     let in_flight = bump(&lane.stats.pulls_in_flight, 1);
     peak(&lane.stats.pulls_peak, in_flight);
@@ -3670,7 +4300,11 @@ fn issue_pull<'scope, 'env>(
     let tx = tx.clone();
     scope.spawn(move || {
         let _slot = slot;
+        // The stream and every accepted buffered piece/write batch keep this
+        // proof. Stream completion alone cannot lend out pending write bytes.
         let mut received = 0u64;
+        let mut empty_received = 0usize;
+        let mut notified = false;
         let mut ends: HashMap<String, u64> = HashMap::new();
         let mut sized: HashMap<String, u64> = HashMap::new();
         let header = serde_json::to_value(&request).unwrap_or_default();
@@ -3727,6 +4361,10 @@ fn issue_pull<'scope, 'env>(
                     }
                     received += len;
                     streamed.fetch_add(len, Ordering::Relaxed);
+                    if !notified && received >= budget / 2 {
+                        notified = true;
+                        let _ = tx.send(RoundEvent::Streamed);
+                    }
                     ends.insert(hash.to_owned(), chunk_end);
                     if unknown && chunk.total > 0 {
                         // The sender's total of an object whose size we did
@@ -3734,7 +4372,9 @@ fn issue_pull<'scope, 'env>(
                         sized.insert(hash.to_owned(), chunk.total);
                         return Ok(());
                     }
-                    if sink.offer(hash, chunk.offset, chunk.total, bytes, tag).is_err()
+                    let offered = sink.offer_retained(hash, chunk.offset, chunk.total, bytes, tag, Some(reservation.clone()));
+                    if offered.is_ok() && bytes.is_empty() { empty_received += 1; }
+                    if offered.is_err()
                         && allowed.iter().all(|(hash, (_, end, _))| {
                             ends.get(hash).is_some_and(|got| got >= end) || sink.settled(hash)
                         })
@@ -3751,10 +4391,14 @@ fn issue_pull<'scope, 'env>(
                 },
             )
             .and_then(|reply| body_of::<ObjectsResult>(&reply, ops::OBJECTS_PULL));
+        // No payload work remains on the reader. Publish completion only
+        // after its own proof drops, so a waking consumer cannot race it.
+        drop(reservation);
         let _ = tx.send(RoundEvent::PullEnded {
             tag,
             result,
             received,
+            empty_received,
             ends,
             sized,
         });
@@ -4138,7 +4782,475 @@ fn push(
 
 #[cfg(test)]
 mod tests {
+    fn pending_pull() -> Pull {
+        Pull {
+            started: Instant::now(),
+            spans: vec![],
+            budget: 64,
+            streamed: Arc::new(AtomicU64::new(0)),
+            received: 64,
+            released: 0,
+            empty_received: 0,
+            empty_released: 0,
+            completed: 0,
+            ended: None,
+        }
+    }
+
+    #[test]
+    fn completed_pull_history_is_removed_without_evicting_live_or_empty_work() {
+        let mut state = RoundState::default();
+        for tag in 0..ROUND_PULL_RECORDS as u64 {
+            state.pulls.insert(tag, pending_pull());
+        }
+        assert!(!state.pull_room());
+        let ready = state.pulls.get_mut(&0).unwrap();
+        ready.ended = Some(Ok(ObjectsResult::default()));
+        ready.released = 64;
+        let empty = state.pulls.get_mut(&1).unwrap();
+        empty.ended = Some(Ok(ObjectsResult::default()));
+        empty.received = 0;
+        empty.empty_received = 1;
+        let drained = state.take_reportable();
+        assert_eq!(drained.len(), 1);
+        assert!(state.pull_room());
+        assert!(state.pulls.contains_key(&1));
+        for tag in 2..ROUND_PULL_RECORDS as u64 {
+            assert!(state.pulls[&tag].ended.is_none());
+        }
+        let empty = state.pulls.get_mut(&1).unwrap();
+        empty.completed = 1;
+        empty.empty_released = 1;
+        assert_eq!(state.take_reportable()[0].completed, 1);
+        assert!(state.take_reportable().is_empty());
+        // A long sequence of completed records stays at one temporary slot;
+        // the six live predecessors remain retained throughout.
+        for tag in 8..50_008 {
+            let mut pull = pending_pull();
+            pull.ended = Some(Ok(ObjectsResult::default()));
+            pull.released = 64;
+            state.pulls.insert(tag, pull);
+            assert!(state.pulls.len() < ROUND_PULL_RECORDS);
+            assert_eq!(state.take_reportable().len(), 1);
+        }
+        assert_eq!(state.pulls.len(), ROUND_PULL_RECORDS - 2);
+    }
+
+    #[test]
+    fn round_object_admission_bounds_history_and_saturates_byte_estimates() {
+        let mut state = RoundState::default();
+        for index in 0..ROUND_OBJECTS {
+            let planned = Planned {
+                item: WantItem {
+                    hash: format!("{index:064x}"),
+                    size: u64::MAX,
+                    offset: 0,
+                    priority: WantPriority::Current,
+                },
+                slot: 0,
+                lease: "fixture".into(),
+            };
+            assert!(state.remember(&planned));
+            state.plan.push_back(planned);
+        }
+        assert_eq!(state.plan_bytes(), u64::MAX);
+        assert_eq!(state.object_room(), 0);
+        let prior = state.plan[0].clone();
+        assert!(state.remember(&prior));
+        let overflow = Planned {
+            item: WantItem {
+                hash: "overflow".into(),
+                ..prior.item
+            },
+            ..prior
+        };
+        assert!(!state.remember(&overflow));
+        assert!(state.object_limit && state.want_dry);
+        assert_eq!(state.planned.len(), ROUND_OBJECTS);
+        assert_eq!(state.plan.len(), ROUND_OBJECTS);
+    }
+    #[test]
+    fn credit_retirement_unwind_releases_only_its_own_live_stream_proofs() {
+        use crate::{content::scheduler::ContentScheduler, model::workspace::DemandPriority};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let scheduler = Arc::new(ContentScheduler::default());
+        let one = Arc::new(
+            scheduler
+                .try_reserve_stream("repo", "peer", DemandPriority::Background, 1024 * 1024)
+                .unwrap()
+                .unwrap(),
+        );
+        let two = scheduler
+            .try_reserve_stream("repo", "peer", DemandPriority::Background, 1024 * 1024)
+            .unwrap()
+            .unwrap();
+        let count = AtomicUsize::new(0);
+        let epoch = AtomicU64::new(0);
+        drop(super::RetiredStreams::new(vec![], &count, &epoch));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert_eq!(epoch.load(Ordering::Acquire), 0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _retiring = super::RetiredStreams::new(vec![one], &count, &epoch);
+            assert_eq!(count.load(Ordering::Acquire), 1);
+            assert_eq!(scheduler.stream_usage().0, 2);
+            panic!("a credit hook unwinds after writing but before returning capacity");
+        }));
+        assert!(result.is_err());
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert_eq!(epoch.load(Ordering::Acquire), 1);
+        assert_eq!(scheduler.stream_usage(), (1, 1024 * 1024));
+        drop(two);
+        assert_eq!(scheduler.usage().0, 0);
+    }
     use super::*;
+
+    #[test]
+    fn cancelling_one_source_attempt_preserves_other_sources_in_the_same_epoch() {
+        let local = format!("work-{}", uuid::Uuid::new_v4());
+        let a = object_key(&local, "a", "repo", false, "hash");
+        let b = object_key(&local, "b", "repo", false, "hash");
+        let first = object_work(&a).unwrap();
+        let second = object_work(&b).unwrap();
+        let cancel = Cancel::new();
+        first.on_cancel(&cancel);
+        cancel.cancel();
+        assert!(!first.current());
+        assert!(second.current());
+        assert!(object_failed_work(&a, &first, "NOT_AVAILABLE", false).is_none());
+        assert!(object_failed_work(&b, &second, "", true).is_some());
+        assert!(object_backoff_for(&local, "a", "repo", false, "hash").is_none());
+        assert!(object_backoff_for(&local, "b", "repo", false, "hash").is_some());
+        assert!(object_installed_work(&b, &second));
+        assert!(!second.current());
+        assert!(object_blocked_for(&b).is_none());
+    }
+
+    #[test]
+    fn a_verified_install_fences_all_prior_source_attempts_without_resurrection() {
+        let local = format!("work-{}", uuid::Uuid::new_v4());
+        let a = object_key(&local, "a", "repo", false, "hash");
+        let b = object_key(&local, "b", "repo", false, "hash");
+        let other = object_key(&local, "a", "repo", false, "other");
+        let first = object_work(&a).unwrap();
+        let second = object_work(&b).unwrap();
+        let unrelated = object_work(&other).unwrap();
+        assert!(
+            object_failed_work(&b, &first, "NOT_AVAILABLE", false).is_none(),
+            "source guard crossed peers"
+        );
+        assert!(object_failed_work(&a, &first, "CORRUPT_AT_SOURCE", false).is_some());
+        assert_eq!(object_installed(&b), ["CORRUPT_AT_SOURCE"]);
+        assert!(!first.current());
+        assert!(!second.current());
+        assert!(unrelated.current());
+        let replacement = object_work(&a).unwrap();
+        assert!(replacement.current());
+        drop(replacement);
+        assert!(!first.current());
+        assert!(!second.current());
+        assert!(object_failed_work(&a, &first, "NOT_AVAILABLE", false).is_none());
+        assert!(object_failed_work(&b, &second, "", true).is_none());
+        assert!(!object_installed_work(&other, &first));
+        assert!(object_failed_work(&other, &unrelated, "NOT_AVAILABLE", false).is_some());
+        object_installed(&other);
+    }
+
+    #[test]
+    fn daemon_object_epoch_capacity_retains_live_and_cancelled_inflight_proofs() {
+        let mut table = HeldTable::default();
+        let key = |n| object_key("capacity", "peer", "repo", false, &format!("{n:064x}"));
+        let mut work: Vec<_> = (0..BACKOFF_MAX)
+            .map(|n| Some(table.work(&key(n)).unwrap()))
+            .collect();
+        let joined = table.work(&key(0)).unwrap();
+        work[0].as_ref().unwrap().cancel();
+        assert!(joined.current());
+        assert_eq!(
+            table.work(&key(BACKOFF_MAX)).err().unwrap().code,
+            "CONTENT_RESOURCE_LIMIT"
+        );
+        drop(work[0].take());
+        assert!(
+            table.work(&key(BACKOFF_MAX)).is_err(),
+            "other source still pins the slot"
+        );
+        drop(joined);
+        let admitted = table.work(&key(BACKOFF_MAX)).unwrap();
+        assert!(admitted.current());
+        assert_eq!(table.epochs.len(), BACKOFF_MAX);
+        assert!(work[BACKOFF_MAX - 1].as_ref().unwrap().current());
+    }
+
+    fn round_id(slot: usize, nonce: u64) -> String {
+        crate::model::lease::qualify_pull_round(
+            &pull_lease("cleanup-peer", LaneSpec::new(0, 1), slot as u64),
+            crate::model::lease::PullRun {
+                generation: crate::model::lease::Generation {
+                    incarnation: 1,
+                    run: 2,
+                },
+                layout: 1,
+            },
+            nonce,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn confirmed_rounds_retire_only_older_matching_slots_and_never_regress() {
+        let mut confirmed = ConfirmedRounds::default();
+        let old = round_id(0, 10);
+        assert!(
+            !confirmed.retires(&old),
+            "allocation or failure confirms nothing"
+        );
+        confirmed.confirm(&round_id(0, 11));
+        assert!(confirmed.retires(&old));
+        assert!(!confirmed.retires(&round_id(1, 10)), "a cannot retire b");
+        assert!(!confirmed.retires(&round_id(0, 11)));
+        assert!(!confirmed.retires(&round_id(0, 12)), "unseen future round");
+        confirmed.confirm(&old);
+        assert!(confirmed.retires(&old), "delayed reply regressed the floor");
+        let base = "pull:cleanup-peer:0/1:a";
+        let run = crate::model::lease::PullRun {
+            generation: crate::model::lease::Generation {
+                incarnation: 1,
+                run: 2,
+            },
+            layout: 1,
+        };
+        assert!(confirmed.retires(&crate::model::lease::qualify_pull(base, run).unwrap()));
+        for session in [
+            base.to_owned(),
+            "opaque".into(),
+            crate::model::lease::qualify_pull("pull:cleanup-peer:0/1:c0000000000000001", run)
+                .unwrap(),
+            round_id(0, 1).replace("cleanup-peer", "another-peer"),
+            round_id(0, 1).replace("0/1:", "0/2:"),
+            crate::model::lease::qualify_pull_round(
+                base,
+                crate::model::lease::PullRun {
+                    generation: crate::model::lease::Generation {
+                        incarnation: 2,
+                        run: 2,
+                    },
+                    layout: 1,
+                },
+                1,
+            )
+            .unwrap(),
+            crate::model::lease::qualify_pull_round(
+                base,
+                crate::model::lease::PullRun {
+                    generation: run.generation,
+                    layout: 2,
+                },
+                1,
+            )
+            .unwrap(),
+        ] {
+            assert!(!confirmed.retires(&session), "{session}");
+        }
+        confirmed.confirm(&round_id(1, 11));
+        assert!(confirmed.retires(&round_id(1, 10)));
+        assert!(!confirmed.retires(&round_id(1, 11)));
+    }
+
+    #[test]
+    fn retained_release_groups_drop_only_confirmed_predecessors_at_the_kept_limit() {
+        let mut confirmed = ConfirmedRounds::default();
+        confirmed.confirm(&round_id(0, 10_000));
+        confirmed.confirm(&round_id(1, 10_000));
+        let mut hashes = BTreeMap::new();
+        for n in 0..MAX_KEPT - 5 {
+            hashes.insert(
+                format!("{n:064x}"),
+                KeptLease {
+                    slot: n % 2,
+                    session: round_id(n % 2, n as u64 + 1),
+                    at: Instant::now(),
+                },
+            );
+        }
+        let kept = [
+            round_id(0, 10_000),
+            round_id(1, 10_000),
+            round_id(0, 10_001),
+            "opaque".into(),
+            round_id(0, 1).replace("a0000000000000001", "c0000000000000001"),
+        ];
+        for (n, session) in kept.iter().enumerate() {
+            hashes.insert(
+                format!("{:064x}", n + MAX_KEPT - 5),
+                KeptLease {
+                    slot: 0,
+                    session: session.clone(),
+                    at: Instant::now(),
+                },
+            );
+        }
+        assert_eq!(hashes.len(), MAX_KEPT);
+        let grouped = retained_release_groups(hashes, &confirmed);
+        assert_eq!(grouped.len(), 5);
+        assert_eq!(grouped.values().map(Vec::len).sum::<usize>(), 5);
+        for session in kept {
+            assert!(grouped.contains_key(&session));
+        }
+    }
+
+    #[test]
+    fn native_round_floor_cleanup_releases_two_current_slots_without_historical_rpc_fanout() {
+        use crate::{
+            core::Store,
+            model::{content_wire, ipc::StopMode, orchestrator::WorkerEndpoint},
+            runtime::{self, Engine},
+            util::fault::{self, FaultAction, FaultConfig},
+        };
+        struct Server(runtime::server::RpcServer);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.stop(StopMode::Force);
+            }
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                fault::configure(None);
+            }
+        }
+        let _reset = Reset;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::initialize(dir.path(), &crate::core::id(), &crate::core::id()).unwrap();
+        let ctx = crate::worker::build_ctx(
+            Arc::new(Mutex::new(Engine::new(store))),
+            dir.path(),
+            false,
+            None,
+        );
+        let server = Server(runtime::server::start_rpc_server(ctx.clone()).unwrap());
+        let endpoint = WorkerEndpoint {
+            instance: ctx.instance.clone(),
+            pid: std::process::id(),
+            address: server.0.discovery().address.clone(),
+            version: ctx.version.clone(),
+            token: Some(server.0.token().to_owned()),
+        };
+        let client = SessionWorkerClient::connect(&endpoint).unwrap();
+        let route = SyncRoute {
+            peer: "cleanup-peer".into(),
+            repo: ctx.repo.clone(),
+            local_replica: ctx.device.clone(),
+            remote_replica: "source".into(),
+        };
+        let reply = client
+            .request(
+                content_wire::LEGACY_CAPS,
+                serde_json::json!({"route":route,"version":1}),
+                vec![],
+                Priority::Control,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert!(
+            body_of::<content_wire::LegacyCapabilities>(&reply, content_wire::LEGACY_CAPS)
+                .unwrap()
+                .round_fences
+        );
+        let mut hashes = BTreeMap::new();
+        {
+            let mut state = lock(&ctx.inflight_objects);
+            for n in 0..MAX_KEPT - 2 {
+                let hash = format!("{n:064x}");
+                let session = round_id(n % 2, n as u64 + 1);
+                state.leases.insert(
+                    hash.clone(),
+                    runtime::ctx::ObjectLease {
+                        session: session.clone(),
+                        expires_ms: u64::MAX,
+                        offset: 0,
+                    },
+                );
+                state
+                    .holders
+                    .insert(hash.clone(), (session.clone(), "source".into()));
+                hashes.insert(
+                    hash,
+                    KeptLease {
+                        slot: n % 2,
+                        session,
+                        at: Instant::now(),
+                    },
+                );
+            }
+        }
+        let mut confirmed = ConfirmedRounds::default();
+        for slot in 0..2 {
+            let session = round_id(slot, 10_000);
+            let header = WantHeader {
+                route: route.clone(),
+                lane: LaneSpec::new(0, 1),
+                max_items: 256,
+                max_bytes: 1024 * 1024,
+                session: session.clone(),
+            };
+            assert!(
+                want_excluding(&client, &header, vec![], Duration::from_secs(1))
+                    .unwrap()
+                    .is_empty()
+            );
+            confirmed.confirm(&session); // only the actual successful reply
+            let hash = format!("{:064x}", MAX_KEPT - 2 + slot);
+            let mut state = lock(&ctx.inflight_objects);
+            state.leases.insert(
+                hash.clone(),
+                runtime::ctx::ObjectLease {
+                    session: session.clone(),
+                    expires_ms: u64::MAX,
+                    offset: 0,
+                },
+            );
+            state
+                .holders
+                .insert(hash.clone(), (session.clone(), "source".into()));
+            hashes.insert(
+                hash,
+                KeptLease {
+                    slot,
+                    session,
+                    at: Instant::now(),
+                },
+            );
+        }
+        let groups = retained_release_groups(hashes, &confirmed);
+        assert_eq!(groups.len(), 2, "obsolete round IDs generated release RPCs");
+        assert_eq!(groups.values().map(Vec::len).sum::<usize>(), 2);
+        let mut config = FaultConfig::new("worker.rpc.objects.release", FaultAction::Hang);
+        config.count = None;
+        config.ms = Some(100);
+        fault::configure(Some(config));
+        let began = Instant::now();
+        for (session, hashes) in groups {
+            release_leases(&client, &route, &session, hashes);
+        }
+        let elapsed = began.elapsed();
+        assert_eq!(fault::fired(), 2, "actual loopback release count");
+        assert!(elapsed < Duration::from_secs(1));
+        let state = lock(&ctx.inflight_objects);
+        assert_eq!(state.leases.len(), MAX_KEPT - 2);
+        assert!(!state.leases.contains_key(&format!("{:064x}", MAX_KEPT - 2)));
+        assert!(!state.leases.contains_key(&format!("{:064x}", MAX_KEPT - 1)));
+        assert!(state.source_backoff.is_empty());
+        drop(state);
+        println!(
+            "WAVE6_CAPACITY {}",
+            serde_json::json!({"scenario":"native-retired-round-cleanup","kept_entries":MAX_KEPT,
+            "retired_without_rpc":MAX_KEPT-2,"release_rpcs":2,"rpc_stall_ms":100,"cleanup_ms":elapsed.as_secs_f64()*1000.0,
+            "bound_ms":1000,"source_backoff_added":false})
+        );
+    }
 
     /// The per-object backoff table stays bounded (WP3.INT re-review): a
     /// peer can make us back off as many objects as it names, and the table

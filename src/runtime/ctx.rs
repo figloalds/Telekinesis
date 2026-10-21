@@ -84,10 +84,14 @@ pub struct ObjectLease {
 /// the store root, shared by every in-process worker of a test binary).
 #[derive(Debug, Default)]
 pub struct ObjectsState {
+    pub effects: super::objects_effects::Effects,
     pub legacy_cancel: crate::util::Cancel,
     /// Latest ordered run per owned legacy lane scope. Never evict a fence
     /// while delayed requests may still exist in this worker incarnation.
     pub lease_runs: BTreeMap<String, crate::model::lease::RunFence>,
+    /// Independent a/b round floors within each pull lane. Kept after release
+    /// so a delayed request cannot resurrect an earlier round.
+    pub lease_rounds: BTreeMap<String, [Option<crate::model::lease::RunFence>; 2]>,
     /// Latest pool layout per direction/peer, across all lane counts.
     pub lease_layouts: BTreeMap<String, (crate::model::lease::Generation, u32)>,
     /// Content-v1 state is separate from legacy hash leases and initialized
@@ -133,6 +137,7 @@ impl ProgressSignal {
 /// generation 0). A returned connection is kept for reuse while fewer than
 /// [`SyncStorePool::MAX_IDLE`] are idle and it has no open transaction;
 /// otherwise it is closed (which rolls back anything left open).
+#[derive(Clone)]
 pub struct SyncStorePool {
     inner: Arc<PoolInner>,
 }
@@ -176,6 +181,36 @@ impl SyncStorePool {
         Ok(PooledStore {
             store: Some(store),
             pool: self.inner.clone(),
+            restore_timeout: None,
+        })
+    }
+
+    /// Foreground content callers own deadline/retry. Set zero busy timeout
+    /// before even refreshing the view; restore a reused handle on return.
+    pub(crate) fn checkout_nowait(&self) -> Result<PooledStore> {
+        let reused = lock(&self.inner.idle).pop();
+        let (mut store, restore) = match reused {
+            Some(store) => {
+                let timeout = store
+                    .db
+                    .query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))?;
+                store.db.busy_timeout(std::time::Duration::ZERO)?;
+                (store, std::time::Duration::from_millis(timeout))
+            }
+            None => (
+                Store::open_transfer_nowait(
+                    &self.inner.root,
+                    &self.inner.repo,
+                    &self.inner.device,
+                )?,
+                std::time::Duration::from_secs(5),
+            ),
+        };
+        refresh_view_identity(&mut store)?;
+        Ok(PooledStore {
+            store: Some(store),
+            pool: self.inner.clone(),
+            restore_timeout: Some(restore),
         })
     }
 
@@ -229,6 +264,7 @@ impl fmt::Debug for SyncStorePool {
 pub struct PooledStore {
     store: Option<Store>,
     pool: Arc<PoolInner>,
+    restore_timeout: Option<std::time::Duration>,
 }
 
 impl Deref for PooledStore {
@@ -253,7 +289,12 @@ impl Drop for PooledStore {
         let Some(store) = self.store.take() else {
             return;
         };
-        if !store.db.is_autocommit() {
+        if store.content_save_connection_failed() || !store.db.is_autocommit() {
+            return;
+        }
+        if let Some(timeout) = self.restore_timeout
+            && store.db.busy_timeout(timeout).is_err()
+        {
             return;
         }
         let mut idle = lock(&self.pool.idle);

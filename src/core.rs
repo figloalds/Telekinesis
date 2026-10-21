@@ -25,6 +25,7 @@ use uuid::Uuid;
 pub mod admission;
 pub mod commit;
 pub mod content_objects;
+pub mod content_saves;
 pub mod demand;
 pub mod derive;
 pub mod inbox;
@@ -429,6 +430,8 @@ pub struct Store {
     pub device: String,
     pub active: String,
     pub generation: u64,
+    /// A failed rollback quarantines this handle; recover through a fresh Store.
+    pub(crate) save_connection_failed: bool,
     view_cache: RefCell<Option<ViewCache>>,
     /// Module-owned derived caches; see `StoreCaches`.
     #[allow(dead_code)]
@@ -449,8 +452,8 @@ struct ViewCache {
     projection: Projection,
     slots: BTreeMap<(String, String), String>,
 }
-/// The only `Store` field the revamp adds. Each module owns its `Cache` type and
-/// chooses its own interior mutability; caches are derived and disposable.
+/// Module-owned derived caches. Correctness state such as a quarantined
+/// connection lives directly on `Store`, rather than in disposable caches.
 #[derive(Default)]
 #[allow(dead_code)]
 pub(crate) struct StoreCaches {
@@ -529,6 +532,7 @@ impl Store {
         inbox::ensure_schema(&mut store)?;
         sharing::ensure_schema(&mut store)?;
         admission::ensure_schema(&store.db)?;
+        content_saves::ensure_schema(&store.db)?;
         content_objects::ensure_schema(&store.db)?;
         objects::startup_object_check(&mut store, options.verify)?;
         crate::startup::progress("validating journal");
@@ -610,6 +614,7 @@ impl Store {
             device,
             active,
             generation,
+            save_connection_failed: false,
             view_cache: RefCell::new(None),
             caches: StoreCaches::default(),
         })
@@ -630,8 +635,19 @@ impl Store {
         Self::open_transfer(&self.root, &self.repo, &self.device)
     }
     pub(crate) fn open_transfer(root: &Path, repo: &str, device: &str) -> Result<Self> {
+        Self::open_transfer_timeout(root, repo, device, std::time::Duration::from_secs(5))
+    }
+    pub(crate) fn open_transfer_nowait(root: &Path, repo: &str, device: &str) -> Result<Self> {
+        Self::open_transfer_timeout(root, repo, device, std::time::Duration::ZERO)
+    }
+    fn open_transfer_timeout(
+        root: &Path,
+        repo: &str,
+        device: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
         let db = Connection::open(root.join("metadata.sqlite"))?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        db.busy_timeout(timeout)?;
         db.execute_batch("PRAGMA synchronous=FULL;")?;
         let active = db.query_row("SELECT value FROM config WHERE key='active'", [], |row| {
             row.get(0)
@@ -643,6 +659,7 @@ impl Store {
             device: device.to_owned(),
             active,
             generation: 0,
+            save_connection_failed: false,
             view_cache: RefCell::new(None),
             caches: StoreCaches::default(),
         })

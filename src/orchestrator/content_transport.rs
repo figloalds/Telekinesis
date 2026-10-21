@@ -590,8 +590,8 @@ impl LocalOffer {
 }
 impl Drop for LocalOffer {
     fn drop(&mut self) {
-        drop(self.turn.take());
         self.release(false);
+        drop(self.turn.take());
     }
 }
 
@@ -678,6 +678,9 @@ pub(crate) struct FrameTask {
 }
 impl Drop for FrameTask {
     fn drop(&mut self) {
+        // Keep the physical reservation until the local cleanup attempt has
+        // returned. LocalOffer's later destructor is then an unarmed no-op.
+        self.local.release(false);
         drop(self.budget.take());
     }
 }
@@ -792,6 +795,7 @@ impl FrameTask {
         let reply = match read {
             Ok(reply) => reply,
             Err(e) => {
+                self.check()?;
                 if e.code() == "PEER_NEEDS_UPGRADE" {
                     lock(&self.state.out_caps)
                         .remove(&(self.conn.peer().session.clone(), self.scope.repo.clone()));
@@ -812,6 +816,7 @@ impl FrameTask {
         let frame: wire::Frame = match parse(reply.header) {
             Ok(frame) => frame,
             Err(e) => {
+                self.check()?;
                 self.local.release(true);
                 return Err(e);
             }
@@ -831,6 +836,10 @@ impl FrameTask {
             }
             Ok::<_, CallError>(())
         };
+        if let Err(e) = self.check() {
+            let _ = ack(&self.conn);
+            return Err(e);
+        }
         if frame.bytes != reply.body.len()
             || frame.bytes > wire::FRAME_BYTES
             || frame.token.is_none()
@@ -842,10 +851,6 @@ impl FrameTask {
                 "INVALID_REPLY",
                 "content frame length/token",
             )));
-        }
-        if let Err(e) = self.check() {
-            let _ = ack(&self.conn);
-            return Err(e);
         }
         let data_client = self.state.worker(self.local.client.endpoint())?;
         // Cancellation abandons this request without closing a shared worker

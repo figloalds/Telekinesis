@@ -770,7 +770,24 @@ pub mod adapter {
 
     /// Step 3 of a force detach: every dirty session into `pending_saves`.
     pub fn persist_dirty(engine: &Shared) {
+        retain_native(engine);
         retain(&mut lock_engine(engine));
+    }
+    fn retain_native(engine: &Shared) {
+        let context = crate::content::ReadContext {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            cancel: crate::util::Cancel::new(),
+        };
+        if let Err(error) = crate::runtime::content_writes::retain_dirty(engine, &context) {
+            emit(
+                Level::Error,
+                &code_of(&error),
+                &[
+                    field("scope", "mount"),
+                    field("message", &format!("{error:#}")),
+                ],
+            );
+        }
     }
 
     fn retain(e: &mut Engine) {
@@ -796,6 +813,7 @@ pub mod adapter {
     /// them), drops clean ones, clears queued notifications, then lifts the
     /// fence with `mounted = false`.
     pub fn release(engine: &Shared) {
+        retain_native(engine);
         let mut e = lock_engine(engine);
         retain(&mut e);
         e.handles.clear();
@@ -815,6 +833,7 @@ pub mod adapter {
     /// handles keep them referenced, so the pending-save retry skips them
     /// until the detach that cleans the instance up), then `mounted = false`.
     pub fn lost(engine: &Shared) {
+        retain_native(engine);
         let mut e = lock_engine(engine);
         retain(&mut e);
         e.mounted = false;

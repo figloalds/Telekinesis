@@ -942,6 +942,26 @@ impl Store {
         self.record_object_error(object, error, retry_at)?;
         Ok(retry_at)
     }
+    /// A verified install wins over an earlier local write failure. The
+    /// availability check and retry row share one transaction; a competing
+    /// registration forces snapshot-upgrade contention rather than stale retry.
+    pub(crate) fn record_unavailable_object_failure(
+        &self,
+        object: &str,
+        error: &ErrorWire,
+    ) -> Result<Option<u64>> {
+        self.in_savepoint("object_owned_failure", || {
+            if self
+                .availability_row(object)?
+                .is_some_and(|row| row.state == AVAILABLE && row.verified_ms > 0)
+            {
+                return Ok(None);
+            }
+            let retry = self.record_object_failure(object, error)?;
+            crate::util::fault::trigger("objects.failure.before_commit")?;
+            Ok(Some(retry))
+        })
+    }
     /// The retry time of `object` while it is inside its failure backoff.
     pub fn object_backoff(&self, object: &str) -> Result<Option<u64>> {
         let retry_at: Option<i64> = self

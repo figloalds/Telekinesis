@@ -1,6 +1,6 @@
 # Wave 6: chunked content, independent engines and fast local builds
 
-Status: implementation in progress, 2026-10-20. Content activation remains off;
+Status: implementation in progress, 2026-10-21. Content activation remains off;
 see the [implementation record](notes/wp6-progress.md) for completed work,
 verification and outstanding gates. The package and release requirements below
 remain the complete Wave 6 scope.

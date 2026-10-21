@@ -1348,6 +1348,7 @@ impl Store {
             params![event.id, event.branch.id, payload],
         )?;
         admission::append_event(&tx, &event, local)?;
+        content_saves::observe_event(&tx, &event, local)?;
         // The event's journal row (the `journal_sequence` trigger) is the
         // journal's newest, so its sequence is the branch's new tip: the
         // cursor of a seal in this commit.
