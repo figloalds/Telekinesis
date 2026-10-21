@@ -47,6 +47,9 @@ pub(super) fn ensure_schema(db: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS content_save_successors(
             operation TEXT NOT NULL,checkpoint TEXT NOT NULL,capture BLOB NOT NULL CHECK(length(capture)<=65536),
             PRIMARY KEY(operation,checkpoint));
+        CREATE TABLE IF NOT EXISTS content_save_metadata_changes(
+            mutation TEXT PRIMARY KEY CHECK(length(mutation)=36),
+            record BLOB NOT NULL CHECK(length(record)<=65536));
         RELEASE content_save_schema;")?;
     Ok(())
 }
@@ -54,7 +57,16 @@ pub(super) fn ensure_schema(db: &Connection) -> Result<()> {
 /// Every ordinary local file-register mutation supersedes pending
 /// publication tickets for that entity. Remote changes remain causal competitors;
 /// they must not be silently parented or discarded by an old open writer.
-pub(super) fn observe_event(db: &Connection, event: &Event, local: bool) -> Result<()> {
+pub(super) fn observe_event(
+    db: &Connection,
+    event: &Event,
+    local: bool,
+    owner: Option<&MetadataOwner>,
+) -> Result<()> {
+    if let Some(owner) = owner {
+        ensure!(local, "CONTENT_METADATA_OWNER_MISMATCH");
+        return owner.check(db, event);
+    }
     if local {
         let mut update = db.prepare_cached(
             "UPDATE content_save_entities SET generation=generation+1,owner=NULL WHERE branch=? AND entity=?",
@@ -137,6 +149,14 @@ struct Capture {
     /// Absent fields remain absent when serializing pre-continuation records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     predecessor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    basic_policy: Option<BasicPolicy>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BasicPolicy {
+    sequence: u64,
+    preserve_times: u8,
 }
 impl Capture {
     fn validate(&self, operation: Uuid) -> Result<()> {
@@ -145,6 +165,9 @@ impl Capture {
         let entity = &self.intent.base.entity;
         ensure!(
             self.intent.operation == operation
+                && self.basic_policy.as_ref().is_none_or(|p| {
+                    p.preserve_times & !6 == 0 && event.changes.len() == 3
+                })
                 && event.id
                     == capture_event_id(
                         operation,
@@ -713,7 +736,7 @@ impl Store {
                 event.changes.push(Change {entity:entity.into(),field:"basic".into(),
                     parents:entry.revisions.get("basic").cloned().into_iter().collect(),value:json!(basic)});
             }
-            let capture=Capture {intent:intent.clone(),view_generation,event,predecessor:None};
+            let capture=Capture {intent:intent.clone(),view_generation,event,predecessor:None,basic_policy:None};
             capture.validate(intent.operation)?;
             store.db.execute("INSERT INTO content_save_operations(operation,capture) VALUES(?,?)",
                 params![intent.operation.to_string(),encode("capture:v1", &capture)?])?;
@@ -736,7 +759,7 @@ impl Store {
                 store.archive_publication(&capture, checkpoint, &receipt)?;
                 return Ok(());
             }
-            let (capture, prior, receipt) = load(&store.db, checkpoint.intent.operation)?;
+            let (mut capture, prior, receipt) = load(&store.db, checkpoint.intent.operation)?;
             ensure!(
                 capture.intent == checkpoint.intent,
                 "CONTENT_SAVE_INTENT_MISMATCH"
@@ -750,6 +773,18 @@ impl Store {
                 return Ok(());
             }
             current(store, &capture)?;
+            if prior.is_none() && let Some(policy) = capture.basic_policy.clone() {
+                let previous = capture.clone();
+                capture.event.created_ms = time();
+                let change = capture.event.changes.get_mut(2).context("CORRUPT_CONTENT_SAVE")?;
+                let mut basic: BasicInfo = serde_json::from_value(change.value.clone())?;
+                let preserve = if policy.sequence == checkpoint.sequence { policy.preserve_times } else { 0 };
+                if preserve & 2 == 0 { basic.write_time = filetime(capture.event.created_ms); }
+                if preserve & 4 == 0 { basic.change_time = filetime(capture.event.created_ms); }
+                change.value = json!(basic);
+                capture.basic_policy = None;
+                store.replace_unselected_capture(&previous, &capture)?;
+            }
             if let Some(prior) = prior {
                 ensure!(
                     checkpoint.sequence > prior.sequence || checkpoint == &prior,
@@ -1052,6 +1087,7 @@ impl Store {
             view_generation,
             event,
             predecessor: Some(predecessor),
+            basic_policy: None,
         };
         capture.validate(capture.intent.operation)?;
         Ok(capture)
