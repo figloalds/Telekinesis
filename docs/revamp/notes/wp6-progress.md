@@ -3339,10 +3339,24 @@ and the three actual process exits. No assertion or gate was relaxed.
 The initial `f6bcdeaa…` freeze was superseded before any final qualifier launched.
 Final qualification is in progress against 381 frozen source inputs:
 `96db7eff4b96db65c7c84b8fecae04f858350b2a47711acbeb6855b919bf6198`.
-Both strict Clippy runs passed. Selected suites, exact executable/source
-verification, archive readback and three existing real-kernel regression
-parents/platform must complete before recording stage qualification. Those
-kernel parents do not prove native basic-info integration, which is not wired.
+Both strict Clippy runs passed, but this attempt failed Linux's
+`classify_covers_every_code_literal_in_src`: 40 contract cases passed and seven
+new codes lacked classification. The 60-case save suite and preceding targets
+passed; later targets/kernel/direct phases did not finish. The Windows build
+was deliberately stopped after verifying its process identity/creation time,
+because it shared that deterministic gate failure. It was not restarted due
+to an observation timeout. Exact 381 inputs and raw outputs are retained/read
+back in `target/wave6/owned-basic-classification-attempt-96db.zip`, SHA256
+`e247842cdb0929038aeaadcdef9a2e59cce6b8d226d8008972ef256e34faf57d`.
+
+The seven codes now have explicit Wave 6 classifications and assertions in the
+existing scope contract. Save-in-progress is contention without failure-count
+escalation; receipt/continuation/owner/UUID integrity violations and invalid
+internal timestamp policy are fatal only in the pending mutation/save scope.
+Recovery bytes stay retained; historical classifications are unchanged.
+Fresh frozen-source qualification must complete before recording this stage
+as qualified. Its existing kernel parents remain regression checks, not proof
+of native basic-info integration, which is not wired.
 
 This adds `content_save_metadata_changes` and an optional private metadata
 capture field. New code reads old captures; older binaries using strict unknown

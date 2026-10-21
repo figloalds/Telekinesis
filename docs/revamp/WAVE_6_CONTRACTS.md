@@ -2317,6 +2317,12 @@ selection replay keeps clocks, and superseding selection atomically changes
 the template before publication. Content/alive parents, descriptor and private
 operation stay exact. Remote content competitors remain conflicts.
 
+Save-in-progress is classified as contention, without failure/backoff
+escalation. Receipt/continuation/owner/UUID integrity failures and invalid
+internal timestamp-policy arguments are fatal in the pending operation/save
+scope, retaining recovery bytes. They must not quarantine unrelated metadata,
+object or network engines. Existing historical error classes stay unchanged.
+
 This is a Core primitive, not complete native metadata integration. Native
 callbacks must support unavailable-base metadata, failed selected saves,
 per-handle Windows timestamp flags and crash-safe sequence binding. Attr-only
