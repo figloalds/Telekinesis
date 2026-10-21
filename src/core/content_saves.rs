@@ -147,8 +147,10 @@ fn record_sql<T>(result: rusqlite::Result<T>) -> Result<T> {
 struct Capture {
     intent: SaveIntent,
     view_generation: u64,
-    /// Immutable local event template, including the captured frontier and clocks.
-    /// Only its content value is filled from the selected prepared checkpoint.
+    /// Local event template. Owned basic-info rebasing and checkpoint selection
+    /// may update metadata while no revision has been committed. A repeated
+    /// selection keeps its clocks; a newer selection fences the old one.
+    /// Publication fills only content from the selected prepared checkpoint.
     event: Event,
     /// Absent fields remain absent when serializing pre-continuation records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -787,6 +789,10 @@ impl Store {
             if prior.as_ref() != Some(checkpoint)
                 && let Some(policy) = capture.basic_policy.clone()
             {
+                ensure!(
+                    checkpoint.sequence >= policy.sequence,
+                    "STALE_WRITE_CHECKPOINT"
+                );
                 let previous = capture.clone();
                 capture.event.created_ms = time();
                 let change = capture
