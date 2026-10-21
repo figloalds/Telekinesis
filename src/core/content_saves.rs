@@ -19,6 +19,10 @@ use std::time::Duration;
 const RECORD_BYTES: usize = 65_536;
 const FRONTIER_LIMIT: usize = 256;
 
+mod metadata;
+pub use metadata::ContentMetadataReceipt;
+pub(super) use metadata::MetadataOwner;
+
 /// The descriptor and parents selected by an open native writer. Checked
 /// inside the metadata writer transaction before superseding an operation.
 pub(crate) struct ContentSaveSelection {
@@ -165,9 +169,10 @@ impl Capture {
         let entity = &self.intent.base.entity;
         ensure!(
             self.intent.operation == operation
-                && self.basic_policy.as_ref().is_none_or(|p| {
-                    p.preserve_times & !6 == 0 && event.changes.len() == 3
-                })
+                && self
+                    .basic_policy
+                    .as_ref()
+                    .is_none_or(|p| { p.preserve_times & !6 == 0 && event.changes.len() == 3 })
                 && event.id
                     == capture_event_id(
                         operation,
@@ -773,23 +778,36 @@ impl Store {
                 return Ok(());
             }
             current(store, &capture)?;
-            if prior.is_none() && let Some(policy) = capture.basic_policy.clone() {
-                let previous = capture.clone();
-                capture.event.created_ms = time();
-                let change = capture.event.changes.get_mut(2).context("CORRUPT_CONTENT_SAVE")?;
-                let mut basic: BasicInfo = serde_json::from_value(change.value.clone())?;
-                let preserve = if policy.sequence == checkpoint.sequence { policy.preserve_times } else { 0 };
-                if preserve & 2 == 0 { basic.write_time = filetime(capture.event.created_ms); }
-                if preserve & 4 == 0 { basic.change_time = filetime(capture.event.created_ms); }
-                change.value = json!(basic);
-                capture.basic_policy = None;
-                store.replace_unselected_capture(&previous, &capture)?;
-            }
-            if let Some(prior) = prior {
+            if let Some(prior) = &prior {
                 ensure!(
-                    checkpoint.sequence > prior.sequence || checkpoint == &prior,
+                    checkpoint.sequence > prior.sequence || checkpoint == prior,
                     "STALE_WRITE_CHECKPOINT"
                 );
+            }
+            if prior.as_ref() != Some(checkpoint)
+                && let Some(policy) = capture.basic_policy.clone()
+            {
+                let previous = capture.clone();
+                capture.event.created_ms = time();
+                let change = capture
+                    .event
+                    .changes
+                    .get_mut(2)
+                    .context("CORRUPT_CONTENT_SAVE")?;
+                let mut basic: BasicInfo = serde_json::from_value(change.value.clone())?;
+                let preserve = if policy.sequence == checkpoint.sequence {
+                    policy.preserve_times
+                } else {
+                    0
+                };
+                if preserve & 2 == 0 {
+                    basic.write_time = filetime(capture.event.created_ms);
+                }
+                if preserve & 4 == 0 {
+                    basic.change_time = filetime(capture.event.created_ms);
+                }
+                change.value = json!(basic);
+                store.replace_pending_capture(&previous, &capture, prior.as_ref())?;
             }
             let changed = store.db.execute(
                 "UPDATE content_save_operations SET selected=? WHERE operation=?",
