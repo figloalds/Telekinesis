@@ -563,6 +563,117 @@ fn owned_basic_process_exit_keeps_event_capture_and_idempotent_receipt_atomic() 
     }
 }
 
+#[test]
+fn owned_basic_silent_sql_receipt_and_capture_writes_cannot_acknowledge_success() {
+    for (label, sql) in [
+        (
+            "receipt_ignore",
+            "CREATE TEMP TRIGGER reject_metadata BEFORE INSERT ON content_save_metadata_changes BEGIN SELECT RAISE(IGNORE); END",
+        ),
+        (
+            "receipt_delete",
+            "CREATE TEMP TRIGGER reject_metadata AFTER INSERT ON content_save_metadata_changes BEGIN DELETE FROM content_save_metadata_changes WHERE mutation=NEW.mutation; END",
+        ),
+        (
+            "capture_revert",
+            "CREATE TEMP TRIGGER reject_metadata AFTER UPDATE OF capture ON content_save_operations BEGIN UPDATE content_save_operations SET capture=OLD.capture WHERE operation=NEW.operation; END",
+        ),
+        (
+            "successor_revert",
+            "CREATE TEMP TRIGGER reject_metadata AFTER UPDATE OF capture ON content_save_successors BEGIN UPDATE content_save_successors SET capture=OLD.capture WHERE operation=NEW.operation AND checkpoint=NEW.checkpoint; END",
+        ),
+    ] {
+        let mut f = Fixture::unselected();
+        let (intent, sequence) = if label == "successor_revert" {
+            f.store
+                .select_content_checkpoint(&f.checkpoint, &context())
+                .unwrap();
+            f.store
+                .publish_content_save(&f.prepared, &context())
+                .unwrap();
+            (
+                f.store
+                    .continue_content_save(&f.checkpoint, &context())
+                    .unwrap()
+                    .intent()
+                    .clone(),
+                0,
+            )
+        } else {
+            (f.checkpoint.intent.clone(), f.checkpoint.sequence)
+        };
+        let before = f.store.entry(&f.entity).unwrap();
+        let basic = owned_basic(&f.store, &f.entity);
+        let mutation = Uuid::new_v4();
+        f.store.db.execute_batch(sql).unwrap();
+        assert!(
+            f.store
+                .apply_content_save_basic(&intent, mutation, basic, sequence, 6, &context())
+                .is_err(),
+            "{label} acknowledged a silently lost write"
+        );
+        assert!(f.store.db.is_autocommit());
+        assert_eq!(f.store.entry(&f.entity).unwrap(), before, "{label}");
+        let count: u64 = f
+            .store
+            .db
+            .query_row(
+                "SELECT count(*) FROM events WHERE id=?",
+                [mutation.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "{label}");
+        f.store
+            .db
+            .execute_batch("DROP TRIGGER reject_metadata")
+            .unwrap();
+        f.store
+            .apply_content_save_basic(&intent, mutation, basic, sequence, 6, &context())
+            .unwrap();
+        assert_eq!(f.store.entry(&f.entity).unwrap().basic_info(), basic);
+        f.oracle();
+    }
+}
+
+#[test]
+fn owned_basic_selection_detects_a_valid_but_silently_reverted_metadata_template() {
+    let mut f = Fixture::unselected();
+    let basic = owned_basic(&f.store, &f.entity);
+    f.store
+        .apply_content_save_basic(
+            &f.checkpoint.intent,
+            Uuid::new_v4(),
+            basic,
+            f.checkpoint.sequence,
+            0,
+            &context(),
+        )
+        .unwrap();
+    f.store.db.execute_batch("CREATE TEMP TABLE previous_metadata AS SELECT operation,capture FROM content_save_operations;
+        CREATE TEMP TRIGGER revert_selection AFTER UPDATE OF selected ON content_save_operations BEGIN
+        UPDATE content_save_operations SET capture=(SELECT capture FROM previous_metadata WHERE operation=NEW.operation) WHERE operation=NEW.operation; END").unwrap();
+    assert!(
+        f.store
+            .select_content_checkpoint(&f.checkpoint, &context())
+            .is_err(),
+        "selection acknowledged a different metadata template"
+    );
+    assert!(f.store.db.is_autocommit());
+    f.store
+        .db
+        .execute_batch("DROP TRIGGER revert_selection")
+        .unwrap();
+    f.store
+        .select_content_checkpoint(&f.checkpoint, &context())
+        .unwrap();
+    f.store
+        .publish_content_save(&f.prepared, &context())
+        .unwrap();
+    assert!(f.store.entry(&f.entity).unwrap().basic_info().write_time > basic.write_time);
+    f.oracle();
+}
+
 /// Independent fixture journal for the next metadata generation. This does not
 /// implement/admit a rollover of the original private journal; it stays intact.
 struct Generation {

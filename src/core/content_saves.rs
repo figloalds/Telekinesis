@@ -822,9 +822,12 @@ impl Store {
                     checkpoint.intent.operation.to_string()
                 ],
             )?;
+            let (stored, selected, receipt) = load(&store.db, checkpoint.intent.operation)?;
             ensure!(
                 changed == 1
-                    && load(&store.db, checkpoint.intent.operation)?.1.as_ref() == Some(checkpoint),
+                    && stored == capture
+                    && selected.as_ref() == Some(checkpoint)
+                    && receipt.is_none(),
                 "CONTENT_SAVE_SELECTION_LOST"
             );
             Ok(())
