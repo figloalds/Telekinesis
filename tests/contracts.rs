@@ -2168,6 +2168,7 @@ fn wave6_error_scopes_extend_the_historical_table() {
         "STALE_CONTENT_VIEW",
         "STALE_CONTENT_WORKSPACE",
         "CONTENT_SAVE_ALREADY_COMMITTED",
+        "CONTENT_METADATA_SAVE_IN_PROGRESS",
     ] {
         assert!(
             !classify(code).counts_as_failure(),
@@ -2180,6 +2181,12 @@ fn wave6_error_scopes_extend_the_historical_table() {
         "CONTENT_SAVE_PUBLICATION_LOST",
         "CONTENT_SAVE_SELECTION_LOST",
         "CONTENT_SAVE_ROLLBACK_FAILED",
+        "CONTENT_METADATA_CONTINUATION_LOST",
+        "CONTENT_METADATA_EVENT_REUSED",
+        "CONTENT_METADATA_MUTATION_REUSED",
+        "CONTENT_METADATA_OWNER_MISMATCH",
+        "CONTENT_METADATA_RECEIPT_LOST",
+        "INVALID_TIMESTAMP_POLICY",
     ] {
         assert_eq!(classify(code), ErrorClass::Fatal);
         assert!(

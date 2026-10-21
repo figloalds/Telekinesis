@@ -66,6 +66,17 @@ cargo test -j 1 --release --locked --offline --test content_transport -- --exact
 The implementation record preserves the failing unmodified timing policy and
 distinguishes this scenario from the full aggregate fairness/load matrix.
 
+Core owned-basic tests use real FULL WAL metadata and private Saved fixtures:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_saves owned_basic_ -- --test-threads=1 --nocapture
+```
+
+They include actual process exits and SQL triggers that silently ignore/delete
+receipts or revert otherwise valid captures. The implementation record retains
+the pre-fix failures. These Core checks do not claim WinFsp/FUSE set-basic
+callback integration; existing kernel scenarios are separate regression checks.
+
 Use the full command/toolchain/target-cache details in the relevant evidence
 when reproducing a recorded result. A successful compile is not a test pass;
 an ignored case, an early-return child driver and a parent-invoked helper are

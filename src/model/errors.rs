@@ -383,6 +383,7 @@ pub const WAVE6_CODES: &[(&str, ErrorClass)] = &[
     ("STALE_CONTENT_VIEW", ErrorClass::Contention),
     ("STALE_CONTENT_WORKSPACE", ErrorClass::Contention),
     ("CONTENT_SAVE_ALREADY_COMMITTED", ErrorClass::Contention),
+    ("CONTENT_METADATA_SAVE_IN_PROGRESS", ErrorClass::Contention),
     // A stable capture/sequence bound cannot be cured by retrying this intent.
     ("CONTENT_SAVE_CAPTURE_LIMIT", ErrorClass::NeedsUserAction),
     ("WRITE_GENERATION_EXHAUSTED", ErrorClass::NeedsUserAction),
@@ -407,6 +408,13 @@ pub const WAVE6_CODES: &[(&str, ErrorClass)] = &[
     ("CONTENT_SAVE_ROLLBACK_FAILED", ErrorClass::Fatal),
     ("CONTENT_SAVE_CONNECTION_FAILED", ErrorClass::Fatal),
     ("CONTENT_SAVE_CONTINUATION_LOST", ErrorClass::Fatal),
+    // Scoped owned-metadata integrity/input failures retain the byte save.
+    ("CONTENT_METADATA_CONTINUATION_LOST", ErrorClass::Fatal),
+    ("CONTENT_METADATA_EVENT_REUSED", ErrorClass::Fatal),
+    ("CONTENT_METADATA_MUTATION_REUSED", ErrorClass::Fatal),
+    ("CONTENT_METADATA_OWNER_MISMATCH", ErrorClass::Fatal),
+    ("CONTENT_METADATA_RECEIPT_LOST", ErrorClass::Fatal),
+    ("INVALID_TIMESTAMP_POLICY", ErrorClass::Fatal),
     ("CONTENT_SAVE_NOT_COMMITTED", ErrorClass::Contention),
     ("WRITE_JOURNAL_TRANSACTION_REQUIRED", ErrorClass::Fatal),
     ("WRITE_JOURNAL_CONNECTION_FAILED", ErrorClass::Fatal),

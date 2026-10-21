@@ -32,6 +32,12 @@ metadata through secondary connections and adopts the continuation on one
 stable `SaveFile`. Receipt replay prevents a lost reply publishing twice.
 Complete root reclamation and production recovery/lifecycle remain unfinished.
 
+Core's scoped `apply_content_save_basic` separately supports an owned metadata
+commit plus an unselected capture rebase, with exact request replay and
+checkpoint-bound time retention. It preserves ordinary stale-save fencing.
+This primitive is not yet wired to native set-basic callbacks; native timestamp
+flags, selected-save handling and namespace continuity remain development work.
+
 Explicit `NativeWrites::install` before mounting/opening attaches existing
 descriptor files to this pipeline on WinFsp/FUSE. Callbacks share a per-file
 mutation gate outside Engine; metadata length uses an atomic cache. Native
