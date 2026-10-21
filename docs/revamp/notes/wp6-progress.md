@@ -3337,7 +3337,7 @@ focused Linux parents then passed, including all four silent-write scenarios
 and the three actual process exits. No assertion or gate was relaxed.
 
 The initial `f6bcdeaa…` freeze was superseded before any final qualifier launched.
-Final qualification is in progress against 381 frozen source inputs:
+First frozen qualification used 381 source inputs:
 `96db7eff4b96db65c7c84b8fecae04f858350b2a47711acbeb6855b919bf6198`.
 Both strict Clippy runs passed, but this attempt failed Linux's
 `classify_covers_every_code_literal_in_src`: 40 contract cases passed and seven
@@ -3354,9 +3354,13 @@ existing scope contract. Save-in-progress is contention without failure-count
 escalation; receipt/continuation/owner/UUID integrity violations and invalid
 internal timestamp policy are fatal only in the pending mutation/save scope.
 Recovery bytes stay retained; historical classifications are unchanged.
-Fresh frozen-source qualification must complete before recording this stage
-as qualified. Its existing kernel parents remain regression checks, not proof
-of native basic-info integration, which is not wired.
+The corrected Linux runs passed all 41 contracts and 60 saves before refreezing.
+Fresh final qualification is in progress against 381 inputs:
+`6f40fb3668ccb903ca7b96c24f762089fe629daaa614ed562e463a113a9b2c89`.
+Selected suites, exact executable/source verification and archive readback
+must complete before recording this stage as qualified. Its existing kernel
+parents remain regression checks, not proof of native basic-info integration,
+which is not wired.
 
 This adds `content_save_metadata_changes` and an optional private metadata
 capture field. New code reads old captures; older binaries using strict unknown
