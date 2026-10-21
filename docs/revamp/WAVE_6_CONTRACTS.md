@@ -2293,3 +2293,39 @@ with zero stalled background completions and successful repaired bytes/fsync.
 This scenario does not replace arbitrary repository/source counts, aggregate
 foreground/structural/background fairness, CPU/RPC budgets, outage/load tests,
 the 30-minute soak or any other original release gate. Activation remains off.
+
+### CCR-WP6.4-20: owned basic-info metadata and capture rebase
+
+The Core `apply_content_save_basic` primitive accepts an exact registered
+SaveIntent, a distinct mutation UUID, a complete BasicInfo register and a
+private sequence/time-retention mask. Caller entity ordering is required.
+The FULL WAL writer rechecks operation, workspace, branch/view and generation
+ownership. A private proof exempts only the exact local basic-info event from
+ordinary invalidation, while its capture is unselected/uncommitted. Ordinary
+metadata and namespace operations keep their existing stale-save fences.
+
+Basic event, bounded/checksummed receipt and capture/successor update commit
+together. Exact replay returns the original receipt after later publications;
+UUID reuse with changed request is refused. Receipt/capture/successor/selection
+readback detects silently ignored, deleted or reverted writes and aborts the
+whole transaction. Published events are immutable; metadata cannot reuse the
+future byte event's identity. There is no provider/private-journal byte work.
+
+An optional private capture policy binds write/change-time retention to one
+sequence. Selecting older bytes is stale; later bytes expire retention. Exact
+selection replay keeps clocks, and superseding selection atomically changes
+the template before publication. Content/alive parents, descriptor and private
+operation stay exact. Remote content competitors remain conflicts.
+
+This is a Core primitive, not complete native metadata integration. Native
+callbacks must support unavailable-base metadata, failed selected saves,
+per-handle Windows timestamp flags and crash-safe sequence binding. Attr-only
+and partial timestamp requests must use fresh metadata/preconditions rather
+than overwrite unrelated fields from a stale full-register snapshot. The
+implementation record tracks these next steps and stage qualification.
+
+The additive metadata receipt table needs retention/storage qualification.
+The optional capture field is readable by new code from old captures; old
+strict readers cannot decode new policies. WP6.6 compatibility fencing remains
+required. Journal version 4 and canonical/wire/event encodings stay unchanged;
+activation, migration and live CAS deletion remain off.

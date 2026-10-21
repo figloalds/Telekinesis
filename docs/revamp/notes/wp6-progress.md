@@ -3299,3 +3299,74 @@ metadata and canonical work must stay outside Engine waits/fsync. Immediate
 durable namespace commits and eventual compatible batching need separate
 correctness/performance evidence; successful content fsync alone does not
 qualify namespace recovery or atomic replacement.
+
+### CCR-WP6.4-20 — owned basic-info metadata and capture rebase (2026-10-21)
+
+Core now offers `apply_content_save_basic` for an exact registered SaveIntent.
+Under one FULL WAL writer, a private proof exempts only its exact local
+basic-info event from ordinary ownership invalidation. Workspace, branch/view,
+generation/owner and unselected/uncommitted capture are checked again inside
+the event savepoint. Ordinary metadata continues fencing stale saves. Content
+and alive parents, descriptor and private operation remain exact; no provider,
+canonical or private-journal byte work occurs in this Core operation.
+
+The basic event, bounded/checksummed request/event receipt and updated capture
+plus successor lookup commit atomically. A mutation UUID supports exact
+lost-reply replay after later publications; changing the request with that UUID
+is rejected. The metadata event cannot reuse the future byte event's identity.
+An optional capture policy binds explicit write/change-time retention to one
+private sequence. Older selection is rejected, later bytes expire retention,
+exact repeated selection preserves clocks, and superseding selection changes
+template/selection together before publication. Published events never change.
+
+Ten new ordinary parents cover bytes/parents stability, timestamp sequence
+ordering, superseding selection, selected-capture refusal, ordinary metadata
+fencing, successor/lost-reply replay, event-ID reuse, a preserved remote content
+competitor and actual process exits before/during/after metadata commit. Eight
+initial focused Linux parents passed. Integrity audit then added two stronger
+parents; the first attempt reported one pass/two failures: ignored receipt and
+valid-but-reverted selected template incorrectly acknowledged success. Exact
+381 inputs/source
+`1c02b5e0320a3e8f6101b160bac4bb8fc2d650b8031baaf9ceccfd24d7643cf5`
+and raw failure outputs were archived/read back in
+`target/wave6/owned-basic-before-integrity-fix.zip`, SHA256
+`f82da0707f5d52619fb1b66e14809748baea60bfd92530499b4c991ad8f5efd4`.
+Exact receipt/current-capture/successor/selected-template readback now rejects
+ignored/deleted/reverted writes and rolls back the whole mutation. All ten
+focused Linux parents then passed, including all four silent-write scenarios
+and the three actual process exits. No assertion or gate was relaxed.
+
+The initial `f6bcdeaa…` freeze was superseded before any final qualifier launched.
+Final qualification is in progress against 381 frozen source inputs:
+`96db7eff4b96db65c7c84b8fecae04f858350b2a47711acbeb6855b919bf6198`.
+Both strict Clippy runs passed. Selected suites, exact executable/source
+verification, archive readback and three existing real-kernel regression
+parents/platform must complete before recording stage qualification. Those
+kernel parents do not prove native basic-info integration, which is not wired.
+
+This adds `content_save_metadata_changes` and an optional private metadata
+capture field. New code reads old captures; older binaries using strict unknown
+field rejection cannot read captures containing the new policy. WP6.6 still
+requires its actual compatibility fence/migration/downgrade rehearsal.
+Private write-journal version 4 and canonical/wire/event encodings are unchanged.
+Receipt lifecycle/retirement and storage amplification remain part of the full
+retention audit; a metadata receipt is not deletion authority.
+
+Native integration must preserve metadata-only operation when base objects are
+unavailable. The strict unselected-capture primitive above is not sufficient
+for a failed, already-selected native save. A checkpoint-bound owned metadata
+operation must supersede/rebase that selection without editing a published
+event or forcing canonical publication. Before acknowledging metadata tied to
+private sequence N, retain that sequence durably so recovery cannot strand a
+policy beyond its newest recoverable Saved. A private FULL checkpoint can do
+this without publishing unrelated bytes. Keep it outside Engine.
+
+Windows timestamp-disable/reset flags must follow the handle that actually
+wrote each private version. Persist their relevant write/change-time mask with
+Working/Saved at the existing NORMAL/FULL boundaries, not a new FULL per
+ordinary write; restore it for Saved recovery. Explicit timestamp retention
+expires on a later byte mutation, while per-handle disabled updates apply to
+that handle's later writes. Failed preflight without changed bytes must not
+clear retention. These native callback/lifetime rules, create/rename/delete/
+replacement, batching, complete retention/GC, aggregate budgets, WP6.5/6.6 and
+all original full release gates remain required. Activation remains off.
