@@ -26,7 +26,7 @@ pub struct Basis {
     pub content: FileContentRef,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScratchRecord { pub operation: String, pub basis: Basis, pub modified_ns: u128, pub hydrated: BTreeSet<u64> }
+pub struct ScratchRecord { pub id:String,pub operation: String, pub basis: Basis, pub modified_ns: u128, pub hydrated: BTreeSet<u64> }
 #[derive(Default)]
 pub struct DirtyBitmap { bits: Vec<u64> }
 impl DirtyBitmap {
@@ -172,7 +172,7 @@ impl WorkingLayer {
                 file.seek(SeekFrom::Start(index as u64*CHUNK_SIZE))?; file.write_all(&bytes)?; hydrated.insert(index as u64);
             }
         }
-        let scratch = Scratch { record:ScratchRecord { operation,basis:basis.clone(),modified_ns:modified_ns(&file)?,hydrated:hydrated.clone() },path,file,dirty:DirtyBitmap::default(),changed:false,writers:usize::from(writable),handles:1,closed_at:None,hydrated,base_visible_len:basis.content.total_len,pin };
+        let scratch = Scratch { record:ScratchRecord { id:operation.clone(),operation,basis:basis.clone(),modified_ns:modified_ns(&file)?,hydrated:hydrated.clone() },path,file,dirty:DirtyBitmap::default(),changed:false,writers:usize::from(writable),handles:1,closed_at:None,hydrated,base_visible_len:basis.content.total_len,pin };
         scratch.persist_record()?;
         let scratch = Arc::new(Mutex::new(scratch)); files.insert(key,scratch.clone()); Ok(scratch)
     }
@@ -201,7 +201,7 @@ impl WorkingLayer {
             let path = entry?.path();
             if path.extension().is_some_and(|e|e=="json") {
                 let record: ScratchRecord = serde_json::from_slice(&fs::read(&path)?)?;
-                ensure!(Uuid::parse_str(&record.operation).is_ok() && path.file_stem().and_then(|s|s.to_str())==Some(record.operation.as_str()),"INVALID_SCRATCH_RECORD");
+                ensure!(Uuid::parse_str(&record.operation).is_ok() && Uuid::parse_str(&record.id).is_ok() && path.file_stem().and_then(|s|s.to_str())==Some(record.id.as_str()),"INVALID_SCRATCH_RECORD");
                 records.push((path.with_extension("scratch"),record));
             }
         } Ok(records)
