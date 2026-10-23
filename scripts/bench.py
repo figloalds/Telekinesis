@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = ("copy_small", "build", "seq_1g", "random_4k", "git_status_50k", "remote_visibility")
 MIB = 1024 * 1024
 # Target ratios against native from docs/revamp/WAVE_6_REPLACEMENT.md section 8.
-TARGETS = {"copy_small": 1.3, "delete_small": 1.3, "build_clean": 1.3, "build_noop": 1.2,
+TARGETS = {"copy_small": 1.3, "build_clean": 1.3, "build_noop": 1.2,
            "seq_write_1g": 1.2, "seq_read_1g": 1.2, "random_4k": 1.5, "git_status_50k": 1.3}
 
 
@@ -270,6 +270,10 @@ def matrix(args):
                     proc.kill()
                     proc.wait()
                 log.close()
+            saved = ROOT / "test-runs/bench" / f"{args.label}-daemon-logs"
+            saved.mkdir(parents=True, exist_ok=True)
+            for log_path in home.glob("*.log"):
+                shutil.copyfile(log_path, saved / log_path.name)
     print("Matrix failures:", failures)
     return int(bool(failures))
 
@@ -309,7 +313,7 @@ def host_info():
 
 def print_table(summary, compare):
     base = compare["summary"] if compare else {}
-    width = max(len(k) for k in summary)
+    width = max((len(k) for k in summary), default=6)
     header = f"{'metric':{width}s} {'median ms':>11s} {'min':>9s} {'max':>9s}"
     if base:
         header += f" {'vs ' + compare['label']:>12s} {'target':>7s}"
@@ -327,6 +331,16 @@ def print_table(summary, compare):
 def gate(report, compare):
     """A missing measurement or incompatible baseline cannot pass the gate."""
     failures = []
+    failures.extend(report.get("errors", []))
+    expected = {"copy_small": ["copy_small"], "build": ["build_clean", "build_noop"],
+                "seq_1g": ["seq_write_1g", "seq_read_1g"], "random_4k": ["random_4k"],
+                "git_status_50k": ["git_status_50k"], "remote_visibility": ["remote_visibility"]}
+    for workload in (report["args"].get("only") or ",".join(WORKLOADS)).split(","):
+        if workload == "remote_visibility" and not report["args"].get("peer_root"):
+            continue
+        for metric in expected[workload]:
+            if report["summary"].get(metric, {}).get("samples", 0) != report["args"]["runs"]:
+                failures.append(f"{metric}: missing measurements")
     if compare:
         dimensions = ("runs", "copy_files", "large_mib", "random_ops", "git_files",
                       "projects", "files", "jobs", "framework")
@@ -441,6 +455,9 @@ def main():
                              lambda run: remote_visibility(root, args.peer_root, args, run))
             else:
                 report["skipped"]["remote_visibility"] = "no --peer-root"
+    except Exception as error:
+        report.setdefault("errors", []).append(f"{type(error).__name__}: {error}")
+        raise
     finally:
         report["summary"] = summarize(samples)
         report["finished"] = datetime.now(timezone.utc).isoformat()

@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <wchar.h>
 typedef struct {UINT64 size, creation_time, access_time, write_time, change_time, index; UINT32 attributes;} TK_INFO;
-typedef struct {UINT64 token, directory_ordinal;WCHAR directory_marker[256];BOOLEAN directory_started;} TK_HANDLE;
+typedef struct {UINT64 token, directory_ordinal;WCHAR directory_marker[256];BOOLEAN directory_started, root;} TK_HANDLE;
 extern UINT32 tk_call(UINT32,const WCHAR*,UINT64*,UINT64,void*,UINT32,UINT32,TK_INFO*,UINT32*);
 static PSECURITY_DESCRIPTOR Security;
 static ULONG SecuritySize;
@@ -37,7 +37,7 @@ static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs
     TK_HANDLE *handle=calloc(1,sizeof *handle);if(!handle)return STATUS_INSUFFICIENT_RESOURCES;
     TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0)|((options&FILE_DELETE_ON_CLOSE)?4:0);
     NTSTATUS result=tk_call(op,name,&handle->token,0,op==2?&attrs:0,op==2?sizeof attrs:0,flags,&info,0);
-    if(!NT_SUCCESS(result)){free(handle);return result;}*context=handle;fill(fi,&info);
+    if(!NT_SUCCESS(result)){free(handle);return result;}handle->root=wcscmp(name,L"\\")==0;*context=handle;fill(fi,&info);
     /* Kernel caching is coherent through remote event notifications. */
     return result;
 }
@@ -74,7 +74,12 @@ static NTSTATUS read_dir(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR pattern,PWSTR m
     for(ordinal=handle->directory_ordinal;;ordinal++) {
         union {UINT8 bytes[104+512];FSP_FSCTL_DIR_INFO info;} item;
         WCHAR name[256]={0};TK_INFO info={0};UINT64 token=((TK_HANDLE*)context)->token;
-        NTSTATUS status=tk_call(13,0,&token,ordinal,name,256,(!marker&&ordinal==0)?1:0,&info,0);
+        UINT64 dots=handle->root?0:2;
+        NTSTATUS status;
+        if(ordinal<dots){
+            wcscpy_s(name,256,ordinal==0?L".":L"..");
+            status=tk_call(8,0,&token,0,0,0,0,&info,0);
+        }else status=tk_call(13,0,&token,ordinal-dots,name,256,(!marker&&ordinal==dots)?1:0,&info,0);
         if(status==STATUS_NO_MORE_FILES)break;if(!NT_SUCCESS(status))return status;
         if(!sequential&&marker&&_wcsicmp(name,marker)<=0)continue;
         memset(&item,0,sizeof item);fill(&item.info.FileInfo,&info);

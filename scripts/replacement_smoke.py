@@ -61,6 +61,10 @@ def main():
         other=Path("Y:/") if os.name=="nt" else HOME/"mount-b"
         processes.append((a, *daemon(a, "X:" if os.name=="nt" else str(mount), "replacement-smoke")))
         (mount / "folder").mkdir()
+        empty=mount / "folder/empty"
+        empty.mkdir()
+        assert list(empty.iterdir())==[]
+        empty.rmdir()
         p = mount / "folder/file.txt"
         p.write_bytes(b"original")
         assert p.read_bytes() == b"original"
