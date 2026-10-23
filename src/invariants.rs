@@ -170,6 +170,9 @@ fn remote_apply_invalidates_cached_paths_without_changing_open_version() -> Resu
     let mut old = [0; 5];
     engine.read(h, 0, &mut old)?;
     assert_eq!(&old, b"local");
+    engine.read_visible(h, 0, &mut old)?;
+    assert_eq!(&old, b"other");
+    assert_eq!(engine.info_visible(h)?.1, 5);
     let new = engine.open_file("file", false, false, false)?;
     engine.read(new, 0, &mut old)?;
     assert_eq!(&old, b"other");
@@ -335,5 +338,21 @@ fn local_metadata_after_remote_content_does_not_erase_the_edit_conflict() -> Res
     assert_eq!(lock(&engine.store).conflicts(false)?.len(), 1);
     engine.close(h)?;
     engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_late_seal_of_a_deleted_entity_cannot_remove_a_recreated_name() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut store = Store::open(root.path(), None)?;
+    let old = store.create("file", EntryKind::File)?;
+    store.delete(&old.id)?;
+    let current = store.create("file", EntryKind::File)?;
+    let mut old = store.entry(&old.id)?;
+    old.content = Some(store.content.import(b"old private bytes")?);
+    let parent = store.projection().visible[&old.id].clone();
+    let event = store.event(MAIN, old, vec![parent], Operation::Delete);
+    store.apply(&[event])?;
+    assert_eq!(store.lookup("file")?.id, current.id);
     Ok(())
 }

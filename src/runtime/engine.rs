@@ -210,6 +210,40 @@ impl Engine {
         let s = h.scratch.as_ref().context("IS_A_DIRECTORY")?;
         lock(s).read(self.working.content(), offset, out)
     }
+    /// Windows shares cached pages across opens of a pathname. After notify
+    /// purges those pages, paging reads must populate them from the visible head.
+    pub fn read_visible(&self, token: u64, offset: u64, out: &mut [u8]) -> Result<usize> {
+        let h = self.handle(token)?;
+        let original = h.scratch.as_ref().context("IS_A_DIRECTORY")?;
+        let entity = lock(&h.entry).id.clone();
+        let basis = {
+            let store = lock(&self.store);
+            store.basis(&entity)?
+        };
+        if lock(original).record.basis.anchor == basis.anchor {
+            return lock(original).read(self.working.content(), offset, out);
+        }
+        let visible = self.working.open(basis, false)?;
+        let result = lock(&visible).read(self.working.content(), offset, out);
+        self.working.cleanup(&visible, false);
+        self.working.release(&visible);
+        result
+    }
+    pub fn info_visible(&self, token: u64) -> Result<(Entry, u64)> {
+        let h = self.handle(token)?;
+        let entity = lock(&h.entry).id.clone();
+        let (mut entry, branch, anchor) = {
+            let store = lock(&self.store);
+            let entry = store.entry(&entity)?;
+            let anchor = store.projection().anchors.get(&entity).cloned();
+            (entry, store.active.clone(), anchor)
+        };
+        let len = anchor
+            .and_then(|anchor| self.working.visible_len(&branch, &entity, &anchor))
+            .unwrap_or_else(|| entry.content.as_ref().map_or(0, |c| c.total_len));
+        entry.working_len = Some(len);
+        Ok((entry, len))
+    }
     pub fn write(
         &self,
         token: u64,

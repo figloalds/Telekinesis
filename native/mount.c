@@ -93,10 +93,17 @@ static FSP_FILE_SYSTEM_INTERFACE Interface;
    default). Rust bounds its content waits below it. */
 UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp_timeout_ms) {
     if(!Security) {
-        /* WinFsp requires a descriptor; the mount adds no user/owner policy. */
-        if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"O:WDG:WDD:(A;;FA;;;WD)",SDDL_REVISION_1,&Security,&SecuritySize))
-            return FspNtStatusFromWin32(GetLastError());
+        /* Report the host owner so tools such as Git can identify this user's
+           files. Access remains the ordinary personal-use mount policy. */
+        HANDLE token=0;DWORD bytes=0;WCHAR *sid=0;NTSTATUS error=STATUS_SUCCESS;
+        if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return FspNtStatusFromWin32(GetLastError());
+        GetTokenInformation(token,TokenUser,0,0,&bytes);
+        TOKEN_USER *user=malloc(bytes);
+        if(!user){CloseHandle(token);return STATUS_INSUFFICIENT_RESOURCES;}
+        if(!GetTokenInformation(token,TokenUser,user,bytes,&bytes)||!ConvertSidToStringSidW(user->User.Sid,&sid))error=FspNtStatusFromWin32(GetLastError());
+        else {WCHAR descriptor[512];swprintf_s(descriptor,512,L"O:%sG:WDD:(A;;FA;;;WD)",sid);
+            if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(descriptor,SDDL_REVISION_1,&Security,&SecuritySize))error=FspNtStatusFromWin32(GetLastError());}
+        if(sid)LocalFree(sid);free(user);CloseHandle(token);if(!NT_SUCCESS(error))return error;
     }
     memset(&Interface,0,sizeof Interface);
     Interface.GetVolumeInfo=volume;Interface.GetSecurityByName=security_name;
@@ -105,8 +112,10 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     Interface.Flush=flush;Interface.GetFileInfo=get_info;Interface.SetBasicInfo=basic;Interface.SetFileSize=size_file;
     Interface.CanDelete=can_delete;Interface.SetDelete=set_delete;Interface.Rename=rename_file;Interface.GetSecurity=get_security;Interface.ReadDirectory=read_dir;
     FSP_FSCTL_VOLUME_PARAMS p={0};p.Version=sizeof p;p.SectorSize=4096;p.SectorsPerAllocationUnit=1;
-    p.MaxComponentLength=255;p.FileInfoTimeout=1000;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
-    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=0;p.UmFileContextIsUserContext2=1;
+    /* WinFsp enables the Windows data cache only for the infinity sentinel.
+       Directories retain a finite metadata lifetime; remote changes notify. */
+    p.MaxComponentLength=255;p.FileInfoTimeout=INFINITE;p.DirInfoTimeoutValid=1;p.DirInfoTimeout=1000;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
+    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
     /* Every mount uses native retirement for open destination handles. */
     p.SupportsPosixUnlinkRename=1;
     if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;

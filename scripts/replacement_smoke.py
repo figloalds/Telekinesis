@@ -86,11 +86,18 @@ def main():
         # Prime both data and attribute caches before a remote update.
         assert remote.stat().st_size == 8
         assert remote.read_bytes() == b"oriXYnal"
+        old_reader=remote.open("rb", buffering=0)
+        assert old_reader.read()==b"oriXYnal"
         (mount / "folder/renamed.txt").write_bytes(b"remote replacement")
         cli(a, "flush")
         started = time.monotonic()
         wait_for(lambda: remote.read_bytes() == b"remote replacement")
         elapsed = (time.monotonic() - started) * 1000
+        old_reader.seek(0)
+        retained=old_reader.read()
+        old_reader.close()
+        expected=b"remote replacement" if os.name=="nt" else b"oriXYnal"
+        assert retained==expected, f"unexpected existing-handle bytes: {retained!r}"
         print(f"paired cached update visible in {elapsed:.1f} ms", flush=True)
         print(json.dumps({"home": str(HOME), "visibility_ms": elapsed}), flush=True)
     finally:

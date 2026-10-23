@@ -1,4 +1,4 @@
-//! WinFsp callbacks route byte I/O directly to version-bound host scratch files.
+//! WinFsp callbacks use host scratch files and the pathname-shared Windows cache.
 use crate::{
     content::working::lock,
     core::{Entry, EntryKind},
@@ -93,7 +93,7 @@ pub fn detach() -> Result<()> {
 pub fn notify(path: &str, action: u32) -> Result<()> {
     let mount = lock(&MOUNT);
     if let Some((native, _)) = mount.as_ref() {
-        let path = path.replace('/', "\\");
+        let path = path.replace('/', "\\").to_uppercase();
         let wide: Vec<_> = path.encode_utf16().chain(Some(0)).collect();
         let status = unsafe { tk_mount_notify(*native, wide.as_ptr(), action) };
         ensure!(status == 0, "NOTIFY_FAILED: {status:08x}");
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn tk_call(
                 } else {
                     unsafe { std::slice::from_raw_parts_mut(buffer as *mut u8, length as usize) }
                 };
-                let n = engine.read(h, offset, out)?;
+                let n = engine.read_visible(h, offset, out)?;
                 if !count.is_null() {
                     unsafe { *count = n as u32 };
                 }
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn tk_call(
                 }
             }
             8 => {
-                let (e, len) = engine.info(h)?;
+                let (e, len) = engine.info_visible(h)?;
                 unsafe { *info = fill(&e, len) };
             }
             9 => engine.cleanup(h, flags & 1 != 0)?,

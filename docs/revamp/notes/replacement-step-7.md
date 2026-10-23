@@ -16,3 +16,13 @@ and exposed stale unsealed sizes to Git. The current working projection now
 supplies draft sizes; further full-gate runs are required. These are measured
 failures, not passing qualification. See `test-evidence/bench/wave6-*.json` and
 the benchmark command in `docs/VALIDATION.md`.
+# Windows cache follow-up
+
+WinFsp now uses `FileInfoTimeout=INFINITE`, the setting required to enable
+Windows data caching, and flushes cached writes to scratch on cleanup. Remote
+notifications use normalized names; paging reads and metadata follow the
+visible entity head after invalidation. Per the user's decision, existing
+Windows readers may see remote updates. Their local edit parent still binds
+conflict detection. A paired, cached-reader smoke test passed in 62 ms;
+the full performance gate remains open.
+

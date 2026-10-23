@@ -56,8 +56,10 @@ boundaries and to present a snapshot as a directory. It is not a block device.
   filesystem under the store directory. On first open the scratch file is
   hydrated from the entity's current manifest: local chunks are copied in,
   remote chunks are fetched on demand by range and written in. A handle is
-  bound to the version it opened; a remote update arriving mid-edit does not
-  change what that handle sees. The conflict, if any, is detected at seal.
+  bound to the version it opened on Linux. On Windows, data caching takes
+  priority: existing handles may see remote updates because WinFsp shares
+  cached pages by pathname (user decision, 2026-10-23). A local edit retains
+  its parent version so concurrent changes still produce a conflict at seal.
 - **Read, write, truncate and append** are passthrough calls on the scratch
   file's host handle. No hashing, no SQLite, no journal. The only bookkeeping on
   write is an in-memory dirty flag and dirty-range bitmap (4 KiB granularity)

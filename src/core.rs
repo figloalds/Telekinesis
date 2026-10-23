@@ -172,6 +172,7 @@ pub struct Projection {
     pub visible: Arc<BTreeMap<String, String>>,
     pub anchors: Arc<BTreeMap<String, String>>,
     children: Arc<BTreeMap<String, BTreeMap<String, String>>>,
+    slots: Arc<BTreeMap<(String, String), BTreeSet<String>>>,
     trees: BTreeMap<String, Digest>,
     dirty: BTreeSet<String>,
 }
@@ -184,8 +185,23 @@ impl Projection {
     }
     fn index(&mut self, entry: Entry) -> Result<()> {
         if let Some(old) = self.entries.get(&entry.id) {
-            if let Some(children) = Arc::make_mut(&mut self.children).get_mut(&old.parent) {
-                children.remove(&name_key(&old.name)?);
+            if !old.deleted {
+                let key = name_key(&old.name)?;
+                let slot = (old.parent.clone(), key.clone());
+                let slots = Arc::make_mut(&mut self.slots);
+                if let Some(members) = slots.get_mut(&slot) {
+                    members.remove(&old.id);
+                    if members.is_empty() {
+                        slots.remove(&slot);
+                    }
+                }
+                if let Some(children) = Arc::make_mut(&mut self.children).get_mut(&old.parent) {
+                    if let Some(winner) = slots.get(&slot).and_then(|s| s.first()) {
+                        children.insert(key, winner.clone());
+                    } else {
+                        children.remove(&key);
+                    }
+                }
             }
             self.dirty.insert(old.parent.clone());
         }
@@ -194,11 +210,11 @@ impl Projection {
                 .entry(entry.parent.clone())
                 .or_default();
             let key = name_key(&entry.name)?;
-            // Path collisions remain in entity history/conflicts, never spawn
-            // synthesized sibling files. Stable entity ordering is deterministic.
-            if children.get(&key).is_none_or(|other| other >= &entry.id) {
-                children.insert(key, entry.id.clone());
-            }
+            let members = Arc::make_mut(&mut self.slots)
+                .entry((entry.parent.clone(), key.clone()))
+                .or_default();
+            members.insert(entry.id.clone());
+            children.insert(key, members.first().unwrap().clone());
             self.dirty.insert(entry.parent.clone());
         }
         Arc::make_mut(&mut self.entries).insert(entry.id.clone(), entry);
